@@ -14,7 +14,8 @@
 
 import * as cron from 'node-cron';
 import { randomUUID } from 'node:crypto';
-import { isWithinQuietHours } from './quiet-hours.js';
+import { effectiveDeliveryTime, effectiveTimezone, isWithinQuietHours } from './quiet-hours.js';
+import { mayRunDuringQuietHours } from './reminder-quiet-hours.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
@@ -41,6 +42,24 @@ export interface DueReminder {
   max_runs: number | null;
   studio_hint: string | null;
   metadata: Record<string, unknown> | null;
+  /** Runs inside quiet hours instead of being held (task 2301cb3c). */
+  run_during_quiet_hours?: boolean | null;
+}
+
+/**
+ * What the scheduler tells the deliver callback about THIS firing.
+ *
+ * Present only when the reminder fires inside quiet hours under its switch, so
+ * the prompt can tell the SB not to contact the user until `until`. Absent on
+ * every ordinary firing, which keeps the callback's call shape unchanged.
+ */
+export interface HeartbeatDeliveryContext {
+  quietHours?: {
+    /** First minute outside the window, as an ISO instant. */
+    until: string;
+    /** The zone the window was evaluated in (the configured one, or UTC). */
+    timezone: string;
+  };
 }
 
 interface HeartbeatConfig {
@@ -535,7 +554,10 @@ function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeli
  * is most likely to be failing.
  */
 export async function processHeartbeat(
-  deliver?: (reminder: DueReminder) => Promise<HeartbeatDeliverResult>,
+  deliver?: (
+    reminder: DueReminder,
+    context?: HeartbeatDeliveryContext
+  ) => Promise<HeartbeatDeliverResult>,
   onFailure?: HeartbeatFailureHook,
   onRecovery?: HeartbeatRecoveryHook
 ): Promise<{
@@ -609,9 +631,11 @@ export async function processHeartbeat(
     stats.processed++;
 
     try {
-      // Check if user is in quiet hours
-      const isQuiet = await isInQuietHours(reminder.user_id);
-      if (isQuiet) {
+      // Check if user is in quiet hours. A reminder with the switch on runs
+      // anyway (Conor, 2026-10-02, option B); every other reminder is held as
+      // before. Watchdogs are excluded inside mayRunDuringQuietHours.
+      const quiet = await quietHoursNow(reminder.user_id);
+      if (quiet.quiet && !mayRunDuringQuietHours(reminder)) {
         // `info`, not `debug`. Debug is not persisted to ~/.ink/logs, so this
         // deferral left no trace at all: a reminder due at 07:30 and delivered
         // at 08:06 looked from the outside like scheduler lag, and got
@@ -645,10 +669,24 @@ export async function processHeartbeat(
         continue;
       }
 
-      // Deliver via caller-provided callback
+      if (quiet.quiet) {
+        logger.info('Reminder runs during quiet hours — its switch is on', {
+          reminderId: reminder.id,
+          quietUntil: quiet.until.toISOString(),
+        });
+      }
+
+      // Deliver via caller-provided callback. The context is passed only for a
+      // quiet-hours firing, so an ordinary call keeps its one-argument shape.
       let outcome: HeartbeatDeliveryOutcome;
       if (deliver) {
-        outcome = normalizeDeliveryOutcome(await deliver(reminder));
+        outcome = normalizeDeliveryOutcome(
+          await (quiet.quiet
+            ? deliver(reminder, {
+                quietHours: { until: quiet.until.toISOString(), timezone: quiet.timezone },
+              })
+            : deliver(reminder))
+        );
       } else {
         logger.warn(`No deliver callback for reminder ${reminder.id} - skipping`);
         outcome = { status: 'failed', error: 'no deliver callback registered' };
@@ -1041,10 +1079,15 @@ async function readBeatHistory(reminderId: string): Promise<FailureStreak> {
 }
 
 /**
- * Check if user is in quiet hours
+ * Whether the user is in quiet hours right now, and if so when they end.
+ *
+ * The end is what a reminder allowed to run overnight is told, so it knows how
+ * long not to contact the user.
  */
-async function isInQuietHours(userId: string): Promise<boolean> {
-  if (!supabase) return false;
+async function quietHoursNow(
+  userId: string
+): Promise<{ quiet: false } | { quiet: true; until: Date; timezone: string }> {
+  if (!supabase) return { quiet: false };
 
   const { data: state } = await supabase
     .from('heartbeat_state')
@@ -1053,7 +1096,7 @@ async function isInQuietHours(userId: string): Promise<boolean> {
     .single();
 
   if (!state?.quiet_start || !state?.quiet_end) {
-    return false;
+    return { quiet: false };
   }
 
   // One predicate, shared with the creation-time warning in reminder-handlers.
@@ -1065,11 +1108,14 @@ async function isInQuietHours(userId: string): Promise<boolean> {
   // SERVER's clock — while selecting the user's `timezone` column and never
   // using it, under a comment conceding "timezone handling can be enhanced".
   // Correct only while the server runs on the user's own machine.
-  return isWithinQuietHours(new Date(), {
-    start: state.quiet_start,
-    end: state.quiet_end,
-    timezone: state.timezone,
-  });
+  const window = { start: state.quiet_start, end: state.quiet_end, timezone: state.timezone };
+  const now = new Date();
+  if (!isWithinQuietHours(now, window)) return { quiet: false };
+  return {
+    quiet: true,
+    until: effectiveDeliveryTime(now, window),
+    timezone: effectiveTimezone(state.timezone),
+  };
 }
 
 /**

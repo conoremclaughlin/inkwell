@@ -10,8 +10,6 @@
  * refusal a caller sees and the behaviour the scheduler applies cannot drift.
  */
 
-import type { Json } from '../data/supabase/types.js';
-
 /**
  * Strategy watchdogs are refused the switch in B.
  *
@@ -28,7 +26,7 @@ export const WATCHDOG_QUIET_HOURS_REFUSAL =
   'without being told not to contact the user. Watchdogs get overnight runs when they become ' +
   'addressed reminders (task c52fccfd).';
 
-export function isStrategyWatchdog(metadata: Json | null | undefined): boolean {
+export function isStrategyWatchdog(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
   return (metadata as Record<string, unknown>).strategyWatchdog === true;
 }
@@ -41,7 +39,7 @@ export function isStrategyWatchdog(metadata: Json | null | undefined): boolean {
  */
 export function mayRunDuringQuietHours(reminder: {
   run_during_quiet_hours?: boolean | null;
-  metadata?: Json | null;
+  metadata?: unknown;
 }): boolean {
   return reminder.run_during_quiet_hours === true && !isStrategyWatchdog(reminder.metadata);
 }
