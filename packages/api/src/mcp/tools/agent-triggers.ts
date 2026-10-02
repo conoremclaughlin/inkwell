@@ -144,6 +144,7 @@ export async function handleTriggerAgent(
       ...(args.recipientSessionId || args.studioId || args.studioHint
         ? { explicitRecipientTarget: true }
         : {}),
+      ...(args.recipientSessionId ? { explicitRecipientSession: true } : {}),
       // Caller-repo inference degrades silently to refuse-and-hold on any
       // dispatch path that forgets this (Lumen, PR #514 round 1).
       ...senderRoutingContext(senderIsBridge),

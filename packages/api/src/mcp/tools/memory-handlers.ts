@@ -1267,6 +1267,46 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       sbSlug,
       creator.sbId
     );
+    // Discovery is separate from admission (T4; Lumen, #719 review). The
+    // lookup finds the transcript's row whatever its contact scope, and only
+    // then is that scope compared with the caller's. A mismatch refuses
+    // outright: reusing would hand one scope another's conversation, and
+    // falling through (to the scoped lookups below, or to an insert) would
+    // mint a second row for the same transcript. forceNew included: it never
+    // licenses a duplicate. Filtering the lookup by contact instead would
+    // make the existing transcript look absent and produce exactly that.
+    if (
+      existingSession &&
+      ((existingSession.contactId ?? null) !== (contactScope ?? null) ||
+        !isSessionAuthorized(existingSession, user.id, creator))
+    ) {
+      logger.warn('start_session refused: the backend conversation belongs to another scope', {
+        sessionId: existingSession.id,
+        sbSlug,
+        backendSessionId: params.backendSessionId,
+        sessionContactId: existingSession.contactId ?? null,
+        callerContactId: contactScope ?? null,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error:
+                  'Refusing to start a session for this backend conversation: it already ' +
+                  'belongs to a session in another contact scope. One backend conversation ' +
+                  'is one Inkwell session, so no second session was created and the ' +
+                  'existing one was not reused.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
     if (existingSession) {
       reusedBy = 'backendSessionId';
       logger.info('start_session reused the session already linked to this backend conversation', {

@@ -222,6 +222,7 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     studioHint: metadata?.studioHint,
     recipientSessionId: metadata?.recipientSessionId,
     recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
+    recipientSessionNamed: metadata?.recipientSessionNamed === true,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -536,6 +537,13 @@ export class UnresolvedStudioError extends Error {
  * Recovery needs no special path: give the thread a route pattern, a
  * studio_hint, or a project, and the next delivery attempt resolves normally.
  */
+/** Why a caller-named session could not take a message (T4). */
+export interface ExplicitAddressHold {
+  sessionId?: string;
+  sessionKey?: string;
+  cause: 'unknown-session' | 'contact-scope' | 'session-key-miss' | 'session-key-held';
+}
+
 export class RoutingRefusedError extends Error {
   readonly code = 'ROUTING_REFUSED';
 
@@ -545,7 +553,12 @@ export class RoutingRefusedError extends Error {
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       /**
        * The caller named an exact studio/session and THAT is what we refused.
        * Without this the message recommends naming one — advice the caller has
@@ -557,6 +570,11 @@ export class RoutingRefusedError extends Error {
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it. */
       project?: ThreadProjectRefusal;
+      /**
+       * The caller named a session (by id or key) that cannot take the
+       * message. Never redirected elsewhere (session-lifecycle-model §3).
+       */
+      explicit?: ExplicitAddressHold;
     }
   ) {
     super(RoutingRefusedError.describe(threadKey, sbSlug, detail));
@@ -568,6 +586,25 @@ export class RoutingRefusedError extends Error {
     sbSlug: string,
     detail: RoutingRefusedError['detail']
   ): string {
+    if (detail.reason === 'explicit-address' && detail.explicit) {
+      const named = detail.explicit.sessionKey
+        ? `sessionKey "${detail.explicit.sessionKey}"`
+        : `session ${detail.explicit.sessionId ?? 'unknown'}`;
+      const why: Record<ExplicitAddressHold['cause'], string> = {
+        'unknown-session': `which is not a session of "${sbSlug}"`,
+        'contact-scope': `which belongs to a different contact scope than this message`,
+        'session-key-miss': `which no live session of "${sbSlug}" carries`,
+        'session-key-held':
+          `which ended, and its session key is now held by another live session, ` +
+          `so it cannot be reopened without taking that key`,
+      };
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
+        `${named}, ${why[detail.explicit.cause]}. Message held; it was not redirected ` +
+        `to another session. Re-send to a session of "${sbSlug}" (list_sessions shows ` +
+        `them), or send without the address.`
+      );
+    }
     // Ambiguity refuses BEFORE any tier runs, so the generic message below —
     // which names route patterns, project affinity and the caller repo — is
     // false here: none of them were consulted. It cost Myra and Lumen a night
@@ -3156,6 +3193,47 @@ export class SessionService implements ISessionService {
   }
 
   /**
+   * Reopen an ended session for an address that names it: a session the
+   * caller named, or the session a reply answers (spec session-lifecycle-model
+   * §3 rungs 1 and 3). Clears ended_at and the completed spellings of
+   * lifecycle and status in one write; the agent's work phase is its own and
+   * is left alone. Returns null when the row's session key is now held by
+   * another live session, which the key's unique index refuses: the caller
+   * decides whether that is a refusal or a decline.
+   */
+  private async reopenEndedSession(
+    session: Session,
+    via: 'named-session' | 'reply-anchor'
+  ): Promise<Session | null> {
+    const status = String(session.status ?? '').toLowerCase();
+    try {
+      const reopened = await this.repository.update(session.id, {
+        endedAt: null,
+        ...(session.lifecycle === 'completed' ? { lifecycle: 'idle' as const } : {}),
+        ...(status === 'completed' || status.startsWith('completed:')
+          ? { status: 'active' as const }
+          : {}),
+      });
+      logger.info('[SessionRouting] Reopened an ended session for an address that names it', {
+        sessionId: session.id,
+        via,
+        endedAt: session.endedAt?.toISOString() ?? null,
+      });
+      return reopened;
+    } catch (err) {
+      if ((err as { code?: string } | null)?.code === '23505') {
+        logger.warn('[SessionRouting] Cannot reopen: its session key is held by a live session', {
+          sessionId: session.id,
+          sessionKey: session.alias ?? null,
+          via,
+        });
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
    * May a channel reply resume the session that wrote the message it answers?
    *
    * A reply anchor is a preference, not an address. recipientSessionId names
@@ -3220,7 +3298,9 @@ export class SessionService implements ISessionService {
       });
     }
 
-    if (session.endedAt) return decline('ended');
+    // An ended session no longer declines (finished-session audit row 6): it
+    // is reopened below, once the read-only checks pass and before any lease
+    // is taken.
 
     // A live terminal, judged by the trigger path's own delivery decision on
     // the same columns. The trigger path would deliver inline to it, but
@@ -3274,6 +3354,13 @@ export class SessionService implements ISessionService {
     // An anchor would open an older one, whoever holds its studio now.
     if (session.studioId && !session.threadKey) {
       return decline('studio_without_thread', { studioId: session.studioId });
+    }
+    // Reopen before the lease, so a key collision declines without holding a
+    // studio. A plan resolution writes nothing.
+    if (session.endedAt && !ctx.planOnly) {
+      const reopened = await this.reopenEndedSession(session, 'reply-anchor');
+      if (!reopened) return decline('ended_key_held', { sessionKey: session.alias ?? null });
+      session = reopened;
     }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
@@ -3334,6 +3421,12 @@ export class SessionService implements ISessionService {
        * or is dropped (Lumen, #681 r2).
        */
       recipientSessionExplicit?: boolean;
+      /**
+       * The caller named this session itself, by id or key (T4; spec
+       * session-lifecycle-model §3 rung 1). Unknown, foreign or other-contact:
+       * refused, never dropped. Ended: reopened. Implies explicit.
+       */
+      recipientSessionNamed?: boolean;
       /**
        * The session that wrote the message a channel reply answers. Tried
        * after recipientSessionId and before every other rung, but only
@@ -3446,6 +3539,23 @@ export class SessionService implements ISessionService {
     let authorizedRecipientSessionId = options?.recipientSessionId;
     let anchorLookupFailed = false;
     let recipientCandidate: Session | null = null;
+    // A session the caller named, by id or key, is an address (T4; spec
+    // session-lifecycle-model §3 rung 1). One that cannot take the message is
+    // refused and the message held; it is never dropped so that the ladder
+    // below can pick some other session.
+    const recipientSessionNamed = options?.recipientSessionNamed === true;
+    const refuseNamedSession = (cause: ExplicitAddressHold['cause']): never => {
+      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', sbSlug, {
+        triedCallerRepo: false,
+        reason: 'explicit-address',
+        anchor: 'session',
+        explicit: {
+          sessionId: options?.recipientSessionId,
+          ...(options?.alias ? { sessionKey: options.alias } : {}),
+          cause,
+        },
+      });
+    };
     if (options?.recipientSessionId) {
       let candidate: Session | null = null;
       try {
@@ -3474,6 +3584,25 @@ export class SessionService implements ISessionService {
             requestedSbId: identitySbId,
           });
         }
+        authorizedRecipientSessionId = undefined;
+        if (recipientSessionNamed) refuseNamedSession('unknown-session');
+      }
+
+      // Contact scope is part of the admission invariant (spec §3): an owner
+      // message never resumes a per-sender contact session, and a contact's
+      // never resumes the owner's. A named session refuses; an inferred one
+      // is dropped, as an unauthorized one is.
+      if (
+        authorizedRecipientSessionId &&
+        candidate &&
+        (candidate.contactId ?? null) !== (options.contactId ?? null)
+      ) {
+        if (recipientSessionNamed) refuseNamedSession('contact-scope');
+        logger.warn('[SessionRouting] Dropping recipientSessionId — another contact scope', {
+          recipientSessionId: options.recipientSessionId,
+          sessionContactId: candidate.contactId ?? null,
+          requestContactId: options.contactId ?? null,
+        });
         authorizedRecipientSessionId = undefined;
       }
     }
@@ -3645,6 +3774,21 @@ export class SessionService implements ISessionService {
         // Authorized above (same user, same identity) — this rung only has to
         // check liveness.
         const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
+        if (!recipientSession && recipientSessionNamed) refuseNamedSession('unknown-session');
+        // An ended session the caller named reopens: an explicit address
+        // resumes any transcript (Conor, 2026-10-02; finished-session audit
+        // row 1). An inferred one still falls through until the T5 readers.
+        // A plan resolution writes nothing; the spawn path's resolution, which
+        // carries the same named flag, reopens it.
+        if (recipientSession?.endedAt && recipientSessionNamed) {
+          const reopened =
+            options?.planOnly === true
+              ? recipientSession
+              : await this.reopenEndedSession(recipientSession, 'named-session');
+          if (!reopened) return refuseNamedSession('session-key-held');
+          this.logRungMatch('recipient-session', reopened, routing, options?.threadKey);
+          return this.withStudioLease(reopened, routing, leaseCtx);
+        }
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
           // A studioless inferred anchor reaching here passed the predicate
@@ -3735,11 +3879,17 @@ export class SessionService implements ISessionService {
           this.logRungMatch('alias', aliasMatch, routing, options?.threadKey);
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
-        logger.debug('No session found for alias', {
+        // A key is always caller-supplied, so a miss is a wrong address:
+        // refused, never a new session minted under the key (Conor,
+        // 2026-10-02: "If the address is wrong, just like the mail, we should
+        // know"). send_to_inbox refuses a miss before storing anything; this
+        // covers a key that stopped resolving while the message waited.
+        logger.warn('[SessionRouting] Refusing a session key no live session carries', {
           alias: options.alias,
           sbSlug,
           aliasStudioScope: aliasStudioScope ?? null,
         });
+        refuseNamedSession('session-key-miss');
       }
 
       // ThreadKey match — find session scoped to this topic
@@ -3787,8 +3937,10 @@ export class SessionService implements ISessionService {
         }
 
         // Thread-scoped request with no match. If the agent has a default
-        // session, route there instead of creating a new one.
-        if (defaultSessionId) {
+        // session, route there instead of creating a new one. Not for a
+        // contact's message: the default session is the owner's (T4; the
+        // unthreaded home rung below already guards this).
+        if (defaultSessionId && !options?.contactId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
           if (defaultSession && !defaultSession.endedAt) {
             this.logRungMatch('default-session', defaultSession, routing, options.threadKey);

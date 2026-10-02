@@ -102,6 +102,14 @@ export interface AgentTriggerPayload {
    * those are continuity hints, never authorized overwrites.
    */
   explicitRecipientTarget?: boolean;
+  /**
+   * True only when the CALLER named the session itself (recipientSessionId
+   * or sessionKey). A named studio alone sets explicitRecipientTarget, not
+   * this. A named session that cannot take the message is refused, and an
+   * ended one is reopened (session-lifecycle-model §3 rung 1, T4); neither
+   * applies to a session routing inferred.
+   */
+  explicitRecipientSession?: boolean;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

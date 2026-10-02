@@ -266,6 +266,12 @@ export interface SessionRequest {
      * b5c71bc3, Lumen #681 r2).
      */
     recipientSessionExplicit?: boolean;
+    /**
+     * True only when the caller named this session itself, by id or key (T4).
+     * Such a session is refused when it cannot take the message and reopened
+     * when it ended; an inferred one falls through as before.
+     */
+    recipientSessionNamed?: boolean;
     // The session that wrote the message this one replies to. A preference,
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
@@ -374,12 +380,23 @@ export interface SessionResult {
     detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it (task b5c71bc3). */
       project?: { slug: string; cause?: 'unset' | 'unresolved' | 'unreadable'; repoRoot?: string };
+      /** A caller-named session that cannot take the message (T4). */
+      explicit?: {
+        sessionId?: string;
+        sessionKey?: string;
+        cause: 'unknown-session' | 'contact-scope' | 'session-key-miss' | 'session-key-held';
+      };
     };
   };
 }

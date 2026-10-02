@@ -2674,6 +2674,12 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockImplementation(async (id: string) =>
         id === authoring.id ? authoring : id === home.id ? home : null
       );
+      // An update returns the row with the write applied, as the repository's
+      // does: a reopened authoring session is the same transcript, not a
+      // fresh mock. The fixture row itself is left as the test set it.
+      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) =>
+        id === authoring.id ? { ...authoring, ...updates } : createMockSession({ id, ...updates })
+      );
       // General reuse: what an unanchored reply lands in.
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(home);
 
@@ -2816,12 +2822,36 @@ describe('SessionService', () => {
       });
     });
 
-    it('declines a session that ended after the reply lookup, and routes without its studio', async () => {
-      // Finding 3 of the review, at the unit: no reuse match, so the reply
-      // creates. The anchor used to pin its studio first, and the new session
-      // was created inside it.
-      const { service } = replyFixture({ authoring: { ...inPrStudio, endedAt: new Date() } });
+    it('reopens a session that ended after the reply lookup, and resumes it (audit row 6)', async () => {
+      // A reply resumes the session that wrote the message it answers, ended
+      // or not (session lifecycle v7 §3 rung 3). It reopens in one write.
+      const { service, tables } = replyFixture({
+        authoring: { ...inPrStudio, endedAt: new Date() },
+      });
+
+      const session = await reply(service, { turnEpochCandidate: 'epoch-1' });
+
+      expect(session.id).toBe('authoring');
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'authoring',
+        expect.objectContaining({ endedAt: null })
+      );
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(tables.studios[0].lease).toMatchObject({ sessionId: 'authoring' });
+    });
+
+    it('declines when its session key is now held by a live session, and routes without its studio', async () => {
+      // Reopening would need the key's unique index to admit a second live
+      // holder. It does not, so the reply declines. Finding 3 of the #682
+      // review still holds for a declined anchor: no reuse match, so the
+      // reply creates, and nothing pins the new session to the old studio.
+      const { service, tables } = replyFixture({
+        authoring: { ...inPrStudio, endedAt: new Date(), alias: 'wren:inkwell:pr' },
+      });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.update).mockRejectedValueOnce(
+        Object.assign(new Error('duplicate key value'), { code: '23505' })
+      );
 
       const session = await reply(service);
 
@@ -2831,6 +2861,8 @@ describe('SessionService', () => {
       expect(vi.mocked(mockRepository.findByUserAndAgent).mock.calls[0][2]).not.toMatchObject({
         studioId: 'studio-pr',
       });
+      // Declined before the lease: the studio stays free.
+      expect(tables.studios[0].lease ?? null).toBeNull();
     });
 
     describe("a live terminal on the session, by the trigger path's delivery decision", () => {
@@ -2996,11 +3028,15 @@ describe('SessionService', () => {
       expect(queued.sessionId).toBe('authoring');
     });
 
-    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+    it('checks again at dequeue: a queued reply reopens a session that ended meanwhile', async () => {
       const { resumed, queued } = await queueTwoReplies({ endWhileQueued: true });
 
-      expect(resumed).toEqual(['backend-authoring', 'backend-home']);
-      expect(queued.sessionId).toBe('home');
+      expect(resumed).toEqual(['backend-authoring', 'backend-authoring']);
+      expect(queued.sessionId).toBe('authoring');
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'authoring',
+        expect.objectContaining({ endedAt: null })
+      );
     });
   });
 
@@ -3324,7 +3360,9 @@ describe('SessionService', () => {
     });
 
     it('passes the contact scope to the alias lookup for a contact request', async () => {
-      const mockFindByAlias = vi.fn().mockResolvedValue(null);
+      const mockFindByAlias = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'contact-main', contactId: 'contact-1' }));
       (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
 
@@ -3343,14 +3381,17 @@ describe('SessionService', () => {
       );
     });
 
-    it('should fall through to threadKey when alias has no match', async () => {
+    it('refuses a session key no live session carries, instead of falling through or minting one', async () => {
+      // T4 (session lifecycle v7 §3 rung 2): a key is always caller-supplied,
+      // so a miss is a wrong address. It used to fall through to thread
+      // routing and, failing that, create a new session under the key.
       const threadSession = createMockSession({ id: 'thread-session', threadKey: 'pr:42' });
       const mockFindByAlias = vi.fn().mockResolvedValue(null);
       const mockFindByThreadKey = vi.fn().mockResolvedValue(threadSession);
       (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
       (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
 
-      await sessionService.handleMessage(
+      const result = await sessionService.handleMessage(
         createMockRequest({
           metadata: { sessionKey: 'nonexistent', threadKey: 'pr:42' },
         })
@@ -3364,15 +3405,16 @@ describe('SessionService', () => {
         null,
         undefined
       );
-      expect(mockFindByThreadKey).toHaveBeenCalledWith(
-        'user-456',
-        'myra',
-        'pr:42',
-        undefined,
-        undefined,
-        // Canonical identity — null here because the mock has no identity row.
-        null
-      );
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal?.detail).toMatchObject({
+        reason: 'explicit-address',
+        explicit: { sessionKey: 'nonexistent', cause: 'session-key-miss' },
+      });
+      // Control for the old behaviour: neither fallback ran.
+      expect(mockFindByThreadKey).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
     });
 
     it('should prefer alias over threadKey when both match', async () => {
@@ -3600,6 +3642,139 @@ describe('SessionService', () => {
     });
   });
 
+  describe('Caller-named sessions — T4 (session lifecycle v7 §3 rung 1)', () => {
+    // A session the caller named by id or key is an address. One that cannot
+    // take the message is refused, never dropped for the ladder to pick
+    // another; an ended one reopens. The inferred cases are the controls:
+    // they keep today's behaviour until the T5 readers.
+    const named = (recipientSessionId: string) =>
+      createMockRequest({
+        sbSlug: 'wren',
+        metadata: {
+          threadKey: 'pr:210',
+          recipientSessionId,
+          recipientSessionExplicit: true,
+          recipientSessionNamed: true,
+          triggerType: 'agent',
+        },
+      });
+    const inferred = (recipientSessionId: string) =>
+      createMockRequest({
+        sbSlug: 'wren',
+        metadata: { threadKey: 'pr:210', recipientSessionId, triggerType: 'agent' },
+      });
+
+    function expectRefused(
+      result: Awaited<ReturnType<SessionService['handleMessage']>>,
+      cause: string
+    ) {
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal?.detail).toMatchObject({
+        reason: 'explicit-address',
+        anchor: 'session',
+        explicit: { cause },
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+    }
+
+    it('refuses a named id that names no session', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+      expectRefused(
+        await sessionService.handleMessage(named('missing-session')),
+        'unknown-session'
+      );
+    });
+
+    it('control: an inferred id that names no session is dropped and routing continues', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+      const result = await sessionService.handleMessage(inferred('missing-session'));
+      expect(result.success).toBe(true);
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+
+    it('refuses a named session of another identity', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'lumen-session', sbSlug: 'lumen' })
+      );
+      expectRefused(await sessionService.handleMessage(named('lumen-session')), 'unknown-session');
+    });
+
+    it('refuses a named per-sender contact session for an owner message', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'contact-session', sbSlug: 'wren', contactId: 'contact-9' })
+      );
+      expectRefused(await sessionService.handleMessage(named('contact-session')), 'contact-scope');
+    });
+
+    it('control: an inferred contact session is dropped for an owner message', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'contact-session', sbSlug: 'wren', contactId: 'contact-9' })
+      );
+      const result = await sessionService.handleMessage(inferred('contact-session'));
+      expect(result.success).toBe(true);
+      expect(result.sessionId).not.toBe('contact-session');
+    });
+
+    it('reopens a named ended session in one write and resumes it', async () => {
+      const ended = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        threadKey: 'pr:210',
+        endedAt: new Date(),
+        lifecycle: 'completed',
+        status: 'completed',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+      vi.mocked(mockRepository.update).mockImplementation(async (_id, updates) => ({
+        ...ended,
+        ...updates,
+      }));
+
+      const result = await sessionService.handleMessage(named('ended-session'));
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('ended-session');
+      expect(mockRepository.update).toHaveBeenCalledWith('ended-session', {
+        endedAt: null,
+        lifecycle: 'idle',
+        status: 'active',
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('a plan resolution returns a named ended session without writing', async () => {
+      const ended = createMockSession({ id: 'ended-session', sbSlug: 'wren', endedAt: new Date() });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+
+      const session = await sessionService.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:210',
+        recipientSessionId: 'ended-session',
+        recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+        planOnly: true,
+      });
+
+      expect(session.id).toBe('ended-session');
+      expect(mockRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses a named ended session whose key a live session now holds', async () => {
+      const ended = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: new Date(),
+        alias: 'wren:inkwell:review',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+      vi.mocked(mockRepository.update).mockRejectedValueOnce(
+        Object.assign(new Error('duplicate key value'), { code: '23505' })
+      );
+      expectRefused(await sessionService.handleMessage(named('ended-session')), 'session-key-held');
+    });
+  });
+
   describe('Default Session Routing (default_session_id)', () => {
     // Helper: chainable Supabase mock — every method returns `this` except terminal ones
     function createChainableMock(terminalResult: unknown) {
@@ -3659,6 +3834,43 @@ describe('SessionService', () => {
       );
       expect(mockRepository.findById).toHaveBeenCalledWith('default-session');
       expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it("never sends a contact's thread miss to the owner's default session (T4)", async () => {
+      // The unthreaded home rung already exempted a contact; the threaded
+      // fallback did not (Lumen, #719 review). A per-sender contact's message
+      // must never run in the owner's home.
+      const defaultSession = createMockSession({ id: 'default-session' });
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi.fn().mockResolvedValue(null);
+      vi.mocked(mockRepository.findById).mockResolvedValue(defaultSession);
+      const mockSupabase = {
+        from: vi
+          .fn()
+          .mockImplementation((table: string) =>
+            table === 'agent_identities'
+              ? createChainableMock({ data: { default_session_id: 'default-session' } })
+              : createChainableMock({ data: null })
+          ),
+      };
+      const serviceWithDefault = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      const session = await serviceWithDefault.getOrCreateSession('user-456', 'myra', {
+        threadKey: 'pr:99',
+        contactId: 'contact-1',
+      });
+
+      expect(session.id).not.toBe('default-session');
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ contactId: 'contact-1', threadKey: 'pr:99' })
+      );
     });
 
     it('should create new thread-scoped session when no default_session_id', async () => {

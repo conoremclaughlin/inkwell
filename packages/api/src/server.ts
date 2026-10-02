@@ -1144,6 +1144,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         sessionKey: payload.sessionKey,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
@@ -1223,6 +1224,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
         ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
+        ...(refusal.detail.explicit ? { explicit: refusal.detail.explicit } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
@@ -1230,7 +1232,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
               : refusal.detail.reason === 'project-without-repo'
                 ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
-                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+                : refusal.detail.reason === 'explicit-address'
+                  ? 'the sender named a session that cannot take this message; re-send to one the recipient owns, or without the address'
+                  : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1255,6 +1259,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             // The pinned project a project-without-repo refusal names; this
             // hand-built copy is where it went missing (Lumen, #681 round 1).
             project: refusal.detail.project ?? null,
+            explicit: refusal.detail.explicit ?? null,
           },
         });
       }
@@ -1289,6 +1294,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // from thread history / the participant stamp is a continuity hint
         // that routing tests against the thread's project repo (#681 r2).
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // The caller named this session itself (T4): refused if it cannot
+        // take the message, reopened if it ended. A named studio alone never
+        // sets it.
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         repoRoot:
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
@@ -1612,6 +1621,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // candidate is promoted as the continuity hint it is, and admission
         // re-checks it against the thread's project repo.
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // Named only while the delivery session IS the one the caller named:
+        // a reroute to a concurrent winner is routing's choice, not theirs.
+        recipientSessionNamed:
+          !!payload.explicitRecipientSession && deliverySession.id === payload.recipientSessionId,
       };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
