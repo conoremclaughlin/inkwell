@@ -1285,7 +1285,13 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       params.threadKey,
       studioScope,
       contactScope,
-      creator.sbId
+      creator.sbId,
+      // A crashed session is the one its agent resumes next. The hooks'
+      // start_session carries no backend id, so this lookup is the only
+      // thing that can find the crashed row; excluding it minted a second
+      // row for the same transcript on every relaunch after a crash
+      // (finished-session audit, rows 10 and 11).
+      { includeFailed: true }
     );
   }
 
@@ -1295,7 +1301,8 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       sbSlug,
       studioScope,
       contactScope,
-      creator.sbId
+      creator.sbId,
+      { includeFailed: true }
     );
   }
 

@@ -368,8 +368,12 @@ export class SessionRepository implements ISessionRepository {
       // since #717, but rows the earlier setter stored as written must stay
       // addressable by the normalised spelling (Lumen, #717 review).
       .ilike('alias', sessionKeyMatchPattern(alias))
-      .is('ended_at', null)
-      .neq('lifecycle', 'failed');
+      .is('ended_at', null);
+    // No lifecycle exclusion: `failed` is a lifecycle, not an ending (see
+    // findByUserAndAgent). A crashed session is the one its agent resumes
+    // next, and a key is how a sender names that transcript; excluding it
+    // here made a crashed session unaddressable by its own key and sent the
+    // message through thread routing instead (finished-session audit, row 4).
     query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {
@@ -419,40 +423,53 @@ export class SessionRepository implements ISessionRepository {
     sbId?: string | null
   ): Promise<Session | null> {
     // See findByAlias: identity by UUID when known, slug only as a fallback.
-    let query = (this.supabase as any)
-      .from('sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('thread_key', threadKey)
-      .is('ended_at', null)
-      // `ended_at IS NULL` was doing none of the work it looks like it is
-      // doing: nothing set `ended_at` on completion, so finished sessions
-      // stayed NULL and kept matching here. A thread whose conversation was
-      // over would route the next trigger back into the completed session
-      // instead of starting a fresh one. Filter on lifecycle directly, and
-      // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
-      // the clause above finally means something (PR #349, revived).
-      .not('lifecycle', 'in', '(completed,failed)')
-      .order('started_at', { ascending: false })
-      .limit(1);
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
+    //
+    // Live first, crashed as the fallback. `failed` is a lifecycle, not an
+    // ending: a thread whose session crashed resumes that session on its
+    // next message rather than starting a fresh one (finished-session audit,
+    // row 5, corrected by Lumen on #718). A completed lifecycle is an ending
+    // and is never matched. Two queries rather than one, so a newer crashed
+    // row cannot outrank an older live one under started_at DESC.
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = (this.supabase as any)
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .is('ended_at', null)
+        // `ended_at IS NULL` was doing none of the work it looks like it is
+        // doing: nothing set `ended_at` on completion, so finished sessions
+        // stayed NULL and kept matching here. A thread whose conversation was
+        // over would route the next trigger back into the completed session
+        // instead of starting a fresh one. Filter on lifecycle directly, and
+        // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
+        // the clause above finally means something (PR #349, revived).
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live'
+          ? query.not('lifecycle', 'in', '(completed,failed)')
+          : query.eq('lifecycle', 'failed');
+      query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
-    if (studioId) {
-      query = query.eq('studio_id', studioId);
-    }
+      if (studioId) {
+        query = query.eq('studio_id', studioId);
+      }
 
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    }
+      if (contactId) {
+        query = query.eq('contact_id', contactId);
+      }
 
-    const { data, error } = await query;
+      const { data, error } = await query;
 
-    if (error) {
-      logger.error('Error finding session by thread key', { userId, sbSlug, threadKey, error });
-      throw error;
-    }
+      if (error) {
+        logger.error('Error finding session by thread key', { userId, sbSlug, threadKey, error });
+        throw error;
+      }
 
-    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+      return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+    };
+    return (await run('live')) ?? (await run('failed'));
   }
 
   async findByUser(

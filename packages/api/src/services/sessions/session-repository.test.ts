@@ -933,10 +933,88 @@ interface ModelTotals {
  * resolve into a different worktree than the caller meant. These tests pin the
  * three outcomes — pinned lookup, unique match, ambiguous refusal.
  */
+describe('SessionRepository.findByThreadKey — crashed rows', () => {
+  /**
+   * A chain mock whose terminal await returns the next scripted result each
+   * time the query runs, recording the lifecycle filters applied to each run.
+   */
+  function sequencedSupabase(results: Array<Array<Record<string, unknown>>>) {
+    const runs: Array<Array<[string, ...unknown[]]>> = [];
+    let current: Array<[string, ...unknown[]]> = [];
+    const chain: Record<string, unknown> = {};
+    const record = (name: string) =>
+      vi.fn((...args: unknown[]) => {
+        current.push([name, ...args]);
+        return chain;
+      });
+    Object.assign(chain, {
+      select: record('select'),
+      eq: record('eq'),
+      is: record('is'),
+      not: record('not'),
+      order: record('order'),
+      limit: record('limit'),
+      then: (resolve: (v: unknown) => void) => {
+        runs.push(current);
+        current = [];
+        const data = results.shift() ?? [];
+        resolve({ data, error: null });
+      },
+    });
+    return { supabase: { from: vi.fn(() => chain) } as never, runs };
+  }
+
+  const row = (id: string, lifecycle: string) => ({
+    id,
+    user_id: 'user-1',
+    agent_id: 'wren',
+    thread_key: 'pr:718',
+    lifecycle,
+    status: 'active',
+    started_at: '2026-10-01T00:00:00Z',
+    metadata: {},
+  });
+
+  it('returns the live session for the thread without consulting crashed rows', async () => {
+    const { supabase, runs } = sequencedSupabase([[row('live', 'idle')]]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByThreadKey('user-1', 'wren', 'pr:718');
+
+    expect(found?.id).toBe('live');
+    expect(runs).toHaveLength(1);
+  });
+
+  // Audit row 5 was wrong: this lookup excluded crashed rows too, so a thread
+  // whose session had crashed got a fresh session on its next message
+  // instead of resuming the transcript (Lumen, #718). Crashed rows now
+  // count, after live ones.
+  it('falls back to the crashed session for the thread when no live one exists', async () => {
+    const { supabase, runs } = sequencedSupabase([[], [row('crashed', 'failed')]]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByThreadKey('user-1', 'wren', 'pr:718');
+
+    expect(found?.id).toBe('crashed');
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toContainEqual(['eq', 'lifecycle', 'failed']);
+  });
+
+  it('never resumes a completed session for the thread', async () => {
+    const { supabase, runs } = sequencedSupabase([[], []]);
+    const repo = new SessionRepository(supabase);
+
+    expect(await repo.findByThreadKey('user-1', 'wren', 'pr:718')).toBeNull();
+    expect(runs[0]).toContainEqual(['not', 'lifecycle', 'in', '(completed,failed)']);
+    expect(runs[1]).toContainEqual(['eq', 'lifecycle', 'failed']);
+  });
+});
+
 describe('SessionRepository.findByAlias — studio scoping', () => {
   /** Mock whose select chain resolves to `rows`, recording the .eq filters. */
   function aliasSupabase(rows: Array<Record<string, unknown>>) {
     const filters: Record<string, unknown> = {};
+    const exclusions: Array<[string, unknown]> = [];
     const chain: Record<string, unknown> = {};
 
     Object.assign(chain, {
@@ -946,7 +1024,10 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
         return chain;
       }),
       is: vi.fn(() => chain),
-      neq: vi.fn(() => chain),
+      neq: vi.fn((col: string, val: unknown) => {
+        exclusions.push([col, val]);
+        return chain;
+      }),
       ilike: vi.fn((col: string, val: unknown) => {
         filters[col] = val;
         return chain;
@@ -958,6 +1039,7 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
     return {
       supabase: { from: vi.fn(() => chain) } as never,
       filters,
+      exclusions,
     };
   }
 
@@ -980,6 +1062,23 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
       metadata: {},
     };
   }
+
+  // A crashed session is a transcript its agent resumes next; a key is how a
+  // sender names that transcript. Excluding lifecycle 'failed' here made a
+  // crashed session unaddressable by its own key, so a send to it fell
+  // through to thread routing and could land elsewhere (finished-session
+  // audit, row 4; Conor, 2026-10-01: "it can always be resumed").
+  it('finds a crashed session by its key: lifecycle failed is not an ending', async () => {
+    const { supabase, exclusions } = aliasSupabase([
+      { ...row('sess-crashed', 'studio-1'), lifecycle: 'failed' },
+    ]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByAlias('user-1', 'wren', 'wren:inkwell:main');
+
+    expect(found?.id).toBe('sess-crashed');
+    expect(exclusions).not.toContainEqual(['lifecycle', 'failed']);
+  });
 
   it('matches the key case-insensitively, with ilike metacharacters escaped', async () => {
     const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);

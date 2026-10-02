@@ -167,6 +167,86 @@ describe('MemoryRepository', () => {
       expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
     });
 
+    // start_session passes includeFailed so a plain relaunch after a crash
+    // reuses the crashed row instead of minting a second one for the same
+    // transcript (finished-session audit, rows 10 and 11). Everything else
+    // keeps the exclusion: a crashed session is not what a badge means by
+    // "active".
+    it('getActiveSession keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+      // live first (neq), then the crashed fallback (eq) once nothing is live
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+    });
+
+    // Live first, crashed as the fallback (Lumen, #718): with crashed rows
+    // admitted to one ordered query, a newer crashed row would outrank an
+    // older live one under started_at DESC and the relaunch would land on the
+    // crash instead of the conversation still running.
+    it('getActiveSession with includeFailed asks for live rows first and crashed rows only when none is live', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+      expect(neqCalls().findIndex((c) => c[1] === 'failed')).toBeGreaterThanOrEqual(0);
+    });
+
+    it('getActiveSession with includeFailed never asks for crashed rows when a live one exists', async () => {
+      mockSupabase._setReturnData({
+        id: 'live-1',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        lifecycle: 'idle',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      const found = await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+
+      expect(found?.id).toBe('live-1');
+      expect(eqCalls()).not.toContainEqual(['lifecycle', 'failed']);
+    });
+
+    it('getActiveSessionByThreadKey keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey('user-1', 'myra', 'pr:501');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey(
+        'user-1',
+        'myra',
+        'pr:501',
+        undefined,
+        undefined,
+        undefined,
+        { includeFailed: true }
+      );
+      // live first (neq), then the crashed fallback (eq) once nothing is live
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+    });
+
     it('getActiveSessionByThreadKey filters on sb_id and not agent_id', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

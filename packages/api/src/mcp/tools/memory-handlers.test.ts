@@ -2478,6 +2478,34 @@ describe('handleStartSession - threadKey matching', () => {
     );
   });
 
+  // The hooks' start_session carries no backend id (Claude's transient ids
+  // are deliberately not read from stdin), so after a crash the only thing
+  // that can find the crashed row is the (sb, studio) reuse lookup. It used
+  // to exclude lifecycle 'failed', and every relaunch after a crash minted a
+  // second row for the same transcript (finished-session audit, row 10).
+  it('reuses a crashed session on a plain relaunch, with no backend id to go on', async () => {
+    const crashed = { ...mockSession, id: 'session-crashed', lifecycle: 'failed' };
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(crashed);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.session.id).toBe('session-crashed');
+    expect(parsed.session.isExisting).toBe(true);
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+      'user-123',
+      'lumen',
+      undefined,
+      undefined,
+      undefined,
+      { includeFailed: true }
+    );
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+  });
+
   it('does not consult the backend link when the caller names no conversation', async () => {
     mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
     mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
@@ -2513,7 +2541,8 @@ describe('handleStartSession - threadKey matching', () => {
       'pr:32',
       undefined,
       undefined, // contactId
-      undefined // sbId — canonical owner when the caller has one
+      undefined, // sbId — canonical owner when the caller has one
+      { includeFailed: true }
     );
     // Should NOT have fallen through to studioId lookup
     expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
@@ -2581,7 +2610,8 @@ describe('handleStartSession - threadKey matching', () => {
       'pr:32',
       studioId,
       undefined, // contactId
-      undefined // sbId
+      undefined, // sbId
+      { includeFailed: true }
     );
   });
 
@@ -2732,7 +2762,8 @@ describe('handleStartSession - identity and contact scope', () => {
       'pr:501',
       undefined,
       undefined,
-      'sb-myra'
+      'sb-myra',
+      { includeFailed: true }
     );
   });
 
@@ -2744,7 +2775,8 @@ describe('handleStartSession - identity and contact scope', () => {
       'myra',
       undefined,
       undefined,
-      'sb-myra'
+      'sb-myra',
+      { includeFailed: true }
     );
   });
 
@@ -2882,7 +2914,8 @@ describe('handleStartSession - studioId="main" scope resolution', () => {
       'wren',
       null,
       undefined, // contactId
-      undefined // sbId
+      undefined, // sbId
+      { includeFailed: true }
     );
   });
 
