@@ -44,7 +44,11 @@
           "replayed": true
         }
       },
-      "otherWorkspace": { "status": 409, "body": { "error": "string" } }
+      "otherWorkspace": { "status": 409, "body": { "error": "string" } },
+      "capReached": {
+        "status": 409,
+        "body": { "error": "string", "code": "awakening_cap_reached" }
+      }
     },
     "name": {
       "request": { "displayName": "小墨" },

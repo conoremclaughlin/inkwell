@@ -259,6 +259,59 @@ describe('awaken', () => {
     expect(rowsOf('agent_identities')).toHaveLength(0);
   });
 
+  describe('the awakening cap', () => {
+    const THIRD = '4d3c2b1a-0f9e-4d8c-8b7a-6f5e4d3c2b1a';
+    const awakenTwo = async () => {
+      await service.awaken(ME, REQUEST);
+      await service.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a');
+    };
+
+    it('is 2 by default: a third awakening is a 409 the app can tell apart, and writes nothing', async () => {
+      await awakenTwo();
+      await expect(service.awaken(ME, THIRD)).rejects.toMatchObject({
+        status: 409,
+        code: 'awakening_cap_reached',
+      });
+      expect(rowsOf('agent_identities')).toHaveLength(2);
+      // The third request's token was minted, then revoked when the redemption refused it.
+      expect(rowsOf('kindle_tokens').map((t) => t.status)).toEqual(['used', 'used', 'revoked']);
+    });
+
+    it('a retry of an awakening already made still replays at the cap', async () => {
+      await awakenTwo();
+      const again = await service.awaken(ME, REQUEST.toUpperCase());
+      expect(again.replayed).toBe(true);
+    });
+
+    it('a retry that loses its race at the cap answers with the winner, not the cap', async () => {
+      service = new InklingService(db as unknown as SupabaseClient, 1);
+      const realRedeem = db.rpcHandlers.redeem_kindle_token;
+      let raced = false;
+      db.rpcHandlers.redeem_kindle_token = (args, fake) => {
+        if (!raced) {
+          raced = true;
+          const winnerToken = fake.seed('kindle_tokens', {
+            token: 'winner',
+            status: 'active',
+            creator_user_id: ME.userId,
+            creator_agent_id: null,
+          });
+          expect(realRedeem({ ...args, p_token: winnerToken.token }, fake).error).toBeNull();
+        }
+        return realRedeem(args, fake); // now at the cap: IK001
+      };
+      const result = await service.awaken(ME, REQUEST);
+      expect(result.replayed).toBe(true);
+      expect(rowsOf('agent_identities')).toHaveLength(1);
+    });
+
+    it('a null cap passes none, so the database applies none', async () => {
+      service = new InklingService(db as unknown as SupabaseClient, null);
+      await awakenTwo();
+      await expect(service.awaken(ME, THIRD)).resolves.toMatchObject({ replayed: false });
+    });
+  });
+
   it('touches only identity, lineage and token tables: no thread, no message, no wake', async () => {
     await service.awaken(ME, REQUEST);
     const touched = [...new Set(db.log.map((e) => e.table))].sort();
@@ -289,6 +342,9 @@ describe('the awakening soul', () => {
 
 describe('list', () => {
   it("lists only the person's inklings in this workspace, oldest first, unnamed as null", async () => {
+    // Three awakenings for ME across two workspaces: past the per-person cap,
+    // which is not what this test is about.
+    service = new InklingService(db as unknown as SupabaseClient, null);
     seedOwnSb(db, ME, 'myra'); // the account's own SB: never listed
     const first = await service.awaken(ME, REQUEST);
     const second = await service.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a');

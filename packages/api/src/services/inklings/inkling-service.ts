@@ -23,6 +23,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { DEFAULT_AWAKEN_CAP } from '../../config/inkling-flags';
 import { logger } from '../../utils/logger';
 
 /** The identity metadata tag for inklings born through this flow. */
@@ -69,12 +70,17 @@ export interface InklingScope {
 export class InklingError extends Error {
   constructor(
     readonly status: 400 | 404 | 409,
-    message: string
+    message: string,
+    /** A stable machine-readable reason, for an answer the app must tell apart. */
+    readonly code?: string
   ) {
     super(message);
     this.name = 'InklingError';
   }
 }
+
+/** The SQLSTATE redeem_kindle_token raises at the awakening cap. */
+export const AWAKEN_CAP_SQLSTATE = 'IK001';
 
 interface IdentityRow {
   id: string;
@@ -180,7 +186,11 @@ function isInklingRow(row: IdentityRow): boolean {
 }
 
 export class InklingService {
-  constructor(private readonly supabase: SupabaseClient) {}
+  constructor(
+    private readonly supabase: SupabaseClient,
+    /** Awakenings per person, enforced inside redeem_kindle_token; null for none. */
+    private readonly awakenCap: number | null = DEFAULT_AWAKEN_CAP
+  ) {}
 
   /**
    * The person's inklings in this workspace, oldest first, all of them.
@@ -250,6 +260,7 @@ export class InklingService {
         },
       },
       p_kindle_method: 'self_serve',
+      p_awaken_cap: this.awakenCap,
     });
 
     const childSbId = (lineage as { child_sb_id?: string | null } | null)?.child_sb_id;
@@ -260,6 +271,13 @@ export class InklingService {
       // is the answer to this request too.
       const winner = await this.findByAwakenRequest(scope.userId, requestId);
       if (winner) return this.replay(winner, scope);
+      if (error?.code === AWAKEN_CAP_SQLSTATE) {
+        throw new InklingError(
+          409,
+          `You can awaken at most ${this.awakenCap} inklings for now`,
+          'awakening_cap_reached'
+        );
+      }
       throw new Error(`Failed to awaken an inkling: ${error?.message ?? 'no identity bound'}`);
     }
 

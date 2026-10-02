@@ -5,8 +5,9 @@
  * The stand-in mirrors the function in
  * supabase/migrations/20261002082853_inkling_self_serve_awakening.sql only as
  * far as the service can observe it: the token is consumed or refused, the
- * lineage and identity are created together, and a second identity for one
- * awakenRequestId rolls the whole redemption back with 23505. The function
+ * lineage and identity are created together, a second identity for one
+ * awakenRequestId rolls the whole redemption back with 23505, and a
+ * self-serve awakening at p_awaken_cap fails IK001. The function
  * itself is proven against real Postgres in
  * src/data/inkling-awakening-migration.pg.test.ts.
  */
@@ -83,6 +84,19 @@ export function createInklingDb(): FakePostgrest {
     }
 
     const selfServe = method === 'self_serve';
+    const cap = args.p_awaken_cap as number | null | undefined;
+    if (selfServe && typeof cap === 'number') {
+      const awakened = db
+        .rows('kindle_lineage')
+        .filter((l) => l.child_user_id === args.p_new_user_id && l.kindle_method === 'self_serve');
+      if (awakened.length >= cap) {
+        // Raised before anything is written, so the token stays active.
+        return {
+          data: null,
+          error: { code: 'IK001', message: 'inkling awakening cap reached' },
+        };
+      }
+    }
     const slug = `kindle-${token.id as string}`;
     const identityInput = args.p_identity as Row;
     const lineage: Row = {

@@ -97,6 +97,7 @@ import {
   validateDisplayName,
   type InklingScope,
 } from '../services/inklings/inkling-service';
+import { inklingAwakenCap } from '../config/inkling-flags';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -3849,12 +3850,14 @@ function inklingScope(authReq: AdminAuthRequest): InklingScope {
 }
 
 async function inklingService(): Promise<InklingService> {
-  return new InklingService((await getDataComposer()).getClient());
+  return new InklingService((await getDataComposer()).getClient(), inklingAwakenCap());
 }
 
 function answerInklingError(res: Response, label: string, error: unknown): void {
   if (error instanceof InklingError) {
-    res.status(error.status).json({ error: error.message });
+    res
+      .status(error.status)
+      .json(error.code ? { error: error.message, code: error.code } : { error: error.message });
     return;
   }
   logger.error(`${label}:`, error);

@@ -5411,6 +5411,7 @@ export type Database = {
       redeem_kindle_token: {
         Args: {
           p_identity: Json;
+          p_awaken_cap?: number;
           p_kindle_method?: string;
           p_new_user_id: string;
           p_token: string;

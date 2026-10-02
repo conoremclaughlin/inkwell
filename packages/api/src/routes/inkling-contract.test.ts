@@ -202,6 +202,16 @@ describe('the server answers in the fixture shapes', () => {
     );
   });
 
+  it('awaken: the cap, a 409 with its own code', async () => {
+    const { awaken: f } = fixture.inklings;
+    await call(awaken, { clientRequestId: '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d' });
+    await call(awaken, { clientRequestId: '2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e' });
+    const third = await call(awaken, f.request);
+    expectMatchesFixture(third, f.capReached);
+    // The fixture pins the code's value, not only its type: the app branches on it.
+    expect(third.body.code).toBe(f.capReached.body.code);
+  });
+
   it('list', async () => {
     await call(awaken, fixture.inklings.awaken.request);
     expectMatchesFixture(await call(list, undefined), fixture.inklings.list);
