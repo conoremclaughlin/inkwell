@@ -4,6 +4,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { sessionKeyMatchPattern } from '../../services/sessions/session-key';
+import { parseArchivedReason } from '../../services/sessions/session-archive';
 import type { Database, TablesInsert } from '../supabase/types';
 import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
@@ -2642,6 +2643,8 @@ export class MemoryRepository {
       headlineUpdatedAt: row.headline_updated_at ? new Date(row.headline_updated_at) : undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
+      archivedAt: row.archived_at ? new Date(row.archived_at) : undefined,
+      archivedReason: parseArchivedReason(row.archived_reason),
       summary: row.summary || undefined,
       updatedAt: row.updated_at ? new Date(row.updated_at) : undefined,
       metadata: row.metadata,

@@ -7,6 +7,7 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
 import { sessionKeyMatchPattern } from './session-key';
+import { parseArchivedReason, readHandedOffTo, readResumeRefused } from './session-archive';
 import type { Database, Json } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -178,6 +179,12 @@ function mapDbToSession(row: DbSession): Session {
     startedAt: row.started_at ? new Date(row.started_at) : new Date(),
     lastActivityAt: row.started_at ? new Date(row.started_at) : new Date(),
     endedAt: row.ended_at ? new Date(row.ended_at) : null,
+
+    // Archive (spec session-lifecycle-model §2.2–2.3): mapped, not yet routed on
+    archivedAt: row.archived_at ? new Date(row.archived_at) : null,
+    archivedReason: parseArchivedReason(row.archived_reason),
+    handedOffTo: readHandedOffTo(metadata),
+    resumeRefused: readResumeRefused(metadata),
 
     // Thread key
     threadKey: row.thread_key || undefined,

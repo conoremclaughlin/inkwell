@@ -3528,6 +3528,8 @@ export type Database = {
           active_thread_key: string | null;
           agent_id: string | null;
           alias: string | null;
+          archived_at: string | null;
+          archived_reason: string | null;
           backend: string | null;
           backend_session_id: string | null;
           claude_session_id: string | null;
@@ -3569,6 +3571,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
@@ -3610,6 +3614,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;

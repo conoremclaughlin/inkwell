@@ -5,6 +5,7 @@
  */
 
 import type { ErrorClassification } from '@inklabs/shared';
+import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 
 // ─── Channel Types ───
 
@@ -180,6 +181,17 @@ export interface Session {
   startedAt: Date;
   lastActivityAt: Date;
   endedAt: Date | null;
+
+  /**
+   * Archived: automatic routing never resumes it (session-lifecycle-model
+   * §2.2). Mapped from T2 on; nothing routes on it until the T11 cutover.
+   */
+  archivedAt?: Date | null;
+  archivedReason?: SessionArchivedReason;
+  /** `metadata.handedOffTo`: the successor session after a handoff. */
+  handedOffTo?: string;
+  /** `metadata.resumeRefused`: a backend refused to resume this transcript. */
+  resumeRefused?: SessionResumeRefused;
 
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
