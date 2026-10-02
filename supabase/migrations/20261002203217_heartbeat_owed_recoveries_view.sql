@@ -13,8 +13,12 @@
 --   * reminder_history: a delivered beat after the outage notice was created,
 --     which is the episode ending. The beat path writes that row before it
 --     announces the recovery.
--- An episode with any recovery row is left out: the drain, a sibling, or the
--- beat path already owns that all-clear.
+-- An episode is left out only when its recovery row will be sent by something
+-- else or already has been: delivered (sent, or covered by a sibling), or
+-- drain-owned with a payload (the drain sends it). A recovery row with
+-- neither, such as the empty row a failed settle recreates when the claim
+-- had also failed, holds nothing, so the episode stays owed here; the claim
+-- the rebuild makes gives that row its payload.
 --
 -- drain_owned limits this to notices that recorded their send. Outages from
 -- before that are not swept here.
@@ -70,6 +74,7 @@ CREATE VIEW public.heartbeat_notifications_owed_recoveries
       WHERE r.reminder_id = o.reminder_id
         AND r.episode_key = o.episode_key
         AND r.kind = 'recovery'
+        AND (r.status = 'delivered' OR (r.drain_owned AND r.payload IS NOT NULL))
     );
 
 -- Server-only reads, like the table itself.

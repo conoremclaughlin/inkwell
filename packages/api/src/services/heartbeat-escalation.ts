@@ -196,7 +196,7 @@ export interface HeldNoticeDrainStats {
   /** An all-clear whose outage notice is not delivered yet; it goes after. */
   waiting: number;
   /**
-   * All-clears owed for an ended episode with no recovery row, handed back to
+   * All-clears owed for an ended episode that nothing durable will send, handed back to
    * the recovery path. Those that were delivered are also counted in `sent`.
    */
   rebuilt: number;
@@ -650,7 +650,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
 
     if (outage === 'unknown') {
       logger.error(
-        '[Heartbeat] All-clear sent without knowing whether its outage notice landed — its claim was not recorded and the outage could not be read, so it may arrive first or alone',
+        '[Heartbeat] Attempting an all-clear without knowing whether its outage notice landed — its claim was not recorded and the outage could not be read, so it may arrive first or alone',
         fields
       );
     }

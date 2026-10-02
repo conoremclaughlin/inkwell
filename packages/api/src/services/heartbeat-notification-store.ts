@@ -310,9 +310,11 @@ export interface HeartbeatNotificationStore {
    * Every all-clear owed for an episode that has ended, where nothing durable
    * holds the all-clear itself (PR #723 review): the outage notice was
    * delivered from a recorded send, a delivered beat followed it in
-   * `reminder_history`, and the episode has no recovery row. That happens when
-   * the recovery beat waited behind its outage and could not record its own
-   * claim. Oldest recovery first, each with the reminder the all-clear is
+   * `reminder_history`, and the episode has no recovery row that is delivered
+   * or that the drain can send. That happens when the recovery beat waited
+   * behind its outage and could not record its own claim, or when a rebuilt
+   * all-clear's claim and send both failed and the settle recreated an empty
+   * row. Oldest recovery first, each with the reminder the all-clear is
    * composed from. All of them, not a page: one that can never be sent stays
    * in the view, and a page of those would hide the rest. Null when a read
    * failed.
@@ -326,7 +328,7 @@ export interface DrainCandidate {
   payload: HeldNoticePayload | null;
 }
 
-/** An all-clear owed for an ended episode that has no recovery row. */
+/** An all-clear owed for an ended episode that nothing durable will send. */
 export interface OwedRecoveryNotice {
   reminder: DueReminder;
   episodeKey: string;

@@ -260,7 +260,8 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
     /** Per-reminder fields for owed all-clears, as the reminder row now reads. */
     reminders: new Map<string, Partial<DueReminder>>(),
     // The owed-recovery view's rules: a delivered, drain-owned outage whose
-    // episode is open and has no recovery row, followed by a delivered beat.
+    // episode is open, followed by a delivered beat, and with no recovery row
+    // that is delivered or that the drain can send.
     // Every owed row, oldest recovery first.
     listOwedRecoveries: vi.fn(async () => {
       const out: Array<{
@@ -273,7 +274,14 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
       for (const [k, row] of rows) {
         const [reminderId, kind, episodeKey] = k.split('|');
         if (kind !== 'outage' || row.status !== 'delivered' || !row.drainOwned) continue;
-        if (row.episodeClosedAt || rows.has(`${reminderId}|recovery|${episodeKey}`)) continue;
+        if (row.episodeClosedAt) continue;
+        const recovery = rows.get(`${reminderId}|recovery|${episodeKey}`);
+        if (
+          recovery &&
+          (recovery.status === 'delivered' || (recovery.drainOwned && recovery.payload))
+        ) {
+          continue;
+        }
         const created = createdAt.get(k) ?? 0;
         const mine = beats.filter((b) => b.reminderId === reminderId);
         const ended = mine.find((b) => b.status === 'delivered' && b.at > created);
@@ -1822,6 +1830,35 @@ describe('held notices drain when quiet hours end', () => {
     expect(sendToChannel).toHaveBeenCalledTimes(2);
   });
 
+  it('a rebuilt all-clear whose claim and send both failed is rebuilt again after a restart', async () => {
+    // The outage has landed and the final run has succeeded.
+    const store = makeFakeStore({
+      [outageKey]: {
+        status: 'delivered',
+        drainOwned: true,
+        payload: { channel: 'telegram', target: '123456789', content: 'x' },
+      },
+    });
+    store.recordBeat('rem-001', 'delivered');
+    decision = { kind: 'clear' };
+
+    // The rebuild's claim fails, then its send fails: the settle recreates
+    // the recovery row with nothing the drain could replay.
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    sendToChannel.mockRejectedValueOnce(new Error('telegram unreachable'));
+    expect(await escalation(store).drainHeldNotices()).toMatchObject({ sent: 0, rebuilt: 1 });
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(store.rows.get(recoveryKey)!.drainOwned).toBeFalsy();
+
+    // Restart. The empty row holds nothing, so the episode is still owed.
+    const after = escalation(store);
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 1, rebuilt: 1 });
+    expect(sendToChannel.mock.calls.at(-1)![0].content).toContain('Heartbeat recovered');
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'delivered' });
+    expect(store.rows.get(outageKey)!.episodeClosedAt).not.toBeNull();
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 0, rebuilt: 0 });
+  });
+
   it('owed all-clears that can never be sent do not use up the batch ahead of one that can', async () => {
     // Twenty older debts whose reminders now point at no external destination:
     // each stays owed, recorded nowhere, every pass.
@@ -1905,7 +1942,7 @@ describe('held notices drain when quiet hours end', () => {
     expect(sendToChannel).not.toHaveBeenCalled();
     // Held, so the log does not claim it was sent.
     expect(logger.error).not.toHaveBeenCalledWith(
-      expect.stringContaining('sent without knowing'),
+      expect.stringContaining('without knowing whether its outage notice landed'),
       expect.anything()
     );
   });

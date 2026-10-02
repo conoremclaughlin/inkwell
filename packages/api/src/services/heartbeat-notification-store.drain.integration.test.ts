@@ -456,12 +456,23 @@ d('held notices — real schema', () => {
     await beat('failed', minutesAgo(50));
     await beat('failed', minutesAgo(50), otherReminderId);
     // Ended by the delivered beat below, but each excluded by its own state.
-    const withRecoveryRow = randomUUID();
+    const withRecoveryRow = randomUUID(); // the drain can send it
+    const deliveredRecovery = randomUUID();
     const closed = randomUUID();
     const legacy = randomUUID();
     const stillOwed = randomUUID();
     await outage({ episodeKey: withRecoveryRow, at: minutesAgo(49) });
     await insertHeld({ kind: 'recovery', episodeKey: withRecoveryRow });
+    await outage({ episodeKey: deliveredRecovery, at: minutesAgo(49) });
+    // Delivered with nothing replayable, as a sibling-covered all-clear is.
+    const { error: deliveredError } = await client.from('heartbeat_notifications').insert({
+      reminder_id: reminderId,
+      user_id: userId,
+      kind: 'recovery',
+      episode_key: deliveredRecovery,
+      status: 'delivered',
+    } as never);
+    expect(deliveredError).toBeNull();
     await outage({ episodeKey: closed, at: minutesAgo(49), closed: true });
     await outage({ episodeKey: legacy, at: minutesAgo(49), drainOwned: false });
     await outage({ episodeKey: stillOwed, at: minutesAgo(49), status: 'pending' });
@@ -470,6 +481,26 @@ d('held notices — real schema', () => {
     await outage({ episodeKey: randomUUID(), at: minutesAgo(49), rid: otherReminderId });
 
     expect(await owedFor([reminderId, otherReminderId])).toEqual([]);
+  });
+
+  it('an empty recovery row holds nothing, so its episode is still owed', async () => {
+    const episodeKey = randomUUID();
+    await beat('failed', minutesAgo(50));
+    await outage({ episodeKey, at: minutesAgo(49) });
+    // What a settle recreates after a failed claim: pending, no payload, not
+    // drain-owned, one attempt recorded.
+    const { error } = await client.from('heartbeat_notifications').insert({
+      reminder_id: reminderId,
+      user_id: userId,
+      kind: 'recovery',
+      episode_key: episodeKey,
+      status: 'pending',
+      attempts: 1,
+    } as never);
+    expect(error).toBeNull();
+    await beat('delivered', minutesAgo(20));
+
+    expect((await owedFor([reminderId])).map((o) => o.episodeKey)).toEqual([episodeKey]);
   });
 
   it('every owed all-clear is listed, past a single page of the view', async () => {
@@ -497,6 +528,47 @@ d('held notices — real schema', () => {
     expect(episodes.filter((e) => !listed.has(e))).toEqual([]);
   });
 
+  // ── The drain end to end on the real store ───────────────────────────────
+
+  /**
+   * Scoped to this file's fixture user and reminder: other DB files run in
+   * parallel, and these drains must not send or settle their notices.
+   */
+  const scoped = (s: HeartbeatNotificationStore): HeartbeatNotificationStore => ({
+    ...s,
+    listDrainUsers: async () => (await s.listDrainUsers())?.filter((u) => u === userId) ?? null,
+    listOwedRecoveries: async () =>
+      (await s.listOwedRecoveries())?.filter((o) => o.reminder.id === reminderId) ?? null,
+  });
+
+  const escalationWith = (
+    s: HeartbeatNotificationStore,
+    sendToChannel: (r: ChannelResponse) => Promise<unknown>
+  ) =>
+    createHeartbeatEscalation({
+      client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store: scoped(s),
+      quietGate: async () => ({ kind: 'clear' }),
+    });
+
+  /** The real store, with only the next all-clear claim failing to record. */
+  const recoveryClaimFailsOnce = () => {
+    const state = { faulted: false };
+    const faulty: HeartbeatNotificationStore = {
+      ...store,
+      claimNotice: async (key, opts) => {
+        if (key.kind === 'recovery' && !state.faulted) {
+          state.faulted = true;
+          return { shouldSend: true, record: null };
+        }
+        return store.claimNotice(key, opts);
+      },
+    };
+    return { faulty, state };
+  };
+
   /**
    * Lumen's scenario. A final run succeeds while its outage notice is still
    * held, and only the all-clear's own claim fails. After a restart no
@@ -512,26 +584,10 @@ d('held notices — real schema', () => {
       .single();
     expect(fixtureError).toBeNull();
     const reminder = fixture as unknown as DueReminder;
-
-    // Scoped to this file's fixture user and reminder: other DB files run in
-    // parallel, and this drain must not send or settle their notices.
-    const scoped = (s: HeartbeatNotificationStore): HeartbeatNotificationStore => ({
-      ...s,
-      listDrainUsers: async () => (await s.listDrainUsers())?.filter((u) => u === userId) ?? null,
-      listOwedRecoveries: async () =>
-        (await s.listOwedRecoveries())?.filter((o) => o.reminder.id === reminderId) ?? null,
-    });
     const sent: ChannelResponse[] = [];
-    const escalationWith = (s: HeartbeatNotificationStore) =>
-      createHeartbeatEscalation({
-        client,
-        sendToChannel: async (r) => {
-          sent.push(r);
-        },
-        defaultSlug: 'myra',
-        store: scoped(s),
-        quietGate: async () => ({ kind: 'clear' }),
-      });
+    const record = async (r: ChannelResponse) => {
+      sent.push(r);
+    };
 
     // Overnight: a failed beat, its outage notice held.
     await beat('failed', minutesAgo(31));
@@ -540,18 +596,8 @@ d('held notices — real schema', () => {
     await beat('delivered', minutesAgo(5));
 
     // Only the all-clear's claim fails. It waits behind the held outage.
-    let faulted = false;
-    const faulty: HeartbeatNotificationStore = {
-      ...store,
-      claimNotice: async (key, opts) => {
-        if (key.kind === 'recovery' && !faulted) {
-          faulted = true;
-          return { shouldSend: true, record: null };
-        }
-        return store.claimNotice(key, opts);
-      },
-    };
-    const before = escalationWith(faulty);
+    const { faulty, state } = recoveryClaimFailsOnce();
+    const before = escalationWith(faulty, record);
     expect(
       await before.onRecovery(reminder, 1, {
         destinationAlreadyAlerted: false,
@@ -559,11 +605,11 @@ d('held notices — real schema', () => {
         destination: null,
       })
     ).toEqual({ alerted: false });
-    expect(faulted).toBe(true);
+    expect(state.faulted).toBe(true);
     expect(sent).toEqual([]);
 
     // Restart: a fresh escalation over the healthy store, and only the drain.
-    const after = escalationWith(createHeartbeatNotificationStore(client));
+    const after = escalationWith(createHeartbeatNotificationStore(client), record);
     await after.drainHeldNotices();
 
     expect(sent.map((s) => s.content.split('\n')[0])).toEqual([
@@ -576,5 +622,48 @@ d('held notices — real schema', () => {
     // Nothing more is owed.
     await after.drainHeldNotices();
     expect(sent).toHaveLength(2);
+  });
+
+  /**
+   * Lumen's re-review at 2d02049e. The outage has landed and the final run
+   * has succeeded. The drain rebuilds the all-clear, but its claim fails and
+   * then its send fails; the settle recreates the recovery row empty. After a
+   * restart, with no reminder ever due again, the drain must still send it.
+   */
+  it('a rebuilt all-clear whose claim and send both failed is sent after a restart', async () => {
+    const episodeKey = randomUUID();
+    await beat('failed', minutesAgo(31));
+    await outage({ episodeKey, at: minutesAgo(30) }); // delivered
+    await beat('delivered', minutesAgo(5));
+
+    const { faulty, state } = recoveryClaimFailsOnce();
+    const failing = escalationWith(faulty, async () => {
+      throw new Error('telegram unreachable');
+    });
+    await failing.drainHeldNotices();
+    expect(state.faulted).toBe(true);
+    expect(await rowFor('recovery', episodeKey)).toMatchObject({
+      status: 'pending',
+      attempts: 1,
+      payload: null,
+      drain_owned: false,
+    });
+
+    // Restart: a healthy store and channel, and only the drain.
+    const sent: ChannelResponse[] = [];
+    const after = escalationWith(createHeartbeatNotificationStore(client), async (r) => {
+      sent.push(r);
+    });
+    await after.drainHeldNotices();
+
+    expect(sent.map((s) => s.content.split('\n')[0])).toEqual([
+      expect.stringContaining('Heartbeat recovered'),
+    ]);
+    expect(await rowFor('recovery', episodeKey)).toMatchObject({ status: 'delivered' });
+    expect((await rowFor('outage', episodeKey)).episode_closed_at).not.toBeNull();
+
+    // Nothing more is owed.
+    await after.drainHeldNotices();
+    expect(sent).toHaveLength(1);
   });
 });
