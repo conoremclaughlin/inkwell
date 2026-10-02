@@ -32,6 +32,18 @@ export const CLIENT_MESSAGE_INDEX = 'inbox_thread_messages_thread_client_message
 export const CLIENT_MESSAGE_CONFLICT =
   'clientMessageId was already used for a different message in this conversation';
 
+export const THREAD_KEY_TAKEN_ERROR =
+  'This conversation key is already in use; a new conversation needs a new key';
+
+/**
+ * A retried create that finds its key taken by a thread the same person
+ * created waits this long, at most, for its original request to store the
+ * first message: 10 checks, 100 ms apart. That original stores within
+ * milliseconds of creating the thread unless it died.
+ */
+export const OWN_CREATE_SETTLE_ATTEMPTS = 10;
+export const OWN_CREATE_SETTLE_INTERVAL_MS = 100;
+
 /**
  * The send handler's store was refused by the client-message index: a
  * concurrent retry of the same message stored first. Postgres names the
@@ -124,13 +136,54 @@ export type ReplayLookup =
   | { kind: 'conflict' };
 
 /**
+ * Who a client-identified create addressed, and its title: recorded on the
+ * stored message at metadata.pcp.createRequest so a retry can be held to the
+ * same submission. Recipients are a set (lowercased, deduplicated, sorted),
+ * so a retry listing them in another order is the same create.
+ */
+export interface CreateRequest {
+  recipients: string[];
+  title: string | null;
+}
+
+export function createRequestOf(recipients: string[], title: string): CreateRequest {
+  return {
+    recipients: [...new Set(recipients.map((r) => r.toLowerCase()))].sort(),
+    title: title || null,
+  };
+}
+
+function sameCreateRequest(metadata: Record<string, unknown> | null, request: CreateRequest) {
+  const stored = (metadata?.pcp as { createRequest?: Partial<CreateRequest> } | undefined)
+    ?.createRequest;
+  if (!stored || !Array.isArray(stored.recipients)) return false;
+  const storedSet = createRequestOf(
+    stored.recipients.filter((r): r is string => typeof r === 'string'),
+    stored.title ?? ''
+  );
+  return (
+    storedSet.title === request.title &&
+    storedSet.recipients.length === request.recipients.length &&
+    storedSet.recipients.every((r, i) => r === request.recipients[i])
+  );
+}
+
+/**
  * Has this client message id already stored a message in this thread? The
- * caller has already authenticated the person's membership. A replay must
- * come from the same person with the same words.
+ * caller has checked the person's workspace role; the sender check here is
+ * what keeps a replay to the person who sent the original. A replay must
+ * come from the same person with the same words and, for a create, the same
+ * recipients and title (`createRequest`); anything else is a conflict.
  */
 export async function lookUpClientMessage(
   supabase: SupabaseClient,
-  input: { threadId: string; clientMessageId: string; userId: string; content: string }
+  input: {
+    threadId: string;
+    clientMessageId: string;
+    userId: string;
+    content: string;
+    createRequest?: CreateRequest;
+  }
 ): Promise<ReplayLookup> {
   const { data, error } = await supabase
     .from('inbox_thread_messages')
@@ -144,7 +197,8 @@ export async function lookUpClientMessage(
   const sameSend =
     stored.sender_kind === 'user' &&
     stored.sender_user_id === input.userId &&
-    stored.content === input.content;
+    stored.content === input.content &&
+    (input.createRequest === undefined || sameCreateRequest(stored.metadata, input.createRequest));
   if (!sameSend) return { kind: 'conflict' };
   return {
     kind: 'replay',

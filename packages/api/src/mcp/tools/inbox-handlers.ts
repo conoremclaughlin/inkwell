@@ -61,6 +61,7 @@ import {
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
+import { ThreadKeyTakenError } from './thread-key-taken.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -378,6 +379,14 @@ export interface InternalSendContext {
    * message is authored as the system — no tool call reaches it.
    */
   sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  /**
+   * The send must create its thread, never join one. When the key is already
+   * taken, whether before the send or by a concurrent request racing it, the
+   * send throws ThreadKeyTakenError before any participant or message is
+   * written. POST /api/admin/threads sets this for a client-identified create,
+   * so a retried submission can never add anyone to a conversation.
+   */
+  createOnly?: boolean;
 }
 
 export async function handleSendToInbox(
@@ -657,6 +666,11 @@ export async function handleSendToInbox(
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
     });
+    // A create-only send stops here when the key was already taken, whether
+    // before this send or by a concurrent request between the lookup above
+    // and the insert. Nothing has been written yet (findOrCreateThread writes
+    // only for a thread it created), and nothing may be.
+    if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id

@@ -94,12 +94,17 @@ import {
 } from '../services/inklings/inkling-service';
 import {
   CLIENT_MESSAGE_CONFLICT,
+  OWN_CREATE_SETTLE_ATTEMPTS,
+  OWN_CREATE_SETTLE_INTERVAL_MS,
+  THREAD_KEY_TAKEN_ERROR,
+  createRequestOf,
   deliveryFromSendResult,
   isClientMessageConflict,
   lookUpClientMessage,
   parseClientMessageId,
   recordDelivery,
 } from '../services/send-receipt';
+import { ThreadKeyTakenError } from '../mcp/tools/thread-key-taken';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -7960,11 +7965,20 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
  * clientMessageId on every retry of one message. The thread key is the
  * client's too, and stays the same across retries, so a retried create
  * lands on the same thread, where a unique index on (thread, clientMessageId)
- * refuses a second copy. A retry answers with the original messageId and
- * replayed: true, and wakes nobody. If a server ever generated the key
- * instead, a retry would open a second thread and this guarantee would not
- * hold. `delivery` comes from positive evidence only (routed, partial,
- * unrouted, or unknown).
+ * refuses a second copy. If a server ever generated the key instead, a
+ * retry would open a second thread and this guarantee would not hold.
+ *
+ * A create carrying clientMessageId never joins a thread that exists, so
+ * a retry can never add anyone to a conversation. It replays (the original
+ * messageId, replayed: true, nobody woken) only when the sender, the words,
+ * the recipients as a set and the title all match what that id stored.
+ * Anything else is a 409 before any write, and so is a new clientMessageId
+ * aimed at a key already in use: a new conversation takes a new key. A
+ * concurrent request that takes the key first is caught inside the send
+ * handler (createOnly), before it writes a participant. Without
+ * clientMessageId the route keeps its old behaviour and continues a thread
+ * that already holds the key. `delivery` comes from positive evidence only
+ * (routed, partial, unrouted, or unknown).
  *
  * Start a thread from the dashboard or phone — or continue one that already
  * exists under that key. This is the only admin route that CREATES threads;
@@ -8030,7 +8044,9 @@ router.post('/threads', async (req: Request, res: Response) => {
       return;
     }
 
-    // Membership first: a replay is only ever looked up for a member.
+    // The workspace role before any lookup. What keeps a replay to the
+    // person who sent the original is the sender check inside
+    // lookUpClientMessage; this role check does not, and need not.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'start a thread');
       return;
@@ -8038,46 +8054,73 @@ router.post('/threads', async (req: Request, res: Response) => {
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
-    const findThread = async (): Promise<{ id: string } | null> => {
+    type KeyedThread = { id: string; created_by_user_id: string | null };
+    const findThread = async (): Promise<KeyedThread | null> => {
       const { data } = await supabase
         .from('inbox_threads')
-        .select('id')
+        .select('id, created_by_user_id')
         .eq('workspace_id', authReq.inkWorkspaceId)
         .eq('thread_key', key)
         .maybeSingle();
-      return (data as { id: string } | null) ?? null;
+      return (data as KeyedThread | null) ?? null;
     };
-    // A retry of a message this thread already stored: the original answers,
-    // and nobody is woken again.
-    const answeredAsReplay = async (threadId: string | undefined): Promise<boolean> => {
-      if (!clientMessageId.value || !threadId) return false;
-      const lookup = await lookUpClientMessage(supabase, {
-        threadId,
-        clientMessageId: clientMessageId.value,
-        userId: authReq.inkUserId,
-        content,
-      });
-      if (lookup.kind === 'conflict') {
-        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
-        return true;
+    // What a client-identified create is held to on a retry: the same
+    // people (as a set) and the same title, beside the same sender and words.
+    const createRequest = clientMessageId.value
+      ? createRequestOf(uniqueRecipients, title)
+      : undefined;
+    // A client-identified create never joins a thread that exists. Either it
+    // is a retry of the submission that created the thread, which answers
+    // with the original message and wakes nobody, or it is a 409: different
+    // people, title or words, or a new message id aimed at a key already in
+    // use. Nothing is written either way.
+    const answerForExistingThread = async (thread: KeyedThread): Promise<void> => {
+      const lookUp = () =>
+        lookUpClientMessage(supabase, {
+          threadId: thread.id,
+          clientMessageId: clientMessageId.value as string,
+          userId: authReq.inkUserId,
+          content,
+          createRequest,
+        });
+      let lookup = await lookUp();
+      // This person created the thread, and the request that did may still be
+      // between creating it and storing its first message (a retry racing its
+      // own original). Let that request land before calling the key taken.
+      for (
+        let attempt = 0;
+        lookup.kind === 'none' &&
+        thread.created_by_user_id === authReq.inkUserId &&
+        attempt < OWN_CREATE_SETTLE_ATTEMPTS;
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, OWN_CREATE_SETTLE_INTERVAL_MS));
+        lookup = await lookUp();
       }
-      if (lookup.kind !== 'replay') return false;
-      res.json({
-        success: true,
-        created: false,
-        messageId: lookup.messageId,
-        threadId: lookup.threadId,
-        threadKey: key,
-        warning: null,
-        threadKeyWarning: null,
-        delivery: lookup.delivery,
-        replayed: true,
+      if (lookup.kind === 'replay') {
+        res.json({
+          success: true,
+          created: false,
+          messageId: lookup.messageId,
+          threadId: lookup.threadId,
+          threadKey: key,
+          warning: null,
+          threadKeyWarning: null,
+          delivery: lookup.delivery,
+          replayed: true,
+        });
+        return;
+      }
+      res.status(409).json({
+        error: lookup.kind === 'conflict' ? CLIENT_MESSAGE_CONFLICT : THREAD_KEY_TAKEN_ERROR,
       });
-      return true;
     };
 
     const existing = await findThread();
-    if (await answeredAsReplay(existing?.id)) return;
+    if (clientMessageId.value && existing) {
+      await answerForExistingThread(existing);
+      return;
+    }
 
     let result: Awaited<ReturnType<typeof handleSendToInbox>>;
     try {
@@ -8096,29 +8139,37 @@ router.post('/threads', async (req: Request, res: Response) => {
           metadata: {
             sentBy: 'user',
             channel: 'admin-api',
-            ...(clientMessageId.value ? { clientMessageId: clientMessageId.value } : {}),
+            ...(clientMessageId.value
+              ? { clientMessageId: clientMessageId.value, pcp: { createRequest } }
+              : {}),
           },
         },
         dataComposer,
         // The person is the sender, in the workspace the middleware resolved —
         // server-side context the public tool schema never carries (§3, §6).
+        // A client-identified create must create: if a concurrent request
+        // takes the key first, the handler refuses before writing anything.
         {
           sender: {
             principal: userPrincipal(authReq.inkUserId),
             workspaceId: authReq.inkWorkspaceId,
           },
+          ...(clientMessageId.value ? { createOnly: true } : {}),
         }
       );
     } catch (error) {
-      // A concurrent retry of this message won the store: the unique index
-      // refused this copy before anything was dispatched. Its message is
-      // the answer.
+      // A concurrent request took the key first (or, belt and braces, stored
+      // this client message id first). The thread it made decides the answer:
+      // a replay of the same submission, or a 409.
       if (
         clientMessageId.value &&
-        isClientMessageConflict(error) &&
-        (await answeredAsReplay((await findThread())?.id))
+        (error instanceof ThreadKeyTakenError || isClientMessageConflict(error))
       ) {
-        return;
+        const taken = await findThread();
+        if (taken) {
+          await answerForExistingThread(taken);
+          return;
+        }
       }
       throw error;
     }
@@ -8215,7 +8266,8 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
-    // Membership first: a replay is only ever looked up for a member.
+    // The workspace role before any lookup; the sender check inside
+    // lookUpClientMessage keeps a replay to the person who sent the original.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reply');
       return;
