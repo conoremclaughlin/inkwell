@@ -353,7 +353,8 @@ export class SessionRepository implements ISessionRepository {
     sbSlug: string,
     alias: string,
     studioId?: string,
-    sbId?: string | null
+    sbId?: string | null,
+    contactId?: string
   ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -379,6 +380,10 @@ export class SessionRepository implements ISessionRepository {
     if (studioId !== undefined) {
       query = query.eq('studio_id', studioId);
     }
+    // A key is an address, and an address carries its contact scope: an
+    // owner send never lands in a per-sender contact session that carries the
+    // same key, and a contact send never lands in the owner's.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
     const { data, error } = (await query.order('started_at', { ascending: false })) as {
       data: DbSession[] | null;
@@ -456,9 +461,10 @@ export class SessionRepository implements ISessionRepository {
         query = query.eq('studio_id', studioId);
       }
 
-      if (contactId) {
-        query = query.eq('contact_id', contactId);
-      }
+      // Owner lookups match only owner sessions. Filtering on the contact
+      // only when one was passed let an owner lookup resolve a per-sender
+      // contact session on the same thread key (task F1).
+      query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
       const { data, error } = await query;
 

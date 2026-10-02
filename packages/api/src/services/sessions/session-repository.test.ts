@@ -1008,6 +1008,34 @@ describe('SessionRepository.findByThreadKey — crashed rows', () => {
     expect(runs[0]).toContainEqual(['not', 'lifecycle', 'in', '(completed,failed)']);
     expect(runs[1]).toContainEqual(['eq', 'lifecycle', 'failed']);
   });
+
+  // An owner lookup (no contact) must never resolve a per-sender contact
+  // session that happens to carry the same thread key: the contact filter was
+  // applied only when a contact was passed (Lumen, review of the session
+  // lifecycle spec, 2026-10-02; task F1).
+  it('restricts an owner lookup to sessions with no contact, on both runs', async () => {
+    const { supabase, runs } = sequencedSupabase([[], []]);
+    const repo = new SessionRepository(supabase);
+
+    await repo.findByThreadKey('user-1', 'wren', 'pr:718');
+
+    expect(runs).toHaveLength(2);
+    for (const run of runs) {
+      expect(run).toContainEqual(['is', 'contact_id', null]);
+    }
+  });
+
+  it('scopes a contact lookup to that contact and never to the owner rows', async () => {
+    const { supabase, runs } = sequencedSupabase([[], []]);
+    const repo = new SessionRepository(supabase);
+
+    await repo.findByThreadKey('user-1', 'myra', 'pr:718', undefined, 'contact-1');
+
+    for (const run of runs) {
+      expect(run).toContainEqual(['eq', 'contact_id', 'contact-1']);
+      expect(run).not.toContainEqual(['is', 'contact_id', null]);
+    }
+  });
 });
 
 describe('SessionRepository.findByAlias — studio scoping', () => {
@@ -1015,6 +1043,7 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
   function aliasSupabase(rows: Array<Record<string, unknown>>) {
     const filters: Record<string, unknown> = {};
     const exclusions: Array<[string, unknown]> = [];
+    const nulls: Array<[string, unknown]> = [];
     const chain: Record<string, unknown> = {};
 
     Object.assign(chain, {
@@ -1023,7 +1052,10 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
         filters[col] = val;
         return chain;
       }),
-      is: vi.fn(() => chain),
+      is: vi.fn((col: string, val: unknown) => {
+        nulls.push([col, val]);
+        return chain;
+      }),
       neq: vi.fn((col: string, val: unknown) => {
         exclusions.push([col, val]);
         return chain;
@@ -1040,6 +1072,7 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
       supabase: { from: vi.fn(() => chain) } as never,
       filters,
       exclusions,
+      nulls,
     };
   }
 
@@ -1179,5 +1212,28 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
 
     expect(found?.id).toBe('sess-b');
     expect(filters).toHaveProperty('studio_id');
+  });
+
+  // A session key is an address, and an address carries its scope: an owner
+  // send must never land in a per-sender contact session that carries the
+  // same key, and a contact send must never land in the owner's (task F1).
+  it('restricts an owner lookup to sessions with no contact', async () => {
+    const { supabase, nulls, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+
+    await repo.findByAlias('user-1', 'wren', 'review');
+
+    expect(nulls).toContainEqual(['contact_id', null]);
+    expect(filters).not.toHaveProperty('contact_id');
+  });
+
+  it('scopes a contact lookup to that contact', async () => {
+    const { supabase, nulls, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+
+    await repo.findByAlias('user-1', 'myra', 'review', undefined, null, 'contact-1');
+
+    expect(filters.contact_id).toBe('contact-1');
+    expect(nulls).not.toContainEqual(['contact_id', null]);
   });
 });
