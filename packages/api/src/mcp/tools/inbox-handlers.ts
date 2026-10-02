@@ -956,6 +956,18 @@ export async function handleSendToInbox(
     }
     for (const t of agentsToTrigger) routingById.set(t.sbId, t);
     const routingSet = [...routingById.values()];
+    // The wake prompt prints a trigger's metadata. A person's retry key and
+    // the record of what their create asked for are the stored message's,
+    // not the recipient's: an SB that echoed clientMessageId on its own send
+    // in this thread would have that send refused by the unique index.
+    const wakeMetadata: Record<string, unknown> = { ...rawMeta };
+    delete wakeMetadata.clientMessageId;
+    if (wakeMetadata.pcp && typeof wakeMetadata.pcp === 'object') {
+      const pcpForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
+      delete pcpForWake.createRequest;
+      if (Object.keys(pcpForWake).length > 0) wakeMetadata.pcp = pcpForWake;
+      else delete wakeMetadata.pcp;
+    }
     const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
@@ -1085,7 +1097,7 @@ export async function handleSendToInbox(
           // the boundary where their intent enters the gateway, instead of the
           // trigger handler rediscovering it from metadata.
           ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
-          ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
+          ...(Object.keys(wakeMetadata).length > 0 ? { metadata: wakeMetadata } : {}),
         };
 
         // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the

@@ -175,6 +175,31 @@ describe('createOnly sends', () => {
     expect(tables.inbox_thread_messages).toHaveLength(1);
   });
 
+  it("keep the person's retry key and create record out of the wake, but store them", async () => {
+    // review bbbbba99, P3: an SB echoing clientMessageId would be refused by the index.
+    const { db, tables } = client(false);
+    await handleSendToInbox(
+      {
+        recipients: ['fern'],
+        threadKey: KEY,
+        content: 'hello',
+        triggerAll: true,
+        metadata: {
+          sentBy: 'user',
+          clientMessageId: '6d1f8a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b',
+          pcp: { createRequest: { recipients: ['fern'], title: null } },
+        },
+      },
+      { getClient: () => db } as never,
+      { sender: { principal: userPrincipal('user-a'), workspaceId: 'ws-a' }, createOnly: true }
+    );
+    const payload = vi.mocked(getAgentGateway().dispatchTrigger).mock.calls[0][0];
+    expect(payload.metadata).toEqual({ sentBy: 'user' });
+    const stored = tables.inbox_thread_messages[0].metadata as Record<string, Row>;
+    expect(stored.clientMessageId).toBe('6d1f8a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b');
+    expect(stored.pcp.createRequest).toEqual({ recipients: ['fern'], title: null });
+  });
+
   it('report every target dispatched to, not only the requested recipients', async () => {
     // A person addresses Moss in Fern's thread; the reply wakes Fern too, so
     // a send receipt must judge delivery over both (review bbbbba99, P2 1).
