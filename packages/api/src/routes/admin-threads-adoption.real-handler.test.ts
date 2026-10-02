@@ -174,27 +174,31 @@ function originalLandsSoon(thread: Row): Promise<void> {
   );
 }
 
-/** The next message insert fails as a dropped connection would. */
-function failNextMessageInsert(): void {
+/** The next insert into this table fails as a dropped connection would. */
+function failNextInsert(table: string): void {
   const from = db.from.bind(db);
   let failed = false;
-  db.from = ((table: string) => {
-    const query = from(table);
-    if (table === 'inbox_thread_messages' && !failed) {
+  db.from = ((name: string) => {
+    const query = from(name);
+    if (name === table && !failed) {
       query.insert = (() => {
         failed = true;
+        const result = { data: null, error: { code: '08006', message: 'connection reset' } };
         return {
-          select: () => ({
-            single: async () => ({
-              data: null,
-              error: { code: '08006', message: 'connection reset' },
-            }),
-          }),
+          select: () => ({ single: async () => result }),
+          then: (resolve: (r: typeof result) => unknown) => resolve(result),
         };
       }) as never;
     }
     return query;
   }) as never;
+}
+
+function people(): string[] {
+  return db
+    .rows('inbox_thread_participants')
+    .filter((p) => p.user_id)
+    .map((p) => String(p.user_id));
 }
 
 beforeEach(() => {
@@ -277,7 +281,7 @@ describe('the recorded intent pins the words (Lumen 77379fb4, 345e579e)', () => 
 
 describe('the create that recorded its intent is the one that may adopt', () => {
   it('records its intent on the thread row, and its exact retry completes it', async () => {
-    failNextMessageInsert();
+    failNextInsert('inbox_thread_messages');
     const died = await call(body());
     expect(died.status).toBe(500);
     const [thread] = db.rows('inbox_threads');
@@ -291,6 +295,22 @@ describe('the create that recorded its intent is the one that may adopt', () => 
     expect(retry.body).toMatchObject({ replayed: false });
     expect(db.rows('inbox_thread_messages')).toHaveLength(1);
     expect(members()).toEqual(['sb-fern']);
+  });
+
+  it('a create that died before any participant was written: its exact retry completes it', async () => {
+    // The earliest partial create: the thread row and its intent, nobody on it.
+    failNextInsert('inbox_thread_participants');
+    const died = await call(body());
+    expect(died.status).toBe(500);
+    expect(db.rows('inbox_threads')).toHaveLength(1);
+    expect(db.rows('inbox_thread_participants')).toHaveLength(0);
+
+    const retry = await call(body());
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ replayed: false });
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+    expect(members()).toEqual(['sb-fern']);
+    expect(people()).toEqual([ME]);
   });
 
   it('an exact retry whose original lands after the adoption checks: one message, its addressee only', async () => {
