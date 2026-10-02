@@ -1867,10 +1867,13 @@ describe('held notices drain when quiet hours end', () => {
     expect(store.rows.get(outageKey)!.episodeClosedAt).toBeNull();
   });
 
-  it('an all-clear whose own claim failed waits when its outage cannot be read either', async () => {
-    // The store can neither record the all-clear nor say whether its outage
-    // landed. Nothing is evidence that the outage reached the human, so the
-    // all-clear waits, and says loudly that nothing durable holds it.
+  /**
+   * Option A (product decision, 2026-10-02): when the all-clear's claim was
+   * not recorded and its outage cannot be read, nothing durable could hold
+   * the all-clear, so it is sent best effort, with the ordering uncertainty
+   * logged. Quiet hours still hold it, and a recorded claim still waits.
+   */
+  it('an unrecorded all-clear whose outage cannot be read is sent anyway, and says so', async () => {
     const store = makeFakeStore();
     store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
     store.outageStatus.mockResolvedValueOnce('unknown');
@@ -1879,13 +1882,45 @@ describe('held notices drain when quiet hours end', () => {
 
     const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
 
-    expect(result).toEqual({ alerted: false });
-    expect(sendToChannel).not.toHaveBeenCalled();
-    expect(store.closeEpisode).not.toHaveBeenCalled();
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
     expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining('its own claim was not recorded'),
+      expect.stringContaining('without knowing whether its outage notice landed'),
       expect.objectContaining({ outage: 'unknown', claimRecorded: false })
     );
+  });
+
+  it('control: that best-effort all-clear still waits out a known quiet-hours hold', async () => {
+    const store = makeFakeStore();
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    store.holdNotice.mockResolvedValueOnce(false); // no row to record the hold on
+    decision = HOLD;
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    // Held, so the log does not claim it was sent.
+    expect(logger.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('sent without knowing'),
+      expect.anything()
+    );
+  });
+
+  it('control: a recorded all-clear whose outage cannot be read waits for the drain', async () => {
+    const store = makeFakeStore();
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'pending', drainOwned: true });
   });
 
   it('control: an all-clear whose own claim failed still goes out after a delivered outage', async () => {

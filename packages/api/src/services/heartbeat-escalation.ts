@@ -612,34 +612,32 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    // An all-clear never overtakes its outage (PR #723 review). If the outage
-    // notice is still owed (held overnight, or its send failing) or its state
-    // cannot be read, this all-clear waits. Asked whether or not the all-clear's
-    // own claim produced a row: a failed recovery INSERT is no evidence that
-    // the outage was delivered.
-    // - Claim recorded: the all-clear is drain-owned, and the drain sends it
-    //   once the outage is delivered.
-    // - Claim not recorded: nothing durable holds the all-clear. Its outage
-    //   row and this beat's delivered row in reminder_history do: once the
-    //   outage is delivered, the drain rebuilds the all-clear from them
-    //   (sendOwedRecoveries), with no further reminder run needed, and a
-    //   later healthy beat would too (retryOwedRecovery). If the state was
-    //   unknown because the outage row was never written either (the store
-    //   failing for the whole episode), nothing rebuilds it, and the error
-    //   below is the only record.
+    // An all-clear does not overtake an outage notice known to be owed (PR
+    // #723 review), whether or not its own claim produced a row: a failed
+    // recovery INSERT is no evidence that the outage was delivered.
+    // - Outage pending: wait. With the claim recorded, the all-clear is
+    //   drain-owned and the drain sends it once the outage is delivered.
+    //   Without it, the drain rebuilds the all-clear from the outage row and
+    //   this beat's delivered row in reminder_history (sendOwedRecoveries),
+    //   with no further reminder run needed.
+    // - Outage unknown, claim recorded: wait, durably, as for pending.
+    // - Outage unknown, claim not recorded: nothing durable could hold the
+    //   all-clear, so it is sent now, best effort (product decision, option
+    //   A, 2026-10-02, task 2301cb3c). It may arrive before its outage notice,
+    //   or without one; that uncertainty is logged. Quiet hours still hold it.
     // A delivered, absent or stranded outage lets the all-clear through as
     // before, including the send-through rule when the claim failed.
     const outage = await store.outageStatus(key);
-    if (outage === 'pending' || outage === 'unknown') {
-      const fields = { reminderId: reminder.id, failedBeats, outage, claimRecorded: !!record };
+    const fields = { reminderId: reminder.id, failedBeats, outage, claimRecorded: !!record };
+    if (outage === 'pending' || (outage === 'unknown' && record)) {
       if (record) {
         logger.info(
           '[Heartbeat] All-clear waits for its outage notice — the drain sends it after',
           fields
         );
       } else {
-        logger.error(
-          '[Heartbeat] All-clear waits for its outage notice, and its own claim was not recorded — only a delivered outage row lets a later healthy beat reconstruct it',
+        logger.warn(
+          '[Heartbeat] All-clear waits for its outage notice, unrecorded — the drain rebuilds it once the outage is delivered',
           fields
         );
       }
@@ -650,6 +648,12 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
+    if (outage === 'unknown') {
+      logger.error(
+        '[Heartbeat] All-clear sent without knowing whether its outage notice landed — its claim was not recorded and the outage could not be read, so it may arrive first or alone',
+        fields
+      );
+    }
     const alert = await alertOwnerDirectly(reminder, recoveryContent);
 
     await store.settleNotice(key, { delivered: alert.sent, error: alert.reason });
