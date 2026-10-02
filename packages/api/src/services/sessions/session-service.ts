@@ -1558,7 +1558,11 @@ export class SessionService implements ISessionService {
    *    carries. A missing working_dir never counts as project placement.
    *
    * Paths are compared by containment after realpath (path.relative), never
-   * by string prefix.
+   * by string prefix, and only absolute ones count.
+   *
+   * A row admitted on its working_dir alone has no record, and once it runs
+   * here the runner gives it the default directory; see
+   * adoptStudiolessPresence for how it keeps continuity after that.
    */
   private async studiolessMatchAllowed(
     match: Session,
@@ -1584,6 +1588,12 @@ export class SessionService implements ISessionService {
     ) {
       return refuse('routing does not place this thread studioless');
     }
+    // A relative path names no directory: containment resolves it against
+    // the root being tested, so `.` or `app` was "inside" every root (Lumen,
+    // #721 r1). update_session_state stores whatever string it is given.
+    if (match.workingDir && !path.isAbsolute(match.workingDir)) {
+      return refuse('working_dir is not an absolute path');
+    }
     if (
       match.workingDir &&
       (await isPathWithinWorkspaceAsync(match.workingDir, project.repoRoot))
@@ -1604,6 +1614,60 @@ export class SessionService implements ISessionService {
       return refuse('working_dir is outside both the project repo and the default directory');
     }
     return true;
+  }
+
+  /**
+   * Record the studioless placement on a session the predicate admitted and
+   * this spawn is about to run (Lumen, #721 r1). A row admitted on a
+   * working_dir inside the project repo carries no record; the runner gives
+   * it the default directory, its hook then reports that directory, and on
+   * the next message it was refused with nothing to show for itself. The
+   * record makes it what a row routing created under the same decision is.
+   *
+   * Only for a match the predicate admitted: an inferred anchor or a
+   * thread-key match. An explicit address bypasses the predicate, and
+   * recording a placement there would turn a one-off address into
+   * continuity. Only at spawn: a plan runs nothing, so nothing moved.
+   * A failed write is logged and the turn proceeds; continuity then breaks
+   * on the next message, as before this fix, rather than this one.
+   */
+  private async adoptStudiolessPresence(
+    session: Session,
+    studiolessPresence: StudiolessPresencePlacement | null,
+    planOnly: boolean
+  ): Promise<Session> {
+    if (planOnly || !studiolessPresence || session.studioId) return session;
+    const project = { slug: studiolessPresence.project, repoRoot: studiolessPresence.repoRoot };
+    if (recordedStudiolessPresence(session, project)) return session;
+    // metadata merges at the top level, so the whole decision is rewritten.
+    const decision = (session.metadata?.routing_decision ?? {}) as Record<string, unknown>;
+    try {
+      const adopted = await this.repository.update(session.id, {
+        metadata: {
+          routing_decision: {
+            ...decision,
+            placement: {
+              kind: STUDIOLESS_PRESENCE,
+              ...studiolessPresence,
+              adoptedAt: new Date().toISOString(),
+            },
+          },
+        },
+      });
+      logger.info('[SessionRouting] Recorded studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        workingDir: session.workingDir ?? null,
+      });
+      return adopted;
+    } catch (err) {
+      logger.warn('[SessionRouting] Could not record studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return session;
+    }
   }
 
   private async continuityStudioAllowed(
@@ -3583,7 +3647,16 @@ export class SessionService implements ISessionService {
         const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
-          return this.withStudioLease(recipientSession, routing, leaseCtx);
+          // A studioless inferred anchor reaching here passed the predicate
+          // after routing; an explicit one did not take it.
+          const anchor = inferredAnchorOnPinnedThread
+            ? await this.adoptStudiolessPresence(
+                recipientSession,
+                studiolessPresence,
+                options?.planOnly === true
+              )
+            : recipientSession;
+          return this.withStudioLease(anchor, routing, leaseCtx);
         }
       }
 
@@ -3702,7 +3775,15 @@ export class SessionService implements ISessionService {
             )))
         ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
-          return this.withStudioLease(threadMatch, routing, leaseCtx);
+          return this.withStudioLease(
+            await this.adoptStudiolessPresence(
+              threadMatch,
+              studiolessPresence,
+              options.planOnly === true
+            ),
+            routing,
+            leaseCtx
+          );
         }
 
         // Thread-scoped request with no match. If the agent has a default
