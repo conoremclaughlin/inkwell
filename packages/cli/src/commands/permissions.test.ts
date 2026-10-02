@@ -96,8 +96,28 @@ describe('sb permissions', () => {
     runSb(['permissions', 'reset'], tmpDir);
     const settings = readSettings(tmpDir);
 
-    expect(settings.permissions).toBeUndefined();
+    // An empty object, not a deleted key: `ink init` keeps an authored
+    // object, and would fill a missing one with a profile (review 4177f7fe).
+    expect(settings.permissions).toEqual({});
     expect(settings.hooks).toBeDefined();
+  });
+
+  it('auto, reset and show refuse a malformed settings file and leave its bytes', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    const path = join(tmpDir, '.claude', 'settings.local.json');
+    for (const content of ['{ "permissions": ', '[1, 2]']) {
+      writeFileSync(path, content);
+      for (const sub of ['auto', 'reset', 'show']) {
+        let status = 0;
+        try {
+          runSb(['permissions', sub], tmpDir);
+        } catch (error) {
+          status = (error as { status?: number }).status ?? -1;
+        }
+        expect(status, `${sub} on ${content}`).toBe(1);
+        expect(readFileSync(path, 'utf-8'), `${sub} on ${content}`).toBe(content);
+      }
+    }
   });
 
   it('dry-run does not write file', () => {

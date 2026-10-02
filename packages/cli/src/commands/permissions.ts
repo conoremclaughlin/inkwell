@@ -29,14 +29,33 @@ interface ClaudeSettings {
   [key: string]: unknown;
 }
 
-function readClaudeSettings(cwd: string): ClaudeSettings {
+/**
+ * The settings file, `{}` when absent, or null when it exists but is not a
+ * JSON object. A writer must refuse null: treating a malformed file as
+ * empty and writing over it replaces whatever rules the person had there
+ * (review 4177f7fe, P2 2).
+ */
+function readClaudeSettings(cwd: string): ClaudeSettings | null {
   const configPath = join(cwd, CLAUDE_SETTINGS_PATH);
   if (!existsSync(configPath)) return {};
   try {
-    return JSON.parse(readFileSync(configPath, 'utf-8'));
+    const parsed: unknown = JSON.parse(readFileSync(configPath, 'utf-8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as ClaudeSettings)
+      : null;
   } catch {
-    return {};
+    return null;
   }
+}
+
+/** Refuse to write over a file that cannot be read; says so and sets exit 1. */
+function refuseMalformed(): void {
+  console.error(
+    chalk.red(
+      `${CLAUDE_SETTINGS_PATH} is not a JSON object; left as it is. Fix or remove it, then run this again.`
+    )
+  );
+  process.exitCode = 1;
 }
 
 function writeClaudeSettings(cwd: string, settings: ClaudeSettings): void {
@@ -55,6 +74,7 @@ export function registerPermissionsCommands(parent: Command): void {
     .action((options: { dryRun?: boolean }) => {
       const cwd = process.cwd();
       const existing = readClaudeSettings(cwd);
+      if (!existing) return refuseMalformed();
 
       const updated: ClaudeSettings = {
         ...existing,
@@ -105,6 +125,7 @@ export function registerPermissionsCommands(parent: Command): void {
     .action(() => {
       const cwd = process.cwd();
       const settings = readClaudeSettings(cwd);
+      if (!settings) return refuseMalformed();
       const perms = settings.permissions;
 
       if (!perms?.allow?.length && !perms?.deny?.length) {
@@ -137,14 +158,18 @@ export function registerPermissionsCommands(parent: Command): void {
     .action(() => {
       const cwd = process.cwd();
       const existing = readClaudeSettings(cwd);
+      if (!existing) return refuseMalformed();
 
       if (!existing.permissions?.allow?.length && !existing.permissions?.deny?.length) {
         console.log(chalk.dim('No permission rules to reset.'));
         return;
       }
 
-      const updated: ClaudeSettings = { ...existing };
-      delete updated.permissions;
+      // An empty object, not a deleted key: a studio's next `ink init` keeps
+      // an authored object and fills a missing one with its profile, so
+      // deleting the key would turn a deliberate ask-everything into the
+      // builder profile (review 4177f7fe, P2 2).
+      const updated: ClaudeSettings = { ...existing, permissions: {} };
       writeClaudeSettings(cwd, updated);
 
       console.log(chalk.green('Permission rules removed. Claude will prompt for all actions.'));
