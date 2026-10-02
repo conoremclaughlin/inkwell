@@ -31,7 +31,6 @@ import {
   userPrincipal,
   type SbPrincipal,
 } from '../services/principals';
-import { boundThreadTitle } from '../mcp/tools/thread-bounds';
 import { describePeople, resolvePersonNames } from '../services/person-display';
 import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
@@ -103,10 +102,12 @@ import {
   OWN_CREATE_SETTLE_ATTEMPTS,
   OWN_CREATE_SETTLE_INTERVAL_MS,
   THREAD_KEY_TAKEN_ERROR,
+  createIntentOf,
   createRequestOf,
   deliveryFromSendResult,
   isClientMessageConflict,
   lookUpClientMessage,
+  matchesCreateIntent,
   parseClientMessageId,
   recordDelivery,
 } from '../services/send-receipt';
@@ -8060,11 +8061,16 @@ router.post('/threads', async (req: Request, res: Response) => {
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
-    type KeyedThread = { id: string; created_by_user_id: string | null; title: string | null };
+    type KeyedThread = {
+      id: string;
+      created_by_user_id: string | null;
+      title: string | null;
+      metadata: unknown;
+    };
     const findThread = async (): Promise<KeyedThread | null> => {
       const { data } = await supabase
         .from('inbox_threads')
-        .select('id, created_by_user_id, title')
+        .select('id, created_by_user_id, title, metadata')
         .eq('workspace_id', authReq.inkWorkspaceId)
         .eq('thread_key', key)
         .maybeSingle();
@@ -8129,14 +8135,24 @@ router.post('/threads', async (req: Request, res: Response) => {
       });
     };
 
-    // A conversation this person's own earlier attempt created and then died
-    // in before its first message landed (the thread, its participants and
-    // the message are separate writes): no message, this create's title, and
-    // exactly this create's inklings with nobody else but this person. Two
-    // retries adopting it at once are settled by the client-message index.
+    // A conversation this very create made and then died in before its first
+    // message landed (the thread, its participants and the message are
+    // separate writes). Proven by the intent recorded on the thread row when
+    // it was created, before any participant: the same client message id,
+    // recipients and title (review 09b80921: creator, title and a member
+    // subset could not prove it, and a mismatching retry added people before
+    // being refused). Adopting it can only add people the original meant to
+    // reach, so even an original whose message lands mid-adoption is seen by
+    // exactly its addressees. Two adopting retries are settled by the
+    // client-message index.
     const adoptable = async (thread: KeyedThread): Promise<boolean> => {
       if (thread.created_by_user_id !== authReq.inkUserId) return false;
-      if ((thread.title ?? null) !== boundThreadTitle(title || null)) return false;
+      if (
+        !createRequest ||
+        !matchesCreateIntent(thread.metadata, clientMessageId.value as string, createRequest)
+      ) {
+        return false;
+      }
       const { data: anyMessage, error: messageError } = await supabase
         .from('inbox_thread_messages')
         .select('id')
@@ -8202,6 +8218,10 @@ router.post('/threads', async (req: Request, res: Response) => {
               workspaceId: authReq.inkWorkspaceId,
             },
             ...(send.createOnly ? { createOnly: true } : {}),
+            // Recorded on the thread row if this send creates it.
+            ...(clientMessageId.value && createRequest
+              ? { createIntent: createIntentOf(clientMessageId.value, createRequest) }
+              : {}),
           }
         );
       } catch (error) {

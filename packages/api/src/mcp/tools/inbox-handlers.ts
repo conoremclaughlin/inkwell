@@ -387,6 +387,14 @@ export interface InternalSendContext {
    * so a retried submission can never add anyone to a conversation.
    */
   createOnly?: boolean;
+  /**
+   * What a client-identified create intends (its clientMessageId, recipients
+   * and title). Written to `inbox_threads.metadata.createIntent` by the same
+   * insert that creates the thread, so before any participant exists. A
+   * retry may adopt a conversation its own interrupted create left only when
+   * this record matches it exactly (POST /api/admin/threads).
+   */
+  createIntent?: Record<string, unknown>;
 }
 
 export async function handleSendToInbox(
@@ -665,6 +673,7 @@ export async function handleSendToInbox(
       title: subject || null,
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
+      ...(internal?.createIntent ? { metadata: { createIntent: internal.createIntent } } : {}),
     });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
@@ -1385,6 +1394,8 @@ export async function findOrCreateThread(
     title: string | null;
     participants: SbPrincipal[];
     person?: UserPrincipal | null;
+    /** Written with the new thread row only; an existing thread is not touched. */
+    metadata?: Record<string, unknown>;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
@@ -1412,6 +1423,7 @@ export async function findOrCreateThread(
       created_by_sb_id: creator.kind === 'sb' ? creator.sbId : null,
       created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: boundThreadTitle(opts.title),
+      ...(opts.metadata ? { metadata: opts.metadata } : {}),
     })
     .select()
     .single();

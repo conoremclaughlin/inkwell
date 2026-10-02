@@ -235,6 +235,7 @@ beforeEach(() => {
       internal: {
         sender: { principal: { userId: string }; workspaceId: string };
         createOnly?: boolean;
+        createIntent?: Row;
       }
     ) => {
       const workspaceId = internal.sender.workspaceId;
@@ -248,6 +249,8 @@ beforeEach(() => {
           thread_key: args.threadKey,
           workspace_id: workspaceId,
           created_by_user_id: internal.sender.principal.userId,
+          // As findOrCreateThread does: the intent is written with the row.
+          metadata: internal.createIntent ? { createIntent: internal.createIntent } : {},
         });
         addPerson(thread, internal.sender.principal.userId);
       }

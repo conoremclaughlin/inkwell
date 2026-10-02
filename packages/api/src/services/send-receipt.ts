@@ -173,6 +173,43 @@ export function createRequestOf(recipients: string[], title: string): CreateRequ
   };
 }
 
+/**
+ * What a client-identified create records on the thread row it creates
+ * (inbox_threads.metadata.createIntent), in the same insert, before any
+ * participant is written. It is the only durable evidence of what an
+ * interrupted create meant, so it is what a retry is held to.
+ */
+export function createIntentOf(clientMessageId: string, request: CreateRequest) {
+  return { clientMessageId, recipients: request.recipients, title: request.title };
+}
+
+/**
+ * Is this thread the one this exact create made? Its recorded intent must
+ * name the same client message id, the same recipients (as a set) and the
+ * same title. A thread with no recorded intent never matches.
+ */
+export function matchesCreateIntent(
+  threadMetadata: unknown,
+  clientMessageId: string,
+  request: CreateRequest
+): boolean {
+  const intent = (threadMetadata as { createIntent?: unknown } | null | undefined)?.createIntent as
+    | { clientMessageId?: unknown; recipients?: unknown; title?: unknown }
+    | undefined;
+  if (!intent || intent.clientMessageId !== clientMessageId || !Array.isArray(intent.recipients)) {
+    return false;
+  }
+  const recorded = createRequestOf(
+    intent.recipients.filter((r): r is string => typeof r === 'string'),
+    typeof intent.title === 'string' ? intent.title : ''
+  );
+  return (
+    recorded.title === request.title &&
+    recorded.recipients.length === request.recipients.length &&
+    recorded.recipients.every((r, i) => r === request.recipients[i])
+  );
+}
+
 function sameCreateRequest(metadata: Record<string, unknown> | null, request: CreateRequest) {
   const stored = (metadata?.pcp as { createRequest?: Partial<CreateRequest> } | undefined)
     ?.createRequest;
