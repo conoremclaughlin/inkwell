@@ -290,3 +290,52 @@ describe('the studio checklist runs before every spawn, whatever the runner', ()
     expect(await owner()).toBeNull();
   });
 });
+
+describe('a Claude launch in a studio is given its profile from the row (design v5, phase A)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetActiveRuns();
+    resetPendingFinalizations();
+    order.events.length = 0;
+    completion.calls.length = 0;
+    worktree = realpathSync(mkdtempSync(join(tmpdir(), 'studio-1-')));
+  });
+  afterEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+    rmSync(worktree, { recursive: true, force: true });
+  });
+
+  const launchConfig = (runner: { run: ReturnType<typeof vi.fn> }) =>
+    (runner.run.mock.calls[0]?.[1] as { config: Record<string, unknown> } | undefined)?.config;
+
+  it("the row's profile, owner and main checkout reach the Claude runner", async () => {
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'detached:origin/pr/7',
+      repo_root: '/repo',
+    });
+    await send();
+    expect(launchConfig(claude as never)?.launchPermissions).toEqual({
+      profile: 'reviewer',
+      owner: 'lumen',
+      mainRoot: '/repo',
+    });
+  });
+
+  it('a Codex launch is not given one: --settings is a Claude Code flag', async () => {
+    const { send, codex } = makeService(makeSession(), 'lumen', { branch: 'lumen/feat/x' });
+    await send();
+    expect(launchConfig(codex as never)).not.toHaveProperty('launchPermissions');
+  });
+
+  it('a studio whose row is gone fails the Claude launch before the runner runs', async () => {
+    const { send, claude } = makeService(
+      makeSession({ backend: 'claude-code', studioId: 'studio-gone' }),
+      'lumen'
+    );
+    const result = await send();
+    expect(result.success).toBe(false);
+    expect(String((result as { error?: unknown }).error)).toMatch(/Launch refused/);
+    expect(claude.run).not.toHaveBeenCalled();
+  });
+});

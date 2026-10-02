@@ -2241,6 +2241,24 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A Claude session in a studio gets its profile at launch, from the row
+    // (design v5, phase A). A row that cannot be read, or is gone, fails the
+    // launch here rather than letting it start without the profile it was
+    // meant to have; the runner then refuses a profile it cannot validate.
+    // A service with no database (an embedded or test configuration) has no
+    // studio rows at all, so there is no profile to deliver; that is logged,
+    // not refused.
+    let launchPermissions: ClaudeRunnerConfig['launchPermissions'];
+    if (resolvedBackend === 'claude-code' && session.studioId && session.studioId !== 'main') {
+      if (this.getStudiosRepo()) {
+        launchPermissions = await this.resolveLaunchPermissions(session.studioId);
+      } else {
+        logger.warn('No studios repository: launch profile not delivered', {
+          studioId: session.studioId,
+        });
+      }
+    }
+
     const strategyGroupId = (metadata?.taskGroupId as string) || undefined;
     const permissionOverlay = strategyGroupId
       ? {
@@ -2289,6 +2307,7 @@ export class SessionService implements ISessionService {
       // .ink/identity.json preferences or Commander defaults.
       toolRouting: runtimeToolRouting,
       ...(permissionOverlay ? { permissionOverlay } : {}),
+      ...(launchPermissions ? { launchPermissions } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
       // Route CLI execution into sandbox container when triggered by a sandboxed strategy
@@ -5427,6 +5446,26 @@ This session will continue with a fresh context after compaction. Your identity,
    * spawned into a studio is not always the SB it belongs to. Non-fatal: the
    * spawn goes ahead either way, and the failure is logged.
    */
+  /**
+   * The profile, owner and main checkout a studio's Claude launch is given,
+   * read from the studio row and never from the checkout. Throws when the
+   * row cannot be read or no longer exists: the launch fails closed.
+   */
+  private async resolveLaunchPermissions(
+    studioId: string
+  ): Promise<NonNullable<ClaudeRunnerConfig['launchPermissions']>> {
+    const repo = this.getStudiosRepo();
+    if (!repo) throw new Error('Launch refused: no studios repository to read the profile from');
+    const row = await repo.findById(studioId);
+    if (!row)
+      throw new Error(`Launch refused: studio ${studioId} has no row to read a profile from`);
+    return {
+      profile: studioPermissionProfile(row),
+      owner: row.sbSlug ?? undefined,
+      mainRoot: row.repoRoot && row.repoRoot !== row.worktreePath ? row.repoRoot : null,
+    };
+  }
+
   private async completeStudioBeforeSpawn(
     workingDirectory: string | undefined,
     studioId: string | null | undefined,
