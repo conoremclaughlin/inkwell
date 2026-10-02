@@ -2030,7 +2030,7 @@ export class SessionService implements ISessionService {
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         sbSlug,
-        injectedContext.agent.name,
+        injectedContext.agent.unnamed ? null : injectedContext.agent.name,
         injectedContext.agent.soul,
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat,
@@ -4887,7 +4887,7 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.sbSlug,
-          context.agent.name,
+          context.agent.unnamed ? null : context.agent.name,
           context.agent.soul,
           fullContext.user.timezone,
           context.agent.heartbeat

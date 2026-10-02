@@ -379,6 +379,12 @@ export interface ToolCall {
 export interface AgentIdentity {
   sbSlug: string;
   name: string;
+  /**
+   * An inkling the person has not named yet (metadata.named === false). Its
+   * stored name is a placeholder, so a prompt must not tell it that is who it
+   * is: render "an inkling who hasn't been named yet" instead.
+   */
+  unnamed?: boolean;
   role: string;
   description?: string;
   /** Workspace this identity belongs to — scopes which constitution it reads. */

@@ -802,7 +802,8 @@ export class ClaudeRunner implements IRunner {
  */
 export function buildIdentityPrompt(
   sbSlug: string,
-  agentName: string,
+  /** Null for an inkling that hasn't been named yet: its stored name is a placeholder. */
+  agentName: string | null,
   soul?: string,
   timezone?: string,
   heartbeat?: string,
@@ -810,7 +811,7 @@ export function buildIdentityPrompt(
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
-**You are ${agentName}. Your slug is \`${sbSlug}\`.**
+**You are ${agentName ?? "an inkling who hasn't been named yet"}. Your slug is \`${sbSlug}\`.**
 
 When calling Inkwell tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 

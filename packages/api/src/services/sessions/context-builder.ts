@@ -34,10 +34,13 @@ type DbContact = Database['public']['Tables']['contacts']['Row'];
 /**
  * Map database agent identity to domain type.
  */
-function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
+export function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
+  // Keyed off the stored flag, never off the placeholder text.
+  const unnamed = (row.metadata as { named?: unknown } | null)?.named === false;
   return {
     sbSlug: row.agent_id,
     name: row.name,
+    ...(unnamed ? { unnamed: true } : {}),
     role: row.role,
     description: row.description || undefined,
     backend: row.backend || undefined,
@@ -559,9 +562,13 @@ export function formatInjectedContext(
   // session this is, who is on the other end, and what time it is there.
   const includeBootstrapDerived = !options.childCallsBootstrap;
 
-  // Agent identity section
+  // Agent identity section. An unnamed inkling's stored name is a
+  // placeholder, never who it is.
+  const who = context.agent.unnamed
+    ? "an inkling who hasn't been named yet"
+    : `**${context.agent.name}**`;
   sections.push(`## Agent Identity
-You are **${context.agent.name}** (SB slug: \`${context.agent.sbSlug}\`).
+You are ${who} (SB slug: \`${context.agent.sbSlug}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
 
