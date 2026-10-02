@@ -647,6 +647,12 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'compaction.ts',
         'token-usage.ts',
         'session-log.ts',
+        'session-history.ts',
+        'provider-recovery.ts',
+        'provider-sample.ts',
+        'activity-render.ts',
+        'auto-evict.ts',
+        'clone-outcomes.ts',
       ])
     );
   });

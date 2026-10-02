@@ -24,3 +24,10 @@ export * from './context-tools.js';
 export * from './compaction.js';
 export * from './token-usage.js';
 export * from './session-log.js';
+
+export * from './activity-render.js';
+export * from './provider-sample.js';
+export * from './auto-evict.js';
+export * from './clone-outcomes.js';
+export * from './session-history.js';
+export * from './provider-recovery.js';

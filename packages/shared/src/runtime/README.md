@@ -62,8 +62,8 @@ non-test source file in this directory.
 
 ## Scope of the context extraction
 
-This is the existing ledger and hook implementation, not a complete hosted
-session. Prompt composition, hydration, compaction orchestration, skills,
+This is the existing ledger, hook and history implementation, not a complete hosted
+session. Prompt composition, compaction orchestration, skills,
 live control delivery and provider adapters still need their own host boundaries.
 The context tools require an explicit status sink for each parent and clone;
 there is no process-global fallback. Compaction still uses the existing
@@ -77,6 +77,23 @@ not populate its eviction map. Already-injected IDs therefore remain
 deduplicated even after eviction; the configured reinjection cooldown is not
 yet implemented. This relocation preserves that behavior rather than claiming
 the simulated recall tests prove the production tracker works.
+
+## Session restoration
+
+`hydrateLedgerFromEvents` reuses the CLI's existing replay policy with an
+explicit, host-loaded event snapshot. Compaction and eviction ordering,
+platform-message replay metadata, recall/inbox/activity cursors, clone summaries
+and event-ID recovery stay the same. `findLastBackendSessionInEvents` and
+`findLastDetectedModelInEvents` recover provider continuity from that snapshot;
+they do not start providers or decide whether an interrupted effect is safe to
+repeat. The session-context fallback also lives here.
+
+The CLI keeps its public file-based wrappers. A server host must load storage
+asynchronously before calling the shared functions. This extraction does not
+activate an async CLI sink, change replay formats, implement safe crash recovery,
+or make loading and replay of an arbitrarily large history bounded/nonblocking.
+The small activity, auto-eviction and clone-outcome policies are shared with live
+CLI handling rather than copied for replay. Their old CLI paths remain shims.
 
 ## Session journal
 
