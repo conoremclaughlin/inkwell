@@ -149,34 +149,68 @@ describe('awaken', () => {
     expect(db.log.filter((e) => e.op === 'rpc')).toHaveLength(1);
   });
 
-  it('losing a race to a concurrent retry returns the winner, and revokes the token the loser minted', async () => {
-    // The winner commits after this request's pre-check and before its own
-    // redemption: the redemption then fails on the awakenRequestId index.
-    const realRedeem = db.rpcHandlers.redeem_kindle_token;
-    let raced = false;
-    db.rpcHandlers.redeem_kindle_token = (args, fake) => {
-      if (!raced) {
-        raced = true;
-        const winnerToken = fake.seed('kindle_tokens', {
-          token: 'winner',
-          status: 'active',
-          creator_user_id: ME.userId,
-          creator_agent_id: null,
-        });
-        const won = realRedeem({ ...args, p_token: winnerToken.token }, fake);
-        expect(won.error).toBeNull();
-      }
-      return realRedeem(args, fake);
-    };
+  // Lumen's probes (345e579e, P2): a UUID's letter case is spelling, not
+  // identity, and the stored id is compared as text.
+  it('the same request id in capitals is the same request: it replays and creates nothing', async () => {
+    const first = await service.awaken(ME, REQUEST);
+    const second = await service.awaken(ME, REQUEST.toUpperCase());
 
-    const result = await service.awaken(ME, REQUEST);
-
-    expect(result.replayed).toBe(true);
+    expect(second).toEqual({ inkling: first.inkling, replayed: true });
     expect(rowsOf('agent_identities')).toHaveLength(1);
-    expect(result.inkling.id).toBe(rowsOf('agent_identities')[0].id);
-    const loserToken = rowsOf('kindle_tokens').find((t) => t.token !== 'winner');
-    expect(loserToken?.status).toBe('revoked');
+    expect(rowsOf('kindle_tokens')).toHaveLength(1);
   });
+
+  it('a request id first sent in capitals is stored in lowercase, so the lowercase retry replays', async () => {
+    const first = await service.awaken(ME, REQUEST.toUpperCase());
+    expect(rowsOf('agent_identities')[0].metadata).toMatchObject({ awakenRequestId: REQUEST });
+
+    const second = await service.awaken(ME, REQUEST);
+    expect(second).toEqual({ inkling: first.inkling, replayed: true });
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+  });
+
+  it('the same request id in capitals from another workspace is still a 409', async () => {
+    await service.awaken(ME, REQUEST);
+    await expect(
+      service.awaken({ ...ME, workspaceId: OTHER_WORKSPACE }, REQUEST.toUpperCase())
+    ).rejects.toMatchObject({ status: 409 });
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+    expect(rowsOf('kindle_tokens')).toHaveLength(1);
+  });
+
+  for (const [label, spelling] of [
+    ['', REQUEST],
+    [' (the loser spelled in capitals)', REQUEST.toUpperCase()],
+  ] as const) {
+    it(`losing a race to a concurrent retry returns the winner, and revokes the token the loser minted${label}`, async () => {
+      // The winner commits after this request's pre-check and before its own
+      // redemption: the redemption then fails on the awakenRequestId index.
+      const realRedeem = db.rpcHandlers.redeem_kindle_token;
+      let raced = false;
+      db.rpcHandlers.redeem_kindle_token = (args, fake) => {
+        if (!raced) {
+          raced = true;
+          const winnerToken = fake.seed('kindle_tokens', {
+            token: 'winner',
+            status: 'active',
+            creator_user_id: ME.userId,
+            creator_agent_id: null,
+          });
+          const won = realRedeem({ ...args, p_token: winnerToken.token }, fake);
+          expect(won.error).toBeNull();
+        }
+        return realRedeem(args, fake);
+      };
+
+      const result = await service.awaken(ME, spelling);
+
+      expect(result.replayed).toBe(true);
+      expect(rowsOf('agent_identities')).toHaveLength(1);
+      expect(result.inkling.id).toBe(rowsOf('agent_identities')[0].id);
+      const loserToken = rowsOf('kindle_tokens').find((t) => t.token !== 'winner');
+      expect(loserToken?.status).toBe('revoked');
+    });
+  }
 
   it('the stand-in redemption really fails on the index (the race above is not vacuous)', async () => {
     await service.awaken(ME, REQUEST);

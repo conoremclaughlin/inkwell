@@ -202,7 +202,10 @@ export class InklingService {
     scope: InklingScope,
     clientRequestId: string
   ): Promise<{ inkling: Inkling; replayed: boolean }> {
-    const prior = await this.findByAwakenRequest(scope.userId, clientRequestId);
+    // A UUID's letter case is spelling, not identity, and the id is stored
+    // and compared as text: one spelling for every lookup and the write.
+    const requestId = clientRequestId.toLowerCase();
+    const prior = await this.findByAwakenRequest(scope.userId, requestId);
     if (prior) return this.replay(prior, scope);
 
     const token = await this.mintSelfServeToken(scope.userId);
@@ -219,7 +222,7 @@ export class InklingService {
         metadata: {
           prototype: true,
           client: INKLING_CLIENT,
-          awakenRequestId: clientRequestId,
+          awakenRequestId: requestId,
           named: false,
         },
       },
@@ -232,7 +235,7 @@ export class InklingService {
       await this.revokeToken(token.id);
       // A concurrent retry of the same awakening won the index: its inkling
       // is the answer to this request too.
-      const winner = await this.findByAwakenRequest(scope.userId, clientRequestId);
+      const winner = await this.findByAwakenRequest(scope.userId, requestId);
       if (winner) return this.replay(winner, scope);
       throw new Error(`Failed to awaken an inkling: ${error?.message ?? 'no identity bound'}`);
     }
