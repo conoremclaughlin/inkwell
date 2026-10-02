@@ -965,13 +965,16 @@ export class MCPServer {
       }
 
       // The new token keeps the session and contact the presenting token was
-      // bound to, and expires no later than it does.
-      const remainingSeconds =
-        typeof userData.expiresAt === 'number'
-          ? userData.expiresAt - Math.floor(Date.now() / 1000)
-          : DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS;
-      const lifetimeSeconds = Math.min(DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS, remainingSeconds);
-      if (lifetimeSeconds <= 0) {
+      // bound to, and expires no later than it does. The ceiling goes to the
+      // signer as an absolute time: a duration computed here would be added
+      // back to the signer's later clock reading, a second too late at a
+      // second boundary (Lumen, 9372b0c7).
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const notAfter = Math.min(
+        nowSeconds + DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS,
+        typeof userData.expiresAt === 'number' ? userData.expiresAt : Infinity
+      );
+      if (notAfter <= nowSeconds) {
         res.status(401).json({
           error: 'invalid_token',
           error_description: 'Missing or invalid bearer token',
@@ -989,14 +992,15 @@ export class MCPServer {
           identityId: identity.id,
           ...(userData.sessionId ? { sessionId: userData.sessionId } : {}),
           ...(userData.contactId ? { contactId: userData.contactId } : {}),
+          exp: notAfter,
         },
-        lifetimeSeconds
+        DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS
       );
 
       res.json({
         access_token: accessToken,
         token_type: 'Bearer',
-        expires_in: lifetimeSeconds,
+        expires_in: notAfter - nowSeconds,
         scope: 'mcp:tools',
         delegated_agent_id: identity.agent_id,
         sb_id: identity.id,

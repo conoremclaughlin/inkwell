@@ -5,7 +5,7 @@
  * tools) and validates stateless request handling via fetch.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import { verifyInkAccessToken } from '../auth/ink-tokens';
 
 const mockVerifyAccessToken = vi.fn();
@@ -23,6 +23,26 @@ vi.mock('../config/env', async () => ({
     SUPABASE_ANON_KEY: 'test-anon-key',
   },
 }));
+
+// The real signer, with one switch: move the clock on by N seconds at the
+// moment of signing, the boundary Lumen's 9372b0c7 probe found.
+const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0 }));
+vi.mock('../auth/ink-tokens', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../auth/ink-tokens')>();
+  return {
+    ...actual,
+    signInkAccessToken: (...args: Parameters<typeof actual.signInkAccessToken>) => {
+      if (!signerClock.advanceSecondsAtSigning) return actual.signInkAccessToken(...args);
+      const later = Date.now() + signerClock.advanceSecondsAtSigning * 1000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+      try {
+        return actual.signInkAccessToken(...args);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  };
+});
 
 vi.mock('../utils/logger', () => ({
   logger: {
@@ -609,6 +629,11 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       // Every other test here returns early when the server could not bind;
       // these must run or fail, never pass by skipping.
       expect(serverUnavailableError).toBeNull();
+      signerClock.advanceSecondsAtSigning = 0;
+    });
+
+    afterEach(() => {
+      signerClock.advanceSecondsAtSigning = 0;
     });
 
     it('refuses an SB-bound token asking for another SB of the same user', async () => {
@@ -689,6 +714,21 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
 
       expect(status).toBe(200);
       expect(body.expires_in).toBeLessThanOrEqual(600);
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access') as {
+        exp?: number;
+      } | null;
+      expect(payload?.exp).toBeLessThanOrEqual(presentedExp);
+    });
+
+    it('never outlives the presenting token across a second boundary at signing', async () => {
+      const presentedExp = nowSeconds() + 600;
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, expiresAt: presentedExp });
+      delegatedIdentity = SB_ALPHA;
+      signerClock.advanceSecondsAtSigning = 1;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
       const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access') as {
         exp?: number;
       } | null;
