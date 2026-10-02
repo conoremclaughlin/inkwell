@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../data/composer';
 import type { User } from '../data/models/user.model';
 import { logger } from '../utils/logger';
-import { getUserFromContext } from '../utils/request-context';
+import { getAuthenticatedPrincipal, getUserFromContext } from '../utils/request-context';
 import { withSupabaseRetry } from '../utils/supabase-retry';
 
 /**
@@ -76,17 +76,149 @@ export interface ResolvedUser {
 }
 
 /**
+ * An explicit identifier named someone other than the authenticated caller.
+ *
+ * The message is the same whether or not the named account exists, and it
+ * never repeats the identifier, so a refusal cannot be used to probe for
+ * accounts.
+ */
+export class PrincipalMismatchError extends Error {
+  constructor() {
+    super(
+      'The user identifier does not match the authenticated user. ' +
+        'Omit userId, email, phone and platform to act as yourself.'
+    );
+    this.name = 'PrincipalMismatchError';
+  }
+}
+
+type IdentifierKind = ResolvedUser['resolvedBy'];
+
+/** The explicit identifiers present, in resolution priority order. */
+function explicitIdentifierKinds(identifier: UserIdentifier): IdentifierKind[] {
+  const kinds: IdentifierKind[] = [];
+  if (identifier.userId) kinds.push('userId');
+  if (identifier.email) kinds.push('email');
+  if (identifier.platform && identifier.platformId) kinds.push('platform');
+  if (identifier.phone) kinds.push('phone');
+  return kinds;
+}
+
+function normalizeEmail(email: string | null | undefined): string | undefined {
+  const normalized = email?.trim().toLowerCase();
+  return normalized || undefined;
+}
+
+/**
+ * Does this identifier name `user`? Each comparison mirrors the repository
+ * lookup it replaces, so a caller's own identifier matches exactly when it
+ * would have found their row. Email is compared case-insensitively, and also
+ * against the email in the verified token, so a renamed account still matches
+ * the identifier mergeWithContext fills in from that token.
+ */
+function identifierNamesUser(
+  kind: IdentifierKind,
+  identifier: UserIdentifier,
+  user: User,
+  principal: { userId: string; email?: string }
+): boolean {
+  switch (kind) {
+    case 'userId':
+      return identifier.userId === user.id;
+    case 'email': {
+      const email = normalizeEmail(identifier.email);
+      return email === normalizeEmail(user.email) || email === normalizeEmail(principal.email);
+    }
+    case 'phone':
+      return !!user.phone_number && identifier.phone === user.phone_number;
+    case 'platform': {
+      const platformId = identifier.platformId!;
+      switch (identifier.platform) {
+        case 'telegram':
+          return user.telegram_id !== null && user.telegram_id === parseInt(platformId, 10);
+        case 'whatsapp':
+          return !!user.whatsapp_id && user.whatsapp_id === platformId;
+        case 'discord':
+          return !!user.discord_id && user.discord_id === platformId;
+        default:
+          return false;
+      }
+    }
+  }
+}
+
+function refuseIdentifier(
+  principal: { userId: string },
+  identifier: UserIdentifier,
+  mismatched: IdentifierKind[]
+): never {
+  logger.warn('Refused a user identifier that does not name the authenticated principal', {
+    principalUserId: principal.userId,
+    mismatched,
+    ...(mismatched.includes('userId') ? { requestedUserId: identifier.userId } : {}),
+  });
+  throw new PrincipalMismatchError();
+}
+
+/**
+ * Resolve the caller when the request carries an authenticated principal.
+ *
+ * The principal is who the call acts as. Explicit identifiers are still
+ * accepted, because many callers pass their own, but every one of them must
+ * name the principal or the call is refused. Only the principal's own row is
+ * read: another account is never looked up.
+ */
+async function resolveAuthenticatedUser(
+  identifier: UserIdentifier,
+  principal: { userId: string; email?: string },
+  dataComposer: DataComposer
+): Promise<ResolvedUser | null> {
+  const kinds = explicitIdentifierKinds(identifier);
+
+  // Settled without a read, so a foreign userId costs no lookup at all.
+  if (identifier.userId && identifier.userId !== principal.userId) {
+    refuseIdentifier(principal, identifier, ['userId']);
+  }
+
+  const user = await withSupabaseRetry(
+    () => dataComposer.repositories.users.findById(principal.userId),
+    { label: 'resolveUser.findById' }
+  );
+  if (!user) {
+    // A verified token for a user row that no longer exists. Falling back to
+    // the token's email could land on a different row provisioned since.
+    logger.warn('Authenticated principal has no user row', { principalUserId: principal.userId });
+    return null;
+  }
+
+  const mismatched = kinds.filter(
+    (kind) => !identifierNamesUser(kind, identifier, user, principal)
+  );
+  if (mismatched.length > 0) refuseIdentifier(principal, identifier, mismatched);
+
+  return { user, resolvedBy: kinds[0] ?? 'userId' };
+}
+
+/**
  * Resolves a user from various identifiers.
  * Tries identifiers in priority order: userId > email > platform > phone
  *
- * If no explicit identifiers are provided, falls back to:
+ * With an authenticated principal in the request context, resolves that
+ * principal and refuses any explicit identifier that names someone else
+ * (PrincipalMismatchError).
+ *
+ * Without one, explicit identifiers resolve directly, and if none are given
+ * it falls back to:
  * - Request context (from web dashboard JWT auth)
- * - Session context (from bootstrap() call)
+ * - Session context (from bootstrap() call), outside a request only
  */
 export async function resolveUser(
   identifier: UserIdentifier,
   dataComposer: DataComposer
 ): Promise<ResolvedUser | null> {
+  const principal = getAuthenticatedPrincipal();
+  if (principal) return resolveAuthenticatedUser(identifier, principal, dataComposer);
+
   const usersRepo = dataComposer.repositories.users;
 
   // Merge with context if no explicit identifiers provided
