@@ -34,13 +34,19 @@
  * the denies, and since deny wins across sources (documented, not
  * measured) delivering them only adds restrictions.
  *
+ * THE OUTPUT DIRECTORY is created with mode 0700 when absent, but an
+ * existing one's owner and mode are not checked. That is moot on macOS,
+ * whose temp directory is per user; on a shared Linux /tmp the runner
+ * should be given a directory of its own. Files a crash leaves behind are
+ * never swept; they are 0600 and hold rules only.
+ *
  * FAILS CLOSED. An unknown profile, an owner that cannot name a scratch
  * path, a root that is not absolute, or a worktree settings file that cannot
  * be read throws, and the runner fails the launch. Never a builder default.
  */
 
 import { randomUUID } from 'crypto';
-import { access, mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { access, lstat, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { isAbsolute, join, normalize, resolve } from 'path';
 import { studioPermissionRules, type StudioPermissionProfile } from '@inklabs/shared';
@@ -154,6 +160,11 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
       `execution root must be an absolute, normalized directory: ${root}`
     );
   }
+  // The root is placed inside path rules unescaped; a glob metacharacter in
+  // it would widen them (review 44db8c0c, P3).
+  if (/[[\]*?{}]/.test(root)) {
+    throw new LaunchSettingsError(`execution root contains a glob metacharacter: ${root}`);
+  }
 
   let generated: ReturnType<typeof studioPermissionRules>;
   try {
@@ -162,10 +173,22 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
     throw new LaunchSettingsError(error instanceof Error ? error.message : String(error));
   }
 
-  // The worktree's own policy, as authored on disk.
-  const localPath = join(req.worktreePath, '.claude', 'settings.local.json');
+  // The worktree's own policy, as authored on disk. Read only as a regular
+  // file in a real `.claude` directory: a checkout under review can ship a
+  // link to a FIFO (the read would hang the launch) or to an endless device
+  // (review 44db8c0c, P3). lstat sees the link itself, as the CLI does.
+  const claudeDir = join(req.worktreePath, '.claude');
+  const localPath = join(claudeDir, 'settings.local.json');
+  const dirStat = await lstat(claudeDir).catch(() => null);
+  if (dirStat && !dirStat.isDirectory()) {
+    throw new LaunchSettingsError(`${claudeDir} is not a directory (a link is refused)`);
+  }
+  const fileStat = dirStat ? await lstat(localPath).catch(() => null) : null;
+  if (fileStat && !fileStat.isFile()) {
+    throw new LaunchSettingsError(`${localPath} is not a regular file (a link is refused)`);
+  }
   let authored = false;
-  if (await exists(localPath)) {
+  if (fileStat) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(await readFile(localPath, 'utf-8'));

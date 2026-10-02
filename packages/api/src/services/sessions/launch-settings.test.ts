@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
@@ -201,6 +202,59 @@ describe('the launch fails closed, never falling back to builder', () => {
       expect(existsSync(out) ? readdirSync(out) : []).toEqual([]);
     });
   }
+});
+
+describe('the worktree settings are read only as a regular file in a real directory (review 44db8c0c, P3)', () => {
+  // A checkout under review can ship a link: to a FIFO it would hang the
+  // launch, to /dev/zero it would read without end. A directory stands in
+  // for "not a regular file", so a broken guard fails here instead of hanging.
+  const outside = () => {
+    const dir = join(root, 'outside');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'settings.local.json'), JSON.stringify({ permissions: {} }));
+    return dir;
+  };
+  const refusals: Array<[string, () => void]> = [
+    [
+      'settings.local.json is a symlink',
+      () =>
+        symlinkSync(
+          join(outside(), 'settings.local.json'),
+          join(worktree, '.claude', 'settings.local.json')
+        ),
+    ],
+    [
+      '.claude is a symlink',
+      () => {
+        rmSync(join(worktree, '.claude'), { recursive: true, force: true });
+        symlinkSync(outside(), join(worktree, '.claude'));
+      },
+    ],
+    [
+      'settings.local.json is not a regular file',
+      () => mkdirSync(join(worktree, '.claude', 'settings.local.json')),
+    ],
+  ];
+  for (const [name, arrange] of refusals) {
+    it(`${name}: refused, and no file written`, async () => {
+      arrange();
+      await expect(launch.prepareLaunchSettings(request())).rejects.toBeInstanceOf(
+        launch.LaunchSettingsError
+      );
+      expect(existsSync(out) ? readdirSync(out) : []).toEqual([]);
+    });
+  }
+
+  it('a worktree path with a glob metacharacter is refused: it would widen the rendered rules', async () => {
+    for (const name of ['repo--a[1]', 'repo--a*', 'repo--a?', 'repo--{a,b}']) {
+      const odd = join(root, name);
+      mkdirSync(join(odd, '.claude'), { recursive: true });
+      await expect(
+        launch.prepareLaunchSettings(request({ worktreePath: odd, studioWorktreePath: odd })),
+        name
+      ).rejects.toBeInstanceOf(launch.LaunchSettingsError);
+    }
+  });
 });
 
 describe('the effective sources are recorded, precedence labelled documented, not measured', () => {
