@@ -78,7 +78,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '../data/supabase/types.js';
+import type { Database, Json } from '../data/supabase/types.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -165,6 +165,23 @@ export interface NoticeKey {
   failedBeats?: number;
 }
 
+/**
+ * What a held notice needs to be sent later without rerunning its reminder:
+ * the direct send, exactly as it would have gone out.
+ */
+export interface HeldNoticePayload {
+  channel: string;
+  target: string;
+  content: string;
+}
+
+/** A notice held for the user's quiet hours (task 2301cb3c). */
+export interface NoticeHold {
+  /** When the window was due to end at the moment of the hold. Display only. */
+  heldUntil: string;
+  payload: HeldNoticePayload;
+}
+
 /** An all-clear we still owe, reconstructed from its outage row. */
 export interface OwedRecovery {
   episodeKey: string;
@@ -233,6 +250,20 @@ export interface HeartbeatNotificationStore {
    * outcome rule the rest of this module turns on.
    */
   closeEpisode(key: NoticeKey): Promise<void>;
+  /**
+   * Hold a due notice for the user's quiet hours, and hand it to the drain.
+   *
+   * A hold is not an attempt and not a delivery: it touches no attempt count,
+   * status, backoff or episode. It records why (`hold_reason`), when the window
+   * was due to end (`held_until`, display only), what to send (`payload`), and
+   * marks the row `drain_owned`, which stays set until the notice is
+   * delivered. `next_attempt_at` stays the channel-retry backoff, so quiet
+   * hours changed or disabled later can release the notice at once.
+   *
+   * Returns whether the hold was persisted. The caller holds either way: a
+   * known quiet-hours hold is never overridden by a store failure.
+   */
+  holdNotice(key: NoticeKey, hold: NoticeHold): Promise<boolean>;
 }
 
 interface NoticeRow {
@@ -909,6 +940,65 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  const holdNotice: HeartbeatNotificationStore['holdNotice'] = async (key, hold) => {
+    const patch = {
+      hold_reason: 'quiet-hours',
+      held_until: hold.heldUntil,
+      drain_owned: true,
+      payload: hold.payload as unknown as Json,
+    };
+    try {
+      const { data, error } = await table()
+        .update(patch)
+        .eq('reminder_id', key.reminderId)
+        .eq('kind', key.kind)
+        .eq('episode_key', key.episodeKey)
+        .select('id');
+
+      if (error) {
+        logger.error(
+          '[Heartbeat] Could not record a quiet-hours hold — the notice is held unrecorded',
+          {
+            reminderId: key.reminderId,
+            kind: key.kind,
+            error: error.message,
+          }
+        );
+        return false;
+      }
+      if (((data as { id: string }[] | null)?.length ?? 0) > 0) return true;
+
+      // claimNotice creates the row before any send, so a zero-row UPDATE means
+      // that INSERT failed. Rebuild it, as settleNotice does, so the drain can
+      // still find what it owes.
+      const created = await insertNotice(key);
+      if (!created) {
+        logger.error('[Heartbeat] Quiet-hours hold matched no row and none could be created', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+        return false;
+      }
+      const { error: patchError } = await table().update(patch).eq('id', created.id);
+      if (patchError) {
+        logger.error('[Heartbeat] Could not record a hold on the recreated notice row', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: patchError.message,
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.error('[Heartbeat] Recording a quiet-hours hold threw', {
+        reminderId: key.reminderId,
+        kind: key.kind,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  };
+
   return {
     openEpisode,
     claimNotice,
@@ -916,5 +1006,6 @@ export function createHeartbeatNotificationStore(
     markCoveredBySibling,
     findOwedRecovery,
     closeEpisode,
+    holdNotice,
   };
 }

@@ -14,7 +14,7 @@
 
 import * as cron from 'node-cron';
 import { randomUUID } from 'node:crypto';
-import { effectiveDeliveryTime, effectiveTimezone, isWithinQuietHours } from './quiet-hours.js';
+import { quietHoursAt } from './quiet-hours.js';
 import { mayRunDuringQuietHours } from './reminder-quiet-hours.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -1108,14 +1108,11 @@ async function quietHoursNow(
   // SERVER's clock — while selecting the user's `timezone` column and never
   // using it, under a comment conceding "timezone handling can be enhanced".
   // Correct only while the server runs on the user's own machine.
-  const window = { start: state.quiet_start, end: state.quiet_end, timezone: state.timezone };
-  const now = new Date();
-  if (!isWithinQuietHours(now, window)) return { quiet: false };
-  return {
-    quiet: true,
-    until: effectiveDeliveryTime(now, window),
-    timezone: effectiveTimezone(state.timezone),
-  };
+  return quietHoursAt(new Date(), {
+    start: state.quiet_start,
+    end: state.quiet_end,
+    timezone: state.timezone,
+  });
 }
 
 /**

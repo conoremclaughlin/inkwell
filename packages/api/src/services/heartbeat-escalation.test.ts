@@ -10,9 +10,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createHeartbeatEscalation } from './heartbeat-escalation.js';
+import {
+  createHeartbeatEscalation,
+  createQuietGate,
+  type QuietGateDecision,
+} from './heartbeat-escalation.js';
 import { backoffForAttempt } from './heartbeat-notification-store.js';
 import type { DueReminder } from './heartbeat.js';
+import { logger } from '../utils/logger.js';
 
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -33,6 +38,11 @@ interface FakeRow {
   failedBeats: number;
   nextAttemptAt: number | null;
   episodeClosedAt: string | null;
+  // Quiet-hours hold (task 2301cb3c).
+  holdReason?: string | null;
+  heldUntil?: string | null;
+  drainOwned?: boolean;
+  payload?: unknown;
 }
 
 /**
@@ -151,6 +161,25 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
       }
       return null;
     }),
+    // Mirrors the real store: a hold touches nothing but the hold fields.
+    holdNotice: vi.fn(
+      async (key: never, hold: { heldUntil: string; payload: unknown }): Promise<boolean> => {
+        const k = keyOf(key);
+        const row = rows.get(k) ?? {
+          status: 'pending',
+          attempts: 0,
+          failedBeats: 0,
+          nextAttemptAt: null,
+          episodeClosedAt: null,
+        };
+        row.holdReason = 'quiet-hours';
+        row.heldUntil = hold.heldUntil;
+        row.drainOwned = true;
+        row.payload = hold.payload;
+        rows.set(k, row);
+        return true;
+      }
+    ),
   };
   return store;
 }
@@ -1175,5 +1204,179 @@ describe('heartbeat escalation', () => {
     // The tail is still there — this keeps both ends, it does not swap which
     // end gets lost.
     expect(content).toContain('at step9');
+  });
+});
+
+/**
+ * The quiet-hours gate on direct notices (task 2301cb3c).
+ *
+ * A reminder allowed to run overnight can fail overnight. Its outage notice,
+ * and later its all-clear, must wait for quiet hours to end. The gate runs
+ * after claimNotice and immediately before the send.
+ */
+describe('notices wait out quiet hours', () => {
+  let sendToChannel: ReturnType<typeof vi.fn>;
+  const HOLD: QuietGateDecision = {
+    kind: 'hold',
+    until: new Date('2026-09-02T15:00:00.000Z'),
+    timezone: 'America/Los_Angeles',
+  };
+  const outageKey = `rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`;
+  const recoveryKey = `rem-001|recovery|${FIRST_FOR_DESTINATION.episodeKey}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendToChannel = vi.fn().mockResolvedValue(undefined);
+  });
+
+  const escalation = (store: ReturnType<typeof makeFakeStore>, decision: QuietGateDecision) =>
+    createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: vi.fn().mockResolvedValue(decision),
+    });
+
+  it('holds an outage notice during quiet hours: no send, no attempt, handed to the drain', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, HOLD);
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.settleNotice).not.toHaveBeenCalled();
+    const row = store.rows.get(outageKey);
+    expect(row).toMatchObject({
+      status: 'pending',
+      attempts: 0,
+      nextAttemptAt: null,
+      holdReason: 'quiet-hours',
+      heldUntil: '2026-09-02T15:00:00.000Z',
+      drainOwned: true,
+    });
+    expect(row?.payload).toMatchObject({ channel: 'telegram', target: '123456789' });
+    expect((row?.payload as { content: string }).content).toContain('Heartbeat FAILED');
+  });
+
+  it('control: the same failure with quiet hours clear is sent at once', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, { kind: 'clear' });
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(store.holdNotice).not.toHaveBeenCalled();
+  });
+
+  it('an unreadable quiet-hours setting sends, and says so', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, { kind: 'unreadable', error: 'db down' });
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(store.holdNotice).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('quiet-policy-unreadable'),
+      expect.objectContaining({ error: 'db down' })
+    );
+  });
+
+  it('a hold the store could not record is still a hold', async () => {
+    const store = makeFakeStore();
+    store.holdNotice.mockResolvedValueOnce(false);
+    const { onFailure } = escalation(store, HOLD);
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('hold was not recorded'),
+      expect.anything()
+    );
+  });
+
+  it('holds an all-clear during quiet hours and leaves the episode open', async () => {
+    // The outage was announced, so an all-clear is owed.
+    const store = makeFakeStore({ [outageKey]: { status: 'delivered' } });
+    const { onRecovery } = escalation(store, HOLD);
+
+    const result = await onRecovery(makeReminder(), 3, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+    expect(store.rows.get(outageKey)?.episodeClosedAt).toBeNull();
+    expect(store.rows.get(recoveryKey)).toMatchObject({
+      attempts: 0,
+      drainOwned: true,
+      holdReason: 'quiet-hours',
+    });
+    expect((store.rows.get(recoveryKey)?.payload as { content: string }).content).toContain(
+      'Heartbeat recovered'
+    );
+  });
+});
+
+describe('createQuietGate', () => {
+  const clientWith = (result: { data?: unknown; error?: { message: string } | null }) =>
+    ({
+      from: () => ({
+        select: () => ({
+          eq: () => ({ maybeSingle: vi.fn().mockResolvedValue(result) }),
+        }),
+      }),
+    }) as never;
+
+  const WINDOW = {
+    quiet_start: '22:00:00',
+    quiet_end: '08:00:00',
+    timezone: 'America/Los_Angeles',
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+  });
+
+  it('holds inside the window, until its end', async () => {
+    vi.setSystemTime(new Date('2026-09-02T09:00:00Z')); // 02:00 PDT
+    const decision = await createQuietGate(clientWith({ data: WINDOW, error: null }))('u1');
+    expect(decision).toEqual({
+      kind: 'hold',
+      until: new Date('2026-09-02T15:00:00.000Z'),
+      timezone: 'America/Los_Angeles',
+    });
+    vi.useRealTimers();
+  });
+
+  it('is clear outside the window, and with no quiet hours set', async () => {
+    vi.setSystemTime(new Date('2026-09-02T20:00:00Z')); // 13:00 PDT
+    expect(await createQuietGate(clientWith({ data: WINDOW, error: null }))('u1')).toEqual({
+      kind: 'clear',
+    });
+    expect(await createQuietGate(clientWith({ data: null, error: null }))('u1')).toEqual({
+      kind: 'clear',
+    });
+    vi.useRealTimers();
+  });
+
+  it('is unreadable on a read error and on a throw, never clear', async () => {
+    expect(
+      await createQuietGate(clientWith({ data: null, error: { message: 'boom' } }))('u1')
+    ).toEqual({ kind: 'unreadable', error: 'boom' });
+    const throwing = {
+      from: () => {
+        throw new Error('no client');
+      },
+    } as never;
+    expect(await createQuietGate(throwing)('u1')).toEqual({
+      kind: 'unreadable',
+      error: 'no client',
+    });
+    vi.useRealTimers();
   });
 });

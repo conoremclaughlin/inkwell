@@ -92,8 +92,52 @@ import type {
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import type { HeartbeatNotificationStore, NoticeKey } from './heartbeat-notification-store.js';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
+import { quietHoursAt } from './quiet-hours.js';
 import { classifyError, failureExcerpt, DISPLAY_EXCERPT } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
+
+/**
+ * Whether a direct notice may go out right now (task 2301cb3c).
+ *
+ * - hold: the user is in quiet hours. The notice is held and sent when they
+ *   end. A known hold always holds.
+ * - clear: send.
+ * - unreadable: the quiet-hours setting could not be read. Send, which is the
+ *   same availability tradeoff alert-dispatch makes ("failing to read quiet
+ *   hours must not silence an alert"), logged so it is never mistaken for a
+ *   verified clear window.
+ */
+export type QuietGateDecision =
+  | { kind: 'hold'; until: Date; timezone: string }
+  | { kind: 'clear' }
+  | { kind: 'unreadable'; error: string };
+
+/** The default gate: the user's `heartbeat_state` quiet window, evaluated now. */
+export function createQuietGate(
+  client: SupabaseClient<Database>
+): (userId: string) => Promise<QuietGateDecision> {
+  return async (userId) => {
+    try {
+      const { data, error } = await client
+        .from('heartbeat_state')
+        .select('quiet_start, quiet_end, timezone')
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (error) return { kind: 'unreadable', error: error.message };
+      if (!data?.quiet_start || !data?.quiet_end) return { kind: 'clear' };
+      const verdict = quietHoursAt(new Date(), {
+        start: data.quiet_start,
+        end: data.quiet_end,
+        timezone: data.timezone,
+      });
+      return verdict.quiet
+        ? { kind: 'hold', until: verdict.until, timezone: verdict.timezone }
+        : { kind: 'clear' };
+    } catch (err) {
+      return { kind: 'unreadable', error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+}
 
 /**
  * Channels we will send an unsolicited outage alert over.
@@ -124,6 +168,11 @@ export interface HeartbeatEscalationDeps {
    * the streak bug survived sixty-one passing tests.
    */
   store?: HeartbeatNotificationStore;
+  /**
+   * Evaluated immediately before every direct send. Injectable for tests;
+   * defaults to the user's quiet window from `heartbeat_state`.
+   */
+  quietGate?: (userId: string) => Promise<QuietGateDecision>;
 }
 
 export interface HeartbeatEscalation {
@@ -134,6 +183,60 @@ export interface HeartbeatEscalation {
 export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): HeartbeatEscalation {
   const { client, sendToChannel, defaultSlug } = deps;
   const store = deps.store ?? createHeartbeatNotificationStore(client);
+  const quietGate = deps.quietGate ?? createQuietGate(client);
+
+  /**
+   * Hold a notice that is about to be sent, if the user is in quiet hours.
+   *
+   * Runs after claimNotice has said the notice is due and immediately before
+   * the send, so a notice claimed just before quiet hours and sent just after
+   * they start is still held. Returns true when the notice was held, in which
+   * case the caller sends nothing and settles nothing: a hold is not an
+   * attempt. The drain sends it when quiet hours end.
+   */
+  const holdForQuietHours = async (
+    reminder: DueReminder,
+    key: NoticeKey,
+    content: string
+  ): Promise<boolean> => {
+    const gate = await quietGate(reminder.user_id);
+    if (gate.kind === 'clear') return false;
+    if (gate.kind === 'unreadable') {
+      logger.warn('[Heartbeat] quiet-policy-unreadable — sending the notice anyway', {
+        reminderId: reminder.id,
+        kind: key.kind,
+        error: gate.error,
+      });
+      return false;
+    }
+
+    const persisted = await store.holdNotice(key, {
+      heldUntil: gate.until.toISOString(),
+      payload: {
+        channel: reminder.delivery_channel,
+        target: reminder.delivery_target ?? '',
+        content,
+      },
+    });
+    const fields = {
+      reminderId: reminder.id,
+      kind: key.kind,
+      heldUntil: gate.until.toISOString(),
+      timezone: gate.timezone,
+    };
+    if (persisted) {
+      logger.info(
+        '[Heartbeat] Notice held for quiet hours — the drain sends it when they end',
+        fields
+      );
+    } else {
+      // Still held. A known quiet-hours hold is never overridden by a store
+      // failure (Lumen, review of task 2301cb3c); the store has already logged
+      // why it could not record it.
+      logger.error('[Heartbeat] Notice held for quiet hours but the hold was not recorded', fields);
+    }
+    return true;
+  };
 
   /**
    * Whether this reminder has anywhere to send an unsolicited notice.
@@ -396,13 +499,17 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const alert = await alertOwnerDirectly(
-      reminder,
+    const outageContent =
       `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
-        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
-        `Whatever this beat monitors is NOT being checked. ` +
-        `I will send one more message when it runs again.`
-    );
+      `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
+      `Whatever this beat monitors is NOT being checked. ` +
+      `I will send one more message when it runs again.`;
+
+    if (await holdForQuietHours(reminder, key, outageContent)) {
+      return { alerted: false };
+    }
+
+    const alert = await alertOwnerDirectly(reminder, outageContent);
 
     // Settle before returning: an unrecorded successful send would re-alert on
     // the next beat, and an unrecorded failure would never be retried.
@@ -463,11 +570,15 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const alert = await alertOwnerDirectly(
-      reminder,
+    const recoveryContent =
       `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
-        `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`
-    );
+      `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`;
+
+    if (await holdForQuietHours(reminder, key, recoveryContent)) {
+      return { alerted: false };
+    }
+
+    const alert = await alertOwnerDirectly(reminder, recoveryContent);
 
     await store.settleNotice(key, { delivered: alert.sent, error: alert.reason });
 
