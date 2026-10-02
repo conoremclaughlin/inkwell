@@ -7,6 +7,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
@@ -892,12 +894,27 @@ describe('SessionService', () => {
 
     describe('an inkling turn starts only in the owner test (Lumen 97b1d66a)', () => {
       const OWNER = '11111111-1111-4111-8111-111111111111';
+      const SB = '3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10';
       const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
       const fromOwner = { sender: { id: 'user', name: 'Owner' } };
+      let inklingsRoot: string;
 
-      afterEach(() => {
-        vi.unstubAllEnvs();
+      beforeEach(async () => {
+        inklingsRoot = await mkdtemp(join(tmpdir(), 'inklings-'));
       });
+
+      afterEach(async () => {
+        vi.unstubAllEnvs();
+        await rm(inklingsRoot, { recursive: true, force: true });
+      });
+
+      const cwdPassedToRunner = () =>
+        (
+          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+            string,
+            { config: { workingDirectory?: string } },
+          ]
+        )[1].config.workingDirectory;
 
       /** A turn for sb-1 (with `metadata`) on OWNER's account, the gate set to `gate`. */
       const turn = async (
@@ -907,7 +924,11 @@ describe('SessionService', () => {
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
         const supabase = makeFakeSupabase({
-          agent_identities: [{ id: 'sb-1', user_id: OWNER, sandbox_bypass: false, metadata }],
+          // agent_id is the request's slug, as an inkling's own slug is: routing
+          // resolves the identity by it.
+          agent_identities: [
+            { id: SB, agent_id: 'myra', user_id: OWNER, sandbox_bypass: false, metadata },
+          ],
           studios: [],
         });
         const service = new SessionService(
@@ -915,14 +936,14 @@ describe('SessionService', () => {
           mockContextBuilder,
           mockClaudeRunner,
           mockActivityStream,
-          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
           mockCodexRunner,
           supabase,
           undefined,
           mockInkRunner
         );
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ sbId: 'sb-1', userId: OWNER } as never)
+          createMockSession({ sbId: SB, userId: OWNER } as never)
         );
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
       };
@@ -931,6 +952,39 @@ describe('SessionService', () => {
         const result = await turn(INKLING);
         expect(mockClaudeRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it('its turn runs in its own folder, made on demand: never the default directory', async () => {
+        await turn(INKLING);
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        // This file mocks fs/promises' stat; the folder check needs the real one.
+        const fs = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+        expect((await fs.stat(join(inklingsRoot, SB))).isDirectory()).toBe(true);
+      });
+
+      it('a threaded message is placed in its folder, not held for want of a studio', async () => {
+        const result = await turn(INKLING, {
+          ...fromOwner,
+          metadata: { threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d' },
+        });
+        expect(result.errorCode).not.toBe('ROUTING_REFUSED');
+        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+      });
+
+      it('a named studio or hint cannot put it in a worktree: its folder wins first', async () => {
+        for (const named of [
+          { studioId: '77777777-7777-4777-8777-777777777777' },
+          { studioHint: 'some-studio' },
+        ]) {
+          vi.mocked(mockClaudeRunner.run).mockClear();
+          const result = await turn(INKLING, {
+            ...fromOwner,
+            metadata: { threadKey: 'chat:conversation-named', ...named },
+          });
+          expect(result.errorCode, JSON.stringify(named)).not.toBe('ROUTING_REFUSED');
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        }
       });
 
       it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {

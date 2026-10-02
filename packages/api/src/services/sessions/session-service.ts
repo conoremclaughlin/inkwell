@@ -79,6 +79,8 @@ import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import { inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
+import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import { inklingOwnerTestUserId } from '../../config/inkling-flags.js';
 
 /**
@@ -87,6 +89,8 @@ import { inklingOwnerTestUserId } from '../../config/inkling-flags.js';
 export interface SessionServiceConfig {
   /** Default working directory for Claude Code */
   defaultWorkingDirectory: string;
+  /** Where inklings' own folders are made; ~/.ink/inklings unless given (tests). */
+  inklingsRoot?: string;
   /** Path to MCP config file */
   mcpConfigPath: string;
   /** Optional explicit model override for Claude backend */
@@ -370,6 +374,8 @@ export interface StudioRoutingDecision {
     | 'project-repo-reuse'
     | 'project-repo-created'
     | 'main-fallback'
+    /** An inkling: no studio, ever; its turns run in its own folder. */
+    | 'inkling-folder'
     | 'refused'
     | 'none';
   /**
@@ -1928,7 +1934,8 @@ export class SessionService implements ISessionService {
     const formattedMessage = this.formatMessage(request, injectedContext.user.timezone);
 
     // Resolve working directory from studio when available.
-    const resolvedWorkingDirectory = await this.resolveWorkingDirectory(
+    // An inkling's turn moves to its own folder below, once its identity is read.
+    let resolvedWorkingDirectory = await this.resolveWorkingDirectory(
       userId,
       sbSlug,
       session.studioId
@@ -2013,6 +2020,20 @@ export class SessionService implements ISessionService {
             retryable: false,
           },
         };
+      }
+
+      // An inkling's turn runs in its own folder, never the Inkwell checkout
+      // or the server's default directory (organisation, not isolation:
+      // inkling-folder.ts). Routing gave it no studio to resolve from.
+      if (
+        session.sbId &&
+        (identity?.metadata as Record<string, unknown> | null | undefined)?.client ===
+          INKLING_CLIENT
+      ) {
+        resolvedWorkingDirectory = await ensureInklingFolder(
+          session.sbId,
+          this.config.inklingsRoot ?? inklingsRoot()
+        );
       }
 
       const parsed = parseRuntimeConfig(identity?.metadata);
@@ -3875,6 +3896,16 @@ export class SessionService implements ISessionService {
     return this.withStudioLease(session, routing, leaseCtx);
   }
 
+  /** Whether this identity is an inkling. An unreadable row is not one: its turn is still checked at the seam. */
+  private async isInklingIdentity(sbId: string): Promise<boolean> {
+    const { data } = await this.supabase!.from('agent_identities')
+      .select('metadata')
+      .eq('id', sbId)
+      .maybeSingle();
+    const metadata = (data as { metadata?: Record<string, unknown> | null } | null)?.metadata;
+    return metadata?.client === INKLING_CLIENT;
+  }
+
   private async resolveStudioId(
     userId: string,
     sbSlug: string,
@@ -3968,6 +3999,15 @@ export class SessionService implements ISessionService {
       // identity is genuinely absent — nothing to confuse it with.
       return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', sbSlug)) as T;
     };
+
+    // An inkling has no studio and never takes one: its turns run in its own
+    // folder, which processMessage sets once it has read the identity. Placed
+    // before every tier, explicit ones included, so no studio hint, route
+    // pattern or continuity row can put it in a worktree, and its threaded
+    // message is placed rather than held for want of a studio.
+    if (this.supabase && options.sbId && (await this.isInklingIdentity(options.sbId))) {
+      return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+    }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
