@@ -120,6 +120,40 @@ describe('applyPermissionOverlay', () => {
 
     await expect(access(join(tempDir, '.claude', 'settings.local.json'))).rejects.toThrow();
   });
+
+  it('merges into the existing object: ask, defaultMode and other keys survive (review 4177f7fe)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    await writeFile(
+      join(tempDir, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        permissions: { ask: ['Bash(*)'], defaultMode: 'plan', additionalDirectories: ['/x'] },
+        model: 'kept',
+      })
+    );
+    const restore = await applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] });
+    const settings = JSON.parse(
+      await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8')
+    );
+    expect(settings.permissions).toEqual({
+      ask: ['Bash(*)'],
+      defaultMode: 'plan',
+      additionalDirectories: ['/x'],
+      allow: ['Bash(ls)'],
+      deny: [],
+    });
+    expect(settings.model).toBe('kept');
+    await restore();
+  });
+
+  it('refuses a malformed settings file and leaves its bytes', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    for (const content of ['{ "permissions": ', '[1]']) {
+      await writeFile(path, content);
+      await expect(applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] })).rejects.toThrow();
+      expect(await readFile(path, 'utf-8')).toBe(content);
+    }
+  });
 });
 
 /**

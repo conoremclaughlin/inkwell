@@ -18,6 +18,7 @@ interface ClaudeSettings {
   permissions?: {
     allow?: string[];
     deny?: string[];
+    [key: string]: unknown;
   };
   hooks?: Record<string, unknown>;
   enableAllProjectMcpServers?: boolean;
@@ -43,16 +44,23 @@ export interface PermissionOverlay {
 /**
  * Apply a temporary permission overlay to `.claude/settings.local.json`.
  *
- * Merges the overlay rules into the existing settings (deduplicating).
- * Returns a restore function that writes back the original content.
- * Call the restore function when the session process exits.
+ * Merges the overlay rules into the existing `permissions` object
+ * (deduplicating), keeping every other key in it, `ask` and `defaultMode`
+ * included, and every key outside it. Returns a restore function that
+ * writes back the original content. Call the restore function when the
+ * session process exits. A settings file that cannot be parsed is refused
+ * (throws), never overwritten.
  *
- * ADDITIVE ONLY: an overlay never lifts a deny. Existing denies are kept
- * and overlay denies are added; an overlay allow that matches a kept deny
- * does nothing, because Claude Code evaluates deny before allow. So a
- * studio profile's denies (push, installs, PR and database writes) cannot
- * be granted away through here, and that is deliberate (design v3, item 2;
- * Lumen, 056b36e7). This overlay edits one worktree-wide file and restores
+ * It never REMOVES a deny: existing denies are kept and overlay denies are
+ * added. An overlay allow that matches a kept deny is inert because Claude
+ * Code evaluates deny before allow; that precedence is documented, not
+ * measured (Claude Code docs, permissions, "Manage permissions"). So a
+ * studio profile's denies (push forms, installs, PR and database writes)
+ * cannot be granted away through here, deliberately (design v3, item 2;
+ * Lumen, 056b36e7). What the overlay does change is the file for the life
+ * of a spawn, and a crash that skips the restore leaves the merged object
+ * behind, which `ink init` then keeps as authored policy. This overlay
+ * edits one worktree-wide file and restores
  * a snapshot, which is not a per-spawn grant: two overlapping turns can
  * restore each other's snapshots and leave a lift behind, every other turn
  * in the checkout sees it meanwhile, and a server death skips the restore.
@@ -68,18 +76,27 @@ export async function applyPermissionOverlay(
 
   let settings: ClaudeSettings = {};
   if (originalContent) {
-    try {
-      settings = JSON.parse(originalContent);
-    } catch {
-      // unparseable — start from current defaults
+    // Fail closed: a file that cannot be read may hold someone's rules.
+    const parsed: unknown = JSON.parse(originalContent);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`${CLAUDE_SETTINGS_REL} is not a JSON object; overlay not applied`);
     }
+    settings = parsed as ClaudeSettings;
   }
 
-  // Merge overlay rules (deduplicate with Set)
-  const existingAllow = settings.permissions?.allow || [];
-  const existingDeny = settings.permissions?.deny || [];
+  // Merge into the existing object: `ask`, `defaultMode` and any other key
+  // stay as authored (review 4177f7fe, P3).
+  const existing =
+    settings.permissions &&
+    typeof settings.permissions === 'object' &&
+    !Array.isArray(settings.permissions)
+      ? settings.permissions
+      : {};
+  const existingAllow = Array.isArray(existing.allow) ? existing.allow : [];
+  const existingDeny = Array.isArray(existing.deny) ? existing.deny : [];
 
   settings.permissions = {
+    ...existing,
     allow: [...new Set([...existingAllow, ...(overlay.allow || [])])],
     deny: [...new Set([...existingDeny, ...(overlay.deny || [])])],
   };
