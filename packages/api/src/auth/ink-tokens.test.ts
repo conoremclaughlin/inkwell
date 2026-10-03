@@ -148,6 +148,41 @@ describe('ink-tokens', () => {
       // we're just testing they're real JWTs — not testing randomness here.
       expect(token1.split('.')).toHaveLength(3);
     });
+
+    describe('an exp on the payload is a ceiling', () => {
+      const T = 2_100_000_000; // seconds; synthetic
+      const payload: InkTokenPayload = {
+        type: 'mcp_access',
+        sub: 'user-123',
+        email: 'test@example.com',
+        scope: 'mcp:tools',
+      };
+      const decode = (token: string) => jwt.decode(token) as { iat: number; exp: number };
+
+      it('caps at the ceiling even when the clock moves on during signing', () => {
+        // First reading T, every later one five seconds on: a signer that
+        // read the clock twice would stamp exp from the later reading.
+        let reads = 0;
+        const now = vi.spyOn(Date, 'now').mockImplementation(() => (T + (reads++ ? 5 : 0)) * 1000);
+        try {
+          const { iat, exp } = decode(signInkAccessToken({ ...payload, exp: T + 600 }, 3600));
+          expect(exp).toBe(T + 600);
+          expect(iat).toBe(T);
+        } finally {
+          now.mockRestore();
+        }
+      });
+
+      it('leaves a shorter lifetime in charge', () => {
+        const now = vi.spyOn(Date, 'now').mockReturnValue(T * 1000);
+        try {
+          const { iat, exp } = decode(signInkAccessToken({ ...payload, exp: T + 99_999 }, 60));
+          expect(exp - iat).toBe(60);
+        } finally {
+          now.mockRestore();
+        }
+      });
+    });
   });
 
   // =========================================================================

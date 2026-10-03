@@ -171,6 +171,22 @@ export function getRequestContext(): RequestContextData | undefined {
 }
 
 /**
+ * The authenticated principal of the current request, if there is one.
+ *
+ * Only a request context carries a principal, and only through `userId`: the
+ * MCP route sets it from a verified bearer token or a verified session, and
+ * the admin middleware from a verified admin token. Nothing else may put a
+ * userId in a request context. The process-global session context is never a
+ * principal: under HTTP it holds whichever client bootstrapped last, and
+ * under stdio the caller named it.
+ */
+export function getAuthenticatedPrincipal(): { userId: string; email?: string } | undefined {
+  const reqCtx = getRequestContext();
+  if (!reqCtx?.userId) return undefined;
+  return { userId: reqCtx.userId, ...(reqCtx.email ? { email: reqCtx.email } : {}) };
+}
+
+/**
  * Get user identification from context.
  * Checks request context first, then falls back to session context.
  * Returns the best available identifier, preferring userId > email > platform+platformId.
@@ -193,6 +209,11 @@ export function getUserFromContext():
       platformId: reqCtx.platformId,
     };
   }
+
+  // A request that authenticated as nobody stays nobody. The session context
+  // is process-global, and under HTTP it belongs to whichever client last
+  // called bootstrap.
+  if (reqCtx) return undefined;
 
   // Fall back to session context
   const sessCtx = getSessionContext();
