@@ -338,6 +338,17 @@ describe('named Bash allows, in every spelling', () => {
     expect(denyRefusesNamedAllow('Read(/a *)', 'Read(/a)')).toBe(false);
   });
 
+  it('only a trailing :* is the legacy prefix form', () => {
+    expect(denyRefusesNamedAllow('Bash(foo *)', 'Bash(foo:*x)')).toBe(false);
+    expect(denyRefusesNamedAllow('Bash(foo *)', 'Bash(foo:*)')).toBe(true);
+  });
+
+  it('broad grants never keep the force or main backstops out', () => {
+    expect(denyRefusesNamedAllow('Bash(git push *--force*)', 'Bash(git *)')).toBe(false);
+    expect(denyRefusesNamedAllow('Bash(git push * main)', 'Bash(git:*)')).toBe(false);
+    expect(denyRefusesNamedAllow('Bash(git push -f *)', 'Bash(*)')).toBe(false);
+  });
+
   it('only a sole trailing wildcard names the bare command', () => {
     expect(denyRefusesNamedAllow('Bash(git -C * push)', 'Bash(git -C * push *)')).toBe(false);
     expect(denyRefusesNamedAllow('Bash(git push)', 'Bash(git push *)')).toBe(true);

@@ -290,6 +290,7 @@ describe('an attach variable counts only when the server acts on it', () => {
     ['PLAYWRIGHT_MCP_USER_DATA_DIR', ''],
     ['PLAYWRIGHT_MCP_USER_DATA_DIR', '  '],
     ['PLAYWRIGHT_MCP_CDP_ENDPOINT', ''],
+    ['PLAYWRIGHT_MCP_CDP_ENDPOINT', ' \t '],
   ])('%s=%j attaches nothing, so the entry is pinned', (key, value) => {
     const entry = { command: 'npx', args: ['@playwright/mcp'], env: { [key]: value } };
     expect(playwrightBrowserAttachments(entry)).toEqual([]);
@@ -312,7 +313,7 @@ describe('an attach variable counts only when the server acts on it', () => {
   });
 });
 
-describe('a configuration file makes its own choices', () => {
+describe('a configuration file is opaque configuration, left as written', () => {
   it.each([
     ['--config', ['@playwright/mcp', '--config', '/tmp/browser.json'], {}],
     ['--config', ['@playwright/mcp', '--config=/tmp/browser.json'], {}],
@@ -325,14 +326,21 @@ describe('a configuration file makes its own choices', () => {
     expect(attached).toEqual([{ name: 'playwright', attachments: [name] }]);
   });
 
-  it('an empty PLAYWRIGHT_MCP_CONFIG names no file, so the entry is pinned', () => {
-    const entry = { command: 'npx', args: ['@playwright/mcp'], env: { PLAYWRIGHT_MCP_CONFIG: '' } };
-    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual([
-      '@playwright/mcp',
-      '--headless',
-      '--isolated',
-    ]);
-  });
+  it.each([[''], ['  ']])(
+    'an empty PLAYWRIGHT_MCP_CONFIG (%j) names no file, so the entry is pinned',
+    (value) => {
+      const entry = {
+        command: 'npx',
+        args: ['@playwright/mcp'],
+        env: { PLAYWRIGHT_MCP_CONFIG: value },
+      };
+      expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual([
+        '@playwright/mcp',
+        '--headless',
+        '--isolated',
+      ]);
+    }
+  );
 
   it('a launch built from .mcp.json (readLaunchMcpServers) keeps a configured entry as written', () => {
     const root = mkdtempSync(join(tmpdir(), 'playwright-config-'));
@@ -347,27 +355,22 @@ describe('a configuration file makes its own choices', () => {
   });
 });
 
-describe("a flag the entry's environment already sets is left to that setting", () => {
+// HEADLESS and ISOLATED are not attachments (Lumen, b8d058f3 on #733): a
+// flag overrides its environment setting, so appending both flags is what
+// enforces the default, whatever the entry's environment says.
+describe("the pin enforces the default over the entry's HEADLESS / ISOLATED environment", () => {
   it.each([
-    ['PLAYWRIGHT_MCP_ISOLATED', 'false', ['@playwright/mcp', '--headless']],
-    ['PLAYWRIGHT_MCP_ISOLATED', '1', ['@playwright/mcp', '--headless']],
-    ['PLAYWRIGHT_MCP_HEADLESS', 'false', ['@playwright/mcp', '--isolated']],
-    ['PLAYWRIGHT_MCP_HEADLESS', '0', ['@playwright/mcp', '--isolated']],
-  ])('%s=%j: only the other flag is added', (key, value, expected) => {
+    ['PLAYWRIGHT_MCP_ISOLATED', 'false'],
+    ['PLAYWRIGHT_MCP_ISOLATED', '0'],
+    ['PLAYWRIGHT_MCP_ISOLATED', ''],
+    ['PLAYWRIGHT_MCP_HEADLESS', 'false'],
+    ['PLAYWRIGHT_MCP_HEADLESS', '0'],
+    ['PLAYWRIGHT_MCP_HEADLESS', ''],
+  ])('%s=%j still gets both flags', (key, value) => {
     const entry = { command: 'npx', args: ['@playwright/mcp'], env: { [key]: value } };
-    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual(expected);
-  });
-
-  it('a value the server does not read (yes) leaves the flag unset, so it is added', () => {
-    const entry = {
-      command: 'npx',
-      args: ['@playwright/mcp'],
-      env: { PLAYWRIGHT_MCP_ISOLATED: 'yes' },
-    };
-    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual([
-      '@playwright/mcp',
-      '--headless',
-      '--isolated',
-    ]);
+    expect(playwrightBrowserAttachments(entry)).toEqual([]);
+    const { servers, pinned } = pinIsolatedPlaywright({ playwright: entry });
+    expect(servers.playwright.args).toEqual(['@playwright/mcp', '--headless', '--isolated']);
+    expect(pinned).toEqual(['playwright']);
   });
 });

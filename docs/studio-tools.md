@@ -30,7 +30,7 @@ A studio's own `.mcp.json` is never rewritten, and neither is the main worktree'
 - the `PLAYWRIGHT_MCP_EXTENSION`, `PLAYWRIGHT_MCP_USER_DATA_DIR` or `PLAYWRIGHT_MCP_CDP_ENDPOINT` environment variables, when set to something the server acts on;
 - a Chrome-family or Dia profile path.
 
-So is an entry that names a configuration file (`--config` or `PLAYWRIGHT_MCP_CONFIG`), since the file can choose all of that itself and we don't read it. That choice belongs to the person whose browser it is, made in their own `.mcp.json`. Adding `--isolated` to such an entry wouldn't work anyway: the server refuses a profile directory in isolated mode, wherever the directory was set.
+An entry that names a configuration file (`--config`, or a non-empty `PLAYWRIGHT_MCP_CONFIG`) is opaque configuration. The file can choose all of that itself and we don't read it, so the entry is left as written and reported. That makes it neither a verified attachment nor a guaranteed isolated launch. That choice belongs to the person whose browser it is, made in their own `.mcp.json`. Adding `--isolated` to such an entry wouldn't work anyway: the server refuses a profile directory in isolated mode, wherever the directory was set.
 
 Nothing we generate makes that choice: `playwright-mcp.test.ts` (shared) and `playwright-mcp.producers.test.ts` (CLI) fail if any producer's output gains one.
 
@@ -39,7 +39,7 @@ Nothing we generate makes that choice: `playwright-mcp.test.ts` (shared) and `pl
 - `PLAYWRIGHT_MCP_EXTENSION` attaches only when it is `true` or `1` exactly; `false`, `0`, `TRUE` and empty do not.
 - A profile directory, endpoint or config path counts only when it is non-empty after trimming.
 - An entry carrying one of the ignored values is pinned like any other.
-- An entry whose environment sets `PLAYWRIGHT_MCP_HEADLESS` or `PLAYWRIGHT_MCP_ISOLATED` (to `true`, `1`, `false` or `0`) keeps that setting: the matching flag isn't added, because a flag would override it.
+- `PLAYWRIGHT_MCP_HEADLESS` and `PLAYWRIGHT_MCP_ISOLATED` are not attachments. Both flags are appended whatever the entry's environment says, and a flag overrides its environment setting, which is what makes the pin enforce the default. An opt-out from the default would be its own policy decision.
 
 ## iOS simulator
 

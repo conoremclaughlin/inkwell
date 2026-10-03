@@ -17,10 +17,10 @@
  * This is the default guard, not a ban. A server entry that names a
  * browser or profile of its own (`--extension`, `--user-data-dir`,
  * `--cdp-endpoint`, `--endpoint`, their environment forms when set, or a
- * Chrome or Dia profile path) is someone's explicit choice, and so is one
- * that names a configuration file (`--config`, `PLAYWRIGHT_MCP_CONFIG`),
- * which can choose all of that itself. `pinIsolatedPlaywright` leaves such
- * an entry exactly as written and reports it. Adding `--isolated` to it
+ * Chrome or Dia profile path) is someone's explicit choice. One that names
+ * a configuration file (`--config`, `PLAYWRIGHT_MCP_CONFIG`) is opaque
+ * configuration, which can choose all of that itself. `pinIsolatedPlaywright`
+ * leaves such an entry exactly as written and reports it. Adding `--isolated` to it
  * would not be harmless either: the server refuses a profile directory in
  * isolated mode, wherever the directory was set. An attach variable the
  * server ignores (`PLAYWRIGHT_MCP_EXTENSION=false`, an empty profile path)
@@ -70,31 +70,22 @@ export const PLAYWRIGHT_ATTACH_ENV: readonly string[] = [
 ];
 
 /**
- * A configuration file, as a flag or in the environment. The file can
- * choose a profile directory, a browser or headed mode, and we don't read
- * it, so an entry naming one makes its own choices.
+ * A configuration file, as a flag or in the environment: opaque
+ * configuration. The file can choose a profile directory, a browser or
+ * headed mode, and we don't read it, so an entry naming one is left as
+ * written. That is not a verified attachment, and not a guaranteed
+ * isolated launch either.
  */
 export const PLAYWRIGHT_CONFIG_FLAG = '--config';
 export const PLAYWRIGHT_CONFIG_ENV = 'PLAYWRIGHT_MCP_CONFIG';
 
-/** Environment settings for the two pinned flags, by the flag they set. */
-const PINNED_FLAG_ENV: Record<(typeof PINNED_FLAGS)[number], string> = {
-  '--headless': 'PLAYWRIGHT_MCP_HEADLESS',
-  '--isolated': 'PLAYWRIGHT_MCP_ISOLATED',
-};
-
-/**
- * 0.0.70's environment parsers, measured through its own config resolver
- * (`resolveCLIConfigForMCP`): a boolean is set only by `true`, `1`,
- * `false` or `0`, exactly as written (`TRUE`, `yes`, empty and blank are
- * unset), and a string only when it is non-empty after trimming.
+/*
+ * 0.0.70's environment parsers (config.js `envToBoolean`, `envToString`,
+ * and measured through `resolveCLIConfigForMCP`): a boolean is true only
+ * for `true` or `1` exactly as written, false for `false` or `0`, and
+ * unset for anything else; a string is its trimmed value when non-empty,
+ * otherwise unset.
  */
-const ENV_BOOLEAN_VALUES = new Set(['true', '1', 'false', '0']);
-
-function envBooleanIsSet(value: unknown): boolean {
-  return typeof value === 'string' && ENV_BOOLEAN_VALUES.has(value);
-}
-
 function envStringIsSet(value: unknown): boolean {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -213,12 +204,11 @@ export function pinIsolatedPlaywright<T extends PlaywrightServerShape>(
     }
     const args = Array.isArray(config.args) ? config.args : [];
     const present = new Set(args.filter((a) => typeof a === 'string').map(flagName));
-    // A flag overrides its environment setting, so a flag the entry's own
-    // environment already sets, either way, is left to that setting.
-    const env = config.env && typeof config.env === 'object' ? config.env : {};
-    const missing = PINNED_FLAGS.filter(
-      (flag) => !present.has(flag) && !envBooleanIsSet(env[PINNED_FLAG_ENV[flag]])
-    );
+    // Appended whatever the entry's environment says: a flag overrides its
+    // PLAYWRIGHT_MCP_HEADLESS / PLAYWRIGHT_MCP_ISOLATED setting, which is
+    // what makes the pin enforce the default. Those two are not
+    // attachments; an opt-out from the default is its own policy decision.
+    const missing = PINNED_FLAGS.filter((flag) => !present.has(flag));
     if (missing.length === 0) {
       out[name] = config;
       continue;
