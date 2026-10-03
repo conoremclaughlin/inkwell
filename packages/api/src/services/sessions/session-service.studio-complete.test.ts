@@ -172,6 +172,8 @@ function makeService(session: Session, owner: string, row: Row = {}) {
         user_id: 'user-456',
         agent_id: owner,
         worktree_path: worktree,
+        // A studio row always names its repo; this one is not the root.
+        repo_root: '/repo',
         status: 'active',
         lease: null,
         ...row,
@@ -322,6 +324,22 @@ describe('a Claude launch in a studio is given its profile from the row (design 
       // The runner refuses the launch unless it runs here (P2 2).
       worktreePath: worktree,
     });
+  });
+
+  it('a row whose repo root is unknown refuses the launch: absence is not proof of the root', async () => {
+    // Lumen d74ce85d, P2 1: a null, missing or empty repo_root must not drop
+    // both the profile and the working-directory check.
+    for (const repoRoot of [null, '']) {
+      completion.calls.length = 0;
+      const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+        branch: 'detached:origin/pr/7',
+        repo_root: repoRoot,
+      });
+      const result = await send();
+      expect(result.success, String(repoRoot)).toBe(false);
+      expect(String((result as { error?: unknown }).error)).toMatch(/Launch refused/);
+      expect(claude.run).not.toHaveBeenCalled();
+    }
   });
 
   it('the root (home) studio is not given one: root profiles are phase B, and the launch goes ahead', async () => {

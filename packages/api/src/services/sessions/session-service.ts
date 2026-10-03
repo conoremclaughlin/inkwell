@@ -5459,11 +5459,19 @@ This session will continue with a fresh context after compaction. Your identity,
     const row = await repo.findById(studioId);
     if (!row)
       throw new Error(`Launch refused: studio ${studioId} has no row to read a profile from`);
-    // The root (home) studio is the main checkout itself. Its lane rules live
-    // in its own settings.local.json until phase B designs a root launch
-    // profile, so it gets none here: logged, not refused (review 44db8c0c,
-    // P2 1).
-    if (!row.repoRoot || row.worktreePath === row.repoRoot) {
+    // Absence is not proof of the root: a row with no repo root could be any
+    // studio, and skipping it would drop both its profile and the
+    // working-directory check (Lumen d74ce85d, P2 1).
+    if (typeof row.repoRoot !== 'string' || row.repoRoot === '') {
+      throw new Error(
+        `Launch refused: studio ${studioId} names no repo root, so whether it is the root studio is unknown`
+      );
+    }
+    // The root (home) studio is the main checkout itself, identified
+    // positively. Its lane rules live in its own settings.local.json until
+    // phase B designs a root launch profile, so it gets none here: logged,
+    // not refused (review 44db8c0c, P2 1).
+    if (row.worktreePath === row.repoRoot) {
       logger.info('Root studio: no launch profile (phase B)', { studioId });
       return undefined;
     }
