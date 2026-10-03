@@ -2,6 +2,8 @@
  * Memory and Session types for long-term memory storage
  */
 
+import type { SessionArchivedReason } from '../../services/sessions/session-archive';
+
 // Common source values — not exhaustive, DB accepts any string
 export type MemorySource =
   | 'conversation'
@@ -149,6 +151,9 @@ export interface Session {
   headlineUpdatedAt?: Date;
   startedAt: Date;
   endedAt?: Date;
+  /** Archived: automatic routing never resumes it (session-lifecycle-model §2.2). */
+  archivedAt?: Date;
+  archivedReason?: SessionArchivedReason;
   summary?: string;
   updatedAt?: Date;
   metadata: Record<string, unknown>;
@@ -265,6 +270,8 @@ export interface SessionRow {
   headline_updated_at?: string | null;
   started_at: string;
   ended_at: string | null;
+  archived_at?: string | null;
+  archived_reason?: string | null;
   summary: string | null;
   updated_at?: string | null;
   metadata: Record<string, unknown>;

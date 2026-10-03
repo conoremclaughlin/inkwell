@@ -7,6 +7,7 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
 import { sessionKeyMatchPattern } from './session-key';
+import { parseArchivedReason, readHandedOffTo, readResumeRefused } from './session-archive';
 import type { Database, Json } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -14,6 +15,7 @@ import type {
   SessionStatus,
   SessionType,
   ISessionRepository,
+  ReopenEndedResult,
   UsageCheckpoint,
   ModelUsageTotals,
 } from './types.js';
@@ -139,6 +141,7 @@ function mapDbToSession(row: DbSession): Session {
     sbSlug: row.agent_id || '',
     sbId: row.sb_id || undefined,
     studioId: row.studio_id || undefined,
+    workingDir: row.working_dir || undefined,
     contactId: row.contact_id || undefined,
     backendSessionId: row.backend_session_id || row.claude_session_id,
 
@@ -177,6 +180,12 @@ function mapDbToSession(row: DbSession): Session {
     startedAt: row.started_at ? new Date(row.started_at) : new Date(),
     lastActivityAt: row.started_at ? new Date(row.started_at) : new Date(),
     endedAt: row.ended_at ? new Date(row.ended_at) : null,
+
+    // Archive (spec session-lifecycle-model §2.2–2.3): mapped, not yet routed on
+    archivedAt: row.archived_at ? new Date(row.archived_at) : null,
+    archivedReason: parseArchivedReason(row.archived_reason),
+    handedOffTo: readHandedOffTo(metadata),
+    resumeRefused: readResumeRefused(metadata),
 
     // Thread key
     threadKey: row.thread_key || undefined,
@@ -353,7 +362,8 @@ export class SessionRepository implements ISessionRepository {
     sbSlug: string,
     alias: string,
     studioId?: string,
-    sbId?: string | null
+    sbId?: string | null,
+    contactId?: string
   ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -379,6 +389,10 @@ export class SessionRepository implements ISessionRepository {
     if (studioId !== undefined) {
       query = query.eq('studio_id', studioId);
     }
+    // A key is an address, and an address carries its contact scope: an
+    // owner send never lands in a per-sender contact session that carries the
+    // same key, and a contact send never lands in the owner's.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
     const { data, error } = (await query.order('started_at', { ascending: false })) as {
       data: DbSession[] | null;
@@ -456,9 +470,10 @@ export class SessionRepository implements ISessionRepository {
         query = query.eq('studio_id', studioId);
       }
 
-      if (contactId) {
-        query = query.eq('contact_id', contactId);
-      }
+      // Owner lookups match only owner sessions. Filtering on the contact
+      // only when one was passed let an owner lookup resolve a per-sender
+      // contact session on the same thread key (task F1).
+      query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
       const { data, error } = await query;
 
@@ -675,6 +690,58 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return mapDbToSession(data);
+  }
+
+  /**
+   * Reopen an ended session for an address that names it (T4), as a
+   * compare-and-set on the ended state the caller observed (Lumen, #725).
+   *
+   * The write clears ended_at, and resets lifecycle and status only when they
+   * still read `completed`. It matches only while ended_at is set and
+   * lifecycle and status are exactly what was observed. A concurrent resume
+   * that got there first (a human pick, another resolution, a turn entering
+   * `running`) changes one of them, so this write matches nothing and the row
+   * is reread: no longer ended means `open`, returned as it now stands; still
+   * ended with a different lifecycle or status means try again from the fresh
+   * state. It never writes turn_epoch, so a newer turn's epoch survives.
+   */
+  async reopenEnded(
+    id: string,
+    observed: Pick<Session, 'lifecycle' | 'status'>
+  ): Promise<ReopenEndedResult> {
+    let expected = observed;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const status = String(expected.status ?? '').toLowerCase();
+      const updates: DbSessionUpdate = {
+        ended_at: null,
+        ...(expected.lifecycle === 'completed' ? { lifecycle: 'idle' } : {}),
+        ...(status === 'completed' || status.startsWith('completed:') ? { status: 'active' } : {}),
+      };
+      let query = this.supabase
+        .from('sessions')
+        .update(updates)
+        .eq('id', id)
+        .not('ended_at', 'is', null);
+      query = expected.lifecycle
+        ? query.eq('lifecycle', expected.lifecycle)
+        : query.is('lifecycle', null);
+      query = expected.status ? query.eq('status', expected.status) : query.is('status', null);
+      const { data, error } = await query.select().maybeSingle();
+      if (error) {
+        if ((error as { code?: string }).code === '23505') return { kind: 'key-held' };
+        logger.error('Error reopening session', { id, error });
+        throw error;
+      }
+      if (data) return { kind: 'reopened', session: mapDbToSession(data) };
+
+      const current = await this.findById(id);
+      if (!current) return { kind: 'missing' };
+      if (!current.endedAt) return { kind: 'open', session: current };
+      expected = { lifecycle: current.lifecycle, status: current.status };
+    }
+    // Still ended after three changes under us: the row is being written as
+    // fast as it is read. Fail rather than guess at a state to write.
+    throw new Error(`Session ${id} kept changing while being reopened`);
   }
 
   /**

@@ -131,6 +131,7 @@ function rig(options: RigOptions = {}) {
   const redispatched: Array<Record<string, unknown>> = [];
   const descriptorLoads: unknown[][] = [];
   const requests: Array<Record<string, unknown>> = [];
+  const wakeCompletions: unknown[][] = [];
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -294,6 +295,11 @@ function rig(options: RigOptions = {}) {
       recipientSbId: 'identity-synthetic',
     }),
     logInkmail: async () => {},
+    // The no-progress breaker's completion hook (T1), recorded, not run.
+    recordWakeSourceCompletion: async (...args: unknown[]) => {
+      wakeCompletions.push(args);
+      return null;
+    },
     assignThreadParticipant: async () => ({ stampPersisted: true }),
     clearRoutingHold: async () => {
       if (options.cleanupThrows) throw new Error('fetch failed');
@@ -359,6 +365,7 @@ function rig(options: RigOptions = {}) {
     redispatched,
     descriptorLoads,
     requests,
+    wakeCompletions,
     row,
     threadPayload,
     get sessionTurns() {
@@ -772,5 +779,48 @@ describe('a carried verdict decides the retry, not the excerpt', () => {
     });
 
     expect(r.timers).toHaveLength(1);
+  });
+});
+
+describe('a completed wake is counted against its source (T1)', () => {
+  // The no-progress breaker counts completed, admitted attempts only
+  // (spec session-lifecycle-model §5). The hook sits after the successful turn,
+  // so a failed or refused delivery never reaches it.
+  const wakeSource = {
+    source: 'strategy_watchdog',
+    workKind: 'task_group',
+    workId: 'group-synthetic',
+    revision: '',
+    fingerprint: 'fp-synthetic',
+    dispatchedAt: '2026-10-02T10:00:00.000Z',
+    taskGroupId: 'group-synthetic',
+    ownerSbId: null,
+  };
+
+  it('hands the successful turn and its tag to the breaker', async () => {
+    const r = rig();
+    await r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } });
+    expect(r.wakeCompletions).toHaveLength(1);
+    const [, userId, metadata] = r.wakeCompletions[0] as [unknown, string, Record<string, unknown>];
+    expect(userId).toBe('user-synthetic');
+    expect(metadata.wakeSource).toEqual(wakeSource);
+  });
+
+  it('a failed turn is not an attempt', async () => {
+    const r = rig({ resultFailure: { success: false, error: 'backend exited 1' } });
+    await expect(
+      r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } })
+    ).rejects.toBeTruthy();
+    expect(r.wakeCompletions).toHaveLength(0);
+  });
+
+  it('a refused delivery is not an attempt', async () => {
+    const r = rig({
+      resultRefusal: { threadKey: 'pr:42', detail: { triedCallerRepo: false, reason: 'no-route' } },
+    });
+    await expect(
+      r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } })
+    ).rejects.toBeTruthy();
+    expect(r.wakeCompletions).toHaveLength(0);
   });
 });

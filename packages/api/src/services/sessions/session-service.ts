@@ -56,7 +56,12 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from '@inklabs/shared';
+import {
+  classifyError,
+  isPathWithinWorkspaceAsync,
+  isPreAcceptanceRefusal,
+  type ErrorClassification,
+} from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -234,6 +239,7 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     studioHint: metadata?.studioHint,
     recipientSessionId: metadata?.recipientSessionId,
     recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
+    recipientSessionNamed: metadata?.recipientSessionNamed === true,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -363,6 +369,70 @@ export interface ThreadProjectRepo {
   cause?: ProjectRepoCause;
 }
 
+/**
+ * Routing's affirmative decision that this identity's work on a pinned thread
+ * runs with no studio (task bd4657a0). It exists only when routing positively
+ * found no studio for the identity in the project's repo AND the thread type
+ * is presence + reuse-only, so the create boundary proceeds studioless rather
+ * than building a worktree (Conor's ruling: discussions execute). A refusal, a
+ * failed studio lookup, a write-intent thread awaiting provisioning, and a
+ * project with no repo all produce none. A null studio on a session is never
+ * this decision; it is only what the decision leaves behind.
+ *
+ * Studioless presence is repo-neutral. The runner gives a studioless session
+ * the server's default working directory (resolveWorkingDirectory), never the
+ * project's repo, so nothing here claims the session ran in the project.
+ */
+export interface StudiolessPresencePlacement {
+  /** The pinned project's canonical slug. */
+  project: string;
+  /** The project's repo, as routing read it for this decision. */
+  repoRoot: string;
+}
+
+/** routing_decision.placement.kind on a row created under that decision. */
+const STUDIOLESS_PRESENCE = 'studioless-presence';
+
+/**
+ * The decision, read off a routing result. Only the project-repo tier's
+ * deferred create yields one: resolveStudioForRepo returns it after a
+ * successful lookup found no studio and no main studio in the repo, while a
+ * failed lookup returns nothing and routing refuses. The create boundary
+ * proceeds studioless on exactly this condition, and reads it from here.
+ */
+export function studiolessPresenceOf(
+  routing: StudioRoutingDecision,
+  projectRepo: ThreadProjectRepo | null | undefined,
+  writeIntent: WriteIntent,
+  studioPolicy: StudioPolicy
+): StudiolessPresencePlacement | null {
+  const deferred = routing.deferredCreate;
+  if (!deferred || deferred.source !== 'project' || routing.studioId) return null;
+  if (writeIntent !== 'presence' || studioPolicy !== 'reuse-only') return null;
+  if (!projectRepo?.repoRoot || deferred.repoRoot !== projectRepo.repoRoot) return null;
+  return { project: projectRepo.slug, repoRoot: projectRepo.repoRoot };
+}
+
+/**
+ * Whether routing recorded, when it created this row, that it placed the
+ * row studioless for this project and repo. Rows created before the record
+ * existed carry none and are not admitted on a null working_dir.
+ */
+function recordedStudiolessPresence(
+  session: Session,
+  project: { slug: string; repoRoot: string }
+): boolean {
+  const decision = session.metadata?.routing_decision as { placement?: unknown } | undefined;
+  const placement = decision?.placement as
+    | { kind?: unknown; project?: unknown; repoRoot?: unknown }
+    | undefined;
+  return (
+    placement?.kind === STUDIOLESS_PRESENCE &&
+    placement.project === project.slug &&
+    placement.repoRoot === project.repoRoot
+  );
+}
+
 /** The pinned project, as a refusal reports it. */
 export interface ThreadProjectRefusal {
   slug: string;
@@ -486,6 +556,18 @@ export class UnresolvedStudioError extends Error {
  * Recovery needs no special path: give the thread a route pattern, a
  * studio_hint, or a project, and the next delivery attempt resolves normally.
  */
+/** Why a caller-named session could not take a message (T4). */
+export interface ExplicitAddressHold {
+  sessionId?: string;
+  sessionKey?: string;
+  cause:
+    | 'unknown-session'
+    | 'contact-scope'
+    | 'session-key-miss'
+    | 'session-key-held'
+    | 'binding-held';
+}
+
 export class RoutingRefusedError extends Error {
   readonly code = 'ROUTING_REFUSED';
 
@@ -495,7 +577,12 @@ export class RoutingRefusedError extends Error {
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       /**
        * The caller named an exact studio/session and THAT is what we refused.
        * Without this the message recommends naming one — advice the caller has
@@ -507,6 +594,11 @@ export class RoutingRefusedError extends Error {
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it. */
       project?: ThreadProjectRefusal;
+      /**
+       * The caller named a session (by id or key) that cannot take the
+       * message. Never redirected elsewhere (session-lifecycle-model §3).
+       */
+      explicit?: ExplicitAddressHold;
     }
   ) {
     super(RoutingRefusedError.describe(threadKey, sbSlug, detail));
@@ -518,6 +610,28 @@ export class RoutingRefusedError extends Error {
     sbSlug: string,
     detail: RoutingRefusedError['detail']
   ): string {
+    if (detail.reason === 'explicit-address' && detail.explicit) {
+      const named = detail.explicit.sessionKey
+        ? `sessionKey "${detail.explicit.sessionKey}"`
+        : `session ${detail.explicit.sessionId ?? 'unknown'}`;
+      const why: Record<ExplicitAddressHold['cause'], string> = {
+        'unknown-session': `which is not a session of "${sbSlug}"`,
+        'contact-scope': `which belongs to a different contact scope than this message`,
+        'session-key-miss': `which no live session of "${sbSlug}" carries`,
+        'session-key-held':
+          `which ended, and its session key is now held by another live session, ` +
+          `so it cannot be reopened without taking that key`,
+        'binding-held':
+          `but the thread's binding could not be moved to it and another session ` +
+          `holds it, so delivery would have gone to a session you did not name`,
+      };
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
+        `${named}, ${why[detail.explicit.cause]}. Message held; it was not redirected ` +
+        `to another session. Re-send to a session of "${sbSlug}" (list_sessions shows ` +
+        `them), or send without the address.`
+      );
+    }
     // Ambiguity refuses BEFORE any tier runs, so the generic message below —
     // which names route patterns, project affinity and the caller repo — is
     // false here: none of them were consulted. It cost Myra and Lumen a night
@@ -1408,11 +1522,19 @@ export class SessionService implements ISessionService {
     userId: string,
     sbId: string | null,
     threadKey: string | undefined,
-    session: Session
+    session: Session,
+    /**
+     * The plan resolution's own studioless-presence decision, reported by
+     * getOrCreateSession's onStudiolessPresence. The winner and any stamp
+     * the repair meets are tested against the decision that produced the
+     * routed candidate, never a fresh one (task bd4657a0). Absent means
+     * none: a studioless session is then refused, as before.
+     */
+    studiolessPresence?: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!threadKey) return true;
     const { project } = await this.resolveThreadBehavior(userId, sbId, threadKey);
-    return this.threadMatchAllowed(userId, session, project, threadKey);
+    return this.threadMatchAllowed(userId, session, project, threadKey, studiolessPresence ?? null);
   }
 
   /**
@@ -1435,24 +1557,181 @@ export class SessionService implements ISessionService {
     );
   }
 
+  /**
+   * The one test a session takes before it may carry a project-pinned
+   * thread: an inferred anchor, a thread-key match, an assignment winner and
+   * a stamp met during repair all go through here (task bd4657a0).
+   *
+   * A session in a studio must be in a studio of the project's repo, as
+   * before. A session with no studio was refused outright, which contradicted
+   * routing: for an identity with no studio in the project's repo, routing
+   * itself places presence work studioless, so every session the thread could
+   * produce was refused on its next message and a new row was minted each
+   * time (Lumen on inkling:thread:app-build, 2026-10-02: 20 rows, 6 that
+   * ran). A studioless session is now admitted when, and only when, routing's
+   * current decision for this thread is that same studioless placement — see
+   * studiolessMatchAllowed for the evidence it must also carry.
+   */
   private async threadMatchAllowed(
     userId: string,
     match: Session,
     projectRepo: ThreadProjectRepo | null | undefined,
-    threadKey: string
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!projectRepo) return true;
-    if (!projectRepo.repoRoot || !match.studioId) {
+    if (!projectRepo.repoRoot) {
       logger.warn('[StudioResolve] Thread-key reuse refused — pinned project repo unverifiable', {
         threadKey,
         sessionId: match.id,
         studioId: match.studioId ?? null,
         project: projectRepo.slug,
-        projectRepoRoot: projectRepo.repoRoot,
+        cause: projectRepo.cause ?? null,
       });
       return false;
     }
+    if (!match.studioId) {
+      return this.studiolessMatchAllowed(
+        match,
+        { slug: projectRepo.slug, repoRoot: projectRepo.repoRoot },
+        threadKey,
+        studiolessPresence
+      );
+    }
     return this.continuityStudioAllowed(userId, match.studioId, { threadKey, projectRepo });
+  }
+
+  /**
+   * A studioless session on a project-pinned thread. Two things must hold.
+   *
+   * 1. Routing's decision for THIS resolution is studioless presence for this
+   *    project and repo. That is what makes reuse placement-neutral: reusing
+   *    the session puts the work exactly where a new session would go.
+   * 2. The session itself is evidence of that placement, not merely a row
+   *    with a null studio:
+   *    - a recorded working_dir inside the project's repo is repository
+   *      evidence on its own (the session ran there);
+   *    - otherwise the row must carry the placement routing recorded when it
+   *      created it (routing_decision.placement), and any recorded
+   *      working_dir must be inside the default working directory, which is
+   *      where the runner puts every studioless session. Claude hooks report
+   *      that directory on every lifecycle event, so it is the expected value
+   *      for a spawned presence session, not a stray one.
+   *    A working_dir anywhere else means the session ran in another repo
+   *    (a terminal resumed it elsewhere), and it is refused whatever it
+   *    carries. A missing working_dir never counts as project placement.
+   *
+   * Paths are compared by containment after realpath (path.relative), never
+   * by string prefix, and only absolute ones count.
+   *
+   * A row admitted on its working_dir alone has no record, and once it runs
+   * here the runner gives it the default directory; see
+   * adoptStudiolessPresence for how it keeps continuity after that.
+   */
+  private async studiolessMatchAllowed(
+    match: Session,
+    project: { slug: string; repoRoot: string },
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
+  ): Promise<boolean> {
+    const refuse = (reason: string): false => {
+      logger.warn('[StudioResolve] Thread-key reuse refused — studioless session', {
+        threadKey,
+        sessionId: match.id,
+        reason,
+        workingDir: match.workingDir ?? null,
+        project: project.slug,
+        projectRepoRoot: project.repoRoot,
+      });
+      return false;
+    };
+    if (
+      !studiolessPresence ||
+      studiolessPresence.project !== project.slug ||
+      studiolessPresence.repoRoot !== project.repoRoot
+    ) {
+      return refuse('routing does not place this thread studioless');
+    }
+    // A relative path names no directory: containment resolves it against
+    // the root being tested, so `.` or `app` was "inside" every root (Lumen,
+    // #721 r1). update_session_state stores whatever string it is given.
+    if (match.workingDir && !path.isAbsolute(match.workingDir)) {
+      return refuse('working_dir is not an absolute path');
+    }
+    if (
+      match.workingDir &&
+      (await isPathWithinWorkspaceAsync(match.workingDir, project.repoRoot))
+    ) {
+      return true;
+    }
+    if (!recordedStudiolessPresence(match, project)) {
+      return refuse(
+        match.workingDir
+          ? 'working_dir is outside the project repo'
+          : 'no recorded studioless placement, and no working_dir'
+      );
+    }
+    if (
+      match.workingDir &&
+      !(await isPathWithinWorkspaceAsync(match.workingDir, this.config.defaultWorkingDirectory))
+    ) {
+      return refuse('working_dir is outside both the project repo and the default directory');
+    }
+    return true;
+  }
+
+  /**
+   * Record the studioless placement on a session the predicate admitted and
+   * this spawn is about to run (Lumen, #721 r1). A row admitted on a
+   * working_dir inside the project repo carries no record; the runner gives
+   * it the default directory, its hook then reports that directory, and on
+   * the next message it was refused with nothing to show for itself. The
+   * record makes it what a row routing created under the same decision is.
+   *
+   * Only for a match the predicate admitted: an inferred anchor or a
+   * thread-key match. An explicit address bypasses the predicate, and
+   * recording a placement there would turn a one-off address into
+   * continuity. Only at spawn: a plan runs nothing, so nothing moved.
+   * A failed write is logged and the turn proceeds; continuity then breaks
+   * on the next message, as before this fix, rather than this one.
+   */
+  private async adoptStudiolessPresence(
+    session: Session,
+    studiolessPresence: StudiolessPresencePlacement | null,
+    planOnly: boolean
+  ): Promise<Session> {
+    if (planOnly || !studiolessPresence || session.studioId) return session;
+    const project = { slug: studiolessPresence.project, repoRoot: studiolessPresence.repoRoot };
+    if (recordedStudiolessPresence(session, project)) return session;
+    // metadata merges at the top level, so the whole decision is rewritten.
+    const decision = (session.metadata?.routing_decision ?? {}) as Record<string, unknown>;
+    try {
+      const adopted = await this.repository.update(session.id, {
+        metadata: {
+          routing_decision: {
+            ...decision,
+            placement: {
+              kind: STUDIOLESS_PRESENCE,
+              ...studiolessPresence,
+              adoptedAt: new Date().toISOString(),
+            },
+          },
+        },
+      });
+      logger.info('[SessionRouting] Recorded studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        workingDir: session.workingDir ?? null,
+      });
+      return adopted;
+    } catch (err) {
+      logger.warn('[SessionRouting] Could not record studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return session;
+    }
   }
 
   private async continuityStudioAllowed(
@@ -3031,6 +3310,57 @@ export class SessionService implements ISessionService {
   }
 
   /**
+   * Reopen an ended session for an address that names it: a session the
+   * caller named, or the session a reply answers (spec session-lifecycle-model
+   * §3 rungs 1 and 3). Clears ended_at and the completed spellings of
+   * lifecycle and status in one conditional write; the agent's work phase is
+   * its own and is left alone. Refuses when the row's session key is now held
+   * by another live session (the key's unique index admits one live holder)
+   * or the row is gone: the caller decides whether that is a refusal or a
+   * decline.
+   */
+  private async reopenEndedSession(
+    session: Session,
+    via: 'named-session' | 'reply-anchor'
+  ): Promise<{ session: Session } | { refused: 'key-held' | 'missing' }> {
+    // A conditional write of the ended state this resolution observed, never
+    // an update by id from a snapshot (Lumen, #725): a resume that got there
+    // first is kept as it stands, newer lifecycle and epoch included.
+    if (!this.repository.reopenEnded) {
+      throw new Error('Session repository cannot reopen an ended session conditionally');
+    }
+    const result = await this.repository.reopenEnded(session.id, {
+      lifecycle: session.lifecycle,
+      status: session.status,
+    });
+    switch (result.kind) {
+      case 'reopened':
+        logger.info('[SessionRouting] Reopened an ended session for an address that names it', {
+          sessionId: session.id,
+          via,
+          endedAt: session.endedAt?.toISOString() ?? null,
+        });
+        return { session: result.session };
+      case 'open':
+        logger.info('[SessionRouting] Session was already reopened; resuming it as it stands', {
+          sessionId: session.id,
+          via,
+          lifecycle: result.session.lifecycle,
+        });
+        return { session: result.session };
+      case 'key-held':
+        logger.warn('[SessionRouting] Cannot reopen: its session key is held by a live session', {
+          sessionId: session.id,
+          sessionKey: session.alias ?? null,
+          via,
+        });
+        return { refused: 'key-held' };
+      case 'missing':
+        return { refused: 'missing' };
+    }
+  }
+
+  /**
    * May a channel reply resume the session that wrote the message it answers?
    *
    * A reply anchor is a preference, not an address. recipientSessionId names
@@ -3095,7 +3425,9 @@ export class SessionService implements ISessionService {
       });
     }
 
-    if (session.endedAt) return decline('ended');
+    // An ended session no longer declines (finished-session audit row 6): it
+    // is reopened below, once the read-only checks pass and before any lease
+    // is taken.
 
     // A live terminal, judged by the trigger path's own delivery decision on
     // the same columns. The trigger path would deliver inline to it, but
@@ -3104,31 +3436,40 @@ export class SessionService implements ISessionService {
     // finalize then clears the terminal's attachment flag. A read that cannot
     // rule a terminal out counts as one: declining costs the reply its
     // conversation, while resuming could cost the terminal its turn.
-    if (!this.supabase) return decline('terminal_unverified');
-    const { data: attachment, error: attachmentError } = await this.supabase
-      .from('sessions')
-      .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
-      .eq('id', session.id)
-      .eq('user_id', ctx.userId)
-      .maybeSingle();
-    if (attachmentError || !attachment) {
-      return decline('terminal_unverified', {
-        error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+    const terminalDecline = async (candidate: Session): Promise<null | 'declined'> => {
+      if (!this.supabase) {
+        decline('terminal_unverified');
+        return 'declined';
+      }
+      const { data: attachment, error: attachmentError } = await this.supabase
+        .from('sessions')
+        .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
+        .eq('id', candidate.id)
+        .eq('user_id', ctx.userId)
+        .maybeSingle();
+      if (attachmentError || !attachment) {
+        decline('terminal_unverified', {
+          error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+        });
+        return 'declined';
+      }
+      const delivery = decideDelivery({
+        forceSpawn: false,
+        pollRow: attachment,
+        attachedRow: {
+          cli_attached: attachment.cli_attached === true,
+          // A row with no update stamp cannot be shown stale, so a set
+          // attachment flag on it stands.
+          updated_at: attachment.updated_at ?? new Date().toISOString(),
+        },
       });
-    }
-    const delivery = decideDelivery({
-      forceSpawn: false,
-      pollRow: attachment,
-      attachedRow: {
-        cli_attached: attachment.cli_attached === true,
-        // A row with no update stamp cannot be shown stale, so a set
-        // attachment flag on it stands.
-        updated_at: attachment.updated_at ?? new Date().toISOString(),
-      },
-    });
-    if (delivery.mode === 'inline') {
-      return decline('terminal_attached', { source: delivery.source });
-    }
+      if (delivery.mode === 'inline') {
+        decline('terminal_attached', { source: delivery.source });
+        return 'declined';
+      }
+      return null;
+    };
+    if (await terminalDecline(session)) return null;
 
     // The lease gate runs only for a request that carries a threadKey, and a
     // reply carries none, so on its own a reply would enter the anchor's
@@ -3149,6 +3490,27 @@ export class SessionService implements ISessionService {
     // An anchor would open an older one, whoever holds its studio now.
     if (session.studioId && !session.threadKey) {
       return decline('studio_without_thread', { studioId: session.studioId });
+    }
+    // Reopen before the lease, so a key collision declines without holding a
+    // studio. A plan resolution writes nothing.
+    if (session.endedAt && !ctx.planOnly) {
+      const reopened = await this.reopenEndedSession(session, 'reply-anchor');
+      if (!('session' in reopened)) {
+        return decline(reopened.refused === 'missing' ? 'missing' : 'ended_key_held', {
+          sessionKey: session.alias ?? null,
+        });
+      }
+      session = reopened.session;
+      // The row the reopen hands back may not be the one the checks above
+      // read: a human pick that attached a terminal in between won the
+      // compare-and-set, and the reopen returns its row (Lumen, #725 r2).
+      // That row is checked again before any lease or return. Running alone
+      // is no reason to decline: a concurrent server-side resume queues this
+      // reply behind its turn as usual.
+      if (await terminalDecline(session)) return null;
+      if (session.studioId && !session.threadKey) {
+        return decline('studio_without_thread', { studioId: session.studioId });
+      }
     }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
@@ -3210,6 +3572,12 @@ export class SessionService implements ISessionService {
        */
       recipientSessionExplicit?: boolean;
       /**
+       * The caller named this session itself, by id or key (T4; spec
+       * session-lifecycle-model §3 rung 1). Unknown, foreign or other-contact:
+       * refused, never dropped. Ended: reopened. Implies explicit.
+       */
+      recipientSessionNamed?: boolean;
+      /**
        * The session that wrote the message a channel reply answers. Tried
        * after recipientSessionId and before every other rung, but only
        * admitted while it can safely take the turn — see admitReplyAnchor.
@@ -3256,6 +3624,14 @@ export class SessionService implements ISessionService {
        * stay unfenced (released as before).
        */
       turnEpochCandidate?: string;
+      /**
+       * Receives this resolution's studioless-presence decision (null when
+       * routing placed the thread anywhere else), once routing has run. The
+       * trigger handler tests the participant stamp's winner against it, so
+       * a winner is judged by the same decision as the routed candidate
+       * (task bd4657a0). Not called when resolution throws before routing.
+       */
+      onStudiolessPresence?: (placement: StudiolessPresencePlacement | null) => void;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -3313,6 +3689,23 @@ export class SessionService implements ISessionService {
     let authorizedRecipientSessionId = options?.recipientSessionId;
     let anchorLookupFailed = false;
     let recipientCandidate: Session | null = null;
+    // A session the caller named, by id or key, is an address (T4; spec
+    // session-lifecycle-model §3 rung 1). One that cannot take the message is
+    // refused and the message held; it is never dropped so that the ladder
+    // below can pick some other session.
+    const recipientSessionNamed = options?.recipientSessionNamed === true;
+    const refuseNamedSession = (cause: ExplicitAddressHold['cause']): never => {
+      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', sbSlug, {
+        triedCallerRepo: false,
+        reason: 'explicit-address',
+        anchor: 'session',
+        explicit: {
+          sessionId: options?.recipientSessionId,
+          ...(options?.alias ? { sessionKey: options.alias } : {}),
+          cause,
+        },
+      });
+    };
     if (options?.recipientSessionId) {
       let candidate: Session | null = null;
       try {
@@ -3341,6 +3734,25 @@ export class SessionService implements ISessionService {
             requestedSbId: identitySbId,
           });
         }
+        authorizedRecipientSessionId = undefined;
+        if (recipientSessionNamed) refuseNamedSession('unknown-session');
+      }
+
+      // Contact scope is part of the admission invariant (spec §3): an owner
+      // message never resumes a per-sender contact session, and a contact's
+      // never resumes the owner's. A named session refuses; an inferred one
+      // is dropped, as an unauthorized one is.
+      if (
+        authorizedRecipientSessionId &&
+        candidate &&
+        (candidate.contactId ?? null) !== (options.contactId ?? null)
+      ) {
+        if (recipientSessionNamed) refuseNamedSession('contact-scope');
+        logger.warn('[SessionRouting] Dropping recipientSessionId — another contact scope', {
+          recipientSessionId: options.recipientSessionId,
+          sessionContactId: candidate.contactId ?? null,
+          requestContactId: options.contactId ?? null,
+        });
         authorizedRecipientSessionId = undefined;
       }
     }
@@ -3376,14 +3788,34 @@ export class SessionService implements ISessionService {
     // every repo-scoped rung. Only a caller-explicit anchor is addressing; an
     // inferred one takes the same repo test as continuity, or is dropped and
     // the ladder decides.
-    if (
-      authorizedRecipientSessionId &&
-      recipientCandidate &&
+    //
+    // A studio-bound anchor is tested HERE, before routing, because routing's
+    // recipient-session tier places the thread in the anchor's studio. A
+    // studioless anchor gives that tier nothing to place by, so it is tested
+    // after routing, against routing's own decision (task bd4657a0).
+    const inferredAnchorOnPinnedThread =
+      !!recipientCandidate &&
       options?.recipientSessionExplicit !== true &&
-      projectRepo &&
-      options?.threadKey &&
-      !(await this.threadMatchAllowed(userId, recipientCandidate, projectRepo, options.threadKey))
-    ) {
+      !!projectRepo &&
+      !!options?.threadKey;
+    const dropInferredAnchor = async (
+      studiolessPresence: StudiolessPresencePlacement | null
+    ): Promise<void> => {
+      if (
+        !authorizedRecipientSessionId ||
+        !recipientCandidate ||
+        !projectRepo ||
+        !options?.threadKey ||
+        (await this.threadMatchAllowed(
+          userId,
+          recipientCandidate,
+          projectRepo,
+          options.threadKey,
+          studiolessPresence
+        ))
+      ) {
+        return;
+      }
       logger.warn(
         '[SessionRouting] Dropping inferred recipientSessionId — outside the project repo',
         {
@@ -3395,6 +3827,9 @@ export class SessionService implements ISessionService {
         }
       );
       authorizedRecipientSessionId = undefined;
+    };
+    if (inferredAnchorOnPinnedThread && recipientCandidate?.studioId) {
+      await dropInferredAnchor(null);
     }
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
@@ -3430,6 +3865,20 @@ export class SessionService implements ISessionService {
     if (routing.unresolvedNamedStudio) {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, sbSlug);
     }
+
+    // Routing's own answer to "does this identity's work on this thread run
+    // studioless?" Every studioless session the rungs below consider is
+    // tested against this one decision (task bd4657a0).
+    const studiolessPresence = studiolessPresenceOf(
+      routing,
+      projectRepo,
+      writeIntent,
+      studioPolicy
+    );
+    if (inferredAnchorOnPinnedThread && !recipientCandidate?.studioId) {
+      await dropInferredAnchor(studiolessPresence);
+    }
+    options?.onStudiolessPresence?.(studiolessPresence);
 
     const leaseCtx = {
       userId,
@@ -3475,9 +3924,37 @@ export class SessionService implements ISessionService {
         // Authorized above (same user, same identity) — this rung only has to
         // check liveness.
         const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
+        if (!recipientSession && recipientSessionNamed) refuseNamedSession('unknown-session');
+        // An ended session the caller named reopens: an explicit address
+        // resumes any transcript (Conor, 2026-10-02; finished-session audit
+        // row 1). An inferred one still falls through until the T5 readers.
+        // A plan resolution writes nothing; the spawn path's resolution, which
+        // carries the same named flag, reopens it.
+        if (recipientSession?.endedAt && recipientSessionNamed) {
+          const reopened =
+            options?.planOnly === true
+              ? { session: recipientSession }
+              : await this.reopenEndedSession(recipientSession, 'named-session');
+          if (!('session' in reopened)) {
+            return refuseNamedSession(
+              reopened.refused === 'missing' ? 'unknown-session' : 'session-key-held'
+            );
+          }
+          this.logRungMatch('recipient-session', reopened.session, routing, options?.threadKey);
+          return this.withStudioLease(reopened.session, routing, leaseCtx);
+        }
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
-          return this.withStudioLease(recipientSession, routing, leaseCtx);
+          // A studioless inferred anchor reaching here passed the predicate
+          // after routing; an explicit one did not take it.
+          const anchor = inferredAnchorOnPinnedThread
+            ? await this.adoptStudiolessPresence(
+                recipientSession,
+                studiolessPresence,
+                options?.planOnly === true
+              )
+            : recipientSession;
+          return this.withStudioLease(anchor, routing, leaseCtx);
         }
       }
 
@@ -3509,7 +3986,8 @@ export class SessionService implements ISessionService {
             a: string,
             alias: string,
             studioId?: string,
-            sb?: string | null
+            sb?: string | null,
+            contactId?: string
           ) => Promise<Session | null>;
         };
 
@@ -3541,7 +4019,9 @@ export class SessionService implements ISessionService {
           aliasStudioScope,
           // Identity by UUID: a same-slug session from another identity must
           // not satisfy this alias (Lumen, PR #514 round 6).
-          identitySbId
+          identitySbId,
+          // Contact scope, as on every other rung (task F1).
+          options?.contactId
         );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
@@ -3553,11 +4033,17 @@ export class SessionService implements ISessionService {
           this.logRungMatch('alias', aliasMatch, routing, options?.threadKey);
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
-        logger.debug('No session found for alias', {
+        // A key is always caller-supplied, so a miss is a wrong address:
+        // refused, never a new session minted under the key (Conor,
+        // 2026-10-02: "If the address is wrong, just like the mail, we should
+        // know"). send_to_inbox refuses a miss before storing anything; this
+        // covers a key that stopped resolving while the message waited.
+        logger.warn('[SessionRouting] Refusing a session key no live session carries', {
           alias: options.alias,
           sbSlug,
           aliasStudioScope: aliasStudioScope ?? null,
         });
+        refuseNamedSession('session-key-miss');
       }
 
       // ThreadKey match — find session scoped to this topic
@@ -3584,15 +4070,31 @@ export class SessionService implements ISessionService {
         if (
           threadMatch &&
           (this.matchInCallerNamedStudio(routing, resolvedStudioId, threadMatch) ||
-            (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey)))
+            (await this.threadMatchAllowed(
+              userId,
+              threadMatch,
+              projectRepo,
+              options.threadKey,
+              studiolessPresence
+            )))
         ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
-          return this.withStudioLease(threadMatch, routing, leaseCtx);
+          return this.withStudioLease(
+            await this.adoptStudiolessPresence(
+              threadMatch,
+              studiolessPresence,
+              options.planOnly === true
+            ),
+            routing,
+            leaseCtx
+          );
         }
 
         // Thread-scoped request with no match. If the agent has a default
-        // session, route there instead of creating a new one.
-        if (defaultSessionId) {
+        // session, route there instead of creating a new one. Not for a
+        // contact's message: the default session is the owner's (T4; the
+        // unthreaded home rung below already guards this).
+        if (defaultSessionId && !options?.contactId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
           if (defaultSession && !defaultSession.endedAt) {
             this.logRungMatch('default-session', defaultSession, routing, options.threadKey);
@@ -3753,6 +4255,11 @@ export class SessionService implements ISessionService {
     // about to create a session now — every reuse rung above has missed — so
     // building the worktree here cannot be wasted by an explicit address
     // winning afterwards.
+    //
+    // Read before the presence branch below clears deferredCreate: a row
+    // created under studioless presence records it, and that record is what
+    // lets the thread's next message reuse the row (task bd4657a0).
+    const createdStudioless = studiolessPresenceOf(routing, projectRepo, writeIntent, studioPolicy);
     if (routing.deferredCreate && !resolvedStudioId && studioPolicy === 'reuse-only') {
       // The third worktree-creating path, gated like the other two (Lumen
       // #523 r1 P1): the D1 parent is durable rather than ephemeral, but it
@@ -3909,6 +4416,9 @@ export class SessionService implements ISessionService {
           threadKey: options?.threadKey ?? null,
           occupancyChecked: routing.occupancyChecked,
           ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
+          ...(createdStudioless && !resolvedStudioId
+            ? { placement: { kind: STUDIOLESS_PRESENCE, ...createdStudioless } }
+            : {}),
           resolvedAt: new Date().toISOString(),
           ...(homeSiblings.length > 0 ? { homeSiblings: homeSiblings.map((s) => s.id) } : {}),
         },
@@ -4629,8 +5139,26 @@ export class SessionService implements ISessionService {
     // The repo-scoped main studio — this is the re-scoped former tier 8. It
     // only runs against a repo we resolved, never the server's ambient cwd.
     // Scoped by the canonical identity too — this rung dropped it and looked
-    // up by slug (Lumen, PR #514 round 3).
-    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, sbSlug, sbId);
+    // up by slug (Lumen, PR #514 round 3). A failed read refuses like the
+    // lookup above: reading it as "none" deferred a create, and for a
+    // presence thread that is a studioless placement nobody decided (task
+    // bd4657a0).
+    const { data: main, error: mainError } = await mainStudioQuery(
+      this.supabase,
+      userId,
+      repoRoot,
+      sbSlug,
+      sbId
+    ).maybeSingle();
+    if (mainError) {
+      logger.warn('[StudioResolve] Repo main-studio lookup failed', {
+        repoRoot,
+        sbSlug,
+        error: mainError.message,
+      });
+      return null;
+    }
+    const mainStudioId: string | undefined = main?.id;
     if (mainStudioId) {
       logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
         repoRoot,
@@ -5606,6 +6134,35 @@ This session will continue with a fresh context after compaction. Your identity,
 }
 
 /**
+ * The root-checkout studio of a repo: the identity's studio whose worktree IS
+ * the repo root. resolveMainStudio reads a failed lookup as "none"; the repo
+ * tiers cannot, because "no studio in this repo" is what places presence work
+ * studioless (task bd4657a0), so they run this query themselves.
+ */
+function mainStudioQuery(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  repoRoot: string,
+  sbSlug?: string,
+  sbId?: string | null
+) {
+  let q = supabase
+    .from('studios')
+    .select('id, updated_at')
+    .eq('user_id', userId)
+    .eq('repo_root', repoRoot)
+    .eq('worktree_path', repoRoot)
+    .in('status', ['active', 'idle', 'archived'])
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  // Canonical identity when we have it — a slug can name different
+  // identities in different workspaces (Lumen, PR #514 round 3).
+  if (sbId) q = q.eq('sb_id', sbId);
+  else if (sbSlug) q = q.eq('agent_id', sbSlug);
+  return q;
+}
+
+/**
  * Resolve 'main' to a studio ID. "Main" = the root repo.
  *
  * Finds the most recently updated studio whose repo_root matches the
@@ -5626,22 +6183,7 @@ export async function resolveMainStudio(
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
 
-  const lookupQuery = () => {
-    let q = supabase
-      .from('studios')
-      .select('id, updated_at')
-      .eq('user_id', userId)
-      .eq('repo_root', targetRoot)
-      .eq('worktree_path', targetRoot)
-      .in('status', ['active', 'idle', 'archived'])
-      .order('updated_at', { ascending: false })
-      .limit(1);
-    // Canonical identity when we have it — a slug can name different
-    // identities in different workspaces (Lumen, PR #514 round 3).
-    if (options?.sbId) q = q.eq('sb_id', options.sbId);
-    else if (sbSlug) q = q.eq('agent_id', sbSlug);
-    return q;
-  };
+  const lookupQuery = () => mainStudioQuery(supabase, userId, targetRoot, sbSlug, options?.sbId);
 
   const { data: match } = await lookupQuery().maybeSingle();
   if (match?.id) return match.id;

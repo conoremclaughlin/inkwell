@@ -33,6 +33,10 @@ import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-s
 import { boundThreadTitle } from './thread-bounds.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { normaliseSessionKey } from '../../services/sessions/session-key';
+import {
+  resolveExplicitAddress,
+  type ResolvedExplicitAddress,
+} from '../../services/sessions/explicit-address';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types';
@@ -63,6 +67,7 @@ import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
 import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
+import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -377,9 +382,17 @@ export interface InternalSendContext {
    * The trusted server-side sender. A system sender may leave `workspaceId`
    * null: the message lands in the first recipient's workspace, as a
    * watchdog or heartbeat send always has. This context is the ONLY way a
-   * message is authored as the system — no tool call reaches it.
+   * message is authored as the system — no tool call reaches it. Absent, the
+   * sender resolves as it does for a tool call.
    */
-  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  sender?: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  /**
+   * A wake source's tag (wake-source-breaker.ts): the trigger handler counts
+   * the wake's completed turn against it. Written to the message metadata
+   * only from here; a `wakeSource` a caller puts in `metadata` is dropped, so
+   * a tool call can never count attempts against someone else's source.
+   */
+  wakeSource?: WakeSourceTag;
   /**
    * The send must create its thread, never join one. When the key is already
    * taken, whether before the send or by a concurrent request racing it, the
@@ -419,7 +432,7 @@ export async function handleSendToInbox(
     recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
-    metadata = {},
+    metadata: callerMetadata = {},
     expiresAt,
     triggerType,
     triggerSummary,
@@ -428,6 +441,11 @@ export async function handleSendToInbox(
     triggerAgents,
     sessionAlias,
   } = parsed;
+
+  // The wake-source tag is server-set only (InternalSendContext.wakeSource).
+  const metadata: Record<string, unknown> = { ...callerMetadata };
+  delete metadata.wakeSource;
+  if (internal?.wakeSource) metadata.wakeSource = internal.wakeSource;
 
   // One spelling on the wire: sessionKey, with sessionAlias accepted for a
   // release. Normalised here so the key the resolver sees is the key the
@@ -499,7 +517,30 @@ export async function handleSendToInbox(
       'permission_grant messages cannot be sent by agents — must originate from platform verification'
     );
   }
-  const effectiveRecipientSessionId = recipientSessionId;
+  // The session the send delivers to, when the caller named one. Replaced by
+  // the checked id once the recipient is resolved (T4): a sessionKey becomes
+  // the id it resolved to, so queued delivery keeps that session.
+  let effectiveRecipientSessionId = recipientSessionId;
+  let explicitAddress: ResolvedExplicitAddress | null = null;
+  // The studio a key lookup is scoped to: the one the caller named, if any.
+  const keyStudioScope = async (): Promise<string | undefined> => {
+    if (!sessionKey) return undefined;
+    if (recipientStudioId) return recipientStudioId;
+    if (!recipientStudioSlugOrHint || !recipientSlug) return undefined;
+    try {
+      return (
+        (await resolveStudioHint(
+          supabase,
+          resolved.user.id,
+          recipientStudioSlugOrHint,
+          recipientSlug,
+          getRequestContext()?.repoRoot
+        )) || undefined
+      );
+    } catch {
+      return undefined;
+    }
+  };
 
   // Default trigger behavior:
   // All message types trigger by default. Most agents don't have heartbeats,
@@ -644,6 +685,21 @@ export async function handleSendToInbox(
       sender.kind === 'sb' ? sender.sbSlug : sender.kind === 'system' ? 'system' : 'user';
     const senderSb: SbPrincipal | null = sender.kind === 'sb' ? sender : null;
     const recipientSbs = await resolveSbsInWorkspace(supabase, workspaceId, allRecipients);
+
+    // A caller-named session (spec session-lifecycle-model §3, T4) is checked
+    // here, before the thread, its participant rows or the message exist, so
+    // a wrong address stores nothing.
+    if (recipientSlug && (recipientSessionId || sessionKey)) {
+      explicitAddress = await resolveExplicitAddress(supabase, {
+        userId: resolved.user.id,
+        recipientSlug,
+        recipientSbId: recipientSbs[0]?.sbId ?? null,
+        recipientSessionId,
+        sessionKey,
+        studioId: await keyStudioScope(),
+      });
+      effectiveRecipientSessionId = explicitAddress?.sessionId;
+    }
     const participantSbs: SbPrincipal[] = [];
     for (const sb of senderSb ? [senderSb, ...recipientSbs] : recipientSbs) {
       if (!participantSbs.some((p) => p.sbId === sb.sbId)) participantSbs.push(sb);
@@ -709,7 +765,7 @@ export async function handleSendToInbox(
           ? null
           : isSender
             ? senderSessionId
-            : recipientSessionId || null;
+            : effectiveRecipientSessionId || null;
 
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
         .select('sb_id, session_id')
@@ -1104,6 +1160,9 @@ export async function handleSendToInbox(
           // metadata.pcp.sender.studioId — never caller body data.
           ...senderRoutingContext(senderIsBridge),
           ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
+          ...(isAddressedRecipient && (recipientSessionId || sessionKey)
+            ? { explicitRecipientSession: true }
+            : {}),
           ...(isAddressedRecipient && sessionKey ? { sessionKey } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
@@ -1183,6 +1242,7 @@ export async function handleSendToInbox(
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
+            ...explicitAddressEcho(explicitAddress),
             // Who this send actually routed to, which can be wider than
             // `recipients` (a reply wakes the thread's other SBs too), and
             // whether each was meant to be woken. A send receipt judges
@@ -1205,6 +1265,23 @@ export async function handleSendToInbox(
   }
 
   // ── Legacy path: simple inbox message (no threadKey) ──
+  // Canonical identity UUIDs for recipient and sender.
+  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
+  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
+
+  // A caller-named session is checked before anything is stored (T4).
+  if (recipientSessionId || sessionKey) {
+    explicitAddress = await resolveExplicitAddress(supabase, {
+      userId: resolved.user.id,
+      recipientSlug: recipientSlug!,
+      recipientSbId,
+      recipientSessionId,
+      sessionKey,
+      studioId: await keyStudioScope(),
+    });
+    effectiveRecipientSessionId = explicitAddress?.sessionId;
+  }
+
   const hasRoutingAnchor = Boolean(
     effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
   );
@@ -1244,10 +1321,6 @@ export async function handleSendToInbox(
       },
     },
   };
-
-  // Resolve canonical identity UUIDs for sender and recipient
-  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
-  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
 
   const { data: message, error } = await supabase
     .from('agent_inbox')
@@ -1306,6 +1379,13 @@ export async function handleSendToInbox(
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       recipientSessionId: effectiveRecipientSessionId,
+      // Caller intent, as on the thread path: the unthreaded path never
+      // carried it, so a caller-named session reached routing as an inferred
+      // hint (T4).
+      ...(effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
+        ? { explicitRecipientTarget: true }
+        : {}),
+      ...(effectiveRecipientSessionId ? { explicitRecipientSession: true } : {}),
       ...senderRoutingContext(senderIsBridge),
       sessionKey,
       studioId: recipientStudioId,
@@ -1353,6 +1433,7 @@ export async function handleSendToInbox(
           priority,
           threadKey: null,
           recipientSessionId: effectiveRecipientSessionId || null,
+          ...explicitAddressEcho(explicitAddress),
           recipientStudioId: recipientStudioId || null,
           recipientStudioSlug: recipientStudioSlugOrHint || null,
           createdAt: message.created_at,
@@ -1373,6 +1454,20 @@ export async function handleSendToInbox(
         }),
       },
     ],
+  };
+}
+
+/**
+ * The session a caller-named address resolved to, echoed on the send's
+ * result (spec session-lifecycle-model §3 rung 2): the caller sees which
+ * session its key named, and that an ended one will be reopened.
+ */
+function explicitAddressEcho(address: ResolvedExplicitAddress | null): Record<string, unknown> {
+  if (!address) return {};
+  return {
+    resolvedSessionId: address.sessionId,
+    addressedBy: address.via,
+    ...(address.ended ? { reopens: true } : {}),
   };
 }
 
