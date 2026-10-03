@@ -45,7 +45,7 @@
     "@anthropic-ai/sdk": "^0.71.2",
     "@inklabs/shared": "workspace:*",
     "@mariozechner/pi-agent-core": "0.71.1",
-    "@mariozechner/pi-coding-agent": "0.71.1",
+    "@mariozechner/pi-coding-agent": "0.73.1",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
