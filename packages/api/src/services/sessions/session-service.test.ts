@@ -971,6 +971,8 @@ describe('SessionService', () => {
           rows?: Record<string, unknown>[];
           /** The by-id identity read fails, as a dropped connection would. */
           readError?: boolean;
+          /** These reads (table and select columns) fail, as a dropped connection would. */
+          failReads?: Array<{ table: string; columns: string }>;
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -993,17 +995,24 @@ describe('SessionService', () => {
           studios: [],
           ...THREAD_TABLES,
         });
-        if (extra.readError) {
+        const failing = [
+          ...(extra.failReads ?? []),
+          ...(extra.readError
+            ? [{ table: 'agent_identities', columns: 'id, user_id, metadata' }]
+            : []),
+        ];
+        if (failing.length > 0) {
+          const failed = { data: null, error: { message: 'fixture read failed' } };
           const from = supabase.from.bind(supabase);
           (supabase as { from: unknown }).from = (table: string) => {
             const query = from(table);
-            if (table !== 'agent_identities') return query;
             const select = query.select.bind(query);
             query.select = ((cols?: string) => {
               const q = select(cols);
-              if (cols === 'id, user_id, metadata') {
-                q.maybeSingle = async () =>
-                  ({ data: null, error: { message: 'fixture read failed' } }) as never;
+              if (failing.some((f) => f.table === table && f.columns === cols)) {
+                q.maybeSingle = async () => failed as never;
+                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(failed).then(resolve);
               }
               return q;
             }) as never;
@@ -1077,6 +1086,41 @@ describe('SessionService', () => {
             rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
           });
           expect(ambiguous.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it("a failed read while proving the owner's message refuses without running, as retryable (Lumen 7d40b0aa)", async () => {
+          for (const read of [
+            { table: 'inbox_thread_messages', columns: 'thread_id, sender_kind, sender_user_id' },
+            { table: 'inbox_thread_participants', columns: 'sb_id' },
+          ]) {
+            const result = await turn(INKLING, fromOwner, OWNER, { failReads: [read] });
+            expect(result.errorCode, read.table).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, read.table).toBe(true);
+          }
+          // A definite no (an SB's message) stays a refusal not worth retrying.
+          const definite = await turn(INKLING, {
+            sender: { id: 'user', name: 'Owner' },
+            metadata: { triggerThreadMessageId: 'msg-sb' },
+          });
+          expect(definite.classification?.retryable).toBe(false);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('with no sbId, a failed identity lookup refuses as retryable; a shared slug does not (Lumen 7d40b0aa)', async () => {
+          const blip = await turn(INKLING, fromOwner, OWNER, {
+            session: { sbId: null },
+            failReads: [{ table: 'agent_identities', columns: 'id' }],
+          });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          const shared = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(shared.classification?.retryable).toBe(false);
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
         });
 

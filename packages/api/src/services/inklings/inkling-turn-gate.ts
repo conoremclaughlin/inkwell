@@ -109,34 +109,43 @@ export async function classifyIdentityById(
  * in a conversation the inkling is on? Read from the stored message the
  * trigger names, which the send path wrote with its server-derived sender.
  * A sender label ('user') proves nothing: trigger_agent takes one from its
- * caller (Lumen's review of 8b9d7f50). No message id, or anything unread,
- * is a no.
+ * caller (Lumen's review of 8b9d7f50).
+ * - 'yes': the stored message is the owner's own, in the inkling's
+ *   conversation.
+ * - 'no': no message id, no such message, another sender, or another
+ *   conversation.
+ * - 'unreadable': a read failed. That still refuses the turn, but as
+ *   something worth retrying (Lumen's re-review of 5516ec7c).
  */
+export type OwnerMessageProof = 'yes' | 'no' | 'unreadable';
+
 export async function isOwnersOwnMessage(
   supabase: SupabaseClient,
   input: { threadMessageId: string | undefined; inklingId: string; ownerUserId: string | null }
-): Promise<boolean> {
-  if (!input.threadMessageId || !input.ownerUserId) return false;
+): Promise<OwnerMessageProof> {
+  if (!input.threadMessageId || !input.ownerUserId) return 'no';
   const { data: message, error } = await supabase
     .from('inbox_thread_messages')
     .select('thread_id, sender_kind, sender_user_id')
     .eq('id', input.threadMessageId)
     .maybeSingle();
+  if (error) return 'unreadable';
   const row = message as {
     thread_id: string;
     sender_kind: string | null;
     sender_user_id: string | null;
   } | null;
-  if (error || !row) return false;
-  if (row.sender_kind !== 'user') return false;
-  if ((row.sender_user_id ?? '').toLowerCase() !== input.ownerUserId.toLowerCase()) return false;
+  if (!row) return 'no';
+  if (row.sender_kind !== 'user') return 'no';
+  if ((row.sender_user_id ?? '').toLowerCase() !== input.ownerUserId.toLowerCase()) return 'no';
   const { data: member, error: memberError } = await supabase
     .from('inbox_thread_participants')
     .select('sb_id')
     .eq('thread_id', row.thread_id)
     .eq('sb_id', input.inklingId)
     .maybeSingle();
-  return !memberError && !!member;
+  if (memberError) return 'unreadable';
+  return member ? 'yes' : 'no';
 }
 
 export interface InklingTurnInput {
@@ -144,29 +153,42 @@ export interface InklingTurnInput {
   /** The account the turn runs for. */
   userId: string;
   /** isOwnersOwnMessage, for an inkling's turn. */
-  fromOwnersOwnMessage: boolean;
+  ownerMessage: OwnerMessageProof;
 }
 
-/** Null when the turn may start; otherwise why it may not. Only inklings, or possible ones, are ever refused. */
+/** Why a turn may not start, and whether trying again could change that. */
+export interface InklingTurnRefusal {
+  reason: string;
+  /** True only when a database read failed: nothing about the turn itself was decided. */
+  retryable: boolean;
+}
+
+/** Null when the turn may start. Only inklings, or SBs whose identity cannot be established, are ever refused. */
 export function inklingTurnRefusal(
   input: InklingTurnInput,
   ownerTestUserId: string | null
-): string | null {
+): InklingTurnRefusal | null {
   const { identity } = input;
   if (identity.kind === 'unknown') {
     return identity.transient
-      ? "the SB's identity could not be read"
-      : "the SB's identity could not be established";
+      ? { reason: "the SB's identity could not be read", retryable: true }
+      : { reason: "the SB's identity could not be established", retryable: false };
   }
   if (identity.kind === 'other') return null;
-  if (ownerTestUserId === null) return 'inklings are not open on this server';
+  const refuse = (reason: string): InklingTurnRefusal => ({ reason, retryable: false });
+  if (ownerTestUserId === null) return refuse('inklings are not open on this server');
   const owner = ownerTestUserId.toLowerCase();
   if (identity.userId.toLowerCase() !== owner || input.userId.toLowerCase() !== owner) {
-    return 'this inkling belongs to an account outside the owner test';
+    return refuse('this inkling belongs to an account outside the owner test');
   }
-  if (identity.metadata.ownerTest !== true) return 'this inkling was not born under the owner test';
-  if (!input.fromOwnersOwnMessage) {
-    return 'an inkling wakes only for a stored message its owner sent in its conversation';
+  if (identity.metadata.ownerTest !== true) {
+    return refuse('this inkling was not born under the owner test');
+  }
+  if (input.ownerMessage === 'unreadable') {
+    return { reason: 'the message that woke it could not be read', retryable: true };
+  }
+  if (input.ownerMessage !== 'yes') {
+    return refuse('an inkling wakes only for a stored message its owner sent in its conversation');
   }
   return null;
 }

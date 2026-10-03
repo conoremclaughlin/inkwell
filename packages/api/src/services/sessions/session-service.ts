@@ -2308,22 +2308,20 @@ export class SessionService implements ISessionService {
         };
       };
       const ownerTestUserId = inklingOwnerTestUserId();
-      const fromOwnersOwnMessage =
-        inklingIdentity.kind === 'inkling' &&
-        (await isOwnersOwnMessage(this.supabase, {
-          threadMessageId: metadata?.triggerThreadMessageId,
-          inklingId: inklingIdentity.id,
-          ownerUserId: ownerTestUserId,
-        }));
+      const ownerMessage =
+        inklingIdentity.kind === 'inkling'
+          ? await isOwnersOwnMessage(this.supabase, {
+              threadMessageId: metadata?.triggerThreadMessageId,
+              inklingId: inklingIdentity.id,
+              ownerUserId: ownerTestUserId,
+            })
+          : 'no';
       const inklingRefusal = inklingTurnRefusal(
-        { identity: inklingIdentity, userId, fromOwnersOwnMessage },
+        { identity: inklingIdentity, userId, ownerMessage },
         ownerTestUserId
       );
       if (inklingRefusal) {
-        return refuseInklingTurn(
-          inklingRefusal,
-          inklingIdentity.kind === 'unknown' && inklingIdentity.transient
-        );
+        return refuseInklingTurn(inklingRefusal.reason, inklingRefusal.retryable);
       }
 
       if (inklingIdentity.kind === 'inkling') {
@@ -5223,7 +5221,7 @@ export class SessionService implements ISessionService {
     if (!canonical) {
       const scope = await this.resolveIdentityScope(userId, sbSlug);
       if (scope.absent) return { kind: 'other' };
-      if (!scope.id) return { kind: 'unknown', transient: false };
+      if (!scope.id) return { kind: 'unknown', transient: scope.unreadable === true };
       canonical = scope.id;
     }
     return classifyIdentityById(this.supabase, canonical);
@@ -5232,7 +5230,7 @@ export class SessionService implements ISessionService {
   private async resolveIdentityScope(
     userId: string,
     sbSlug: string
-  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
+  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean; unreadable?: boolean }> {
     if (!this.supabase) return { absent: true };
     try {
       const { data, error } = await this.supabase
@@ -5253,7 +5251,9 @@ export class SessionService implements ISessionService {
           sbSlug,
           error: error.message,
         });
-        return { ambiguous: true };
+        // Still ambiguous to routing; `unreadable` lets the inkling gate tell a
+        // failed read (worth retrying) from a slug two identities share.
+        return { ambiguous: true, unreadable: true };
       }
 
       if (!data?.length) {
@@ -5270,7 +5270,7 @@ export class SessionService implements ISessionService {
     } catch {
       // Unreadable identity is not "unambiguous" — treat it as ambiguous and
       // fall through to a hold rather than routing by slug.
-      return { ambiguous: true };
+      return { ambiguous: true, unreadable: true };
     }
   }
 
