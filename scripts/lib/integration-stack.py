@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 from integration_data import (BASELINE_FILE, POLICY, Refusal, capture_baseline,
@@ -29,6 +30,22 @@ from integration_data import (BASELINE_FILE, POLICY, Refusal, capture_baseline,
 PREFIX = "[integration-db] "
 PORT_NAMES = ("API", "DB", "STUDIO", "INBUCKET", "INBUCKET_SMTP", "INBUCKET_POP3")
 DEFAULT_EXCLUDE = "studio,mailpit,logflare,vector,supavisor"
+# The suffix group is what makes a project private.
+PROJECT_PATTERN = re.compile(r"(?:ink|pcp)-integration(-[a-zA-Z0-9_-]+)?")
+# One shared integration stack is the design (Conor, 2026-10-02). A Supabase
+# stack is about eight containers and most of a GiB that stays resident, and a
+# cold start replays every migration. The Docker VM on a development machine
+# is shared with every other project's stack and is mostly full before a test
+# starts. On 2026-10-02 four integration stacks came up in eleven minutes:
+# the lock used to refuse a second run, and a new project suffix got past it,
+# which is the most expensive way to wait. So a held lock is now waited on,
+# and a private stack is an explicit decision (--private-stack): one at a
+# time, machine-wide, and stopped after its run unless --reuse keeps it. Use
+# one only for a run the shared stack cannot serve, such as a rehearsal with
+# withheld migrations (INTEGRATION_MIGRATIONS_UNTIL).
+DEFAULT_PROJECT = "ink-integration"
+DEFAULT_LOCK_WAIT_SECONDS = 1200
+LOCK_REPORT_SECONDS = 60
 
 
 def say(message):
@@ -47,7 +64,7 @@ def containers(project):
 
 
 def settings(env):
-    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", "ink-integration")
+    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", DEFAULT_PROJECT)
     # This namespace is exclusively disposable test data. No app project ID
     # can be selected accidentally through an inherited override.
     # `pcp-integration` is still accepted, and deliberately: a stack created
@@ -56,7 +73,7 @@ def settings(env):
     # an already-running stack with no way to reach it — including --stop.
     # Both prefixes name the same disposable namespace; neither can collide
     # with an app project ID.
-    if not re.fullmatch(r"(?:ink|pcp)-integration(?:-[a-zA-Z0-9_-]+)?", project):
+    if not PROJECT_PATTERN.fullmatch(project):
         raise Refusal(
             "INTEGRATION_SUPABASE_PROJECT_ID must be ink-integration or "
             "ink-integration-<suffix> (legacy pcp-integration is also accepted)."
@@ -72,28 +89,65 @@ def settings(env):
     return project, ports, env.get("INTEGRATION_SUPABASE_EXCLUDE", DEFAULT_EXCLUDE)
 
 
+def lock_wait(env):
+    value = env.get("INTEGRATION_LOCK_WAIT_SECONDS", str(DEFAULT_LOCK_WAIT_SECONDS))
+    if not value.isascii() or not value.isdigit():
+        raise Refusal("Invalid INTEGRATION_LOCK_WAIT_SECONDS; expected whole seconds (0 refuses at once).")
+    return int(value)
+
+
+def private_stacks():
+    """Projects of the private integration stacks running on this machine."""
+    output = capture(["docker", "ps", "--filter", "label=com.supabase.cli.project",
+                      "--format", '{{.Label "com.supabase.cli.project"}}'])
+    matches = (PROJECT_PATTERN.fullmatch(name) for name in output.splitlines())
+    return {match[0] for match in matches if match and match[1]}
+
+
 @contextlib.contextmanager
-def locks(directory, project, ports):
+def locks(directory, project, ports, wait=0, private=False, checkout=None, poll=2.0):
     directory.mkdir(parents=True, exist_ok=True)
+    # Project lock also covers callers that override ports. Port locks
+    # cover callers with different project IDs but overlapping ports. The
+    # private-stack lock is one slot for the whole machine.
+    keys = ["project-" + project] + ["port-" + str(p) for p in ports]
+    if private:
+        keys.append("private-stack")
+    label = ("runner/descendant lock from PID " + str(os.getpid()) + ", project " + project +
+             (", checkout " + str(checkout) if checkout else ""))
+    started = time.monotonic()
     with contextlib.ExitStack() as stack:
         handles = []
-        # Project lock also covers callers that override ports. Port locks
-        # cover callers with different project IDs but overlapping ports.
-        for key in sorted(["project-" + project] + ["port-" + str(p) for p in ports]):
-            handle = stack.enter_context((directory / (key + ".lock")).open("a+"))
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.seek(0)
-                owner = handle.read().strip()
-                raise Refusal("Another integration run holds " + key + " (" + owner + "). "
-                              "Wait for that run to finish and retry; run DB integration tests sparingly. "
-                              "Find the actual holder (which may be a surviving descendant) with: lsof -nP " +
-                              shlex.quote(str(directory / (key + ".lock"))) + ". "
-                              "See CONTRIBUTING.md for orphan recovery; never delete the lock file.")
+        # Every caller takes its keys in one sorted order, so two waiters
+        # cannot each hold a key the other is waiting for.
+        for key in sorted(keys):
+            path = directory / (key + ".lock")
+            handle = stack.enter_context(path.open("a+"))
+            reported = None
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    handle.seek(0)
+                    owner = handle.read().strip() or "holder not yet recorded"
+                waited = time.monotonic() - started
+                if waited >= wait:
+                    raise Refusal("Another integration run holds " + key + " (" + owner + ")" +
+                                  (" and still held it after " + str(int(waited)) + "s" if wait else "") + ". "
+                                  "Wait for that run to finish and retry; run DB integration tests sparingly. "
+                                  "Do not start a private stack to get around a held lock. "
+                                  "Find the actual holder (which may be a surviving descendant) with: lsof -nP " +
+                                  shlex.quote(str(path)) + ". "
+                                  "See CONTRIBUTING.md for orphan recovery; never delete the lock file.")
+                if reported is None or time.monotonic() - reported >= LOCK_REPORT_SECONDS:
+                    say(("Waiting up to " + str(wait) + "s for " if reported is None else
+                         "Still waiting (" + str(int(waited)) + "s) for ") + key + "; held by " + owner)
+                    reported = time.monotonic()
+                time.sleep(min(poll, max(wait - waited, 0)))
             handle.seek(0)
             handle.truncate()
-            handle.write("runner/descendant lock from PID " + str(os.getpid()) + ", project " + project)
+            handle.write(label + ", since " + datetime.now(timezone.utc).isoformat(timespec="seconds"))
             handle.flush()
             handles.append(handle)
         # Do not unlink lock files: waiters may still reference their inodes.
@@ -239,23 +293,29 @@ def write_state(path, state):
 
 def manage(root, harness, args, env):
     if "--help" in args or "-h" in args:
-        say("Usage: yarn test:integration:db:local [--reuse|--fresh] [--reset|--stop] [vitest filters]")
-        say("Local default: retained test stack. CI default: fresh stack. --reset reapplies migrations + seed.")
+        say("Usage: yarn test:integration:db:local [--reuse|--fresh] [--reset|--stop] [--private-stack] [vitest filters]")
+        say("Local default: the shared retained test stack. CI default: fresh stack. --reset reapplies migrations + seed.")
+        say("A held lock is waited on (INTEGRATION_LOCK_WAIT_SECONDS, default " +
+            str(DEFAULT_LOCK_WAIT_SECONDS) + "), then refused.")
+        say("--private-stack allows an " + DEFAULT_PROJECT + "-<suffix> project: one at a time, stopped after "
+            "its run unless --reuse. Only for a run the shared stack cannot serve.")
         say("--stop releases an owned retained stack. Warm runs clean scoped fixture data; run tests sparingly.")
         return 0
     project, ports, exclude = settings(env)
-    fresh = env.get("CI", "").lower() in ("1", "true")
-    reset = stop = False
+    lifecycle = None
+    reset = stop = private_flag = False
     suite_args = []
     for arg in args:
         if arg == "--fresh":
-            fresh = True
+            lifecycle = "fresh"
         elif arg == "--reuse":
-            fresh = False
+            lifecycle = "reuse"
         elif arg == "--reset":
             reset = True
         elif arg == "--stop":
             stop = True
+        elif arg == "--private-stack":
+            private_flag = True
         else:
             suite_args.append(arg)
     if stop and (reset or suite_args):
@@ -273,10 +333,26 @@ def manage(root, harness, args, env):
             "only. Stop it with: INTEGRATION_SUPABASE_PROJECT_ID=" + project +
             " yarn test:integration:db:local --stop, then run again without the "
             "override to create a current stack.")
+    # See DEFAULT_PROJECT for why a second stack is a decision, not a reflex.
+    # Stopping one never needs the flag: it only gives memory back.
+    private = project != DEFAULT_PROJECT
+    if private and not stop and not private_flag:
+        raise Refusal(
+            "Project " + project + " would start a private stack beside the shared " + DEFAULT_PROJECT +
+            ". One shared stack is deliberate: each extra stack holds most of a GiB of Docker memory and "
+            "replays every migration on a cold start. Run without INTEGRATION_SUPABASE_PROJECT_ID, and the "
+            "harness waits for a busy shared stack instead of refusing. If the shared stack cannot serve "
+            "this run (withheld migrations, for example), pass --private-stack.")
+    if lifecycle:
+        fresh = lifecycle == "fresh"
+    else:
+        # A private stack is disposable unless --reuse asks to keep it.
+        fresh = private or env.get("CI", "").lower() in ("1", "true")
     base = Path(env.get("INTEGRATION_SUPABASE_CACHE_DIR", str(Path.home() / ".cache/inkwell/integration-db")))
     # Locks are machine-wide even when a caller selects a different cache dir.
     lock_dir = Path.home() / ".cache/inkwell/integration-db-locks"
-    with locks(lock_dir, project, ports) as lock_fds:
+    with locks(lock_dir, project, ports, wait=lock_wait(env), private=private and not stop,
+               checkout=root) as lock_fds:
         for command in ("docker", "supabase", "bash", "yarn"):
             if not shutil.which(command):
                 raise Refusal(command + " is required.")
@@ -285,6 +361,16 @@ def manage(root, harness, args, env):
         except subprocess.CalledProcessError:
             raise Refusal("Docker daemon is unavailable. Start Docker Desktop (or your Docker daemon), then retry.")
         existing = containers(project)
+        if private and not stop:
+            # The private-stack lock bounds concurrent runs; a retained or
+            # kept stack outlives its run, so count the running ones too.
+            others = sorted(private_stacks() - {project})
+            if others:
+                raise Refusal(
+                    "A private integration stack is already running (" + ", ".join(others) + "), and the "
+                    "machine-wide cap is one. Use the shared stack, or wait for that one to be released. "
+                    "If it is yours: INTEGRATION_SUPABASE_PROJECT_ID=" + others[0] +
+                    " yarn test:integration:db:local --stop. Never stop someone else's run.")
         cache = base / project
         state_path = cache / "state.json"
         state = read_state(state_path)
