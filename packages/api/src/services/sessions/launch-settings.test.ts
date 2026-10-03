@@ -6,7 +6,22 @@
  * the sources are recorded with precedence labelled documented, not
  * measured. Synthetic temp directories only, no Claude Code process.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+/** An lstat failure other than absence, injected for one path. */
+const fault = vi.hoisted(() => ({ lstatPath: '' }));
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    lstat: async (...args: Parameters<typeof actual.lstat>) => {
+      if (fault.lstatPath && String(args[0]) === fault.lstatPath) {
+        throw Object.assign(new Error('fixture: permission denied'), { code: 'EACCES' });
+      }
+      return actual.lstat(...args);
+    },
+  };
+});
 import {
   existsSync,
   mkdirSync,
@@ -244,6 +259,29 @@ describe('the worktree settings are read only as a regular file in a real direct
       expect(existsSync(out) ? readdirSync(out) : []).toEqual([]);
     });
   }
+
+  it('only absence counts as absent: an lstat error on .claude or the file refuses (Lumen d74ce85d, P2 2)', async () => {
+    // EACCES must not read as "no authored policy" and let a builder
+    // artifact be generated over policy nobody could see.
+    writeFileSync(
+      join(worktree, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: {} })
+    );
+    try {
+      for (const path of [
+        join(worktree, '.claude'),
+        join(worktree, '.claude', 'settings.local.json'),
+      ]) {
+        fault.lstatPath = path;
+        await expect(launch.prepareLaunchSettings(request()), path).rejects.toBeInstanceOf(
+          launch.LaunchSettingsError
+        );
+        expect(existsSync(out) ? readdirSync(out) : [], path).toEqual([]);
+      }
+    } finally {
+      fault.lstatPath = '';
+    }
+  });
 
   it('a worktree path with a glob metacharacter is refused: it would widen the rendered rules', async () => {
     for (const name of ['repo--a[1]', 'repo--a*', 'repo--a?', 'repo--{a,b}']) {

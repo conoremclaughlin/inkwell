@@ -46,6 +46,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import type { Stats } from 'fs';
 import { access, lstat, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { isAbsolute, join, normalize, resolve } from 'path';
@@ -128,6 +129,22 @@ export function renderAbsoluteRule(rule: string, root: string): string {
   throw new LaunchSettingsError(`cannot render the path rule ${rule} absolutely`);
 }
 
+/**
+ * lstat, with confirmed absence (ENOENT) as null and every other failure a
+ * refusal: a path that cannot be inspected may hold authored policy, and
+ * reading it as absent would generate a profile over it (Lumen d74ce85d,
+ * P2 2).
+ */
+async function lstatOrAbsent(path: string): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    const code = (error as NodeJS.ErrnoException)?.code ?? 'unknown error';
+    throw new LaunchSettingsError(`${path} cannot be inspected (${code})`);
+  }
+}
+
 async function exists(path: string): Promise<boolean> {
   return access(path).then(
     () => true,
@@ -179,11 +196,11 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
   // (review 44db8c0c, P3). lstat sees the link itself, as the CLI does.
   const claudeDir = join(req.worktreePath, '.claude');
   const localPath = join(claudeDir, 'settings.local.json');
-  const dirStat = await lstat(claudeDir).catch(() => null);
+  const dirStat = await lstatOrAbsent(claudeDir);
   if (dirStat && !dirStat.isDirectory()) {
     throw new LaunchSettingsError(`${claudeDir} is not a directory (a link is refused)`);
   }
-  const fileStat = dirStat ? await lstat(localPath).catch(() => null) : null;
+  const fileStat = dirStat ? await lstatOrAbsent(localPath) : null;
   if (fileStat && !fileStat.isFile()) {
     throw new LaunchSettingsError(`${localPath} is not a regular file (a link is refused)`);
   }
