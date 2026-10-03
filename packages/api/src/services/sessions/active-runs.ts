@@ -314,9 +314,175 @@ export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<DrainResul
   return { runs: listActiveRuns(), drained };
 }
 
+/**
+ * A provider child an admitted generation owns: what can stop it, and what
+ * reports how it ended.
+ *
+ * Children die with this process only if something stops them: active-runs
+ * otherwise tracks lifecycle records, not processes (spec:live-agent-surfaces,
+ * P2). A generation can own several at once (the turn, its summarizer, its
+ * shadow clones), so ownership is per child, never one replaceable slot.
+ */
+export interface OwnedChild {
+  /** Ask the child to stop. Stopping is confirmed only through `settled`. */
+  abort(): void;
+  /**
+   * Settles when the child's turn does. Only `childExited: true` confirms the
+   * child is gone: a turn can resolve after giving up on a child that kept
+   * running (BackendRunResult.childExited), and a rejection confirms nothing.
+   */
+  settled: Promise<{ childExited: boolean }>;
+}
+
+/** One child's place under its generation, for the owner to give back. */
+export interface ChildOwnership {
+  readonly sessionId: string;
+  readonly turnEpoch: string;
+  /**
+   * Give up this child, and only this child. Idempotent. Nothing else the
+   * generation owns, and nothing a newer generation owns, is touched.
+   */
+  release(): void;
+}
+
+interface OwnedChildRecord {
+  readonly sessionId: string;
+  readonly turnEpoch: string;
+  readonly child: OwnedChild;
+}
+
+/**
+ * Every child an admitted generation has taken on and not given back. Not an
+ * admission registry: a child joins only under the generation `active`
+ * currently admits for its session, and is tagged with it. A record outlives
+ * its generation's entry, because a child a takeover has replaced is still
+ * running in this process until it is stopped.
+ */
+const ownedChildren = new Set<OwnedChildRecord>();
+
+/**
+ * Whether `turnEpoch` is the generation admitted for `sessionId` right now,
+ * with intake open. Synchronous, so a caller can act on the answer before
+ * anything else runs.
+ *
+ * This is the local registration, taken before the turn's durable `running`
+ * write lands. Telling it apart from a confirmed durable admission is the
+ * caller's job (P2d).
+ */
+export function isGenerationAdmitted(sessionId: string, turnEpoch: string): boolean {
+  if (!intakeOpen) return false;
+  const entry = active.get(sessionId);
+  return entry !== undefined && entry.turnEpoch !== undefined && entry.turnEpoch === turnEpoch;
+}
+
+/**
+ * Put a child under the generation `turnEpoch` of `sessionId`. Refused (and
+ * undefined) unless that generation is the one admitted for the session now,
+ * and once intake has closed. Compare-and-act on the epoch, like
+ * clearActiveRunIfOwner.
+ */
+export function attachRunChild(
+  sessionId: string,
+  turnEpoch: string,
+  child: OwnedChild
+): ChildOwnership | undefined {
+  if (!isGenerationAdmitted(sessionId, turnEpoch)) return undefined;
+  const record: OwnedChildRecord = { sessionId, turnEpoch, child };
+  ownedChildren.add(record);
+  return {
+    sessionId,
+    turnEpoch,
+    release: () => {
+      ownedChildren.delete(record);
+    },
+  };
+}
+
+/** The children owned now, by generation. */
+export function listOwnedChildren(): Array<{ sessionId: string; turnEpoch: string }> {
+  return [...ownedChildren].map(({ sessionId, turnEpoch }) => ({ sessionId, turnEpoch }));
+}
+
+/** Why a stopped child's exit is not confirmed. */
+export type UnconfirmedStop = 'not-exited' | 'rejected' | 'timeout';
+
+export interface StopOwnedChildrenResult {
+  /** Stopped, and confirmed gone. They are given back. */
+  confirmed: Array<{ sessionId: string; turnEpoch: string }>;
+  /**
+   * Asked to stop, without a confirmed exit. They stay owned: an unconfirmed
+   * exit is an unknown effect until reconciled, and never safe to replay.
+   */
+  unconfirmed: Array<{ sessionId: string; turnEpoch: string; reason: UnconfirmedStop }>;
+}
+
+/**
+ * Stop the owned children, all of them or one generation's, and wait up to
+ * `timeoutMs` for each to settle. A child is reported stopped only on a
+ * confirmed exit; abort() returning, or `settled` resolving, is not one.
+ * Exposed for graceful shutdown, which is not wired to it yet (P2d).
+ */
+export async function stopOwnedChildren(
+  timeoutMs: number,
+  generation?: { sessionId: string; turnEpoch: string }
+): Promise<StopOwnedChildrenResult> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError('stopOwnedChildren needs a finite, non-negative timeout');
+  }
+  const records = [...ownedChildren].filter(
+    (record) =>
+      !generation ||
+      (record.sessionId === generation.sessionId && record.turnEpoch === generation.turnEpoch)
+  );
+  for (const record of records) {
+    try {
+      record.child.abort();
+    } catch (error) {
+      // Still wait on it: a failed signal says nothing about the child.
+      logger.warn('[ActiveRuns] Stopping an owned child threw', {
+        sessionId: record.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    timer.unref();
+  });
+  const outcomes = await Promise.all(
+    records.map((record) =>
+      Promise.race([
+        record.child.settled.then(
+          ({ childExited }) =>
+            childExited === true ? ('exited' as const) : ('not-exited' as const),
+          () => 'rejected' as const
+        ),
+        expiry,
+      ])
+    )
+  );
+  if (timer) clearTimeout(timer);
+
+  const result: StopOwnedChildrenResult = { confirmed: [], unconfirmed: [] };
+  records.forEach((record, index) => {
+    const outcome = outcomes[index]!;
+    const ref = { sessionId: record.sessionId, turnEpoch: record.turnEpoch };
+    if (outcome === 'exited') {
+      ownedChildren.delete(record);
+      result.confirmed.push(ref);
+    } else {
+      result.unconfirmed.push({ ...ref, reason: outcome });
+    }
+  });
+  return result;
+}
+
 /** Test seam. Not used in production paths. */
 export function resetActiveRuns(): void {
   active.clear();
   inFlightWrites.clear();
+  ownedChildren.clear();
   intakeOpen = true;
 }

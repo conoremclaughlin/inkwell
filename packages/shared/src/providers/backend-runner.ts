@@ -23,6 +23,12 @@ export const EFFECTIVE_CONFIG_CHECK_MS = 10_000;
 /** What a spawn refused by its effective-config check reports: EX_CONFIG. */
 export const CONFIG_REFUSED_EXIT_CODE = 78;
 
+/**
+ * The exit code a turn reports when its host withdrew the spawn
+ * (BackendHost.admitSpawn): sysexits' EX_NOPERM. No child was started.
+ */
+export const SPAWN_NOT_ADMITTED_EXIT_CODE = 77;
+
 /** The refusal when a check rejects instead of answering: it could not vouch for the config. */
 export const EFFECTIVE_CONFIG_CHECK_FAILED =
   "the backend's configuration could not be checked before the spawn";
@@ -340,6 +346,22 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       // An abort during the mint or the lookup: the credential exists, but
       // no child ever holds it.
       if (abortRequested) return abortedBeforeSpawn(command);
+
+      // The host's last word, with no await between it and the spawn: a run
+      // whose admission was lost during the mint or the check (a takeover, a
+      // shutdown closing intake) starts no child (Lumen, #701 873209b4).
+      if (host.admitSpawn && !host.admitSpawn()) {
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'the host withdrew admission before the backend was spawned',
+          exitCode: SPAWN_NOT_ADMITTED_EXIT_CODE,
+          durationMs: 0,
+          command,
+          timedOut: false,
+          childExited: true,
+        };
+      }
 
       const spawned = spawnBackend({
         binary,

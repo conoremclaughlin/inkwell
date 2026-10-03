@@ -74,6 +74,15 @@ export interface BackendHost {
   readonly inkwellMcpUrl: string;
   /** The executable to spawn for an adapter's binary name. */
   resolveBinary(name: string): Promise<string>;
+  /**
+   * The host's last word on a spawn, asked synchronously right before it,
+   * after every await of the turn, so nothing can change between the answer
+   * and the spawn. False withdraws it: no child starts, and the turn ends
+   * as refused (SPAWN_NOT_ADMITTED_EXIT_CODE). A host serving admitted runs
+   * answers whether the run's generation still holds its admission; one that
+   * is its own session (the CLI) has none to lose and omits it.
+   */
+  admitSpawn?(): boolean;
   /** A warning an adapter raises, such as media it could not inject. */
   warn(message: string): void;
 }
