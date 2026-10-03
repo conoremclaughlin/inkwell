@@ -31,3 +31,4 @@ export * from './auto-evict.js';
 export * from './clone-outcomes.js';
 export * from './session-history.js';
 export * from './provider-recovery.js';
+export * from './serial-input-drain.js';

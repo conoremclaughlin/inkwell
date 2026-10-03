@@ -107,3 +107,26 @@ An append's returned ID is reserved, not a commit acknowledgment. Await
 `flush()` at a durability boundary. This preserves the existing sink contract;
 there is no added fsync/power-loss guarantee, replay engine, write-buffer bound
 or safe automatic replay of an unresolved external effect.
+
+## Ordinary input drain
+
+`SerialInputDrain` is the shared FIFO used by the CLI for user, system and
+Inkmail-triggered turns. It retains at most the host's declared count and byte
+budget (including the active input). Admission is synchronous; its returned
+promise represents completion, not a durable receipt. Capacity and closed-intake
+refusals happen before local presentation, so the inbox path can leave refused
+inputs unacknowledged. An input failure does not poison the next queued turn.
+
+The CLI currently caps the queue at 128 inputs / 8 MiB of UTF-8 input fields.
+The host supplies size measurement; the runtime never reads environment or
+process state. Each instance has its own queue, so independent sessions remain
+concurrent. `close()` closes intake and waits for accepted work; it does not
+interrupt it. Interrupt and approval responses must go directly to the active
+owner, not into this ordinary-input drain.
+
+This is not a lease, cross-process ownership fence, deduplication store, or
+crash-recovery mechanism. A hosted adapter must queue bounded durable command
+references, authorize/reconcile them through the canonical command records,
+and recheck ownership before dispatch. Running two drains for the same session
+is NOT prevented by this class. Server activation and multi-view streaming stay
+gated on that integration and its end-to-end tests.

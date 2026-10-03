@@ -1,5 +1,6 @@
 import {
   compactForLedger,
+  SerialInputDrain,
   EVICTED_DISPLAY_MAX,
   extractSessionContextMessages,
   findLastBackendSessionInEvents,
@@ -7227,7 +7228,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let rl: ReturnType<typeof createInterface> | null = null;
 
-  let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
   let consecutiveBackendFailures = 0;
   let lastStatusSummary = '';
@@ -7274,49 +7274,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     workingDir: process.cwd(),
     onDebug: (event, detail) => sbDebugLog('chat', event, detail),
   });
-  const enqueueTurn = (
-    raw: string,
-    source: 'user' | 'inbox-auto' | 'system' = 'user',
-    displayLabel?: string
-  ): Promise<void> => {
-    // Echo at SUBMIT time, not when the queue reaches the turn — a message
-    // typed while another turn is in flight must not vanish until its turn
-    // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
-    if (raw.trim()) {
-      // The echo interleaves with any in-flight streamed paragraphs — the next
-      // one must re-render its agent header so it can't read as continuation
-      // of this message.
-      streamRenderer.noteInterleave();
-      if (source === 'user') {
-        if (inkRepl) {
-          inkRepl.addMessage('user', raw, { label: 'you' });
-        } else {
-          printLine(
-            renderMessageLine('user', raw, {
-              label: 'you',
-              timezone: runtime.userTimezone,
-            })
-          );
-          printLine('');
-        }
-      } else if (source === 'system') {
-        const label = displayLabel || 'system';
-        if (inkRepl) {
-          inkRepl.addMessage('system', raw, { label });
-        } else {
-          printLine(
-            renderMessageLine('system', raw, {
-              label,
-              timezone: runtime.userTimezone,
-            })
-          );
-          printLine('');
-        }
-      }
-    }
-    pendingTurns += 1;
-    emitStatusLaneIfChanged();
-    const run = async () => {
+  // One shared ordinary-input drain. The CLI still owns admission, context,
+  // policy and rendering; hosted callers must supply durable command IDs and
+  // the canonical owner fence rather than treating this queue as a lease.
+  const inputDrain = new SerialInputDrain<{
+    raw: string;
+    source: 'user' | 'inbox-auto' | 'system';
+    displayLabel?: string;
+  }>({
+    maxPendingInputs: 128,
+    maxPendingBytes: 8 * 1024 * 1024,
+    sizeOf: ({ raw, source, displayLabel }) =>
+      Buffer.byteLength(raw, 'utf8') +
+      Buffer.byteLength(source, 'utf8') +
+      Buffer.byteLength(displayLabel ?? '', 'utf8'),
+    run: async ({ raw, source, displayLabel }) => {
       if (inkRepl) {
         inkRepl.setWaiting(true, runtime.backend);
       } else {
@@ -7329,8 +7301,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // deferral, and boundary logic all read the marker. So an
       // unacknowledged open on studio-backed work refuses the turn instead
       // of running unprotected.
-      const turnProtected = await turnSignal.open();
       try {
+        const turnProtected = await turnSignal.open();
         const gate = turnGateDecision(runtime.sessionId, turnProtected, currentInkStudioId());
         if (!gate.allow) {
           printLine(chalk.red(`Turn not started: ${gate.reason}`));
@@ -7351,10 +7323,57 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // Restore the dock now that the turn is done (if prompt is waiting)
         restorePromptAfterWrite?.();
       }
-    };
-    turnQueue = turnQueue.then(run, run);
-    return turnQueue;
-  };
+    },
+  });
+  const enqueueTurn = (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ): Promise<void> =>
+    inputDrain.enqueue({ raw, source, displayLabel }, () => {
+      // Echo at SUBMIT time, not when the queue reaches the turn — a message
+      // typed while another turn is in flight must not vanish until its turn
+      // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
+      if (raw.trim()) {
+        // The echo interleaves with any in-flight streamed paragraphs — the next
+        // one must re-render its agent header so it can't read as continuation
+        // of this message.
+        streamRenderer.noteInterleave();
+        if (source === 'user') {
+          if (inkRepl) {
+            inkRepl.addMessage('user', raw, { label: 'you' });
+          } else {
+            printLine(
+              renderMessageLine('user', raw, {
+                label: 'you',
+                timezone: runtime.userTimezone,
+              })
+            );
+            printLine('');
+          }
+        } else if (source === 'system') {
+          const label = displayLabel || 'system';
+          if (inkRepl) {
+            inkRepl.addMessage('system', raw, { label });
+          } else {
+            printLine(
+              renderMessageLine('system', raw, {
+                label,
+                timezone: runtime.userTimezone,
+              })
+            );
+            printLine('');
+          }
+        }
+      }
+      pendingTurns += 1;
+      try {
+        emitStatusLaneIfChanged();
+      } catch (error) {
+        pendingTurns -= 1;
+        throw error;
+      }
+    });
 
   // Not async: the turn is in the queue when this returns, and a failure to
   // put it there throws into the caller's intake instead of rejecting later,
@@ -7617,7 +7636,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     cancelRunningClones();
     runtime.approvalChannel?.dispose();
     if (pendingTurns > 0) {
-      await turnQueue;
+      await inputDrain.flush();
     }
     // Process-proof detach (missed-stop backstop, round-two P1): clears any
     // cli_turn_at this process opened but failed to close, and marks the
@@ -7793,7 +7812,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         keepRunning = false;
         continue;
       }
-      await turnQueue;
+      await inputDrain.flush();
       keepRunning = false;
       continue;
     }
@@ -9122,7 +9141,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         case 'usage': {
           if (pendingTurns > 0) {
-            await turnQueue;
+            await inputDrain.flush();
           }
           const usage = formatUsageLines(
             ledger,
@@ -9140,7 +9159,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       continue;
     }
-    void enqueueTurn(raw);
+    try {
+      void enqueueTurn(raw).catch((error) => {
+        printLine(chalk.red(`Turn failed: ${String(error)}`));
+      });
+    } catch (error) {
+      printLine(chalk.red(`Input not queued: ${String(error)}`));
+    }
   }
 
   // ── Cleanup ──
@@ -9157,7 +9182,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   if (pendingTurns > 0) {
     console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
-    await turnQueue;
+    await inputDrain.flush();
   }
 
   // Process-proof detach (missed-stop backstop, round-two P1): clears any
