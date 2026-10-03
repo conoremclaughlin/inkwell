@@ -455,7 +455,14 @@ def manage(root, harness, args, env):
         ready = False
         suite_code = 0
         primary_error = False
-        keep = not fresh or env.get("INTEGRATION_KEEP_SUPABASE") == "1"
+        # INTEGRATION_KEEP_SUPABASE keeps an unmanaged inspection stack that
+        # --stop cannot release. A private stack is kept only by --reuse,
+        # which retains it as a managed one, so the flag never keeps it.
+        keep_requested = env.get("INTEGRATION_KEEP_SUPABASE") == "1"
+        if private and fresh and keep_requested:
+            say("INTEGRATION_KEEP_SUPABASE=1 does not keep a private stack; it is stopped after "
+                "this run. Use --reuse to keep it.")
+        keep = not fresh or (keep_requested and not private)
         try:
             if not existing:
                 prepare(root, workdir, config, until)

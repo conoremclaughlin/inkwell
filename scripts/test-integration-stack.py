@@ -357,6 +357,22 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.count("supabase", "stop"), 0)
         self.assertEqual(self.state()["project"], "ink-integration-t6")
 
+    def test_the_legacy_keep_flag_does_not_retain_a_private_stack(self):
+        # Lumen, #729: fresh was implied, but an inherited keep flag still
+        # won, leaving an unmanaged private stack that --stop cannot release
+        # and that held the private slot after its run.
+        self.env["INTEGRATION_KEEP_SUPABASE"] = "1"
+        self.use_project("ink-integration-t6")
+        for args in (("--private-stack",), ("--private-stack", "--fresh")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_stack(*args), 0)
+                self.assertFalse(self.current)
+        self.assertEqual(self.count("supabase", "stop"), 2)
+        # Control: --reuse is how a private stack is kept, as a managed one.
+        self.run_stack("--private-stack", "--reuse")
+        self.assertTrue(self.current)
+        self.assertEqual(self.state()["project"], "ink-integration-t6")
+
     def test_stopping_a_private_stack_needs_no_flag_and_is_not_capped(self):
         self.use_project("ink-integration-t6")
         self.run_stack("--private-stack", "--reuse")

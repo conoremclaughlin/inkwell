@@ -494,7 +494,8 @@ the shared stack cannot serve, such as a rehearsal with withheld migrations
 Private stacks are capped at one running per machine: a machine-wide lock covers
 concurrent runs, and a run refuses while another project's private stack is up. A
 private stack is disposable by default (started, used, stopped) unless `--reuse`
-keeps it; `--stop` releases a kept one and never needs the flag. On 2026-10-02 four
+keeps it; `--stop` releases a kept one and never needs the flag. `INTEGRATION_KEEP_SUPABASE=1`
+never keeps a private stack, because what it keeps is a stack `--stop` cannot release. On 2026-10-02 four
 integration stacks came up in eleven minutes, because the lock used to refuse and a
 new suffix got past it.
 
