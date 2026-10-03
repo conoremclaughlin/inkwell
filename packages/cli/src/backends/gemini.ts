@@ -13,11 +13,11 @@
  * Docs: https://geminicli.com/docs/
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
-import { encodeContextToken } from '@inklabs/shared';
+import { encodeContextToken, readLaunchMcpServers } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
@@ -34,23 +34,16 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * for GitHub auth which works, but Inkwell headers haven't been verified end-to-end.
  * Live validation needed once Aster's quota resets.
  */
-function buildGeminiSettings(
+export function buildGeminiSettings(
   cwd: string,
   contextToken: string,
   sessionId?: string,
   studioId?: string
 ): { path: string; cleanup: () => void } | null {
-  // Start from .mcp.json to preserve other MCP servers (supabase, github, etc.)
-  const mcpJsonPath = join(cwd, '.mcp.json');
-  let mcpServers: Record<string, unknown> = {};
-  if (existsSync(mcpJsonPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-      mcpServers = parsed.mcpServers || {};
-    } catch {
-      // ignore parse errors
-    }
-  }
+  // Start from .mcp.json to preserve other MCP servers (supabase, github,
+  // etc.), with Playwright launched headless and isolated like every other
+  // session's.
+  const mcpServers = readLaunchMcpServers(join(cwd, '.mcp.json'));
 
   // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
   // The legacy 'pcp' server name is retired — never target or create it.

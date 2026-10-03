@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { injectSessionHeaders } from '@inklabs/shared';
+import { injectSessionHeaders, pinIsolatedPlaywright } from '@inklabs/shared';
 import { discoverSkills } from '../repl/skills.js';
 
 export interface SkillMcpServer {
@@ -324,6 +324,9 @@ export function buildMergedMcpConfig(
       skillsModified = true;
     }
   }
+  // A skill copy synced before the Playwright pin still carries the old
+  // arguments; what it adds launches like every other session's.
+  config.mcpServers = pinIsolatedPlaywright(config.mcpServers).servers;
 
   if (!skillsModified) {
     return {

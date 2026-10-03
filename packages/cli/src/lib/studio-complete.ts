@@ -47,8 +47,10 @@ import {
   auditStudio,
   copyBootstrapFiles,
   describePermissions,
+  pinIsolatedPlaywright,
   studioPermissionRules,
   syncMcpConfig,
+  type PlaywrightServerShape,
   type StudioAudit,
   type StudioPermissionProfile,
 } from '@inklabs/shared';
@@ -184,6 +186,25 @@ function readSettingsFile(path: string): SettingsFile {
   if (!existsSync(path)) return { state: 'absent' };
   const settings = readJson(path);
   return settings ? { state: 'read', settings } : { state: 'malformed' };
+}
+
+/**
+ * Pin the Playwright server in a `.mcp.json` to the default launch
+ * (@inklabs/shared `pinIsolatedPlaywright`), rewriting the file only when
+ * a flag was added. Returns the servers pinned. A file that cannot be read
+ * is left as it is.
+ */
+function pinPlaywrightInMcpJson(mcpPath: string): string[] {
+  if (isSymlink(mcpPath)) return [];
+  const config = readJson(mcpPath);
+  if (!config || !isPlainObject(config.mcpServers)) return [];
+  const { servers, pinned } = pinIsolatedPlaywright(
+    config.mcpServers as Record<string, PlaywrightServerShape>
+  );
+  if (pinned.length > 0) {
+    writeFileSync(mcpPath, JSON.stringify({ ...config, mcpServers: servers }, null, 2) + '\n');
+  }
+  return pinned;
 }
 
 export function defaultServerUrl(): string {
@@ -390,7 +411,20 @@ export async function completeStudio(
   if (rootSync && options.mainRoot) {
     const copied = copyBootstrapFiles(options.mainRoot, worktreePath);
     if (copied.length > 0) {
-      steps.push({ label: 'root sync', status: 'created', detail: `copied ${copied.join(', ')}` });
+      // The copy made this run is ours to adjust: its Playwright server
+      // launches like every session's (headless, isolated). An existing
+      // studio file is not touched.
+      const pinned = copied.includes('.mcp.json')
+        ? pinPlaywrightInMcpJson(join(worktreePath, '.mcp.json'))
+        : [];
+      steps.push({
+        label: 'root sync',
+        status: 'created',
+        detail: [
+          `copied ${copied.join(', ')}`,
+          ...(pinned.length > 0 ? [`${pinned.join(', ')} launched headless and isolated`] : []),
+        ].join('; '),
+      });
     } else {
       steps.push({ label: 'root sync', status: 'exists', detail: 'nothing to copy' });
     }

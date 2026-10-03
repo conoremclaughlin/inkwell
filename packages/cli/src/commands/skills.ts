@@ -27,6 +27,7 @@ import {
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
+import { pinIsolatedPlaywright } from '@inklabs/shared';
 import { discoverSkills } from '../repl/skills.js';
 import { parseSkillMcpConfig } from '../lib/skill-mcp.js';
 import { callInkTool } from '../lib/ink-mcp.js';
@@ -133,7 +134,7 @@ export function buildSkillMd(skill: GetSkillResponse): string {
   return `---\n${yamlLines}\n---\n\n${skill.content}\n`;
 }
 
-function injectMcpServers(
+export function injectMcpServers(
   mcpJsonPath: string,
   skills: ServerSkill[]
 ): { added: string[]; existed: string[] } {
@@ -168,12 +169,16 @@ function injectMcpServers(
       continue;
     }
 
-    config.mcpServers[serverName] = {
-      type: 'stdio',
-      command: skill.mcp.command,
-      args: skill.mcp.args,
-      ...(skill.mcp.env && Object.keys(skill.mcp.env).length > 0 ? { env: skill.mcp.env } : {}),
-    };
+    // A server that still serves the skill with the old Playwright
+    // arguments gets the pinned launch written all the same.
+    config.mcpServers[serverName] = pinIsolatedPlaywright({
+      [serverName]: {
+        type: 'stdio',
+        command: skill.mcp.command,
+        args: skill.mcp.args,
+        ...(skill.mcp.env && Object.keys(skill.mcp.env).length > 0 ? { env: skill.mcp.env } : {}),
+      },
+    }).servers[serverName];
     added.push(serverName);
   }
 

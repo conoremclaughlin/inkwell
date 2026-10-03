@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join } from 'path';
 import { formatTomlPath, readTomlDefinitions, type TomlStatement } from './toml-definitions.js';
+import { pinIsolatedPlaywright } from './playwright-mcp.js';
 
 export interface McpServerConfig {
   type?: string;
@@ -551,7 +552,9 @@ export function syncMcpConfig(
   const sourceEnv = options?.sourceEnvPath ? parseEnvFile(options.sourceEnvPath) : {};
   const targetEnv = parseEnvFile(join(targetDir, '.env.local'));
   const envLocal = { ...sourceEnv, ...targetEnv };
-  const servers = injectEnvLocal(mcpJson.mcpServers, envLocal);
+  // Codex and Gemini launch Playwright the way every session does: headless
+  // and isolated, unless the entry names a browser of its own.
+  const servers = pinIsolatedPlaywright(injectEnvLocal(mcpJson.mcpServers, envLocal)).servers;
 
   // --- Codex: .codex/config.toml ---
   const codexDir = join(targetDir, '.codex');

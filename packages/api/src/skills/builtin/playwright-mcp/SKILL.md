@@ -28,7 +28,7 @@ metadata:
 mcp:
   name: playwright
   command: npx
-  args: ['@playwright/mcp', '--headless']
+  args: ['@playwright/mcp', '--headless', '--isolated']
   env: {}
 ---
 
@@ -92,10 +92,12 @@ browser_take_screenshot({ filename: "full.png", fullPage: true })  # full page
 
 ## Options
 
-The MCP server defaults to headless Chromium. Override via skill config or passthrough:
+Every studio session launches the server `--headless --isolated`: no window on anyone's screen, and a throwaway in-memory profile, so no logins, cookies or autofill carry between sessions and several sessions can run at once. Driving someone's everyday browser interferes with what they are doing in it, and a page snapshot in an everyday, logged-in profile has exposed filled password fields. The session launchers add both flags to a Playwright entry that lacks them.
 
-- `--browser firefox|webkit` — different browser engine
-- `--headless=false` — show the browser window
+Pointing the server at a browser or profile of someone's own (`--extension`, `--user-data-dir`, `--cdp-endpoint`, `--endpoint`, or a Chrome or Dia profile path) is an explicit opt-in, made by the person whose browser it is in their own `.mcp.json`. The launchers leave such an entry as written. Don't add one yourself.
+
+Other options:
+
+- `--browser firefox|webkit|chrome|msedge` — browser engine or Chrome channel
 - `--viewport-size 1920x1080` — set viewport dimensions
-- `--save-video 1280x720` — record video
 - `--output-dir ./playwright-output` — save artifacts

@@ -11,7 +11,7 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type {
@@ -32,6 +32,7 @@ import {
   resolveSpawnTarget,
   CONTAINER_RUNNER_FILES,
   encodeContextToken,
+  readLaunchMcpServers,
 } from '@inklabs/shared';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
@@ -87,17 +88,10 @@ export class GeminiRunner implements IRunner {
     let geminiSettingsEnvPath: string | undefined;
     let geminiSettingsHostPath: string | undefined;
     if (config.inkAccessToken) {
-      const mcpJsonPath = join(config.workingDirectory, '.mcp.json');
-      // Start from workspace .mcp.json servers (includes supabase, github, etc.)
-      let mcpServers: Record<string, unknown> = {};
-      if (existsSync(mcpJsonPath)) {
-        try {
-          const parsed = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-          mcpServers = parsed.mcpServers || {};
-        } catch {
-          // ignore parse errors
-        }
-      }
+      // Start from workspace .mcp.json servers (includes supabase, github,
+      // etc.), with Playwright launched headless and isolated like every
+      // other session's.
+      const mcpServers = readLaunchMcpServers(join(config.workingDirectory, '.mcp.json'));
 
       // Build consolidated context token
       const contextToken = encodeContextToken({
