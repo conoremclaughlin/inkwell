@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { SpineSession, ThreadSpine } from '../threads-api/index.js';
 import {
+  byLatestMessage,
   isConversation,
   isSessionLive,
+  lastSpokeAt,
   liveAgentsOf,
   matchesThreadSearch,
   spineStatus,
@@ -56,6 +58,59 @@ describe('isConversation', () => {
   it('lists a key with a thread, and not one only a session references', () => {
     expect(isConversation(spine())).toBe(true);
     expect(isConversation(spine({ thread: null, sources: ['session'] }))).toBe(false);
+  });
+});
+
+/** A spine whose newest message and last activity are set independently. */
+const spoke = (key: string, messageAt: string | null, activityAt: string): ThreadSpine => {
+  const base = spine({ key, lastActivityAt: activityAt });
+  base.thread = {
+    ...base.thread!,
+    lastMessage: messageAt ? { ...base.thread!.lastMessage!, createdAt: messageAt } : null,
+  };
+  return base;
+};
+
+describe('lastSpokeAt', () => {
+  it("is the newest message's time, whatever else touched the key since", () => {
+    expect(lastSpokeAt(spoke('a', '2026-10-02T18:00:00Z', '2026-10-03T07:00:00Z'))).toBe(
+      '2026-10-02T18:00:00Z'
+    );
+  });
+
+  it('falls back to the last activity for a thread with no message, or an older server', () => {
+    expect(lastSpokeAt(spoke('a', null, '2026-10-03T07:00:00Z'))).toBe('2026-10-03T07:00:00Z');
+    const older = spine({ lastActivityAt: '2026-10-03T07:00:00Z' });
+    older.thread = { ...older.thread!, lastMessage: undefined };
+    expect(lastSpokeAt(older)).toBe('2026-10-03T07:00:00Z');
+  });
+});
+
+describe('byLatestMessage', () => {
+  it('puts the newest message first, not the newest session activity', () => {
+    // Conor's list, 2026-10-03: a thread whose session was busy six hours
+    // after its last message sat above one answered ten minutes ago.
+    const busySession = spoke('busy', '2026-10-03T01:00:00Z', '2026-10-03T07:05:00Z');
+    const justAnswered = spoke('answered', '2026-10-03T07:00:00Z', '2026-10-03T07:00:00Z');
+    const yesterday = spoke('yesterday', '2026-10-02T09:00:00Z', '2026-10-03T07:06:00Z');
+    expect([yesterday, busySession, justAnswered].sort(byLatestMessage).map((s) => s.key)).toEqual([
+      'answered',
+      'busy',
+      'yesterday',
+    ]);
+  });
+
+  it('compares instants at full precision and breaks ties by key', () => {
+    const later = spoke('z', '2026-10-03T07:00:00.000002Z', '2026-10-03T07:00:00Z');
+    const earlier = spoke('y', '2026-10-03T07:00:00.000001Z', '2026-10-03T07:00:00Z');
+    const tieB = spoke('b', '2026-10-03T06:00:00Z', '2026-10-03T06:00:00Z');
+    const tieA = spoke('a', '2026-10-03T06:00:00Z', '2026-10-03T06:00:00Z');
+    expect([tieB, earlier, tieA, later].sort(byLatestMessage).map((s) => s.key)).toEqual([
+      'z',
+      'y',
+      'a',
+      'b',
+    ]);
   });
 });
 

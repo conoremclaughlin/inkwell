@@ -6,6 +6,7 @@ import type { SpineIdentity, ThreadSpine } from '@inklabs/shared/stories/threads
 import {
   displayTitle,
   hasLiveSession,
+  lastSpokeAt,
   matchesThreadSearch,
   previewLine,
   spineStatus,
@@ -328,7 +329,7 @@ function ThreadRow({
               unread ? 'font-semibold text-sky-600 dark:text-sky-400' : 'text-muted-foreground'
             )}
           >
-            {formatShortAgo(last?.createdAt ?? spine.lastActivityAt)}
+            {formatShortAgo(lastSpokeAt(spine))}
           </span>
         </div>
         <div className="mt-0.5 flex items-center gap-2">
