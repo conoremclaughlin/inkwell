@@ -312,6 +312,31 @@ describe('a turn run through the server host', () => {
     expect(await handle.result).toMatchObject({ childExited: true });
   });
 
+  // Lumen, #701 d84b473b: the newer generation starts nothing beside the
+  // older child until that child's exit is confirmed.
+  it('a takeover over a running child: the newer generation starts nothing until the older exit is confirmed', async () => {
+    admit();
+    exitAtOnce.value = false;
+    startHostedBackendTurn(hostInput().input, unhosted('claude'));
+    await vi.waitFor(() => expect(spawned).toHaveLength(1));
+    takeOver();
+    const newer = { ...admission, turnEpoch: 'epoch-newer' };
+
+    expect(() =>
+      startHostedBackendTurn({ ...hostInput().input, admission: newer }, unhosted('claude'))
+    ).toThrow(SERVER_HOST_REFUSALS.olderChildUnconfirmed);
+    expect(spawned).toHaveLength(1);
+
+    expect(await stopOwnedChildren(2_000)).toEqual({ confirmed: [admission], unconfirmed: [] });
+    exitAtOnce.value = true;
+    const { handle } = startHostedBackendTurn(
+      { ...hostInput().input, admission: newer },
+      unhosted('claude')
+    );
+    expect(await handle.result).toMatchObject({ success: true, childExited: true });
+    expect(spawned).toHaveLength(2);
+  });
+
   it('intake closing before the start: nothing starts', async () => {
     admit();
     await closeIntakeAndDrain(10);

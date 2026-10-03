@@ -25,6 +25,7 @@ import {
   attachRunChild,
   getActiveRun,
   isGenerationAdmitted,
+  otherGenerationOwnsChild,
   type ChildOwnership,
 } from './active-runs.js';
 
@@ -43,7 +44,24 @@ export const SERVER_HOST_REFUSALS = {
   notAdmitted:
     "the run's generation is no longer the one admitted for its session, or intake has closed; nothing is minted or started for it",
   wrongSession: 'a hosted turn must name the session its generation was admitted for',
+  olderChildUnconfirmed:
+    'another generation of this session still owns a child whose exit is not confirmed; nothing is minted or started beside it',
 } as const;
+
+/**
+ * Why `admission` may not start work now, or undefined when it may. In this
+ * process only: the durable cross-process gate is still missing (P2d), so a
+ * writer elsewhere is not seen here.
+ */
+function refusalFor(admission: { sessionId: string; turnEpoch: string }): string | undefined {
+  if (!isGenerationAdmitted(admission.sessionId, admission.turnEpoch)) {
+    return SERVER_HOST_REFUSALS.notAdmitted;
+  }
+  if (otherGenerationOwnsChild(admission.sessionId, admission.turnEpoch)) {
+    return SERVER_HOST_REFUSALS.olderChildUnconfirmed;
+  }
+  return undefined;
+}
 
 /**
  * A refusal from the host's sessionEnv. The runner asks for credentials
@@ -102,12 +120,17 @@ function requireFinitePositive(value: number, what: string): void {
  * can end it at any time. The host asks again before and after each mint,
  * and once more right before each spawn (admitSpawn), so an old host mints
  * nothing and starts nothing (Lumen, #701 873209b4).
+ *
+ * Each of those asks also refuses while another generation of the session
+ * still owns a child whose exit is not confirmed: a takeover never runs work
+ * beside a child that may still be writing (Lumen, #701 d84b473b).
  */
 export function createServerBackendHost(input: ServerBackendHostInput): BackendHost {
   const { admission } = input;
-  const admitted = () => isGenerationAdmitted(admission.sessionId, admission.turnEpoch);
   const run = getActiveRun(admission.sessionId);
-  if (!run || !admitted()) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
+  if (!run) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
+  const refusedAtCreation = refusalFor(admission);
+  if (refusedAtCreation) throw new Error(refusedAtCreation);
   requireFinitePositive(input.budgetMs, 'the run budget');
   if (!Number.isFinite(run.startedAt)) {
     throw new RangeError('the admitted run has no usable start time');
@@ -146,13 +169,15 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
       // can stretch a credential past the run.
       const remainingMs = deadlineAt - now();
       if (remainingMs <= 0) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.deadlinePassed);
-      if (!admitted()) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.notAdmitted);
+      const refused = refusalFor(admission);
+      if (refused) throw new HostedSpawnRefusal(refused);
       const lifetimeMs =
         Math.min(hardTimeoutMs, remainingMs) + STOP_GRACE_MS + STOP_GIVE_UP_MS + MINT_SKEW_MS;
       const token = await input.mintAccessToken({ ttlSeconds: Math.ceil(lifetimeMs / 1000) });
       // Asked again after the await: admission lost during the mint means the
       // credential exists but is handed to nothing.
-      if (!admitted()) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.notAdmitted);
+      const refusedAfterMint = refusalFor(admission);
+      if (refusedAfterMint) throw new HostedSpawnRefusal(refusedAfterMint);
       if (typeof token !== 'string' || token.length === 0) {
         throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.missingCredential);
       }
@@ -165,7 +190,7 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
     inkwellMcpUrl: input.inkwellMcpUrl,
     resolveBinary: (name) => input.resolveBinary(name),
     warn: (message) => input.warn(message),
-    admitSpawn: admitted,
+    admitSpawn: () => refusalFor(admission) === undefined,
   };
 }
 
@@ -211,7 +236,9 @@ export function startHostedBackendTurn(
     abort: () => handle?.abort(),
     settled,
   });
-  if (!ownership) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
+  if (!ownership) {
+    throw new Error(refusalFor(hostInput.admission) ?? SERVER_HOST_REFUSALS.notAdmitted);
+  }
 
   try {
     handle = startBackendTurn({ ...request, host });
