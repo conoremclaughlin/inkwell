@@ -11,7 +11,7 @@ import { ThreadConversation } from '@/components/threads/thread-conversation';
 import { ThreadDetails } from '@/components/threads/thread-details';
 import { ThreadList } from '@/components/threads/thread-list';
 import type { ThreadsResponse } from '@inklabs/shared/stories/threads-api';
-import { isConversation } from '@inklabs/shared/stories/thread-browsing';
+import { byLatestMessage, isConversation } from '@inklabs/shared/stories/thread-browsing';
 import { nameLookup } from '@inklabs/shared/stories/thread-viewing';
 
 const DETAILS_STORAGE_KEY = 'ink.threads.details-open';
@@ -87,9 +87,10 @@ function ThreadsChat() {
   const nameFor = useMemo(() => nameLookup(identities?.individuals), [identities]);
 
   const spines = useMemo(() => data?.spines ?? [], [data]);
-  // The list is conversations. A key only a session, studio or task group
-  // references has nothing to read yet; it stays reachable by link.
-  const threads = useMemo(() => spines.filter(isConversation), [spines]);
+  // The list is conversations, newest message first. A key only a session,
+  // studio or task group references has nothing to read yet; it stays
+  // reachable by link.
+  const threads = useMemo(() => spines.filter(isConversation).sort(byLatestMessage), [spines]);
   const selected = useMemo(
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]
@@ -244,7 +245,7 @@ function NoConversation({
               {state === 'empty' ? 'No threads yet' : 'Pick a thread'}
             </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Every conversation between you and the SBs is on the left, newest activity first.
+              Every conversation between you and the SBs is on the left, newest message first.
             </p>
           </>
         )}
