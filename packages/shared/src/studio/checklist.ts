@@ -25,6 +25,7 @@
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { readCodexConfig } from './mcp-config-sync.js';
+import { describePermissions } from './claude-defaults.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -223,25 +224,31 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
   );
 
   // .claude/settings.local.json — permissions and hooks live in one file,
-  // and are two different items: a file with hooks and no allow list makes
-  // every tool call ask.
+  // and are two different items: a file with hooks and no permissions makes
+  // every tool call ask. Any `permissions` object counts, whatever it holds:
+  // deny or ask rules alone, `defaultMode` alone, or nothing at all are
+  // someone's deliberate policy, and `ink init` keeps them as they are, so
+  // the checklist must not call them missing (design v3, item 4).
   const settingsPath = join(worktreePath, '.claude', 'settings.local.json');
   const settings = readJson(settingsPath);
   const permissions =
-    settings?.permissions && typeof settings.permissions === 'object'
+    settings?.permissions &&
+    typeof settings.permissions === 'object' &&
+    !Array.isArray(settings.permissions)
       ? (settings.permissions as Record<string, unknown>)
       : null;
-  const allow = Array.isArray(permissions?.allow) ? (permissions?.allow as unknown[]) : [];
   add(
     'claude-permissions',
     '.claude/settings.local.json permissions',
     linked,
-    allow.length > 0 || !linked,
-    allow.length > 0
-      ? `${allow.length} allow rule(s)`
+    !!permissions || !linked,
+    permissions
+      ? describePermissions(permissions)
       : linked
         ? settings
-          ? 'no allow rules'
+          ? settings.permissions === undefined
+            ? 'no permissions'
+            : 'permissions is not an object'
           : existsSync(settingsPath)
             ? 'unparseable'
             : 'missing'

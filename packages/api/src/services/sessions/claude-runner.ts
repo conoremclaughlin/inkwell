@@ -27,10 +27,14 @@ import {
   CONTAINER_RUNNER_FILES,
   PRINT_MODE_CHANNEL_ENV,
 } from '@inklabs/shared';
-import { homedir } from 'os';
-import { join } from 'path';
+import { homedir, tmpdir } from 'os';
+import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
+import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
+
+/** Where the sandbox orchestrator mounts the studio checkout in a container. */
+const CONTAINER_STUDIO_ROOT = '/studio';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -442,6 +446,49 @@ export class ClaudeRunner implements IRunner {
     // It now runs in the session service before EVERY runner (task
     // 2841c7a9), so a Codex or Gemini SB's studio is completed too.
 
+    // The studio's permission profile, in a settings file of this launch's
+    // own (design v5, phase A). Prepared before the overlay so a refused
+    // launch leaves nothing applied. A profile that cannot be validated or
+    // delivered fails the launch: no builder fallback.
+    let launchSettings: LaunchSettings | null = null;
+    if (config.launchPermissions && config.workingDirectory) {
+      try {
+        launchSettings = await prepareLaunchSettings({
+          worktreePath: config.workingDirectory,
+          studioWorktreePath: config.launchPermissions.worktreePath,
+          mainRoot: config.launchPermissions.mainRoot,
+          profile: config.launchPermissions.profile,
+          owner: config.launchPermissions.owner,
+          outputDir: config.container?.runtimeDir ?? join(tmpdir(), 'ink-claude-settings'),
+          ...(config.container
+            ? {
+                executionRoot: CONTAINER_STUDIO_ROOT,
+                processPathFor: (hostPath: string) =>
+                  `${CONTAINER_RUNNER_FILES}/${basename(hostPath)}`,
+              }
+            : {}),
+        });
+      } catch (err) {
+        mcpInjection?.cleanup();
+        const reason = err instanceof Error ? err.message : String(err);
+        logger.error('Launch refused: the studio permission profile could not be delivered', {
+          cwd: config.workingDirectory,
+          studioId: config.studioId,
+          reason,
+        });
+        throw new Error(`Launch refused: ${reason}`);
+      }
+      args.push('--settings', launchSettings.processPath);
+      logger.info('Launch settings delivered', {
+        launchId: launchSettings.launchId,
+        studioId: config.studioId,
+        profile: launchSettings.profile,
+        delivered: launchSettings.delivered,
+        sources: launchSettings.sources,
+        precedence: launchSettings.precedence,
+      });
+    }
+
     // Apply per-session permission overlay (from strategy config or 2FA grant).
     // The restore function is called after the process exits to revert the overlay.
     let restoreOverlay: (() => Promise<void>) | null = null;
@@ -681,6 +728,7 @@ export class ClaudeRunner implements IRunner {
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         restoreOverlay?.().catch(() => {});
+        launchSettings?.cleanup().catch(() => {});
         if (!settled) {
           settled = true;
           reject(new Error(`Failed to spawn Claude: ${error.message}`));
@@ -692,6 +740,7 @@ export class ClaudeRunner implements IRunner {
         clearTimeout(idleTimer);
         mcpInjection?.cleanup();
         restoreOverlay?.().catch(() => {});
+        launchSettings?.cleanup().catch(() => {});
         if (settled) return; // Already resolved by timeout
         settled = true;
         // Before resolving: the stream's last line may have arrived without a

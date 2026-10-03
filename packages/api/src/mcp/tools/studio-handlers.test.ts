@@ -178,10 +178,17 @@ describe('handleCreateStudio completes the studio through the routine', () => {
     // The completion routine (`ink init`, task c3b34be8) runs in the new
     // worktree with the row it now has; it syncs config from the MAIN
     // worktree by its own placement detection, not from the caller's path.
+    // A studio on a branch of its own gets the builder profile, read from
+    // the row (design v3, item 5); inheritance is never passed (item 3).
     expect(completeStudioViaCli).toHaveBeenCalledWith(
       studioPath,
-      expect.objectContaining({ sbSlug: 'wren', studioId: 'studio-test-id' })
+      expect.objectContaining({
+        sbSlug: 'wren',
+        studioId: 'studio-test-id',
+        permissionProfile: 'builder',
+      })
     );
+    expect(completeStudioViaCli.mock.calls.at(-1)?.[1]).not.toHaveProperty('inheritPermissions');
 
     // The studio record is anchored to the resolved main root as well
     expect(studiosCreate).toHaveBeenCalledWith(expect.objectContaining({ repoRoot: mainRoot }));

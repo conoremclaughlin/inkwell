@@ -197,11 +197,13 @@ describe('auditStudio', () => {
           ),
       },
       {
+        // No permissions key at all. An empty allow list is no longer a
+        // break: it is an authored policy (design v3, item 4).
         id: 'claude-permissions',
         break: (r) =>
           writeFile(
             path.join(r, '.claude', 'settings.local.json'),
-            JSON.stringify({ permissions: { allow: [] }, hooks: claudeHooks() })
+            JSON.stringify({ hooks: claudeHooks() })
           ),
       },
       {
@@ -261,6 +263,57 @@ describe('auditStudio', () => {
         const audit = auditStudio(root, { linked: true });
         const failed = audit.checks.filter((x) => !x.ok).map((x) => x.id);
         expect(failed, c.id).toEqual([c.id]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('any authored permissions object completes the item: deny-only, ask-only, mode-only, empty, empty allow', async () => {
+    const authored: Array<Record<string, unknown>> = [
+      { deny: ['Bash(git push *)'] },
+      { ask: ['Bash(*)'] },
+      { defaultMode: 'plan' },
+      {},
+      { allow: [] },
+    ];
+    for (const permissions of authored) {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(
+          path.join(root, '.claude', 'settings.local.json'),
+          JSON.stringify({ permissions, hooks: claudeHooks() })
+        );
+        const audit = auditStudio(root, { linked: true });
+        const check = audit.checks.find((c) => c.id === 'claude-permissions');
+        expect(check?.ok, JSON.stringify(permissions)).toBe(true);
+        expect(audit.complete, JSON.stringify(permissions)).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('no permissions key, a non-object permissions, and an unparseable file each fail the item, saying which', async () => {
+    const cases: Array<{ content: string; detail: string }> = [
+      { content: JSON.stringify({ hooks: claudeHooks() }), detail: 'no permissions' },
+      {
+        content: JSON.stringify({ permissions: ['Bash(*)'], hooks: claudeHooks() }),
+        detail: 'permissions is not an object',
+      },
+      { content: '{ "permissions": ', detail: 'unparseable' },
+    ];
+    for (const c of cases) {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(path.join(root, '.claude', 'settings.local.json'), c.content);
+        const check = auditStudio(root, { linked: true }).checks.find(
+          (x) => x.id === 'claude-permissions'
+        );
+        expect(check?.ok, c.detail).toBe(false);
+        expect(check?.detail).toBe(c.detail);
       } finally {
         await rm(root, { recursive: true, force: true });
       }

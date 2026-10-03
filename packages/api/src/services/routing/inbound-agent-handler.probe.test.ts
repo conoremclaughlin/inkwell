@@ -406,6 +406,8 @@ describe('reply admission, through session routing', () => {
         status: 'active',
         route_patterns: [],
         ephemeral: false,
+        // NOT NULL in the schema; a launch refuses a row that names no root.
+        repo_root: worktrees,
         worktree_path: mkdtempSync(path.join(worktrees, `${id}-`)),
         lease:
           opts.occupied && id === 'studio-old'
