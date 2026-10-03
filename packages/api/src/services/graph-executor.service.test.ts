@@ -697,6 +697,7 @@ describe('GraphExecutorService no-progress breaker', () => {
         dispatchedAt: expect.any(String),
         taskGroupId: 'g-1',
         ownerSbId: 'ident-9',
+        signature: expect.stringMatching(/^[0-9a-f]{64}$/),
       },
     });
   });

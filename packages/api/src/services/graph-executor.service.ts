@@ -27,7 +27,12 @@ import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveSbSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
-import { WakeSourceBreaker, type WakeSourceTag } from './wake-source-breaker';
+import {
+  WakeSourceBreaker,
+  issueWakeSourceTag,
+  type WakeSourceTag,
+  type WakeSourceTagFields,
+} from './wake-source-breaker';
 import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
 
@@ -356,7 +361,8 @@ export class GraphExecutorService {
         continue;
       }
       const state = states.get(node.id);
-      const wakeSource: WakeSourceTag | undefined = state
+      // Signed in triggerNode, once the identity the dispatch reaches is known.
+      const wakeFields: WakeSourceTagFields | undefined = state
         ? {
             source: 'graph_dispatch',
             workKind: 'graph_node',
@@ -374,7 +380,7 @@ export class GraphExecutorService {
         group,
         node,
         target.kind,
-        wakeSource
+        wakeFields
       );
       if (ok) {
         triggered.push(node.id);
@@ -676,7 +682,7 @@ export class GraphExecutorService {
     group: TaskGroup,
     node: GraphNodeRef,
     kind: 'work' | 'gate',
-    wakeSource?: WakeSourceTag
+    wakeFields?: WakeSourceTagFields
   ): Promise<{ ok: boolean; recipientIdentityId: string | null }> {
     const client = this.dataComposer.getClient();
     let slug: string | null = null;
@@ -727,7 +733,7 @@ export class GraphExecutorService {
       `graph_${kind}_ready`,
       node.id,
       // The owner is whoever this dispatch actually reaches.
-      wakeSource ? { ...wakeSource, ownerSbId: recipientIdentityId } : undefined
+      wakeFields ? issueWakeSourceTag({ ...wakeFields, ownerSbId: recipientIdentityId }) : undefined
     );
     return { ok, recipientIdentityId };
   }

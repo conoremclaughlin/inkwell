@@ -2277,6 +2277,7 @@ describe('StrategyService', () => {
           dispatchedAt: expect.any(String),
           taskGroupId: 'group-1',
           ownerSbId: 'sb-wren-uuid',
+          signature: expect.stringMatching(/^[0-9a-f]{64}$/),
         },
       });
     });
