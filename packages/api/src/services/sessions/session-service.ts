@@ -3327,31 +3327,40 @@ export class SessionService implements ISessionService {
     // finalize then clears the terminal's attachment flag. A read that cannot
     // rule a terminal out counts as one: declining costs the reply its
     // conversation, while resuming could cost the terminal its turn.
-    if (!this.supabase) return decline('terminal_unverified');
-    const { data: attachment, error: attachmentError } = await this.supabase
-      .from('sessions')
-      .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
-      .eq('id', session.id)
-      .eq('user_id', ctx.userId)
-      .maybeSingle();
-    if (attachmentError || !attachment) {
-      return decline('terminal_unverified', {
-        error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+    const terminalDecline = async (candidate: Session): Promise<null | 'declined'> => {
+      if (!this.supabase) {
+        decline('terminal_unverified');
+        return 'declined';
+      }
+      const { data: attachment, error: attachmentError } = await this.supabase
+        .from('sessions')
+        .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
+        .eq('id', candidate.id)
+        .eq('user_id', ctx.userId)
+        .maybeSingle();
+      if (attachmentError || !attachment) {
+        decline('terminal_unverified', {
+          error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+        });
+        return 'declined';
+      }
+      const delivery = decideDelivery({
+        forceSpawn: false,
+        pollRow: attachment,
+        attachedRow: {
+          cli_attached: attachment.cli_attached === true,
+          // A row with no update stamp cannot be shown stale, so a set
+          // attachment flag on it stands.
+          updated_at: attachment.updated_at ?? new Date().toISOString(),
+        },
       });
-    }
-    const delivery = decideDelivery({
-      forceSpawn: false,
-      pollRow: attachment,
-      attachedRow: {
-        cli_attached: attachment.cli_attached === true,
-        // A row with no update stamp cannot be shown stale, so a set
-        // attachment flag on it stands.
-        updated_at: attachment.updated_at ?? new Date().toISOString(),
-      },
-    });
-    if (delivery.mode === 'inline') {
-      return decline('terminal_attached', { source: delivery.source });
-    }
+      if (delivery.mode === 'inline') {
+        decline('terminal_attached', { source: delivery.source });
+        return 'declined';
+      }
+      return null;
+    };
+    if (await terminalDecline(session)) return null;
 
     // The lease gate runs only for a request that carries a threadKey, and a
     // reply carries none, so on its own a reply would enter the anchor's
@@ -3383,6 +3392,16 @@ export class SessionService implements ISessionService {
         });
       }
       session = reopened.session;
+      // The row the reopen hands back may not be the one the checks above
+      // read: a human pick that attached a terminal in between won the
+      // compare-and-set, and the reopen returns its row (Lumen, #725 r2).
+      // That row is checked again before any lease or return. Running alone
+      // is no reason to decline: a concurrent server-side resume queues this
+      // reply behind its turn as usual.
+      if (await terminalDecline(session)) return null;
+      if (session.studioId && !session.threadKey) {
+        return decline('studio_without_thread', { studioId: session.studioId });
+      }
     }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {

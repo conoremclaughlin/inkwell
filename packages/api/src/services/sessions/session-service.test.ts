@@ -2881,6 +2881,36 @@ describe('SessionService', () => {
       );
     });
 
+    it('declines when a terminal attached while it reopened, rechecking the row it got back (Lumen, #725 r2)', async () => {
+      // The reply read the authoring session ended and unattached. Before its
+      // reopen landed, a human picked the transcript and attached a terminal:
+      // the reopen loses its compare-and-set and hands back that live row.
+      // Resuming it headless would run a second process on the human's
+      // conversation, so the refreshed row is checked again.
+      const { service, tables } = replyFixture({
+        authoring: { endedAt: new Date(), lifecycle: 'completed' },
+      });
+      vi.mocked(mockRepository.reopenEnded!).mockImplementationOnce(async () => {
+        tables.sessions[0].cli_attached = true;
+        tables.sessions[0].updated_at = stamp();
+        return {
+          kind: 'open',
+          session: createMockSession({
+            id: 'authoring',
+            sbSlug: 'wren',
+            sbId: 'sb-wren',
+            endedAt: null,
+            lifecycle: 'running',
+          }),
+        };
+      });
+
+      const session = await reply(service);
+
+      expect(mockRepository.reopenEnded).toHaveBeenCalledTimes(1);
+      expect(session.id).toBe('home');
+    });
+
     it('declines when its session key is now held by a live session, and routes without its studio', async () => {
       // Reopening would need the key's unique index to admit a second live
       // holder. It does not, so the reply declines. Finding 3 of the #682
