@@ -245,7 +245,7 @@ function NoConversation({
               {state === 'empty' ? 'No threads yet' : 'Pick a thread'}
             </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Every conversation between you and the SBs is on the left, newest activity first.
+              Every conversation between you and the SBs is on the left, newest message first.
             </p>
           </>
         )}
