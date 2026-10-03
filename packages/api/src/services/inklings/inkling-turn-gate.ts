@@ -62,27 +62,90 @@ export async function claimInklingTurn(
   return { allowed: false, used: cap };
 }
 
+/**
+ * What the SB a turn is for is, as far as the database can say:
+ * - 'inkling', with its row;
+ * - 'other', positively not an inkling;
+ * - 'unknown', when the row could not be read or found.
+ * Read by id with no user filter, so an inkling never hides behind a
+ * mismatched account. With no id, it is read by the account and slug, and
+ * any inkling among those rows makes it one. Lumen's review of 8b9d7f50:
+ * an unreadable or absent identity used to skip the whole gate.
+ */
+export type InklingIdentity =
+  | { kind: 'inkling'; id: string; userId: string; metadata: Record<string, unknown> }
+  | { kind: 'other' }
+  | { kind: 'unknown' };
+
+export async function classifyInklingIdentity(
+  supabase: SupabaseClient,
+  input: { sbId: string | null | undefined; sbSlug: string; userId: string }
+): Promise<InklingIdentity> {
+  type Row = { id: string; user_id: string; metadata: Record<string, unknown> | null };
+  let rows: Row[];
+  if (input.sbId) {
+    const { data, error } = await supabase
+      .from('agent_identities')
+      .select('id, user_id, metadata')
+      .eq('id', input.sbId)
+      .maybeSingle();
+    if (error || !data) return { kind: 'unknown' };
+    rows = [data as Row];
+  } else {
+    const { data, error } = await supabase
+      .from('agent_identities')
+      .select('id, user_id, metadata')
+      .eq('user_id', input.userId)
+      .eq('agent_id', input.sbSlug);
+    if (error || !data || data.length === 0) return { kind: 'unknown' };
+    rows = data as Row[];
+  }
+  const inkling = rows.find((r) => r.metadata?.client === INKLING_CLIENT);
+  if (!inkling) return { kind: 'other' };
+  return {
+    kind: 'inkling',
+    id: inkling.id,
+    userId: inkling.user_id,
+    metadata: inkling.metadata ?? {},
+  };
+}
+
+/**
+ * Every inkling's slug is kindle-<token id>, set when it is awakened and
+ * never changed by naming. So an SB whose identity cannot be read is
+ * refused when its slug could be an inkling's, and only then.
+ */
+export function mayBeInklingSlug(sbSlug: string): boolean {
+  return sbSlug.toLowerCase().startsWith('kindle-');
+}
+
 export interface InklingTurnInput {
-  /** agent_identities.metadata of the SB the turn is for; null when unknown. */
-  identityMetadata: Record<string, unknown> | null | undefined;
-  /** The account the turn runs for (the identity's user_id). */
+  identity: InklingIdentity;
+  sbSlug: string;
+  /** The account the turn runs for. */
   userId: string;
   /** SessionRequest.sender.id: 'user' for a person's message. */
   senderId: string | undefined;
 }
 
-/** Null when the turn may start; otherwise why it may not. Only inklings are ever refused. */
+/** Null when the turn may start; otherwise why it may not. Only inklings, or possible ones, are ever refused. */
 export function inklingTurnRefusal(
   input: InklingTurnInput,
   ownerTestUserId: string | null
 ): string | null {
-  const metadata = input.identityMetadata;
-  if (!metadata || metadata.client !== INKLING_CLIENT) return null;
+  const { identity } = input;
+  if (identity.kind === 'unknown') {
+    return mayBeInklingSlug(input.sbSlug)
+      ? 'the identity could not be read, and it may be an inkling'
+      : null;
+  }
+  if (identity.kind === 'other') return null;
   if (ownerTestUserId === null) return 'inklings are not open on this server';
-  if (input.userId.toLowerCase() !== ownerTestUserId.toLowerCase()) {
+  const owner = ownerTestUserId.toLowerCase();
+  if (identity.userId.toLowerCase() !== owner || input.userId.toLowerCase() !== owner) {
     return 'this inkling belongs to an account outside the owner test';
   }
-  if (metadata.ownerTest !== true) return 'this inkling was not born under the owner test';
+  if (identity.metadata.ownerTest !== true) return 'this inkling was not born under the owner test';
   if (input.senderId !== 'user') {
     return 'an inkling wakes only for its owner’s own message, not a system, SB or channel send';
   }

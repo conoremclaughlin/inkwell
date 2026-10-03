@@ -929,7 +929,8 @@ describe('SessionService', () => {
       const turn = async (
         metadata: Record<string, unknown>,
         request: Record<string, unknown> = fromOwner,
-        gate = OWNER
+        gate = OWNER,
+        extra: { session?: Record<string, unknown>; row?: Record<string, unknown> } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
         const supabase = makeFakeSupabase({
@@ -944,6 +945,7 @@ describe('SessionService', () => {
               metadata,
               // NOT NULL in the table; the turn-cap claim's conditional update needs it.
               updated_at: '2026-10-02T08:00:00.000Z',
+              ...extra.row,
             },
           ],
           studios: [],
@@ -960,15 +962,83 @@ describe('SessionService', () => {
           mockInkRunner
         );
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ sbId: SB, userId: OWNER } as never)
+          createMockSession({ sbId: SB, userId: OWNER, ...extra.session } as never)
         );
+        lastService = service;
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
       };
+      let lastService: SessionService;
 
       it("the owner's own message wakes an inkling born under the test", async () => {
         const result = await turn(INKLING);
         expect(mockClaudeRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
+        const MISSING = '99999999-9999-4999-8999-999999999999';
+
+        it('an identity that cannot be read is refused when its slug could be an inkling, and only then', async () => {
+          const kindle = await turn(INKLING, { ...fromOwner, sbSlug: 'kindle-zzz' }, OWNER, {
+            session: { sbId: MISSING, sbSlug: 'kindle-zzz' },
+          });
+          expect(kindle.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          // Control: an unreadable identity whose slug no inkling can have runs as today.
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, OWNER, {
+            session: { sbId: MISSING },
+          });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
+          const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
+          expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          await turn(INKLING, fromOwner, OWNER, { session: { sbId: null } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            timeoutMs: 300_000,
+            killProcessGroup: true,
+          });
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        });
+
+        it("another account's inkling is refused though the turn names the owner's account", async () => {
+          const result = await turn(INKLING, fromOwner, OWNER, {
+            row: { user_id: '33333333-3333-4333-8333-333333333333' },
+          });
+          expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('an inkling session on another backend is refused, never run unbounded', async () => {
+          for (const backend of ['codex-cli', 'ink']) {
+            const result = await turn(INKLING, fromOwner, OWNER, { session: { backend } });
+            expect(result.errorCode, backend).toBe('INKLING_TURN_REFUSED');
+          }
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('an inkling session is never compacted; another SB still is', async () => {
+          for (const [metadata, compacts] of [
+            [INKLING, false],
+            [{}, true],
+          ] as const) {
+            await turn(metadata, { sender: { id: 'system', name: 'x' } });
+            vi.mocked(mockRepository.tryAcquireCompactionLock).mockClear();
+            vi.mocked(mockRepository.findById).mockResolvedValueOnce(
+              createMockSession({ sbId: SB, userId: OWNER } as never)
+            );
+            await lastService.triggerCompaction('session-123');
+            expect(
+              vi.mocked(mockRepository.tryAcquireCompactionLock).mock.calls.length > 0,
+              JSON.stringify(metadata)
+            ).toBe(compacts);
+          }
+        });
       });
 
       it('its turn runs in its own folder, made on demand: never the default directory', async () => {
