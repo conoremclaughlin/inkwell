@@ -692,7 +692,11 @@ describe('InkAuthProvider', () => {
       );
 
       const result = provider.verifyAccessToken(`Bearer ${token}`);
-      expect(result).toEqual({ userId: 'user-123', email: 'test@example.com' });
+      expect(result).toEqual({
+        userId: 'user-123',
+        email: 'test@example.com',
+        expiresAt: (jwt.decode(token) as { exp: number }).exp,
+      });
     });
 
     it('should return null for missing auth header', () => {
@@ -820,7 +824,11 @@ describe('InkAuthProvider', () => {
 
       // Step 5: Verify the access token
       const verified = provider.verifyAccessToken(`Bearer ${refreshResult.access_token}`);
-      expect(verified).toEqual({ userId: 'user-123', email: 'test@example.com' });
+      expect(verified).toEqual({
+        userId: 'user-123',
+        email: 'test@example.com',
+        expiresAt: refreshedDecoded.exp,
+      });
 
       // No Supabase auth calls after initial callback
       expect(mockGetUser).toHaveBeenCalledTimes(1); // Only during handleAuthCallback

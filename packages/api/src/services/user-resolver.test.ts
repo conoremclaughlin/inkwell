@@ -4,6 +4,7 @@ import { resetSharedBreakerForTests } from '../utils/supabase-retry';
 
 // getUserFromContext is a hard dependency on AsyncLocalStorage; stub it out.
 vi.mock('../utils/request-context', () => ({
+  getAuthenticatedPrincipal: vi.fn().mockReturnValue(undefined),
   getUserFromContext: vi.fn().mockReturnValue(undefined),
 }));
 
