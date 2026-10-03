@@ -52,6 +52,7 @@ import {
 import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
+import { recordWakeSourceCompletion } from './services/wake-source-breaker';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
@@ -1144,6 +1145,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         sessionKey: payload.sessionKey,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
@@ -1223,6 +1225,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
         ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
+        ...(refusal.detail.explicit ? { explicit: refusal.detail.explicit } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
@@ -1230,7 +1233,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
               : refusal.detail.reason === 'project-without-repo'
                 ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
-                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+                : refusal.detail.reason === 'explicit-address'
+                  ? 'the sender named a session that cannot take this message; re-send to one the recipient owns, or without the address'
+                  : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1255,6 +1260,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             // The pinned project a project-without-repo refusal names; this
             // hand-built copy is where it went missing (Lumen, #681 round 1).
             project: refusal.detail.project ?? null,
+            explicit: refusal.detail.explicit ?? null,
           },
         });
       }
@@ -1289,6 +1295,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // from thread history / the participant stamp is a continuity hint
         // that routing tests against the thread's project repo (#681 r2).
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // The caller named this session itself (T4): refused if it cannot
+        // take the message, reopened if it ended. A named studio alone never
+        // sets it.
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         repoRoot:
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
@@ -1336,6 +1346,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
           } else {
             stampedSessionId = assignment.sessionId;
+          }
+          // A named session is an address (T4; Lumen, #725). If its stamp could
+          // not be written and another session holds the binding, the message
+          // is held and reported, never delivered to that other session.
+          if (assignment.rerouted && payload.explicitRecipientSession) {
+            throw new RoutingRefusedError(payload.threadKey || '(unthreaded)', targetSlug, {
+              triedCallerRepo: false,
+              reason: 'explicit-address',
+              anchor: 'session',
+              explicit: { sessionId: payload.recipientSessionId, cause: 'binding-held' },
+            });
           }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
@@ -1435,6 +1456,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
         } catch (err) {
+          // A refused address is a routing decision, not a failed write: it
+          // holds the message instead of degrading to the routed candidate.
+          if (err instanceof RoutingRefusedError) throw err;
           assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
@@ -1612,6 +1636,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // candidate is promoted as the continuity hint it is, and admission
         // re-checks it against the thread's project repo.
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // Named only while the delivery session IS the one the caller named:
+        // a reroute to a concurrent winner is routing's choice, not theirs.
+        recipientSessionNamed:
+          !!payload.explicitRecipientSession && deliverySession.id === payload.recipientSessionId,
       };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
@@ -1744,6 +1772,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // routingRecovery untouched by this dispatch, so the stamp's generation
     // guard passed.)
     await clearHoldAtTerminal();
+
+    // A completed, admitted wake: count it against its source's no-progress
+    // breaker (spec session-lifecycle-model §5). Only a message a wake source
+    // tagged is counted; never throws.
+    await recordWakeSourceCompletion(dataComposer!, userId, payload.metadata);
 
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =

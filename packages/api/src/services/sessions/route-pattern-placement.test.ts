@@ -151,7 +151,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler
+       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -451,6 +451,8 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = [], dFirst =
     RoutingRefusedError,
     routeResponses: vi.fn(async () => undefined),
     triggerRetryScheduler: { cancelFor: vi.fn() },
+    // The no-progress breaker's completion hook (T1): inert here.
+    recordWakeSourceCompletion: vi.fn(async () => null),
   });
 
   /** One delivery, through the handler production registers on the gateway. */

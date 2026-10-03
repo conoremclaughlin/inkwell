@@ -5,6 +5,7 @@
  */
 
 import type { ErrorClassification } from '@inklabs/shared';
+import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 
 // ─── Channel Types ───
 
@@ -181,6 +182,17 @@ export interface Session {
   lastActivityAt: Date;
   endedAt: Date | null;
 
+  /**
+   * Archived: automatic routing never resumes it (session-lifecycle-model
+   * §2.2). Mapped from T2 on; nothing routes on it until the T11 cutover.
+   */
+  archivedAt?: Date | null;
+  archivedReason?: SessionArchivedReason;
+  /** `metadata.handedOffTo`: the successor session after a handoff. */
+  handedOffTo?: string;
+  /** `metadata.resumeRefused`: a backend refused to resume this transcript. */
+  resumeRefused?: SessionResumeRefused;
+
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
@@ -254,6 +266,12 @@ export interface SessionRequest {
      * b5c71bc3, Lumen #681 r2).
      */
     recipientSessionExplicit?: boolean;
+    /**
+     * True only when the caller named this session itself, by id or key (T4).
+     * Such a session is refused when it cannot take the message and reopened
+     * when it ended; an inferred one falls through as before.
+     */
+    recipientSessionNamed?: boolean;
     // The session that wrote the message this one replies to. A preference,
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
@@ -362,12 +380,28 @@ export interface SessionResult {
     detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it (task b5c71bc3). */
       project?: { slug: string; cause?: 'unset' | 'unresolved' | 'unreadable'; repoRoot?: string };
+      /** A caller-named session that cannot take the message (T4). */
+      explicit?: {
+        sessionId?: string;
+        sessionKey?: string;
+        cause:
+          | 'unknown-session'
+          | 'contact-scope'
+          | 'session-key-miss'
+          | 'session-key-held'
+          | 'binding-held';
+      };
     };
   };
 }
@@ -553,6 +587,21 @@ export interface ISessionService {
 
 // ─── Repository Interface ───
 
+/**
+ * What a conditional reopen found (SessionRepository.reopenEnded):
+ * - `reopened`: this call cleared the ended state it observed.
+ * - `open`: the row is no longer ended (another resolution or a human resume
+ *   reopened it first), and `session` is it as it stands now.
+ * - `key-held`: its session key is held by another live session, so the key's
+ *   unique index refuses a second live holder.
+ * - `missing`: the row is gone.
+ */
+export type ReopenEndedResult =
+  | { kind: 'reopened'; session: Session }
+  | { kind: 'open'; session: Session }
+  | { kind: 'key-held' }
+  | { kind: 'missing' };
+
 export interface ISessionRepository {
   findById(id: string): Promise<Session | null>;
 
@@ -575,6 +624,15 @@ export interface ISessionRepository {
       includeFailed?: boolean;
     }
   ): Promise<Session | null>;
+
+  /**
+   * Reopen an ended session, conditional on the ended state the caller
+   * observed (T4; Lumen, #725). See SessionRepository.reopenEnded.
+   */
+  reopenEnded?(
+    id: string,
+    observed: Pick<Session, 'lifecycle' | 'status'>
+  ): Promise<ReopenEndedResult>;
 
   findByThreadKey?(
     userId: string,

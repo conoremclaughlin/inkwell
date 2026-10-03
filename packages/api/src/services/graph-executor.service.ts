@@ -27,6 +27,12 @@ import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveSbSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
+import {
+  WakeSourceBreaker,
+  issueWakeSourceTag,
+  type WakeSourceTag,
+  type WakeSourceTagFields,
+} from './wake-source-breaker';
 import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
 
@@ -188,6 +194,7 @@ const CLAIM_IDLE_RECLAIM_MS = Number(process.env.GRAPH_CLAIM_IDLE_RECLAIM_MS || 
 
 export class GraphExecutorService {
   private leaseService?: StudioLeaseService;
+  private wakeBreaker?: WakeSourceBreaker;
 
   constructor(
     private dataComposer: DataComposer,
@@ -201,6 +208,17 @@ export class GraphExecutorService {
       this.leaseService = new StudioLeaseService(this.dataComposer.getClient());
     }
     return this.leaseService;
+  }
+
+  /** The no-progress breaker dispatch consults (spec session-lifecycle-model §5). */
+  private breaker(): WakeSourceBreaker {
+    if (!this.wakeBreaker) this.wakeBreaker = new WakeSourceBreaker(this.dataComposer);
+    return this.wakeBreaker;
+  }
+
+  /** Test seam: inject a breaker. */
+  setWakeBreaker(breaker: WakeSourceBreaker): void {
+    this.wakeBreaker = breaker;
   }
 
   /**
@@ -228,6 +246,10 @@ export class GraphExecutorService {
         groupStatus: group.status,
       };
     }
+
+    // Starting (or restarting) execution is the explicit resume a tripped
+    // node's notice names: every node gets a fresh no-progress count.
+    await this.breaker().resetGroup(userId, 'graph_dispatch', groupId);
 
     if (group.status !== 'active' || group.execution_phase !== 'worker_active') {
       await groups.update(groupId, {
@@ -299,6 +321,25 @@ export class GraphExecutorService {
       ? await this.readDispatchStamps(allTargets.map((t) => t.node.id))
       : new Map<string, number>();
 
+    // No-progress breaker (spec session-lifecycle-model §5). Claims stop two
+    // sessions working one node at once, not the same node being dispatched
+    // again and again to turns that end without touching it. A node whose
+    // last three dispatched turns left its state unchanged is not dispatched
+    // until its state changes or the group is restarted.
+    const states = await this.breaker().readTaskStates(
+      userId,
+      allTargets.map((t) => t.node.id)
+    );
+    const admissions = await this.breaker().admitMany(
+      userId,
+      'graph_dispatch',
+      allTargets.map((t) => ({
+        workId: t.node.id,
+        revision: states.get(t.node.id)?.revision ?? '0',
+        fingerprint: states.get(t.node.id)?.fingerprint ?? null,
+      }))
+    );
+
     for (const target of allTargets) {
       const { node } = target;
       const fresh = 'fresh' in target ? target.fresh : !opts.dedupe;
@@ -310,7 +351,37 @@ export class GraphExecutorService {
         }
       }
 
-      const { ok, recipientIdentityId } = await this.triggerNode(userId, group, node, target.kind);
+      const admission = admissions.get(node.id);
+      if (admission && !admission.allowed) {
+        logger.info('[GraphDispatch] Not dispatching: no-progress breaker tripped', {
+          taskId: node.id,
+          trippedAt: admission.trippedAt,
+        });
+        skipped.push(node.id);
+        continue;
+      }
+      const state = states.get(node.id);
+      // Signed in triggerNode, once the identity the dispatch reaches is known.
+      const wakeFields: WakeSourceTagFields | undefined = state
+        ? {
+            source: 'graph_dispatch',
+            workKind: 'graph_node',
+            workId: node.id,
+            revision: state.revision,
+            fingerprint: state.fingerprint,
+            dispatchedAt: new Date().toISOString(),
+            taskGroupId: group.id,
+            ownerSbId: null,
+          }
+        : undefined;
+
+      const { ok, recipientIdentityId } = await this.triggerNode(
+        userId,
+        group,
+        node,
+        target.kind,
+        wakeFields
+      );
       if (ok) {
         triggered.push(node.id);
         // The identity triggerNode ACTUALLY reached, which is not always the
@@ -610,7 +681,8 @@ export class GraphExecutorService {
     userId: string,
     group: TaskGroup,
     node: GraphNodeRef,
-    kind: 'work' | 'gate'
+    kind: 'work' | 'gate',
+    wakeFields?: WakeSourceTagFields
   ): Promise<{ ok: boolean; recipientIdentityId: string | null }> {
     const client = this.dataComposer.getClient();
     let slug: string | null = null;
@@ -653,7 +725,16 @@ export class GraphExecutorService {
           `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.` +
           (await this.gateChecklist(node.id));
 
-    const ok = await this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+    const ok = await this.sendTrigger(
+      userId,
+      group,
+      slug,
+      content,
+      `graph_${kind}_ready`,
+      node.id,
+      // The owner is whoever this dispatch actually reaches.
+      wakeFields ? issueWakeSourceTag({ ...wakeFields, ownerSbId: recipientIdentityId }) : undefined
+    );
     return { ok, recipientIdentityId };
   }
 
@@ -687,37 +768,39 @@ export class GraphExecutorService {
     recipientSlug: string,
     content: string,
     reason: string,
-    taskId?: string
+    taskId?: string,
+    wakeSource?: WakeSourceTag
   ): Promise<boolean> {
     try {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
       const studioSlug = typeof metadata.studioSlug === 'string' ? metadata.studioSlug : undefined;
       const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
-      await handleSendToInbox(
-        {
-          userId,
-          recipientSlug: recipientSlug,
-          senderSlug: recipientSlug,
-          recipientStudioId: studioId,
-          recipientStudioSlug: studioId ? undefined : studioSlug,
-          content,
-          messageType: 'session_resume',
-          priority: 'high',
-          threadKey: group.thread_key || `strategy:${group.id}`,
-          trigger: true,
-          triggerType: 'message',
-          triggerSummary: `Graph: ${reason} — ${group.title}`,
-          metadata: {
-            source: 'graph_executor',
-            reason,
-            groupId: group.id,
-            ...(taskId ? { taskId } : {}),
-            ...(repoRoot ? { repoRoot } : {}),
-          },
+      const sendArgs = {
+        userId,
+        recipientSlug: recipientSlug,
+        senderSlug: recipientSlug,
+        recipientStudioId: studioId,
+        recipientStudioSlug: studioId ? undefined : studioSlug,
+        content,
+        messageType: 'session_resume',
+        priority: 'high',
+        threadKey: group.thread_key || `strategy:${group.id}`,
+        trigger: true,
+        triggerType: 'message',
+        triggerSummary: `Graph: ${reason} — ${group.title}`,
+        metadata: {
+          source: 'graph_executor',
+          reason,
+          groupId: group.id,
+          ...(taskId ? { taskId } : {}),
+          ...(repoRoot ? { repoRoot } : {}),
         },
-        this.dataComposer
-      );
+      };
+      // Only a wake carries the internal context; every other send is unchanged.
+      await (wakeSource
+        ? handleSendToInbox(sendArgs, this.dataComposer, { wakeSource })
+        : handleSendToInbox(sendArgs, this.dataComposer));
       return true;
     } catch (err) {
       logger.warn(`Graph dispatch to ${recipientSlug} failed (${reason}):`, err);

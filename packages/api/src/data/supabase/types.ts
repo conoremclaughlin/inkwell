@@ -3528,6 +3528,8 @@ export type Database = {
           active_thread_key: string | null;
           agent_id: string | null;
           alias: string | null;
+          archived_at: string | null;
+          archived_reason: string | null;
           backend: string | null;
           backend_session_id: string | null;
           claude_session_id: string | null;
@@ -3569,6 +3571,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
@@ -3610,6 +3614,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
@@ -5084,6 +5090,80 @@ export type Database = {
           whatsapp_id?: string | null;
         };
         Relationships: [];
+      };
+      wake_source_breakers: {
+        Row: {
+          created_at: string;
+          id: string;
+          last_counted_at: string | null;
+          last_fingerprint: string | null;
+          last_notice_at: string | null;
+          last_tripped_at: string | null;
+          no_progress_count: number;
+          owner_sb_id: string | null;
+          revision: string;
+          source: string;
+          task_group_id: string | null;
+          trip_count: number;
+          tripped_at: string | null;
+          tripped_fingerprint: string | null;
+          updated_at: string;
+          user_id: string;
+          version: number;
+          work_id: string;
+          work_kind: string;
+        };
+        Insert: {
+          created_at?: string;
+          id?: string;
+          last_counted_at?: string | null;
+          last_fingerprint?: string | null;
+          last_notice_at?: string | null;
+          last_tripped_at?: string | null;
+          no_progress_count?: number;
+          owner_sb_id?: string | null;
+          revision?: string;
+          source: string;
+          task_group_id?: string | null;
+          trip_count?: number;
+          tripped_at?: string | null;
+          tripped_fingerprint?: string | null;
+          updated_at?: string;
+          user_id: string;
+          version?: number;
+          work_id: string;
+          work_kind: string;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          last_counted_at?: string | null;
+          last_fingerprint?: string | null;
+          last_notice_at?: string | null;
+          last_tripped_at?: string | null;
+          no_progress_count?: number;
+          owner_sb_id?: string | null;
+          revision?: string;
+          source?: string;
+          task_group_id?: string | null;
+          trip_count?: number;
+          tripped_at?: string | null;
+          tripped_fingerprint?: string | null;
+          updated_at?: string;
+          user_id?: string;
+          version?: number;
+          work_id?: string;
+          work_kind?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'wake_source_breakers_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       workspace_members: {
         Row: {

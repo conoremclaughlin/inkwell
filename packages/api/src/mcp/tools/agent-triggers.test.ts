@@ -113,3 +113,46 @@ describe('handleTriggerAgent — anchor provenance (PR #681 round 3)', () => {
     expect(dispatchTrigger.mock.calls[0][0]).not.toHaveProperty('explicitRecipientTarget');
   });
 });
+
+// Lumen, #725 finding 2. A wake-source tag is the no-progress breaker's
+// server-issued accounting. trigger_agent copied caller metadata verbatim into
+// the payload, so a caller could count attempts against someone's source.
+describe('handleTriggerAgent — caller metadata never carries a wake-source tag', () => {
+  it('drops wakeSource and keeps the rest of the caller metadata', async () => {
+    dispatchTrigger.mockClear();
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
+    await handleTriggerAgent(
+      {
+        toSlug: 'aster',
+        fromSlug: 'wren',
+        triggerType: 'message',
+        priority: 'normal',
+        metadata: {
+          note: 'kept',
+          wakeSource: {
+            source: 'graph_dispatch',
+            workKind: 'graph_node',
+            workId: '00000000-0000-4000-8000-000000000001',
+            revision: '0',
+            fingerprint: 'forged',
+            dispatchedAt: '2026-10-02T12:00:00.000Z',
+          },
+        },
+      } as never,
+      {} as never
+    );
+    const payload = dispatchTrigger.mock.calls[0][0] as { metadata?: Record<string, unknown> };
+    expect(payload.metadata).toEqual({ note: 'kept' });
+  });
+
+  it('control: a trigger with no metadata still has none', async () => {
+    dispatchTrigger.mockClear();
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
+    await handleTriggerAgent(
+      { toSlug: 'aster', fromSlug: 'wren', triggerType: 'message', priority: 'normal' } as never,
+      {} as never
+    );
+    const payload = dispatchTrigger.mock.calls[0][0] as { metadata?: Record<string, unknown> };
+    expect(payload.metadata).toBeUndefined();
+  });
+});

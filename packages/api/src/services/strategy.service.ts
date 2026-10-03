@@ -32,6 +32,7 @@ import { ephemeralWorktreePath } from './studio-paths';
 import { completeStudioViaCli } from './studio-complete';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 import { SYSTEM_PRINCIPAL } from './principals';
+import { WakeSourceBreaker, issueWakeSourceTag, type WakeSourceTag } from './wake-source-breaker';
 
 const execFileAsync = promisify(execFile);
 
@@ -191,6 +192,7 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
 
 export class StrategyService {
   private sandboxOrchestrator?: SandboxOrchestrator;
+  private wakeBreaker?: WakeSourceBreaker;
 
   constructor(dataComposer: DataComposer, sandboxOrchestrator?: SandboxOrchestrator);
   constructor(
@@ -198,6 +200,17 @@ export class StrategyService {
     orchestrator?: SandboxOrchestrator
   ) {
     this.sandboxOrchestrator = orchestrator;
+  }
+
+  /** The no-progress breaker the watchdog consults (spec session-lifecycle-model §5). */
+  private breaker(): WakeSourceBreaker {
+    if (!this.wakeBreaker) this.wakeBreaker = new WakeSourceBreaker(this.dataComposer);
+    return this.wakeBreaker;
+  }
+
+  /** Test seam: inject a breaker. */
+  setWakeBreaker(breaker: WakeSourceBreaker): void {
+    this.wakeBreaker = breaker;
   }
 
   private getAssignment(group: TaskGroup): TaskAssignment {
@@ -758,6 +771,9 @@ export class StrategyService {
       execution_phase: 'pending_trigger',
     });
 
+    // A resume is the explicit restart a tripped watchdog asks for: fresh count.
+    await this.breaker().resetGroup(userId, 'strategy_watchdog', groupId);
+
     // Re-create watchdog reminder
     await this.createWatchdogReminder(group, userId);
 
@@ -1087,7 +1103,8 @@ export class StrategyService {
     group: TaskGroup,
     task: ProjectTask,
     reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume',
-    sandboxContainerName?: string
+    sandboxContainerName?: string,
+    wakeSource?: WakeSourceTag
   ): Promise<boolean> {
     if (!group.sb_id) {
       logger.warn(
@@ -1119,34 +1136,35 @@ export class StrategyService {
       const repoRoot = typeof rawRepoRoot === 'string' ? rawRepoRoot : undefined;
       const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
 
-      await handleSendToInbox(
-        {
-          userId: group.user_id,
-          recipientSlug: ownerSlug,
-          senderSlug: ownerSlug,
-          // Prefer studioId (UUID); fall back to slug only when UUID is absent.
-          recipientStudioId: studioId,
-          recipientStudioSlug: studioId ? undefined : studioSlug,
-          content,
-          messageType: 'session_resume',
-          priority: 'high',
-          threadKey,
-          trigger: true,
-          triggerType: 'message',
-          triggerSummary: `Strategy "${group.strategy}" — ${reason === 'strategy_kickoff' ? 'start' : 'continue'}: ${task.title}`,
-          metadata: {
-            source: 'strategy_service',
-            strategyTrigger: true,
-            reason,
-            groupId: group.id,
-            taskId: task.id,
-            strategy: group.strategy,
-            ...(repoRoot ? { repoRoot } : {}),
-            ...(sandboxContainerName ? { sandboxContainerName } : {}),
-          },
+      const sendArgs = {
+        userId: group.user_id,
+        recipientSlug: ownerSlug,
+        senderSlug: ownerSlug,
+        // Prefer studioId (UUID); fall back to slug only when UUID is absent.
+        recipientStudioId: studioId,
+        recipientStudioSlug: studioId ? undefined : studioSlug,
+        content,
+        messageType: 'session_resume',
+        priority: 'high',
+        threadKey,
+        trigger: true,
+        triggerType: 'message',
+        triggerSummary: `Strategy "${group.strategy}" — ${reason === 'strategy_kickoff' ? 'start' : 'continue'}: ${task.title}`,
+        metadata: {
+          source: 'strategy_service',
+          strategyTrigger: true,
+          reason,
+          groupId: group.id,
+          taskId: task.id,
+          strategy: group.strategy,
+          ...(repoRoot ? { repoRoot } : {}),
+          ...(sandboxContainerName ? { sandboxContainerName } : {}),
         },
-        this.dataComposer
-      );
+      };
+      // Only a wake carries the internal context; every other send is unchanged.
+      await (wakeSource
+        ? handleSendToInbox(sendArgs, this.dataComposer, { wakeSource })
+        : handleSendToInbox(sendArgs, this.dataComposer));
 
       logger.info(
         `Strategy trigger sent to ${ownerSlug} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
@@ -1664,6 +1682,47 @@ export class StrategyService {
       return { outcome: 'skipped', reason: 'no pending or in-progress task remaining' };
     }
 
+    // No-progress breaker (spec session-lifecycle-model §5). The checks above
+    // stop the watchdog on work state; this one stops it when the work state
+    // has not moved across three completed wakes, which is PR #349's loop: an
+    // active group, a pending task, an agent that ends each turn with no
+    // change. A tripped watchdog pauses its strategy, visibly and durably;
+    // resume_strategy restarts it with a fresh count.
+    const breakerKey = {
+      userId: group.user_id,
+      source: 'strategy_watchdog' as const,
+      workKind: 'task_group' as const,
+      workId: group.id,
+      revision: '',
+    };
+    const fingerprint = await this.breaker().readFingerprint(group.user_id, 'task_group', group.id);
+    const admission = await this.breaker().admit(breakerKey, fingerprint);
+    if (!admission.allowed) {
+      await this.pauseStrategy(groupId, group.user_id);
+      await this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog paused the strategy: no progress across its last wakes`,
+        { reason: 'no_progress_breaker', trippedAt: admission.trippedAt }
+      );
+      return {
+        outcome: 'skipped',
+        reason: `no-progress breaker tripped at ${admission.trippedAt}; strategy paused`,
+      };
+    }
+    const wakeSource: WakeSourceTag | undefined = fingerprint
+      ? issueWakeSourceTag({
+          source: breakerKey.source,
+          workKind: breakerKey.workKind,
+          workId: breakerKey.workId,
+          revision: breakerKey.revision,
+          fingerprint,
+          dispatchedAt: new Date().toISOString(),
+          taskGroupId: group.id,
+          ownerSbId: group.sb_id ?? null,
+        })
+      : undefined;
+
     // If the strategy uses a sandbox, spin up (or reuse) the container before
     // triggering. The orchestrator short-circuits if the container is already
     // running, so this is safe to call on every watchdog tick.
@@ -1702,7 +1761,8 @@ export class StrategyService {
       group,
       currentTask,
       'watchdog',
-      sandboxContainerName
+      sandboxContainerName,
+      wakeSource
     );
     return fired
       ? { outcome: 'fired' }

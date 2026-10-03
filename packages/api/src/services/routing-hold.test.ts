@@ -57,6 +57,7 @@ describe('stampRoutingHold', () => {
         heldAt: '2026-08-19T02:00:05.000Z',
         recovery: 'route pattern, studioHint, or project affinity',
         occupied: null,
+        explicit: null,
       },
     });
   });
@@ -83,6 +84,28 @@ describe('stampRoutingHold', () => {
     expect(hold.recovery).toBe(
       'wait for the lease holder to finish, or fix the overflow provisioning failure'
     );
+  });
+
+  it('records an EXPLICIT-ADDRESS refusal with the session the sender named', async () => {
+    // The sender named a session that cannot take the message (T4). The hold
+    // says which, so the fix is visible on the thread: re-send to a session
+    // the recipient owns. Route patterns have nothing to do with it.
+    const { client, rpc } = rpcClient({ data: 1 });
+    await expect(
+      stampRoutingHold(client, {
+        ...STAMP,
+        detail: {
+          triedCallerRepo: false,
+          reason: 'explicit-address',
+          explicit: { sessionKey: 'wren:inkwell:gone', cause: 'session-key-miss' },
+        },
+      })
+    ).resolves.toBe(true);
+
+    const hold = rpc.mock.calls[0][1].p_hold;
+    expect(hold.reason).toBe('explicit-address');
+    expect(hold.explicit).toEqual({ sessionKey: 'wren:inkwell:gone', cause: 'session-key-miss' });
+    expect(hold.recovery).toBe('re-send to a session the recipient owns, or without the address');
   });
 
   it('reports failure when the RPC returns an error rather than assuming success', async () => {

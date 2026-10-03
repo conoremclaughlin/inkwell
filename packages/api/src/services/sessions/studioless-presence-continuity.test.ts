@@ -96,7 +96,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, resolveThreadTriggerScope
+       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -492,6 +492,8 @@ function makeWorld(opts: WorldOptions = {}) {
     RoutingRefusedError,
     routeResponses: vi.fn(async () => undefined),
     triggerRetryScheduler: { cancelFor: vi.fn() },
+    // The no-progress breaker's completion hook (T1): inert here.
+    recordWakeSourceCompletion: vi.fn(async () => null),
   });
 
   const stamp = () => tables.inbox_thread_participants[0].session_id as string | null;
