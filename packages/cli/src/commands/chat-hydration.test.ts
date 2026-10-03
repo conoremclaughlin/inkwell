@@ -864,7 +864,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         args: {
           channel: 'telegram',
           conversationId: '100200300',
-          content: 'Post-session catch-up',
+          content: 'Rehearsal catch-up',
         },
         status: 'executed',
         result: { success: true },
@@ -877,7 +877,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         sbSlug: 'myra',
         platform: 'telegram',
         createdAt: '2026-08-12T22:03:00Z',
-        content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+        content: 'Rehearsal catch-up: Ada emailed about the bake sale.',
       },
     ]);
 
@@ -893,7 +893,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
     const sent = result.tailPreview.find((p) => p.role === 'assistant');
     expect(sent).toBeDefined();
     expect(sent!.label).toBe('📤 myra → telegram');
-    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.content).toContain('Ada emailed about the bake sale');
     expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
 
     // The activity id is marked seen so the live poll cannot double-render it.
@@ -909,7 +909,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         activityType: 'message_in',
         sbSlug: 'myra',
         platform: 'telegram',
-        content: 'Therapy finished 45 minutes ago!',
+        content: 'Choir rehearsal ended 45 minutes ago!',
       },
     ]);
     const ledger = new ContextLedger();
@@ -986,7 +986,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     sbSlug: 'myra',
     platform: 'telegram',
     createdAt: '2026-08-12T22:03:00Z',
-    content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+    content: 'Rehearsal catch-up: Ada emailed about the bake sale.',
   };
 
   it('a platform send in the compaction kept tail replays as a message block, not the ⚡ line', () => {
@@ -1003,13 +1003,13 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
           { role: 'assistant', content: 'recent answer', source: 'claude' },
           {
             role: 'system',
-            content: '⚡ myra sent — Post-session catch-up…',
+            content: '⚡ myra sent — Rehearsal catch-up…',
             source: 'ink-activity',
             eid: 3,
             replay: {
               role: 'assistant',
               label: '📤 myra → telegram',
-              body: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+              body: 'Rehearsal catch-up: Ada emailed about the bake sale.',
               at: '2026-08-12T22:03:00Z',
             },
           },
@@ -1025,7 +1025,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     const sent = result.tailPreview.find((p) => p.label === '📤 myra → telegram');
     expect(sent).toBeDefined();
     expect(sent!.role).toBe('assistant');
-    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.content).toContain('Ada emailed about the bake sale');
     expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
 
     // …while the LEDGER keeps the compact ⚡ line (context unchanged) with
@@ -1069,7 +1069,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
       (k) => (k as { source?: string }).source === 'ink-activity-history'
     ) as { replay?: { label?: string; body?: string } } | undefined;
     expect(keptSend?.replay?.label).toBe('📤 myra → telegram');
-    expect(keptSend?.replay?.body).toContain('Ruoshan emailed');
+    expect(keptSend?.replay?.body).toContain('Ada emailed');
 
     // Cycle 2: next process reattaches onto the compaction event.
     write([
@@ -1080,7 +1080,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     const result2 = hydrateLedgerFromTranscript(ledger2, transcriptPath, 'myra');
     const sent2 = result2.tailPreview.find((p) => p.label === '📤 myra → telegram');
     expect(sent2).toBeDefined();
-    expect(sent2!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent2!.content).toContain('Ada emailed about the bake sale');
   });
 });
 
