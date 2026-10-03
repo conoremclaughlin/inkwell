@@ -5775,6 +5775,8 @@ export type Database = {
           p_session_id?: string | null;
           p_reclaim?: boolean;
           p_reason?: string | null;
+          p_fence_turn_epoch?: boolean;
+          p_expected_turn_epoch?: string | null;
         };
         Returns: Json;
       };

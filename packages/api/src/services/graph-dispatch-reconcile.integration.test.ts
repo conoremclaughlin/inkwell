@@ -12,8 +12,8 @@
  * PR #559 review kept finding: clearing a stamp that belongs to a session
  * still working re-dispatches what someone is already doing. Four guards exist
  * for that and each is pinned here — only the RECIPIENT'S live sessions can
- * veto, only the RECIPIENT'S finished session can vouch and only for stamps it
- * post-dates, a stamp newer than the cutoff is never touched, and the write
+ * veto (ended or not), only the RECIPIENT'S dead turn (shutdown breadcrumb or
+ * crash, never ended_at) can vouch and only for stamps it post-dates, a stamp newer than the cutoff is never touched, and the write
  * compare-and-sets so a dispatch landing mid-statement is not overwritten.
  * None of it is visible to a mock, because all of it lives in the RPC's SQL —
  * and the last one needs a second connection holding a row lock, which is why
@@ -305,6 +305,85 @@ d('reconcileInterruptedDispatches (real DB)', () => {
 
     expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
   });
+
+  /**
+   * T6 (session lifecycle §6). ended_at is written by the agent, through
+   * end_session or update_session_state(completed), from inside the turn that
+   * is still working, and an ended session can be resumed. An ended row that
+   * is visibly alive is alive: it vetoes like any other.
+   */
+  it('refuses to clear when an ENDED session of the recipient is still alive', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_ended_alive');
+    await stamp(taskId);
+    await interruptedSession(threadKey, reviewer);
+    const now = new Date().toISOString();
+    await newSession({
+      thread_key: threadKey,
+      sb_id: reviewer,
+      ended_at: now,
+      status: 'completed',
+      lifecycle: 'completed',
+      cli_turn_at: now,
+    });
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+  });
+
+  /**
+   * T6. Ending a session says the agent declared its work done, not that the
+   * turn holding the dispatch died. Only what a dead turn leaves behind (the
+   * shutdown breadcrumb, or lifecycle 'failed') is evidence. A caller can also
+   * write 'failed'; the liveness veto is what protects a live turn then.
+   */
+  it('does not count an ended session as evidence that the turn is over', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_ended_evidence');
+    await stamp(taskId);
+    await newSession({
+      thread_key: threadKey,
+      sb_id: reviewer,
+      ended_at: new Date(Date.now() + 1_000).toISOString(),
+      status: 'completed',
+      lifecycle: 'completed',
+    });
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+  });
+
+  it('still clears after a recorded crash (lifecycle failed, nothing alive)', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_crashed');
+    await stamp(taskId);
+    // Inserted after the stamp, so its updated_at post-dates the dispatch.
+    await newSession({ thread_key: threadKey, sb_id: reviewer, lifecycle: 'failed' });
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    'review regression: an old open CLI turn vetoes recovery (ended=%s)',
+    async (ended) => {
+      const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_old_open_turn');
+      await stamp(taskId, {}, new Date(Date.now() - 15 * 60_000));
+      await interruptedSession(threadKey, reviewer, new Date(Date.now() - 14 * 60_000));
+      await newSession({
+        active_thread_key: threadKey,
+        sb_id: reviewer,
+        ended_at: ended ? new Date().toISOString() : null,
+        status: ended ? 'completed' : 'resumable',
+        lifecycle: ended ? 'completed' : 'idle',
+        cli_attached: false,
+        cli_poll_at: null,
+        cli_turn_at: new Date(Date.now() - 11 * 60_000).toISOString(),
+      });
+      await executor.reconcileInterruptedDispatches(LATER());
+      expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+    }
+  );
 
   /**
    * BLOCKER 2 (Lumen, PR #559). The original cleared the key with a
