@@ -17,7 +17,7 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { isSafeStudioComponent, studioPermissionProfile, studioSiblingPath } from '@inklabs/shared';
 import { completeStudioViaCli, ensureStudioComplete } from '../../services/studio-complete';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
@@ -902,6 +902,8 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       sbSlug: actor.sbSlug,
       studioId: studio.id,
       ...(purpose ? { purpose } : {}),
+      // From the row just written, never the checkout (design v3, item 5).
+      permissionProfile: studioPermissionProfile(studio),
     });
   }
 
@@ -1444,6 +1446,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   await ensureStudioComplete(studio.worktreePath, {
     sbSlug: studio.sbSlug ?? actor.sbSlug,
     studioId: studio.id,
+    permissionProfile: studioPermissionProfile(studio),
   });
 
   // Link session and set to active

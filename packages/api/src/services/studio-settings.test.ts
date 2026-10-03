@@ -1,5 +1,22 @@
 import path from 'path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync } from 'fs';
+
+/** A read failure other than absence, injected for one path. */
+const fault = vi.hoisted(() => ({ readPath: '', code: 'EACCES' }));
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    readFile: (async (...args: Parameters<typeof actual.readFile>) => {
+      if (fault.readPath && String(args[0]) === fault.readPath) {
+        throw Object.assign(new Error('fixture: read failed'), { code: fault.code });
+      }
+      return actual.readFile(...args);
+    }) as typeof actual.readFile,
+  };
+});
+
 import { mkdtemp, rm, readFile, mkdir, writeFile, access, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -64,6 +81,28 @@ describe('applyPermissionOverlay', () => {
     expect(restored.permissions.allow).not.toContain('Bash(docker *)');
   });
 
+  it('never lifts a deny: an overlay allow for a denied action leaves the deny in place (design v3, item 2)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const deny = [
+      'Bash(git push * main)',
+      'Bash(git push *--force*)',
+      'mcp__github__merge_pull_request',
+    ];
+    await writeFile(
+      join(tempDir, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(*)'], deny } })
+    );
+    const restore = await applyPermissionOverlay(tempDir, {
+      allow: ['Bash(git push origin main)', 'mcp__github__merge_pull_request'],
+    });
+    const settings = JSON.parse(
+      await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8')
+    );
+    // Every deny survives, so deny-before-allow still refuses the action.
+    expect(settings.permissions.deny).toEqual(deny);
+    await restore();
+  });
+
   it('deduplicates overlay rules', async () => {
     await seedSettings(tempDir);
 
@@ -97,6 +136,80 @@ describe('applyPermissionOverlay', () => {
     await restore();
 
     await expect(access(join(tempDir, '.claude', 'settings.local.json'))).rejects.toThrow();
+  });
+
+  it('merges into the existing object: ask, defaultMode and other keys survive (review 4177f7fe)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    await writeFile(
+      join(tempDir, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        permissions: { ask: ['Bash(*)'], defaultMode: 'plan', additionalDirectories: ['/x'] },
+        model: 'kept',
+      })
+    );
+    const restore = await applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] });
+    const settings = JSON.parse(
+      await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8')
+    );
+    expect(settings.permissions).toEqual({
+      ask: ['Bash(*)'],
+      defaultMode: 'plan',
+      additionalDirectories: ['/x'],
+      allow: ['Bash(ls)'],
+      deny: [],
+    });
+    expect(settings.model).toBe('kept');
+    await restore();
+  });
+
+  it('refuses a malformed settings file and leaves its bytes', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    for (const content of ['{ "permissions": ', '[1]']) {
+      await writeFile(path, content);
+      await expect(applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] })).rejects.toThrow();
+      expect(await readFile(path, 'utf-8')).toBe(content);
+    }
+  });
+
+  it('refuses policy it cannot validate, before any write (Lumen d74ce85d, P2 3)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    for (const content of [
+      '',
+      JSON.stringify({ permissions: [] }),
+      JSON.stringify({ permissions: null }),
+      JSON.stringify({ permissions: { deny: 'Bash(*)' } }),
+      JSON.stringify({ permissions: { allow: ['Bash(ls)', 7] } }),
+      JSON.stringify({ permissions: { ask: {} } }),
+    ]) {
+      await writeFile(path, content);
+      await expect(
+        applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] }),
+        content
+      ).rejects.toThrow();
+      expect(readFileSync(path, 'utf-8'), content).toBe(content);
+    }
+  });
+
+  it('a read failure other than absence refuses and leaves the bytes (EACCES, EIO)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    const content = JSON.stringify({ permissions: { deny: ['Bash(*)'] } });
+    await writeFile(path, content);
+    try {
+      for (const code of ['EACCES', 'EIO']) {
+        fault.readPath = path;
+        fault.code = code;
+        await expect(
+          applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] }),
+          code
+        ).rejects.toThrow();
+        expect(readFileSync(path, 'utf-8'), code).toBe(content);
+      }
+    } finally {
+      fault.readPath = '';
+    }
   });
 });
 

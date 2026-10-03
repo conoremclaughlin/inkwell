@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
+import { DEFAULT_CLAUDE_ALLOW_RULES, DEFAULT_CLAUDE_DENY_RULES } from '@inklabs/shared';
 
 const CLI_PATH = join(__dirname, '..', '..', 'dist', 'cli.js');
 
@@ -41,6 +42,15 @@ describe('sb permissions', () => {
     expect(perms.deny).toContain('Bash(rm -rf *)');
     expect(perms.deny).toContain('Bash(git push --force *)');
     expect(perms.deny).toContain('Bash(git reset --hard *)');
+  });
+
+  it('auto writes the one shared list, not a copy of it (design v3, item 6)', () => {
+    runSb(['permissions', 'auto'], tmpDir);
+    const perms = readSettings(tmpDir).permissions as { allow: string[]; deny: string[] };
+    expect(perms.allow).toEqual([...DEFAULT_CLAUDE_ALLOW_RULES]);
+    expect(perms.deny).toEqual([...DEFAULT_CLAUDE_DENY_RULES]);
+    // The drifted copy never had it.
+    expect(perms.allow).toContain('mcp__playwright__*');
   });
 
   it('preserves existing non-permission settings', () => {
@@ -86,9 +96,56 @@ describe('sb permissions', () => {
     runSb(['permissions', 'reset'], tmpDir);
     const settings = readSettings(tmpDir);
 
-    expect(settings.permissions).toBeUndefined();
+    // An empty object, not a deleted key: `ink init` keeps an authored
+    // object, and would fill a missing one with a profile (review 4177f7fe).
+    expect(settings.permissions).toEqual({});
     expect(settings.hooks).toBeDefined();
   });
+
+  it('reset leaves a durable {} for mode-only, ask-only, a missing key and a missing file (Lumen d74ce85d, P2 4)', () => {
+    // A mode-only bypassPermissions must not survive a reset, and a missing
+    // permissions key would be filled with a profile by the next ink init.
+    const path = join(tmpDir, '.claude', 'settings.local.json');
+    for (const before of [
+      { permissions: { defaultMode: 'bypassPermissions' }, model: 'kept' },
+      { permissions: { ask: ['Bash(*)'] }, model: 'kept' },
+      { model: 'kept' },
+    ]) {
+      mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+      writeFileSync(path, JSON.stringify(before));
+      runSb(['permissions', 'reset'], tmpDir);
+      expect(readSettings(tmpDir), JSON.stringify(before)).toEqual({
+        permissions: {},
+        model: 'kept',
+      });
+    }
+    rmSync(join(tmpDir, '.claude'), { recursive: true, force: true });
+    runSb(['permissions', 'reset'], tmpDir);
+    expect(readSettings(tmpDir)).toEqual({ permissions: {} });
+  }, 20_000);
+
+  // Each case spawns the built CLI (~0.5 s), so the cases are the minimum
+  // that reaches both refusals in every command, with room for a loaded run.
+  it('auto, reset and show refuse a malformed settings file and leave its bytes', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    const path = join(tmpDir, '.claude', 'settings.local.json');
+    for (const [content, sub] of [
+      ['{ "permissions": ', 'auto'],
+      ['{ "permissions": ', 'reset'],
+      ['{ "permissions": ', 'show'],
+      ['[1, 2]', 'auto'],
+    ]) {
+      writeFileSync(path, content);
+      let status = 0;
+      try {
+        runSb(['permissions', sub], tmpDir);
+      } catch (error) {
+        status = (error as { status?: number }).status ?? -1;
+      }
+      expect(status, `${sub} on ${content}`).toBe(1);
+      expect(readFileSync(path, 'utf-8'), `${sub} on ${content}`).toBe(content);
+    }
+  }, 20_000);
 
   it('dry-run does not write file', () => {
     const output = runSb(['permissions', 'auto', '--dry-run'], tmpDir);

@@ -852,6 +852,24 @@ export interface ClaudeRunnerConfig {
     allow?: string[];
     deny?: string[];
   };
+  /**
+   * The studio's permission profile, delivered with `claude --settings` in a
+   * file of this launch's own (launch-settings.ts). Read from the studio row
+   * by the session service, never from the checkout. Present for a studio
+   * session; a profile that cannot be validated fails the launch.
+   */
+  launchPermissions?: {
+    profile: unknown;
+    owner: unknown;
+    /** The main checkout, for the record of sources; null when not a worktree. */
+    mainRoot: string | null;
+    /**
+     * The studio row's worktree. The launch is refused unless it runs
+     * there: a working directory that fell back elsewhere must not be
+     * granted the studio's profile.
+     */
+    worktreePath: string;
+  };
   /** Run the backend CLI inside a Docker container instead of on the host */
   container?: {
     containerName: string;

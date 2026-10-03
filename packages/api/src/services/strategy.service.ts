@@ -29,6 +29,7 @@ import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveSbSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { ephemeralWorktreePath } from './studio-paths';
+import { studioPermissionProfile } from '@inklabs/shared';
 import { completeStudioViaCli } from './studio-complete';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 import { SYSTEM_PRINCIPAL } from './principals';
@@ -1292,6 +1293,7 @@ export class StrategyService {
         sbSlug: ownerSlug,
         studioId: studio.id,
         purpose: `Ephemeral sandbox for: ${group.title}`,
+        permissionProfile: studioPermissionProfile(studio),
       });
 
       // Update the task group metadata with the new studioId
@@ -1405,6 +1407,7 @@ export class StrategyService {
         sbSlug,
         studioId: studio.id,
         purpose: `Strategy studio for: ${group.title}`,
+        permissionProfile: studioPermissionProfile(studio),
       });
 
       const existingMeta = (group.metadata || {}) as Record<string, unknown>;

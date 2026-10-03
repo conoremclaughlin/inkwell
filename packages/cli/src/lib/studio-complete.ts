@@ -20,14 +20,25 @@
  *
  * Two switches, both on by default (Conor, 2026-09-24: "included by
  * default and adjustable later"):
- *   - rootSync: copy `.mcp.json`, `.env.local` and the Claude permissions
- *     from the main worktree. Off, the routine generates the thin default
- *     `.mcp.json` and the default permissions instead.
+ *   - rootSync: copy `.mcp.json` and `.env.local` from the main worktree.
+ *     Off, the routine generates the thin default `.mcp.json` instead.
  *   - studioSetup: write `.ink/identity.json` and register the studio row
  *     (or record a known id). Off for a checkout deliberately not tracked
  *     as a studio.
  * In the main worktree (mainRoot null) neither applies: hooks, backend
  * config and skills only, as `ink init` has always done there.
+ *
+ * Claude permissions are not synced (design v3, Conor 2026-10-02: "people
+ * should be able to do their work by default"). The main worktree's
+ * `settings.local.json` carries the operator's lane rules: absolute Edit
+ * paths into the root checkout, and denies a studio does not want, such
+ * as local commits. A new studio gets a profile instead: `builder`, or
+ * `reviewer` for a checkout the server recorded as detached, chosen by the
+ * caller from the studio's record and never from the checkout. Copying the
+ * main worktree's rules is an explicit opt-in (`inheritPermissions: true`).
+ * Any `permissions` object already in the file is kept exactly as it is,
+ * empty and mode-only included; a file that cannot be parsed is reported
+ * failed and left untouched, by this step and by the hook step after it.
  */
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
@@ -35,10 +46,11 @@ import { join } from 'path';
 import {
   auditStudio,
   copyBootstrapFiles,
+  describePermissions,
+  studioPermissionRules,
   syncMcpConfig,
-  DEFAULT_CLAUDE_ALLOW_RULES,
-  DEFAULT_CLAUDE_DENY_RULES,
   type StudioAudit,
+  type StudioPermissionProfile,
 } from '@inklabs/shared';
 import { installHooks, callInkTool } from '../commands/hooks.js';
 import { syncSkills as syncSkillsFromServer } from '../commands/skills.js';
@@ -66,10 +78,41 @@ export interface CompleteStudioOptions {
   sbSlug: string;
   /** The main worktree when this is a linked worktree; null when it IS the main worktree. */
   mainRoot: string | null;
-  /** Copy local config and permissions from the main worktree (default true). */
+  /** Copy `.mcp.json` and `.env.local` from the main worktree (default true). */
   rootSync?: boolean;
-  /** Copy the Claude permissions from the main worktree (default: rootSync). */
+  /**
+   * Copy the main worktree's Claude permissions instead of writing a
+   * profile. Opt-in: only `true` copies them.
+   */
   inheritPermissions?: boolean;
+  /**
+   * The profile written into a settings file that has no permissions yet.
+   * The caller takes it from the studio's server-side record
+   * (`studioPermissionProfile`) or its own trusted input, never from the
+   * checkout. Absent, and with no `lookupPermissions` to supply one, no
+   * permissions are written: there is no default.
+   */
+  permissionProfile?: StudioPermissionProfile;
+  /**
+   * Whose scratch paths the profile names (default `sbSlug`, the caller's
+   * own trusted input). Never read from identity.json.
+   */
+  permissionOwner?: string;
+  /**
+   * Looks the studio's row up when no profile was given (a manual
+   * `ink init`); consulted only when permissions are about to be written.
+   * Undefined, or a lookup that fails, is no profile.
+   */
+  lookupPermissions?: () => Promise<
+    { profile?: StudioPermissionProfile; owner?: string } | undefined
+  >;
+  /**
+   * Write Claude permissions at all (default true). Off when the caller
+   * could not read the studio's record, so the profile, and the owner whose
+   * scratch paths it names, are unknown: a guess would be kept by every
+   * later run, since an existing permissions object is never replaced.
+   */
+  permissions?: boolean;
   /** Write identity and register the studio row (default true). */
   studioSetup?: boolean;
   /** The studio's name; defaults to the worktree folder's suffix after `--`. */
@@ -120,6 +163,27 @@ function readJson(path: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * A settings file as found: absent, malformed (it exists but is not a JSON
+ * object), or read. `readJson` folds the first two together, and a writer
+ * that treats a malformed file as an empty one replaces whatever the
+ * person had in it.
+ */
+type SettingsFile =
+  | { state: 'absent' }
+  | { state: 'malformed' }
+  | { state: 'read'; settings: Record<string, unknown> };
+
+function readSettingsFile(path: string): SettingsFile {
+  if (!existsSync(path)) return { state: 'absent' };
+  const settings = readJson(path);
+  return settings ? { state: 'read', settings } : { state: 'malformed' };
 }
 
 export function defaultServerUrl(): string {
@@ -453,9 +517,11 @@ export async function completeStudio(
     }
   }
 
-  // Claude permissions (linked worktrees): the main worktree's, else the defaults.
+  // Claude permissions (linked worktrees): an authored policy is kept, and
+  // only a file with no `permissions` key at all gets the profile.
   const claudeDir = join(worktreePath, '.claude');
   const settingsPath = join(claudeDir, 'settings.local.json');
+  const settingsFile = readSettingsFile(settingsPath);
   if (!linked) {
     steps.push({ label: 'permissions', status: 'skipped', detail: 'main worktree' });
   } else if (isSymlink(claudeDir) || isSymlink(settingsPath)) {
@@ -464,29 +530,75 @@ export async function completeStudio(
       status: 'failed',
       detail: 'is a symlink; refusing to write through it',
     });
+  } else if (settingsFile.state === 'malformed') {
+    // Fail closed: a file that cannot be read may hold someone's rules, and
+    // writing a profile over it would replace them.
+    steps.push({
+      label: 'permissions',
+      status: 'failed',
+      detail: 'settings.local.json is not a JSON object; left as it is (fix or remove it)',
+    });
+  } else if (settingsFile.state === 'read' && settingsFile.settings.permissions !== undefined) {
+    const authored = settingsFile.settings.permissions;
+    steps.push(
+      isPlainObject(authored)
+        ? {
+            label: 'permissions',
+            status: 'exists',
+            detail: `${describePermissions(authored)}, kept as authored`,
+          }
+        : {
+            label: 'permissions',
+            status: 'failed',
+            detail: 'permissions is not an object; left as it is (fix or remove it)',
+          }
+    );
+  } else if (options.permissions === false) {
+    steps.push({
+      label: 'permissions',
+      status: 'skipped',
+      detail: "the studio's record could not be read, so its profile is unknown",
+    });
   } else {
-    const settings = readJson(settingsPath) || {};
-    const permissions = settings.permissions as Record<string, unknown> | undefined;
-    const allow = Array.isArray(permissions?.allow) ? (permissions?.allow as unknown[]) : [];
-    if (allow.length > 0) {
+    const settings = settingsFile.state === 'read' ? settingsFile.settings : {};
+    const inherited =
+      options.inheritPermissions === true && options.mainRoot
+        ? readJson(join(options.mainRoot, '.claude', 'settings.local.json'))?.permissions
+        : undefined;
+    // The profile and its owner come from the caller or the studio's row,
+    // never from the checkout: identity.json is not quarantined in a review
+    // checkout, so a PR could name any owner there (review 4177f7fe, P3).
+    let profile = options.permissionProfile;
+    let owner = options.permissionOwner ?? options.sbSlug;
+    if (!isPlainObject(inherited) && !profile && options.lookupPermissions) {
+      const found = await options.lookupPermissions().catch(() => undefined);
+      profile = found?.profile;
+      if (found?.owner) owner = found.owner;
+    }
+    let rules: ReturnType<typeof studioPermissionRules> | undefined;
+    let refused: string | undefined;
+    if (!isPlainObject(inherited) && profile) {
+      try {
+        rules = studioPermissionRules(profile, owner);
+      } catch (error) {
+        refused = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!isPlainObject(inherited) && !profile) {
+      // No profile is no permissions: a default written here would be kept
+      // by every later run (review 4177f7fe, P2 1).
       steps.push({
         label: 'permissions',
-        status: 'exists',
-        detail: `${allow.length} allow rule(s)`,
+        status: 'skipped',
+        detail:
+          'no permission profile: the studio has no row to read one from (pass --permission-profile, or let the server complete it)',
       });
+    } else if (refused) {
+      steps.push({ label: 'permissions', status: 'failed', detail: refused });
     } else {
-      const mainSettings =
-        (options.inheritPermissions ?? rootSync) && options.mainRoot
-          ? readJson(join(options.mainRoot, '.claude', 'settings.local.json'))
-          : null;
-      const mainPermissions = mainSettings?.permissions as Record<string, unknown> | undefined;
-      const fromMain =
-        Array.isArray(mainPermissions?.allow) && (mainPermissions?.allow as unknown[]).length > 0;
       const next = {
         ...settings,
-        permissions: fromMain
-          ? mainPermissions
-          : { allow: [...DEFAULT_CLAUDE_ALLOW_RULES], deny: [...DEFAULT_CLAUDE_DENY_RULES] },
+        permissions: isPlainObject(inherited) ? inherited : rules,
         enableAllProjectMcpServers: settings.enableAllProjectMcpServers ?? true,
       };
       mkdirSync(claudeDir, { recursive: true });
@@ -494,13 +606,27 @@ export async function completeStudio(
       steps.push({
         label: 'permissions',
         status: 'created',
-        detail: fromMain ? 'copied from the main worktree' : 'defaults',
+        detail: isPlainObject(inherited)
+          ? 'copied from the main worktree'
+          : options.inheritPermissions === true
+            ? `${profile} profile (the main worktree had no permissions to copy)`
+            : `${profile} profile`,
       });
     }
   }
 
-  // Hooks and backend config: every backend, every studio.
-  steps.push(hookStep(worktreePath, 'claude-code', options.force));
+  // Hooks and backend config: every backend, every studio. The Claude
+  // hooks share the settings file, and the installer replaces a file it
+  // cannot parse, so a malformed one is refused here as well.
+  if (readSettingsFile(settingsPath).state === 'malformed') {
+    steps.push({
+      label: 'hooks (claude-code)',
+      status: 'failed',
+      detail: 'settings.local.json is not a JSON object; left as it is (fix or remove it)',
+    });
+  } else {
+    steps.push(hookStep(worktreePath, 'claude-code', options.force));
+  }
   if (existsSync(join(worktreePath, '.mcp.json'))) {
     try {
       // syncMcpConfig always regenerates; the step reports what changed.

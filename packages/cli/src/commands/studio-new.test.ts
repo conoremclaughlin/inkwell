@@ -10,6 +10,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import * as shared from '@inklabs/shared';
 import { completeStudio } from '../lib/studio-complete.js';
 
 const TEST_DIR = join(tmpdir(), 'ink-ws-new-test-' + Date.now());
@@ -335,7 +336,7 @@ describe('Config directory copying', () => {
     expect(existsSync(join(wsPath, '.gemini'))).toBe(false);
   });
 
-  it('the completion routine gives a new worktree the source permissions and hooks for every backend', async () => {
+  it('the completion routine gives a new worktree the builder profile, not the source permissions, and hooks for every backend', async () => {
     const wsPath = join(realDir(realRepo), `test-repo--complete`);
     mkdirSync(join(realRepo, '.claude'), { recursive: true });
     writeFileSync(
@@ -352,6 +353,8 @@ describe('Config directory copying', () => {
 
     const report = await completeStudio(wsPath, {
       sbSlug: 'wren',
+      // A creator names the profile; there is no default.
+      permissionProfile: 'builder',
       mainRoot: realRepo,
       studioName: 'complete',
       branch: 'wren/studio/complete',
@@ -363,7 +366,8 @@ describe('Config directory copying', () => {
     const settings = JSON.parse(
       readFileSync(join(wsPath, '.claude', 'settings.local.json'), 'utf-8')
     );
-    expect(settings.permissions).toEqual({ allow: ['Bash(ls:*)'] });
+    // Inheriting the source's rules is opt-in (design v3, item 3).
+    expect(settings.permissions).toEqual(shared.studioPermissionRules('builder', 'wren'));
     expect(settings.hooks).toBeDefined();
     expect(existsSync(join(wsPath, '.codex', 'config.toml'))).toBe(true);
     expect(existsSync(join(wsPath, '.gemini', 'settings.json'))).toBe(true);

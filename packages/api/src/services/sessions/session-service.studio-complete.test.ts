@@ -162,7 +162,7 @@ function succeedingRunner(name: string): IRunner {
 }
 
 /** A service whose session sits in studio-1, a row owned by `owner` on a real directory. */
-function makeService(session: Session, owner: string) {
+function makeService(session: Session, owner: string, row: Row = {}) {
   const { repo } = makeStatefulRepo(session);
   const tables: Record<string, Row[]> = {
     sessions: [{ id: session.id, user_id: 'user-456', studio_id: session.studioId }],
@@ -172,8 +172,11 @@ function makeService(session: Session, owner: string) {
         user_id: 'user-456',
         agent_id: owner,
         worktree_path: worktree,
+        // A studio row always names its repo; this one is not the root.
+        repo_root: '/repo',
         status: 'active',
         lease: null,
+        ...row,
       },
     ],
     agent_identities: [],
@@ -253,6 +256,32 @@ describe('the studio checklist runs before every spawn, whatever the runner', ()
     expect(await owner!()).toBe('aster');
   });
 
+  it("the permission profile offered is the ROW's: a detached checkout is a reviewer, a branch studio a builder", async () => {
+    const profileOf = async (row: Row) => {
+      completion.calls.length = 0;
+      const { send } = makeService(makeSession(), 'lumen', row);
+      await send();
+      const lookup = completion.calls[0]?.options.profile as (() => Promise<string>) | undefined;
+      expect(typeof lookup).toBe('function');
+      return lookup!();
+    };
+    expect(await profileOf({ branch: 'detached:origin/pr/7' })).toBe('reviewer');
+    expect(
+      await profileOf({
+        branch: 'lumen/eph/pr-7',
+        metadata: { checkout: { mode: 'detached', ref: 'origin/pr/7', commit: 'abc' } },
+      })
+    ).toBe('reviewer');
+    expect(await profileOf({ branch: 'lumen/feat/x', metadata: {} })).toBe('builder');
+  });
+
+  it('a session with no studio row is offered no profile: no permissions, never a guessed builder', async () => {
+    const { send } = makeService(makeSession({ studioId: null }), 'lumen');
+    await send();
+    const lookup = completion.calls[0].options.profile as () => Promise<string | undefined>;
+    expect(await lookup()).toBeUndefined();
+  });
+
   it('a session with no studio row offers no owner and no studio id', async () => {
     const { send } = makeService(makeSession({ studioId: null }), 'lumen');
     await send();
@@ -261,5 +290,85 @@ describe('the studio checklist runs before every spawn, whatever the runner', ()
     expect(completion.calls[0].options).not.toHaveProperty('studioId');
     const owner = completion.calls[0].options.owner as () => Promise<string | null>;
     expect(await owner()).toBeNull();
+  });
+});
+
+describe('a Claude launch in a studio is given its profile from the row (design v5, phase A)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetActiveRuns();
+    resetPendingFinalizations();
+    order.events.length = 0;
+    completion.calls.length = 0;
+    worktree = realpathSync(mkdtempSync(join(tmpdir(), 'studio-1-')));
+  });
+  afterEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+    rmSync(worktree, { recursive: true, force: true });
+  });
+
+  const launchConfig = (runner: { run: ReturnType<typeof vi.fn> }) =>
+    (runner.run.mock.calls[0]?.[1] as { config: Record<string, unknown> } | undefined)?.config;
+
+  it("the row's profile, owner and main checkout reach the Claude runner", async () => {
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'detached:origin/pr/7',
+      repo_root: '/repo',
+    });
+    await send();
+    expect(launchConfig(claude as never)?.launchPermissions).toEqual({
+      profile: 'reviewer',
+      owner: 'lumen',
+      mainRoot: '/repo',
+      // The runner refuses the launch unless it runs here (P2 2).
+      worktreePath: worktree,
+    });
+  });
+
+  it('a row whose repo root is unknown refuses the launch: absence is not proof of the root', async () => {
+    // Lumen d74ce85d, P2 1: a null, missing or empty repo_root must not drop
+    // both the profile and the working-directory check.
+    for (const repoRoot of [null, '']) {
+      completion.calls.length = 0;
+      const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+        branch: 'detached:origin/pr/7',
+        repo_root: repoRoot,
+      });
+      const result = await send();
+      expect(result.success, String(repoRoot)).toBe(false);
+      expect(String((result as { error?: unknown }).error)).toMatch(/Launch refused/);
+      expect(claude.run).not.toHaveBeenCalled();
+    }
+  });
+
+  it('the root (home) studio is not given one: root profiles are phase B, and the launch goes ahead', async () => {
+    // resolveMainStudio gives a root-repo session a real studio row whose
+    // worktree is the repo root (review 44db8c0c, P2 1).
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'main',
+      repo_root: worktree,
+    });
+    const result = await send();
+    expect(result.success).toBe(true);
+    expect(claude.run).toHaveBeenCalledTimes(1);
+    expect(launchConfig(claude as never)).not.toHaveProperty('launchPermissions');
+  });
+
+  it('a Codex launch is not given one: --settings is a Claude Code flag', async () => {
+    const { send, codex } = makeService(makeSession(), 'lumen', { branch: 'lumen/feat/x' });
+    await send();
+    expect(launchConfig(codex as never)).not.toHaveProperty('launchPermissions');
+  });
+
+  it('a studio whose row is gone fails the Claude launch before the runner runs', async () => {
+    const { send, claude } = makeService(
+      makeSession({ backend: 'claude-code', studioId: 'studio-gone' }),
+      'lumen'
+    );
+    const result = await send();
+    expect(result.success).toBe(false);
+    expect(String((result as { error?: unknown }).error)).toMatch(/Launch refused/);
+    expect(claude.run).not.toHaveBeenCalled();
   });
 });

@@ -18,6 +18,12 @@ import {
   type LaunchStudioLookup,
 } from './launch-studio.js';
 
+/** The server's get_studio, for the tests that use the default lookup. */
+const server = vi.hoisted(() => ({ studio: null as Record<string, unknown> | null }));
+vi.mock('./ink-mcp.js', () => ({
+  callInkTool: vi.fn(async () => ({ studio: server.studio })),
+}));
+
 let root: string;
 let studio: string;
 
@@ -123,6 +129,40 @@ function seedComplete(dir: string) {
   );
 }
 
+describe('completeStudioForLaunch — the permission profile comes from the row', () => {
+  it("a row's profile is passed to ink init", async () => {
+    const d = deps({
+      lookupStudio: vi.fn(
+        async (): Promise<LaunchStudioLookup> => ({
+          status: 'found',
+          row: { id: STUDIO_ID, sbSlug: 'lumen', permissionProfile: 'reviewer' },
+        })
+      ),
+    });
+    await completeStudioForLaunch(studio, 'wren', d);
+    expect(d.runInit).toHaveBeenCalledWith(studio, {
+      agent: 'lumen',
+      studioId: STUDIO_ID,
+      permissionProfile: 'reviewer',
+    });
+  });
+
+  it('the default lookup reads it from get_studio: a detached row is a reviewer, a branch row a builder', async () => {
+    for (const [row, expected] of [
+      [{ id: STUDIO_ID, sbSlug: 'lumen', branch: 'detached:origin/pr/7' }, 'reviewer'],
+      [{ id: STUDIO_ID, sbSlug: 'lumen', branch: 'lumen/feat/x', metadata: {} }, 'builder'],
+    ] as const) {
+      server.studio = { ...row };
+      const d = { placement: linked, runInit: vi.fn(async () => report(true)) };
+      await completeStudioForLaunch(studio, 'wren', d);
+      expect(d.runInit).toHaveBeenCalledWith(
+        studio,
+        expect.objectContaining({ agent: 'lumen', permissionProfile: expected })
+      );
+    }
+  });
+});
+
 describe('completeStudioForLaunch', () => {
   it("an incomplete studio is completed for its row's owner, not for the -a slug", async () => {
     // `ink -a wren` in Lumen's studio: the identity file must say lumen.
@@ -132,7 +172,12 @@ describe('completeStudioForLaunch', () => {
     expect(result.owner).toBe('lumen');
     expect(result.missingBefore).toContain('identity');
     expect(d.lookupStudio).toHaveBeenCalledWith(studio);
-    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'lumen', studioId: STUDIO_ID });
+    // This row carries no profile, so no permissions are written.
+    expect(d.runInit).toHaveBeenCalledWith(studio, {
+      agent: 'lumen',
+      studioId: STUDIO_ID,
+      permissions: false,
+    });
   });
 
   it('a worktree the server confirms has no row takes the launching slug and registers as ink init would', async () => {
@@ -141,7 +186,9 @@ describe('completeStudioForLaunch', () => {
     });
     const result = await completeStudioForLaunch(studio, 'wren', d);
     expect(result.owner).toBe('wren');
-    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren' });
+    // No row, no profile: in a detached PR checkout a default would be kept
+    // by every later run (review 4177f7fe, P2 1).
+    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren', permissions: false });
   });
 
   it('a worktree whose owner the server could not name is completed with studio setup off', async () => {
@@ -153,7 +200,13 @@ describe('completeStudioForLaunch', () => {
     const result = await completeStudioForLaunch(studio, 'wren', d);
     expect(result.owner).toBeUndefined();
     expect(result.ownerUnknown).toBe('fetch failed');
-    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren', studioSetup: false });
+    // Permissions are left too: their profile comes from the same row, and
+    // their scratch paths name the owner (design v3, item 5).
+    expect(d.runInit).toHaveBeenCalledWith(studio, {
+      agent: 'wren',
+      studioSetup: false,
+      permissions: false,
+    });
     const [line, ...rest] = describeLaunchStudioResult(result);
     expect(line).toContain('owner is unknown');
     expect(line).toContain('fetch failed');

@@ -60,6 +60,7 @@ import {
   classifyError,
   isPathWithinWorkspaceAsync,
   isPreAcceptanceRefusal,
+  studioPermissionProfile,
   type ErrorClassification,
 } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
@@ -2380,6 +2381,24 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A Claude session in a studio gets its profile at launch, from the row
+    // (design v5, phase A). A row that cannot be read, or is gone, fails the
+    // launch here rather than letting it start without the profile it was
+    // meant to have; the runner then refuses a profile it cannot validate.
+    // A service with no database (an embedded or test configuration) has no
+    // studio rows at all, so there is no profile to deliver; that is logged,
+    // not refused.
+    let launchPermissions: ClaudeRunnerConfig['launchPermissions'];
+    if (resolvedBackend === 'claude-code' && session.studioId && session.studioId !== 'main') {
+      if (this.getStudiosRepo()) {
+        launchPermissions = await this.resolveLaunchPermissions(session.studioId);
+      } else {
+        logger.warn('No studios repository: launch profile not delivered', {
+          studioId: session.studioId,
+        });
+      }
+    }
+
     const strategyGroupId = (metadata?.taskGroupId as string) || undefined;
     const permissionOverlay = strategyGroupId
       ? {
@@ -2431,6 +2450,7 @@ export class SessionService implements ISessionService {
       // .ink/identity.json preferences or Commander defaults.
       toolRouting: runtimeToolRouting,
       ...(permissionOverlay ? { permissionOverlay } : {}),
+      ...(launchPermissions ? { launchPermissions } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
       // Route CLI execution into sandbox container when triggered by a sandboxed strategy
@@ -5793,6 +5813,43 @@ This session will continue with a fresh context after compaction. Your identity,
    * spawned into a studio is not always the SB it belongs to. Non-fatal: the
    * spawn goes ahead either way, and the failure is logged.
    */
+  /**
+   * The profile, owner and main checkout a studio's Claude launch is given,
+   * read from the studio row and never from the checkout. Throws when the
+   * row cannot be read or no longer exists: the launch fails closed.
+   */
+  private async resolveLaunchPermissions(
+    studioId: string
+  ): Promise<ClaudeRunnerConfig['launchPermissions']> {
+    const repo = this.getStudiosRepo();
+    if (!repo) throw new Error('Launch refused: no studios repository to read the profile from');
+    const row = await repo.findById(studioId);
+    if (!row)
+      throw new Error(`Launch refused: studio ${studioId} has no row to read a profile from`);
+    // Absence is not proof of the root: a row with no repo root could be any
+    // studio, and skipping it would drop both its profile and the
+    // working-directory check (Lumen d74ce85d, P2 1).
+    if (typeof row.repoRoot !== 'string' || row.repoRoot === '') {
+      throw new Error(
+        `Launch refused: studio ${studioId} names no repo root, so whether it is the root studio is unknown`
+      );
+    }
+    // The root (home) studio is the main checkout itself, identified
+    // positively. Its lane rules live in its own settings.local.json until
+    // phase B designs a root launch profile, so it gets none here: logged,
+    // not refused (review 44db8c0c, P2 1).
+    if (row.worktreePath === row.repoRoot) {
+      logger.info('Root studio: no launch profile (phase B)', { studioId });
+      return undefined;
+    }
+    return {
+      profile: studioPermissionProfile(row),
+      owner: row.sbSlug ?? undefined,
+      mainRoot: row.repoRoot,
+      worktreePath: row.worktreePath,
+    };
+  }
+
   private async completeStudioBeforeSpawn(
     workingDirectory: string | undefined,
     studioId: string | null | undefined,
@@ -5800,6 +5857,14 @@ This session will continue with a fresh context after compaction. Your identity,
   ): Promise<void> {
     if (!workingDirectory) return;
     const rowId = studioId && studioId !== 'main' ? studioId : undefined;
+    // One read of the row serves both lookups, and only on the incomplete path.
+    let rowRead: ReturnType<StudiosRepository['findById']> | undefined;
+    const readRow = () => {
+      const repo = this.getStudiosRepo();
+      if (!repo) throw new Error('no studios repository to look the studio up in');
+      rowRead ??= repo.findById(rowId as string);
+      return rowRead;
+    };
     try {
       await ensureStudioComplete(workingDirectory, {
         sbSlug,
@@ -5810,11 +5875,15 @@ This session will continue with a fresh context after compaction. Your identity,
         // then writes nothing that names an owner (Lumen, PR #699).
         owner: async () => {
           if (!rowId) return null;
-          const repo = this.getStudiosRepo();
-          if (!repo) throw new Error('no studios repository to look the owner up in');
-          const row = await repo.findById(rowId);
+          const row = await readRow();
           return row?.sbSlug ?? null;
         },
+        // The permission profile comes from the row, never the checkout: a
+        // PR-review checkout or a 'reviewer' row is a reviewer. No studio on
+        // the session, or a row that is gone, is no profile, and a failed
+        // read throws; either way no permissions are written rather than a
+        // guess (design v3 item 5; review 4177f7fe, P2 1).
+        profile: async () => (rowId ? studioPermissionProfile(await readRow()) : undefined),
       });
     } catch (err) {
       logger.debug('Studio checklist before spawn failed (non-fatal)', {
