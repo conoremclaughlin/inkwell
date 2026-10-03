@@ -65,58 +65,43 @@ export async function claimInklingTurn(
 /**
  * What the SB a turn is for is, as far as the database can say:
  * - 'inkling', with its row;
- * - 'other', positively not an inkling;
- * - 'unknown', when the row could not be read or found.
- * Read by id with no user filter, so an inkling never hides behind a
- * mismatched account. With no id, it is read by the account and slug, and
- * any inkling among those rows makes it one. Lumen's review of 8b9d7f50:
- * an unreadable or absent identity used to skip the whole gate.
+ * - 'other', positively not an inkling: its row says so, or no identity
+ *   row exists at all;
+ * - 'unknown', when its canonical identity could not be established.
+ *   `transient` is true when a read failed, false when nothing names one
+ *   identity (an ambiguous slug, an id that names no row).
+ * Lumen's review of 8b9d7f50: an unreadable or absent identity used to skip
+ * the whole gate.
  */
 export type InklingIdentity =
   | { kind: 'inkling'; id: string; userId: string; metadata: Record<string, unknown> }
   | { kind: 'other' }
-  | { kind: 'unknown' };
-
-export async function classifyInklingIdentity(
-  supabase: SupabaseClient,
-  input: { sbId: string | null | undefined; sbSlug: string; userId: string }
-): Promise<InklingIdentity> {
-  type Row = { id: string; user_id: string; metadata: Record<string, unknown> | null };
-  let rows: Row[];
-  if (input.sbId) {
-    const { data, error } = await supabase
-      .from('agent_identities')
-      .select('id, user_id, metadata')
-      .eq('id', input.sbId)
-      .maybeSingle();
-    if (error || !data) return { kind: 'unknown' };
-    rows = [data as Row];
-  } else {
-    const { data, error } = await supabase
-      .from('agent_identities')
-      .select('id, user_id, metadata')
-      .eq('user_id', input.userId)
-      .eq('agent_id', input.sbSlug);
-    if (error || !data || data.length === 0) return { kind: 'unknown' };
-    rows = data as Row[];
-  }
-  const inkling = rows.find((r) => r.metadata?.client === INKLING_CLIENT);
-  if (!inkling) return { kind: 'other' };
-  return {
-    kind: 'inkling',
-    id: inkling.id,
-    userId: inkling.user_id,
-    metadata: inkling.metadata ?? {},
-  };
-}
+  | { kind: 'unknown'; transient: boolean };
 
 /**
- * Every inkling's slug is kindle-<token id>, set when it is awakened and
- * never changed by naming. So an SB whose identity cannot be read is
- * refused when its slug could be an inkling's, and only then.
+ * Read the canonical identity by its id, with no user filter, so an inkling
+ * never hides behind a mismatched account. The id is the session's, or the
+ * one routing resolves (SessionService.classifyTurnIdentity); a slug is
+ * never the authority.
  */
-export function mayBeInklingSlug(sbSlug: string): boolean {
-  return sbSlug.toLowerCase().startsWith('kindle-');
+export async function classifyIdentityById(
+  supabase: SupabaseClient,
+  sbId: string
+): Promise<InklingIdentity> {
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('id, user_id, metadata')
+    .eq('id', sbId)
+    .maybeSingle();
+  if (error) return { kind: 'unknown', transient: true };
+  const row = data as {
+    id: string;
+    user_id: string;
+    metadata: Record<string, unknown> | null;
+  } | null;
+  if (!row) return { kind: 'unknown', transient: false };
+  if (row.metadata?.client !== INKLING_CLIENT) return { kind: 'other' };
+  return { kind: 'inkling', id: row.id, userId: row.user_id, metadata: row.metadata ?? {} };
 }
 
 /**
@@ -156,7 +141,6 @@ export async function isOwnersOwnMessage(
 
 export interface InklingTurnInput {
   identity: InklingIdentity;
-  sbSlug: string;
   /** The account the turn runs for. */
   userId: string;
   /** isOwnersOwnMessage, for an inkling's turn. */
@@ -170,9 +154,9 @@ export function inklingTurnRefusal(
 ): string | null {
   const { identity } = input;
   if (identity.kind === 'unknown') {
-    return mayBeInklingSlug(input.sbSlug)
-      ? 'the identity could not be read, and it may be an inkling'
-      : null;
+    return identity.transient
+      ? "the SB's identity could not be read"
+      : "the SB's identity could not be established";
   }
   if (identity.kind === 'other') return null;
   if (ownerTestUserId === null) return 'inklings are not open on this server';

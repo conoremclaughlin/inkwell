@@ -954,7 +954,14 @@ describe('SessionService', () => {
         metadata: Record<string, unknown>,
         request: Record<string, unknown> = fromOwner,
         gate = OWNER,
-        extra: { session?: Record<string, unknown>; row?: Record<string, unknown> } = {}
+        extra: {
+          session?: Record<string, unknown>;
+          row?: Record<string, unknown>;
+          /** More identity rows (for a slug two identities share). */
+          rows?: Record<string, unknown>[];
+          /** The by-id identity read fails, as a dropped connection would. */
+          readError?: boolean;
+        } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
         const supabase = makeFakeSupabase({
@@ -971,10 +978,28 @@ describe('SessionService', () => {
               updated_at: '2026-10-02T08:00:00.000Z',
               ...extra.row,
             },
+            ...(extra.rows ?? []),
           ],
           studios: [],
           ...THREAD_TABLES,
         });
+        if (extra.readError) {
+          const from = supabase.from.bind(supabase);
+          (supabase as { from: unknown }).from = (table: string) => {
+            const query = from(table);
+            if (table !== 'agent_identities') return query;
+            const select = query.select.bind(query);
+            query.select = ((cols?: string) => {
+              const q = select(cols);
+              if (cols === 'id, user_id, metadata') {
+                q.maybeSingle = async () =>
+                  ({ data: null, error: { message: 'fixture read failed' } }) as never;
+              }
+              return q;
+            }) as never;
+            return query;
+          };
+        }
         const service = new SessionService(
           mockRepository,
           mockContextBuilder,
@@ -1021,17 +1046,38 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
         });
 
-        it('an identity that cannot be read is refused when its slug could be an inkling, and only then', async () => {
-          const kindle = await turn(INKLING, { ...fromOwner, sbSlug: 'kindle-zzz' }, OWNER, {
-            session: { sbId: MISSING, sbSlug: 'kindle-zzz' },
+        it('an identity that cannot be established is refused, whatever its slug (Lumen 5bd4de42)', async () => {
+          // An sbId that names no row: refused, kindle- slug or not. Not retryable.
+          for (const sbSlug of ['kindle-zzz', 'myra']) {
+            const result = await turn({}, { ...fromOwner, sbSlug }, OWNER, {
+              session: { sbId: MISSING, sbSlug },
+            });
+            expect(result.errorCode, sbSlug).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, sbSlug).toBe(false);
+          }
+          // A failed identity read: refused, but retryable, so a blip loses nothing.
+          const blip = await turn({}, fromOwner, OWNER, { readError: true });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
           });
-          expect(kindle.errorCode).toBe('INKLING_TURN_REFUSED');
+          // With no sbId, a slug two identities share is ambiguous: refused.
+          const ambiguous = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(ambiguous.errorCode).toBe('INKLING_TURN_REFUSED');
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
-          // Control: an unreadable identity whose slug no inkling can have runs as today.
-          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, OWNER, {
-            session: { sbId: MISSING },
+        });
+
+        it('positively no identity row, or a readable ordinary one, runs as today', async () => {
+          // No sbId, and the account has no identity row for this slug at all.
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' }, sbSlug: 'nobody' }, OWNER, {
+            session: { sbId: null, sbSlug: 'nobody' },
           });
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
         });
 
         it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {

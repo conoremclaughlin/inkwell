@@ -80,10 +80,10 @@ import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import {
   claimInklingTurn,
-  classifyInklingIdentity,
+  classifyIdentityById,
+  type InklingIdentity,
   inklingTurnRefusal,
   isOwnersOwnMessage,
-  mayBeInklingSlug,
 } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
@@ -2003,16 +2003,13 @@ export class SessionService implements ISessionService {
       // An inkling's turn starts only in the owner test, on its owner's
       // account, for its owner's own message (Lumen 97b1d66a). Refused
       // here, before anything is logged, registered or spawned, and not
-      // retryable: nothing about it is transient.
-      // Classified on its own read, by id with no user filter (or by account
-      // and slug with no id), so an unreadable or absent identity cannot pass
-      // for "not an inkling" (Lumen's review of 8b9d7f50).
-      const inklingIdentity = await classifyInklingIdentity(this.supabase, {
-        sbId: session.sbId,
-        sbSlug,
-        userId,
-      });
-      const refuseInklingTurn = (reason: string): SessionResult => {
+      // retryable, unless an identity read failed.
+      // Classified on the canonical identity (the session's sbId, else the one
+      // routing resolves), read by id with no user filter, so an unreadable,
+      // ambiguous or absent-row identity cannot pass for "not an inkling"
+      // (Lumen's review of 8b9d7f50).
+      const inklingIdentity = await this.classifyTurnIdentity(userId, sbSlug, session.sbId);
+      const refuseInklingTurn = (reason: string, retryable = false): SessionResult => {
         logger.warn('[Inkling] Turn refused', { sbSlug, sbId: session.sbId, reason });
         return {
           success: false,
@@ -2025,9 +2022,9 @@ export class SessionService implements ISessionService {
           error: `Inkling turn refused: ${reason}`,
           errorCode: 'INKLING_TURN_REFUSED',
           classification: {
-            category: 'config',
+            category: retryable ? 'network' : 'config',
             summary: `Inkling turn refused: ${reason}`,
-            retryable: false,
+            retryable,
           },
         };
       };
@@ -2040,10 +2037,15 @@ export class SessionService implements ISessionService {
           ownerUserId: ownerTestUserId,
         }));
       const inklingRefusal = inklingTurnRefusal(
-        { identity: inklingIdentity, sbSlug, userId, fromOwnersOwnMessage },
+        { identity: inklingIdentity, userId, fromOwnersOwnMessage },
         ownerTestUserId
       );
-      if (inklingRefusal) return refuseInklingTurn(inklingRefusal);
+      if (inklingRefusal) {
+        return refuseInklingTurn(
+          inklingRefusal,
+          inklingIdentity.kind === 'unknown' && inklingIdentity.transient
+        );
+      }
 
       if (inklingIdentity.kind === 'inkling') {
         // Only the Claude runner enforces an inkling's ceiling, group stop
@@ -4676,6 +4678,29 @@ export class SessionService implements ISessionService {
    *   { ambiguous }     → several identities share this slug; caller-repo
    *                       resolution must not run at all
    */
+  /**
+   * The canonical identity a turn is for, classified for the inkling gate:
+   * the session's sbId, else the one routing resolves for this account and
+   * slug (resolveIdentityScope, which refuses ambiguity). No identity row at
+   * all is positively not an inkling; an ambiguous slug is unknown. The slug
+   * itself is never the authority (Lumen, 5bd4de42).
+   */
+  private async classifyTurnIdentity(
+    userId: string,
+    sbSlug: string,
+    sbId: string | null | undefined
+  ): Promise<InklingIdentity> {
+    if (!this.supabase) return { kind: 'other' };
+    let canonical = sbId ?? null;
+    if (!canonical) {
+      const scope = await this.resolveIdentityScope(userId, sbSlug);
+      if (scope.absent) return { kind: 'other' };
+      if (!scope.id) return { kind: 'unknown', transient: false };
+      canonical = scope.id;
+    }
+    return classifyIdentityById(this.supabase, canonical);
+  }
+
   private async resolveIdentityScope(
     userId: string,
     sbSlug: string
@@ -4943,15 +4968,12 @@ export class SessionService implements ISessionService {
     // is one that may be an inkling's and cannot be read (Lumen's review of
     // 8b9d7f50).
     if (this.supabase) {
-      const identity = await classifyInklingIdentity(this.supabase, {
-        sbId: session.sbId,
-        sbSlug: session.sbSlug,
-        userId: session.userId,
-      });
-      if (
-        identity.kind === 'inkling' ||
-        (identity.kind === 'unknown' && mayBeInklingSlug(session.sbSlug))
-      ) {
+      const identity = await this.classifyTurnIdentity(
+        session.userId,
+        session.sbSlug,
+        session.sbId
+      );
+      if (identity.kind !== 'other') {
         logger.info('[Inkling] Not compacting an inkling session', {
           sessionId,
           sbSlug: session.sbSlug,
