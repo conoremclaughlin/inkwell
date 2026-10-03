@@ -125,6 +125,15 @@ export async function handleTriggerAgent(
       senderIsBridge = false;
     }
 
+    // A wake-source tag is server-issued accounting for the no-progress
+    // breaker (wake-source-breaker.ts), never caller data. The tag is signed
+    // and the hook verifies it; dropping the key here keeps a caller's copy
+    // out of the payload altogether, as send_to_inbox does.
+    const callerMetadata =
+      args.metadata && typeof args.metadata === 'object'
+        ? Object.fromEntries(Object.entries(args.metadata).filter(([key]) => key !== 'wakeSource'))
+        : args.metadata;
+
     const payload: AgentTriggerPayload = {
       fromSlug: args.fromSlug,
       toSlug: args.toSlug,
@@ -149,7 +158,7 @@ export async function handleTriggerAgent(
       // dispatch path that forgets this (Lumen, PR #514 round 1).
       ...senderRoutingContext(senderIsBridge),
       ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
-      metadata: args.metadata,
+      metadata: callerMetadata,
     };
 
     const result = gateway.dispatchTrigger(payload);

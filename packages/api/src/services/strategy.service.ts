@@ -32,7 +32,7 @@ import { ephemeralWorktreePath } from './studio-paths';
 import { completeStudioViaCli } from './studio-complete';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 import { SYSTEM_PRINCIPAL } from './principals';
-import { WakeSourceBreaker, type WakeSourceTag } from './wake-source-breaker';
+import { WakeSourceBreaker, issueWakeSourceTag, type WakeSourceTag } from './wake-source-breaker';
 
 const execFileAsync = promisify(execFile);
 
@@ -1711,7 +1711,7 @@ export class StrategyService {
       };
     }
     const wakeSource: WakeSourceTag | undefined = fingerprint
-      ? {
+      ? issueWakeSourceTag({
           source: breakerKey.source,
           workKind: breakerKey.workKind,
           workId: breakerKey.workId,
@@ -1720,7 +1720,7 @@ export class StrategyService {
           dispatchedAt: new Date().toISOString(),
           taskGroupId: group.id,
           ownerSbId: group.sb_id ?? null,
-        }
+        })
       : undefined;
 
     // If the strategy uses a sandbox, spin up (or reuse) the container before

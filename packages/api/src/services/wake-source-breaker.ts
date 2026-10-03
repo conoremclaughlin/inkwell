@@ -30,7 +30,7 @@
  * own fire decision reads the breaker, and delivery never does.
  */
 
-import { createHash } from 'crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import type { DataComposer } from '../data/composer';
 import { resolveSbId, resolveSbSlug } from '../auth/resolve-identity';
 import { SYSTEM_PRINCIPAL } from './principals';
@@ -61,13 +61,8 @@ export interface WakeSourceKey {
   revision: string;
 }
 
-/**
- * Carried on the wake message's metadata as `wakeSource`, from the source's
- * fire decision to the trigger handler that records the attempt. Server-set
- * only: handleSendToInbox drops any `wakeSource` a caller puts in metadata
- * and writes this from its internal context.
- */
-export interface WakeSourceTag {
+/** What a source knows about one wake when it fires. */
+export interface WakeSourceTagFields {
   source: WakeSource;
   workKind: WakeWorkKind;
   workId: string;
@@ -77,6 +72,53 @@ export interface WakeSourceTag {
   dispatchedAt: string;
   taskGroupId: string | null;
   ownerSbId: string | null;
+}
+
+/**
+ * Carried on the wake message's metadata as `wakeSource`, from the source's
+ * fire decision to the trigger handler that records the attempt.
+ *
+ * Only a tag this server issued counts. The signature is an HMAC over every
+ * field under a key generated when the process starts, so a tag a caller
+ * writes into metadata (send_to_inbox, trigger_agent or any future ingress)
+ * fails verification, and a field changed after issue does too. Both public
+ * ingresses also drop the key outright. A tag issued before a restart no
+ * longer verifies, so its completion goes uncounted, which only delays a trip.
+ * A replayed genuine tag cannot add a count: it is a duplicate of the attempt
+ * it copies (decideCompletedAttempt).
+ */
+export interface WakeSourceTag extends WakeSourceTagFields {
+  signature: string;
+}
+
+const TAG_KEY = randomBytes(32);
+
+function tagSignature(fields: WakeSourceTagFields): string {
+  return createHmac('sha256', TAG_KEY)
+    .update(
+      JSON.stringify([
+        fields.source,
+        fields.workKind,
+        fields.workId,
+        fields.revision,
+        fields.fingerprint,
+        fields.dispatchedAt,
+        fields.taskGroupId,
+        fields.ownerSbId,
+      ])
+    )
+    .digest('hex');
+}
+
+/** Sign a wake's tag. Sources call this when they fire, never callers. */
+export function issueWakeSourceTag(fields: WakeSourceTagFields): WakeSourceTag {
+  return { ...fields, signature: tagSignature(fields) };
+}
+
+function signatureMatches(fields: WakeSourceTagFields, signature: string): boolean {
+  const expected = Buffer.from(tagSignature(fields), 'hex');
+  const given = Buffer.from(signature, 'hex');
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 export interface BreakerRow {
@@ -112,30 +154,48 @@ export interface TaskStateRow {
   outcome: string | null;
   gate_state: string | null;
   gate_attempt: number | null;
-  gate_version: number | null;
   gate_request_revision: number | null;
 }
 
 export const TASK_STATE_COLUMNS =
-  'status, outcome, gate_state, gate_attempt, gate_version, gate_request_revision';
+  'status, outcome, gate_state, gate_attempt, gate_request_revision';
+
+/**
+ * Claim bookkeeping is not work. claim_graph_task moves a node from pending to
+ * in_progress (and a verification gate from open to in_progress), and
+ * release_graph_claim moves both back; both bump gate_version as a fence. So
+ * a turn that claims and releases, or one whose completion is read before its
+ * fire-and-forget boundary release lands, must read the same as one that
+ * never claimed. Status in_progress reads as pending, a claimed gate as open,
+ * and gate_version is not part of the fingerprint at all. What remains is
+ * semantic: a terminal or blocked status, an outcome, a gate opening or a
+ * verdict, a retry (gate_attempt) and a new revision.
+ */
+function workStatus(status: string | null): string | null {
+  return status === 'in_progress' ? 'pending' : status;
+}
+
+function gateStatus(gateState: string | null): string | null {
+  return gateState === 'in_progress' ? 'open' : gateState;
+}
 
 function digest(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
 /**
- * A task's or graph node's progress fingerprint. Claim columns, metadata (the
- * dispatch stamps live there) and `updated_at` are left out on purpose: a turn
+ * A task's or graph node's progress fingerprint. Claim columns, the claim
+ * fence (gate_version), metadata (the dispatch stamps live there) and
+ * `updated_at` are left out, and claimed states read as unclaimed: a turn
  * that claims a node and releases it unfinished made no progress.
  */
 export function taskFingerprint(row: TaskStateRow): string {
   return digest([
     'task',
-    row.status,
+    workStatus(row.status),
     row.outcome ?? null,
-    row.gate_state ?? null,
+    gateStatus(row.gate_state ?? null),
     row.gate_attempt ?? null,
-    row.gate_version ?? null,
     row.gate_request_revision ?? null,
   ]);
 }
@@ -147,7 +207,7 @@ export function taskGroupFingerprint(
 ): string {
   const states = [...tasks]
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map((t) => [t.id, t.status, t.outcome ?? null]);
+    .map((t) => [t.id, workStatus(t.status), t.outcome ?? null]);
   return digest(['task_group', group.status ?? null, group.current_task_index ?? null, states]);
 }
 
@@ -252,7 +312,10 @@ export function decideCompletedAttempt(
   };
 }
 
-/** Parse a `wakeSource` tag off message metadata; null unless every field is valid. */
+/**
+ * Parse a `wakeSource` tag off message metadata. Null unless every field is
+ * valid and the signature proves this server issued it, unchanged.
+ */
 export function parseWakeSourceTag(metadata: unknown): WakeSourceTag | null {
   if (!metadata || typeof metadata !== 'object') return null;
   const raw = (metadata as Record<string, unknown>).wakeSource;
@@ -264,7 +327,8 @@ export function parseWakeSourceTag(metadata: unknown): WakeSourceTag | null {
   if (!str(t.workId) || !str(t.fingerprint) || !str(t.dispatchedAt)) return null;
   if (typeof t.revision !== 'string') return null;
   if (Number.isNaN(Date.parse(t.dispatchedAt))) return null;
-  return {
+  if (!str(t.signature) || !/^[0-9a-f]{64}$/.test(t.signature)) return null;
+  const fields: WakeSourceTagFields = {
     source: t.source as WakeSource,
     workKind: t.workKind as WakeWorkKind,
     workId: t.workId,
@@ -274,6 +338,8 @@ export function parseWakeSourceTag(metadata: unknown): WakeSourceTag | null {
     taskGroupId: str(t.taskGroupId) ? t.taskGroupId : null,
     ownerSbId: str(t.ownerSbId) ? t.ownerSbId : null,
   };
+  if (!signatureMatches(fields, t.signature)) return null;
+  return { ...fields, signature: t.signature };
 }
 
 // ── Service ──────────────────────────────────────────────────────────────────
@@ -509,32 +575,58 @@ export class WakeSourceBreaker {
 
   /** Clear one item's count and trip (an explicit resume). */
   async reset(key: WakeSourceKey): Promise<void> {
-    try {
-      const { error } = await this.client
-        .from('wake_source_breakers')
-        .update(CLEARED)
-        .eq('user_id', key.userId)
-        .eq('source', key.source)
-        .eq('work_id', key.workId)
-        .eq('revision', key.revision);
-      if (error) throw error;
-    } catch (err) {
-      logger.warn('[WakeBreaker] Reset failed', { workId: key.workId, error: String(err) });
-    }
+    await this.resetMatching({
+      user_id: key.userId,
+      source: key.source,
+      work_id: key.workId,
+      revision: key.revision,
+    });
   }
 
   /** Clear every item of one source in a group (strategy resume, graph restart). */
   async resetGroup(userId: string, source: WakeSource, taskGroupId: string): Promise<void> {
+    await this.resetMatching({ user_id: userId, source, task_group_id: taskGroupId });
+  }
+
+  /**
+   * A reset is a compare-and-set per row that advances `version`, so a
+   * completion that read the row before the reset loses its own CAS and
+   * re-reads instead of writing its stale count over the reset. The reset also
+   * moves `last_counted_at` to now: an attempt dispatched before it is then a
+   * duplicate (decideCompletedAttempt) and is excluded, never restored.
+   */
+  private async resetMatching(filters: Record<string, string>): Promise<void> {
     try {
-      const { error } = await this.client
-        .from('wake_source_breakers')
-        .update(CLEARED)
-        .eq('user_id', userId)
-        .eq('source', source)
-        .eq('task_group_id', taskGroupId);
+      const resetAt = this.now().toISOString();
+      let query = this.client.from('wake_source_breakers').select('id, version');
+      for (const [column, value] of Object.entries(filters)) {
+        query = query.eq(column as never, value as never);
+      }
+      const { data, error } = await query;
       if (error) throw error;
+      for (const row of (data ?? []) as unknown as Array<{ id: string; version: number }>) {
+        let version = row.version;
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const { data: written, error: writeError } = await this.client
+            .from('wake_source_breakers')
+            .update({ ...CLEARED, last_counted_at: resetAt, version: version + 1 })
+            .eq('id', row.id)
+            .eq('version', version)
+            .select('id');
+          if (writeError) throw writeError;
+          if (written && written.length > 0) break;
+          const { data: fresh, error: readError } = await this.client
+            .from('wake_source_breakers')
+            .select('id, version')
+            .eq('id', row.id)
+            .maybeSingle();
+          if (readError) throw readError;
+          if (!fresh) break;
+          version = (fresh as unknown as { version: number }).version;
+        }
+      }
     } catch (err) {
-      logger.warn('[WakeBreaker] Group reset failed', { taskGroupId, error: String(err) });
+      logger.warn('[WakeBreaker] Reset failed', { filters, error: String(err) });
     }
   }
 
