@@ -84,7 +84,7 @@ The end-to-end check is a triggered turn in a fresh builder studio that takes a 
 
 1. Create a fresh builder studio for each SB: `ink studio create probe-tools --agent wren`, and the same for `lumen` (Codex). Record each studio's `sandbox_bypass`.
 2. Boot a simulator first, outside the turn: `xcrun simctl bootstatus "iPhone 17" -b`.
-3. Trigger one turn per studio with `send_to_inbox(recipientSlug, recipientStudioId, threadKey: "pcp:thread:studio-tools-probe")` and this request: "Navigate Playwright to https://example.com, take a screenshot, and save it as `~/.ink/files/<sb>-screenshots/probe-playwright.jpg`. Then run `xcrun simctl io booted screenshot --type=jpeg ~/.ink/files/<sb>-screenshots/probe-simctl.jpg`. Report each tool call's result verbatim. Don't ask for approval."
+3. Trigger one turn per studio with `send_to_inbox(recipientSlug, recipientStudioId, threadKey: "thread:studio-tools-probe")` and this request: "Navigate Playwright to https://example.com, take a screenshot, and save it as `~/.ink/files/<sb>-screenshots/probe-playwright.jpg`. Then run `xcrun simctl io booted screenshot --type=jpeg ~/.ink/files/<sb>-screenshots/probe-simctl.jpg`. Report each tool call's result verbatim. Don't ask for approval."
 4. While the turn runs, capture:
    - the Claude session's MCP config, `$TMPDIR/sb-mcp/mcp-server-*.json`: the playwright args carry `--headless --isolated`.
    - `ps -Ao pid,command | grep -i 'chrom'`: the browser runs headless, with no `--user-data-dir` under `~/Library/Application Support`.
