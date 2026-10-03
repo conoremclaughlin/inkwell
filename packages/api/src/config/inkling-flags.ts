@@ -30,6 +30,17 @@ export function inklingOwnerTestUserId(source: EnvSource = process.env): string 
   return raw && UUID.test(raw) ? raw : null;
 }
 
+/** The first test's ceiling on one inkling turn: five minutes. */
+export const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * How long one inkling turn may run before it is stopped, with everything
+ * it started: INKLING_TURN_TIMEOUT_MS, else five minutes.
+ */
+export function inklingTurnTimeoutMs(source: EnvSource = process.env): number {
+  return positiveInt(source.INKLING_TURN_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS);
+}
+
 /** The first test's turns per inkling, unless INKLING_TURN_CAP says otherwise. */
 export const DEFAULT_TURN_CAP = 20;
 

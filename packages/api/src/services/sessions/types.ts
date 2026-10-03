@@ -689,6 +689,17 @@ export interface IContextBuilder {
 export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
+  /**
+   * This run's hard ceiling, when it must be lower than the runner's own
+   * (an inkling turn's). The Claude runner honours it.
+   */
+  timeoutMs?: number;
+  /**
+   * Spawn the backend as a process-group leader and stop the whole group,
+   * so the tools it started stop with it (stop-process.ts). The Claude
+   * runner honours it.
+   */
+  killProcessGroup?: boolean;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |

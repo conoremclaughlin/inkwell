@@ -81,7 +81,11 @@ import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import { claimInklingTurn, inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
-import { inklingOwnerTestUserId, inklingTurnCap } from '../../config/inkling-flags.js';
+import {
+  inklingOwnerTestUserId,
+  inklingTurnCap,
+  inklingTurnTimeoutMs,
+} from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -1972,6 +1976,8 @@ export class SessionService implements ISessionService {
     // scope. Missing/invalid identity fails CLOSED: toolRouting stays
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
+    // Set once an inkling's turn has passed the gate and claimed a slot.
+    let inklingTurn = false;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
     if (this.supabase) {
@@ -2024,6 +2030,7 @@ export class SessionService implements ISessionService {
         if (!claim.allowed) {
           return refuseInklingTurn(`turn cap reached (${claim.used} of ${cap})`);
         }
+        inklingTurn = true;
         // Its turn runs in its own folder, never the Inkwell checkout or the
         // server's default directory (organisation, not isolation:
         // inkling-folder.ts). Routing gave it no studio to resolve from.
@@ -2083,6 +2090,9 @@ export class SessionService implements ISessionService {
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
+      // An inkling turn is bounded: its own ceiling, and a stop that takes
+      // the tools it started with it.
+      ...(inklingTurn ? { timeoutMs: inklingTurnTimeoutMs(), killProcessGroup: true } : {}),
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(

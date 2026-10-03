@@ -31,6 +31,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
+import { stopProcess } from './stop-process.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -514,11 +515,17 @@ export class ClaudeRunner implements IRunner {
         container: config.container,
       });
 
+      // A run that must stop with its tools leads its own process group, so a
+      // stop can signal the whole group (stopProcess).
+      const killGroup = config.killProcessGroup === true;
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
         env: target.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: killGroup,
       });
+      // The run's own ceiling may be lower than the module's (an inkling turn's).
+      const ceilingMs = Math.min(PROCESS_TIMEOUT_MS, config.timeoutMs ?? PROCESS_TIMEOUT_MS);
 
       let stderr = '';
       const responses: ChannelResponse[] = [];
@@ -546,7 +553,7 @@ export class ClaudeRunner implements IRunner {
               hasResponses: responses.length > 0,
               hasFinalText: !!finalTextResponse,
             });
-            this.killProcess(proc);
+            this.killProcess(proc, killGroup);
             settled = true;
             resolve({
               responses,
@@ -575,11 +582,11 @@ export class ClaudeRunner implements IRunner {
       const timeout = setTimeout(() => {
         if (!settled) {
           logger.error('Claude Code process hit hard timeout, killing', {
-            timeoutMs: PROCESS_TIMEOUT_MS,
+            timeoutMs: ceilingMs,
             hasResponses: responses.length > 0,
             hasFinalText: !!finalTextResponse,
           });
-          this.killProcess(proc);
+          this.killProcess(proc, killGroup);
           settled = true;
           resolve({
             responses,
@@ -590,12 +597,12 @@ export class ClaudeRunner implements IRunner {
             timedOut: {
               kind: 'hard',
               message: `Claude Code timeout: exceeded the ${Math.round(
-                PROCESS_TIMEOUT_MS / 1000
+                ceilingMs / 1000
               )}s ceiling, process killed`,
             },
           });
         }
-      }, PROCESS_TIMEOUT_MS);
+      }, ceilingMs);
 
       const consumeLine = (line: string) => {
         {
@@ -732,22 +739,8 @@ export class ClaudeRunner implements IRunner {
   /**
    * Kill a Claude Code subprocess gracefully, with escalation to SIGKILL.
    */
-  private killProcess(proc: ChildProcess): void {
-    try {
-      proc.kill('SIGTERM');
-      // If it doesn't die in 5s, force kill
-      setTimeout(() => {
-        try {
-          if (!proc.killed) {
-            proc.kill('SIGKILL');
-          }
-        } catch {
-          // Process already dead
-        }
-      }, 5000);
-    } catch {
-      // Process already dead
-    }
+  private killProcess(proc: ChildProcess, group = false): void {
+    stopProcess(proc, { group });
   }
 
   /**

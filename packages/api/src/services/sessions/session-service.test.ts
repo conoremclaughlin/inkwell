@@ -908,6 +908,14 @@ describe('SessionService', () => {
         await rm(inklingsRoot, { recursive: true, force: true });
       });
 
+      const configPassedToRunner = () =>
+        (
+          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+            string,
+            { config: { timeoutMs?: number; killProcessGroup?: boolean } },
+          ]
+        )[1].config;
+
       const cwdPassedToRunner = () =>
         (
           vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
@@ -968,6 +976,19 @@ describe('SessionService', () => {
         // This file mocks fs/promises' stat; the folder check needs the real one.
         const fs = await vi.importActual<typeof import('fs/promises')>('fs/promises');
         expect((await fs.stat(join(inklingsRoot, SB))).isDirectory()).toBe(true);
+      });
+
+      it('its turn is bounded: its own ceiling, and a stop that takes its tools with it', async () => {
+        vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '90000');
+        await turn(INKLING);
+        expect(configPassedToRunner()).toMatchObject({ timeoutMs: 90000, killProcessGroup: true });
+      });
+
+      it('another SB keeps the runner defaults: no inkling ceiling, no group stop', async () => {
+        await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+        const config = configPassedToRunner();
+        expect(config.timeoutMs).toBeUndefined();
+        expect(config.killProcessGroup).toBeUndefined();
       });
 
       it('a threaded message is placed in its folder, not held for want of a studio', async () => {

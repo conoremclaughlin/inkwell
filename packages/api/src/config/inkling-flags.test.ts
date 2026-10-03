@@ -2,10 +2,21 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AWAKEN_CAP,
   DEFAULT_TURN_CAP,
+  DEFAULT_TURN_TIMEOUT_MS,
   inklingAwakenCap,
   inklingOwnerTestUserId,
   inklingTurnCap,
+  inklingTurnTimeoutMs,
 } from './inkling-flags';
+
+describe('inklingTurnTimeoutMs', () => {
+  it('is five minutes unless INKLING_TURN_TIMEOUT_MS is a positive whole number', () => {
+    expect(DEFAULT_TURN_TIMEOUT_MS).toBe(300_000);
+    expect(inklingTurnTimeoutMs({})).toBe(300_000);
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '90000' })).toBe(90_000);
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: 'soon' })).toBe(300_000);
+  });
+});
 
 describe('inklingTurnCap', () => {
   it('is 20 unless INKLING_TURN_CAP is a positive whole number', () => {
