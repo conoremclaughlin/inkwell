@@ -82,6 +82,7 @@ import {
   claimInklingTurn,
   classifyInklingIdentity,
   inklingTurnRefusal,
+  isOwnersOwnMessage,
   mayBeInklingSlug,
 } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
@@ -2030,9 +2031,17 @@ export class SessionService implements ISessionService {
           },
         };
       };
+      const ownerTestUserId = inklingOwnerTestUserId();
+      const fromOwnersOwnMessage =
+        inklingIdentity.kind === 'inkling' &&
+        (await isOwnersOwnMessage(this.supabase, {
+          threadMessageId: metadata?.triggerThreadMessageId,
+          inklingId: inklingIdentity.id,
+          ownerUserId: ownerTestUserId,
+        }));
       const inklingRefusal = inklingTurnRefusal(
-        { identity: inklingIdentity, sbSlug, userId, senderId: request.sender?.id },
-        inklingOwnerTestUserId()
+        { identity: inklingIdentity, sbSlug, userId, fromOwnersOwnMessage },
+        ownerTestUserId
       );
       if (inklingRefusal) return refuseInklingTurn(inklingRefusal);
 

@@ -119,13 +119,48 @@ export function mayBeInklingSlug(sbSlug: string): boolean {
   return sbSlug.toLowerCase().startsWith('kindle-');
 }
 
+/**
+ * Did the owner, as a person, really send the message that woke this turn,
+ * in a conversation the inkling is on? Read from the stored message the
+ * trigger names, which the send path wrote with its server-derived sender.
+ * A sender label ('user') proves nothing: trigger_agent takes one from its
+ * caller (Lumen's review of 8b9d7f50). No message id, or anything unread,
+ * is a no.
+ */
+export async function isOwnersOwnMessage(
+  supabase: SupabaseClient,
+  input: { threadMessageId: string | undefined; inklingId: string; ownerUserId: string | null }
+): Promise<boolean> {
+  if (!input.threadMessageId || !input.ownerUserId) return false;
+  const { data: message, error } = await supabase
+    .from('inbox_thread_messages')
+    .select('thread_id, sender_kind, sender_user_id')
+    .eq('id', input.threadMessageId)
+    .maybeSingle();
+  const row = message as {
+    thread_id: string;
+    sender_kind: string | null;
+    sender_user_id: string | null;
+  } | null;
+  if (error || !row) return false;
+  if (row.sender_kind !== 'user') return false;
+  if ((row.sender_user_id ?? '').toLowerCase() !== input.ownerUserId.toLowerCase()) return false;
+  const { data: member, error: memberError } = await supabase
+    .from('inbox_thread_participants')
+    .select('sb_id')
+    .eq('thread_id', row.thread_id)
+    .eq('sb_id', input.inklingId)
+    .maybeSingle();
+  return !memberError && !!member;
+}
+
 export interface InklingTurnInput {
   identity: InklingIdentity;
   sbSlug: string;
   /** The account the turn runs for. */
   userId: string;
-  /** SessionRequest.sender.id: 'user' for a person's message. */
-  senderId: string | undefined;
+  /** isOwnersOwnMessage, for an inkling's turn. */
+  fromOwnersOwnMessage: boolean;
 }
 
 /** Null when the turn may start; otherwise why it may not. Only inklings, or possible ones, are ever refused. */
@@ -146,8 +181,8 @@ export function inklingTurnRefusal(
     return 'this inkling belongs to an account outside the owner test';
   }
   if (identity.metadata.ownerTest !== true) return 'this inkling was not born under the owner test';
-  if (input.senderId !== 'user') {
-    return 'an inkling wakes only for its owner’s own message, not a system, SB or channel send';
+  if (!input.fromOwnersOwnMessage) {
+    return 'an inkling wakes only for a stored message its owner sent in its conversation';
   }
   return null;
 }

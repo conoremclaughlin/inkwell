@@ -264,6 +264,13 @@ export interface SessionRequest {
     taskGroupId?: string;
     // Docker container name for sandboxed strategy execution
     sandboxContainerName?: string;
+    /**
+     * The stored thread message that prompted this trigger, copied by the
+     * trigger handler from the payload's own threadMessageId (set only by
+     * the server's send path), never from caller metadata. The inkling turn
+     * gate reads the message to learn who really sent it.
+     */
+    triggerThreadMessageId?: string;
   };
 }
 

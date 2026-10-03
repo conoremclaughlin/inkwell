@@ -63,6 +63,29 @@ describe('handleTriggerAgent — authenticated-user stamping (PR #487)', () => {
   });
 });
 
+describe('handleTriggerAgent — no stored-message provenance from the caller (PR #722)', () => {
+  it('never dispatches a caller-supplied threadMessageId, which the inkling gate trusts', async () => {
+    dispatchTrigger.mockClear();
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
+    await handleTriggerAgent(
+      {
+        toSlug: 'kindle-abc',
+        fromSlug: 'user',
+        triggerType: 'message',
+        priority: 'normal',
+        threadMessageId: 'msg-owner',
+        threadId: 'thread-1',
+        metadata: { triggerThreadMessageId: 'msg-owner' },
+      } as never,
+      {} as never
+    );
+    expect(dispatchTrigger).toHaveBeenCalledTimes(1);
+    const payload = dispatchTrigger.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('threadMessageId');
+    expect(payload).not.toHaveProperty('threadId');
+  });
+});
+
 describe('handleTriggerAgent — anchor provenance (PR #681 round 3)', () => {
   // A recipientSessionId / studio the CALLER passes here is addressing, the
   // same way it is on send_to_inbox. Without the flag the trigger handler

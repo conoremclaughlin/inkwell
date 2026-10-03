@@ -897,7 +897,31 @@ describe('SessionService', () => {
       const OWNER = '11111111-1111-4111-8111-111111111111';
       const SB = '3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10';
       const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
-      const fromOwner = { sender: { id: 'user', name: 'Owner' } };
+      const fromOwner = {
+        sender: { id: 'user', name: 'Owner' },
+        metadata: { triggerThreadMessageId: 'msg-owner' },
+      };
+
+      /** The inkling's conversation, as the send path stores it: the gate reads these. */
+      const THREAD_TABLES = {
+        inbox_thread_messages: [
+          { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
+          { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          {
+            id: 'msg-someone',
+            thread_id: 'thread-1',
+            sender_kind: 'user',
+            sender_user_id: '44444444-4444-4444-8444-444444444444',
+          },
+          {
+            id: 'msg-elsewhere',
+            thread_id: 'thread-2',
+            sender_kind: 'user',
+            sender_user_id: OWNER,
+          },
+        ],
+        inbox_thread_participants: [{ thread_id: 'thread-1', sb_id: SB, user_id: null }],
+      };
       let inklingsRoot: string;
 
       beforeEach(async () => {
@@ -949,6 +973,7 @@ describe('SessionService', () => {
             },
           ],
           studios: [],
+          ...THREAD_TABLES,
         });
         const service = new SessionService(
           mockRepository,
@@ -977,6 +1002,24 @@ describe('SessionService', () => {
 
       describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
         const MISSING = '99999999-9999-4999-8999-999999999999';
+
+        it("a 'user' label proves nothing: only the owner's own stored message, in its conversation, wakes it", async () => {
+          const label = { id: 'user', name: 'Owner' };
+          for (const messageId of [
+            undefined, // trigger_agent: a caller-supplied fromSlug 'user' and no stored message
+            'msg-sb', // an SB's message in its conversation
+            'msg-someone', // another person's
+            'msg-elsewhere', // the owner's, but in a conversation the inkling is not on
+            'msg-missing', // names no stored message
+          ]) {
+            const result = await turn(INKLING, {
+              sender: label,
+              metadata: messageId ? { triggerThreadMessageId: messageId } : {},
+            });
+            expect(result.errorCode, String(messageId)).toBe('INKLING_TURN_REFUSED');
+          }
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
 
         it('an identity that cannot be read is refused when its slug could be an inkling, and only then', async () => {
           const kindle = await turn(INKLING, { ...fromOwner, sbSlug: 'kindle-zzz' }, OWNER, {
@@ -1086,7 +1129,10 @@ describe('SessionService', () => {
       it('a threaded message is placed in its folder, not held for want of a studio', async () => {
         const result = await turn(INKLING, {
           ...fromOwner,
-          metadata: { threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d' },
+          metadata: {
+            ...fromOwner.metadata,
+            threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+          },
         });
         expect(result.errorCode).not.toBe('ROUTING_REFUSED');
         expect(mockClaudeRunner.run).toHaveBeenCalled();
@@ -1101,7 +1147,7 @@ describe('SessionService', () => {
           vi.mocked(mockClaudeRunner.run).mockClear();
           const result = await turn(INKLING, {
             ...fromOwner,
-            metadata: { threadKey: 'chat:conversation-named', ...named },
+            metadata: { ...fromOwner.metadata, threadKey: 'chat:conversation-named', ...named },
           });
           expect(result.errorCode, JSON.stringify(named)).not.toBe('ROUTING_REFUSED');
           expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
@@ -1126,7 +1172,7 @@ describe('SessionService', () => {
           mockActivityStream,
           { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
           mockCodexRunner,
-          makeFakeSupabase({ agent_identities: [row], studios: [] }),
+          makeFakeSupabase({ agent_identities: [row], studios: [], ...THREAD_TABLES }),
           undefined,
           mockInkRunner
         );
