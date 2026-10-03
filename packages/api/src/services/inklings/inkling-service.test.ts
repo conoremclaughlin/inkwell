@@ -23,6 +23,7 @@ import {
   validateDisplayName,
 } from './inkling-service';
 import { createInklingDb, seedOwnSb, AWAKEN_REQUEST_INDEX } from '../../test/fake-inkling-db';
+import { liveInklingTurns, trackInklingTurn } from './inkling-turns';
 import type { FakePostgrest, Row } from '../../test/fake-postgrest';
 
 const ME = {
@@ -99,6 +100,35 @@ describe('the owner test gate (Lumen 97b1d66a)', () => {
   it("matches the account in any letter case, as the env's UUID may be written", async () => {
     const upper = as({ userId: ME.userId.toUpperCase() });
     await expect(upper.awaken(ME, REQUEST)).resolves.toMatchObject({ replayed: false });
+  });
+});
+
+describe("cancelling an inkling's turn", () => {
+  it('stops its live turn, says so, and says so again only if one is running', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    const turn = trackInklingTurn(inkling.id);
+    expect(await service.cancel(ME, inkling.id)).toEqual({ cancelled: true });
+    expect(turn.signal.aborted).toBe(true);
+    turn.done();
+    expect(liveInklingTurns(inkling.id)).toBe(0);
+    expect(await service.cancel(ME, inkling.id)).toEqual({ cancelled: false });
+  });
+
+  it('is the owner test only, and the caller’s own inkling only', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    const turn = trackInklingTurn(inkling.id);
+    const off = new InklingService(db as unknown as SupabaseClient, { ownerTestUserId: null });
+    await expect(off.cancel(ME, inkling.id)).rejects.toMatchObject({
+      status: 403,
+      code: 'inklings_disabled',
+    });
+    await expect(as(HOUSEMATE).cancel(HOUSEMATE, inkling.id)).rejects.toMatchObject({
+      status: 404,
+    });
+    const myra = seedOwnSb(db, ME, 'myra');
+    await expect(service.cancel(ME, String(myra.id))).rejects.toMatchObject({ status: 404 });
+    expect(turn.signal.aborted).toBe(false);
+    turn.done();
   });
 });
 

@@ -10,6 +10,7 @@ import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
@@ -986,9 +987,30 @@ describe('SessionService', () => {
 
       it('another SB keeps the runner defaults: no inkling ceiling, no group stop', async () => {
         await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
-        const config = configPassedToRunner();
+        const config = configPassedToRunner() as { signal?: AbortSignal } & Record<string, unknown>;
         expect(config.timeoutMs).toBeUndefined();
         expect(config.killProcessGroup).toBeUndefined();
+        expect(config.signal).toBeUndefined();
+      });
+
+      it('its owner can cancel it while it runs; it is released when the run ends', async () => {
+        let during = -1;
+        let aborted = false;
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (_m, options) => {
+          during = liveInklingTurns(SB);
+          cancelInklingTurns(SB);
+          aborted = (options.config as { signal?: AbortSignal }).signal?.aborted === true;
+          return {
+            success: false,
+            responses: [],
+            backendSessionId: null,
+            error: 'cancelled',
+          } as never;
+        });
+        await turn(INKLING);
+        expect(during).toBe(1);
+        expect(aborted).toBe(true);
+        expect(liveInklingTurns(SB)).toBe(0);
       });
 
       it('a threaded message is placed in its folder, not held for want of a studio', async () => {

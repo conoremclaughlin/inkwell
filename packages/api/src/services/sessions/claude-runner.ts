@@ -408,7 +408,7 @@ export class ClaudeRunner implements IRunner {
      * `run()` decides `success` from this, so a timeout that resolves without
      * it is reported as a completed turn. See the timers below.
      */
-    timedOut?: { kind: 'idle' | 'hard'; message: string };
+    timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -604,6 +604,30 @@ export class ClaudeRunner implements IRunner {
         }
       }, ceilingMs);
 
+      // Cancellation (an owner stopping an inkling's turn): the same stop as
+      // a timeout, reported without the word "timeout", which the retry
+      // classifier would read as transient.
+      const onAbort = () => {
+        if (settled) return;
+        logger.warn('Claude Code turn cancelled, stopping', {
+          hasResponses: responses.length > 0,
+        });
+        clearTimeout(timeout);
+        clearTimeout(idleTimer);
+        this.killProcess(proc, killGroup);
+        settled = true;
+        resolve({
+          responses,
+          usage,
+          servedModel,
+          toolCalls,
+          finalTextResponse: finalTextResponse || '[Turn cancelled]',
+          timedOut: { kind: 'cancelled', message: 'Claude Code turn cancelled, process stopped' },
+        });
+      };
+      if (config.signal?.aborted) onAbort();
+      else config.signal?.addEventListener('abort', onAbort, { once: true });
+
       const consumeLine = (line: string) => {
         {
           try {
@@ -695,6 +719,7 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('close', (code) => {
+        config.signal?.removeEventListener('abort', onAbort);
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         mcpInjection?.cleanup();

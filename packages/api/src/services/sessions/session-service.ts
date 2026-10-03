@@ -80,6 +80,7 @@ import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import { claimInklingTurn, inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import { trackInklingTurn } from '../inklings/inkling-turns.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import {
   inklingOwnerTestUserId,
@@ -2399,23 +2400,32 @@ export class SessionService implements ISessionService {
     await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     const turnStartMs = Date.now();
+    // A live inkling turn its owner can cancel (inkling-turns.ts), released
+    // however the run ends.
+    const inklingTracking = inklingTurn && session.sbId ? trackInklingTurn(session.sbId) : null;
 
     try {
-      result = await runner.run(formattedMessage, {
-        backendSessionId: session.backendSessionId || undefined,
-        // Always handed over, including on resume. Every runner already gates
-        // its own injection on `!isResume`, so this does not change what a
-        // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
-        // that re-bootstraps on every turn, and needs this copy on hand to
-        // recover when that bootstrap fails.
-        injectedContext,
-        // The epoch every terminal write for this turn is fenced on. A
-        // backend process that reports its own turns to the lifecycle route
-        // (ink chat) names this one instead of claiming its own, which fenced
-        // this run out of its own finalize on every ink-backed turn.
-        config: { ...runnerConfig, turnEpoch },
-        mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
-      });
+      result = await runner
+        .run(formattedMessage, {
+          backendSessionId: session.backendSessionId || undefined,
+          // Always handed over, including on resume. Every runner already gates
+          // its own injection on `!isResume`, so this does not change what a
+          // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+          // that re-bootstraps on every turn, and needs this copy on hand to
+          // recover when that bootstrap fails.
+          injectedContext,
+          // The epoch every terminal write for this turn is fenced on. A
+          // backend process that reports its own turns to the lifecycle route
+          // (ink chat) names this one instead of claiming its own, which fenced
+          // this run out of its own finalize on every ink-backed turn.
+          config: {
+            ...runnerConfig,
+            turnEpoch,
+            ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+          },
+          mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+        })
+        .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most

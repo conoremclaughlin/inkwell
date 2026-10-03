@@ -3963,6 +3963,28 @@ router.post('/inklings/:id/name', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/admin/inklings/:id/cancel → 200 { cancelled }
+ *
+ * Stops the inkling's running turn, with everything it started, if it has
+ * one in this server. `cancelled: false` means none was running. Owner test
+ * only (403 inklings_disabled otherwise), and only the caller's own inkling
+ * (404).
+ */
+router.post('/inklings/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, "cancel an inkling's turn");
+      return;
+    }
+    const result = await (await inklingService()).cancel(inklingScope(authReq), req.params.id);
+    res.json(result);
+  } catch (error) {
+    answerInklingError(res, "Failed to cancel the inkling's turn", error);
+  }
+});
+
 // =============================================================================
 // Individuals (AI Beings)
 // =============================================================================

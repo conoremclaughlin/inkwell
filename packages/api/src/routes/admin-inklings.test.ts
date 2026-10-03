@@ -52,6 +52,7 @@ vi.mock('../utils/request-context', () => ({
 }));
 
 import router from './admin';
+import { trackInklingTurn } from '../services/inklings/inkling-turns';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 
@@ -205,6 +206,31 @@ describe('GET /inklings', () => {
     await call(awaken, { clientRequestId: REQUEST });
     const res = await call(list, undefined, { workspaceId: OTHER_WORKSPACE });
     expect(res._json).toEqual({ inklings: [] });
+  });
+});
+
+describe('POST /inklings/:id/cancel', () => {
+  const cancel = handler('post', '/inklings/:id/cancel');
+
+  it("stops its owner's live turn: 200 { cancelled }; a viewer gets 403; the test off is 403", async () => {
+    const awakenedRes = await call(awaken, { clientRequestId: REQUEST });
+    const id = (awakenedRes._json.inkling as { id: string }).id;
+    const turn = trackInklingTurn(id);
+
+    const viewer = await call(cancel, {}, { params: { id }, role: 'viewer' });
+    expect(viewer._status).toBe(403);
+    expect(turn.signal.aborted).toBe(false);
+
+    const res = await call(cancel, {}, { params: { id } });
+    expect(res._status).toBe(200);
+    expect(res._json).toEqual({ cancelled: true });
+    expect(turn.signal.aborted).toBe(true);
+    turn.done();
+
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    const off = await call(cancel, {}, { params: { id } });
+    expect(off._status).toBe(403);
+    expect(off._json).toMatchObject({ code: 'inklings_disabled' });
   });
 });
 

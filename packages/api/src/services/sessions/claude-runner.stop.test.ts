@@ -40,6 +40,25 @@ afterEach(() => {
   rmSync(pidsPath, { force: true });
 });
 
+/** A fake claude that ignores SIGTERM and starts a grandchild that does too. */
+function writeHangingFake(): string {
+  const fake = join(fixtures, 'claude-hangs.mjs');
+  writeFileSync(
+    fake,
+    [
+      '#!/usr/bin/env node',
+      "import { spawn } from 'child_process';",
+      "import { writeFileSync } from 'fs';",
+      `const g = spawn(process.execPath, ['-e', ${JSON.stringify(IGNORES_TERM)}], { stdio: 'ignore' });`,
+      `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid, g.pid]));`,
+      IGNORES_TERM,
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+  chmodSync(fake, 0o755);
+  return fake;
+}
+
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -50,6 +69,33 @@ function alive(pid: number): boolean {
 }
 
 describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
+  it('a cancelled run stops at once, as a non-transient failure, with nothing left running', async () => {
+    hoisted.binary = writeHangingFake();
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 500);
+    const started = Date.now();
+    const result = await new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        signal: controller.signal,
+      },
+    });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Claude Code turn cancelled, process stopped',
+    });
+    // Not the word the retry classifier reads as transient.
+    expect(String(result.error)).not.toMatch(/timeout/i);
+
+    const [fakeClaude, grandchild] = reported();
+    await new Promise((resolve) => setTimeout(resolve, 6_500));
+    expect(alive(fakeClaude)).toBe(false);
+    expect(alive(grandchild)).toBe(false);
+  }, 20_000);
+
   it('stops at the run ceiling, and nothing it started is left running', async () => {
     const fake = join(fixtures, 'claude-hangs.mjs');
     writeFileSync(

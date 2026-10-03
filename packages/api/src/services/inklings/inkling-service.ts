@@ -24,6 +24,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { DEFAULT_AWAKEN_CAP } from '../../config/inkling-flags';
+import { cancelInklingTurns } from './inkling-turns';
 import { logger } from '../../utils/logger';
 
 /** The identity metadata tag for inklings born through this flow. */
@@ -353,6 +354,20 @@ export class InklingService {
       if (error) throw new Error(`Failed to record the chosen name: ${error.message}`);
     }
     return toInkling(named);
+  }
+
+  /**
+   * Stop this inkling's running turn, if it has one in this server process
+   * (inkling-turns.ts). Owner test only, and only the caller's own inkling.
+   * `cancelled` says whether a turn was running to stop.
+   */
+  async cancel(scope: InklingScope, inklingId: string): Promise<{ cancelled: boolean }> {
+    this.assertOwnerTest(scope);
+    const identity = isUuid(inklingId) ? await this.readIdentity(inklingId, scope) : null;
+    if (!identity || !isInklingRow(identity)) {
+      throw new InklingError(404, 'No inkling with that id');
+    }
+    return { cancelled: cancelInklingTurns(identity.id) > 0 };
   }
 
   /**

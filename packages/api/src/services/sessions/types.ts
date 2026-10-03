@@ -700,6 +700,11 @@ export interface ClaudeRunnerConfig {
    * runner honours it.
    */
   killProcessGroup?: boolean;
+  /**
+   * Stops the run when aborted, as a timeout would (an owner cancelling an
+   * inkling's turn). The Claude runner honours it.
+   */
+  signal?: AbortSignal;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
