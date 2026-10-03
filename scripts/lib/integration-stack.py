@@ -32,9 +32,9 @@ PORT_NAMES = ("API", "DB", "STUDIO", "INBUCKET", "INBUCKET_SMTP", "INBUCKET_POP3
 DEFAULT_EXCLUDE = "studio,mailpit,logflare,vector,supavisor"
 # The suffix group is what makes a project private.
 PROJECT_PATTERN = re.compile(r"(?:ink|pcp)-integration(-[a-zA-Z0-9_-]+)?")
-# One shared integration stack is the design (Conor, 2026-10-02). A Supabase
-# stack is about eight containers and most of a GiB that stays resident, and a
-# cold start replays every migration. The Docker VM on a development machine
+# One shared integration stack is the design. A Supabase stack is about eight
+# containers and most of a GiB that stays resident, and a cold start replays
+# every migration. The Docker VM on a development machine
 # is shared with every other project's stack and is mostly full before a test
 # starts. On 2026-10-02 four integration stacks came up in eleven minutes:
 # the lock used to refuse a second run, and a new project suffix got past it,
