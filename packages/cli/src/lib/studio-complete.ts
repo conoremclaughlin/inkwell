@@ -50,6 +50,7 @@ import {
   pinIsolatedPlaywright,
   studioPermissionRules,
   syncMcpConfig,
+  type PlaywrightServerShape,
   type StudioAudit,
   type StudioPermissionProfile,
 } from '@inklabs/shared';
@@ -197,7 +198,9 @@ function pinPlaywrightInMcpJson(mcpPath: string): string[] {
   if (isSymlink(mcpPath)) return [];
   const config = readJson(mcpPath);
   if (!config || !isPlainObject(config.mcpServers)) return [];
-  const { servers, pinned } = pinIsolatedPlaywright(config.mcpServers);
+  const { servers, pinned } = pinIsolatedPlaywright(
+    config.mcpServers as Record<string, PlaywrightServerShape>
+  );
   if (pinned.length > 0) {
     writeFileSync(mcpPath, JSON.stringify({ ...config, mcpServers: servers }, null, 2) + '\n');
   }
