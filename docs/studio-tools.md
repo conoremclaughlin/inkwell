@@ -24,7 +24,22 @@ The reason for the default: a session that drives someone's everyday browser, or
 
 A studio's own `.mcp.json` is never rewritten, and neither is the main worktree's. A launch through any of the paths above is pinned regardless; only a bare `claude` started by hand in an older studio, or in the main worktree, still reads `--headless` alone.
 
-**Pointing it at a real browser is an explicit opt-in.** An entry that names a browser or profile of someone's own is left exactly as written: `--extension`, `--user-data-dir`, `--cdp-endpoint`, `--endpoint`, the `PLAYWRIGHT_MCP_EXTENSION`, `PLAYWRIGHT_MCP_USER_DATA_DIR` or `PLAYWRIGHT_MCP_CDP_ENDPOINT` environment variables, or a Chrome-family or Dia profile path. That choice belongs to the person whose browser it is, made in their own `.mcp.json`. Nothing we generate makes it: `playwright-mcp.test.ts` (shared) and `playwright-mcp.producers.test.ts` (CLI) fail if any producer's output gains one. (Adding `--isolated` to such an entry would not work anyway: the server refuses a profile directory in isolated mode.)
+**Pointing it at a real browser is an explicit opt-in.** An entry that names a browser or profile of someone's own is left exactly as written. That means any of:
+
+- `--extension`, `--user-data-dir`, `--cdp-endpoint` or `--endpoint`;
+- the `PLAYWRIGHT_MCP_EXTENSION`, `PLAYWRIGHT_MCP_USER_DATA_DIR` or `PLAYWRIGHT_MCP_CDP_ENDPOINT` environment variables, when set to something the server acts on;
+- a Chrome-family or Dia profile path.
+
+So is an entry that names a configuration file (`--config` or `PLAYWRIGHT_MCP_CONFIG`), since the file can choose all of that itself and we don't read it. That choice belongs to the person whose browser it is, made in their own `.mcp.json`. Adding `--isolated` to such an entry wouldn't work anyway: the server refuses a profile directory in isolated mode, wherever the directory was set.
+
+Nothing we generate makes that choice: `playwright-mcp.test.ts` (shared) and `playwright-mcp.producers.test.ts` (CLI) fail if any producer's output gains one.
+
+**What the server ignores is no choice at all.** Values follow @playwright/mcp 0.0.70's parsers, measured through its own config resolver:
+
+- `PLAYWRIGHT_MCP_EXTENSION` attaches only when it is `true` or `1` exactly; `false`, `0`, `TRUE` and empty do not.
+- A profile directory, endpoint or config path counts only when it is non-empty after trimming.
+- An entry carrying one of the ignored values is pinned like any other.
+- An entry whose environment sets `PLAYWRIGHT_MCP_HEADLESS` or `PLAYWRIGHT_MCP_ISOLATED` (to `true`, `1`, `false` or `0`) keeps that setting: the matching flag isn't added, because a flag would override it.
 
 ## iOS simulator
 
@@ -72,7 +87,12 @@ ink permissions sync <path> --json # another studio, as JSON
 
 - The profile and its owner come from the studio's row, or from `--profile` and `--owner`. Never from the checkout.
 - Rules are appended after the file's own, in profile order. Nothing is removed or reordered, and every other setting is kept.
-- A profile deny is not added when it would refuse something the file allows by name (an authored `Bash(yarn install)` keeps `Bash(yarn install*)` out). A broad allow such as `Bash(*)` names nothing in particular, so the backstops are added beside it. A profile allow is not added when the file denies or asks about that exact rule. The report lists both.
+- A profile deny is not added when it would refuse something the file allows by name (an authored `Bash(yarn install)` keeps `Bash(yarn install*)` out).
+  - Bash rules are read in every spelling: the legacy `X:*` is the same rule as `X *`, and a sole trailing ` *` also matches the bare command. So `Bash(git push)` and `Bash(git push:*)` both keep `Bash(git push *)` out.
+  - A broad allow such as `Bash(*)`, `Bash(git *)` or `mcp__github__*` names nothing in particular, so the backstops are added beside it. So is a deny narrower than a prefix grant: `Bash(git push:*)` still gets `Bash(git push *--force*)`.
+- A profile allow is not added when the file denies or asks about that exact rule.
+- The report lists everything kept out.
+- Skipping a deny while adding `Bash(*)` still widens the studio beyond the named grant. Read the dry run before `--apply`.
 - One consequence of reading allows by name: an allow left behind by a "don't ask again" click counts as named. A one-off `Bash(git -C <root> add <files>)` keeps the reviewer profile's `Bash(git -C * add *)` out of that file. Reviewer launches still deliver every deny.
 - It leaves alone a file holding exactly the profile, a permissions object with no rules (what `ink permissions reset` writes on purpose), and a studio with no permissions object or no settings file, which `ink init` fills. It refuses the main worktree, a file it cannot read, and a symlinked `.claude` directory or settings file.
 

@@ -24,7 +24,11 @@ import {
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { studioPermissionRules } from '@inklabs/shared';
-import { planProfileSync, syncStudioPermissions } from './permission-sync.js';
+import {
+  denyRefusesNamedAllow,
+  planProfileSync,
+  syncStudioPermissions,
+} from './permission-sync.js';
 
 const builder = studioPermissionRules('builder', 'wren');
 const reviewer = studioPermissionRules('reviewer', 'wren');
@@ -287,5 +291,55 @@ describe('syncStudioPermissions', () => {
     const result = sync(true);
     expect(result.outcome).toBe('refused');
     expect(readFileSync(join(elsewhere, 'settings.local.json'), 'utf-8')).toBe(text);
+  });
+});
+
+// Bash rules name commands in more than one spelling (Lumen, review
+// 5399743367 on #733): a sole trailing ` *` also matches the bare command,
+// and the legacy `X:*` is the same rule as `X *`.
+describe('named Bash allows, in every spelling', () => {
+  it.each([
+    ['reviewer', 'Bash(git push *)', 'Bash(git push)'],
+    ['reviewer', 'Bash(git push *)', 'Bash(git push:*)'],
+    ['reviewer', 'Bash(git add *)', 'Bash(git add:*)'],
+    ['builder', 'Bash(pnpm add *)', 'Bash(pnpm add:*)'],
+    ['builder', 'Bash(pnpm add *)', 'Bash(pnpm add)'],
+  ] as const)('%s: %s is kept out beside an authored %s', (profile, deny, allow) => {
+    const plan = planProfileSync(
+      { allow: [allow], deny: [] },
+      studioPermissionRules(profile, 'lumen')
+    );
+    expect(plan.addDeny).not.toContain(deny);
+    expect(plan.kept).toContainEqual(
+      expect.objectContaining({
+        rule: deny,
+        list: 'deny',
+        reason: `this file allows ${allow} by name`,
+      })
+    );
+  });
+
+  it('a backstop narrower than a prefix grant is still added beside it', () => {
+    const plan = planProfileSync({ allow: ['Bash(git push:*)'], deny: [] }, builder);
+    expect(plan.addDeny).toContain('Bash(git push *--force*)');
+    expect(plan.addDeny).toContain('Bash(git push * main)');
+    expect(denyRefusesNamedAllow('Bash(git push *--force*)', 'Bash(git push *)')).toBe(false);
+  });
+
+  it('a broad grant names no command, so every backstop goes in beside it', () => {
+    expect(planProfileSync({ allow: ['Bash(*)', 'mcp__github__*'] }, builder).addDeny).toEqual(
+      builder.deny
+    );
+    expect(denyRefusesNamedAllow('Bash(git push *)', 'Bash(git *)')).toBe(false);
+    expect(denyRefusesNamedAllow('Bash(git push *)', 'Bash(git:*)')).toBe(false);
+  });
+
+  it('applies Bash spellings to Bash rules only', () => {
+    expect(denyRefusesNamedAllow('Read(/a *)', 'Read(/a)')).toBe(false);
+  });
+
+  it('only a sole trailing wildcard names the bare command', () => {
+    expect(denyRefusesNamedAllow('Bash(git -C * push)', 'Bash(git -C * push *)')).toBe(false);
+    expect(denyRefusesNamedAllow('Bash(git push)', 'Bash(git push *)')).toBe(true);
   });
 });

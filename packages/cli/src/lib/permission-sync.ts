@@ -23,9 +23,11 @@
  *     backstops are added beside it.
  *   - a profile allow is not added when the file denies or asks about
  *     exactly that rule.
- * Both are reported. The match is a glob over the rule's own text, not
- * Claude Code's decision engine, so it is a conservative reading of what
- * the author named, not a proof of what a call would do.
+ * Both are reported. The match is a glob over the rule's own text, with
+ * Bash rules read in each spelling Claude Code accepts (the legacy `X:*`
+ * is `X *`, and a sole trailing ` *` also matches the bare command). It is
+ * not Claude Code's decision engine: a conservative reading of what the
+ * author named, not a proof of what a call would do.
  *
  * What it leaves. A file holding exactly the profile (generated); a
  * permissions object with no rules at all, which is what `ink permissions
@@ -91,16 +93,55 @@ function globMatches(glob: string, text: string): boolean {
 }
 
 /**
+ * A Bash pattern in its current spelling: the legacy `X:*` suffix is the
+ * same rule as `X *`.
+ */
+function normalizeBashPattern(pattern: string): string {
+  return pattern.endsWith(':*') ? `${pattern.slice(0, -2)} *` : pattern;
+}
+
+/** Whether a Bash pattern's only wildcard is a trailing ` *`: a prefix grant or deny. */
+function isBashPrefixPattern(pattern: string): boolean {
+  return pattern.endsWith(' *') && pattern.indexOf('*') === pattern.length - 1;
+}
+
+/**
+ * Whether a Bash pattern matches a command: `*` spans anything, and a sole
+ * trailing ` *` also matches the bare command (`git push *` matches
+ * `git push`).
+ */
+function bashPatternMatches(pattern: string, command: string): boolean {
+  const p = normalizeBashPattern(pattern);
+  if (globMatches(p, command)) return true;
+  return isBashPrefixPattern(p) && p.slice(0, -2) === command;
+}
+
+/**
+ * The commands a Bash allow names: its text as written, and for a prefix
+ * grant (`git push *`, `git push:*`) the bare command as well.
+ */
+function bashNamedCommands(pattern: string): string[] {
+  const p = normalizeBashPattern(pattern);
+  return isBashPrefixPattern(p) ? [p, p.slice(0, -2)] : [p];
+}
+
+/**
  * Whether a deny rule refuses what an allow rule names: the same tool, and
- * the deny's pattern matches the allow's text. A deny never matches a
- * broader allow (`Bash(rm -rf *)` does not match `Bash(*)`), which is what
- * lets a backstop sit beside a broad grant.
+ * the deny's pattern matches the allow's text (for Bash, the allow's text
+ * or the bare command a prefix allow names, in either spelling). A deny
+ * never matches a broader allow (`Bash(rm -rf *)` does not match
+ * `Bash(*)`, `Bash(git push *)` does not match `Bash(git *)`), which is
+ * what lets a backstop sit beside a broad grant.
  */
 export function denyRefusesNamedAllow(deny: string, allow: string): boolean {
   const d = parseRule(deny);
   const a = parseRule(allow);
   if (d.pattern === undefined && a.pattern === undefined) return globMatches(d.tool, a.tool);
   if (d.pattern === undefined || a.pattern === undefined || d.tool !== a.tool) return false;
+  if (d.tool === 'Bash') {
+    const denyPattern = d.pattern;
+    return bashNamedCommands(a.pattern).some((command) => bashPatternMatches(denyPattern, command));
+  }
   return globMatches(d.pattern, a.pattern);
 }
 

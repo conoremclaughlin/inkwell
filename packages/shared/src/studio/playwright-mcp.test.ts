@@ -83,9 +83,10 @@ describe('playwrightBrowserAttachments', () => {
     ['/Users/someone/Library/Application Support/Chromium'],
     ['/home/someone/.config/google-chrome/Profile 1'],
   ])('names a browser profile path (%s) in an argument or an env value', (path) => {
-    expect(playwrightBrowserAttachments({ args: ['@playwright/mcp', `--config=${path}`] })).toEqual(
-      ['browser profile path']
-    );
+    // A flag that is no choice of its own, so only the path is reported.
+    expect(
+      playwrightBrowserAttachments({ args: ['@playwright/mcp', `--output-dir=${path}`] })
+    ).toEqual(['browser profile path']);
     expect(playwrightBrowserAttachments({ args: ['@playwright/mcp'], env: { X: path } })).toEqual([
       'browser profile path',
     ]);
@@ -270,5 +271,103 @@ describe('the configs this package generates launch Playwright isolated and head
     } finally {
       result.cleanup();
     }
+  });
+});
+
+// ============================================================================
+// What counts as an entry's own choice (Lumen, review 5399743367 on #733).
+// Values follow 0.0.70's parsers as measured through its config resolver:
+// a boolean is set only by true/1/false/0 as written; a string only when
+// non-empty after trimming.
+// ============================================================================
+
+describe('an attach variable counts only when the server acts on it', () => {
+  it.each([
+    ['PLAYWRIGHT_MCP_EXTENSION', 'false'],
+    ['PLAYWRIGHT_MCP_EXTENSION', '0'],
+    ['PLAYWRIGHT_MCP_EXTENSION', ''],
+    ['PLAYWRIGHT_MCP_EXTENSION', 'TRUE'],
+    ['PLAYWRIGHT_MCP_USER_DATA_DIR', ''],
+    ['PLAYWRIGHT_MCP_USER_DATA_DIR', '  '],
+    ['PLAYWRIGHT_MCP_CDP_ENDPOINT', ''],
+  ])('%s=%j attaches nothing, so the entry is pinned', (key, value) => {
+    const entry = { command: 'npx', args: ['@playwright/mcp'], env: { [key]: value } };
+    expect(playwrightBrowserAttachments(entry)).toEqual([]);
+    const { servers, pinned, attached } = pinIsolatedPlaywright({ playwright: entry });
+    expect(servers.playwright.args).toEqual(['@playwright/mcp', '--headless', '--isolated']);
+    expect(pinned).toEqual(['playwright']);
+    expect(attached).toEqual([]);
+  });
+
+  it.each([
+    ['PLAYWRIGHT_MCP_EXTENSION', 'true'],
+    ['PLAYWRIGHT_MCP_EXTENSION', '1'],
+    ['PLAYWRIGHT_MCP_USER_DATA_DIR', '/tmp/profile'],
+    ['PLAYWRIGHT_MCP_CDP_ENDPOINT', 'http://127.0.0.1:9222'],
+  ])('%s=%j is an opt-in, left as written', (key, value) => {
+    const entry = { command: 'npx', args: ['@playwright/mcp'], env: { [key]: value } };
+    const { servers, attached } = pinIsolatedPlaywright({ playwright: entry });
+    expect(servers.playwright).toBe(entry);
+    expect(attached).toEqual([{ name: 'playwright', attachments: [key] }]);
+  });
+});
+
+describe('a configuration file makes its own choices', () => {
+  it.each([
+    ['--config', ['@playwright/mcp', '--config', '/tmp/browser.json'], {}],
+    ['--config', ['@playwright/mcp', '--config=/tmp/browser.json'], {}],
+    ['PLAYWRIGHT_MCP_CONFIG', ['@playwright/mcp'], { PLAYWRIGHT_MCP_CONFIG: '/tmp/browser.json' }],
+  ])('an entry naming one through %s is left as written', (name, args, env) => {
+    const entry = { command: 'npx', args, env };
+    const { servers, pinned, attached } = pinIsolatedPlaywright({ playwright: entry });
+    expect(servers.playwright).toBe(entry);
+    expect(pinned).toEqual([]);
+    expect(attached).toEqual([{ name: 'playwright', attachments: [name] }]);
+  });
+
+  it('an empty PLAYWRIGHT_MCP_CONFIG names no file, so the entry is pinned', () => {
+    const entry = { command: 'npx', args: ['@playwright/mcp'], env: { PLAYWRIGHT_MCP_CONFIG: '' } };
+    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual([
+      '@playwright/mcp',
+      '--headless',
+      '--isolated',
+    ]);
+  });
+
+  it('a launch built from .mcp.json (readLaunchMcpServers) keeps a configured entry as written', () => {
+    const root = mkdtempSync(join(tmpdir(), 'playwright-config-'));
+    try {
+      const entry = { command: 'npx', args: ['@playwright/mcp', '--config', join(root, 'b.json')] };
+      const mcp = join(root, '.mcp.json');
+      writeFileSync(mcp, JSON.stringify({ mcpServers: { playwright: entry } }));
+      expect((readLaunchMcpServers(mcp) as Record<string, unknown>).playwright).toEqual(entry);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a flag the entry's environment already sets is left to that setting", () => {
+  it.each([
+    ['PLAYWRIGHT_MCP_ISOLATED', 'false', ['@playwright/mcp', '--headless']],
+    ['PLAYWRIGHT_MCP_ISOLATED', '1', ['@playwright/mcp', '--headless']],
+    ['PLAYWRIGHT_MCP_HEADLESS', 'false', ['@playwright/mcp', '--isolated']],
+    ['PLAYWRIGHT_MCP_HEADLESS', '0', ['@playwright/mcp', '--isolated']],
+  ])('%s=%j: only the other flag is added', (key, value, expected) => {
+    const entry = { command: 'npx', args: ['@playwright/mcp'], env: { [key]: value } };
+    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual(expected);
+  });
+
+  it('a value the server does not read (yes) leaves the flag unset, so it is added', () => {
+    const entry = {
+      command: 'npx',
+      args: ['@playwright/mcp'],
+      env: { PLAYWRIGHT_MCP_ISOLATED: 'yes' },
+    };
+    expect(pinIsolatedPlaywright({ playwright: entry }).servers.playwright.args).toEqual([
+      '@playwright/mcp',
+      '--headless',
+      '--isolated',
+    ]);
   });
 });

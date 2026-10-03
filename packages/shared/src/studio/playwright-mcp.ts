@@ -16,12 +16,16 @@
  *
  * This is the default guard, not a ban. A server entry that names a
  * browser or profile of its own (`--extension`, `--user-data-dir`,
- * `--cdp-endpoint`, `--endpoint`, their environment forms, or a Chrome or
- * Dia profile path) is someone's explicit choice: `pinIsolatedPlaywright`
- * leaves it exactly as written and reports it. Adding `--isolated` to it
+ * `--cdp-endpoint`, `--endpoint`, their environment forms when set, or a
+ * Chrome or Dia profile path) is someone's explicit choice, and so is one
+ * that names a configuration file (`--config`, `PLAYWRIGHT_MCP_CONFIG`),
+ * which can choose all of that itself. `pinIsolatedPlaywright` leaves such
+ * an entry exactly as written and reports it. Adding `--isolated` to it
  * would not be harmless either: the server refuses a profile directory in
- * isolated mode. What we generate never names one, and the tests over
- * every producer fail if it does.
+ * isolated mode, wherever the directory was set. An attach variable the
+ * server ignores (`PLAYWRIGHT_MCP_EXTENSION=false`, an empty profile path)
+ * is no choice at all, and the entry is pinned. What we generate never
+ * names one, and the tests over every producer fail if it does.
  *
  * Flags, defaults and both refusals read from @playwright/mcp 0.0.70
  * (playwright-core lib/tools/mcp: program.js, config.js, browserFactory.js).
@@ -55,12 +59,55 @@ export const PLAYWRIGHT_ATTACH_FLAGS: readonly string[] = [
   '--endpoint',
 ];
 
-/** The same, set through the server's environment. */
+/**
+ * The same, set through the server's environment. Each counts only when
+ * the server acts on its value (`envAttachmentActive`).
+ */
 export const PLAYWRIGHT_ATTACH_ENV: readonly string[] = [
   'PLAYWRIGHT_MCP_EXTENSION',
   'PLAYWRIGHT_MCP_USER_DATA_DIR',
   'PLAYWRIGHT_MCP_CDP_ENDPOINT',
 ];
+
+/**
+ * A configuration file, as a flag or in the environment. The file can
+ * choose a profile directory, a browser or headed mode, and we don't read
+ * it, so an entry naming one makes its own choices.
+ */
+export const PLAYWRIGHT_CONFIG_FLAG = '--config';
+export const PLAYWRIGHT_CONFIG_ENV = 'PLAYWRIGHT_MCP_CONFIG';
+
+/** Environment settings for the two pinned flags, by the flag they set. */
+const PINNED_FLAG_ENV: Record<(typeof PINNED_FLAGS)[number], string> = {
+  '--headless': 'PLAYWRIGHT_MCP_HEADLESS',
+  '--isolated': 'PLAYWRIGHT_MCP_ISOLATED',
+};
+
+/**
+ * 0.0.70's environment parsers, measured through its own config resolver
+ * (`resolveCLIConfigForMCP`): a boolean is set only by `true`, `1`,
+ * `false` or `0`, exactly as written (`TRUE`, `yes`, empty and blank are
+ * unset), and a string only when it is non-empty after trimming.
+ */
+const ENV_BOOLEAN_VALUES = new Set(['true', '1', 'false', '0']);
+
+function envBooleanIsSet(value: unknown): boolean {
+  return typeof value === 'string' && ENV_BOOLEAN_VALUES.has(value);
+}
+
+function envStringIsSet(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Whether an attach variable takes effect: the extension bridge only when
+ * it reads as true, a profile directory or endpoint only when non-empty.
+ * `PLAYWRIGHT_MCP_EXTENSION=false`, `0` or empty attaches nothing.
+ */
+function envAttachmentActive(key: string, value: unknown): boolean {
+  if (key === 'PLAYWRIGHT_MCP_EXTENSION') return value === 'true' || value === '1';
+  return envStringIsSet(value);
+}
 
 /**
  * A personal browser's profile directory, on macOS or Linux: Chrome,
@@ -99,10 +146,10 @@ export function isPlaywrightMcpServer(config: PlaywrightServerShape | null | und
 }
 
 /**
- * What in an entry points the server at a browser or profile of someone's
- * own: attach flags and environment names as written, and
- * `browser profile path` for an argument or environment value naming one.
- * Names only, never values. Empty for the default launch.
+ * What in an entry makes its own browser choice: attach flags, attach
+ * variables the server would act on, a configuration file (flag or
+ * variable), and `browser profile path` for an argument or environment
+ * value naming one. Names only, never values. Empty for the default launch.
  */
 export function playwrightBrowserAttachments(config: PlaywrightServerShape): string[] {
   const found = new Set<string>();
@@ -110,12 +157,13 @@ export function playwrightBrowserAttachments(config: PlaywrightServerShape): str
   for (const arg of args) {
     if (typeof arg !== 'string') continue;
     const name = flagName(arg);
-    if (PLAYWRIGHT_ATTACH_FLAGS.includes(name)) found.add(name);
+    if (PLAYWRIGHT_ATTACH_FLAGS.includes(name) || name === PLAYWRIGHT_CONFIG_FLAG) found.add(name);
     if (BROWSER_PROFILE_PATH.test(arg)) found.add('browser profile path');
   }
   const env = config.env && typeof config.env === 'object' ? config.env : {};
   for (const [key, value] of Object.entries(env)) {
-    if (PLAYWRIGHT_ATTACH_ENV.includes(key)) found.add(key);
+    if (PLAYWRIGHT_ATTACH_ENV.includes(key) && envAttachmentActive(key, value)) found.add(key);
+    if (key === PLAYWRIGHT_CONFIG_ENV && envStringIsSet(value)) found.add(key);
     if (typeof value === 'string' && BROWSER_PROFILE_PATH.test(value)) {
       found.add('browser profile path');
     }
@@ -165,7 +213,12 @@ export function pinIsolatedPlaywright<T extends PlaywrightServerShape>(
     }
     const args = Array.isArray(config.args) ? config.args : [];
     const present = new Set(args.filter((a) => typeof a === 'string').map(flagName));
-    const missing = PINNED_FLAGS.filter((flag) => !present.has(flag));
+    // A flag overrides its environment setting, so a flag the entry's own
+    // environment already sets, either way, is left to that setting.
+    const env = config.env && typeof config.env === 'object' ? config.env : {};
+    const missing = PINNED_FLAGS.filter(
+      (flag) => !present.has(flag) && !envBooleanIsSet(env[PINNED_FLAG_ENV[flag]])
+    );
     if (missing.length === 0) {
       out[name] = config;
       continue;
