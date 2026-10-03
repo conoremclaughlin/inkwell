@@ -25,6 +25,7 @@ vi.mock('@inklabs/shared/providers', async (importOriginal) => ({
 import { STOP_GIVE_UP_MS, STOP_GRACE_MS } from '@inklabs/shared';
 import type { BackendRunResult, BackendTurnHandle } from '@inklabs/shared/providers';
 import {
+  attachRunChild,
   closeIntakeAndDrain,
   listOwnedChildren,
   registerActiveRun,
@@ -426,3 +427,82 @@ describe('startHostedBackendTurn', () => {
     expect(listOwnedChildren()).toEqual([]);
   });
 });
+
+// Lumen, #701 d84b473b: no generation mints or starts beside another
+// generation's child whose exit is not confirmed.
+describe('the older-generation barrier at the host', () => {
+  /** epoch-1 owns a child that has not exited; epoch-2 is the admitted generation. */
+  function olderChildHeld() {
+    admit('epoch-1');
+    const ownership = attachRunChild('session-1', 'epoch-1', {
+      abort: () => undefined,
+      settled: new Promise(() => undefined),
+    });
+    expect(ownership).toBeDefined();
+    admit('epoch-2');
+    return ownership!;
+  }
+  const newer = { sessionId: 'session-1', turnEpoch: 'epoch-2' };
+
+  beforeEach(() => {
+    startTurn.mockReset();
+  });
+
+  it('refuses to create a host beside it, naming the older child', () => {
+    olderChildHeld();
+    expect(() => createServerBackendHost(input({ admission: newer }))).toThrow(
+      SERVER_HOST_REFUSALS.olderChildUnconfirmed
+    );
+  });
+
+  it('a live host mints nothing and refuses its spawn once such a child is owned', async () => {
+    admit('epoch-2');
+    const given = input({ admission: newer });
+    const host = createServerBackendHost(given);
+    expect(host.admitSpawn?.()).toBe(true);
+    // A flip-flop takeover leaves epoch-2 admitted beside epoch-1's child.
+    olderChildHeld();
+
+    await expect(host.sessionEnv({ hardTimeoutMs: 1_000 })).rejects.toThrow(
+      new HostedSpawnRefusal(SERVER_HOST_REFUSALS.olderChildUnconfirmed)
+    );
+    expect(given.mintAccessToken).not.toHaveBeenCalled();
+    expect(host.admitSpawn?.()).toBe(false);
+  });
+
+  it('starts no turn beside it, and starts one once the older exit is confirmed', () => {
+    const older = olderChildHeld();
+    expect(() =>
+      startHostedBackendTurn(input({ admission: newer }), {
+        ...requestFor(),
+        inkSessionId: 'session-1',
+      })
+    ).toThrow(SERVER_HOST_REFUSALS.olderChildUnconfirmed);
+    expect(startTurn).not.toHaveBeenCalled();
+
+    // The older child's confirmed exit gives it back.
+    older.release();
+    startTurn.mockImplementationOnce(() => ({
+      result: new Promise<BackendRunResult>(() => undefined),
+      abort: vi.fn(),
+    }));
+    expect(() =>
+      startHostedBackendTurn(input({ admission: newer }), {
+        ...requestFor(),
+        inkSessionId: 'session-1',
+      })
+    ).not.toThrow();
+    expect(startTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+function requestFor() {
+  return {
+    backend: 'claude',
+    sbSlug: 'synthetic-sb',
+    prompt: 'ping',
+    cliAttached: false,
+    workingDirectory: '/synthetic/studio',
+    studioId: 'studio-1',
+  };
+}

@@ -376,9 +376,41 @@ export function isGenerationAdmitted(sessionId: string, turnEpoch: string): bool
 }
 
 /**
+ * Whether another generation of `sessionId` still owns a child: one pending,
+ * or settled without a confirmed exit (childExited false, a rejection, a stop
+ * that timed out). Such a child may still be running and writing, so no
+ * other generation of the session may start work beside it. Only a confirmed
+ * exit gives the child back. Recording its effect as unknown does not, and
+ * there is deliberately no other release (Lumen, #701 d84b473b).
+ */
+export function otherGenerationOwnsChild(sessionId: string, turnEpoch: string): boolean {
+  for (const record of ownedChildren) {
+    if (record.sessionId === sessionId && record.turnEpoch !== turnEpoch) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the generation `turnEpoch` may start work for `sessionId` now: it
+ * is the admitted one (isGenerationAdmitted), and no other generation of the
+ * session still owns a child. Synchronous, like isGenerationAdmitted.
+ *
+ * Both halves are this process's view. A writer in another process, or a
+ * child this process lost track of when it restarted, is invisible here: the
+ * durable cross-process gate is still missing (P2d).
+ */
+export function mayGenerationProceed(sessionId: string, turnEpoch: string): boolean {
+  return (
+    isGenerationAdmitted(sessionId, turnEpoch) && !otherGenerationOwnsChild(sessionId, turnEpoch)
+  );
+}
+
+/**
  * Put a child under the generation `turnEpoch` of `sessionId`. Refused (and
- * undefined) unless that generation is the one admitted for the session now,
- * and once intake has closed. Compare-and-act on the epoch, like
+ * undefined) unless that generation may proceed (mayGenerationProceed): it
+ * is the one admitted for the session now, intake is open, and no other
+ * generation of the session still owns a child. A generation may own several
+ * children of its own. Compare-and-act on the epoch, like
  * clearActiveRunIfOwner.
  */
 export function attachRunChild(
@@ -386,7 +418,7 @@ export function attachRunChild(
   turnEpoch: string,
   child: OwnedChild
 ): ChildOwnership | undefined {
-  if (!isGenerationAdmitted(sessionId, turnEpoch)) return undefined;
+  if (!mayGenerationProceed(sessionId, turnEpoch)) return undefined;
   const record: OwnedChildRecord = { sessionId, turnEpoch, child };
   ownedChildren.add(record);
   return {
