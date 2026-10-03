@@ -62,12 +62,27 @@ describe('SerialInputDrain', () => {
     const held = gate();
     const queue = drain(async () => held.promise, 10, 5);
     const first = queue.enqueue('12345');
-    expect(() => queue.enqueue('6')).toThrow(InputDrainRefusal);
+    expect(() => queue.enqueue('6')).toThrow('capacity');
     held.resolve();
     await first;
     await queue.enqueue('abcde');
     expect(queue.pendingBytes).toBe(0);
-    expect(() => queue.enqueue('123456')).toThrow(InputDrainRefusal);
+    expect(() => queue.enqueue('123456')).toThrow('too-large');
+  });
+
+  it('distinguishes permanently oversized input even while count capacity is occupied', async () => {
+    const held = gate();
+    const queue = drain(async () => held.promise, 1, 5);
+    const first = queue.enqueue('first');
+    const prepare = vi.fn();
+    expect(() => queue.enqueue('123456', prepare)).toThrow('too-large');
+    expect(prepare).not.toHaveBeenCalled();
+    expect(queue.pendingInputs).toBe(1);
+    expect(queue.pendingBytes).toBe(5);
+    held.resolve();
+    await first;
+    expect(() => queue.enqueue('123456')).toThrow('too-large');
+    await queue.enqueue('fits');
   });
 
   it('does not acknowledge or run an input whose local preparation throws', async () => {

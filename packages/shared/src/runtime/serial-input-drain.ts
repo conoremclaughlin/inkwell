@@ -13,7 +13,7 @@ export interface SerialInputDrainOptions<Input> {
 }
 
 export class InputDrainRefusal extends Error {
-  constructor(readonly reason: 'closed' | 'capacity' | 'reentrant') {
+  constructor(readonly reason: 'closed' | 'capacity' | 'too-large' | 'reentrant') {
     super(`Session input was not queued: ${reason}`);
     this.name = 'InputDrainRefusal';
   }
@@ -50,6 +50,8 @@ export class SerialInputDrain<Input> {
    * durable receipt. Refusal throws before anything can run. The optional
    * local preparation hook supports CLI echo/status: if it throws, nothing
    * is queued and an inbox caller must not acknowledge delivery.
+   * Preparation is not a commit: if it throws or closes intake, its caller
+   * must undo accounting effects. Presentation should be safe to repeat.
    *
    * Inputs must not be mutated after acceptance. No timeout here: giving up
    * waiting on a run is not evidence that its execution stopped.
@@ -64,6 +66,8 @@ export class SerialInputDrain<Input> {
       if (!Number.isSafeInteger(bytes) || bytes < 0) {
         throw new RangeError('Input size must be a non-negative safe integer');
       }
+      // Unlike occupied capacity, waiting cannot make this input fit.
+      if (bytes > this.options.maxPendingBytes) throw new InputDrainRefusal('too-large');
       if (
         this.count >= this.options.maxPendingInputs ||
         bytes > this.options.maxPendingBytes - this.bytes

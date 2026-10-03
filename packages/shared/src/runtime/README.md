@@ -113,9 +113,14 @@ or safe automatic replay of an unresolved external effect.
 `SerialInputDrain` is the shared FIFO used by the CLI for user, system and
 Inkmail-triggered turns. It retains at most the host's declared count and byte
 budget (including the active input). Admission is synchronous; its returned
-promise represents completion, not a durable receipt. Capacity and closed-intake
-refusals happen before local presentation, so the inbox path can leave refused
-inputs unacknowledged. An input failure does not poison the next queued turn.
+promise represents completion, not a durable receipt. Capacity refusals happen
+before local preparation and are retryable. An individually oversized input is
+refused as `too-large`, even when the queue is empty. The CLI displays and journals
+its inbox auto-run refusal before acknowledging delivery; it does not pretend the
+turn ran or retry it indefinitely. Other thread-intake failures remain unacknowledged.
+An input failure does not poison the next queued turn. If a preparation callback
+throws or closes intake, its caller must undo accounting effects; presentation
+must be safe to repeat.
 
 The CLI currently caps the queue at 128 inputs / 8 MiB of UTF-8 input fields.
 The host supplies size measurement; the runtime never reads environment or

@@ -1,6 +1,7 @@
 import {
   compactForLedger,
   SerialInputDrain,
+  InputDrainRefusal,
   EVICTED_DISPLAY_MAX,
   extractSessionContextMessages,
   findLastBackendSessionInEvents,
@@ -4896,7 +4897,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
       msg.content.trim().length > 0;
 
     if (eligibleForAutoRun && enqueueAutoRun) {
-      autoRunTurns.push(enqueueAutoRun(msg));
+      try {
+        autoRunTurns.push(enqueueAutoRun(msg));
+      } catch (error) {
+        // Delivery and execution are separate: this message is on screen and
+        // in the journal, but it can never fit in this queue. Report that
+        // failure before acknowledging delivery; do not retry it every poll.
+        // Busy capacity and other intake failures still propagate for retry.
+        if (!(error instanceof InputDrainRefusal) || error.reason !== 'too-large') throw error;
+        const notice = `Inbox auto-run refused for ${msg.id}: input exceeds the queue's byte limit. Message delivered, but no turn queued. Send a smaller message to run it.`;
+        if (inkRepl) inkRepl.addMessage('system', notice);
+        else printLine(chalk.yellow(notice));
+        runtime.log.append({
+          type: 'inbox_auto_run_refused',
+          messageId: msg.id,
+          reason: error.reason,
+          ...(msg.threadKey ? { threadKey: msg.threadKey } : {}),
+        });
+      }
     }
     seenInboxIds.add(msg.id);
   };
