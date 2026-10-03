@@ -11,7 +11,7 @@ import {
   playwrightBrowserAttachments,
 } from './playwright-mcp.js';
 import { syncMcpConfig } from './mcp-config-sync.js';
-import { injectSessionHeaders } from '../runner/mcp-config.js';
+import { injectSessionHeaders, readLaunchMcpServers } from '../runner/mcp-config.js';
 
 /** The entry every studio's `.mcp.json` carries today, copied from the main worktree. */
 const STUDIO_ENTRY_BEFORE = {
@@ -239,6 +239,19 @@ describe('the configs this package generates launch Playwright isolated and head
     } finally {
       result.cleanup();
     }
+  });
+
+  it('the servers a Gemini launch builds its settings from (readLaunchMcpServers)', () => {
+    const source = writeMcpJson({
+      inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+      playwright: STUDIO_ENTRY_BEFORE,
+    });
+    const servers = readLaunchMcpServers(source) as Record<string, { args?: string[] }>;
+    expectDefaultLaunch(servers.playwright);
+    expect(servers.inkwell).toEqual({ type: 'http', url: 'http://localhost:3001/mcp' });
+    expect(readLaunchMcpServers(join(root, 'absent.json'))).toEqual({});
+    writeFileSync(source, '{ not json');
+    expect(readLaunchMcpServers(source)).toEqual({});
   });
 
   it('a session config keeps an explicit browser opt-in as written', () => {

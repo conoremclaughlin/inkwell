@@ -167,6 +167,26 @@ export function injectSessionHeaders(
   };
 }
 
+/**
+ * The MCP servers a backend launch takes from a `.mcp.json`: its server
+ * map, with the Playwright server pinned to the default launch (headless,
+ * isolated; studio/playwright-mcp.ts). Empty when the file is absent,
+ * cannot be parsed, or has no server map. For launchers that build their
+ * own settings from the file (Gemini's) instead of passing it through
+ * injectSessionHeaders.
+ */
+export function readLaunchMcpServers(mcpJsonPath: string): Record<string, unknown> {
+  if (!existsSync(mcpJsonPath)) return {};
+  let servers: unknown;
+  try {
+    servers = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'))?.mcpServers;
+  } catch {
+    return {};
+  }
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return {};
+  return pinIsolatedPlaywright(servers as Record<string, McpServerConfig>).servers;
+}
+
 // ─── Context Token ──────────────────────────────────────────
 
 /**

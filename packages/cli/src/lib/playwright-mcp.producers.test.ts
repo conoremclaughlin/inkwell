@@ -23,6 +23,7 @@ import {
 import { buildMergedMcpConfig, parseSkillMcpConfig } from './skill-mcp.js';
 import { completeStudio, type StepResult } from './studio-complete.js';
 import { injectMcpServers } from '../commands/skills.js';
+import { buildGeminiSettings } from '../backends/gemini.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BUNDLED_SKILL = join(
@@ -148,6 +149,22 @@ mcp:
       expect(readJson(mcpConfigPath!).mcpServers.playwright.args).toEqual(ATTACHED_ENTRY.args);
     } finally {
       cleanup();
+    }
+  });
+});
+
+describe('ink gemini (the settings file the CLI hands Gemini)', () => {
+  it("pins the studio's Playwright entry", () => {
+    writeFileSync(
+      join(root, '.mcp.json'),
+      JSON.stringify({ mcpServers: { playwright: STUDIO_ENTRY_BEFORE } })
+    );
+    const settings = buildGeminiSettings(root, 'context-token');
+    try {
+      expect(settings).not.toBeNull();
+      expectDefaultLaunch(readJson(settings!.path).mcpServers.playwright);
+    } finally {
+      settings?.cleanup();
     }
   });
 });
