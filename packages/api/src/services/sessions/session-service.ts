@@ -84,6 +84,21 @@ import { StudiosRepository, type Studio } from '../../data/repositories/studios.
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
+import {
+  claimInklingTurn,
+  classifyIdentityById,
+  type InklingIdentity,
+  inklingTurnRefusal,
+  isOwnersOwnMessage,
+} from '../inklings/inkling-turn-gate.js';
+import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import { trackInklingTurn } from '../inklings/inkling-turns.js';
+import { INKLING_CLIENT } from '../inklings/inkling-service.js';
+import {
+  inklingOwnerTestUserId,
+  inklingTurnCap,
+  inklingTurnTimeoutMs,
+} from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -91,6 +106,8 @@ import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 export interface SessionServiceConfig {
   /** Default working directory for Claude Code */
   defaultWorkingDirectory: string;
+  /** Where inklings' own folders are made; ~/.ink/inklings unless given (tests). */
+  inklingsRoot?: string;
   /** Path to MCP config file */
   mcpConfigPath: string;
   /** Optional explicit model override for Claude backend */
@@ -439,6 +456,8 @@ export interface StudioRoutingDecision {
     | 'project-repo-reuse'
     | 'project-repo-created'
     | 'main-fallback'
+    /** An inkling: no studio, ever; its turns run in its own folder. */
+    | 'inkling-folder'
     | 'refused'
     | 'none';
   /**
@@ -2206,7 +2225,8 @@ export class SessionService implements ISessionService {
     const formattedMessage = this.formatMessage(request, injectedContext.user.timezone);
 
     // Resolve working directory from studio when available.
-    const resolvedWorkingDirectory = await this.resolveWorkingDirectory(
+    // An inkling's turn moves to its own folder below, once its identity is read.
+    let resolvedWorkingDirectory = await this.resolveWorkingDirectory(
       userId,
       sbSlug,
       session.studioId
@@ -2243,6 +2263,9 @@ export class SessionService implements ISessionService {
     // scope. Missing/invalid identity fails CLOSED: toolRouting stays
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
+    // Set once an inkling's turn has passed the gate and claimed a slot.
+    let inklingTurn = false;
+    let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
     if (this.supabase) {
@@ -2256,6 +2279,78 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+
+      // An inkling's turn starts only in the owner test, on its owner's
+      // account, for its owner's own message (Lumen 97b1d66a). Refused
+      // here, before anything is logged, registered or spawned, and not
+      // retryable, unless an identity read failed.
+      // Classified on the canonical identity (the session's sbId, else the one
+      // routing resolves), read by id with no user filter, so an unreadable,
+      // ambiguous or absent-row identity cannot pass for "not an inkling"
+      // (Lumen's review of 8b9d7f50).
+      const inklingIdentity = await this.classifyTurnIdentity(userId, sbSlug, session.sbId);
+      const refuseInklingTurn = (reason: string, retryable = false): SessionResult => {
+        logger.warn('[Inkling] Turn refused', { sbSlug, sbId: session.sbId, reason });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: `Inkling turn refused: ${reason}`,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: {
+            category: retryable ? 'network' : 'config',
+            summary: `Inkling turn refused: ${reason}`,
+            retryable,
+          },
+        };
+      };
+      const ownerTestUserId = inklingOwnerTestUserId();
+      const ownerMessage =
+        inklingIdentity.kind === 'inkling'
+          ? await isOwnersOwnMessage(this.supabase, {
+              threadMessageId: metadata?.triggerThreadMessageId,
+              inklingId: inklingIdentity.id,
+              ownerUserId: ownerTestUserId,
+            })
+          : 'no';
+      const inklingRefusal = inklingTurnRefusal(
+        { identity: inklingIdentity, userId, ownerMessage },
+        ownerTestUserId
+      );
+      if (inklingRefusal) {
+        return refuseInklingTurn(inklingRefusal.reason, inklingRefusal.retryable);
+      }
+
+      if (inklingIdentity.kind === 'inkling') {
+        // Only the Claude runner enforces an inkling's ceiling, group stop
+        // and cancellation; on any other backend the turn would run unbounded.
+        if (resolvedBackend !== 'claude-code') {
+          return refuseInklingTurn(
+            `inkling turns run only on the Claude runner, which bounds them (not ${resolvedBackend})`
+          );
+        }
+        // A bounded first test: each turn is counted against the inkling's
+        // cap before anything is spawned.
+        const cap = inklingTurnCap();
+        const claim = await claimInklingTurn(this.supabase, inklingIdentity.id, userId, cap);
+        if (!claim.allowed) {
+          return refuseInklingTurn(`turn cap reached (${claim.used} of ${cap})`);
+        }
+        inklingTurn = true;
+        inklingSbId = inklingIdentity.id;
+        // Its turn runs in its own folder, never the Inkwell checkout or the
+        // server's default directory (organisation, not isolation:
+        // inkling-folder.ts). Routing gave it no studio to resolve from.
+        resolvedWorkingDirectory = await ensureInklingFolder(
+          inklingIdentity.id,
+          this.config.inklingsRoot ?? inklingsRoot()
+        );
+      }
+
       const parsed = parseRuntimeConfig(identity?.metadata);
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;
@@ -2324,11 +2419,14 @@ export class SessionService implements ISessionService {
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
+      // An inkling turn is bounded: its own ceiling, and a stop that takes
+      // the tools it started with it.
+      ...(inklingTurn ? { timeoutMs: inklingTurnTimeoutMs(), killProcessGroup: true } : {}),
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         sbSlug,
-        injectedContext.agent.name,
+        injectedContext.agent.unnamed ? null : injectedContext.agent.name,
         injectedContext.agent.soul,
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat,
@@ -2631,23 +2729,32 @@ export class SessionService implements ISessionService {
     await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     const turnStartMs = Date.now();
+    // A live inkling turn its owner can cancel (inkling-turns.ts), released
+    // however the run ends.
+    const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
 
     try {
-      result = await runner.run(formattedMessage, {
-        backendSessionId: session.backendSessionId || undefined,
-        // Always handed over, including on resume. Every runner already gates
-        // its own injection on `!isResume`, so this does not change what a
-        // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
-        // that re-bootstraps on every turn, and needs this copy on hand to
-        // recover when that bootstrap fails.
-        injectedContext,
-        // The epoch every terminal write for this turn is fenced on. A
-        // backend process that reports its own turns to the lifecycle route
-        // (ink chat) names this one instead of claiming its own, which fenced
-        // this run out of its own finalize on every ink-backed turn.
-        config: { ...runnerConfig, turnEpoch },
-        mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
-      });
+      result = await runner
+        .run(formattedMessage, {
+          backendSessionId: session.backendSessionId || undefined,
+          // Always handed over, including on resume. Every runner already gates
+          // its own injection on `!isResume`, so this does not change what a
+          // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+          // that re-bootstraps on every turn, and needs this copy on hand to
+          // recover when that bootstrap fails.
+          injectedContext,
+          // The epoch every terminal write for this turn is fenced on. A
+          // backend process that reports its own turns to the lifecycle route
+          // (ink chat) names this one instead of claiming its own, which fenced
+          // this run out of its own finalize on every ink-backed turn.
+          config: {
+            ...runnerConfig,
+            turnEpoch,
+            ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+          },
+          mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+        })
+        .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most
@@ -4366,6 +4473,16 @@ export class SessionService implements ISessionService {
     return this.withStudioLease(session, routing, leaseCtx);
   }
 
+  /** Whether this identity is an inkling. An unreadable row is not one: its turn is still checked at the seam. */
+  private async isInklingIdentity(sbId: string): Promise<boolean> {
+    const { data } = await this.supabase!.from('agent_identities')
+      .select('metadata')
+      .eq('id', sbId)
+      .maybeSingle();
+    const metadata = (data as { metadata?: Record<string, unknown> | null } | null)?.metadata;
+    return metadata?.client === INKLING_CLIENT;
+  }
+
   private async resolveStudioId(
     userId: string,
     sbSlug: string,
@@ -4459,6 +4576,15 @@ export class SessionService implements ISessionService {
       // identity is genuinely absent — nothing to confuse it with.
       return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', sbSlug)) as T;
     };
+
+    // An inkling has no studio and never takes one: its turns run in its own
+    // folder, which processMessage sets once it has read the identity. Placed
+    // before every tier, explicit ones included, so no studio hint, route
+    // pattern or continuity row can put it in a worktree, and its threaded
+    // message is placed rather than held for want of a studio.
+    if (this.supabase && options.sbId && (await this.isInklingIdentity(options.sbId))) {
+      return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+    }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
@@ -5098,10 +5224,33 @@ export class SessionService implements ISessionService {
    *   { ambiguous }     → several identities share this slug; caller-repo
    *                       resolution must not run at all
    */
+  /**
+   * The canonical identity a turn is for, classified for the inkling gate:
+   * the session's sbId, else the one routing resolves for this account and
+   * slug (resolveIdentityScope, which refuses ambiguity). No identity row at
+   * all is positively not an inkling; an ambiguous slug is unknown. The slug
+   * itself is never the authority (Lumen, 5bd4de42).
+   */
+  private async classifyTurnIdentity(
+    userId: string,
+    sbSlug: string,
+    sbId: string | null | undefined
+  ): Promise<InklingIdentity> {
+    if (!this.supabase) return { kind: 'other' };
+    let canonical = sbId ?? null;
+    if (!canonical) {
+      const scope = await this.resolveIdentityScope(userId, sbSlug);
+      if (scope.absent) return { kind: 'other' };
+      if (!scope.id) return { kind: 'unknown', transient: scope.unreadable === true };
+      canonical = scope.id;
+    }
+    return classifyIdentityById(this.supabase, canonical);
+  }
+
   private async resolveIdentityScope(
     userId: string,
     sbSlug: string
-  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
+  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean; unreadable?: boolean }> {
     if (!this.supabase) return { absent: true };
     try {
       const { data, error } = await this.supabase
@@ -5122,7 +5271,9 @@ export class SessionService implements ISessionService {
           sbSlug,
           error: error.message,
         });
-        return { ambiguous: true };
+        // Still ambiguous to routing; `unreadable` lets the inkling gate tell a
+        // failed read (worth retrying) from a slug two identities share.
+        return { ambiguous: true, unreadable: true };
       }
 
       if (!data?.length) {
@@ -5139,7 +5290,7 @@ export class SessionService implements ISessionService {
     } catch {
       // Unreadable identity is not "unambiguous" — treat it as ambiguous and
       // fall through to a hold rather than routing by slug.
-      return { ambiguous: true };
+      return { ambiguous: true, unreadable: true };
     }
   }
 
@@ -5360,6 +5511,25 @@ export class SessionService implements ISessionService {
       return;
     }
 
+    // Compaction is a turn outside every inkling bound (gate, folder, cap,
+    // ceiling, cancellation), so an inkling's session is never compacted, nor
+    // is one that may be an inkling's and cannot be read (Lumen's review of
+    // 8b9d7f50).
+    if (this.supabase) {
+      const identity = await this.classifyTurnIdentity(
+        session.userId,
+        session.sbSlug,
+        session.sbId
+      );
+      if (identity.kind !== 'other') {
+        logger.info('[Inkling] Not compacting an inkling session', {
+          sessionId,
+          sbSlug: session.sbSlug,
+        });
+        return;
+      }
+    }
+
     // Acquire database-backed compaction lock (atomic, multi-server safe)
     const lockAcquired = await this.repository.tryAcquireCompactionLock(sessionId);
     if (!lockAcquired) {
@@ -5435,7 +5605,7 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.sbSlug,
-          context.agent.name,
+          context.agent.unnamed ? null : context.agent.name,
           context.agent.soul,
           fullContext.user.timezone,
           context.agent.heartbeat

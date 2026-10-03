@@ -288,6 +288,13 @@ export interface SessionRequest {
     taskGroupId?: string;
     // Docker container name for sandboxed strategy execution
     sandboxContainerName?: string;
+    /**
+     * The stored thread message that prompted this trigger, copied by the
+     * trigger handler from the payload's own threadMessageId (set only by
+     * the server's send path), never from caller metadata. The inkling turn
+     * gate reads the message to learn who really sent it.
+     */
+    triggerThreadMessageId?: string;
   };
 }
 
@@ -419,6 +426,12 @@ export interface ToolCall {
 export interface AgentIdentity {
   sbSlug: string;
   name: string;
+  /**
+   * An inkling the person has not named yet (metadata.named === false). Its
+   * stored name is a placeholder, so a prompt must not tell it that is who it
+   * is: render "an inkling who hasn't been named yet" instead.
+   */
+  unnamed?: boolean;
   role: string;
   description?: string;
   /** Workspace this identity belongs to — scopes which constitution it reads. */
@@ -747,6 +760,22 @@ export interface IContextBuilder {
 export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
+  /**
+   * This run's hard ceiling, when it must be lower than the runner's own
+   * (an inkling turn's). The Claude runner honours it.
+   */
+  timeoutMs?: number;
+  /**
+   * Spawn the backend as a process-group leader and stop the whole group,
+   * so the tools it started stop with it (stop-process.ts). The Claude
+   * runner honours it.
+   */
+  killProcessGroup?: boolean;
+  /**
+   * Stops the run when aborted, as a timeout would (an owner cancelling an
+   * inkling's turn). The Claude runner honours it.
+   */
+  signal?: AbortSignal;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |

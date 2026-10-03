@@ -65,6 +65,8 @@ import {
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
+import { ThreadKeyTakenError } from './thread-key-taken.js';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 
 // The thread tables are new and not yet in generated Supabase types.
@@ -391,6 +393,22 @@ export interface InternalSendContext {
    * a tool call can never count attempts against someone else's source.
    */
   wakeSource?: WakeSourceTag;
+  /**
+   * The send must create its thread, never join one. When the key is already
+   * taken, whether before the send or by a concurrent request racing it, the
+   * send throws ThreadKeyTakenError before any participant or message is
+   * written. POST /api/admin/threads sets this for a client-identified create,
+   * so a retried submission can never add anyone to a conversation.
+   */
+  createOnly?: boolean;
+  /**
+   * What a client-identified create intends (its clientMessageId, recipients
+   * and title). Written to `inbox_threads.metadata.createIntent` by the same
+   * insert that creates the thread, so before any participant exists. A
+   * retry may adopt a conversation its own interrupted create left only when
+   * this record matches it exactly (POST /api/admin/threads).
+   */
+  createIntent?: Record<string, unknown>;
 }
 
 export async function handleSendToInbox(
@@ -690,6 +708,14 @@ export async function handleSendToInbox(
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
 
+    // A conversation with an inkling is only between it and its owner, in
+    // the owner test (Lumen 97b1d66a). Asked before anything is written.
+    await assertInklingThreadAllowed(supabase, {
+      sender,
+      participantSbs,
+      existingThreadId: existingThread?.id ?? null,
+    });
+
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.
     if (!existingThread) {
@@ -712,7 +738,13 @@ export async function handleSendToInbox(
       title: subject || null,
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
+      ...(internal?.createIntent ? { metadata: { createIntent: internal.createIntent } } : {}),
     });
+    // A create-only send stops here when the key was already taken, whether
+    // before this send or by a concurrent request between the lookup above
+    // and the insert. Nothing has been written yet (findOrCreateThread writes
+    // only for a thread it created), and nothing may be.
+    if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id
@@ -998,6 +1030,18 @@ export async function handleSendToInbox(
     }
     for (const t of agentsToTrigger) routingById.set(t.sbId, t);
     const routingSet = [...routingById.values()];
+    // The wake prompt prints a trigger's metadata. A person's retry key and
+    // the record of what their create asked for are the stored message's,
+    // not the recipient's: an SB that echoed clientMessageId on its own send
+    // in this thread would have that send refused by the unique index.
+    const wakeMetadata: Record<string, unknown> = { ...rawMeta };
+    delete wakeMetadata.clientMessageId;
+    if (wakeMetadata.pcp && typeof wakeMetadata.pcp === 'object') {
+      const inkForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
+      delete inkForWake.createRequest;
+      if (Object.keys(inkForWake).length > 0) wakeMetadata.pcp = inkForWake;
+      else delete wakeMetadata.pcp;
+    }
     const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
@@ -1130,7 +1174,7 @@ export async function handleSendToInbox(
           // the boundary where their intent enters the gateway, instead of the
           // trigger handler rediscovering it from metadata.
           ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
-          ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
+          ...(Object.keys(wakeMetadata).length > 0 ? { metadata: wakeMetadata } : {}),
         };
 
         // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
@@ -1199,6 +1243,11 @@ export async function handleSendToInbox(
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
             ...explicitAddressEcho(explicitAddress),
+            // Who this send actually routed to, which can be wider than
+            // `recipients` (a reply wakes the thread's other SBs too), and
+            // whether each was meant to be woken. A send receipt judges
+            // delivery from this, never from the requested list.
+            dispatched: routingSet.map((t) => ({ sbSlug: t.sbSlug, wake: wakeIds.has(t.sbId) })),
             messageType,
             priority,
             triggered: triggeredAgents,
@@ -1449,6 +1498,8 @@ export async function findOrCreateThread(
     title: string | null;
     participants: SbPrincipal[];
     person?: UserPrincipal | null;
+    /** Written with the new thread row only; an existing thread is not touched. */
+    metadata?: Record<string, unknown>;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
@@ -1476,6 +1527,7 @@ export async function findOrCreateThread(
       created_by_sb_id: creator.kind === 'sb' ? creator.sbId : null,
       created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: boundThreadTitle(opts.title),
+      ...(opts.metadata ? { metadata: opts.metadata } : {}),
     })
     .select()
     .single();

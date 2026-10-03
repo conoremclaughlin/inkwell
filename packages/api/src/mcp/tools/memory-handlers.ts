@@ -361,6 +361,7 @@ const topicsSchema = z
 // Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
 // the same budgeted renderer. Re-exported here for existing importers.
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
+import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
 
 export { buildKnowledgeSummary };
@@ -2656,6 +2657,28 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 // ==============================================// BOOTSTRAP HANDLER
 // ==============================================
 /**
+ * Who bootstrap tells the calling SB it is. An inkling that hasn't been named
+ * yet gets a null name and a plain statement of that, never its stored
+ * placeholder: its first act on waking is to call bootstrap.
+ */
+export function bootstrapAgentInfo(dbIdentity: Record<string, unknown>): {
+  name: string | null;
+  role: string;
+  capabilities: Record<string, unknown> | null;
+  naming?: string;
+} {
+  const identity = dbIdentity as { name: string; metadata?: unknown };
+  return {
+    name: nameOf(identity),
+    role: dbIdentity.role as string,
+    capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
+    ...(isUnnamed(identity)
+      ? { naming: "You haven't been named yet. The person may name you, or never; don't ask." }
+      : {}),
+  };
+}
+
+/**
  * Bootstrap loads identity core + active context in one call.
  * This is the recommended way to start a new session.
  *
@@ -2749,7 +2772,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
       // All active sessions (filter by sbSlug if provided) — client picks the right one
       dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
-      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul).
+      // Keep `metadata` in this select: bootstrapAgentInfo and nameOf read
+      // metadata.named, and without it an unnamed inkling would be told its
+      // placeholder name again (review 3ce682bd).
       sbSlug
         ? dataComposer
             .getClient()
@@ -2777,7 +2803,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       // Agents cross-reference this with their personal `relationships` notes.
       supabase
         .from('agent_identities')
-        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        // `metadata` is what nameOf reads: an unnamed inkling is listed with
+        // no name, never as its placeholder.
+        .select('agent_id, name, role, backend, session_scope, capabilities, description, metadata')
         .eq('user_id', user.id)
         .order('created_at', { ascending: true })
         .then(({ data }) => data || []),
@@ -2929,13 +2957,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     : null;
 
   // Build agent info from dbIdentity
-  const agentInfo = dbIdentity
-    ? {
-        name: dbIdentity.name as string,
-        role: dbIdentity.role as string,
-        capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
-      }
-    : null;
+  const agentInfo = dbIdentity ? bootstrapAgentInfo(dbIdentity) : null;
 
   // Build knowledge summary (or use cache for the text)
   let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
@@ -3086,7 +3108,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             dbIdentity: dbIdentity
               ? {
                   sbSlug: dbIdentity.agent_id,
-                  name: dbIdentity.name,
+                  name: nameOf(dbIdentity as { name: string; metadata?: unknown }),
                   role: dbIdentity.role,
                   description: dbIdentity.description,
                   values: dbIdentity.values,
@@ -3105,7 +3127,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               .filter((s) => s.agent_id !== sbSlug)
               .map((s) => ({
                 sbSlug: s.agent_id,
-                name: s.name,
+                name: nameOf(s),
                 role: s.role,
                 backend: s.backend,
                 sessionScope: s.session_scope,

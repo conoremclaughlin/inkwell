@@ -31,6 +31,7 @@ import { homedir, tmpdir } from 'os';
 import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
+import { stopProcess } from './stop-process.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 
 /** Where the sandbox orchestrator mounts the studio checkout in a container. */
@@ -411,7 +412,7 @@ export class ClaudeRunner implements IRunner {
      * `run()` decides `success` from this, so a timeout that resolves without
      * it is reported as a completed turn. See the timers below.
      */
-    timedOut?: { kind: 'idle' | 'hard'; message: string };
+    timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -561,11 +562,17 @@ export class ClaudeRunner implements IRunner {
         container: config.container,
       });
 
+      // A run that must stop with its tools leads its own process group, so a
+      // stop can signal the whole group (stopProcess).
+      const killGroup = config.killProcessGroup === true;
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
         env: target.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: killGroup,
       });
+      // The run's own ceiling may be lower than the module's (an inkling turn's).
+      const ceilingMs = Math.min(PROCESS_TIMEOUT_MS, config.timeoutMs ?? PROCESS_TIMEOUT_MS);
 
       let stderr = '';
       const responses: ChannelResponse[] = [];
@@ -593,7 +600,7 @@ export class ClaudeRunner implements IRunner {
               hasResponses: responses.length > 0,
               hasFinalText: !!finalTextResponse,
             });
-            this.killProcess(proc);
+            this.killProcess(proc, killGroup);
             settled = true;
             resolve({
               responses,
@@ -622,11 +629,11 @@ export class ClaudeRunner implements IRunner {
       const timeout = setTimeout(() => {
         if (!settled) {
           logger.error('Claude Code process hit hard timeout, killing', {
-            timeoutMs: PROCESS_TIMEOUT_MS,
+            timeoutMs: ceilingMs,
             hasResponses: responses.length > 0,
             hasFinalText: !!finalTextResponse,
           });
-          this.killProcess(proc);
+          this.killProcess(proc, killGroup);
           settled = true;
           resolve({
             responses,
@@ -637,12 +644,36 @@ export class ClaudeRunner implements IRunner {
             timedOut: {
               kind: 'hard',
               message: `Claude Code timeout: exceeded the ${Math.round(
-                PROCESS_TIMEOUT_MS / 1000
+                ceilingMs / 1000
               )}s ceiling, process killed`,
             },
           });
         }
-      }, PROCESS_TIMEOUT_MS);
+      }, ceilingMs);
+
+      // Cancellation (an owner stopping an inkling's turn): the same stop as
+      // a timeout, reported without the word "timeout", which the retry
+      // classifier would read as transient.
+      const onAbort = () => {
+        if (settled) return;
+        logger.warn('Claude Code turn cancelled, stopping', {
+          hasResponses: responses.length > 0,
+        });
+        clearTimeout(timeout);
+        clearTimeout(idleTimer);
+        this.killProcess(proc, killGroup);
+        settled = true;
+        resolve({
+          responses,
+          usage,
+          servedModel,
+          toolCalls,
+          finalTextResponse: finalTextResponse || '[Turn cancelled]',
+          timedOut: { kind: 'cancelled', message: 'Claude Code turn cancelled, process stopped' },
+        });
+      };
+      if (config.signal?.aborted) onAbort();
+      else config.signal?.addEventListener('abort', onAbort, { once: true });
 
       const consumeLine = (line: string) => {
         {
@@ -736,6 +767,7 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('close', (code) => {
+        config.signal?.removeEventListener('abort', onAbort);
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         mcpInjection?.cleanup();
@@ -781,22 +813,8 @@ export class ClaudeRunner implements IRunner {
   /**
    * Kill a Claude Code subprocess gracefully, with escalation to SIGKILL.
    */
-  private killProcess(proc: ChildProcess): void {
-    try {
-      proc.kill('SIGTERM');
-      // If it doesn't die in 5s, force kill
-      setTimeout(() => {
-        try {
-          if (!proc.killed) {
-            proc.kill('SIGKILL');
-          }
-        } catch {
-          // Process already dead
-        }
-      }, 5000);
-    } catch {
-      // Process already dead
-    }
+  private killProcess(proc: ChildProcess, group = false): void {
+    stopProcess(proc, { group });
   }
 
   /**
@@ -851,7 +869,8 @@ export class ClaudeRunner implements IRunner {
  */
 export function buildIdentityPrompt(
   sbSlug: string,
-  agentName: string,
+  /** Null for an inkling that hasn't been named yet: its stored name is a placeholder. */
+  agentName: string | null,
   soul?: string,
   timezone?: string,
   heartbeat?: string,
@@ -859,7 +878,7 @@ export function buildIdentityPrompt(
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
-**You are ${agentName}. Your slug is \`${sbSlug}\`.**
+**You are ${agentName ?? "an inkling who hasn't been named yet"}. Your slug is \`${sbSlug}\`.**
 
 When calling Inkwell tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 

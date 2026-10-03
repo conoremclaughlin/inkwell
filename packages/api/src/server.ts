@@ -1147,6 +1147,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         recipientSessionId: payload.recipientSessionId,
         recipientSessionNamed: !!payload.explicitRecipientSession,
         sessionKey: payload.sessionKey,
+        // The payload's own field, which only the send path sets; never the
+        // caller-supplied payload.metadata. The inkling gate reads this
+        // message to learn who sent it (Lumen's review of 8b9d7f50).
+        triggerThreadMessageId: payload.threadMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId

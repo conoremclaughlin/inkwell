@@ -20,6 +20,7 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { ensureDefaultReminders } from '../../services/heartbeat';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
+import { nameOf } from '../../services/identity-name';
 
 // =====================================================
 // SCHEMAS
@@ -546,7 +547,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
 
     if (params.file === 'identity') {
       fileContent = {
-        name: data.name,
+        name: nameOf(data),
         role: data.role,
         description: data.description,
         values: data.values,
@@ -593,7 +594,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
             identity: {
               id: data.id,
               sbSlug: data.agent_id,
-              name: data.name,
+              name: nameOf(data),
               role: data.role,
               description: data.description,
               values: data.values,
@@ -642,7 +643,7 @@ export async function handleListIdentities(args: unknown, dataComposer: DataComp
             identities: data.map((row) => ({
               id: row.id,
               sbSlug: row.agent_id,
-              name: row.name,
+              name: nameOf(row),
               role: row.role,
               description: row.description,
               values: row.values,
@@ -867,7 +868,9 @@ export async function handleMeetFamily(args: unknown, dataComposer: DataComposer
 
   const { data: siblings } = await supabase
     .from('agent_identities')
-    .select('agent_id, name, role, description, values, soul, relationships, capabilities')
+    .select(
+      'agent_id, name, role, description, values, soul, relationships, capabilities, metadata'
+    )
     .eq('user_id', user.id)
     .order('created_at', { ascending: true });
 
@@ -893,7 +896,7 @@ export async function handleMeetFamily(args: unknown, dataComposer: DataComposer
 
   const family = siblings.map((s) => ({
     sbSlug: s.agent_id,
-    name: s.name,
+    name: nameOf(s),
     role: s.role,
     description: s.description,
     values: s.values,

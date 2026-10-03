@@ -7,7 +7,10 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
@@ -899,6 +902,433 @@ describe('SessionService', () => {
       ];
       return call[1].config.model;
     };
+
+    describe('an inkling turn starts only in the owner test (Lumen 97b1d66a)', () => {
+      const OWNER = '11111111-1111-4111-8111-111111111111';
+      const SB = '3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10';
+      const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
+      const fromOwner = {
+        sender: { id: 'user', name: 'Owner' },
+        metadata: { triggerThreadMessageId: 'msg-owner' },
+      };
+
+      /** The inkling's conversation, as the send path stores it: the gate reads these. */
+      const THREAD_TABLES = {
+        inbox_thread_messages: [
+          { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
+          { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          {
+            id: 'msg-someone',
+            thread_id: 'thread-1',
+            sender_kind: 'user',
+            sender_user_id: '44444444-4444-4444-8444-444444444444',
+          },
+          {
+            id: 'msg-elsewhere',
+            thread_id: 'thread-2',
+            sender_kind: 'user',
+            sender_user_id: OWNER,
+          },
+        ],
+        inbox_thread_participants: [{ thread_id: 'thread-1', sb_id: SB, user_id: null }],
+      };
+      let inklingsRoot: string;
+
+      beforeEach(async () => {
+        inklingsRoot = await mkdtemp(join(tmpdir(), 'inklings-'));
+      });
+
+      afterEach(async () => {
+        vi.unstubAllEnvs();
+        await rm(inklingsRoot, { recursive: true, force: true });
+      });
+
+      const configPassedToRunner = () =>
+        (
+          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+            string,
+            { config: { timeoutMs?: number; killProcessGroup?: boolean } },
+          ]
+        )[1].config;
+
+      const cwdPassedToRunner = () =>
+        (
+          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+            string,
+            { config: { workingDirectory?: string } },
+          ]
+        )[1].config.workingDirectory;
+
+      /** A turn for sb-1 (with `metadata`) on OWNER's account, the gate set to `gate`. */
+      const turn = async (
+        metadata: Record<string, unknown>,
+        request: Record<string, unknown> = fromOwner,
+        gate = OWNER,
+        extra: {
+          session?: Record<string, unknown>;
+          row?: Record<string, unknown>;
+          /** More identity rows (for a slug two identities share). */
+          rows?: Record<string, unknown>[];
+          /** The by-id identity read fails, as a dropped connection would. */
+          readError?: boolean;
+          /** These reads (table and select columns) fail, as a dropped connection would. */
+          failReads?: Array<{ table: string; columns: string }>;
+        } = {}
+      ) => {
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
+        const supabase = makeFakeSupabase({
+          // agent_id is the request's slug, as an inkling's own slug is: routing
+          // resolves the identity by it.
+          agent_identities: [
+            {
+              id: SB,
+              agent_id: 'myra',
+              user_id: OWNER,
+              sandbox_bypass: false,
+              metadata,
+              // NOT NULL in the table; the turn-cap claim's conditional update needs it.
+              updated_at: '2026-10-02T08:00:00.000Z',
+              ...extra.row,
+            },
+            ...(extra.rows ?? []),
+          ],
+          studios: [],
+          ...THREAD_TABLES,
+        });
+        const failing = [
+          ...(extra.failReads ?? []),
+          ...(extra.readError
+            ? [{ table: 'agent_identities', columns: 'id, user_id, metadata' }]
+            : []),
+        ];
+        if (failing.length > 0) {
+          const failed = { data: null, error: { message: 'fixture read failed' } };
+          const from = supabase.from.bind(supabase);
+          (supabase as { from: unknown }).from = (table: string) => {
+            const query = from(table);
+            const select = query.select.bind(query);
+            query.select = ((cols?: string) => {
+              const q = select(cols);
+              if (failing.some((f) => f.table === table && f.columns === cols)) {
+                q.maybeSingle = async () => failed as never;
+                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(failed).then(resolve);
+              }
+              return q;
+            }) as never;
+            return query;
+          };
+        }
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
+          mockCodexRunner,
+          supabase,
+          undefined,
+          mockInkRunner
+        );
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({ sbId: SB, userId: OWNER, ...extra.session } as never)
+        );
+        lastService = service;
+        return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
+      };
+      let lastService: SessionService;
+
+      it("the owner's own message wakes an inkling born under the test", async () => {
+        const result = await turn(INKLING);
+        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
+        const MISSING = '99999999-9999-4999-8999-999999999999';
+
+        it("a 'user' label proves nothing: only the owner's own stored message, in its conversation, wakes it", async () => {
+          const label = { id: 'user', name: 'Owner' };
+          for (const messageId of [
+            undefined, // trigger_agent: a caller-supplied fromSlug 'user' and no stored message
+            'msg-sb', // an SB's message in its conversation
+            'msg-someone', // another person's
+            'msg-elsewhere', // the owner's, but in a conversation the inkling is not on
+            'msg-missing', // names no stored message
+          ]) {
+            const result = await turn(INKLING, {
+              sender: label,
+              metadata: messageId ? { triggerThreadMessageId: messageId } : {},
+            });
+            expect(result.errorCode, String(messageId)).toBe('INKLING_TURN_REFUSED');
+          }
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('an identity that cannot be established is refused, whatever its slug (Lumen 5bd4de42)', async () => {
+          // An sbId that names no row: refused, kindle- slug or not. Not retryable.
+          for (const sbSlug of ['kindle-zzz', 'myra']) {
+            const result = await turn({}, { ...fromOwner, sbSlug }, OWNER, {
+              session: { sbId: MISSING, sbSlug },
+            });
+            expect(result.errorCode, sbSlug).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, sbSlug).toBe(false);
+          }
+          // A failed identity read: refused, but retryable, so a blip loses nothing.
+          const blip = await turn({}, fromOwner, OWNER, { readError: true });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          // With no sbId, a slug two identities share is ambiguous: refused.
+          const ambiguous = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(ambiguous.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it("a failed read while proving the owner's message refuses without running, as retryable (Lumen 7d40b0aa)", async () => {
+          for (const read of [
+            { table: 'inbox_thread_messages', columns: 'thread_id, sender_kind, sender_user_id' },
+            { table: 'inbox_thread_participants', columns: 'sb_id' },
+          ]) {
+            const result = await turn(INKLING, fromOwner, OWNER, { failReads: [read] });
+            expect(result.errorCode, read.table).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, read.table).toBe(true);
+          }
+          // A definite no (an SB's message) stays a refusal not worth retrying.
+          const definite = await turn(INKLING, {
+            sender: { id: 'user', name: 'Owner' },
+            metadata: { triggerThreadMessageId: 'msg-sb' },
+          });
+          expect(definite.classification?.retryable).toBe(false);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('with no sbId, a failed identity lookup refuses as retryable; a shared slug does not (Lumen 7d40b0aa)', async () => {
+          const blip = await turn(INKLING, fromOwner, OWNER, {
+            session: { sbId: null },
+            failReads: [{ table: 'agent_identities', columns: 'id' }],
+          });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          const shared = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(shared.classification?.retryable).toBe(false);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('positively no identity row, or a readable ordinary one, runs as today', async () => {
+          // No sbId, and the account has no identity row for this slug at all.
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' }, sbSlug: 'nobody' }, OWNER, {
+            session: { sbId: null, sbSlug: 'nobody' },
+          });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+        });
+
+        it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
+          const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
+          expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          await turn(INKLING, fromOwner, OWNER, { session: { sbId: null } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            timeoutMs: 300_000,
+            killProcessGroup: true,
+          });
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        });
+
+        it("another account's inkling is refused though the turn names the owner's account", async () => {
+          const result = await turn(INKLING, fromOwner, OWNER, {
+            row: { user_id: '33333333-3333-4333-8333-333333333333' },
+          });
+          expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('an inkling session on another backend is refused, never run unbounded', async () => {
+          for (const backend of ['codex-cli', 'ink']) {
+            const result = await turn(INKLING, fromOwner, OWNER, { session: { backend } });
+            expect(result.errorCode, backend).toBe('INKLING_TURN_REFUSED');
+          }
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('an inkling session is never compacted; another SB still is', async () => {
+          for (const [metadata, compacts] of [
+            [INKLING, false],
+            [{}, true],
+          ] as const) {
+            await turn(metadata, { sender: { id: 'system', name: 'x' } });
+            vi.mocked(mockRepository.tryAcquireCompactionLock).mockClear();
+            vi.mocked(mockRepository.findById).mockResolvedValueOnce(
+              createMockSession({ sbId: SB, userId: OWNER } as never)
+            );
+            await lastService.triggerCompaction('session-123');
+            expect(
+              vi.mocked(mockRepository.tryAcquireCompactionLock).mock.calls.length > 0,
+              JSON.stringify(metadata)
+            ).toBe(compacts);
+          }
+        });
+      });
+
+      it('its turn runs in its own folder, made on demand: never the default directory', async () => {
+        await turn(INKLING);
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        // This file mocks fs/promises' stat; the folder check needs the real one.
+        const fs = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+        expect((await fs.stat(join(inklingsRoot, SB))).isDirectory()).toBe(true);
+      });
+
+      it('its turn is bounded: its own ceiling, and a stop that takes its tools with it', async () => {
+        vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '90000');
+        await turn(INKLING);
+        expect(configPassedToRunner()).toMatchObject({ timeoutMs: 90000, killProcessGroup: true });
+      });
+
+      it('another SB keeps the runner defaults: no inkling ceiling, no group stop', async () => {
+        await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+        const config = configPassedToRunner() as { signal?: AbortSignal } & Record<string, unknown>;
+        expect(config.timeoutMs).toBeUndefined();
+        expect(config.killProcessGroup).toBeUndefined();
+        expect(config.signal).toBeUndefined();
+      });
+
+      it('its owner can cancel it while it runs; it is released when the run ends', async () => {
+        let during = -1;
+        let aborted = false;
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (_m, options) => {
+          during = liveInklingTurns(SB);
+          cancelInklingTurns(SB);
+          aborted = (options.config as { signal?: AbortSignal }).signal?.aborted === true;
+          return {
+            success: false,
+            responses: [],
+            backendSessionId: null,
+            error: 'cancelled',
+          } as never;
+        });
+        await turn(INKLING);
+        expect(during).toBe(1);
+        expect(aborted).toBe(true);
+        expect(liveInklingTurns(SB)).toBe(0);
+      });
+
+      it('a threaded message is placed in its folder, not held for want of a studio', async () => {
+        const result = await turn(INKLING, {
+          ...fromOwner,
+          metadata: {
+            ...fromOwner.metadata,
+            threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+          },
+        });
+        expect(result.errorCode).not.toBe('ROUTING_REFUSED');
+        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+      });
+
+      it('a named studio or hint cannot put it in a worktree: its folder wins first', async () => {
+        for (const named of [
+          { studioId: '77777777-7777-4777-8777-777777777777' },
+          { studioHint: 'some-studio' },
+        ]) {
+          vi.mocked(mockClaudeRunner.run).mockClear();
+          const result = await turn(INKLING, {
+            ...fromOwner,
+            metadata: { ...fromOwner.metadata, threadKey: 'chat:conversation-named', ...named },
+          });
+          expect(result.errorCode, JSON.stringify(named)).not.toBe('ROUTING_REFUSED');
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        }
+      });
+
+      it('the turn past the cap is refused before anything is spawned', async () => {
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', OWNER);
+        vi.stubEnv('INKLING_TURN_CAP', '2');
+        const row = {
+          id: SB,
+          agent_id: 'myra',
+          user_id: OWNER,
+          sandbox_bypass: false,
+          metadata: INKLING,
+          updated_at: '2026-10-02T08:00:00.000Z',
+        };
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
+          mockCodexRunner,
+          makeFakeSupabase({ agent_identities: [row], studios: [], ...THREAD_TABLES }),
+          undefined,
+          mockInkRunner
+        );
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({ sbId: SB, userId: OWNER } as never)
+        );
+        const results = [];
+        for (let i = 0; i < 3; i++) {
+          results.push(
+            await service.handleMessage(createMockRequest({ userId: OWNER, ...fromOwner }))
+          );
+        }
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+        expect(results[2]).toMatchObject({
+          errorCode: 'INKLING_TURN_REFUSED',
+          error: expect.stringContaining('turn cap reached (2 of 2)'),
+          classification: { retryable: false },
+        });
+        expect((row.metadata as Record<string, unknown>).ownerTestTurns).toBe(2);
+      });
+
+      it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
+        const result = await turn(INKLING, fromOwner, '');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: { retryable: false },
+        });
+      });
+
+      it('a heartbeat, the system, an SB or a channel message never wakes it', async () => {
+        for (const id of ['system', 'myra', '123456789', OWNER]) {
+          const result = await turn(INKLING, { sender: { id, name: 'not a person here' } });
+          expect(result.errorCode, id).toBe('INKLING_TURN_REFUSED');
+        }
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      });
+
+      it('an inkling not born under the test, or on another account, never wakes', async () => {
+        const unborn = await turn({ client: 'inkling-mobile', named: false });
+        const elsewhere = await turn(INKLING, fromOwner, '33333333-3333-4333-8333-333333333333');
+        expect([unborn.errorCode, elsewhere.errorCode]).toEqual([
+          'INKLING_TURN_REFUSED',
+          'INKLING_TURN_REFUSED',
+        ]);
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      });
+
+      it('any other SB is untouched, gate on or off', async () => {
+        for (const gate of [OWNER, '']) {
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, gate);
+        }
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+      });
+    });
 
     it('passes a pinned model through to the runner config', async () => {
       const service = serviceWithIdentity(

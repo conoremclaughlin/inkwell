@@ -1,0 +1,137 @@
+{
+  "contract": "Inkling consumer awakening, v3 (inkling:thread:app-build 242d45bf, amended 58202c0a)",
+  "note": "Example wire payloads for the Inkling app's adapter. Values are illustrative; field names, presence and types are the contract. Pinned by packages/api/src/routes/inkling-contract.test.ts against the real handlers.",
+  "inklings": {
+    "list": {
+      "status": 200,
+      "body": {
+        "inklings": [
+          {
+            "id": "3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10",
+            "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
+            "displayName": null,
+            "createdAt": "2026-10-02T08:00:05.000Z",
+            "nameable": true
+          }
+        ]
+      }
+    },
+    "awaken": {
+      "request": { "clientRequestId": "0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a" },
+      "created": {
+        "status": 201,
+        "body": {
+          "inkling": {
+            "id": "3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10",
+            "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
+            "displayName": null,
+            "createdAt": "2026-10-02T08:00:05.000Z",
+            "nameable": true
+          },
+          "replayed": false
+        }
+      },
+      "replayed": {
+        "status": 200,
+        "body": {
+          "inkling": {
+            "id": "3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10",
+            "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
+            "displayName": null,
+            "createdAt": "2026-10-02T08:00:05.000Z",
+            "nameable": true
+          },
+          "replayed": true
+        }
+      },
+      "otherWorkspace": { "status": 409, "body": { "error": "string" } },
+      "capReached": {
+        "status": 409,
+        "body": { "error": "string", "code": "awakening_cap_reached" }
+      },
+      "disabled": {
+        "status": 403,
+        "body": { "error": "string", "code": "inklings_disabled" }
+      }
+    },
+    "name": {
+      "request": { "displayName": "小墨" },
+      "response": {
+        "status": 200,
+        "body": {
+          "inkling": {
+            "id": "3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10",
+            "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
+            "displayName": "小墨",
+            "createdAt": "2026-10-02T08:00:05.000Z",
+            "nameable": true
+          }
+        }
+      },
+      "invalid": { "status": 400, "body": { "error": "string" } },
+      "notNameable": { "status": 409, "body": { "error": "string" } },
+      "unknown": { "status": 404, "body": { "error": "string" } }
+    }
+  },
+  "threads": {
+    "create": {
+      "request": {
+        "key": "chat:conversation-5f0c9e2d-1a3b-4c5d-8e7f-9a0b1c2d3e4f",
+        "recipients": ["kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d"],
+        "title": "A new conversation",
+        "content": "Hello there",
+        "studioSlug": "main",
+        "clientMessageId": "6d1f8a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "created": true,
+          "messageId": "7e2a1b3c-4d5e-4f6a-8b7c-9d0e1f2a3b4c",
+          "threadId": "8f3b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "threadKey": "chat:conversation-5f0c9e2d-1a3b-4c5d-8e7f-9a0b1c2d3e4f",
+          "warning": null,
+          "threadKeyWarning": null,
+          "delivery": { "status": "routed", "unrouted": [] },
+          "replayed": false
+        }
+      }
+    },
+    "reply": {
+      "request": {
+        "key": "chat:conversation-5f0c9e2d-1a3b-4c5d-8e7f-9a0b1c2d3e4f",
+        "content": "One more thing",
+        "clientMessageId": "9a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "messageId": "0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d",
+          "threadId": "8f3b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "triggered": ["kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d"],
+          "warning": null,
+          "threadKeyWarning": null,
+          "delivery": { "status": "routed", "unrouted": [] },
+          "replayed": false
+        }
+      },
+      "replayed": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "messageId": "0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d",
+          "threadId": "8f3b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+          "triggered": [],
+          "warning": null,
+          "threadKeyWarning": null,
+          "delivery": { "status": "routed", "unrouted": [] },
+          "replayed": true
+        }
+      },
+      "conflict": { "status": 409, "body": { "error": "string" } }
+    },
+    "deliveryStatuses": ["routed", "partial", "unrouted", "unknown"]
+  }
+}
