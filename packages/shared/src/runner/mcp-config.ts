@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { pinIsolatedPlaywright } from '../studio/playwright-mcp.js';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -63,8 +64,12 @@ export interface InjectSessionHeadersResult {
  * The header values use ${VAR} interpolation so Claude Code resolves
  * them from the spawned process's env vars at runtime.
  *
- * If the config already has the headers, or the file doesn't exist,
- * or there's no "inkwell" server entry, returns the original path unchanged.
+ * The same pass pins a Playwright MCP server to the default launch
+ * (headless, isolated; studio/playwright-mcp.ts), with or without an
+ * "inkwell" entry to decorate.
+ *
+ * If nothing needed adding, or the file doesn't exist or can't be parsed,
+ * returns the original path unchanged.
  */
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
@@ -87,53 +92,56 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
+  // Every session launches Playwright headless and on a throwaway profile,
+  // whatever the studio's own file says, unless the entry names a browser
+  // of its own (studio/playwright-mcp.ts).
+  const playwright = pinIsolatedPlaywright(config.mcpServers);
+  config.mcpServers = playwright.servers;
+  let modified = playwright.pinned.length > 0;
+
   // Session headers are injected only into the canonical 'inkwell' server. The
   // legacy 'pcp' server name is retired — no code should create or feed it.
   const serverKey = 'inkwell';
-  if (!config.mcpServers[serverKey]) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
+  if (config.mcpServers[serverKey]) {
+    // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
+    // Only when we actually have a session — otherwise the rendered header
+    // would be an empty string which muddies server-side logs.
+    if (inkSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
+      config.mcpServers[serverKey].headers = {
+        ...config.mcpServers[serverKey].headers,
+        'x-ink-session-id': '${INK_SESSION_ID}',
+      };
+      modified = true;
+    }
 
-  let modified = false;
+    // Inject studio ID header
+    if (studioId && !config.mcpServers[serverKey].headers?.['x-ink-studio-id']) {
+      config.mcpServers[serverKey].headers = {
+        ...config.mcpServers[serverKey].headers,
+        'x-ink-studio-id': '${INK_STUDIO_ID}',
+      };
+      modified = true;
+    }
 
-  // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
-  // Only when we actually have a session — otherwise the rendered header
-  // would be an empty string which muddies server-side logs.
-  if (inkSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
-    config.mcpServers[serverKey].headers = {
-      ...config.mcpServers[serverKey].headers,
-      'x-ink-session-id': '${INK_SESSION_ID}',
-    };
-    modified = true;
-  }
+    // Inject Authorization header for triggered sessions.
+    // Uses ${VAR} interpolation so the token is resolved from INK_ACCESS_TOKEN
+    // env var at runtime, not hardcoded in the config file.
+    if (accessToken && !config.mcpServers[serverKey].headers?.['Authorization']) {
+      config.mcpServers[serverKey].headers = {
+        ...config.mcpServers[serverKey].headers,
+        Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
+      };
+      modified = true;
+    }
 
-  // Inject studio ID header
-  if (studioId && !config.mcpServers[serverKey].headers?.['x-ink-studio-id']) {
-    config.mcpServers[serverKey].headers = {
-      ...config.mcpServers[serverKey].headers,
-      'x-ink-studio-id': '${INK_STUDIO_ID}',
-    };
-    modified = true;
-  }
-
-  // Inject Authorization header for triggered sessions.
-  // Uses ${VAR} interpolation so the token is resolved from INK_ACCESS_TOKEN
-  // env var at runtime, not hardcoded in the config file.
-  if (accessToken && !config.mcpServers[serverKey].headers?.['Authorization']) {
-    config.mcpServers[serverKey].headers = {
-      ...config.mcpServers[serverKey].headers,
-      Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-    };
-    modified = true;
-  }
-
-  // Inject consolidated context token (Phase 1 — alongside individual headers)
-  if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
-    config.mcpServers[serverKey].headers = {
-      ...config.mcpServers[serverKey].headers,
-      'x-ink-context': '${INK_CONTEXT}',
-    };
-    modified = true;
+    // Inject consolidated context token (Phase 1 — alongside individual headers)
+    if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
+      config.mcpServers[serverKey].headers = {
+        ...config.mcpServers[serverKey].headers,
+        'x-ink-context': '${INK_CONTEXT}',
+      };
+      modified = true;
+    }
   }
 
   if (!modified) {
