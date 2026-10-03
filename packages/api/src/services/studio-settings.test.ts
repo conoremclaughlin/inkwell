@@ -1,5 +1,22 @@
 import path from 'path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync } from 'fs';
+
+/** A read failure other than absence, injected for one path. */
+const fault = vi.hoisted(() => ({ readPath: '', code: 'EACCES' }));
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    readFile: (async (...args: Parameters<typeof actual.readFile>) => {
+      if (fault.readPath && String(args[0]) === fault.readPath) {
+        throw Object.assign(new Error('fixture: read failed'), { code: fault.code });
+      }
+      return actual.readFile(...args);
+    }) as typeof actual.readFile,
+  };
+});
+
 import { mkdtemp, rm, readFile, mkdir, writeFile, access, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -152,6 +169,46 @@ describe('applyPermissionOverlay', () => {
       await writeFile(path, content);
       await expect(applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] })).rejects.toThrow();
       expect(await readFile(path, 'utf-8')).toBe(content);
+    }
+  });
+
+  it('refuses policy it cannot validate, before any write (Lumen d74ce85d, P2 3)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    for (const content of [
+      '',
+      JSON.stringify({ permissions: [] }),
+      JSON.stringify({ permissions: null }),
+      JSON.stringify({ permissions: { deny: 'Bash(*)' } }),
+      JSON.stringify({ permissions: { allow: ['Bash(ls)', 7] } }),
+      JSON.stringify({ permissions: { ask: {} } }),
+    ]) {
+      await writeFile(path, content);
+      await expect(
+        applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] }),
+        content
+      ).rejects.toThrow();
+      expect(readFileSync(path, 'utf-8'), content).toBe(content);
+    }
+  });
+
+  it('a read failure other than absence refuses and leaves the bytes (EACCES, EIO)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const path = join(tempDir, '.claude', 'settings.local.json');
+    const content = JSON.stringify({ permissions: { deny: ['Bash(*)'] } });
+    await writeFile(path, content);
+    try {
+      for (const code of ['EACCES', 'EIO']) {
+        fault.readPath = path;
+        fault.code = code;
+        await expect(
+          applyPermissionOverlay(tempDir, { allow: ['Bash(ls)'] }),
+          code
+        ).rejects.toThrow();
+        expect(readFileSync(path, 'utf-8'), code).toBe(content);
+      }
+    } finally {
+      fault.readPath = '';
     }
   });
 });

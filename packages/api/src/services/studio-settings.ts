@@ -26,13 +26,40 @@ interface ClaudeSettings {
 }
 
 /**
- * Read the current settings file content (for backup before overlay).
+ * Read the current settings file content (for backup before overlay): null
+ * only when the file is confirmed absent (ENOENT). Any other read failure
+ * throws, because a file that could not be read may hold policy the overlay
+ * would otherwise replace (Lumen d74ce85d, P2 3).
  */
 async function readSettings(worktreePath: string): Promise<string | null> {
   try {
     return await readFile(join(worktreePath, CLAUDE_SETTINGS_REL), 'utf-8');
-  } catch {
-    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+const isStringList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string');
+
+/**
+ * The present permission fields the overlay touches or must keep, checked
+ * before anything is written: `permissions` an object, and `allow`, `deny`
+ * and `ask` lists of strings when present. Anything else throws.
+ */
+function validatePermissions(permissions: unknown): void {
+  if (permissions === undefined) return;
+  if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)) {
+    throw new Error(`${CLAUDE_SETTINGS_REL}: permissions is not an object; overlay not applied`);
+  }
+  for (const key of ['allow', 'deny', 'ask'] as const) {
+    const list = (permissions as Record<string, unknown>)[key];
+    if (list !== undefined && !isStringList(list)) {
+      throw new Error(
+        `${CLAUDE_SETTINGS_REL}: permissions.${key} is not a list of rules; overlay not applied`
+      );
+    }
   }
 }
 
@@ -75,25 +102,29 @@ export async function applyPermissionOverlay(
   const originalContent = await readSettings(worktreePath);
 
   let settings: ClaudeSettings = {};
-  if (originalContent) {
-    // Fail closed: a file that cannot be read may hold someone's rules.
-    const parsed: unknown = JSON.parse(originalContent);
+  // Present means present, an empty file included: only confirmed absence
+  // (null) starts from nothing. Fail closed: a file that cannot be parsed,
+  // or whose permission fields cannot be validated, may hold someone's
+  // rules, so it is refused before anything is written.
+  if (originalContent !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(originalContent);
+    } catch {
+      throw new Error(`${CLAUDE_SETTINGS_REL} cannot be parsed; overlay not applied`);
+    }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error(`${CLAUDE_SETTINGS_REL} is not a JSON object; overlay not applied`);
     }
+    validatePermissions((parsed as ClaudeSettings).permissions);
     settings = parsed as ClaudeSettings;
   }
 
   // Merge into the existing object: `ask`, `defaultMode` and any other key
   // stay as authored (review 4177f7fe, P3).
-  const existing =
-    settings.permissions &&
-    typeof settings.permissions === 'object' &&
-    !Array.isArray(settings.permissions)
-      ? settings.permissions
-      : {};
-  const existingAllow = Array.isArray(existing.allow) ? existing.allow : [];
-  const existingDeny = Array.isArray(existing.deny) ? existing.deny : [];
+  const existing = settings.permissions ?? {};
+  const existingAllow = existing.allow ?? [];
+  const existingDeny = existing.deny ?? [];
 
   settings.permissions = {
     ...existing,
@@ -113,7 +144,9 @@ export async function applyPermissionOverlay(
   // Return restore function
   return async () => {
     try {
-      if (originalContent) {
+      // The original bytes, an empty file included; only a file that did not
+      // exist is removed.
+      if (originalContent !== null) {
         await writeFile(settingsPath, originalContent);
       } else {
         // File didn't exist before overlay — remove it
