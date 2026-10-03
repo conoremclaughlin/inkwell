@@ -98,6 +98,20 @@ describe('planProfileSync', () => {
     );
   });
 
+  it('matches a deny only against an allow for the same tool', () => {
+    const plan = planProfileSync({ allow: ['Edit(git reset --hard x)'], deny: [] }, builder);
+    expect(plan.addDeny).toContain('Bash(git reset --hard *)');
+    expect(plan.kept).toEqual([]);
+  });
+
+  it("appends after the file's own denies, keeping them", () => {
+    const plan = planProfileSync({ allow: ['Read(*)'], deny: ['Bash(sudo *)'] }, builder);
+    expect((plan.permissions as { deny: string[] }).deny).toEqual([
+      'Bash(sudo *)',
+      ...builder.deny,
+    ]);
+  });
+
   it('adds the backstops to a file whose grants are broad', () => {
     const plan = planProfileSync({ allow: ['Bash(*)', 'mcp__github__*'], deny: [] }, builder);
     expect(plan.addDeny).toEqual(builder.deny);
@@ -235,12 +249,22 @@ describe('syncStudioPermissions', () => {
     ['not an object', '[]'],
     ['permissions not an object', JSON.stringify({ permissions: ['Bash(*)'] })],
     ['allow not a list', JSON.stringify({ permissions: { allow: 'Bash(*)' } })],
-    ['a rule that is not a string', JSON.stringify({ permissions: { allow: [1] } })],
+    ['an allow rule that is not a string', JSON.stringify({ permissions: { allow: [1] } })],
+    [
+      'a deny rule that is not a string',
+      JSON.stringify({ permissions: { allow: ['Read(*)'], deny: [1] } }),
+    ],
   ])('refuses a file it cannot read (%s), and leaves it as it is', (_label, text) => {
     writeSettings(text);
     const result = sync(true);
     expect(result.outcome).toBe('refused');
+    expect(result.detail).toContain('left as it is');
     expect(readFileSync(settingsPath, 'utf-8')).toBe(text);
+  });
+
+  it('names the rule list it cannot read', () => {
+    writeSettings(JSON.stringify({ permissions: { allow: [1] } }));
+    expect(sync(true).detail).toContain('permissions.allow is not a list of rules');
   });
 
   it('refuses to write through a symlinked settings file', () => {
