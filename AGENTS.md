@@ -754,6 +754,14 @@ Optional:
 
 When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
 
+### The DB integration stack: one, shared, and only when the change reaches it
+
+Docker is the scarcest resource on the development machine, and the DB integration suite (`yarn test:integration:db:local`) is its heaviest user. Three rules:
+
+1. **Ask first whether the change reaches an integration point**: the database, the server, or a provider. If it does not, its unit tests are the evidence and nothing gets booted.
+2. **When it does, run the focused files while iterating, and the full suite once**, on the head you hand over. Name that head in the review request; a reviewer does not repeat the full run on the same head. Do not fan out subagents that each run the suite.
+3. **Use the shared stack.** One stack is the design: each extra one holds most of a GiB of Docker memory and replays every migration on a cold start. A busy stack is waited on, not refused, so a new `ink-integration-<suffix>` is never the way past it. On 2026-10-02 four stacks came up in eleven minutes that way and maxed out Docker. A private stack takes `--private-stack`, is capped at one per machine, and is stopped after its run; it is for a run the shared stack cannot serve, such as withheld migrations. Mechanics are in [CONTRIBUTING.md](./CONTRIBUTING.md#integration-tests).
+
 ### Private data and public contributor attribution (IRONCLAD)
 
 **Public contributor identity is allowed; private contact and life data is not.** A contributor's public name, normal authorship credit, and established public contributor attribution in git history are not privacy incidents merely because they identify a person. Repository-work examples may name contributors. This does not make their private contact details, or other people's personal information, public.
