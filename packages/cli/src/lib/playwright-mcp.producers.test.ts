@@ -239,8 +239,11 @@ describe('completeStudio root sync (a new studio copies the main worktree .mcp.j
     );
   });
 
-  it("does not rewrite a studio's existing .mcp.json", async () => {
+  it("does not rewrite a studio's existing .mcp.json, even when the same run copies another file", async () => {
     const { main, studio } = seed(STUDIO_ENTRY_BEFORE);
+    // Root sync copies .env.local in this run, so the pin is reached and
+    // must still leave the studio's own .mcp.json alone.
+    writeFileSync(join(main, '.env.local'), 'EXAMPLE=1\n');
     const existing = {
       mcpServers: {
         inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
