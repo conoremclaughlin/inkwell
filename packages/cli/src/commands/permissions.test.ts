@@ -102,6 +102,28 @@ describe('sb permissions', () => {
     expect(settings.hooks).toBeDefined();
   });
 
+  it('reset leaves a durable {} for mode-only, ask-only, a missing key and a missing file (Lumen d74ce85d, P2 4)', () => {
+    // A mode-only bypassPermissions must not survive a reset, and a missing
+    // permissions key would be filled with a profile by the next ink init.
+    const path = join(tmpDir, '.claude', 'settings.local.json');
+    for (const before of [
+      { permissions: { defaultMode: 'bypassPermissions' }, model: 'kept' },
+      { permissions: { ask: ['Bash(*)'] }, model: 'kept' },
+      { model: 'kept' },
+    ]) {
+      mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+      writeFileSync(path, JSON.stringify(before));
+      runSb(['permissions', 'reset'], tmpDir);
+      expect(readSettings(tmpDir), JSON.stringify(before)).toEqual({
+        permissions: {},
+        model: 'kept',
+      });
+    }
+    rmSync(join(tmpDir, '.claude'), { recursive: true, force: true });
+    runSb(['permissions', 'reset'], tmpDir);
+    expect(readSettings(tmpDir)).toEqual({ permissions: {} });
+  }, 20_000);
+
   // Each case spawns the built CLI (~0.5 s), so the cases are the minimum
   // that reaches both refusals in every command, with room for a loaded run.
   it('auto, reset and show refuse a malformed settings file and leave its bytes', () => {

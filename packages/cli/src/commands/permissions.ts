@@ -154,21 +154,30 @@ export function registerPermissionsCommands(parent: Command): void {
 
   perms
     .command('reset')
-    .description('Remove all auto-approve and deny rules')
+    .description('Remove all permission rules and modes, leaving an empty permissions object')
     .action(() => {
       const cwd = process.cwd();
       const existing = readClaudeSettings(cwd);
       if (!existing) return refuseMalformed();
 
-      if (!existing.permissions?.allow?.length && !existing.permissions?.deny?.length) {
+      const current = existing.permissions;
+      if (
+        current &&
+        typeof current === 'object' &&
+        !Array.isArray(current) &&
+        Object.keys(current).length === 0
+      ) {
         console.log(chalk.dim('No permission rules to reset.'));
         return;
       }
 
-      // An empty object, not a deleted key: a studio's next `ink init` keeps
-      // an authored object and fills a missing one with its profile, so
-      // deleting the key would turn a deliberate ask-everything into the
-      // builder profile (review 4177f7fe, P2 2).
+      // Always a durable empty object, whatever was there: rules, a mode
+      // alone (a bypassPermissions mode must not survive a reset), ask rules
+      // alone, or no permissions key at all. A studio's next `ink init`
+      // keeps an authored object and fills a missing one with its profile,
+      // so a missing key would turn a deliberate reset into the builder
+      // profile (review 4177f7fe, P2 2; Lumen d74ce85d, P2 4). Every other
+      // setting is kept.
       const updated: ClaudeSettings = { ...existing, permissions: {} };
       writeClaudeSettings(cwd, updated);
 
