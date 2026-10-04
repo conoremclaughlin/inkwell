@@ -16,6 +16,7 @@ vi.mock('../../utils/logger', () => ({
 import { FakePostgrest, type Row } from '../../test/fake-postgrest';
 import { withReactionsTable, withUuidCanonicalization } from '../../test/fake-reactions-db';
 import { userPrincipal, type SbPrincipal } from '../principals';
+import { InklingThreadRefusedError } from '../inklings/inkling-thread-gate';
 import {
   REACTION_CHOICES,
   REACTION_LIMIT_PER_REACTOR,
@@ -415,16 +416,51 @@ describe('reactToMessage', () => {
       ]);
     });
 
-    it('refuses the inkling itself, though it is a member', async () => {
+    // The inkling itself: #738's gate decides, as it does for the inkling's
+    // reply. It may act only in a conversation it is already in, with its
+    // owner and none but the owner's own inklings.
+    it('lets the inkling react in its own conversation', async () => {
+      const answer = await inInklingThread(pip, { emoji: '❤️' });
+      expect(answer.reactions).toEqual([
+        { emoji: '❤️', count: 1, reactors: [{ kind: 'sb', id: pip.sbId }], mine: true },
+      ]);
+    });
+
+    it('refuses the inkling once another SB is in its conversation', async () => {
+      db.seed('inbox_thread_participants', { thread_id: inklingThread.id, sb_id: wren.sbId });
       expect(await refusal(inInklingThread(pip))).toEqual({
         status: 403,
-        code: 'inkling_reaction_refused',
+        code: 'inkling_thread_refused',
       });
       expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
     });
 
-    it('refuses the inkling even under a gate that would allow it (the #738 rule), until the follow-up', async () => {
-      const permissive = vi.fn(async () => {});
+    it('refuses the inkling in a conversation its owner has left', async () => {
+      await db
+        .from('inbox_thread_participants')
+        .delete()
+        .eq('thread_id', inklingThread.id as string)
+        .eq('user_id', ME);
+      expect(await refusal(inInklingThread(pip))).toEqual({
+        status: 403,
+        code: 'inkling_thread_refused',
+      });
+      expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
+    });
+
+    it('refuses the inkling while inklings are closed on this server', async () => {
+      vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+      expect(await refusal(inInklingThread(pip))).toEqual({
+        status: 403,
+        code: 'inklings_disabled',
+      });
+      expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
+    });
+
+    it('leaves the inkling to the gate: what the gate refuses is refused', async () => {
+      const refusing = vi.fn(async () => {
+        throw new InklingThreadRefusedError('inkling_thread_refused', 'refused by the gate');
+      });
       const refused = await refusal(
         reactToMessage(
           db,
@@ -435,10 +471,15 @@ describe('reactToMessage', () => {
             emoji: '👍',
             reactor: pip,
           },
-          { inklingGate: permissive }
+          { inklingGate: refusing }
         )
       );
-      expect(refused).toEqual({ status: 403, code: 'inkling_reaction_refused' });
+      expect(refused).toEqual({ status: 403, code: 'inkling_thread_refused' });
+      expect(refusing).toHaveBeenCalledWith(db, {
+        sender: pip,
+        participantSbs: [],
+        existingThreadId: inklingThread.id,
+      });
       expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
     });
 
