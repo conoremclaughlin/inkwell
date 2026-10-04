@@ -3885,7 +3885,7 @@ function answerInklingError(res: Response, label: string, error: unknown): void 
 }
 
 /**
- * GET /api/admin/inklings → { inklings: [...Inkling, activity] }, oldest first.
+ * GET /api/admin/inklings → { inklings: [...Inkling, activity], now }, oldest first.
  *
  * Only inklings born through this flow: never the account's other SBs, and
  * no fallback to /individuals. Reading is every role's, like threads; the
@@ -3893,17 +3893,21 @@ function answerInklingError(res: Response, label: string, error: unknown): void 
  *
  * `activity` ({ state: 'idle' | 'working' | 'stopping', since }) is each
  * listed inkling's turn state in this server process (inkling-turns.ts),
- * read for those inklings only.
+ * read for those inklings only. `now` is this server's clock as it
+ * answers, so the app measures elapsed time as now minus since and never
+ * mixes in the phone's own clock.
  */
 router.get('/inklings', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const inklings = await (await inklingService()).list(inklingScope(authReq));
+    const now = new Date().toISOString();
     res.json({
       inklings: inklings.map((inkling) => ({
         ...inkling,
         activity: inklingTurnActivity(inkling.id),
       })),
+      now,
     });
   } catch (error) {
     answerInklingError(res, 'Failed to list inklings', error);

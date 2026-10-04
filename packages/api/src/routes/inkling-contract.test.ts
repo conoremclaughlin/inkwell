@@ -237,6 +237,10 @@ describe('the server answers in the fixture shapes', () => {
     expectMatchesFixture(await call(list, undefined), fixture.inklings.list);
   });
 
+  it('list, empty: still answers with the server clock', async () => {
+    expectMatchesFixture(await call(list, undefined), fixture.inklings.listEmpty);
+  });
+
   it('list while a named inkling has a turn running', async () => {
     const awakened = await call(awaken, fixture.inklings.awaken.request);
     const id = (awakened.body.inkling as { id: string }).id;
@@ -329,6 +333,17 @@ describe("the fixture satisfies the app's adapter (inkling 2d1f1030)", () => {
       expect(['idle', 'working', 'stopping']).toContain(activity.state);
       if (activity.state === 'idle') expect(activity.since).toBeNull();
       else expect(Number.isNaN(Date.parse(activity.since))).toBe(false);
+    }
+  });
+
+  it('every list answers with an ISO now no earlier than any since', () => {
+    const { list, listWorking, listEmpty } = fixture.inklings;
+    for (const { body } of [list, listWorking, listEmpty]) {
+      expect(new Date(body.now).toISOString()).toBe(body.now);
+      for (const { activity } of body.inklings) {
+        if (activity.since)
+          expect(Date.parse(body.now)).toBeGreaterThanOrEqual(Date.parse(activity.since));
+      }
     }
   });
 
