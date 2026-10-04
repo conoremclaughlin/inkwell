@@ -72,7 +72,9 @@ describe('the owner test gate (Lumen 97b1d66a)', () => {
   it('off: awakening and naming are refused, and nothing is read or written', async () => {
     const mine = await service.awaken(ME, REQUEST); // made while the test was open
     const before = db.log.length;
-    const off = new InklingService(db as unknown as SupabaseClient, { ownerTestUserId: null });
+    const off = new InklingService(db as unknown as SupabaseClient, {
+      ownerTestUserIds: new Set(),
+    });
     await expect(off.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a')).rejects.toMatchObject(
       closed
     );
@@ -117,7 +119,9 @@ describe("cancelling an inkling's turn", () => {
   it('is the owner test only, and the caller’s own inkling only', async () => {
     const { inkling } = await service.awaken(ME, REQUEST);
     const turn = trackInklingTurn(inkling.id);
-    const off = new InklingService(db as unknown as SupabaseClient, { ownerTestUserId: null });
+    const off = new InklingService(db as unknown as SupabaseClient, {
+      ownerTestUserIds: new Set(),
+    });
     await expect(off.cancel(ME, inkling.id)).rejects.toMatchObject({
       status: 403,
       code: 'inklings_disabled',
@@ -157,7 +161,7 @@ beforeEach(() => {
 /** A service whose owner test is open to `who`, as the server's would be for that account. */
 function as(who: { userId: string }, options: InklingServiceOptions = {}): InklingService {
   return new InklingService(db as unknown as SupabaseClient, {
-    ownerTestUserId: who.userId,
+    ownerTestUserIds: new Set([who.userId]),
     ...options,
   });
 }

@@ -906,6 +906,8 @@ describe('SessionService', () => {
     describe('an inkling turn starts only in the owner test (Lumen 97b1d66a)', () => {
       const OWNER = '11111111-1111-4111-8111-111111111111';
       const SB = '3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10';
+      /** A second account in the owner test. */
+      const SECOND = '55555555-5555-4555-8555-555555555555';
       const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
       const fromOwner = {
         sender: { id: 'user', name: 'Owner' },
@@ -917,6 +919,8 @@ describe('SessionService', () => {
         inbox_thread_messages: [
           { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
           { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          // The second account's message, in the same conversation.
+          { id: 'msg-second', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: SECOND },
           // The inkling's own reply in its conversation.
           {
             id: 'msg-inkling',
@@ -1057,6 +1061,27 @@ describe('SessionService', () => {
         const result = await turn(INKLING);
         expect(mockClaudeRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it("a second account in the test wakes its own inkling with its own message, and no other account's message does", async () => {
+        // OWNER is listed first, so a wake proof bound to any one listed
+        // account, rather than to this inkling's own owner, fails here.
+        vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', `${OWNER},${SECOND}`);
+        const theirs = { row: { user_id: SECOND }, session: { userId: SECOND } };
+        const asSecond = (triggerThreadMessageId: string) => ({
+          userId: SECOND,
+          sender: { id: 'user', name: 'Tester' },
+          metadata: { triggerThreadMessageId },
+        });
+
+        const woken = await turn(INKLING, asSecond('msg-second'), OWNER, theirs);
+        expect(woken.errorCode).not.toBe('INKLING_TURN_REFUSED');
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+
+        // The first account is in the test too, but it is not this inkling's owner.
+        const notTheirs = await turn(INKLING, asSecond('msg-owner'), OWNER, theirs);
+        expect(notTheirs.errorCode).toBe('INKLING_TURN_REFUSED');
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
       });
 
       it("the inkling's own reply starts no turn and takes nothing from its cap", async () => {
