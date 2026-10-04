@@ -63,6 +63,7 @@ vi.mock('../utils/request-context', () => ({
 }));
 
 import router from './admin';
+import { trackInklingTurn } from '../services/inklings/inkling-turns';
 
 const fixture = JSON.parse(
   readFileSync(path.join(__dirname, '../test/fixtures/inkling-contract-v3.json'), 'utf8')
@@ -236,6 +237,27 @@ describe('the server answers in the fixture shapes', () => {
     expectMatchesFixture(await call(list, undefined), fixture.inklings.list);
   });
 
+  it('list, empty: still answers with the server clock', async () => {
+    expectMatchesFixture(await call(list, undefined), fixture.inklings.listEmpty);
+  });
+
+  it('list while a named inkling has a turn running', async () => {
+    const awakened = await call(awaken, fixture.inklings.awaken.request);
+    const id = (awakened.body.inkling as { id: string }).id;
+    await call(name, fixture.inklings.name.request, { params: { id } });
+    const turn = trackInklingTurn(id);
+    try {
+      const answer = await call(list, undefined);
+      expectMatchesFixture(answer, fixture.inklings.listWorking);
+      const [listed] = answer.body.inklings as Array<{ activity: { state: string } }>;
+      expect(listed.activity.state).toBe(
+        fixture.inklings.listWorking.body.inklings[0].activity.state
+      );
+    } finally {
+      turn.done();
+    }
+  });
+
   it('name: named, invalid, not nameable, unknown', async () => {
     const f = fixture.inklings.name;
     const awakened = await call(awaken, fixture.inklings.awaken.request);
@@ -299,6 +321,29 @@ describe("the fixture satisfies the app's adapter (inkling 2d1f1030)", () => {
       expect(Number.isNaN(Date.parse(inkling.createdAt))).toBe(false);
       // createConversation() resolves recipients from an inkling id to its slug.
       expect(typeof inkling.sbSlug).toBe('string');
+    }
+  });
+
+  it("every listed inkling's activity is one of three states, with since null exactly when idle", () => {
+    const listed = [
+      ...fixture.inklings.list.body.inklings,
+      ...fixture.inklings.listWorking.body.inklings,
+    ];
+    for (const { activity } of listed) {
+      expect(['idle', 'working', 'stopping']).toContain(activity.state);
+      if (activity.state === 'idle') expect(activity.since).toBeNull();
+      else expect(Number.isNaN(Date.parse(activity.since))).toBe(false);
+    }
+  });
+
+  it('every list answers with an ISO now no earlier than any since', () => {
+    const { list, listWorking, listEmpty } = fixture.inklings;
+    for (const { body } of [list, listWorking, listEmpty]) {
+      expect(new Date(body.now).toISOString()).toBe(body.now);
+      for (const { activity } of body.inklings) {
+        if (activity.since)
+          expect(Date.parse(body.now)).toBeGreaterThanOrEqual(Date.parse(activity.since));
+      }
     }
   });
 
