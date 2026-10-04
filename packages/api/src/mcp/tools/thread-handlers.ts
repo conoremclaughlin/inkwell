@@ -24,15 +24,18 @@ import {
   resolveSbInWorkspace,
   resolveSbsByIds,
   senderColumns,
+  userPrincipal,
   type Principal,
   type SbPrincipal,
   type UserPrincipal,
 } from '../../services/principals';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { readTieRemainder } from './tie-completion.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
+import { threadLinkHeader } from './thread-link-views.js';
 import {
   REACTIONS_ARE_NOT_APPROVAL,
   ReactionRefusedError,
@@ -955,6 +958,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     }
   }
 
+  // What the thread links to and what links to it (thread:thread-links).
+  // A delivery poll is the hot path and only wants messages, so it skips this.
+  const links = channelPoll ? null : await threadLinkHeader(supabase, caller, thread);
+
   return {
     content: [
       {
@@ -971,6 +978,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           createdBy: await creatorLabel(supabase, thread, participants),
           participants: participantSlugs(participants),
           people: participants.map((p) => p.userId).filter((id): id is string => !!id),
+          ...(links ? ('error' in links ? { linksError: links.error } : { links }) : {}),
           messageCount: messages?.length || 0,
           // Truncation is visible, never silent: how many older matching
           // messages were cut by the cold-start guard or latestN window.
@@ -1108,6 +1116,16 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       ],
     };
   }
+
+  // A conversation with an inkling has its members fixed when it is made,
+  // and no other conversation takes an inkling (inkling-thread-gate.ts):
+  // the same rule the send path asks, before anything is written or woken.
+  // Throws on refusal.
+  await assertInklingThreadAllowed(supabase, {
+    sender: actor ?? userPrincipal(resolved.user.id),
+    participantSbs: [newcomer],
+    existingThreadId: thread.id,
+  });
 
   // Add participant
   const { error: addError } = await threadTable(supabase, 'inbox_thread_participants').insert({

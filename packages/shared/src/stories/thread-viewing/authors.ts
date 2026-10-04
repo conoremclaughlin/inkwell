@@ -62,6 +62,15 @@ export function toConversationMessage(
     priority: PRIORITIES.has(message.priority)
       ? (message.priority as ConversationMessage['priority'])
       : undefined,
+    ...(message.reactions
+      ? {
+          reactions: message.reactions.map((r) => ({
+            emoji: r.emoji,
+            count: r.count,
+            mine: r.mine,
+          })),
+        }
+      : {}),
   };
 }
 

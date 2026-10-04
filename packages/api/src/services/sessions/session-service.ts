@@ -95,7 +95,7 @@ import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import {
-  inklingOwnerTestUserId,
+  inklingOwnerTestUserIds,
   inklingTurnCap,
   inklingTurnTimeoutMs,
 } from '../../config/inkling-flags.js';
@@ -2321,18 +2321,20 @@ export class SessionService implements ISessionService {
           },
         };
       };
-      const ownerTestUserId = inklingOwnerTestUserId();
+      const ownerTestUserIds = inklingOwnerTestUserIds();
+      // Only the inkling's own owner can have sent the message that wakes
+      // it. Whether that owner is in the test at all is the refusal's call.
       const ownerMessage =
         inklingIdentity.kind === 'inkling'
           ? await isOwnersOwnMessage(this.supabase, {
               threadMessageId: metadata?.triggerThreadMessageId,
               inklingId: inklingIdentity.id,
-              ownerUserId: ownerTestUserId,
+              ownerUserId: inklingIdentity.userId,
             })
           : 'no';
       const inklingRefusal = inklingTurnRefusal(
         { identity: inklingIdentity, userId, ownerMessage },
-        ownerTestUserId
+        ownerTestUserIds
       );
       if (inklingRefusal) {
         return refuseInklingTurn(inklingRefusal.reason, inklingRefusal.retryable);

@@ -61,6 +61,7 @@ WINDOWED_FIXTURE_TABLES = (
      ("observation_conflicts", "publication_operation_events", "publication_operations",
       "task_authority_holds")),
     ("20261002225412", "", ("wake_source_breakers",)),
+    ("20261004085434", "", ("thread_links",)),
     ("20261004095944", "", ("thread_message_reactions",)),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")

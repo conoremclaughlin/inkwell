@@ -3,7 +3,8 @@ import {
   DEFAULT_AWAKEN_CAP,
   DEFAULT_TURN_CAP,
   inklingAwakenCap,
-  inklingOwnerTestUserId,
+  inklingOwnerTestAllowlist,
+  inklingOwnerTestUserIds,
   inklingTurnCap,
   inklingTurnTimeoutMs,
   isInklingOwnerTestUser,
@@ -31,36 +32,70 @@ describe('inklingTurnCap', () => {
   });
 });
 
-describe('inklingOwnerTestUserId', () => {
-  const OWNER = '11111111-1111-4111-8111-111111111111';
+describe('inklingOwnerTestAllowlist', () => {
+  // Letters in the ids, so that their case can differ at all.
+  const OWNER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const TESTER = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+  const ids = (source: Record<string, string | undefined>) => [...inklingOwnerTestUserIds(source)];
 
   it('is off unless it names a user: unset, blank, 1, true and junk are all off', () => {
-    for (const raw of [undefined, '', '  ', '1', 'true', 'on', 'owner', `${OWNER}x`]) {
-      expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: raw })).toBeNull();
+    for (const raw of [undefined, '', '  ', '1', 'true', 'on', 'owner', '*', `${OWNER}x`]) {
+      expect(ids({ INKLING_OWNER_TEST_USER_ID: raw }), String(raw)).toEqual([]);
+      expect(ids({ INKLING_OWNER_TEST_USER_IDS: raw }), String(raw)).toEqual([]);
     }
   });
 
-  it('names one user, in lowercase', () => {
-    expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: ` ${OWNER} ` })).toBe(OWNER);
-    expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: OWNER.toUpperCase() })).toBe(OWNER);
+  it('still honours the single account the test began with, in lowercase', () => {
+    expect(ids({ INKLING_OWNER_TEST_USER_ID: ` ${OWNER.toUpperCase()} ` })).toEqual([OWNER]);
+  });
+
+  it('lists accounts, comma-separated, joined with the single one, each once', () => {
+    expect(ids({ INKLING_OWNER_TEST_USER_IDS: ` ${TESTER.toUpperCase()} , ${OWNER}` })).toEqual([
+      TESTER,
+      OWNER,
+    ]);
+    expect(
+      ids({ INKLING_OWNER_TEST_USER_IDS: `${TESTER},${OWNER}`, INKLING_OWNER_TEST_USER_ID: OWNER })
+    ).toEqual([TESTER, OWNER]);
+    expect(ids({ INKLING_OWNER_TEST_USER_IDS: TESTER, INKLING_OWNER_TEST_USER_ID: OWNER })).toEqual(
+      [TESTER, OWNER]
+    );
+  });
+
+  it('leaves out an entry that is not a whole UUID, and says where without saying what', () => {
+    const allowlist = inklingOwnerTestAllowlist({
+      INKLING_OWNER_TEST_USER_IDS: `${OWNER}, *,${TESTER.slice(0, -1)}, ,${TESTER}`,
+      INKLING_OWNER_TEST_USER_ID: 'everyone',
+    });
+    expect([...allowlist.userIds]).toEqual([OWNER, TESTER]);
+    // Entry 4 is blank: a stray comma, not a mistake.
+    expect(allowlist.malformed).toEqual([
+      'INKLING_OWNER_TEST_USER_IDS entry 2',
+      'INKLING_OWNER_TEST_USER_IDS entry 3',
+      'INKLING_OWNER_TEST_USER_ID',
+    ]);
+    expect(allowlist.malformed.join(' ')).not.toContain(TESTER.slice(0, 8));
   });
 });
 
 describe('isInklingOwnerTestUser', () => {
-  // Letters in the id, so that its case can differ at all.
   const OWNER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const TESTER = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
   const SOMEONE = '22222222-2222-4222-8222-222222222222';
 
-  it("is true for the test's account in any letter case, and for nobody else", () => {
-    expect(isInklingOwnerTestUser(OWNER, OWNER)).toBe(true);
-    expect(isInklingOwnerTestUser(OWNER.toUpperCase(), OWNER)).toBe(true);
-    expect(isInklingOwnerTestUser(OWNER, OWNER.toUpperCase())).toBe(true);
-    expect(isInklingOwnerTestUser(SOMEONE, OWNER)).toBe(false);
+  it('is true for every listed account in any letter case, and for nobody else', () => {
+    const allowlist = inklingOwnerTestUserIds({
+      INKLING_OWNER_TEST_USER_IDS: `${OWNER},${TESTER}`,
+    });
+    expect(isInklingOwnerTestUser(OWNER, allowlist)).toBe(true);
+    expect(isInklingOwnerTestUser(OWNER.toUpperCase(), allowlist)).toBe(true);
+    expect(isInklingOwnerTestUser(TESTER, allowlist)).toBe(true);
+    expect(isInklingOwnerTestUser(SOMEONE, allowlist)).toBe(false);
   });
 
   it('is false for everyone while the test is off', () => {
     for (const userId of [OWNER, SOMEONE, '']) {
-      expect(isInklingOwnerTestUser(userId, null), userId).toBe(false);
+      expect(isInklingOwnerTestUser(userId, new Set()), userId).toBe(false);
     }
   });
 });

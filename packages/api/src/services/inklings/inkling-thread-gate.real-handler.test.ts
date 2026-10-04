@@ -33,6 +33,15 @@ const gateway = vi.hoisted(() => ({
 vi.mock('../../channels/agent-gateway', () => ({
   getAgentGateway: vi.fn(() => gateway),
 }));
+/**
+ * The SBs a send woke: one dispatchTrigger per wake. processTrigger runs
+ * for every addressed recipient as routing-only assignment, which starts
+ * no turn, so it is not counted.
+ */
+const woken = (): string[] =>
+  (gateway.dispatchTrigger.mock.calls as unknown as Array<[{ toSlug: string }]>)
+    .map(([payload]) => payload.toSlug)
+    .sort();
 vi.mock('../../auth/ink-tokens', () => ({
   signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
@@ -59,6 +68,7 @@ vi.mock('../../utils/logger', () => ({
 
 import router from '../../routes/admin';
 import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
+import { handleAddThreadParticipant } from '../../mcp/tools/thread-handlers';
 import { getRequestContext } from '../../utils/request-context';
 import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
 
@@ -252,9 +262,7 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
   it("the inkling's reply wakes nobody: no trigger is dispatched and its cap is untouched", async () => {
     // Control: the owner's message does wake the inkling.
     await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
-    const wakes = () =>
-      gateway.dispatchTrigger.mock.calls.length + gateway.processTrigger.mock.calls.length;
-    expect(wakes()).toBeGreaterThan(0);
+    expect(woken()).toEqual(['pip']);
     gateway.dispatchTrigger.mockClear();
     gateway.processTrigger.mockClear();
     const metadataBefore = structuredClone(
@@ -262,7 +270,7 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
     );
 
     expect(await replyAs(asSb('pip'))).toBeNull();
-    expect(wakes()).toBe(0);
+    expect(woken()).toEqual([]);
     const pip = db.rows('agent_identities').find((r) => r.id === 'sb-pip');
     expect(pip?.metadata).toEqual(metadataBefore);
   });
@@ -276,14 +284,20 @@ function asSb(slug: string, userId = ME): Row {
 /** A send by `principal` on `key`, addressed to itself unless `recipients` are given. */
 async function replyAs(
   principal: Row,
-  opts: { key?: string; recipients?: string[] } = {}
+  opts: { key?: string; recipients?: string[]; messageType?: string } = {}
 ): Promise<unknown> {
   const dataComposer = { repositories: {}, getClient: () => db };
   const to = opts.recipients
     ? { recipients: opts.recipients }
     : { recipientSlug: principal.sbSlug as string };
   return handleSendToInbox(
-    { userId: ME, threadKey: opts.key ?? KEY, ...to, content: 'from the inkling' },
+    {
+      userId: ME,
+      threadKey: opts.key ?? KEY,
+      ...to,
+      content: 'from the inkling',
+      ...(opts.messageType ? { messageType: opts.messageType } : {}),
+    },
     dataComposer as never,
     { sender: { principal: principal as never, workspaceId: WS } }
   ).then(
@@ -421,5 +435,486 @@ describe('a conversation with no inkling', () => {
       });
       expect(res.status).toBe(200);
     }
+  });
+});
+
+describe('with more than one account in the owner test, each reaches only its own inklings', () => {
+  beforeEach(() => {
+    // The list alone, with the single-account variable unset.
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', `${ME},${SOMEONE}`);
+    sb('moss', OWNER_TEST_INKLING, SOMEONE);
+  });
+
+  it('each listed account may start a conversation with its own inkling, and its inkling may reply', async () => {
+    expect((await call(create, { key: KEY, recipients: ['pip'], content: 'hi' })).status).toBe(200);
+    const theirs = 'chat:conversation-moss';
+    expect(
+      (await call(create, { key: theirs, recipients: ['moss'], content: 'hi' }, SOMEONE)).status
+    ).toBe(200);
+    expect(await replyAs(asSb('moss', SOMEONE), { key: theirs })).toBeNull();
+    expect(await replyAs(asSb('pip'))).toBeNull();
+    expect(db.rows('inbox_thread_messages')).toHaveLength(4);
+  });
+
+  it("a listed account may not start a conversation with, or write into, another listed account's inkling", async () => {
+    const intruding = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' }, SOMEONE);
+    expect(intruding).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    const reverse = await call(create, { key: 'chat:moss', recipients: ['moss'], content: 'hi' });
+    expect(reverse).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    expect(written()).toEqual(NOTHING);
+
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const before = written();
+    const replying = await call(reply, { key: KEY, content: 'me too' }, SOMEONE);
+    expect(replying.status).not.toBe(200);
+    expect(written()).toEqual(before);
+  });
+
+  it('an account left off the list is refused, and an empty list closes the test', async () => {
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', SOMEONE);
+    const res = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    expect(res).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', ' , ');
+    const off = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    expect(off).toMatchObject({ status: 403, body: { code: 'inklings_disabled' } });
+    expect(written()).toEqual(NOTHING);
+  });
+});
+
+describe("owner-present groups of the owner's own inklings, up to three", () => {
+  beforeEach(() => {
+    sb('tam', OWNER_TEST_INKLING);
+    sb('wisp', OWNER_TEST_INKLING);
+    sb('kit', OWNER_TEST_INKLING);
+  });
+
+  it('the owner may start one with two or three of their inklings, and write in it', async () => {
+    const two = await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    expect(two.status).toBe(200);
+    expect((await call(reply, { key: KEY, content: 'and again' })).status).toBe(200);
+    const three = await call(create, {
+      key: 'chat:three',
+      recipients: ['pip', 'tam', 'wisp'],
+      content: 'hi',
+    });
+    expect(three.status).toBe(200);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(3);
+  });
+
+  it('each member inkling may reply, and its reply wakes nobody', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    // Control: the owner's message woke every member.
+    expect(woken()).toEqual(['pip', 'tam']);
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    for (const slug of ['pip', 'tam']) {
+      expect(await replyAs(asSb(slug)), slug).toBeNull();
+    }
+    expect(db.rows('inbox_thread_messages')).toHaveLength(3);
+    expect(woken()).toEqual([]);
+  });
+
+  it('a member inkling addressing its siblings, or asking for action, still wakes nobody', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    expect(await replyAs(asSb('pip'), { recipients: ['pip', 'tam'] })).toBeNull();
+    expect(await replyAs(asSb('pip'), { messageType: 'task_request' })).toBeNull();
+    expect(await replyAs(asSb('tam'), { messageType: 'session_resume' })).toBeNull();
+    expect(woken()).toEqual([]);
+  });
+
+  it("in a one-to-one too, an inkling's actionable message to itself wakes nobody (#738's disclosed edge)", async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    for (const messageType of ['task_request', 'session_resume']) {
+      expect(await replyAs(asSb('pip'), { messageType }), messageType).toBeNull();
+    }
+    expect(woken()).toEqual([]);
+  });
+
+  it("an ordinary SB's reply in a person's group thread still wakes whom it names (unchanged)", async () => {
+    // Must-not-change control (Myra 495a3ba8): only an inkling sender is
+    // quiet, never an SB sender as such, and never a thread's shape.
+    sb('sage');
+    sb('myra');
+    const team = 'chat:team';
+    const started = await call(create, {
+      key: team,
+      recipients: ['fern', 'sage', 'myra'],
+      content: 'hi',
+    });
+    expect(started.status).toBe(200);
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    expect(await replyAs(asSb('fern'), { key: team, recipients: ['sage', 'myra'] })).toBeNull();
+    expect(woken()).toEqual(['myra', 'sage']);
+  });
+
+  /** A send by the owner, as a person, through the handler (not create-only). */
+  const ownerSend = (key: string, recipients: string[]) =>
+    handleSendToInbox(
+      { userId: ME, threadKey: key, recipients, content: 'from the owner' },
+      { repositories: {}, getClient: () => db } as never,
+      { sender: { principal: { kind: 'user', userId: ME } as never, workspaceId: WS } }
+    );
+  const sbMembers = (key: string) => {
+    const thread = db.rows('inbox_threads').find((t) => t.thread_key === key);
+    return db
+      .rows('inbox_thread_participants')
+      .filter((p) => p.thread_id === thread?.id && !!p.sb_id)
+      .map((p) => p.sb_id as string)
+      .sort();
+  };
+
+  it('a conversation keeps the inklings it was created with: the owner may not add one', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    const before = written();
+    await expect(ownerSend(KEY, ['wisp'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+  });
+
+  // Lumen's review of #740 at 290990dc: two concurrent additions each read
+  // the two-member conversation, each passed the cap, and it ended with 4.
+  it('concurrent owner additions never grow the conversation', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    const results = await Promise.allSettled([ownerSend(KEY, ['wisp']), ownerSend(KEY, ['kit'])]);
+    expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected']);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+  });
+
+  it('of two sends that each find no conversation, only the one that creates it writes', async () => {
+    // inbox_threads_workspace_key: UNIQUE (workspace_id, thread_key).
+    db.unique.inbox_threads = [
+      {
+        name: 'inbox_threads_workspace_key',
+        key: (r) => `${String(r.workspace_id)}:${String(r.thread_key)}`,
+      },
+    ];
+    const results = await Promise.allSettled([
+      ownerSend(KEY, ['pip', 'tam']),
+      ownerSend(KEY, ['wisp', 'kit']),
+    ]);
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual(['fulfilled', 'rejected']);
+    const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(lost.reason).toBeInstanceOf(InklingThreadRefusedError);
+    expect(db.rows('inbox_threads').filter((t) => t.thread_key === KEY)).toHaveLength(1);
+    const members = sbMembers(KEY);
+    expect([
+      ['sb-pip', 'sb-tam'],
+      ['sb-kit', 'sb-wisp'],
+    ]).toContainEqual(members);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an inkling conversation is marked as one on its thread row when it is created', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    await call(create, { key: 'chat:fern', recipients: ['fern'], content: 'hi' });
+    const markOf = (key: string) =>
+      (db.rows('inbox_threads').find((t) => t.thread_key === key)?.metadata as Row | undefined)
+        ?.inklingConversation;
+    expect(markOf(KEY)).toBe(true);
+    expect(markOf('chat:fern')).toBeUndefined();
+  });
+
+  it('a marked conversation whose inklings are not visible yet takes no other send', async () => {
+    const thread = db.seed('inbox_threads', {
+      thread_key: KEY,
+      workspace_id: WS,
+      metadata: { inklingConversation: true },
+    });
+    db.seed('inbox_thread_participants', { thread_id: thread.id, workspace_id: WS, user_id: ME });
+    await expect(ownerSend(KEY, ['fern'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    expect(await replyAs(asSb('fern'), { key: KEY })).toBeInstanceOf(InklingThreadRefusedError);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+  });
+
+  /**
+   * Holds the next send at its second inbox_threads lookup: after the
+   * gate's look found no conversation, before findOrCreateThread's own.
+   * `atPause` resolves when it is held; `release` lets it go on.
+   */
+  function holdAtSecondThreadLookup() {
+    let reached!: () => void;
+    let release!: () => void;
+    const atPause = new Promise<void>((resolve) => (reached = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const realFrom = db.from.bind(db);
+    let lookups = 0;
+    let armed = true;
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'inbox_threads' && armed) {
+        const realMaybeSingle = query.maybeSingle.bind(query);
+        query.maybeSingle = async () => {
+          lookups += 1;
+          if (armed && lookups === 2) {
+            armed = false;
+            reached();
+            await released;
+          }
+          return realMaybeSingle();
+        };
+      }
+      return query;
+    }) as typeof db.from;
+    return { atPause, release, restore: () => (db.from = realFrom) };
+  }
+
+  // Lumen, 24a82534: an ordinary conversation and an inkling conversation
+  // racing for one key, in both orders. The loser must not join a winner of
+  // the other kind on the strength of how it was judged before the race.
+  it('an ordinary send that found no conversation never joins the inkling conversation made meanwhile', async () => {
+    const hold = holdAtSecondThreadLookup();
+    const ordinary = ownerSend(KEY, ['fern']).then(
+      () => null,
+      (e: unknown) => e
+    );
+    await hold.atPause;
+    hold.restore();
+    await ownerSend(KEY, ['pip', 'tam']);
+    hold.release();
+    expect(await ordinary).toBeInstanceOf(InklingThreadRefusedError);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an inkling send that found no conversation never joins the ordinary conversation made meanwhile', async () => {
+    const hold = holdAtSecondThreadLookup();
+    const inkling = ownerSend(KEY, ['pip', 'tam']).then(
+      () => null,
+      (e: unknown) => e
+    );
+    await hold.atPause;
+    hold.restore();
+    await ownerSend(KEY, ['fern']);
+    hold.release();
+    expect(await inkling).toBeInstanceOf(InklingThreadRefusedError);
+    expect(sbMembers(KEY)).toEqual(['sb-fern']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an inkling conversation is closed to other sends from the moment its thread row exists', async () => {
+    // Hold the creating send between its thread insert and its members'.
+    let reached!: () => void;
+    let release!: () => void;
+    const atPause = new Promise<void>((resolve) => (reached = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const realFrom = db.from.bind(db);
+    let armed = true;
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'inbox_thread_participants' && armed) {
+        const realInsert = query.insert.bind(query);
+        query.insert = ((values: Row | Row[]) => {
+          realInsert(values);
+          if (armed) {
+            armed = false;
+            const realThen = query.then.bind(query);
+            query.then = ((onFulfilled, onRejected) => {
+              reached();
+              return released.then(() => realThen(onFulfilled, onRejected));
+            }) as typeof query.then;
+          }
+          return query;
+        }) as typeof query.insert;
+      }
+      return query;
+    }) as typeof db.from;
+
+    const creating = ownerSend(KEY, ['pip', 'tam']);
+    await atPause;
+    db.from = realFrom;
+    expect(db.rows('inbox_threads')).toHaveLength(1);
+    expect(sbMembers(KEY)).toEqual([]);
+    await expect(ownerSend(KEY, ['fern'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    release();
+    await creating;
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('more than three is refused whole', async () => {
+    const res = await call(create, {
+      key: KEY,
+      recipients: ['pip', 'tam', 'wisp', 'kit'],
+      content: 'hi',
+    });
+    expect(res).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    expect(written()).toEqual(NOTHING);
+  });
+
+  it("a non-inkling SB, or another account's inkling, is never in a group", async () => {
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', SOMEONE);
+    sb('moss', OWNER_TEST_INKLING, SOMEONE);
+    for (const recipients of [
+      ['pip', 'tam', 'fern'],
+      ['pip', 'moss'],
+    ]) {
+      const res = await call(create, {
+        key: `chat:${recipients.join('-')}`,
+        recipients,
+        content: 'hi',
+      });
+      expect(res, recipients.join()).toMatchObject({
+        status: 403,
+        body: { code: 'inkling_thread_refused' },
+      });
+    }
+    expect(written()).toEqual(NOTHING);
+  });
+
+  it('a member inkling may not reply without the owner present, or bring a sibling in', async () => {
+    seedThread([
+      { sb_id: 'sb-pip', user_id: null },
+      { sb_id: 'sb-tam', user_id: null },
+    ]);
+    expect(await replyAs(asSb('pip'))).toBeInstanceOf(InklingThreadRefusedError);
+
+    await call(create, { key: 'chat:pair', recipients: ['pip', 'tam'], content: 'hi' });
+    const before = written();
+    expect(
+      await replyAs(asSb('pip'), { key: 'chat:pair', recipients: ['pip', 'wisp'] })
+    ).toBeInstanceOf(InklingThreadRefusedError);
+    expect(await replyAs(asSb('wisp'), { key: 'chat:pair' })).toBeInstanceOf(
+      InklingThreadRefusedError
+    );
+    expect(written()).toEqual(before);
+  });
+});
+
+describe('membership is fixed for every writer: add_thread_participant (Lumen 0d0d6f6e)', () => {
+  beforeEach(() => {
+    sb('tam', OWNER_TEST_INKLING);
+    sb('wisp', OWNER_TEST_INKLING);
+    sb('kit', OWNER_TEST_INKLING);
+    sb('sage');
+    // The person's own workspace, where a caller bound to no SB writes.
+    db.seed('workspaces', {
+      id: WS,
+      user_id: ME,
+      type: 'personal',
+      slug: 'personal',
+      archived_at: null,
+    });
+    // An SB writes with its owner's role, read from the membership table.
+    db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
+  });
+
+  /** add_thread_participant as an MCP caller bound to `actor`, or as the person when null. */
+  const addAs = async (actor: string | null, newcomer: string): Promise<unknown> => {
+    if (actor) {
+      vi.mocked(getRequestContext).mockImplementation(
+        () => ({ userId: ME, sbId: `sb-${actor}`, sbSlug: actor }) as never
+      );
+    }
+    try {
+      return await handleAddThreadParticipant(
+        { userId: ME, threadKey: KEY, sbSlug: newcomer, triggerNewParticipant: true },
+        { repositories: {}, getClient: () => db } as never
+      ).then(
+        (r) => JSON.parse(r.content[0].text) as Row,
+        (e: unknown) => e
+      );
+    } finally {
+      vi.mocked(getRequestContext).mockImplementation(() => ({ userId: ME }) as never);
+    }
+  };
+
+  /** A group's members as stored. */
+  const sbMembers = () =>
+    db
+      .rows('inbox_thread_participants')
+      .filter((p) => !!p.sb_id)
+      .map((p) => p.sb_id)
+      .sort();
+
+  it('a member inkling may not add a fourth inkling to its group: nothing written, nobody woken', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam', 'wisp'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs('pip', 'kit')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(sbMembers()).toEqual(['sb-pip', 'sb-tam', 'sb-wisp']);
+    expect(woken()).toEqual([]);
+  });
+
+  it('the owner may not add to their own inkling conversation either: its members are fixed when it is made', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    for (const newcomer of ['wisp', 'fern']) {
+      expect(await addAs(null, newcomer), newcomer).toBeInstanceOf(InklingThreadRefusedError);
+    }
+    expect(written()).toEqual(before);
+    expect(woken()).toEqual([]);
+  });
+
+  it('a legacy inkling conversation, with no mark, takes no ordinary SB from anyone', async () => {
+    seedThread([
+      { sb_id: 'sb-pip', user_id: null },
+      { sb_id: null, user_id: ME },
+    ]);
+    const before = written();
+    expect(await addAs('pip', 'fern')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(await addAs(null, 'fern')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(woken()).toEqual([]);
+  });
+
+  it('an ordinary conversation takes no inkling, from an SB in it or from the owner', async () => {
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs('fern', 'pip')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(await addAs(null, 'pip')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(woken()).toEqual([]);
+  });
+
+  it('must not change: an ordinary conversation still takes an ordinary SB, records it and wakes it', async () => {
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs('fern', 'sage')).toMatchObject({ success: true, sbSlug: 'sage' });
+    expect(sbMembers()).toEqual(['sb-fern', 'sb-sage']);
+    expect(written()).toEqual({
+      ...before,
+      participants: before.participants + 1,
+      messages: before.messages + 1,
+    });
+    expect(woken()).toEqual(['sage']);
+  });
+
+  it('must not change: adding a member already there is a no-op, in an inkling conversation too', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs(null, 'tam')).toMatchObject({ success: true, alreadyParticipant: true });
+    expect(written()).toEqual(before);
+    expect(woken()).toEqual([]);
+  });
+
+  it('an inkling acting on a conversation it is not in may not add to it, though everyone in it is ordinary (Lumen 14e33aeb)', async () => {
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs('pip', 'sage')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(sbMembers()).toEqual(['sb-fern']);
+    expect(woken()).toEqual([]);
+  });
+
+  it('must not change: an ordinary SB outside an ordinary conversation still adds to it, and is not counted as joining', async () => {
+    sb('moss');
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    expect(await addAs('moss', 'sage')).toMatchObject({ success: true, sbSlug: 'sage' });
+    expect(sbMembers()).toEqual(['sb-fern', 'sb-sage']);
+    expect(woken()).toEqual(['sage']);
   });
 });

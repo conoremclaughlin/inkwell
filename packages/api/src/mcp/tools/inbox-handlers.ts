@@ -66,8 +66,13 @@ import {
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
-import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
+import {
+  assertInklingThreadAllowed,
+  INKLING_CONVERSATION_MARK,
+} from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
+import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
+import { linkReaderForPrincipal } from './thread-link-views.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -140,7 +145,19 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(80)
     .optional()
     .describe('Deprecated spelling of sessionKey; use sessionKey.'),
-  relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
+  relatedArtifactUri: z
+    .string()
+    .optional()
+    .describe(
+      'Related artifact URI. With a threadKey, it links the thread to the artifact, as one of `links`; an unknown URI is reported under links.skipped rather than refusing the send.'
+    ),
+  links: z
+    .array(z.string().min(3).max(500))
+    .max(SEND_LINKS_MAX)
+    .optional()
+    .describe(
+      'Thread only: link the thread to these threads or library artifacts as the message is sent, e.g. ["spec:live-agent-surfaces", "ink://specs/thread-media"]. A target the thread already links is left as it is. An unknown ink:// URI or malformed key refuses the send before anything is stored. Read links with list_thread_links.'
+    ),
   metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
@@ -432,6 +449,7 @@ export async function handleSendToInbox(
     recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
+    links,
     metadata: callerMetadata = {},
     expiresAt,
     triggerType,
@@ -481,6 +499,12 @@ export async function handleSendToInbox(
   }
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
+  }
+  // A link is made by a thread; without one there is nothing to link from,
+  // and the non-thread path would deliver the message and drop the links
+  // (Lumen, #737).
+  if (links?.length && !threadKey) {
+    throw new Error('threadKey is required when using links[]: links are made by a thread');
   }
   if (
     recipients &&
@@ -708,9 +732,10 @@ export async function handleSendToInbox(
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
 
-    // A conversation with an inkling is only between it and its owner, in
-    // the owner test (Lumen 97b1d66a). Asked before anything is written.
-    await assertInklingThreadAllowed(supabase, {
+    // A conversation with an inkling is only between its owner and the
+    // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
+    // anything is written. An inkling's own send wakes nobody (`quiet`).
+    let inklingVerdict = await assertInklingThreadAllowed(supabase, {
       sender,
       participantSbs,
       existingThreadId: existingThread?.id ?? null,
@@ -722,6 +747,26 @@ export async function handleSendToInbox(
       prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, workspaceId, threadKey);
     }
 
+    // Links the send carries (thread:thread-links), resolved before anything
+    // is written so a bad target stores nothing. relatedArtifactUri joins
+    // them: this path used to accept it and drop it.
+    const sendLinks =
+      (links && links.length > 0) || relatedArtifactUri
+        ? await resolveSendLinks(
+            supabase,
+            {
+              workspaceId,
+              callerUserId: sender.kind === 'system' ? resolved.user.id : sender.userId,
+              // The sender links only what it may see, the same rule as
+              // link_thread (thread-link-views).
+              reader: await linkReaderForPrincipal(supabase, workspaceId, sender),
+            },
+            threadKey,
+            links ?? [],
+            relatedArtifactUri
+          )
+        : null;
+
     // ── Reply semantics ──
     // A closed thread accepts replies. Closed is a work-state signal, not a
     // lock (spec inkmail-thread-scope §2): the reply is stored, counts as
@@ -731,6 +776,13 @@ export async function handleSendToInbox(
     // If sender is NOT a participant, auto-add them (join-on-send).
 
     // Find or create thread
+    // Written with the thread row only if this send creates it. An inkling
+    // conversation is marked in that same insert, so a send that loses the
+    // race to create it sees what it is before any member row is written.
+    const newThreadMetadata: Record<string, unknown> = {
+      ...(internal?.createIntent ? { createIntent: internal.createIntent } : {}),
+      ...(inklingVerdict.inklingConversation ? { [INKLING_CONVERSATION_MARK]: true } : {}),
+    };
     let thread = await findOrCreateThread(supabase, {
       workspaceId,
       threadKey,
@@ -738,13 +790,25 @@ export async function handleSendToInbox(
       title: subject || null,
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
-      ...(internal?.createIntent ? { metadata: { createIntent: internal.createIntent } } : {}),
+      ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
     });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
     // and the insert. Nothing has been written yet (findOrCreateThread writes
     // only for a thread it created), and nothing may be.
     if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
+    // A send that found no conversation but did not create this one lost the
+    // race to another send. It was judged as a creator, against no members,
+    // so it is judged again against the conversation that now exists, before
+    // it writes anything: no send joins a conversation it was not judged
+    // against.
+    if (!existingThread && !thread.isNew) {
+      inklingVerdict = await assertInklingThreadAllowed(supabase, {
+        sender,
+        participantSbs,
+        existingThreadId: thread.id,
+      });
+    }
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id
@@ -909,6 +973,25 @@ export async function handleSendToInbox(
       throw new Error(`Failed to send thread message: ${tmError.message}`);
     }
 
+    const sendLinkReport =
+      sendLinks && (sendLinks.targets.length > 0 || sendLinks.skipped.length > 0)
+        ? {
+            ...(await writeSendLinks(supabase, {
+              workspaceId,
+              sourceThreadId: thread.id,
+              messageId: threadMessage.id,
+              linkedBy:
+                sender.kind === 'sb'
+                  ? { kind: 'sb', sbId: sender.sbId }
+                  : sender.kind === 'user'
+                    ? { kind: 'user', userId: sender.userId }
+                    : { kind: 'system' },
+              targets: sendLinks.targets,
+            })),
+            ...(sendLinks.skipped.length > 0 ? { skipped: sendLinks.skipped } : {}),
+          }
+        : null;
+
     // Update thread updated_at
     await threadTable(supabase, 'inbox_threads')
       .update({ updated_at: new Date().toISOString() })
@@ -952,7 +1035,7 @@ export async function handleSendToInbox(
     // resolution — same predicate as the sender-advance exemption above.
     const selfStudioTarget = explicitSelfTarget;
 
-    if (trigger !== false && !missingSenderSession) {
+    if (trigger !== false && !missingSenderSession && !inklingVerdict.quiet) {
       // Dispatch operates on the SB participants only (§7): a person's row
       // never changes the routing, and a person's reply wakes every SB.
       const currentParticipants = await getParticipants(supabase, thread.id);
@@ -1240,6 +1323,7 @@ export async function handleSendToInbox(
             // Distinct from `warning` below so a key problem and a session
             // problem can both be reported on the same send.
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
+            ...(sendLinkReport ? { links: sendLinkReport } : {}),
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
             ...explicitAddressEcho(explicitAddress),
