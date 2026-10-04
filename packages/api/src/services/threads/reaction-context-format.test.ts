@@ -1,12 +1,18 @@
 /**
  * The reaction context an SB is shown with its next turn in a thread
  * (spec inkling-reactions v2, "Reactions and an SB's turns", item 2; design
- * ink://designs/reaction-context-next-turn v2). The formatter is pure: it
- * renders a batch already claimed, and never reads or writes anything.
+ * ink://designs/reaction-context-next-turn). The formatter is pure: it
+ * renders a batch already claimed, never reads or writes anything, and says
+ * exactly which claimed reactions it rendered, so only those are ever
+ * acknowledged as delivered (Lumen, 3800b00e, "rendered means selected").
  */
 
 import { describe, expect, it } from 'vitest';
-import { formatReactionContext, type ReactionContextBatch } from './reaction-context-format';
+import {
+  formatReactionContext,
+  type ReactionContextBatch,
+  type ReactionContextFormat,
+} from './reaction-context-format';
 import { REACTIONS_ARE_NOT_APPROVAL } from './thread-reactions';
 
 const TZ = 'America/Los_Angeles';
@@ -43,18 +49,26 @@ function reaction(
   };
 }
 
-function render(batch: ReactionContextBatch) {
-  return formatReactionContext(batch, { names, timeZone: TZ });
+function renderAll(batch: ReactionContextBatch, extra: Partial<ReactionContextFormat> = {}) {
+  return formatReactionContext(batch, { names, timeZone: TZ, ...extra });
 }
+const render = (batch: ReactionContextBatch, extra: Partial<ReactionContextFormat> = {}) =>
+  renderAll(batch, extra).text;
 
 describe('formatReactionContext', () => {
   it('renders nothing for an empty batch', () => {
-    expect(render({ reactions: [], messages: [PLAN] })).toBeNull();
+    expect(renderAll({ reactions: [], messages: [PLAN] })).toEqual({
+      text: null,
+      renderedReactionIds: [],
+      unrenderedReactionIds: [],
+    });
   });
 
-  it('opens with the line that a reaction is never approval', () => {
+  it('opens with new reactions and the line that a reaction is never approval', () => {
     const text = render({ reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)], messages: [PLAN] });
-    expect(text?.split('\n')[0]).toContain(REACTIONS_ARE_NOT_APPROVAL);
+    expect(text?.split('\n')[0]).toBe(
+      `New reactions to your messages. ${REACTIONS_ARE_NOT_APPROVAL}`
+    );
   });
 
   it('gives one line per message, however many reactions it has', () => {
@@ -66,8 +80,7 @@ describe('formatReactionContext', () => {
       ],
       messages: [PLAN],
     });
-    const lines = text!.split('\n').slice(1);
-    expect(lines).toEqual([
+    expect(text!.split('\n').slice(1)).toEqual([
       '- Conor and Sam reacted ❤️ 👍 to your 3:02 PM message "Here is the plan for the launch."',
     ]);
   });
@@ -120,18 +133,120 @@ describe('formatReactionContext', () => {
     expect(text).toContain('to your Oct 3, 9:30 AM message "Morning."');
   });
 
-  it('says when more reactions are waiting for a later turn', () => {
-    const text = render({
-      reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)],
-      messages: [PLAN],
-      pendingBeyond: 4,
+  describe('rendered means selected', () => {
+    it('reports exactly the reactions it rendered', () => {
+      const result = renderAll({
+        reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1), reaction('r2', NOTE.id, '👍', SAM, 2)],
+        messages: [PLAN, NOTE],
+      });
+      expect(result.renderedReactionIds.sort()).toEqual(['r1', 'r2']);
+      expect(result.unrenderedReactionIds).toEqual([]);
     });
-    expect(text!.split('\n').at(-1)).toBe('- 4 more reactions will follow on a later turn.');
-  });
 
-  it('skips a reaction whose message is not in the batch', () => {
-    expect(
-      render({ reactions: [reaction('r1', 'm-missing', '❤️', CONOR, 1)], messages: [PLAN] })
-    ).toBeNull();
+    it('leaves a reaction whose message is not in the batch unrendered, never silently dropped', () => {
+      const result = renderAll({
+        reactions: [
+          reaction('r1', PLAN.id, '❤️', CONOR, 1),
+          reaction('r2', 'm-missing', '👍', CONOR, 2),
+        ],
+        messages: [PLAN],
+      });
+      expect(result.renderedReactionIds).toEqual(['r1']);
+      expect(result.unrenderedReactionIds).toEqual(['r2']);
+    });
+
+    it('stops at the text budget, keeps whole lines in order, and counts what it left out', () => {
+      const result = renderAll(
+        {
+          reactions: [
+            reaction('r1', PLAN.id, '❤️', CONOR, 1),
+            reaction('r2', PLAN.id, '👍', SAM, 2),
+            reaction('r3', NOTE.id, '🙏', CONOR, 3),
+            reaction('r4', NOTE.id, '😂', SAM, 4),
+          ],
+          messages: [PLAN, NOTE],
+        },
+        { maxChars: 250 }
+      );
+      const lines = result.text!.split('\n');
+      expect(lines.slice(1, -1)).toEqual([
+        '- Conor and Sam reacted ❤️ 👍 to your 3:02 PM message "Here is the plan for the launch."',
+      ]);
+      expect(lines.at(-1)).toBe('- 2 more reactions will follow on a later turn.');
+      expect(result.text!.length).toBeLessThanOrEqual(250);
+      expect(result.renderedReactionIds.sort()).toEqual(['r1', 'r2']);
+      expect(result.unrenderedReactionIds.sort()).toEqual(['r3', 'r4']);
+    });
+
+    it('stops at the first line that does not fit, rather than skipping it for a shorter one', () => {
+      const short1 = { id: 'm-a', createdAt: '2026-10-04T22:02:00Z', content: 'Ok.' };
+      const long = {
+        id: 'm-b',
+        createdAt: '2026-10-04T22:04:00Z',
+        content: 'A much longer message that will not fit in what is left of the budget.',
+      };
+      const short2 = { id: 'm-c', createdAt: '2026-10-04T22:06:00Z', content: 'Yes.' };
+      const batch = {
+        reactions: [
+          reaction('r1', short1.id, '👍', CONOR, 1),
+          reaction('r2', long.id, '❤️', CONOR, 2),
+          reaction('r3', short2.id, '🙏', CONOR, 3),
+        ],
+        messages: [short1, long, short2],
+      };
+      const [header, lineA, , lineC] = render(batch)!.split('\n');
+      // Room for the first and third lines, not the longer second one.
+      const budget = [
+        header,
+        lineA,
+        lineC,
+        '- 999 more reactions will follow on a later turn.',
+      ].join('\n').length;
+      const result = renderAll(batch, { maxChars: budget });
+      expect(result.renderedReactionIds).toEqual(['r1']);
+      expect(result.unrenderedReactionIds).toEqual(['r2', 'r3']);
+    });
+
+    it('always renders the first message, even over a tiny budget', () => {
+      const result = renderAll(
+        { reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)], messages: [PLAN] },
+        { maxChars: 10 }
+      );
+      expect(result.renderedReactionIds).toEqual(['r1']);
+      expect(result.text).toContain('- Conor reacted ❤️');
+    });
+
+    it('adds a measured count of reactions still pending beyond the batch', () => {
+      const text = render({
+        reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)],
+        messages: [PLAN],
+        pendingBeyond: 4,
+      });
+      expect(text!.split('\n').at(-1)).toBe('- 4 more reactions will follow on a later turn.');
+    });
+
+    it('says "more" without a number when the count beyond the batch is not measured', () => {
+      const text = render({
+        reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)],
+        messages: [PLAN],
+        pendingBeyond: 'unmeasured',
+      });
+      expect(text!.split('\n').at(-1)).toBe('- More reactions will follow on a later turn.');
+    });
+
+    it('says one reaction, not one reactions', () => {
+      const text = render({
+        reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)],
+        messages: [PLAN],
+        pendingBeyond: 1,
+      });
+      expect(text!.split('\n').at(-1)).toBe('- 1 more reaction will follow on a later turn.');
+    });
+
+    it('renders nothing, and leaves everything unrendered, when no reaction has its message', () => {
+      expect(
+        renderAll({ reactions: [reaction('r1', 'm-missing', '❤️', CONOR, 1)], messages: [PLAN] })
+      ).toEqual({ text: null, renderedReactionIds: [], unrenderedReactionIds: ['r1'] });
+    });
   });
 });
