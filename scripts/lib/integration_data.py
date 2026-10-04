@@ -61,6 +61,11 @@ WINDOWED_FIXTURE_TABLES = (
      ("observation_conflicts", "publication_operation_events", "publication_operations",
       "task_authority_holds")),
     ("20261002225412", "", ("wake_source_breakers",)),
+    # The admission mode row is migration-seeded; the baseline keeps it at
+    # 'legacy' and cleanup restores it after a suite flips it.
+    ("20261004094856", "",
+     ("runtime_admission_mode", "session_command_events", "session_command_receipts",
+      "session_commands")),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
