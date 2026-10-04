@@ -13,21 +13,37 @@ import { tmpdir } from 'os';
 
 const fixtures = mkdtempSync(join(tmpdir(), 'claude-fake-stop-'));
 const pidsPath = join(fixtures, 'pids.json');
-const hoisted = vi.hoisted(() => ({ binary: '', exitNeverConfirmed: false }));
+const hoisted = vi.hoisted(() => ({
+  binary: '',
+  scriptedStop: null as null | { exited: boolean; group?: 'empty' | 'alive' | 'unknown' },
+  /** Stands in for the permission overlay, the last await before the spawn; returns its restore. */
+  overlay: null as null | (() => () => Promise<void>),
+}));
 
 vi.mock('./resolve-binary.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./resolve-binary.js')>();
   return { ...actual, resolveBinaryPath: () => Promise.resolve(hoisted.binary) };
 });
 
-// The real stop, except where a test needs a process whose exit is never
-// confirmed: no real process outlives SIGKILL, so that one answer is scripted.
+// The real stop, except where a test needs a stop that is never confirmed:
+// no real process outlives SIGKILL, so that one answer is scripted.
 vi.mock('./stop-process.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./stop-process.js')>();
   return {
     ...actual,
     stopProcessAndWait: (...args: Parameters<typeof actual.stopProcessAndWait>) =>
-      hoisted.exitNeverConfirmed ? Promise.resolve(false) : actual.stopProcessAndWait(...args),
+      hoisted.scriptedStop
+        ? Promise.resolve(hoisted.scriptedStop)
+        : actual.stopProcessAndWait(...args),
+  };
+});
+
+vi.mock('../studio-settings.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../studio-settings.js')>();
+  return {
+    ...actual,
+    applyPermissionOverlay: (...args: Parameters<typeof actual.applyPermissionOverlay>) =>
+      hoisted.overlay ? Promise.resolve(hoisted.overlay()) : actual.applyPermissionOverlay(...args),
   };
 });
 
@@ -94,6 +110,45 @@ function writeSlowToExitFake(exitAfterMs: number): string {
       "import { writeFileSync } from 'fs';",
       `process.on('SIGTERM', () => setTimeout(() => process.exit(0), ${exitAfterMs}));`,
       `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+  chmodSync(fake, 0o755);
+  return fake;
+}
+
+/**
+ * A fake claude that exits as soon as it gets SIGTERM, having started a tool
+ * that ignores SIGTERM: the shape a wait on the leader alone cannot see. Both
+ * report their pids only once their handlers are in place.
+ */
+function writeLeaderWithStubbornTool(): string {
+  const fake = join(fixtures, 'claude-leaves-a-tool.mjs');
+  // Paths come from the fake's own location (the runner hands it a clean
+  // env), and the tool is handed its pid file as an argument: no path is
+  // spliced into code.
+  writeFileSync(
+    fake,
+    [
+      '#!/usr/bin/env node',
+      "import { spawn } from 'child_process';",
+      "import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';",
+      "import { dirname, join } from 'path';",
+      "import { fileURLToPath } from 'url';",
+      'const here = dirname(fileURLToPath(import.meta.url));',
+      "const toolPidPath = join(here, 'tool.pid');",
+      'rmSync(toolPidPath, { force: true });',
+      "process.on('SIGTERM', () => process.exit(0));",
+      `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
+      "spawn(process.execPath, ['-e', tool, toolPidPath], { stdio: 'ignore' });",
+      'const wait = setInterval(() => {',
+      '  if (!existsSync(toolPidPath)) return;',
+      "  const toolPid = Number(readFileSync(toolPidPath, 'utf-8'));",
+      '  if (!(toolPid > 0)) return;',
+      '  clearInterval(wait);',
+      "  writeFileSync(join(here, 'pids.json'), JSON.stringify([process.pid, toolPid]));",
+      '}, 20);',
       'setInterval(() => {}, 1000);',
     ].join('\n'),
     { mode: 0o755 }
@@ -203,14 +258,22 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
 
   it('a cancelled run keeps what its process wrote while it wound down', async () => {
     const fake = join(fixtures, 'claude-says-goodbye.mjs');
-    const lastWord = JSON.stringify({ type: 'result', result: 'stopped mid-thought' });
+    // Its last word is data in a file beside it, read when it is stopped,
+    // never spliced into its code.
+    writeFileSync(
+      join(fixtures, 'last-word.jsonl'),
+      JSON.stringify({ type: 'result', result: 'stopped mid-thought' }) + '\n'
+    );
     writeFileSync(
       fake,
       [
         '#!/usr/bin/env node',
-        "import { writeFileSync } from 'fs';",
-        `process.on('SIGTERM', () => { process.stdout.write(${JSON.stringify(lastWord + '\n')}); setTimeout(() => process.exit(0), 100); });`,
-        `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+        "import { readFileSync, writeFileSync } from 'fs';",
+        "import { dirname, join } from 'path';",
+        "import { fileURLToPath } from 'url';",
+        'const here = dirname(fileURLToPath(import.meta.url));',
+        "process.on('SIGTERM', () => { process.stdout.write(readFileSync(join(here, 'last-word.jsonl'), 'utf-8')); setTimeout(() => process.exit(0), 100); });",
+        "writeFileSync(join(here, 'pids.json'), JSON.stringify([process.pid]));",
         'setInterval(() => {}, 1000);',
       ].join('\n'),
       { mode: 0o755 }
@@ -234,7 +297,7 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
 
   it('a process that never confirms its exit is given up on at the bound, and the outcome says so', async () => {
     hoisted.binary = writeSlowToExitFake(400);
-    hoisted.exitNeverConfirmed = true;
+    hoisted.scriptedStop = { exited: false, group: 'alive' };
     try {
       const controller = new AbortController();
       const run = new ClaudeRunner().run('hello', {
@@ -245,17 +308,105 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
           signal: controller.signal,
         },
       });
-      await whenReported();
+      const [fakeClaude] = await whenReported();
       controller.abort();
       const result = await run;
       expect(result).toMatchObject({ success: false });
       expect(result.error).toBe(
-        'Claude Code turn cancelled; its process did not confirm it had exited'
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
       );
       expect(String(result.error)).not.toMatch(/timeout/i);
+      // The group to fence on; process metadata only.
+      expect(result.stopUnconfirmed).toEqual({
+        leaderExited: false,
+        pgid: fakeClaude,
+        group: 'alive',
+      });
     } finally {
-      hoisted.exitNeverConfirmed = false;
+      hoisted.scriptedStop = null;
     }
+  }, 20_000);
+
+  it('a leader that exited is not enough: a group that could not be observed leaves the stop unconfirmed', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    hoisted.scriptedStop = { exited: true, group: 'unknown' };
+    try {
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude] = await whenReported();
+      controller.abort();
+      const result = await run;
+      expect(result.error).toBe(
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
+      );
+      expect(result.stopUnconfirmed).toMatchObject({
+        leaderExited: true,
+        pgid: fakeClaude,
+        group: 'unknown',
+      });
+    } finally {
+      hoisted.scriptedStop = null;
+    }
+  }, 20_000);
+
+  it('a group stop is confirmed only by an empty group: an outcome that says nothing of the group leaves it unconfirmed', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    hoisted.scriptedStop = { exited: true };
+    try {
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude] = await whenReported();
+      controller.abort();
+      const result = await run;
+      expect(result.error).toBe(
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
+      );
+      expect(result.stopUnconfirmed).toEqual({ leaderExited: true, pgid: fakeClaude });
+    } finally {
+      hoisted.scriptedStop = null;
+    }
+  }, 20_000);
+
+  it('a cancelled run whose leader exits on SIGTERM settles only once its TERM-ignoring tool is gone (Lumen 42298771)', async () => {
+    hoisted.binary = writeLeaderWithStubbornTool();
+    const controller = new AbortController();
+    const run = new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        signal: controller.signal,
+      },
+    });
+    const [fakeClaude, tool] = await whenReported();
+    const abortedAt = Date.now();
+    controller.abort();
+    const result = await run;
+    const settledAfter = Date.now() - abortedAt;
+    // The leader went at once; the run waited for the tool, which only the
+    // group's SIGKILL ends.
+    expect(alive(fakeClaude)).toBe(false);
+    expect(alive(tool)).toBe(false);
+    expect(settledAfter).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Claude Code turn cancelled, process stopped',
+    });
+    expect(result.stopUnconfirmed).toBeUndefined();
   }, 20_000);
 
   it('stops at the run ceiling, and nothing it started is left running', async () => {
@@ -297,4 +448,78 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
     expect(alive(fakeClaude)).toBe(false);
     expect(alive(grandchild)).toBe(false);
   }, 20_000);
+});
+
+describe("ClaudeRunner: the caller's admission is asked again at the spawn seam (Lumen's review of #747)", () => {
+  /** A fake claude that records its pid and exits at once, so a spawn by mistake ends cleanly. */
+  function writeExitsAtOnceFake(): string {
+    const fake = join(fixtures, 'claude-exits.mjs');
+    writeFileSync(
+      fake,
+      [
+        '#!/usr/bin/env node',
+        "import { writeFileSync } from 'fs';",
+        `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+    chmodSync(fake, 0o755);
+    return fake;
+  }
+
+  /**
+   * Starts a run whose gate reads `refuse` when asked, recording each answer.
+   * The run has a permission overlay, its last await before the spawn, and
+   * `refuse` turns while that await is in flight.
+   */
+  function runGated(refuse: { now: boolean; during: boolean }) {
+    const asked: boolean[] = [];
+    const overlay = { restored: false };
+    hoisted.overlay = () => {
+      if (refuse.during) refuse.now = true;
+      return async () => {
+        overlay.restored = true;
+      };
+    };
+    const run = new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        permissionOverlay: { allow: [] },
+        admitSpawn: () => {
+          asked.push(refuse.now);
+          return refuse.now ? 'Synthetic refusal' : undefined;
+        },
+      },
+    });
+    return { run, asked, overlay };
+  }
+
+  afterEach(() => {
+    hoisted.overlay = null;
+  });
+
+  it('a refusal that arrives during the last await of the run’s preparation starts nothing, undoes the overlay, and says so', async () => {
+    hoisted.binary = writeExitsAtOnceFake();
+    const { run, asked, overlay } = runGated({ now: false, during: true });
+    const result = await run;
+    expect(asked).toEqual([true]);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Synthetic refusal',
+      refusedBeforeSpawn: true,
+    });
+    expect(reported()).toEqual([]);
+    expect(overlay.restored).toBe(true);
+  });
+
+  it('an admitting gate spawns as before (control: the fake records itself when it runs)', async () => {
+    hoisted.binary = writeExitsAtOnceFake();
+    const { run, asked } = runGated({ now: false, during: false });
+    const result = await run;
+    expect(asked).toEqual([false]);
+    expect(result.refusedBeforeSpawn).toBeUndefined();
+    expect(reported()).toHaveLength(1);
+  });
 });

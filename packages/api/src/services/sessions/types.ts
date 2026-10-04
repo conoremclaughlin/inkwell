@@ -6,6 +6,7 @@
 
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
+import type { GroupState } from './stop-process';
 
 // ─── Channel Types ───
 
@@ -795,6 +796,15 @@ export interface ClaudeRunnerConfig {
    * inkling's turn). The Claude runner honours it.
    */
   signal?: AbortSignal;
+  /**
+   * The caller's admission, asked again at the spawn seam: synchronously,
+   * after the last await of the runner's own preparation, with none between
+   * it and the spawn. A reason refuses the run, which starts nothing and
+   * returns `refusedBeforeSpawn` with the reason as its error. An admission
+   * made earlier can go stale while the run is prepared (Lumen's review of
+   * #747). The Claude runner honours it.
+   */
+  admitSpawn?: () => string | undefined;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
@@ -934,6 +944,20 @@ export interface RunnerResult {
   finalTextResponse?: string;
   /** Tool calls captured during this run (for activity stream logging) */
   toolCalls?: ToolCall[];
+  /**
+   * Set when the run was stopped and the stop could not confirm, by the
+   * bound, that the process (and, for a group stop, its whole group) had
+   * gone. The caller must not let replacement work overlap whatever is still
+   * running (stop-process.ts, inkling-stop-fence.ts).
+   */
+  stopUnconfirmed?: {
+    leaderExited: boolean;
+    /** The group's number, for a group stop: the only thing a fence may release on. */
+    pgid?: number;
+    group?: GroupState;
+  };
+  /** `admitSpawn` refused this run: nothing was started, and `error` is its reason. */
+  refusedBeforeSpawn?: true;
 }
 
 /** @deprecated Use RunnerResult */
