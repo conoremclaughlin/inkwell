@@ -14,6 +14,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { isInklingOwnerTestUser, type OwnerTestAllowlist } from '../../config/inkling-flags';
 import { INKLING_CLIENT } from './inkling-service';
 
 /** Attempts at the conditional counter update before a contended claim is refused. */
@@ -166,7 +167,7 @@ export interface InklingTurnRefusal {
 /** Null when the turn may start. Only inklings, or SBs whose identity cannot be established, are ever refused. */
 export function inklingTurnRefusal(
   input: InklingTurnInput,
-  ownerTestUserId: string | null
+  ownerTestUserIds: OwnerTestAllowlist
 ): InklingTurnRefusal | null {
   const { identity } = input;
   if (identity.kind === 'unknown') {
@@ -176,9 +177,11 @@ export function inklingTurnRefusal(
   }
   if (identity.kind === 'other') return null;
   const refuse = (reason: string): InklingTurnRefusal => ({ reason, retryable: false });
-  if (ownerTestUserId === null) return refuse('inklings are not open on this server');
-  const owner = ownerTestUserId.toLowerCase();
-  if (identity.userId.toLowerCase() !== owner || input.userId.toLowerCase() !== owner) {
+  if (ownerTestUserIds.size === 0) return refuse('inklings are not open on this server');
+  // The inkling's owner must be in the test, and the turn must run on that
+  // same account: another listed account never reaches this inkling.
+  const owner = identity.userId.toLowerCase();
+  if (!isInklingOwnerTestUser(owner, ownerTestUserIds) || input.userId.toLowerCase() !== owner) {
     return refuse('this inkling belongs to an account outside the owner test');
   }
   if (identity.metadata.ownerTest !== true) {

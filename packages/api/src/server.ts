@@ -69,6 +69,7 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
 import { handleHangup } from './utils/hangup';
 import { resolveThreadTriggerScope } from './services/trigger-scope';
@@ -575,6 +576,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     cwd: process.cwd(),
     ...heartbeatServiceFlags,
   });
+
+  // The owner test's accounts are counted here, never named. An entry that
+  // isn't a UUID was left out of the test, and this is where that shows.
+  const inklingOwnerTest = inklingOwnerTestAllowlist();
+  logger.info('Inkling owner test evaluated', {
+    accounts: inklingOwnerTest.userIds.size,
+  });
+  if (inklingOwnerTest.malformed.length > 0) {
+    logger.warn('Inkling owner test: entries left out because they are not UUIDs', {
+      entries: inklingOwnerTest.malformed,
+    });
+  }
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.

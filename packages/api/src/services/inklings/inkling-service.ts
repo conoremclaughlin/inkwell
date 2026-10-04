@@ -23,7 +23,11 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { DEFAULT_AWAKEN_CAP } from '../../config/inkling-flags';
+import {
+  DEFAULT_AWAKEN_CAP,
+  isInklingOwnerTestUser,
+  type OwnerTestAllowlist,
+} from '../../config/inkling-flags';
 import { cancelInklingTurns } from './inkling-turns';
 import { logger } from '../../utils/logger';
 
@@ -73,10 +77,10 @@ export interface InklingServiceOptions {
   /** Awakenings per person, enforced inside redeem_kindle_token; null for none. */
   awakenCap?: number | null;
   /**
-   * The owner test's one account (inklingOwnerTestUserId), or null: then
+   * The owner test's accounts (inklingOwnerTestUserIds). Empty or absent:
    * nobody may awaken or name an inkling here.
    */
-  ownerTestUserId?: string | null;
+  ownerTestUserIds?: OwnerTestAllowlist;
 }
 
 /** The answer for awakening or naming outside the owner test, whoever is asking. */
@@ -203,27 +207,25 @@ function isInklingRow(row: IdentityRow): boolean {
 
 export class InklingService {
   private readonly awakenCap: number | null;
-  private readonly ownerTestUserId: string | null;
+  private readonly ownerTestUserIds: OwnerTestAllowlist;
 
   constructor(
     private readonly supabase: SupabaseClient,
     options: InklingServiceOptions = {}
   ) {
     this.awakenCap = options.awakenCap === undefined ? DEFAULT_AWAKEN_CAP : options.awakenCap;
-    this.ownerTestUserId = options.ownerTestUserId?.toLowerCase() ?? null;
+    this.ownerTestUserIds = options.ownerTestUserIds ?? new Set();
   }
 
   /**
-   * Awakening and naming are open only in the owner test, and only to its
-   * account acting as the owner of the workspace. Everyone else, and
-   * everyone when the test is off, gets the same 403, which does not say
-   * who the owner is.
+   * Awakening and naming are open only in the owner test, and only to one
+   * of its accounts acting as the owner of the workspace. Everyone else,
+   * and everyone when the test is off, gets the same 403, which does not
+   * say who is in the test.
    */
   private assertOwnerTest(scope: InklingScope): void {
     const isOwner =
-      this.ownerTestUserId !== null &&
-      scope.userId.toLowerCase() === this.ownerTestUserId &&
-      scope.role === 'owner';
+      isInklingOwnerTestUser(scope.userId, this.ownerTestUserIds) && scope.role === 'owner';
     if (!isOwner) {
       throw new InklingError(403, 'Inklings are not open on this server', INKLINGS_DISABLED);
     }

@@ -97,7 +97,7 @@ import {
   validateDisplayName,
   type InklingScope,
 } from '../services/inklings/inkling-service';
-import { inklingAwakenCap, inklingOwnerTestUserId } from '../config/inkling-flags';
+import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
 import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
@@ -3864,7 +3864,7 @@ function inklingScope(authReq: AdminAuthRequest): InklingScope {
 async function inklingService(): Promise<InklingService> {
   return new InklingService((await getDataComposer()).getClient(), {
     awakenCap: inklingAwakenCap(),
-    ownerTestUserId: inklingOwnerTestUserId(),
+    ownerTestUserIds: inklingOwnerTestUserIds(),
   });
 }
 

@@ -57,7 +57,7 @@ const ME = {
 async function awakenedRow(name?: string) {
   const db = createInklingDb();
   const service = new InklingService(db as unknown as SupabaseClient, {
-    ownerTestUserId: ME.userId,
+    ownerTestUserIds: new Set([ME.userId]),
   });
   const { inkling } = await service.awaken(ME, '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a');
   if (name) await service.name(ME, inkling.id, name);

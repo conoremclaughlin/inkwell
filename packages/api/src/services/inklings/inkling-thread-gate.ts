@@ -2,8 +2,8 @@
  * Who may write to a conversation that holds an inkling (Lumen 97b1d66a).
  *
  * In the owner test an inkling is a trusted personal SB with its owner's
- * reach, so its conversations stay between the two of them: the gate's
- * account, as a person, and that one inkling. No other SB, no other
+ * reach, so its conversations stay between the two of them: its owner, an
+ * owner-test account, as a person, and that one inkling. No other SB, no other
  * person, no system or strategy send, and nothing at all while the test is
  * off. handleSendToInbox asks before it writes anything, so a refused send
  * leaves no thread, participant or message behind. Turn dispatch checks
@@ -17,7 +17,11 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { inklingOwnerTestUserId, isInklingOwnerTestUser } from '../../config/inkling-flags';
+import {
+  inklingOwnerTestUserIds,
+  isInklingOwnerTestUser,
+  type OwnerTestAllowlist,
+} from '../../config/inkling-flags';
 import type { Principal, SbPrincipal } from '../principals';
 import { INKLING_CLIENT, INKLINGS_DISABLED } from './inkling-service';
 
@@ -53,7 +57,7 @@ export async function assertInklingThreadAllowed(
     participantSbs: SbPrincipal[];
     existingThreadId: string | null;
   },
-  ownerTestUserId: string | null = inklingOwnerTestUserId()
+  ownerTestUserIds: OwnerTestAllowlist = inklingOwnerTestUserIds()
 ): Promise<void> {
   const sbIds = new Set(input.participantSbs.map((sb) => sb.sbId));
   const people = new Set<string>();
@@ -84,11 +88,11 @@ export async function assertInklingThreadAllowed(
   const inklings = identities.filter((r) => r.metadata?.client === INKLING_CLIENT);
   if (inklings.length === 0) return;
 
-  if (ownerTestUserId === null) {
+  if (ownerTestUserIds.size === 0) {
     throw new InklingThreadRefusedError(INKLINGS_DISABLED, 'Inklings are not open on this server');
   }
   const [inkling] = inklings;
-  // The inkling's owner, who must be the owner test's account.
+  // The inkling's owner, who must be one of the owner test's accounts.
   const owner = inkling.user_id.toLowerCase();
   const sender = input.sender;
   const fromOwner = sender.kind === 'user' && sender.userId.toLowerCase() === owner;
@@ -100,7 +104,7 @@ export async function assertInklingThreadAllowed(
     members.has(inkling.id) &&
     people.has(owner);
   const allowed =
-    isInklingOwnerTestUser(owner, ownerTestUserId) &&
+    isInklingOwnerTestUser(owner, ownerTestUserIds) &&
     (fromOwner || replyFromInkling) &&
     inklings.length === 1 &&
     sbIds.size === 1 &&

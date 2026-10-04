@@ -423,3 +423,47 @@ describe('a conversation with no inkling', () => {
     }
   });
 });
+
+describe('with more than one account in the owner test, each reaches only its own inklings', () => {
+  beforeEach(() => {
+    // The list alone, with the single-account variable unset.
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', `${ME},${SOMEONE}`);
+    sb('moss', OWNER_TEST_INKLING, SOMEONE);
+  });
+
+  it('each listed account may start a conversation with its own inkling, and its inkling may reply', async () => {
+    expect((await call(create, { key: KEY, recipients: ['pip'], content: 'hi' })).status).toBe(200);
+    const theirs = 'chat:conversation-moss';
+    expect(
+      (await call(create, { key: theirs, recipients: ['moss'], content: 'hi' }, SOMEONE)).status
+    ).toBe(200);
+    expect(await replyAs(asSb('moss', SOMEONE), { key: theirs })).toBeNull();
+    expect(await replyAs(asSb('pip'))).toBeNull();
+    expect(db.rows('inbox_thread_messages')).toHaveLength(4);
+  });
+
+  it("a listed account may not start a conversation with, or write into, another listed account's inkling", async () => {
+    const intruding = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' }, SOMEONE);
+    expect(intruding).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    const reverse = await call(create, { key: 'chat:moss', recipients: ['moss'], content: 'hi' });
+    expect(reverse).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    expect(written()).toEqual(NOTHING);
+
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const before = written();
+    const replying = await call(reply, { key: KEY, content: 'me too' }, SOMEONE);
+    expect(replying.status).not.toBe(200);
+    expect(written()).toEqual(before);
+  });
+
+  it('an account left off the list is refused, and an empty list closes the test', async () => {
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', SOMEONE);
+    const res = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    expect(res).toMatchObject({ status: 403, body: { code: 'inkling_thread_refused' } });
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', ' , ');
+    const off = await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    expect(off).toMatchObject({ status: 403, body: { code: 'inklings_disabled' } });
+    expect(written()).toEqual(NOTHING);
+  });
+});

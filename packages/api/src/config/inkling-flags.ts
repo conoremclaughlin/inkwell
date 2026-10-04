@@ -17,29 +17,59 @@ function positiveInt(raw: string | undefined, fallback: number): number {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/** The owner test's accounts: exact user UUIDs, in lowercase. */
+export type OwnerTestAllowlist = ReadonlySet<string>;
+
 /**
- * The owner test's gate: INKLING_OWNER_TEST_USER_ID names the one account
- * that may awaken, name and talk to inklings on this server, as a trusted
- * personal SB with the same reach as the account's other SBs (Lumen
- * 97b1d66a). Unset, or not a UUID, means off: no awakening, no naming, and
- * no inkling turn. It names a user, not just "on", because this server has
- * no owner of its own: every account owns its personal workspace.
+ * The owner test's gate: the accounts that may awaken, name and talk to
+ * their own inklings on this server, each inkling a trusted personal SB
+ * with the same reach as that account's other SBs (Lumen 97b1d66a).
+ *
+ * INKLING_OWNER_TEST_USER_IDS lists them, comma-separated.
+ * INKLING_OWNER_TEST_USER_ID, the single account the test began with, is
+ * still honoured and joins the list. Every entry must be a whole UUID:
+ * there is no wildcard, and an entry that isn't one is left out, so a typo
+ * can only shrink the test, never widen it. `malformed` names where each
+ * one was (never its value, which would name an account) for the startup
+ * log. Nothing listed means off: no awakening, no naming, and no inkling
+ * turn. It names users, not just "on", because this server has no owner of
+ * its own: every account owns its personal workspace.
  */
-export function inklingOwnerTestUserId(source: EnvSource = process.env): string | null {
-  const raw = source.INKLING_OWNER_TEST_USER_ID?.trim().toLowerCase();
-  return raw && UUID.test(raw) ? raw : null;
+export function inklingOwnerTestAllowlist(source: EnvSource = process.env): {
+  userIds: OwnerTestAllowlist;
+  malformed: string[];
+} {
+  const userIds = new Set<string>();
+  const malformed: string[] = [];
+  const take = (raw: string, where: string) => {
+    const id = raw.trim().toLowerCase();
+    if (id === '') return;
+    if (UUID.test(id)) userIds.add(id);
+    else malformed.push(where);
+  };
+  (source.INKLING_OWNER_TEST_USER_IDS ?? '')
+    .split(',')
+    .forEach((raw, i) => take(raw, `INKLING_OWNER_TEST_USER_IDS entry ${i + 1}`));
+  take(source.INKLING_OWNER_TEST_USER_ID ?? '', 'INKLING_OWNER_TEST_USER_ID');
+  return { userIds, malformed };
+}
+
+/** The owner test's accounts (inklingOwnerTestAllowlist), empty when it is off. */
+export function inklingOwnerTestUserIds(source: EnvSource = process.env): OwnerTestAllowlist {
+  return inklingOwnerTestAllowlist(source).userIds;
 }
 
 /**
- * Whether `userId` is the owner test's account. Owner checks ask this
- * rather than comparing ids themselves, so letting more accounts into the
- * test changes this function, not its callers.
+ * Whether `userId` is one of the owner test's accounts. Every owner check
+ * asks this rather than comparing ids itself. Being in the test lets an
+ * account reach its own inklings only: callers still require the inkling's
+ * owner and the acting account to be the same one.
  */
 export function isInklingOwnerTestUser(
   userId: string,
-  ownerTestUserId: string | null = inklingOwnerTestUserId()
+  allowlist: OwnerTestAllowlist = inklingOwnerTestUserIds()
 ): boolean {
-  return ownerTestUserId !== null && userId.toLowerCase() === ownerTestUserId.toLowerCase();
+  return allowlist.has(userId.toLowerCase());
 }
 
 /** The first test's ceiling on one inkling turn: five minutes. */
