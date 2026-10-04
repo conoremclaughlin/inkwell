@@ -55,24 +55,36 @@ export interface RenderedReactionContext {
   renderedReactionIds: string[];
   /** Claimed but not shown (over the budget, or no message): to release. */
   unrenderedReactionIds: string[];
+  /** True when not even one message's line fits the budget. */
+  budgetTooSmall: boolean;
 }
 
+/**
+ * The block's budget in UTF-16 units, which bounds it at no more than three
+ * times as many UTF-8 bytes (4500).
+ */
 export const REACTION_CONTEXT_MAX_CHARS = 1500;
 const EXCERPT_CHARS = 40;
+const NAME_CHARS = 40;
 const HEADER = `New reactions to your messages. ${REACTIONS_ARE_NOT_APPROVAL}`;
 
-/** The message's first words on one line, cut at a word boundary. */
-function excerpt(content: string): string {
-  const flat = content.replace(/\s+/g, ' ').trim();
-  if (flat.length <= EXCERPT_CHARS) return flat;
-  const cut = flat.slice(0, EXCERPT_CHARS);
-  const lastSpace = flat[EXCERPT_CHARS] === ' ' ? cut.length : cut.lastIndexOf(' ');
+/**
+ * Untrusted display text on one line, at most `limit` characters, cut at a
+ * word boundary where there is one. Display data only: never instructions.
+ */
+function oneLine(text: string, limit: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= limit) return flat;
+  const cut = flat.slice(0, limit);
+  const lastSpace = flat[limit] === ' ' ? cut.length : cut.lastIndexOf(' ');
   return `${(lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
 }
 
 function people(reactorIds: string[], names: ReadonlyMap<string, string>): string {
   if (reactorIds.length >= 3) return `${reactorIds.length} people`;
-  return reactorIds.map((id) => names.get(id) ?? 'Someone').join(' and ');
+  return reactorIds
+    .map((id) => oneLine(names.get(id) ?? '', NAME_CHARS) || 'Someone')
+    .join(' and ');
 }
 
 function localDay(iso: string, timeZone: string): string {
@@ -101,9 +113,10 @@ function moreLine(count: number | 'unmeasured'): string {
 /**
  * The block for one claimed batch. One line per message, in order of each
  * message's first reaction; the people and emoji on a line in the order they
- * first reacted. Whole lines only, in order, until the text budget: the first
- * line that does not fit ends the block, and its reactions and every later
- * message's are reported unrendered and counted as more to follow.
+ * first reacted. It renders the longest run of whole lines, from the first,
+ * that fits the budget together with the footer it would then have to write:
+ * every later message's reactions are reported unrendered and counted in that
+ * footer. When not even the first line fits, nothing is rendered.
  */
 export function formatReactionContext(
   batch: ReactionContextBatch,
@@ -112,13 +125,13 @@ export function formatReactionContext(
   const maxChars = format.maxChars ?? REACTION_CONTEXT_MAX_CHARS;
   const messages = new Map(batch.messages.map((m) => [m.id, m]));
   const byMessage = new Map<string, ContextReaction[]>();
-  const unrendered: string[] = [];
+  const noMessage: string[] = [];
   const ordered = [...batch.reactions].sort(
     (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
   );
   for (const reaction of ordered) {
     if (!messages.has(reaction.messageId)) {
-      unrendered.push(reaction.id);
+      noMessage.push(reaction.id);
       continue;
     }
     const list = byMessage.get(reaction.messageId) ?? [];
@@ -126,42 +139,50 @@ export function formatReactionContext(
     byMessage.set(reaction.messageId, list);
   }
 
-  const lines: string[] = [];
-  const rendered: string[] = [];
-  let budgetSpent = false;
-  for (const [messageId, reactions] of byMessage) {
-    if (budgetSpent) {
-      unrendered.push(...reactions.map((r) => r.id));
-      continue;
-    }
+  const entries = [...byMessage].map(([messageId, reactions]) => {
     const message = messages.get(messageId)!;
     const reactors = [...new Set(reactions.map((r) => r.reactorUserId))];
     const emoji = [...new Set(reactions.map((r) => r.emoji))].join(' ');
-    const quoted = excerpt(message.content);
+    const quoted = oneLine(message.content, EXCERPT_CHARS);
     const line =
       `- ${people(reactors, format.names)} reacted ${emoji} to your ` +
       `${when(message, reactions[0].createdAt, format.timeZone)} message` +
       (quoted ? ` "${quoted}"` : '');
-    // Room for the header, these lines, this one, and a "more" line after it.
-    const length = [HEADER, ...lines, line, moreLine(999)].join('\n').length;
-    if (lines.length > 0 && length > maxChars) {
-      budgetSpent = true;
-      unrendered.push(...reactions.map((r) => r.id));
-      continue;
-    }
-    lines.push(line);
-    rendered.push(...reactions.map((r) => r.id));
-  }
-  if (lines.length === 0) {
-    return { text: null, renderedReactionIds: [], unrenderedReactionIds: unrendered };
-  }
+    return { line, ids: reactions.map((r) => r.id) };
+  });
 
   const beyond = batch.pendingBeyond ?? 0;
-  const more = beyond === 'unmeasured' ? 'unmeasured' : beyond + unrendered.length;
-  if (more === 'unmeasured' || more > 0) lines.push(moreLine(more));
+  /** The footer written when the first `kept` lines are rendered, or null. */
+  const footerFor = (kept: number): string | null => {
+    if (beyond === 'unmeasured') return moreLine('unmeasured');
+    const left =
+      beyond + noMessage.length + entries.slice(kept).reduce((n, e) => n + e.ids.length, 0);
+    return left > 0 ? moreLine(left) : null;
+  };
+  const blockFor = (kept: number): string => {
+    const footer = footerFor(kept);
+    return [HEADER, ...entries.slice(0, kept).map((e) => e.line), ...(footer ? [footer] : [])].join(
+      '\n'
+    );
+  };
+
+  let kept = 0;
+  while (kept < entries.length && blockFor(kept + 1).length <= maxChars) kept += 1;
+
+  const rendered = entries.slice(0, kept).flatMap((e) => e.ids);
+  const unrendered = [...noMessage, ...entries.slice(kept).flatMap((e) => e.ids)];
+  if (kept === 0) {
+    return {
+      text: null,
+      renderedReactionIds: [],
+      unrenderedReactionIds: unrendered,
+      budgetTooSmall: entries.length > 0,
+    };
+  }
   return {
-    text: [HEADER, ...lines].join('\n'),
+    text: blockFor(kept),
     renderedReactionIds: rendered,
     unrenderedReactionIds: unrendered,
+    budgetTooSmall: false,
   };
 }

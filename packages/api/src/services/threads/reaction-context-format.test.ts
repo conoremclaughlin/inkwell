@@ -61,6 +61,7 @@ describe('formatReactionContext', () => {
       text: null,
       renderedReactionIds: [],
       unrenderedReactionIds: [],
+      budgetTooSmall: false,
     });
   });
 
@@ -156,26 +157,41 @@ describe('formatReactionContext', () => {
     });
 
     it('stops at the text budget, keeps whole lines in order, and counts what it left out', () => {
-      const result = renderAll(
-        {
-          reactions: [
-            reaction('r1', PLAN.id, '❤️', CONOR, 1),
-            reaction('r2', PLAN.id, '👍', SAM, 2),
-            reaction('r3', NOTE.id, '🙏', CONOR, 3),
-            reaction('r4', NOTE.id, '😂', SAM, 4),
-          ],
-          messages: [PLAN, NOTE],
-        },
-        { maxChars: 250 }
-      );
+      const batch = {
+        reactions: [
+          reaction('r1', PLAN.id, '❤️', CONOR, 1),
+          reaction('r2', PLAN.id, '👍', SAM, 2),
+          reaction('r3', NOTE.id, '🙏', CONOR, 3),
+          reaction('r4', NOTE.id, '😂', SAM, 4),
+        ],
+        messages: [PLAN, NOTE],
+      };
+      const [header, first] = render(batch)!.split('\n');
+      // Room for the first line and the footer it leaves, not the second line.
+      const maxChars = [header, first, '- 2 more reactions will follow on a later turn.'].join(
+        '\n'
+      ).length;
+      const result = renderAll(batch, { maxChars });
       const lines = result.text!.split('\n');
       expect(lines.slice(1, -1)).toEqual([
         '- Conor and Sam reacted ❤️ 👍 to your 3:02 PM message "Here is the plan for the launch."',
       ]);
       expect(lines.at(-1)).toBe('- 2 more reactions will follow on a later turn.');
-      expect(result.text!.length).toBeLessThanOrEqual(250);
+      expect(result.text!.length).toBeLessThanOrEqual(maxChars);
       expect(result.renderedReactionIds.sort()).toEqual(['r1', 'r2']);
       expect(result.unrenderedReactionIds.sort()).toEqual(['r3', 'r4']);
+    });
+
+    it('writes no footer when every line fits and nothing is left over', () => {
+      const batch = {
+        reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1), reaction('r2', NOTE.id, '👍', SAM, 2)],
+        messages: [PLAN, NOTE],
+      };
+      const exact = render(batch)!;
+      const result = renderAll(batch, { maxChars: exact.length });
+      expect(result.text).toBe(exact);
+      expect(result.text!.split('\n')).toHaveLength(3);
+      expect(result.unrenderedReactionIds).toEqual([]);
     });
 
     it('stops at the first line that does not fit, rather than skipping it for a shorter one', () => {
@@ -207,13 +223,60 @@ describe('formatReactionContext', () => {
       expect(result.unrenderedReactionIds).toEqual(['r2', 'r3']);
     });
 
-    it('always renders the first message, even over a tiny budget', () => {
+    it('renders nothing over a budget too small for even one line, and says so (Lumen, 8455 r1)', () => {
       const result = renderAll(
         { reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)], messages: [PLAN] },
         { maxChars: 10 }
       );
+      expect(result).toEqual({
+        text: null,
+        renderedReactionIds: [],
+        unrenderedReactionIds: ['r1'],
+        budgetTooSmall: true,
+      });
+    });
+
+    it('stays inside the default budget when a display name is very long (Lumen, 8455 r1)', () => {
+      const result = formatReactionContext(
+        { reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)], messages: [PLAN] },
+        { names: new Map([[CONOR, 'R'.repeat(1600)]]), timeZone: TZ }
+      );
+      expect(result.text!.length).toBeLessThanOrEqual(1500);
       expect(result.renderedReactionIds).toEqual(['r1']);
-      expect(result.text).toContain('- Conor reacted ❤️');
+    });
+
+    it('keeps a display name to one line and a bounded length (Lumen, 8455 r1)', () => {
+      const result = formatReactionContext(
+        { reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1)], messages: [PLAN] },
+        { names: new Map([[CONOR, `Robin\nsecond line ${'x'.repeat(80)}`]]), timeZone: TZ }
+      );
+      const lines = result.text!.split('\n');
+      expect(lines).toHaveLength(2);
+      // Flattened to one line, then cut at the last word boundary within 40.
+      expect(lines[1]).toMatch(/^- Robin second line… reacted ❤️/);
+      expect(lines[1].indexOf(' reacted')).toBeLessThanOrEqual(2 + 40 + 1);
+    });
+
+    it('budgets for the footer it will actually write, however large the count (Lumen, 8455 r1)', () => {
+      const batch = {
+        reactions: [
+          reaction('r1', PLAN.id, '❤️', CONOR, 1),
+          reaction('r2', NOTE.id, '👍', CONOR, 2),
+        ],
+        messages: [PLAN, NOTE],
+      };
+      const generous = render(batch)!;
+      const maxChars = [generous, '- 999 more reactions will follow on a later turn.'].join(
+        '\n'
+      ).length;
+      const result = renderAll({ ...batch, pendingBeyond: 10000 }, { maxChars });
+      expect(result.text!.length).toBeLessThanOrEqual(maxChars);
+      // Something gave way to fit the five-digit footer, and it is counted.
+      expect(result.text!.split('\n').at(-1)).toBe(
+        '- 10001 more reactions will follow on a later turn.'
+      );
+      expect(result.renderedReactionIds).toEqual(['r1']);
+      expect(result.unrenderedReactionIds).toEqual(['r2']);
     });
 
     it('adds a measured count of reactions still pending beyond the batch', () => {
@@ -246,7 +309,12 @@ describe('formatReactionContext', () => {
     it('renders nothing, and leaves everything unrendered, when no reaction has its message', () => {
       expect(
         renderAll({ reactions: [reaction('r1', 'm-missing', '❤️', CONOR, 1)], messages: [PLAN] })
-      ).toEqual({ text: null, renderedReactionIds: [], unrenderedReactionIds: ['r1'] });
+      ).toEqual({
+        text: null,
+        renderedReactionIds: [],
+        unrenderedReactionIds: ['r1'],
+        budgetTooSmall: false,
+      });
     });
   });
 });
