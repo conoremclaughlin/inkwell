@@ -37,6 +37,39 @@ describe('commandPayloadDigest', () => {
   it('names its algorithm', () => {
     expect(commandPayloadDigest(base)).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
+
+  it('changes with the origin and the addressee', () => {
+    const aimed = { ...base, origin: { kind: 'browser' as const }, addressee: 'fixture-alpha' };
+    const digest = commandPayloadDigest(aimed);
+    expect(commandPayloadDigest({ ...aimed, addressee: 'fixture-beta' })).not.toBe(digest);
+    expect(commandPayloadDigest({ ...aimed, origin: { kind: 'terminal' } })).not.toBe(digest);
+    expect(commandPayloadDigest({ ...aimed, origin: { kind: 'browser', ref: 'tab-2' } })).not.toBe(
+      digest
+    );
+  });
+
+  // Lumen, pr:701 9a5d87ef A4: the digest must cover the value JSON transport stores.
+  it('does not give an empty array and a sparse array the same digest', () => {
+    const sparse = new Array(1);
+    expect(JSON.stringify(sparse)).toBe('[null]');
+    expect(commandPayloadDigest({ ...base, payload: sparse })).not.toBe(
+      commandPayloadDigest({ ...base, payload: [] })
+    );
+    expect(commandPayloadDigest({ ...base, payload: sparse })).toBe(
+      commandPayloadDigest({ ...base, payload: [null] })
+    );
+  });
+
+  it('does not give two different serialized dates the same digest', () => {
+    const first = new Date('2026-01-01T00:00:00Z');
+    const second = new Date('2026-01-02T00:00:00Z');
+    expect(commandPayloadDigest({ ...base, payload: first })).not.toBe(
+      commandPayloadDigest({ ...base, payload: second })
+    );
+    expect(commandPayloadDigest({ ...base, payload: first })).toBe(
+      commandPayloadDigest({ ...base, payload: first.toISOString() })
+    );
+  });
 });
 
 describe('admitCommand', () => {
@@ -77,6 +110,34 @@ describe('admitCommand', () => {
       p_recipients: [],
       p_protocol: ADMISSION_PROTOCOL,
     });
+  });
+
+  it('hashes and sends one normalized payload, running toJSON once', async () => {
+    const { client, rpc } = clientReturning({ outcome: 'forbidden' });
+    let calls = 0;
+    const payload = { stamp: { toJSON: () => ({ call: ++calls }) }, holes: new Array(2) };
+    await admitCommand(client, { ...input, payload });
+    expect(calls).toBe(1);
+    const sent = rpc.mock.calls[0][1] as { p_payload: unknown; p_payload_digest: string };
+    expect(sent.p_payload).toEqual({ stamp: { call: 1 }, holes: [null, null] });
+    expect(sent.p_payload_digest).toBe(commandPayloadDigest({ ...input, payload: sent.p_payload }));
+  });
+
+  it('refuses a payload JSON cannot carry, before any call', async () => {
+    for (const payload of [10n, () => 'x', Symbol('x')]) {
+      const { client, rpc } = clientReturning({ outcome: 'forbidden' });
+      await expect(admitCommand(client, { ...input, payload })).rejects.toThrow(
+        /not representable as JSON/
+      );
+      expect(rpc).not.toHaveBeenCalled();
+    }
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const { client, rpc } = clientReturning({ outcome: 'forbidden' });
+    await expect(admitCommand(client, { ...input, payload: cyclic })).rejects.toThrow(
+      /not representable as JSON/
+    );
+    expect(rpc).not.toHaveBeenCalled();
   });
 
   it('returns each contracted outcome as parsed', async () => {
