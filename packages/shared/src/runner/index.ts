@@ -28,6 +28,16 @@ export {
 export { writeRuntimeSessionHint } from './runtime-hints.js';
 
 export {
+  TURN_REPLY_EVENT,
+  TURN_REPLIES_FORWARDED_ENV,
+  LOCAL_TOOL_CALL_PLACEHOLDER,
+  userFacingReplyText,
+  parseTurnReplyEvent,
+  type TurnReply,
+  type TurnReplyEvent,
+} from './turn-reply.js';
+
+export {
   stripAnsi,
   readableOutput,
   failureExcerpt,

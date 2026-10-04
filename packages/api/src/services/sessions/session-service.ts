@@ -2446,6 +2446,7 @@ export class SessionService implements ISessionService {
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
       // .ink/identity.json preferences or Commander defaults.
       toolRouting: runtimeToolRouting,

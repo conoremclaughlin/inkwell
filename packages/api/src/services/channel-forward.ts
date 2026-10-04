@@ -27,7 +27,13 @@
  *
  * Split out as a pure decision so the three cases can be told apart and tested
  * without a server, a channel gateway, or a live turn.
+ *
+ * A run with several outer turns (`ink chat`) is decided per turn instead, by
+ * `createTurnReplyForwarder` below; this whole-run decision remains for
+ * runners that report one turn.
  */
+
+import { userFacingReplyText, type TurnReply } from '@inklabs/shared';
 
 export type ChannelForwardDecision =
   /** Auto-forward the agent's final text; nothing else delivered it. */
@@ -51,14 +57,15 @@ export function decideChannelForward(input: {
 
   // Whitespace-only is not a reply: forwarding it satisfies a truthiness check
   // and still delivers nothing a reader can use — the failure wearing a success
-  // badge.
+  // badge. Neither is the placeholder an ink turn that ended on tool calls
+  // stores as its text; forwarding it sent the user a line about a transcript.
   //
   // But trim only DETECTS that; it must not be what gets sent. Leading
   // indentation is load-bearing in Markdown — a fenced block, a nested list —
   // and trimming the forwarded value would silently reformat the agent's answer
   // (Lumen, PR #580). Detect on the trimmed copy, forward the original.
-  const text = input.finalTextResponse;
-  if (!text || !text.trim()) return { action: 'nothing-delivered', reason: 'no-final-text' };
+  const text = userFacingReplyText(input.finalTextResponse);
+  if (!text) return { action: 'nothing-delivered', reason: 'no-final-text' };
 
   return { action: 'auto-forward', content: text };
 }
@@ -92,7 +99,6 @@ export interface ChannelForwardPayload {
 export interface ChannelForwardEffects {
   info(message: string, meta: Record<string, unknown>): void;
   warn(message: string, meta: Record<string, unknown>): void;
-  debug(message: string, meta: Record<string, unknown>): void;
   release(payload?: ChannelForwardPayload): Promise<void>;
 }
 
@@ -135,14 +141,164 @@ export async function applyChannelForward(
       finalTextLength: context.finalTextLength,
     });
   } else {
-    effects.debug('Explicit delivery marker present, skipping auto-forward', {
+    // Info, not debug: a skip is a decision not to deliver text, and debug is
+    // not persisted. When it was the only trace of a dropped reply, there was
+    // no trace (task 0eb376e5).
+    effects.info('Explicit delivery marker present, skipping auto-forward', {
       channel,
       conversationId,
       hadExplicitResponse: context.hadExplicitResponse,
+      finalTextLength: context.finalTextLength,
     });
   }
 
   await effects.release();
+}
+
+/** One turn's verdict. `explicit-response` and `forward` both mean the user got something. */
+export type TurnReplyDecision =
+  | { action: 'forward'; content: string }
+  | { action: 'explicit-response' }
+  | { action: 'no-text' };
+
+/**
+ * The per-turn form of `decideChannelForward`: a turn that delivered through
+ * send_response keeps its text to itself, and a turn that did not has its text
+ * forwarded. The same rule a one-turn runner gets, applied to each turn rather
+ * than to whichever turn happened to be last.
+ */
+export function decideTurnReply(input: {
+  hadExplicitResponse: boolean;
+  text: string | null | undefined;
+}): TurnReplyDecision {
+  if (input.hadExplicitResponse) return { action: 'explicit-response' };
+  const text = userFacingReplyText(input.text);
+  if (!text) return { action: 'no-text' };
+  return { action: 'forward', content: text };
+}
+
+export interface TurnReplyForwarderEffects {
+  /** Read AND clear the conversation's explicit-send marker (consumeExplicitResponse). */
+  consumeExplicitResponse(): boolean;
+  /** Send one message to the conversation without releasing it. */
+  send(payload: ChannelForwardPayload): Promise<void>;
+  info(message: string, meta: Record<string, unknown>): void;
+  warn(message: string, meta: Record<string, unknown>): void;
+  error(message: string, meta: Record<string, unknown>): void;
+  release(): Promise<void>;
+}
+
+export interface TurnReplyForwarder {
+  /** For SessionRequest.onTurnReply. Reads the marker before its first await. */
+  onTurnReply(reply: TurnReply & { sessionId?: string }): Promise<void>;
+  /** How many turns the run reported. Zero means the runner reports none. */
+  readonly turnsSeen: number;
+  /** After the run: settle the last sends, say what was delivered, release. */
+  finish(run: { success: boolean }): Promise<void>;
+}
+
+/**
+ * Deliver a multi-turn run's replies as its turns end.
+ *
+ * The explicit-send marker is consumed synchronously when a turn's reply
+ * arrives, so it answers for that turn and no later one: the chat prints a
+ * turn's reply before it starts the next turn. Sends are queued, so replies
+ * reach the user in turn order even if one send is slow.
+ *
+ * `finish` releases the conversation without a payload, because the last
+ * turn's text was already decided as that turn ended. It warns when the whole
+ * run delivered nothing, the same promise `applyChannelForward` keeps.
+ */
+export function createTurnReplyForwarder(
+  context: { channel: string; conversationId: string },
+  effects: TurnReplyForwarderEffects
+): TurnReplyForwarder {
+  const { channel, conversationId } = context;
+  const forwarded: number[] = [];
+  const explicit: number[] = [];
+  const failed: number[] = [];
+  let turnsSeen = 0;
+  let sends: Promise<void> = Promise.resolve();
+
+  const onTurnReply = (reply: TurnReply & { sessionId?: string }): Promise<void> => {
+    turnsSeen += 1;
+    const decision = decideTurnReply({
+      hadExplicitResponse: effects.consumeExplicitResponse(),
+      text: reply.text,
+    });
+    const meta = { channel, conversationId, turn: reply.turn, label: reply.label };
+
+    if (decision.action === 'explicit-response') {
+      explicit.push(reply.turn);
+      effects.info('Turn delivered by send_response; its text is not forwarded', {
+        ...meta,
+        textLength: reply.text?.length ?? 0,
+      });
+      return sends;
+    }
+    if (decision.action === 'no-text') {
+      effects.info('Turn ended without a reply to forward', meta);
+      return sends;
+    }
+
+    const step = sends.then(async () => {
+      effects.info('Auto-routing turn reply (no send_response this turn)', {
+        ...meta,
+        responseLength: decision.content.length,
+      });
+      try {
+        await effects.send({
+          content: decision.content,
+          format: 'markdown',
+          ...(reply.sessionId ? { sessionId: reply.sessionId } : {}),
+        });
+        forwarded.push(reply.turn);
+      } catch (error) {
+        failed.push(reply.turn);
+        effects.error('Failed to forward turn reply; this turn reached nobody', {
+          ...meta,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+    sends = step;
+    return step;
+  };
+
+  const finish = async (run: { success: boolean }): Promise<void> => {
+    await sends;
+    // A send after the last reported turn (a run that crashed mid-turn after
+    // calling send_response) still delivered something, and its marker must
+    // not outlive this run.
+    const lateExplicit = effects.consumeExplicitResponse();
+    const meta = {
+      channel,
+      conversationId,
+      turnsSeen,
+      forwardedTurns: forwarded,
+      explicitTurns: explicit,
+      failedTurns: failed,
+      lateExplicit,
+      runSucceeded: run.success,
+    };
+    if (forwarded.length === 0 && explicit.length === 0 && !lateExplicit) {
+      effects.warn('Nothing delivered to the user for this run', {
+        ...meta,
+        reason: !run.success ? 'run-failed' : failed.length > 0 ? 'send-failed' : 'no-final-text',
+      });
+    } else {
+      effects.info('Run replies settled', meta);
+    }
+    await effects.release();
+  };
+
+  return {
+    onTurnReply,
+    get turnsSeen() {
+      return turnsSeen;
+    },
+    finish,
+  };
 }
 
 /**

@@ -22,6 +22,7 @@ import {
 import { promptTransportFor } from '../backends/index.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
+import { continuationPrompt, turnReplyEvent } from '../repl/turn-reply.js';
 import {
   CloneRegistry,
   formatCloneLine,
@@ -217,6 +218,7 @@ import {
   encodeContextToken,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
+  TURN_REPLIES_FORWARDED_ENV,
   verifyDelegationToken,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
@@ -4070,6 +4072,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // first iteration's results while the note claimed they followed.
   let turnDialogue: ReseedDialogueEntry[] = [];
   let turnDialogueMuted = false;
+  // The assistant text the last completed outer turn stored, or null when it
+  // stored none (aborted, failed before the ledger write). The non-interactive
+  // loop reads it after each turn to report that turn's reply (turn_reply).
+  let lastTurnAssistantText: string | null = null;
   // This spawn's assistant text, UNCUT, and the dialogue entry it is written
   // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
   // earlier block (`Looking.\nuser`) is retracted when a later block reveals
@@ -7869,6 +7875,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } else {
       ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
+      // A failed backend's text is whatever it printed before failing, not a
+      // reply: the same rule the server applies to a failed run.
+      lastTurnAssistantText = loopResult.success ? assistantDisplayText : null;
       runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
@@ -8302,8 +8311,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
     // system message — it's harness-delivered, not typed by the human.
     const messageLabel = options.messageLabel?.trim();
+    // Each outer turn's reply goes out as one line the moment the turn ends;
+    // the server forwards it to the channel then, not after the last turn.
+    // Only the last turn's text used to survive the run (turn-reply.ts).
+    const runTurnAndReport = async (
+      turn: number,
+      raw: string,
+      source: 'user' | 'system',
+      label: string | undefined
+    ): Promise<void> => {
+      lastTurnAssistantText = null;
+      await enqueueTurn(raw, source, label);
+      console.log(JSON.stringify(turnReplyEvent(turn, label || 'user', lastTurnAssistantText)));
+    };
+    // Set by the server only when it forwards these lines to a channel.
+    const repliesForwarded = process.env[TURN_REPLIES_FORWARDED_ENV] === '1';
     clearLastSignal();
-    await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
+    await runTurnAndReport(1, message, messageLabel ? 'system' : 'user', messageLabel);
     // Actual completed outer turns — reported instead of the configured cap,
     // which lies whenever signal_status halts the loop early.
     let turnsCompleted = 1;
@@ -8322,8 +8346,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!exitReason) {
       for (let turn = 2; turn <= maxTurns; turn++) {
         clearLastSignal();
-        await enqueueTurn(
-          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
+        await runTurnAndReport(
+          turn,
+          continuationPrompt(repliesForwarded),
           'system',
           'continuation'
         );

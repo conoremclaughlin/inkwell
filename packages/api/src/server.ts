@@ -80,6 +80,7 @@ import {
   decideChannelForward,
   applyChannelForward,
   attributeResponses,
+  createTurnReplyForwarder,
 } from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
@@ -311,6 +312,41 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
+    // External channels get their replies back on the channel: through
+    // send_response, or the runtime forwards the text.
+    const isExternalChannel =
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
+    // A run with several outer turns reports each turn's reply as the turn
+    // ends, and each is forwarded then (createTurnReplyForwarder). A runner
+    // that reports no turns leaves this unused, and the run's final text is
+    // decided below as before.
+    const gatewayForTurns = isExternalChannel ? channelGateway : null;
+    const turnReplies = gatewayForTurns
+      ? createTurnReplyForwarder(
+          { channel, conversationId },
+          {
+            consumeExplicitResponse: () => consumeExplicitResponse(channel, conversationId),
+            send: async (payload) => {
+              await gatewayForTurns.sendResponse({
+                channel: channel as ChannelType,
+                conversationId,
+                content: payload.content,
+                format: payload.format,
+                ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+              });
+            },
+            info: (m, meta) => logger.info(m, meta),
+            warn: (m, meta) => logger.warn(m, meta),
+            error: (m, meta) => logger.error(m, meta),
+            release: () =>
+              gatewayForTurns.releaseConversation(channel as GatewayChannel, conversationId),
+          }
+        )
+      : null;
+
     // Build SessionRequest
     const request: SessionRequest = {
       userId,
@@ -337,6 +373,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         // for a message that was never a reply, so its presence means one was.
         ...(replyRouting ? { replyRouting } : {}),
       },
+      ...(turnReplies ? { onTurnReply: turnReplies.onTurnReply } : {}),
     };
 
     // Process through SessionService
@@ -380,13 +417,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
-    // and auto-route the text response if no explicit send_response was called
-    const isExternalChannel =
-      channel === 'telegram' ||
-      channel === 'whatsapp' ||
-      channel === 'discord' ||
-      channel === 'slack';
-    if (isExternalChannel && channelGateway) {
+    // and auto-route the text response if no explicit send_response was called.
+    // A run that reported its turns was decided turn by turn; only the release
+    // and the run-level verdict are left.
+    if (turnReplies && turnReplies.turnsSeen > 0) {
+      await turnReplies.finish({ success: result.success });
+    } else if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       // Reads AND clears. releaseConversation below drains a pending next turn
       // synchronously, and a marker still standing then is read by that nested
@@ -415,7 +451,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         {
           info: (m, meta) => logger.info(m, meta),
           warn: (m, meta) => logger.warn(m, meta),
-          debug: (m, meta) => logger.debug(m, meta),
           release: (payload) =>
             gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
         }
