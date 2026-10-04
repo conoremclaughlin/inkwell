@@ -41,8 +41,10 @@ import {
  *  the final `item.completed` carried them (Lumen, #745, a local synthetic
  *  provider). Byte silence here is not evidence that tokens have stopped, so
  *  a silence killer would break the rule this file follows: a turn still
- *  producing output is never killed. A wedged Codex turn runs until the
- *  server's run interruption or a configured ceiling stops it. */
+ *  producing output is never killed. A wedged Codex turn is stopped only by a
+ *  configured ceiling or a kill by hand: the server's run interruption at
+ *  restart records the run as interrupted but does not kill its process
+ *  (Lumen, #745). */
 export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CODEX_PROCESS_TIMEOUT_MS);
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
