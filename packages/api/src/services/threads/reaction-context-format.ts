@@ -44,7 +44,10 @@ export interface ReactionContextFormat {
   names: ReadonlyMap<string, string>;
   /** The user's timezone, for the message times. */
   timeZone: string;
-  /** The block's text budget. The first message's line is always rendered. */
+  /**
+   * The block's text budget, in UTF-16 units. Nothing is forced past it:
+   * when not even the first message's line fits, nothing is rendered.
+   */
   maxChars?: number;
 }
 
@@ -166,8 +169,11 @@ export function formatReactionContext(
     );
   };
 
-  let kept = 0;
-  while (kept < entries.length && blockFor(kept + 1).length <= maxChars) kept += 1;
+  // The longest prefix that fits, tried from the full block down. Length is
+  // not monotonic in the prefix (the footer vanishes once nothing is left
+  // over), so a shorter prefix failing says nothing about a longer one.
+  let kept = entries.length;
+  while (kept > 0 && blockFor(kept).length > maxChars) kept -= 1;
 
   const rendered = entries.slice(0, kept).flatMap((e) => e.ids);
   const unrendered = [...noMessage, ...entries.slice(kept).flatMap((e) => e.ids)];

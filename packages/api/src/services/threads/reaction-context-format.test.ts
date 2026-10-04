@@ -182,6 +182,34 @@ describe('formatReactionContext', () => {
       expect(result.unrenderedReactionIds.sort()).toEqual(['r3', 'r4']);
     });
 
+    it('renders every line when the whole block fits exactly, though a shorter prefix with its footer does not (Lumen, 07b6 r1)', () => {
+      // The footer disappears once nothing is left over, so the full block
+      // can be shorter than one line plus "- 1 more reaction …": here the
+      // second line (a short name, a message with no text) is shorter than
+      // that footer.
+      const empty = { id: 'm-empty', createdAt: NOTE.createdAt, content: '' };
+      const batch = {
+        reactions: [
+          reaction('r1', PLAN.id, '❤️', CONOR, 1),
+          reaction('r2', empty.id, '👍', 'u-al', 2),
+        ],
+        messages: [PLAN, empty],
+      };
+      const shortNames = new Map([...names, ['u-al', 'Al']]);
+      const full = render(batch, { names: shortNames })!;
+      const [header, first] = full.split('\n');
+      const oneLinePlusFooter = [
+        header,
+        first,
+        '- 1 more reaction will follow on a later turn.',
+      ].join('\n');
+      expect(oneLinePlusFooter.length).toBeGreaterThan(full.length);
+      const result = renderAll(batch, { names: shortNames, maxChars: full.length });
+      expect(result.text).toBe(full);
+      expect(result.renderedReactionIds.sort()).toEqual(['r1', 'r2']);
+      expect(result.budgetTooSmall).toBe(false);
+    });
+
     it('writes no footer when every line fits and nothing is left over', () => {
       const batch = {
         reactions: [reaction('r1', PLAN.id, '❤️', CONOR, 1), reaction('r2', NOTE.id, '👍', SAM, 2)],
