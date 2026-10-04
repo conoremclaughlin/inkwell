@@ -4,10 +4,12 @@ import { ADMISSION_PROTOCOL } from './command-admission';
 import {
   admitTurn,
   mintTenureCapability,
+  reconcileTenure,
   recordInvocation,
   registerTenure,
   releaseTenure,
   tenureCapabilityHash,
+  type LegacySessionState,
   type TenureHolder,
 } from './tenure-admission';
 
@@ -122,5 +124,64 @@ describe('releaseTenure', () => {
     await expect(
       releaseTenure(bad.client, { sessionId: SESSION, holder, evidence: 'controller_retired' })
     ).rejects.toThrow(/outside its contract/);
+  });
+});
+
+describe('reconcileTenure', () => {
+  const legacy: LegacySessionState = {
+    turnEpoch: 'epoch-legacy',
+    backendSessionId: 'native-session-fixture',
+    lifecycle: 'running',
+    cliTurnAt: null,
+    cliTurnStoppedAt: null,
+    updatedAt: '2026-10-04T12:00:00.123456+00:00',
+  };
+
+  it('sends a legacy attestation with the exact state it was bound to', async () => {
+    const { client, rpc } = clientReturning({ outcome: 'reconciled', tenureId: TENURE });
+    await reconcileTenure(client, {
+      sessionId: SESSION,
+      expectedTenureId: null,
+      evidence: 'legacy_quiescence_attested',
+      currentHostId: 'machine-fixture',
+      evidenceRef: 'attestation-fixture',
+      expectedLegacy: legacy,
+      authority: 'reconciler-fixture',
+      hostInstanceId: 'host-fixture',
+    });
+    expect(rpc).toHaveBeenCalledWith('reconcile_tenure', {
+      p_session_id: SESSION,
+      p_expected_tenure_id: null,
+      p_evidence: 'legacy_quiescence_attested',
+      p_current_boot_id: null,
+      p_current_host_id: 'machine-fixture',
+      p_evidence_ref: 'attestation-fixture',
+      p_expected_legacy: legacy,
+      p_authority: 'reconciler-fixture',
+      p_host_instance_id: 'host-fixture',
+      p_protocol: ADMISSION_PROTOCOL,
+    });
+  });
+
+  it('reads the current legacy state from a stale attestation, and fails closed on a changed shape', async () => {
+    const changed = { ...legacy, updatedAt: '2026-10-04T12:00:01+00:00' };
+    const input = {
+      sessionId: SESSION,
+      expectedTenureId: null,
+      evidence: 'legacy_quiescence_attested' as const,
+      currentHostId: 'machine-fixture',
+      evidenceRef: 'attestation-fixture',
+      expectedLegacy: legacy,
+      authority: 'reconciler-fixture',
+      hostInstanceId: 'host-fixture',
+    };
+    const stale = { outcome: 'stale_expectation', tenureId: null, legacy: changed };
+    expect(await reconcileTenure(clientReturning(stale).client, input)).toEqual(stale);
+    for (const reply of [
+      { ...stale, legacy: { ...changed, extra: 'field' } },
+      { ...stale, legacy: { ...changed, updatedAt: undefined } },
+    ]) {
+      await expect(reconcileTenure(clientReturning(reply).client, input)).rejects.toThrow();
+    }
   });
 });
