@@ -99,6 +99,13 @@ import {
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserId } from '../config/inkling-flags';
 import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import { inklingTurnActivity } from '../services/inklings/inkling-turns';
+import {
+  ReactionRefusedError,
+  loadReactions,
+  reactToMessage,
+  type ReactionSummary,
+} from '../services/threads/thread-reactions';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -3884,17 +3891,30 @@ function answerInklingError(res: Response, label: string, error: unknown): void 
 }
 
 /**
- * GET /api/admin/inklings → { inklings: Inkling[] }, oldest first.
+ * GET /api/admin/inklings → { inklings: [...Inkling, activity], now }, oldest first.
  *
  * Only inklings born through this flow: never the account's other SBs, and
  * no fallback to /individuals. Reading is every role's, like threads; the
  * list holds only the person's own inklings.
+ *
+ * `activity` ({ state: 'idle' | 'working' | 'stopping', since }) is each
+ * listed inkling's turn state in this server process (inkling-turns.ts),
+ * read for those inklings only. `now` is this server's clock as it
+ * answers, so the app measures elapsed time as now minus since and never
+ * mixes in the phone's own clock.
  */
 router.get('/inklings', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const inklings = await (await inklingService()).list(inklingScope(authReq));
-    res.json({ inklings });
+    const now = new Date().toISOString();
+    res.json({
+      inklings: inklings.map((inkling) => ({
+        ...inkling,
+        activity: inklingTurnActivity(inkling.id),
+      })),
+      now,
+    });
   } catch (error) {
     answerInklingError(res, 'Failed to list inklings', error);
   }
@@ -7956,6 +7976,21 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       return 'system';
     };
 
+    // Reactions (spec inkling-reactions), `mine` for this viewer. Shown in
+    // a background thread too: reading is open, reacting is for members.
+    // When they cannot be read the messages carry no `reactions` and meta
+    // says so, rather than [] on each, which would claim nobody reacted.
+    let reactionsByMessage: Map<string, ReactionSummary[]> | null = null;
+    try {
+      reactionsByMessage = await loadReactions(
+        supabase,
+        (messageRows || []).map((m) => m.id),
+        { kind: 'user', id: viewerUserId }
+      );
+    } catch (error) {
+      logger.error('Thread message reactions unavailable:', error);
+    }
+
     res.json({
       studioHistory,
       viewerUserId,
@@ -7995,9 +8030,15 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           priority: m.priority,
           metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
+          ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))
         .reverse(),
-      meta: { fetched, total, truncated: total > fetched },
+      meta: {
+        fetched,
+        total,
+        truncated: total > fetched,
+        ...(reactionsByMessage === null ? { reactionsUnavailable: true } : {}),
+      },
     });
   } catch (error) {
     logger.error('Failed to load thread messages:', error);
@@ -8536,6 +8577,60 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     if (answerInklingThreadRefusal(res, error)) return;
     logger.error('Failed to send thread reply:', error);
     res.status(500).json(errorJson('Failed to send reply', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reactions
+ * Body: { threadKey, messageId, emoji, remove?: boolean }
+ *   → 200 { messageId, reactions }
+ *
+ * The person's own reaction on one message (spec inkling-reactions, "Wire").
+ * `reactions` is the message's summary, `mine` for this person. Adding one
+ * that is already there, or removing one that is not, is 200 and changes
+ * nothing. 400 a malformed emoji or id; 403 a role that cannot write, not a
+ * member (a background thread), or the inkling gate; 404 the message is not
+ * in that thread in this workspace; 409 over the per-person limit. Each
+ * refusal carries a stable `code`.
+ *
+ * A reaction is not a message. It wakes nobody, and moves no unread count
+ * and no thread recency. It is never approval of anything.
+ */
+router.post('/threads/reactions', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const threadKey = typeof req.body?.threadKey === 'string' ? req.body.threadKey.trim() : '';
+    const messageId = typeof req.body?.messageId === 'string' ? req.body.messageId : '';
+    const emoji = typeof req.body?.emoji === 'string' ? req.body.emoji : '';
+    const remove: unknown = req.body?.remove;
+    if (remove !== undefined && typeof remove !== 'boolean') {
+      res.status(400).json({ error: 'remove must be true or false', code: 'invalid_remove' });
+      return;
+    }
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'react to a message');
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await reactToMessage(supabase, {
+      workspaceId: authReq.inkWorkspaceId,
+      threadKey,
+      messageId,
+      emoji,
+      remove: remove === true,
+      reactor: userPrincipal(authReq.inkUserId),
+    });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof ReactionRefusedError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    logger.error('Failed to react to a thread message:', error);
+    res.status(500).json(errorJson('Failed to react to the message', error));
   }
 });
 

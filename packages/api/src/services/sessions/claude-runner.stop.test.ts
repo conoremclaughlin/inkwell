@@ -13,14 +13,26 @@ import { tmpdir } from 'os';
 
 const fixtures = mkdtempSync(join(tmpdir(), 'claude-fake-stop-'));
 const pidsPath = join(fixtures, 'pids.json');
-const hoisted = vi.hoisted(() => ({ binary: '' }));
+const hoisted = vi.hoisted(() => ({ binary: '', exitNeverConfirmed: false }));
 
 vi.mock('./resolve-binary.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./resolve-binary.js')>();
   return { ...actual, resolveBinaryPath: () => Promise.resolve(hoisted.binary) };
 });
 
+// The real stop, except where a test needs a process whose exit is never
+// confirmed: no real process outlives SIGKILL, so that one answer is scripted.
+vi.mock('./stop-process.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./stop-process.js')>();
+  return {
+    ...actual,
+    stopProcessAndWait: (...args: Parameters<typeof actual.stopProcessAndWait>) =>
+      hoisted.exitNeverConfirmed ? Promise.resolve(false) : actual.stopProcessAndWait(...args),
+  };
+});
+
 import { ClaudeRunner } from './claude-runner.js';
+import { STOP_GIVE_UP_MS, STOP_GRACE_MS } from './stop-process.js';
 
 const IGNORES_TERM = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
 
@@ -68,12 +80,47 @@ function alive(pid: number): boolean {
   }
 }
 
+/**
+ * A fake claude that exits `exitAfterMs` after SIGTERM, the way a CLI winding
+ * down does. It reports its pid only once that handler is in place, so a stop
+ * can never land before it.
+ */
+function writeSlowToExitFake(exitAfterMs: number): string {
+  const fake = join(fixtures, `claude-exits-after-${exitAfterMs}.mjs`);
+  writeFileSync(
+    fake,
+    [
+      '#!/usr/bin/env node',
+      "import { writeFileSync } from 'fs';",
+      `process.on('SIGTERM', () => setTimeout(() => process.exit(0), ${exitAfterMs}));`,
+      `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+  chmodSync(fake, 0o755);
+  return fake;
+}
+
+/** The pids the fake reported, once it has. */
+async function whenReported(): Promise<number[]> {
+  const until = Date.now() + 10_000;
+  while (reported().length === 0) {
+    if (Date.now() > until) throw new Error('the fake never reported its pid');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return reported();
+}
+
 describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
-  it('a cancelled run stops at once, as a non-transient failure, with nothing left running', async () => {
+  it('a cancelled run that ignores SIGTERM settles at the group SIGKILL, once it has exited, as a non-transient failure', async () => {
     hoisted.binary = writeHangingFake();
     const controller = new AbortController();
-    setTimeout(() => controller.abort(), 500);
-    const started = Date.now();
+    let abortedAt = 0;
+    setTimeout(() => {
+      abortedAt = Date.now();
+      controller.abort();
+    }, 500);
     const result = await new ClaudeRunner().run('hello', {
       config: {
         workingDirectory: fixtures,
@@ -82,7 +129,13 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
         signal: controller.signal,
       },
     });
-    expect(Date.now() - started).toBeLessThan(5_000);
+    const settledAfter = Date.now() - abortedAt;
+    const [fakeClaude, grandchild] = reported();
+    // Settled when the process was gone, not when it was signalled: until
+    // then it could still write to the session a next turn would resume.
+    expect(alive(fakeClaude)).toBe(false);
+    expect(settledAfter).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+    expect(settledAfter).toBeLessThan(STOP_GRACE_MS + STOP_GIVE_UP_MS);
     expect(result).toMatchObject({
       success: false,
       error: 'Claude Code turn cancelled, process stopped',
@@ -90,10 +143,119 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
     // Not the word the retry classifier reads as transient.
     expect(String(result.error)).not.toMatch(/timeout/i);
 
-    const [fakeClaude, grandchild] = reported();
-    await new Promise((resolve) => setTimeout(resolve, 6_500));
-    expect(alive(fakeClaude)).toBe(false);
+    // The grandchild got the same SIGKILL; give the system a moment to reap it.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
     expect(alive(grandchild)).toBe(false);
+  }, 20_000);
+
+  it.each([
+    ['as a group', true],
+    ['alone', false],
+  ])(
+    'a cancelled run (%s) settles when its process exits, not when it is signalled',
+    async (_label, killProcessGroup) => {
+      hoisted.binary = writeSlowToExitFake(400);
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude] = await whenReported();
+      const abortedAt = Date.now();
+      controller.abort();
+      const result = await run;
+      const settledAfter = Date.now() - abortedAt;
+      expect(alive(fakeClaude)).toBe(false);
+      expect(settledAfter).toBeGreaterThanOrEqual(350);
+      // Promptly once it has gone: no fixed wait for the grace period.
+      expect(settledAfter).toBeLessThan(STOP_GRACE_MS);
+      expect(result).toMatchObject({
+        success: false,
+        error: 'Claude Code turn cancelled, process stopped',
+      });
+    },
+    20_000
+  );
+
+  it('a run past its ceiling settles when its process exits, not when it is signalled', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    const started = Date.now();
+    const result = await new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        timeoutMs: 1000,
+        killProcessGroup: true,
+      },
+    });
+    const [fakeClaude] = reported();
+    expect(alive(fakeClaude)).toBe(false);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000 + 350);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Claude Code timeout: exceeded the 1s ceiling, process killed',
+    });
+  }, 20_000);
+
+  it('a cancelled run keeps what its process wrote while it wound down', async () => {
+    const fake = join(fixtures, 'claude-says-goodbye.mjs');
+    const lastWord = JSON.stringify({ type: 'result', result: 'stopped mid-thought' });
+    writeFileSync(
+      fake,
+      [
+        '#!/usr/bin/env node',
+        "import { writeFileSync } from 'fs';",
+        `process.on('SIGTERM', () => { process.stdout.write(${JSON.stringify(lastWord + '\n')}); setTimeout(() => process.exit(0), 100); });`,
+        `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+        'setInterval(() => {}, 1000);',
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+    chmodSync(fake, 0o755);
+    hoisted.binary = fake;
+    const controller = new AbortController();
+    const run = new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        signal: controller.signal,
+      },
+    });
+    await whenReported();
+    controller.abort();
+    const result = await run;
+    expect(result).toMatchObject({ success: false, finalTextResponse: 'stopped mid-thought' });
+  }, 20_000);
+
+  it('a process that never confirms its exit is given up on at the bound, and the outcome says so', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    hoisted.exitNeverConfirmed = true;
+    try {
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      await whenReported();
+      controller.abort();
+      const result = await run;
+      expect(result).toMatchObject({ success: false });
+      expect(result.error).toBe(
+        'Claude Code turn cancelled; its process did not confirm it had exited'
+      );
+      expect(String(result.error)).not.toMatch(/timeout/i);
+    } finally {
+      hoisted.exitNeverConfirmed = false;
+    }
   }, 20_000);
 
   it('stops at the run ceiling, and nothing it started is left running', async () => {

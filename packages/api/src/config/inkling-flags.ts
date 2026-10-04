@@ -30,6 +30,18 @@ export function inklingOwnerTestUserId(source: EnvSource = process.env): string 
   return raw && UUID.test(raw) ? raw : null;
 }
 
+/**
+ * Whether `userId` is the owner test's account. Owner checks ask this
+ * rather than comparing ids themselves, so letting more accounts into the
+ * test changes this function, not its callers.
+ */
+export function isInklingOwnerTestUser(
+  userId: string,
+  ownerTestUserId: string | null = inklingOwnerTestUserId()
+): boolean {
+  return ownerTestUserId !== null && userId.toLowerCase() === ownerTestUserId.toLowerCase();
+}
+
 /** The first test's ceiling on one inkling turn: five minutes. */
 export const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
 

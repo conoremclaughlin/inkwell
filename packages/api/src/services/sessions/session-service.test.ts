@@ -37,6 +37,8 @@ import type {
   ClaudeRunnerResult,
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
+import { ClaudeRunner } from './claude-runner.js';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -63,6 +65,18 @@ vi.mock('./claude-runner.js', async (importOriginal) => {
   return {
     ...actual,
     buildIdentityPrompt: vi.fn(() => 'mocked-identity-prompt'),
+  };
+});
+
+// The real ClaudeRunner, for the stopped-turn suite only: it resolves a fake
+// `claude` binary there, and the real path everywhere else.
+const stopFake = vi.hoisted(() => ({ binary: '' }));
+vi.mock('./resolve-binary.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./resolve-binary.js')>();
+  return {
+    ...actual,
+    resolveBinaryPath: (name: string) =>
+      stopFake.binary ? Promise.resolve(stopFake.binary) : actual.resolveBinaryPath(name),
   };
 });
 
@@ -917,6 +931,14 @@ describe('SessionService', () => {
         inbox_thread_messages: [
           { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
           { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          // The inkling's own reply in its conversation.
+          {
+            id: 'msg-inkling',
+            thread_id: 'thread-1',
+            sender_kind: 'sb',
+            sender_sb_id: SB,
+            sender_user_id: null,
+          },
           {
             id: 'msg-someone',
             thread_id: 'thread-1',
@@ -976,7 +998,7 @@ describe('SessionService', () => {
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
-        const supabase = makeFakeSupabase({
+        const tables = {
           // agent_id is the request's slug, as an inkling's own slug is: routing
           // resolves the identity by it.
           agent_identities: [
@@ -994,7 +1016,9 @@ describe('SessionService', () => {
           ],
           studios: [],
           ...THREAD_TABLES,
-        });
+        };
+        lastTables = tables;
+        const supabase = makeFakeSupabase(tables);
         const failing = [
           ...(extra.failReads ?? []),
           ...(extra.readError
@@ -1037,11 +1061,32 @@ describe('SessionService', () => {
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
       };
       let lastService: SessionService;
+      let lastTables: Record<string, Row[]>;
+      /** The turns counted against the inkling's cap in the last turn's tables. */
+      const turnsCounted = () =>
+        (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
+          ?.ownerTestTurns;
 
       it("the owner's own message wakes an inkling born under the test", async () => {
         const result = await turn(INKLING);
         expect(mockClaudeRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it("the inkling's own reply starts no turn and takes nothing from its cap", async () => {
+        // Control: the owner's message is counted, so the count is observable.
+        await turn(INKLING);
+        expect(turnsCounted()).toBe(1);
+        vi.mocked(mockClaudeRunner.run).mockClear();
+
+        const result = await turn(INKLING, {
+          sender: { id: 'user', name: 'Owner' },
+          metadata: { triggerThreadMessageId: 'msg-inkling' },
+        });
+        expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+        expect(result.classification?.retryable).toBe(false);
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(turnsCounted()).toBeUndefined();
       });
 
       describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
@@ -1224,6 +1269,122 @@ describe('SessionService', () => {
         expect(during).toBe(1);
         expect(aborted).toBe(true);
         expect(liveInklingTurns(SB)).toBe(0);
+      });
+
+      describe('a stopped turn holds its session until its process has exited (two processes on one Claude session)', () => {
+        let leaderPid = 0;
+
+        afterEach(() => {
+          if (leaderPid) {
+            try {
+              process.kill(leaderPid, 'SIGKILL');
+            } catch {
+              // already gone
+            }
+          }
+          leaderPid = 0;
+          stopFake.binary = '';
+        });
+
+        /**
+         * A fake `claude` that exits 400 ms after SIGTERM, the way a CLI
+         * winding down does, and reports its pid once that handler is set.
+         */
+        const writeFake = async (): Promise<string> => {
+          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-'));
+          const pidFile = join(dir, 'leader.pid');
+          const script = join(dir, 'claude.mjs');
+          writeFileSync(
+            script,
+            [
+              '#!/usr/bin/env node',
+              "import { writeFileSync } from 'fs';",
+              "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
+              `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+              'setInterval(() => {}, 1000);',
+            ].join('\n'),
+            { mode: 0o755 }
+          );
+          stopFake.binary = script;
+          return pidFile;
+        };
+
+        const pidOf = async (pidFile: string): Promise<number> => {
+          const until = Date.now() + 10_000;
+          for (;;) {
+            const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf-8')) : 0;
+            if (pid > 0) return pid;
+            if (Date.now() > until) throw new Error('the fake never reported its pid');
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        };
+
+        const alive = (pid: number): boolean => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+
+        /** Turn 1 runs the real ClaudeRunner on the fake; turn 2 records when it began. */
+        const wire = (stoppedAt: () => number) => {
+          const real = new ClaudeRunner();
+          const second: { leaderAlive?: boolean; afterStopMs?: number } = {};
+          vi.mocked(mockClaudeRunner.run)
+            .mockImplementationOnce((message, options) => real.run(message, options))
+            .mockImplementationOnce(async () => {
+              second.leaderAlive = alive(leaderPid);
+              second.afterStopMs = Date.now() - stoppedAt();
+              return {
+                success: true,
+                responses: [],
+                backendSessionId: 'claude-abc',
+              } as never;
+            });
+          return second;
+        };
+
+        it('Stop, then the owner sends at once: the next turn starts only once the stopped one has exited', async () => {
+          const pidFile = await writeFake();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(pidFile);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          await first;
+          const next = await lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          expect(next.success).toBe(true);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+          // Never a second `--resume` of the session beside the first.
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        it('the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
+          const pidFile = await writeFake();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(pidFile);
+          const queued = lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          // Long enough to reach the session lock and queue behind it.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          const [, next] = await Promise.all([first, queued]);
+          expect(next.success).toBe(true);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
       });
 
       it('a threaded message is placed in its folder, not held for want of a studio', async () => {

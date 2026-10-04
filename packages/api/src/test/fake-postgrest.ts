@@ -5,12 +5,12 @@
  * as it would against PostgREST, so a missing scope fails a test instead of
  * being answered by a fixture.
  *
- * Supported: from(table) with select / insert / update, eq (including
- * `column->>key`), gt, in, order, limit, maybeSingle, single, and awaiting the builder
- * for many rows; rpc through registered handlers. Unique constraints are
- * declared per table and refuse a write with 23505, as Postgres does. A
- * table with an updated_at column gets a fresh one on every update, as the
- * canonical trigger does.
+ * Supported: from(table) with select / insert / update / delete, eq
+ * (including `column->>key`), gt, in, order, limit, range, maybeSingle,
+ * single, and awaiting the builder for many rows; rpc through registered
+ * handlers. Unique constraints are declared per table and refuse a write
+ * with 23505, as Postgres does. A table with an updated_at column gets a
+ * fresh one on every update, as the canonical trigger does.
  *
  * Why not services/sessions/fake-supabase.ts: that fake has no unique
  * constraints (every insert succeeds, and an array insert becomes one
@@ -37,7 +37,7 @@ export interface UniqueConstraint {
 }
 export type RpcHandler = (args: Record<string, unknown>, db: FakePostgrest) => FakeResult;
 
-type Op = 'select' | 'insert' | 'update';
+type Op = 'select' | 'insert' | 'update' | 'delete';
 
 export class FakePostgrest {
   readonly tables: Record<string, Row[]> = {};
@@ -128,6 +128,7 @@ export class FakeQuery implements PromiseLike<FakeResult> {
   private filters: Array<{ label: string; test: (row: Row) => boolean }> = [];
   private ordering: Array<{ column: string; ascending: boolean }> = [];
   private limitCount: number | undefined;
+  private offset = 0;
   private inListLengths: number[] = [];
   private values: Row[] = [];
   private patch: Row = {};
@@ -155,6 +156,11 @@ export class FakeQuery implements PromiseLike<FakeResult> {
   update(patch: Row): this {
     this.op = 'update';
     this.patch = patch;
+    return this;
+  }
+
+  delete(): this {
+    this.op = 'delete';
     return this;
   }
 
@@ -193,6 +199,13 @@ export class FakeQuery implements PromiseLike<FakeResult> {
 
   limit(count: number): this {
     this.limitCount = count;
+    return this;
+  }
+
+  /** Rows `from` through `to`, inclusive, as PostgREST's Range header asks. */
+  range(from: number, to: number): this {
+    this.offset = from;
+    this.limitCount = to - from + 1;
     return this;
   }
 
@@ -245,6 +258,7 @@ export class FakeQuery implements PromiseLike<FakeResult> {
     }
     if (this.op === 'insert') return this.runInsert();
     if (this.op === 'update') return this.runUpdate();
+    if (this.op === 'delete') return this.runDelete();
 
     const rows = this.matching();
     for (const { column, ascending } of [...this.ordering].reverse()) {
@@ -254,7 +268,8 @@ export class FakeQuery implements PromiseLike<FakeResult> {
       });
     }
     const cap = Math.min(this.limitCount ?? Infinity, this.db.maxRows ?? Infinity);
-    const limited = cap === Infinity ? rows : rows.slice(0, cap);
+    const fromOffset = rows.slice(this.offset);
+    const limited = cap === Infinity ? fromOffset : fromOffset.slice(0, cap);
     return { data: limited.map((r) => this.project(r)), error: null };
   }
 
@@ -272,6 +287,14 @@ export class FakeQuery implements PromiseLike<FakeResult> {
       inserted.push(row);
     }
     return { data: this.returning ? inserted.map((r) => this.project(r)) : [], error: null };
+  }
+
+  private runDelete(): FakeResult<Row[]> {
+    const targets = new Set(this.matching());
+    const table = this.db.rows(this.table);
+    const kept = table.filter((row) => !targets.has(row));
+    table.splice(0, table.length, ...kept);
+    return { data: this.returning ? [...targets].map((r) => this.project(r)) : [], error: null };
   }
 
   private runUpdate(): FakeResult<Row[]> {

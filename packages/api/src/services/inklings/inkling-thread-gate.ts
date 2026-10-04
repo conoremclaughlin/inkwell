@@ -8,10 +8,16 @@
  * off. handleSendToInbox asks before it writes anything, so a refused send
  * leaves no thread, participant or message behind. Turn dispatch checks
  * again at the spawn seam; this is the creation half.
+ *
+ * Two senders write: the owner, and the inkling replying. The inkling only
+ * replies, in a conversation it is already a member of with its owner; it
+ * never starts one. Its reply addresses itself and wakes nobody, and the
+ * turn gate wakes an inkling only for its owner's message, so a reply
+ * cannot start another turn.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { inklingOwnerTestUserId } from '../../config/inkling-flags';
+import { inklingOwnerTestUserId, isInklingOwnerTestUser } from '../../config/inkling-flags';
 import type { Principal, SbPrincipal } from '../principals';
 import { INKLING_CLIENT, INKLINGS_DISABLED } from './inkling-service';
 
@@ -35,8 +41,9 @@ interface IdentityRow {
 
 /**
  * Refuses (throws) a send that would put an inkling in a conversation with
- * anyone but its owner, or that comes from anyone but that owner. A send
- * that touches no inkling passes untouched.
+ * anyone but its owner, or that comes from anyone but that owner or, as a
+ * reply, the inkling itself. A send that touches no inkling passes
+ * untouched.
  */
 export async function assertInklingThreadAllowed(
   supabase: SupabaseClient,
@@ -50,6 +57,8 @@ export async function assertInklingThreadAllowed(
 ): Promise<void> {
   const sbIds = new Set(input.participantSbs.map((sb) => sb.sbId));
   const people = new Set<string>();
+  /** The SBs already in the conversation, before this send. */
+  const members = new Set<string>();
   if (input.existingThreadId) {
     const { data, error } = await supabase
       .from('inbox_thread_participants')
@@ -57,7 +66,10 @@ export async function assertInklingThreadAllowed(
       .eq('thread_id', input.existingThreadId);
     if (error) throw new Error(`Failed to read the conversation's members: ${error.message}`);
     for (const row of (data ?? []) as Array<{ sb_id: string | null; user_id: string | null }>) {
-      if (row.sb_id) sbIds.add(row.sb_id);
+      if (row.sb_id) {
+        sbIds.add(row.sb_id);
+        members.add(row.sb_id);
+      }
       if (row.user_id) people.add(row.user_id.toLowerCase());
     }
   }
@@ -75,14 +87,23 @@ export async function assertInklingThreadAllowed(
   if (ownerTestUserId === null) {
     throw new InklingThreadRefusedError(INKLINGS_DISABLED, 'Inklings are not open on this server');
   }
-  const owner = ownerTestUserId.toLowerCase();
   const [inkling] = inklings;
+  // The inkling's owner, who must be the owner test's account.
+  const owner = inkling.user_id.toLowerCase();
+  const sender = input.sender;
+  const fromOwner = sender.kind === 'user' && sender.userId.toLowerCase() === owner;
+  // The inkling answering: in a conversation it is already in, with its
+  // owner in it too. Never a new one, and never one its owner has left.
+  const replyFromInkling =
+    sender.kind === 'sb' &&
+    sender.sbId === inkling.id &&
+    members.has(inkling.id) &&
+    people.has(owner);
   const allowed =
-    input.sender.kind === 'user' &&
-    input.sender.userId.toLowerCase() === owner &&
+    isInklingOwnerTestUser(owner, ownerTestUserId) &&
+    (fromOwner || replyFromInkling) &&
     inklings.length === 1 &&
     sbIds.size === 1 &&
-    inkling.user_id.toLowerCase() === owner &&
     inkling.metadata?.ownerTest === true &&
     [...people].every((person) => person === owner);
   if (!allowed) {

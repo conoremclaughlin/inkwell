@@ -40,3 +40,44 @@ export function stopProcess(
   }, options.graceMs ?? STOP_GRACE_MS);
   escalate.unref();
 }
+
+/** How long past the grace period's SIGKILL to wait for an exit before giving up. */
+export const STOP_GIVE_UP_MS = 2000;
+
+/**
+ * stopProcess, settled when the process has exited rather than when it was
+ * signalled. A run is not over while its process is still running: it can
+ * still write to the session a next turn would resume, which made two
+ * processes on one Claude session after a stopped inkling turn (measured,
+ * #740 thread a0b00a78).
+ *
+ * Resolves true on the exit. Resolves false if it has not exited `giveUpMs`
+ * after the SIGKILL: past that the process cannot be reached, and waiting
+ * longer helps nobody. "Exited" is the process itself: with `group`, a tool
+ * it started that left the group (its own session) is never signalled, and
+ * one that ignores SIGTERM dies with the group's SIGKILL, not before.
+ */
+export function stopProcessAndWait(
+  proc: ChildProcess,
+  options: { group?: boolean; graceMs?: number; giveUpMs?: number } = {}
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let giveUp: NodeJS.Timeout | undefined;
+    const finish = (exited: boolean) => {
+      if (giveUp) clearTimeout(giveUp);
+      proc.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    proc.once('exit', onExit);
+    stopProcess(proc, options);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      finish(true);
+      return;
+    }
+    giveUp = setTimeout(
+      () => finish(false),
+      (options.graceMs ?? STOP_GRACE_MS) + (options.giveUpMs ?? STOP_GIVE_UP_MS)
+    );
+  });
+}
