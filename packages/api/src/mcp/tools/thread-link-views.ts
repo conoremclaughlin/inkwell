@@ -12,16 +12,17 @@ import type { Principal } from '../../services/principals';
 import { roleOfUserIn } from './caller-principal';
 import {
   THREAD_LINK_HEADER_MAX,
+  artifactVisibleTo,
   describeThreadLinks,
   findLinkArtifact,
   linkReaderForSb,
   linkReaderForUser,
   listLinksFrom,
   listLinksTo,
-  readerSeesArtifact,
   specTwin,
   specTwinKeysOf,
   type LinkReader,
+  type LinkScope,
   type LinkTarget,
   type ResolvedLinkTarget,
   type ThreadLinkRow,
@@ -30,13 +31,7 @@ import {
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
 
-/** Where a link is resolved: its workspace, the caller's user, and what the caller may see. */
-export interface LinkScope {
-  workspaceId: string;
-  /** The caller's user: an SB's owner, or the person. Scopes legacy artifacts. */
-  callerUserId: string;
-  reader: LinkReader;
-}
+export type { LinkScope };
 
 /**
  * Resolve a parsed target to what is stored. A thread key is stored as
@@ -58,7 +53,7 @@ export async function resolveLinkTarget(
     return { resolved: { kind: 'thread', threadKey: target.threadKey } };
   }
   const found = await findLinkArtifact(supabase, scope.workspaceId, scope.callerUserId, target.uri);
-  if (!found || !readerSeesArtifact(scope.reader, found.artifact)) {
+  if (!found || !artifactVisibleTo(scope, found.artifact)) {
     return { error: `No artifact at ${target.uri}` };
   }
   return {
@@ -125,14 +120,12 @@ async function subjectOf(
 /**
  * Every link to and from a subject, as views. For a `spec:` thread or an
  * `ink://specs/` artifact, links to its twin count as links to it. The reader
- * is required: it decides which links survive (LinkReader).
+ * scope is required: its reader decides which links survive (LinkReader).
  */
 export async function threadLinkViewsFor(
   supabase: SupabaseClient,
-  callerUserId: string,
-  workspaceId: string,
+  scope: LinkScope,
   subject: { threadKey: string; threadId: string | null } | { artifactId: string; uri: string },
-  reader: LinkReader,
   options: { direction?: 'both' | 'to' | 'from'; relation?: string } = {}
 ) {
   const direction = options.direction ?? 'both';
@@ -143,15 +136,15 @@ export async function threadLinkViewsFor(
     linksTo = await listLinksFrom(supabase, subject.threadId);
   }
   if (direction !== 'to') {
-    const whole = await subjectOf(supabase, workspaceId, callerUserId, subject);
-    linkedFrom = await listLinksTo(supabase, workspaceId, whole);
+    const whole = await subjectOf(supabase, scope.workspaceId, scope.callerUserId, subject);
+    linkedFrom = await listLinksTo(supabase, scope.workspaceId, whole);
   }
 
   if (options.relation) {
     linksTo = linksTo.filter((r) => r.relation === options.relation);
     linkedFrom = linkedFrom.filter((r) => r.relation === options.relation);
   }
-  return describeThreadLinks(supabase, workspaceId, { linksTo, linkedFrom }, reader);
+  return describeThreadLinks(supabase, scope, { linksTo, linkedFrom });
 }
 
 export interface ThreadLinkHeader {
@@ -176,14 +169,15 @@ export async function threadLinkHeader(
   thread: { id: string; thread_key: string }
 ): Promise<ThreadLinkHeader | { error: string }> {
   try {
-    const reader = await linkReaderForSb(supabase, caller);
-    const views = await threadLinkViewsFor(
-      supabase,
-      caller.userId,
-      caller.workspaceId,
-      { threadKey: thread.thread_key, threadId: thread.id },
-      reader
-    );
+    const scope: LinkScope = {
+      workspaceId: caller.workspaceId,
+      callerUserId: caller.userId,
+      reader: await linkReaderForSb(supabase, caller),
+    };
+    const views = await threadLinkViewsFor(supabase, scope, {
+      threadKey: thread.thread_key,
+      threadId: thread.id,
+    });
     return {
       linksTo: views.linksTo.slice(0, THREAD_LINK_HEADER_MAX),
       linkedFrom: views.linkedFrom.slice(0, THREAD_LINK_HEADER_MAX),

@@ -354,17 +354,14 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   // Who is asking decides how much they see: the team sees every link, anyone
   // else only links between threads they take part in (LinkReader).
   const scope = await scopeOf(supabase, caller);
-  const reader = scope.reader;
   const options = { direction: parsed.direction, relation: parsed.relation };
 
   if (parsed.threadKey) {
     const thread = await findThread(supabase, caller.workspaceId, parsed.threadKey);
     const views = await threadLinkViewsFor(
       supabase,
-      caller.userId,
-      caller.workspaceId,
+      scope,
       { threadKey: parsed.threadKey, threadId: thread?.id ?? null },
-      reader,
       options
     );
     return reply({
@@ -386,10 +383,8 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   }
   const views = await threadLinkViewsFor(
     supabase,
-    caller.userId,
-    caller.workspaceId,
+    scope,
     { artifactId: r.resolved.artifactId, uri: r.uri! },
-    reader,
     options
   );
   return reply({

@@ -33,6 +33,8 @@ const USER_A = '00000000-0000-4000-8000-000000000001';
 const USER_B = '00000000-0000-4000-8000-000000000002';
 const WS = 'ws-review';
 const FULL = { kind: 'full' } as const;
+/** The team's view, in the fixture's workspace, as the workspace owner. */
+const FULL_SCOPE = { workspaceId: WS, callerUserId: USER_A, reader: FULL };
 
 /**
  * One workspace, two owners' SBs, both in thread pr:1, which links an
@@ -195,8 +197,50 @@ describe('thread link resolution across owners (Lumen, #737)', () => {
     expect(tables.thread_links).toHaveLength(1);
   });
 
-  it('gives both workspace SBs the same spec-twin backlinks', async () => {
+  // Round 1 asked both SBs to get the same spec-twin backlinks. Under the
+  // reader scope they differ by design, and round 2 caught this case still
+  // asserting equality, i.e. asserting the bypass (Lumen). Both members are in
+  // pr:1; only alpha's user owns the spec, so only alpha sees the link to it.
+  it('spec-twin backlinks follow the reader: the spec’s owner sees them, another member does not', async () => {
     const { dc } = fixture();
+    const alpha = parsed(
+      await handleListThreadLinks(
+        { userId: USER_A, sbSlug: 'alpha', threadKey: 'spec:example' },
+        dc
+      )
+    );
+    const beta = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'spec:example' }, dc)
+    );
+    expect(alpha.linkedFrom.map((l: { threadKey: string }) => l.threadKey)).toEqual(['pr:1']);
+    expect(beta.linkedFrom).toEqual([]);
+  });
+
+  // A `spec:` key usually has no thread. Its end is visible to a restricted
+  // reader that may see the spec it is the twin of, and only to that reader.
+  it('a spec: key end is visible through its spec to the spec’s owner only', async () => {
+    const { dc, tables } = fixture();
+    tables.thread_links[0] = {
+      ...tables.thread_links[0],
+      target_kind: 'thread',
+      target_thread_key: 'spec:example',
+      target_artifact_id: null,
+      target_ref: 'spec:example',
+    };
+    const alpha = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(alpha.linksTo.map((l: { threadKey: string }) => l.threadKey)).toEqual(['spec:example']);
+    const beta = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'pr:1' }, dc)
+    );
+    expect(beta.linksTo).toEqual([]);
+  });
+
+  // The other pole: with the workspace owner's SB in the fixture, both team
+  // and spec owner agree, and a member's SB that owns the spec sees it too.
+  it('the team sees every spec-twin backlink', async () => {
+    const { dc } = fixture({ roles: { a: 'owner', b: 'member' }, artifactOwner: USER_B });
     const alpha = parsed(
       await handleListThreadLinks(
         { userId: USER_A, sbSlug: 'alpha', threadKey: 'spec:example' },
@@ -240,34 +284,136 @@ describe('spec backlinks across a Library rename (Lumen, #737)', () => {
       target_ref: 'spec:example',
     };
     expect(
-      await artifactBacklinks(client, WS, { id: 'artifact', uri: 'ink://specs/example' }, FULL)
+      await artifactBacklinks(client, FULL_SCOPE, { id: 'artifact', uri: 'ink://specs/example' })
     ).toMatchObject({ count: 1 });
   });
 
   it('keeps the old spec thread’s links on the renamed artifact', async () => {
     const { client } = renamed();
-    const oldThread = await threadLinkViewsFor(
-      client,
-      USER_A,
-      WS,
-      { threadKey: 'spec:old-example', threadId: null },
-      FULL
-    );
+    const oldThread = await threadLinkViewsFor(client, FULL_SCOPE, {
+      threadKey: 'spec:old-example',
+      threadId: null,
+    });
     expect(oldThread.linkedFrom).toHaveLength(1);
     expect(
-      await artifactBacklinks(client, WS, { id: 'artifact', uri: 'ink://specs/example' }, FULL)
+      await artifactBacklinks(client, FULL_SCOPE, { id: 'artifact', uri: 'ink://specs/example' })
     ).toMatchObject({ count: 1 });
   });
 
   it('and on the spec thread under its new name', async () => {
     const { client } = renamed();
-    const current = await threadLinkViewsFor(
-      client,
-      USER_A,
-      WS,
-      { threadKey: 'spec:example', threadId: null },
-      FULL
-    );
+    const current = await threadLinkViewsFor(client, FULL_SCOPE, {
+      threadKey: 'spec:example',
+      threadId: null,
+    });
     expect(current.linkedFrom.map((l) => l.threadKey)).toEqual(['pr:1']);
+  });
+});
+
+// Lumen's round-2 probes from the #737 review at 449ca43b, appended as
+// written: two controls and three boundary checks.
+describe('Lumen round 2 reader boundary probes', () => {
+  it('control: a member sees the incoming link when participating at both thread ends', async () => {
+    const { dc, tables } = fixture();
+    tables.inbox_threads.push({
+      id: 'visible',
+      thread_key: 'thread:visible',
+      workspace_id: WS,
+      title: 'Synthetic visible target',
+      status: 'open',
+    });
+    tables.inbox_thread_participants.push({ thread_id: 'visible', sb_id: 'sb-b', user_id: null });
+    tables.thread_links[0] = {
+      ...tables.thread_links[0],
+      target_kind: 'thread',
+      target_thread_key: 'thread:visible',
+      target_artifact_id: null,
+      target_ref: 'thread:visible',
+    };
+    const incoming = parsed(
+      await handleListThreadLinks(
+        { userId: USER_B, sbSlug: 'beta', threadKey: 'thread:visible' },
+        dc
+      )
+    );
+    expect(incoming.linkedFrom).toHaveLength(1);
+  });
+
+  it('control: a member sees an incoming link to its own artifact', async () => {
+    const { dc } = fixture({ artifactOwner: USER_B });
+    const incoming = parsed(
+      await handleListThreadLinks(
+        { userId: USER_B, sbSlug: 'beta', uri: 'ink://specs/example' },
+        dc
+      )
+    );
+    expect(incoming.linkedFrom).toHaveLength(1);
+  });
+
+  it('does not reveal an owner-private artifact link through its spec twin', async () => {
+    const { dc, tables } = fixture();
+    tables.thread_links[0].note = 'Synthetic restricted artifact link note';
+    const byUri = parsed(
+      await handleListThreadLinks(
+        { userId: USER_B, sbSlug: 'beta', uri: 'ink://specs/example' },
+        dc
+      )
+    );
+    expect(byUri).toEqual({ success: false, error: 'No artifact at ink://specs/example' });
+    const outgoing = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'pr:1' }, dc)
+    );
+    expect(outgoing.linksTo).toEqual([]);
+    const twin = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'spec:example' }, dc)
+    );
+    expect(twin.linkedFrom).toEqual([]);
+  });
+
+  it('does not reveal a hidden thread link by reading its incoming direction', async () => {
+    const { dc, tables } = fixture();
+    tables.inbox_threads.push({
+      id: 'hidden',
+      thread_key: 'thread:hidden',
+      workspace_id: WS,
+      title: 'Synthetic hidden target',
+      status: 'open',
+    });
+    tables.thread_links[0] = {
+      ...tables.thread_links[0],
+      target_kind: 'thread',
+      target_thread_key: 'thread:hidden',
+      target_artifact_id: null,
+      target_ref: 'thread:hidden',
+      note: 'Synthetic hidden thread link note',
+    };
+    const outgoing = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'pr:1' }, dc)
+    );
+    expect(outgoing.linksTo).toEqual([]);
+    const incoming = parsed(
+      await handleListThreadLinks(
+        { userId: USER_B, sbSlug: 'beta', threadKey: 'thread:hidden' },
+        dc
+      )
+    );
+    expect(incoming.linkedFrom).toEqual([]);
+  });
+
+  it('uses the same legacy artifact scope for outgoing reads and resolution', async () => {
+    const { dc, tables } = fixture({ roles: { a: 'owner', b: 'member' }, artifactOwner: USER_B });
+    tables.artifacts[0].workspace_id = null;
+    tables.thread_links[0].linked_by_sb_id = 'sb-b';
+    const byUri = parsed(
+      await handleListThreadLinks(
+        { userId: USER_A, sbSlug: 'alpha', uri: 'ink://specs/example' },
+        dc
+      )
+    );
+    expect(byUri).toEqual({ success: false, error: 'No artifact at ink://specs/example' });
+    const outgoing = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(outgoing.linksTo).toEqual([]);
   });
 });

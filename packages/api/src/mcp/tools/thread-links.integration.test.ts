@@ -395,7 +395,16 @@ describe('thread links (DB integration)', () => {
     );
     expect(d.linksTo).toEqual([]);
 
-    // A links to the spec key, which has no thread the inkling could list.
+    // A links to the spec key (the inkling's user owns the spec, so that end
+    // is visible through the twin) and to B (a thread the inkling is not in).
+    // Its header shows the spec link alone; the team's shows both.
+    const toB = parse(
+      await handleLinkThread(
+        { ...base(), sbSlug: 'echo', threadKey: KEY_A, to: KEY_B },
+        dataComposer
+      )
+    );
+    expect(toB.success).toBe(true);
     const read = parse(
       await handleGetThreadMessages(
         { ...base(), sbSlug: INK, threadKey: KEY_A, fullHistory: true, markRead: false },
@@ -403,14 +412,27 @@ describe('thread links (DB integration)', () => {
       )
     );
     expect(read.success).toBe(true);
-    expect(read.links).toMatchObject({ linksTo: [], linksToCount: 0 });
+    expect(read.links.linksTo.map((l: { threadKey: string }) => l.threadKey)).toEqual([SPEC_KEY]);
     const teamRead = parse(
       await handleGetThreadMessages(
         { ...base(), sbSlug: 'echo', threadKey: KEY_A, fullHistory: true, markRead: false },
         dataComposer
       )
     );
-    expect(teamRead.links.linksToCount).toBe(1);
+    expect(teamRead.links.linksTo.map((l: { threadKey: string }) => l.threadKey).sort()).toEqual(
+      [KEY_B, SPEC_KEY].sort()
+    );
+
+    // Read from B's side, the same row stays hidden from the inkling: it is
+    // not in B (Lumen, #737 round 2).
+    const fromB = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: INK, threadKey: KEY_B }, dataComposer)
+    );
+    expect(fromB.linkedFrom).toEqual([]);
+    const teamFromB = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: 'echo', threadKey: KEY_B }, dataComposer)
+    );
+    expect(teamFromB.linkedFrom.map((l: { threadKey: string }) => l.threadKey)).toEqual([KEY_A]);
   });
 
   it('refuses a self-link, a web URL and an unknown artifact without writing', async () => {

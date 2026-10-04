@@ -300,6 +300,70 @@ export function readerSeesArtifact(reader: LinkReader, artifact: { user_id: stri
   return reader.kind === 'full' || artifact.user_id === reader.userId;
 }
 
+/** Where links are read or written: their workspace, the caller's user, and what it may see. */
+export interface LinkScope {
+  workspaceId: string;
+  /** The caller's user: an SB's owner, or the person. Scopes legacy artifacts. */
+  callerUserId: string;
+  reader: LinkReader;
+}
+
+/**
+ * The one artifact predicate (Lumen, #737 round 2): in the link's workspace,
+ * legacy rule included, and visible to this reader. Resolving a target and
+ * showing a link's end both ask exactly this, so an artifact a caller sees at
+ * a link's end is one it can also link and unlink.
+ */
+export function artifactVisibleTo(scope: LinkScope, artifact: LinkArtifactRow): boolean {
+  return (
+    artifactInWorkspace(artifact, scope.workspaceId, scope.callerUserId) &&
+    readerSeesArtifact(scope.reader, artifact)
+  );
+}
+
+/**
+ * Artifacts by current or former URI, batched: one query for each table.
+ * Used to read a `spec:` key's twin at a link's end.
+ */
+async function artifactsByUri(
+  supabase: SupabaseClient,
+  uris: string[]
+): Promise<Map<string, LinkArtifactRow>> {
+  const out = new Map<string, LinkArtifactRow>();
+  if (uris.length === 0) return out;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const client = supabase as any;
+  const { data: direct, error } = await client
+    .from('artifacts')
+    .select(LINK_ARTIFACT_COLUMNS)
+    .in('uri', uris);
+  if (error) throw new Error(`Failed to read spec artifacts: ${error.message}`);
+  for (const a of (direct ?? []) as LinkArtifactRow[]) out.set(a.uri, a);
+  const missing = uris.filter((u) => !out.has(u));
+  if (missing.length === 0) return out;
+  const { data: aliases, error: aliasError } = await client
+    .from('artifact_uri_aliases')
+    .select('alias_uri, artifact_id')
+    .in('alias_uri', missing);
+  if (aliasError) throw new Error(`Failed to read spec aliases: ${aliasError.message}`);
+  const aliasRows = (aliases ?? []) as Array<{ alias_uri: string; artifact_id: string }>;
+  if (aliasRows.length === 0) return out;
+  const { data: aliased, error: aliasedError } = await client
+    .from('artifacts')
+    .select(LINK_ARTIFACT_COLUMNS)
+    .in(
+      'id',
+      aliasRows.map((a) => a.artifact_id)
+    );
+  if (aliasedError) throw new Error(`Failed to read spec artifacts: ${aliasedError.message}`);
+  const byId = new Map(((aliased ?? []) as LinkArtifactRow[]).map((a) => [a.id, a]));
+  for (const a of aliasRows) {
+    const row = byId.get(a.artifact_id);
+    if (row) out.set(a.alias_uri, row);
+  }
+  return out;
+}
+
 /**
  * Find the artifact a link names, by its URI or a former one, in the link's
  * workspace.
@@ -478,52 +542,81 @@ async function participatingThreadIds(
 /**
  * Turn rows into views: `linksTo` describes each row's target, `linkedFrom`
  * each row's source thread. Titles and statuses come from batched lookups,
- * one query per table, never one per row. The reader decides what survives:
- * see LinkReader.
+ * one query per table, never one per row.
+ *
+ * The scope decides what survives, and it is decided per ROW, at both ends,
+ * whichever direction the row is read from (Lumen, #737 round 2). An earlier
+ * cut checked only the source for `linkedFrom`, so a restricted reader that
+ * saw no outgoing edge from pr:1 could ask the hidden target for its incoming
+ * edges and get the same row back, note included. Now a row shows only if
+ * the reader may see its source thread and its target:
+ *
+ * - a thread target: the reader takes part in it, or, for a `spec:` key, it
+ *   may see the spec artifact that key is the twin of (the two are one
+ *   subject, and a spec key usually has no thread at all);
+ * - an artifact target: artifactVisibleTo, the same predicate that resolving
+ *   a target uses, so a visible end is always one the caller can unlink.
+ *
+ * A full reader passes every thread check; artifacts are still held to the
+ * workspace and the legacy-owner rule.
  */
 export async function describeThreadLinks(
   supabase: SupabaseClient,
-  workspaceId: string,
-  rows: { linksTo: ThreadLinkRow[]; linkedFrom: ThreadLinkRow[] },
-  reader: LinkReader
+  scope: LinkScope,
+  rows: { linksTo: ThreadLinkRow[]; linkedFrom: ThreadLinkRow[] }
 ): Promise<ThreadLinkViews> {
+  const { workspaceId, reader } = scope;
+  const all = [...rows.linksTo, ...rows.linkedFrom];
   const targetKeys = unique(
-    rows.linksTo.filter((r) => r.target_kind === 'thread').map((r) => r.target_thread_key!)
+    all.filter((r) => r.target_kind === 'thread').map((r) => r.target_thread_key!)
   );
   const artifactIds = unique(
-    rows.linksTo.filter((r) => r.target_kind === 'artifact').map((r) => r.target_artifact_id!)
+    all.filter((r) => r.target_kind === 'artifact').map((r) => r.target_artifact_id!)
   );
-  const sourceIds = unique(rows.linkedFrom.map((r) => r.source_thread_id));
-  const sbIds = unique(
-    [...rows.linksTo, ...rows.linkedFrom]
-      .map((r) => r.linked_by_sb_id)
-      .filter((id): id is string => !!id)
-  );
+  const sourceIds = unique(all.map((r) => r.source_thread_id));
+  const sbIds = unique(all.map((r) => r.linked_by_sb_id).filter((id): id is string => !!id));
+  // The spec artifact behind each `spec:` target key, for the twin rule.
+  const twinUriByKey = new Map<string, string>();
+  for (const key of targetKeys) {
+    const twin = specTwin({ kind: 'thread', threadKey: key });
+    if (twin && twin.kind === 'artifact') twinUriByKey.set(key, twin.uri);
+  }
 
-  const [threadsByKey, artifactsById, sourcesById, slugBySbId] = await Promise.all([
+  const [threadsByKey, artifactsById, sourcesById, slugBySbId, twinArtifacts] = await Promise.all([
     threadsWhere(supabase, workspaceId, 'thread_key', targetKeys),
     artifactsWhereId(supabase, artifactIds),
     threadsWhere(supabase, workspaceId, 'id', sourceIds),
     resolveSbsByIds(supabase, sbIds).then((sbs) => new Map(sbs.map((sb) => [sb.sbId, sb.sbSlug]))),
+    reader.kind === 'full'
+      ? Promise.resolve(new Map<string, LinkArtifactRow>())
+      : artifactsByUri(supabase, unique([...twinUriByKey.values()])),
   ]);
 
-  // A restricted reader sees a link only between threads it takes part in.
-  // Both ends are checked: the source of every row (the subject thread, for
-  // linksTo) and the thread at the other end.
   const visible =
     reader.kind === 'full'
       ? null
       : await participatingThreadIds(
           supabase,
-          unique([
-            ...rows.linksTo.map((r) => r.source_thread_id),
-            ...[...threadsByKey.values()].map((t) => t.id),
-            ...sourceIds,
-          ]),
+          unique([...sourceIds, ...[...threadsByKey.values()].map((t) => t.id)]),
           reader.principal
         );
-  const canSee = (threadId: string | undefined): boolean =>
+  const canSeeThread = (threadId: string | undefined): boolean =>
     visible === null || (threadId !== undefined && visible.has(threadId));
+  const canSeeThreadKey = (key: string): boolean => {
+    if (visible === null) return true;
+    if (canSeeThread(threadsByKey.get(key)?.id)) return true;
+    const twinUri = twinUriByKey.get(key);
+    const twin = twinUri ? twinArtifacts.get(twinUri) : undefined;
+    return twin !== undefined && artifactVisibleTo(scope, twin);
+  };
+  const rowVisible = (r: ThreadLinkRow): boolean => {
+    if (!canSeeThread(r.source_thread_id)) return false;
+    if (r.target_kind === 'thread') return canSeeThreadKey(r.target_thread_key!);
+    // The FK cascades on delete, so a missing artifact is one deleted between
+    // the two reads: left out rather than shown as an id with no address.
+    const a = artifactsById.get(r.target_artifact_id!);
+    return a !== undefined && artifactVisibleTo(scope, a);
+  };
 
   const linkedBy = (r: ThreadLinkRow): string =>
     r.linked_by_kind === 'sb'
@@ -539,12 +632,9 @@ export async function describeThreadLinks(
 
   const linksTo: ThreadLinkView[] = [];
   for (const r of rows.linksTo) {
-    if (!canSee(r.source_thread_id)) continue;
+    if (!rowVisible(r)) continue;
     if (r.target_kind === 'thread') {
       const t = threadsByKey.get(r.target_thread_key!);
-      // A restricted reader cannot list a key with no thread either, so it
-      // stays hidden with the rest.
-      if (visible !== null && !canSee(t?.id)) continue;
       linksTo.push({
         kind: 'thread',
         threadKey: r.target_thread_key!,
@@ -553,15 +643,7 @@ export async function describeThreadLinks(
         ...common(r),
       });
     } else {
-      const a = artifactsById.get(r.target_artifact_id!);
-      // The FK cascades on delete, so a miss here is an artifact deleted
-      // between the two reads. Leave it out rather than show an id with no
-      // address.
-      if (!a) continue;
-      // Never an artifact outside the workspace, and a restricted reader
-      // sees only its own user's (readerSeesArtifact).
-      if (a.workspace_id !== null && a.workspace_id !== workspaceId) continue;
-      if (!readerSeesArtifact(reader, a)) continue;
+      const a = artifactsById.get(r.target_artifact_id!)!;
       linksTo.push({
         kind: 'artifact',
         uri: a.uri,
@@ -576,8 +658,9 @@ export async function describeThreadLinks(
   const linkedFrom: ThreadLinkView[] = [];
   const seenSources = new Set<string>();
   for (const r of rows.linkedFrom) {
+    if (!rowVisible(r)) continue;
     const t = sourcesById.get(r.source_thread_id);
-    if (!t || !canSee(t.id)) continue;
+    if (!t) continue;
     // A thread that linked both a spec and its thread appears once.
     if (seenSources.has(r.source_thread_id)) continue;
     seenSources.add(r.source_thread_id);
@@ -595,27 +678,24 @@ export async function describeThreadLinks(
 
 /**
  * The threads linking to an artifact, for get_artifact: links to the artifact
- * itself and, for a spec, to its `spec:<slug>` threads, former URIs included. Capped at
- * THREAD_LINK_HEADER_MAX with the total beside it. Never throws: links
- * decorate the artifact, so a failure is returned as `error` beside it.
+ * itself and, for a spec, to its `spec:<slug>` threads, former URIs included.
+ * Capped at THREAD_LINK_HEADER_MAX with the total beside it. Never throws:
+ * links decorate the artifact, so a failure is returned as `error` beside it.
  */
 export async function artifactBacklinks(
   supabase: SupabaseClient,
-  workspaceId: string,
-  artifact: { id: string; uri: string },
-  reader: LinkReader
+  scope: LinkScope,
+  artifact: { id: string; uri: string }
 ): Promise<{ threads: ThreadLinkView[]; count: number } | { error: string }> {
   try {
-    const rows = await listLinksTo(supabase, workspaceId, {
+    const rows = await listLinksTo(supabase, scope.workspaceId, {
       artifactId: artifact.id,
       threadKeys: await specTwinKeysOf(supabase, artifact),
     });
-    const { linkedFrom } = await describeThreadLinks(
-      supabase,
-      workspaceId,
-      { linksTo: [], linkedFrom: rows },
-      reader
-    );
+    const { linkedFrom } = await describeThreadLinks(supabase, scope, {
+      linksTo: [],
+      linkedFrom: rows,
+    });
     return { threads: linkedFrom.slice(0, THREAD_LINK_HEADER_MAX), count: linkedFrom.length };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };

@@ -712,9 +712,14 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     .then(async ({ workspaceId: linkWorkspaceId, sb, role }) =>
       artifactBacklinks(
         supabase,
-        linkWorkspaceId,
-        { id: artifact.id, uri: artifact.uri },
-        sb ? await linkReaderForSb(supabase, sb) : linkReaderForUser(role, resolved.user.id)
+        {
+          workspaceId: linkWorkspaceId,
+          callerUserId: sb ? sb.userId : resolved.user.id,
+          reader: sb
+            ? await linkReaderForSb(supabase, sb)
+            : linkReaderForUser(role, resolved.user.id),
+        },
+        { id: artifact.id, uri: artifact.uri }
       )
     )
     .catch((error: unknown) => ({
