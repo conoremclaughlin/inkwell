@@ -129,7 +129,13 @@ export function ThreadConversation({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b bg-background/95 px-3 backdrop-blur md:px-5">
+      {/*
+        A solid header, not backdrop-blur: it sits above the scroller, so the
+        blur had nothing to blur. Removed as the likeliest cause of the
+        single-frame blank paints of this region in Conor's recording (task
+        190eeb01). The cause is a hypothesis, not proven.
+      */}
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b bg-background px-3 md:px-5">
         <button
           type="button"
           onClick={onBack}
