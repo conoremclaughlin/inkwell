@@ -262,11 +262,23 @@ describe('durable command admission', () => {
       };
       const { data: first } = await supabase.rpc('admit_command', args);
       expect(first).toMatchObject({ outcome: 'admitted' });
-      const { data: second } = await supabase.rpc('admit_command', {
-        ...args,
-        p_addressee: 'fixture-beta',
-      });
-      expect(second).toEqual({ outcome: 'conflict', id: first.id });
+      // Each field alone, under the same caller digest.
+      for (const changed of [
+        { p_addressee: 'fixture-beta' },
+        { p_origin_kind: 'terminal' },
+        { p_origin_ref: 'tab-2' },
+        { p_kind: 'session.compact' },
+        { p_expected_turn: 'another-turn' },
+        { p_source_message_ref: randomUUID() },
+      ]) {
+        const { data: again } = await supabase.rpc('admit_command', { ...args, ...changed });
+        expect({ changed, again }).toEqual({
+          changed,
+          again: { outcome: 'conflict', id: first.id },
+        });
+      }
+      const { data: same } = await supabase.rpc('admit_command', args);
+      expect(same).toMatchObject({ outcome: 'existing', id: first.id });
     });
 
     it('records the queued event and the originator receipt with the command', async () => {
