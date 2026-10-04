@@ -26,11 +26,12 @@ vi.mock('../../utils/request-context', async (original) => ({
   getSessionContext: vi.fn(() => undefined),
   getPinnedSlug: vi.fn(() => undefined),
 }));
+const gateway = vi.hoisted(() => ({
+  dispatchTrigger: vi.fn(() => ({ success: true, accepted: true })),
+  processTrigger: vi.fn(async () => ({ success: true })),
+}));
 vi.mock('../../channels/agent-gateway', () => ({
-  getAgentGateway: vi.fn(() => ({
-    dispatchTrigger: vi.fn(() => ({ success: true, accepted: true })),
-    processTrigger: vi.fn(async () => ({ success: true })),
-  })),
+  getAgentGateway: vi.fn(() => gateway),
 }));
 vi.mock('../../auth/ink-tokens', () => ({
   signInkAccessToken: vi.fn(),
@@ -123,6 +124,8 @@ const written = () => ({
 const NOTHING = { threads: 0, participants: 0, messages: 0 };
 
 beforeEach(() => {
+  gateway.dispatchTrigger.mockClear();
+  gateway.processTrigger.mockClear();
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
   sb('pip', OWNER_TEST_INKLING);
@@ -244,6 +247,24 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
     await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
     expect(await replyAs(asSb('pip'))).toBeNull();
     expect(db.rows('inbox_thread_messages')).toHaveLength(2);
+  });
+
+  it("the inkling's reply wakes nobody: no trigger is dispatched and its cap is untouched", async () => {
+    // Control: the owner's message does wake the inkling.
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const wakes = () =>
+      gateway.dispatchTrigger.mock.calls.length + gateway.processTrigger.mock.calls.length;
+    expect(wakes()).toBeGreaterThan(0);
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    const metadataBefore = structuredClone(
+      db.rows('agent_identities').find((r) => r.id === 'sb-pip')?.metadata
+    );
+
+    expect(await replyAs(asSb('pip'))).toBeNull();
+    expect(wakes()).toBe(0);
+    const pip = db.rows('agent_identities').find((r) => r.id === 'sb-pip');
+    expect(pip?.metadata).toEqual(metadataBefore);
   });
 });
 

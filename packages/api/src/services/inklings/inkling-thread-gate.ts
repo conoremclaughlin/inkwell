@@ -17,7 +17,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { inklingOwnerTestUserId } from '../../config/inkling-flags';
+import { inklingOwnerTestUserId, isInklingOwnerTestUser } from '../../config/inkling-flags';
 import type { Principal, SbPrincipal } from '../principals';
 import { INKLING_CLIENT, INKLINGS_DISABLED } from './inkling-service';
 
@@ -87,8 +87,9 @@ export async function assertInklingThreadAllowed(
   if (ownerTestUserId === null) {
     throw new InklingThreadRefusedError(INKLINGS_DISABLED, 'Inklings are not open on this server');
   }
-  const owner = ownerTestUserId.toLowerCase();
   const [inkling] = inklings;
+  // The inkling's owner, who must be the owner test's account.
+  const owner = inkling.user_id.toLowerCase();
   const sender = input.sender;
   const fromOwner = sender.kind === 'user' && sender.userId.toLowerCase() === owner;
   // The inkling answering: in a conversation it is already in, with its
@@ -99,10 +100,10 @@ export async function assertInklingThreadAllowed(
     members.has(inkling.id) &&
     people.has(owner);
   const allowed =
+    isInklingOwnerTestUser(owner, ownerTestUserId) &&
     (fromOwner || replyFromInkling) &&
     inklings.length === 1 &&
     sbIds.size === 1 &&
-    inkling.user_id.toLowerCase() === owner &&
     inkling.metadata?.ownerTest === true &&
     [...people].every((person) => person === owner);
   if (!allowed) {

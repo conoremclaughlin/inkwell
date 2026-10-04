@@ -7,6 +7,7 @@ import {
   inklingOwnerTestUserId,
   inklingTurnCap,
   inklingTurnTimeoutMs,
+  isInklingOwnerTestUser,
 } from './inkling-flags';
 
 describe('inklingTurnTimeoutMs', () => {
@@ -41,6 +42,25 @@ describe('inklingOwnerTestUserId', () => {
   it('names one user, in lowercase', () => {
     expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: ` ${OWNER} ` })).toBe(OWNER);
     expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: OWNER.toUpperCase() })).toBe(OWNER);
+  });
+});
+
+describe('isInklingOwnerTestUser', () => {
+  // Letters in the id, so that its case can differ at all.
+  const OWNER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const SOMEONE = '22222222-2222-4222-8222-222222222222';
+
+  it("is true for the test's account in any letter case, and for nobody else", () => {
+    expect(isInklingOwnerTestUser(OWNER, OWNER)).toBe(true);
+    expect(isInklingOwnerTestUser(OWNER.toUpperCase(), OWNER)).toBe(true);
+    expect(isInklingOwnerTestUser(OWNER, OWNER.toUpperCase())).toBe(true);
+    expect(isInklingOwnerTestUser(SOMEONE, OWNER)).toBe(false);
+  });
+
+  it('is false for everyone while the test is off', () => {
+    for (const userId of [OWNER, SOMEONE, '']) {
+      expect(isInklingOwnerTestUser(userId, null), userId).toBe(false);
+    }
   });
 });
 
