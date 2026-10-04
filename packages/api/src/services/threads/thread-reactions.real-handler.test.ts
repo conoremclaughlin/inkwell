@@ -224,10 +224,10 @@ beforeEach(() => {
   };
   wren = sb('wren');
   pip = sb('pip', { client: 'inkling-mobile', named: false, ownerTest: true });
-  team = thread('pcp:thread:team', [wren, ME]);
+  team = thread('thread:team', [wren, ME]);
   first = message(team, 'first');
   second = message(team, 'second');
-  background = thread('pcp:thread:background', [wren]);
+  background = thread('thread:background', [wren]);
   backgroundMessage = message(background, 'not yours');
   inklingThread = thread('chat:pip', [pip, ME]);
   inklingMessage = message(inklingThread, 'hi pip');

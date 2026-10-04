@@ -94,11 +94,11 @@ beforeEach(() => {
   wren = sb('wren');
   lumen = sb('lumen');
   pip = sb('pip', OWNER_TEST_INKLING);
-  team = thread('pcp:thread:team', [wren, lumen, ME]);
+  team = thread('thread:team', [wren, lumen, ME]);
   teamMessage = message(team);
   inklingThread = thread('chat:pip', [pip, ME]);
   inklingMessage = message(inklingThread);
-  background = thread('pcp:thread:background', [wren]);
+  background = thread('thread:background', [wren]);
   backgroundMessage = message(background);
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
 });
@@ -338,8 +338,8 @@ describe('reactToMessage', () => {
   });
 
   it('answers 404 for a thread key with no thread in the caller’s workspace', async () => {
-    thread('pcp:thread:elsewhere', [wren], OTHER_WS);
-    for (const threadKey of ['pcp:thread:nope', 'pcp:thread:elsewhere']) {
+    thread('thread:elsewhere', [wren], OTHER_WS);
+    for (const threadKey of ['thread:nope', 'thread:elsewhere']) {
       expect(await refusal(react({ reactor: wren, threadKey }))).toEqual({
         status: 404,
         code: 'thread_not_found',
