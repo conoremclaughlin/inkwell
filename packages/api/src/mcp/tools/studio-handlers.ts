@@ -433,6 +433,15 @@ async function bindThreadHome(
   const supabase = dataComposer.getClient();
   // The agent is a principal in exactly one workspace; the thread lives there.
   const sb = await resolveCallerSb(supabase, opts.userId, opts.sbSlug);
+  // An inkling never starts a conversation, and a studio is not where an
+  // inkling works: an inkling caller is refused here, judged as the creator
+  // of a conversation holding only itself, before any thread or member row
+  // exists (Lumen, #740 round 4). For an ordinary SB this is a pass.
+  await assertInklingThreadAllowed(supabase, {
+    sender: sb,
+    participantSbs: [sb],
+    existingThreadId: null,
+  });
   const thread = await findOrCreateThread(supabase, {
     workspaceId: sb.workspaceId,
     threadKey: opts.threadKey,

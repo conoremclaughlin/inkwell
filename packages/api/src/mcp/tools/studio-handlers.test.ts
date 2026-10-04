@@ -349,8 +349,12 @@ describe('create_studio / adopt_studio provenance', () => {
       sbId: 'sb-1',
       contactId: undefined,
     }));
+    // A real (fake) database: a thread home is judged by the inkling gate,
+    // which reads the caller's identity. Empty here, so the caller is an
+    // ordinary SB unless a test seeds otherwise.
+    const client = createInklingDb();
     const dc = {
-      getClient: () => ({}),
+      getClient: () => client,
       repositories: {
         studios: { create, update, findById, findByPath: vi.fn(async () => null), linkSession },
         projects: { findById: vi.fn() },
@@ -1157,6 +1161,41 @@ describe('create_studio / adopt_studio provenance', () => {
         expect.anything(),
         expect.objectContaining({ threadId: 'thread-x', sbId: 'sb-1' })
       );
+    });
+
+    /** A new key, through the real findOrCreateThread, with the caller seeded as given. */
+    const createNewHome = async (callerMetadata: Record<string, unknown>) => {
+      db = createInklingDb();
+      db.seed('agent_identities', {
+        id: 'sb-1',
+        agent_id: 'wren',
+        user_id: OWNER,
+        workspace_id: 'ws-1',
+        metadata: callerMetadata,
+      });
+      const actual = await vi.importActual<typeof import('./inbox-handlers')>('./inbox-handlers');
+      findOrCreateThreadMock.mockImplementation(actual.findOrCreateThread as never);
+      assignMock.mockClear();
+      return createFor();
+    };
+
+    it('an inkling caller starts no conversation through a studio home: no thread or member is created, and the studio is still made (Lumen 14e33aeb)', async () => {
+      const payload = await createNewHome(INKLING);
+      expect(payload.success).toBe(true);
+      expect(payload.routing).toMatchObject({ home: null });
+      expect(payload.routing.homeError).toMatch(/only between its owner/);
+      expect(db.rows('inbox_threads')).toHaveLength(0);
+      expect(db.rows('inbox_thread_participants')).toHaveLength(0);
+      expect(assignMock).not.toHaveBeenCalled();
+    });
+
+    it('must not change: an ordinary caller still creates and binds a new studio thread', async () => {
+      const payload = await createNewHome({});
+      expect(payload.routing).toMatchObject({ home: { threadCreated: true } });
+      expect(payload.routing.homeError).toBeUndefined();
+      expect(db.rows('inbox_threads')).toHaveLength(1);
+      expect(sbMembers()).toEqual(['sb-1']);
+      expect(assignMock).toHaveBeenCalledTimes(1);
     });
   });
 });

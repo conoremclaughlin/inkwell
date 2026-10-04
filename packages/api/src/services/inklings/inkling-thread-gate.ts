@@ -106,18 +106,36 @@ export async function assertInklingThreadAllowed(
       if (row.user_id) people.add(row.user_id.toLowerCase());
     }
   }
-  if (sbIds.size === 0 && !marked) return { quiet: false, inklingConversation: false };
+  // The SB acting, when this write puts someone else on the thread
+  // (add_thread_participant's caller). It is classified too, or an inkling
+  // acting outside its own conversation would read as an ordinary write. It
+  // is not counted among the conversation's SBs: it joins nothing.
+  const actorSbId =
+    input.sender.kind === 'sb' && !sbIds.has(input.sender.sbId) ? input.sender.sbId : null;
+  if (sbIds.size === 0 && !marked && !actorSbId) {
+    return { quiet: false, inklingConversation: false };
+  }
 
+  const lookup = actorSbId ? [...sbIds, actorSbId] : [...sbIds];
   let identities: IdentityRow[] = [];
-  if (sbIds.size > 0) {
+  if (lookup.length > 0) {
     const { data, error } = await supabase
       .from('agent_identities')
       .select('id, user_id, metadata')
-      .in('id', [...sbIds]);
+      .in('id', lookup);
     if (error) throw new Error(`Failed to read the conversation's SBs: ${error.message}`);
     identities = (data ?? []) as IdentityRow[];
   }
-  const inklings = identities.filter((r) => r.metadata?.client === INKLING_CLIENT);
+  const isInkling = (r: IdentityRow) => r.metadata?.client === INKLING_CLIENT;
+  // An inkling writes only as a member of its own conversation, so one
+  // acting on a conversation it is not in is refused, whatever that holds.
+  if (actorSbId && identities.some((r) => r.id === actorSbId && isInkling(r))) {
+    throw new InklingThreadRefusedError(
+      INKLING_THREAD_REFUSED,
+      "An inkling's conversation is only between its owner and the owner's own inklings"
+    );
+  }
+  const inklings = identities.filter((r) => sbIds.has(r.id) && isInkling(r));
   if (inklings.length === 0) {
     if (!marked) return { quiet: false, inklingConversation: false };
     // An inkling conversation whose inklings this send cannot see yet: its

@@ -898,4 +898,23 @@ describe('membership is fixed for every writer: add_thread_participant (Lumen 0d
     expect(written()).toEqual(before);
     expect(woken()).toEqual([]);
   });
+
+  it('an inkling acting on a conversation it is not in may not add to it, though everyone in it is ordinary (Lumen 14e33aeb)', async () => {
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await addAs('pip', 'sage')).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(sbMembers()).toEqual(['sb-fern']);
+    expect(woken()).toEqual([]);
+  });
+
+  it('must not change: an ordinary SB outside an ordinary conversation still adds to it, and is not counted as joining', async () => {
+    sb('moss');
+    await call(create, { key: KEY, recipients: ['fern'], content: 'hi' });
+    gateway.dispatchTrigger.mockClear();
+    expect(await addAs('moss', 'sage')).toMatchObject({ success: true, sbSlug: 'sage' });
+    expect(sbMembers()).toEqual(['sb-fern', 'sb-sage']);
+    expect(woken()).toEqual(['sage']);
+  });
 });
