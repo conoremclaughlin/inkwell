@@ -11,8 +11,10 @@
  * Who may react: a member of the thread (a participant SB, or a person in
  * its `people`), in the caller's workspace. A person reading a thread they
  * are not in (a background thread) may see its reactions but not add one.
- * In an inkling's conversation the inkling gate also applies, and an
- * inkling itself may not react yet (see refuseInklingReactor).
+ * In an inkling's conversation the inkling gate also applies, to the
+ * inkling as to its owner: it reacts only in a conversation it is already
+ * in, with its owner and none but the owner's own inklings, the rule its
+ * reply follows.
  *
  * The database holds what every writer must obey: each (message, reactor,
  * emoji) once, at most six emoji per reactor on one message (a trigger, so
@@ -23,7 +25,6 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { SbPrincipal, UserPrincipal } from '../principals';
-import { INKLING_CLIENT } from '../inklings/inkling-service';
 import {
   assertInklingThreadAllowed,
   InklingThreadRefusedError,
@@ -31,7 +32,7 @@ import {
 
 export const REACTIONS_TABLE = 'thread_message_reactions';
 
-/** The six emoji the Inkling app offers. Any single emoji is accepted. */
+/** The six emoji the Inkling app offers. Any emoji isReactionEmoji accepts may be used. */
 export const REACTION_CHOICES = ['❤️', '👍', '😂', '😮', '😢', '🙏'] as const;
 
 /** At most this many distinct emoji per reactor on one message. */
@@ -82,7 +83,6 @@ export type ReactionRefusalCode =
   | 'message_not_found'
   | 'not_a_member'
   | 'background_thread'
-  | 'inkling_reaction_refused'
   | 'inkling_thread_refused'
   | 'inklings_disabled'
   | 'reaction_limit';
@@ -238,30 +238,6 @@ export interface ReactDeps {
 }
 
 /**
- * An inkling may not react yet, in any thread. Its own-thread rule (an
- * inkling acts only in a conversation it is already in, with its owner and
- * nobody else) lands with PR #738; until then this refuses before the gate
- * is asked, so the refusal holds whatever the gate allows. Removing this
- * check is the follow-up that lets the gate decide.
- */
-async function refuseInklingReactor(client: Client, reactor: SbPrincipal): Promise<void> {
-  const { data, error } = await client
-    .from('agent_identities')
-    .select('metadata')
-    .eq('id', reactor.sbId)
-    .maybeSingle();
-  if (error) throw new Error(`Failed to read the reacting SB: ${error.message}`);
-  const metadata = (data as { metadata: Record<string, unknown> | null } | null)?.metadata;
-  if (metadata?.client === INKLING_CLIENT) {
-    throw new ReactionRefusedError(
-      403,
-      'inkling_reaction_refused',
-      'An inkling cannot react to messages yet'
-    );
-  }
-}
-
-/**
  * Adds or removes one reaction and answers with the message's reactions as
  * the reactor sees them. Adding one that is already there, or removing one
  * that is not, changes nothing and answers the same way.
@@ -332,8 +308,6 @@ export async function reactToMessage(
         )
       : new ReactionRefusedError(403, 'not_a_member', 'Only a member of the thread can react');
   }
-
-  if (reactor.kind === 'sb') await refuseInklingReactor(client, reactor);
 
   const gate = deps.inklingGate ?? assertInklingThreadAllowed;
   try {
