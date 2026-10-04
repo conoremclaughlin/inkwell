@@ -656,6 +656,7 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'serial-input-drain.ts',
         'paragraph-stream.ts',
         'preview-guard.ts',
+        'frame-fanout.ts',
       ])
     );
   });

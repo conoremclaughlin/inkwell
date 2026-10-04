@@ -131,6 +131,31 @@ the existing observer-preview guard, not a full participant projection or a
 replacement for authorization. Its retained text has the same hosted-budget
 limitation as the paragraph renderer above.
 
+## Bounded live delivery
+
+`FrameFanout` delivers an already-encoded string to independent pull readers.
+One instance serves one authorized projection, not every principal who happens
+to name a session. The host authorizes subscriptions, guards and projects text,
+and supplies finite subscriber/count/UTF-8-byte limits. A slow reader overflows
+independently; publishing never invokes or awaits consumer code. Reader queues
+and their pending reads are bounded, and frames cannot be mutated by a sibling
+reader. The host must separately bound its registry and transport/in-flight
+writes; a frame returned by `next()` is no longer in this queue.
+
+Detaching a reader does not interrupt the writer. Revocation and source closure
+discard queued frames and fail reads explicitly; `ended` also signals a consumer
+busy writing its last frame. The host must stop that transport and revalidate
+authority before writing: a frame already handed to it cannot be recalled.
+Oversized publishes return `too_large` without delivering to anyone, and must
+be handled rather than treated as success. Overflow/source closure require the
+host's authorized replay/snapshot recovery, not skipping ahead.
+
+This primitive is not yet wired to hosted sessions or the CLI. It retains no
+history, grants no participant access, creates no cursors, and supplies no
+generation fencing or replay/live stitching. The existing observer projection
+is unchanged. A guarded-text/two-reader synthetic composition test is not a
+real provider or end-to-end attach proof.
+
 ## Ordinary input drain
 
 `SerialInputDrain` is the shared FIFO used by the CLI for user, system and
