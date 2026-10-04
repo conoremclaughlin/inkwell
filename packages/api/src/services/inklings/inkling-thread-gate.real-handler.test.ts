@@ -26,11 +26,12 @@ vi.mock('../../utils/request-context', async (original) => ({
   getSessionContext: vi.fn(() => undefined),
   getPinnedSlug: vi.fn(() => undefined),
 }));
+const gateway = vi.hoisted(() => ({
+  dispatchTrigger: vi.fn(() => ({ success: true, accepted: true })),
+  processTrigger: vi.fn(async () => ({ success: true })),
+}));
 vi.mock('../../channels/agent-gateway', () => ({
-  getAgentGateway: vi.fn(() => ({
-    dispatchTrigger: vi.fn(() => ({ success: true, accepted: true })),
-    processTrigger: vi.fn(async () => ({ success: true })),
-  })),
+  getAgentGateway: vi.fn(() => gateway),
 }));
 vi.mock('../../auth/ink-tokens', () => ({
   signInkAccessToken: vi.fn(),
@@ -58,7 +59,8 @@ vi.mock('../../utils/logger', () => ({
 
 import router from '../../routes/admin';
 import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
-import { InklingThreadRefusedError } from './inkling-thread-gate';
+import { getRequestContext } from '../../utils/request-context';
+import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -122,6 +124,8 @@ const written = () => ({
 const NOTHING = { threads: 0, participants: 0, messages: 0 };
 
 beforeEach(() => {
+  gateway.dispatchTrigger.mockClear();
+  gateway.processTrigger.mockClear();
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
   sb('pip', OWNER_TEST_INKLING);
@@ -213,6 +217,200 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
     expect(written()).toEqual(NOTHING);
   });
 
+  it("the inkling's own reply in its owner's conversation is stored (MCP tool path)", async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    // An SB writes with its owner's role, read from the membership table.
+    db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
+    // A turn's MCP token binds the inkling's own identity.
+    vi.mocked(getRequestContext).mockImplementation(
+      () => ({ userId: ME, sbId: 'sb-pip', sbSlug: 'pip' }) as never
+    );
+    try {
+      const dataComposer = { repositories: {}, getClient: () => db };
+      const outcome = await handleSendToInbox(
+        { userId: ME, threadKey: KEY, recipientSlug: 'pip', content: 'hello, you' },
+        dataComposer as never
+      ).then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(outcome).toBeNull();
+    } finally {
+      vi.mocked(getRequestContext).mockImplementation(() => ({ userId: ME }) as never);
+    }
+    const messages = db.rows('inbox_thread_messages');
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({ sender_kind: 'sb', sender_sb_id: 'sb-pip' });
+  });
+
+  it("the inkling's own reply, sent with a server-internal sender, is stored", async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    expect(await replyAs(asSb('pip'))).toBeNull();
+    expect(db.rows('inbox_thread_messages')).toHaveLength(2);
+  });
+
+  it("the inkling's reply wakes nobody: no trigger is dispatched and its cap is untouched", async () => {
+    // Control: the owner's message does wake the inkling.
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const wakes = () =>
+      gateway.dispatchTrigger.mock.calls.length + gateway.processTrigger.mock.calls.length;
+    expect(wakes()).toBeGreaterThan(0);
+    gateway.dispatchTrigger.mockClear();
+    gateway.processTrigger.mockClear();
+    const metadataBefore = structuredClone(
+      db.rows('agent_identities').find((r) => r.id === 'sb-pip')?.metadata
+    );
+
+    expect(await replyAs(asSb('pip'))).toBeNull();
+    expect(wakes()).toBe(0);
+    const pip = db.rows('agent_identities').find((r) => r.id === 'sb-pip');
+    expect(pip?.metadata).toEqual(metadataBefore);
+  });
+});
+
+/** An SB principal in my workspace, as the server resolves one. */
+function asSb(slug: string, userId = ME): Row {
+  return { kind: 'sb', sbId: `sb-${slug}`, sbSlug: slug, userId, workspaceId: WS };
+}
+
+/** A send by `principal` on `key`, addressed to itself unless `recipients` are given. */
+async function replyAs(
+  principal: Row,
+  opts: { key?: string; recipients?: string[] } = {}
+): Promise<unknown> {
+  const dataComposer = { repositories: {}, getClient: () => db };
+  const to = opts.recipients
+    ? { recipients: opts.recipients }
+    : { recipientSlug: principal.sbSlug as string };
+  return handleSendToInbox(
+    { userId: ME, threadKey: opts.key ?? KEY, ...to, content: 'from the inkling' },
+    dataComposer as never,
+    { sender: { principal: principal as never, workspaceId: WS } }
+  ).then(
+    () => null,
+    (e: unknown) => e
+  );
+}
+
+/** A conversation as stored, with exactly these members. */
+function seedThread(
+  members: Array<{ sb_id: string | null; user_id: string | null }>,
+  key = KEY
+): void {
+  const thread = db.seed('inbox_threads', { thread_key: key, workspace_id: WS });
+  for (const member of members) {
+    db.seed('inbox_thread_participants', { thread_id: thread.id, workspace_id: WS, ...member });
+  }
+}
+
+describe('an inkling replies only in a conversation it already shares with its owner, and nobody else', () => {
+  it('may not start a conversation', async () => {
+    expect(await replyAs(asSb('pip'))).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(NOTHING);
+  });
+
+  it("may not bring another SB in, even one of its owner's own", async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const before = written();
+    sb('tam', OWNER_TEST_INKLING);
+    for (const recipients of [
+      ['pip', 'fern'],
+      ['pip', 'tam'],
+    ]) {
+      expect(await replyAs(asSb('pip'), { recipients }), recipients.join()).toBeInstanceOf(
+        InklingThreadRefusedError
+      );
+    }
+    expect(written()).toEqual(before);
+  });
+
+  it("may not write into a conversation it isn't a member of, even its owner's", async () => {
+    seedThread([{ sb_id: null, user_id: ME }]);
+    expect(await replyAs(asSb('pip'))).toBeInstanceOf(InklingThreadRefusedError);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+    expect(db.rows('inbox_thread_participants')).toHaveLength(1);
+  });
+
+  it("another of the owner's inklings may not write into this one's conversation", async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    sb('tam', OWNER_TEST_INKLING);
+    const before = written();
+    expect(await replyAs(asSb('tam'))).toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+  });
+
+  it('may not reply without its owner in the conversation, or with another person in it', async () => {
+    const cases = {
+      'chat:pip-alone': [{ sb_id: 'sb-pip', user_id: null }],
+      'chat:pip-owner-and-someone': [
+        { sb_id: 'sb-pip', user_id: null },
+        { sb_id: null, user_id: ME },
+        { sb_id: null, user_id: SOMEONE },
+      ],
+    };
+    for (const [key, members] of Object.entries(cases)) {
+      seedThread(members, key);
+      expect(await replyAs(asSb('pip'), { key }), key).toBeInstanceOf(InklingThreadRefusedError);
+    }
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+  });
+
+  it('the gate itself names the sender: an SB left out of the participants is not the inkling', async () => {
+    // handleSendToInbox always lists an SB sender among the participants;
+    // the gate does not lean on that.
+    seedThread([
+      { sb_id: 'sb-pip', user_id: null },
+      { sb_id: null, user_id: ME },
+    ]);
+    const thread = db.rows('inbox_threads')[0];
+    const pip = asSb('pip') as never;
+    const ask = (sender: Row) =>
+      assertInklingThreadAllowed(db as never, {
+        sender: sender as never,
+        participantSbs: [pip],
+        existingThreadId: thread.id as string,
+      }).then(
+        () => null,
+        (e: unknown) => e
+      );
+    expect(await ask(asSb('pip'))).toBeNull();
+    expect(await ask(asSb('fern'))).toBeInstanceOf(InklingThreadRefusedError);
+  });
+
+  it('may not reply with the owner test off', async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
+    const before = written();
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    const refused = await replyAs(asSb('pip'));
+    expect(refused).toBeInstanceOf(InklingThreadRefusedError);
+    expect((refused as InklingThreadRefusedError).code).toBe('inklings_disabled');
+    expect(written()).toEqual(before);
+  });
+
+  it("an inkling not born under the owner test, or another account's, may not reply", async () => {
+    sb('old', { client: 'inkling-mobile', named: false });
+    sb('elsewhere', OWNER_TEST_INKLING, SOMEONE);
+    for (const [slug, owner] of [
+      ['old', ME],
+      ['elsewhere', SOMEONE],
+    ] as const) {
+      const key = `chat:${slug}`;
+      seedThread(
+        [
+          { sb_id: `sb-${slug}`, user_id: null },
+          { sb_id: null, user_id: owner },
+        ],
+        key
+      );
+      expect(await replyAs(asSb(slug, owner), { key }), slug).toBeInstanceOf(
+        InklingThreadRefusedError
+      );
+    }
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+  });
+});
+
+describe('a conversation with no inkling', () => {
   it('a conversation with no inkling is untouched by the gate, on or off', async () => {
     for (const gate of [ME, '']) {
       vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);

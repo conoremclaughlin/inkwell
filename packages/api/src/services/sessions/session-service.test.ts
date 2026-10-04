@@ -917,6 +917,14 @@ describe('SessionService', () => {
         inbox_thread_messages: [
           { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
           { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          // The inkling's own reply in its conversation.
+          {
+            id: 'msg-inkling',
+            thread_id: 'thread-1',
+            sender_kind: 'sb',
+            sender_sb_id: SB,
+            sender_user_id: null,
+          },
           {
             id: 'msg-someone',
             thread_id: 'thread-1',
@@ -976,7 +984,7 @@ describe('SessionService', () => {
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
-        const supabase = makeFakeSupabase({
+        const tables = {
           // agent_id is the request's slug, as an inkling's own slug is: routing
           // resolves the identity by it.
           agent_identities: [
@@ -994,7 +1002,9 @@ describe('SessionService', () => {
           ],
           studios: [],
           ...THREAD_TABLES,
-        });
+        };
+        lastTables = tables;
+        const supabase = makeFakeSupabase(tables);
         const failing = [
           ...(extra.failReads ?? []),
           ...(extra.readError
@@ -1037,11 +1047,32 @@ describe('SessionService', () => {
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
       };
       let lastService: SessionService;
+      let lastTables: Record<string, Row[]>;
+      /** The turns counted against the inkling's cap in the last turn's tables. */
+      const turnsCounted = () =>
+        (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
+          ?.ownerTestTurns;
 
       it("the owner's own message wakes an inkling born under the test", async () => {
         const result = await turn(INKLING);
         expect(mockClaudeRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it("the inkling's own reply starts no turn and takes nothing from its cap", async () => {
+        // Control: the owner's message is counted, so the count is observable.
+        await turn(INKLING);
+        expect(turnsCounted()).toBe(1);
+        vi.mocked(mockClaudeRunner.run).mockClear();
+
+        const result = await turn(INKLING, {
+          sender: { id: 'user', name: 'Owner' },
+          metadata: { triggerThreadMessageId: 'msg-inkling' },
+        });
+        expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+        expect(result.classification?.retryable).toBe(false);
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(turnsCounted()).toBeUndefined();
       });
 
       describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
