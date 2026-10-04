@@ -124,6 +124,13 @@ raw-text retention is not newly bounded by this move: hosted integration must
 enforce output/replay budgets without breaking whole-spawn guard context. No
 observer projection or current terminal behavior changes here.
 
+`ImitationPreviewGuard` is also shared, with its CLI path re-exporting the same
+implementation. It holds possible result-frame prefixes across completed text
+blocks and reports whole-spawn offsets used by mid-turn reseeding. It is still
+the existing observer-preview guard, not a full participant projection or a
+replacement for authorization. Its retained text has the same hosted-budget
+limitation as the paragraph renderer above.
+
 ## Ordinary input drain
 
 `SerialInputDrain` is the shared FIFO used by the CLI for user, system and
