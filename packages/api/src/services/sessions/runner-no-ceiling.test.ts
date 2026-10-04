@@ -151,6 +151,15 @@ const runners = [
   },
 ];
 
+describe('CodexRunner silence window', () => {
+  it('is no shorter than the 30-minute ceiling it replaces', () => {
+    // `codex exec --json` is silent through a long reasoning item or command,
+    // so a shorter window could stop a turn the old ceiling let finish
+    // (Lumen, #745). At 30 minutes it never stops one sooner.
+    expect(CODEX_IDLE_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60 * 1000);
+  });
+});
+
 describe.each(runners)('$name with no ceiling configured', (r) => {
   it('has no ceiling', () => {
     expect(r.ceiling()).toBeUndefined();

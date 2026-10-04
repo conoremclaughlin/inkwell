@@ -41,7 +41,9 @@ import { decideChannelForward } from '../channel-forward.js';
 vi.hoisted(() => {
   process.env.CLAUDE_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
   process.env.GEMINI_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
-  process.env.CODEX_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
+  // Above Codex's 30-minute silence window, so each case reaches the timer
+  // it names.
+  process.env.CODEX_PROCESS_TIMEOUT_MS = String(60 * 60 * 1000);
 });
 
 const spawnMock = vi.fn();

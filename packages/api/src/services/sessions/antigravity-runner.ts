@@ -48,8 +48,9 @@ import { buildSessionEnv, resolveSpawnTarget } from '@inklabs/shared';
 const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS);
 
 /** What agy is told when we set no ceiling. `--print-timeout` takes a
- *  duration, and we have not verified a spelling that means "never", so a
- *  day stands in for none. */
+ *  duration and we have not verified a spelling that means "never", so agy
+ *  itself still ends a turn after a day: a 24-hour bound that agy imposes,
+ *  far past any observed turn, not the absence of one (Lumen, #745). */
 const UNBOUNDED_PRINT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 /** Idle timeout: no output for this long = stuck. */

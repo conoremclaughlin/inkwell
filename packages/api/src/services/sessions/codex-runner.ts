@@ -37,11 +37,17 @@ import {
 export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CODEX_PROCESS_TIMEOUT_MS);
 
 /** Time (ms) with no output from the subprocess before it is treated as
- *  stuck. Reset on every byte it writes, as in the Claude runner. Codex had
- *  none while it had a ceiling; without one, nothing else would stop a wedged
- *  Codex. Its longest silence inside a turn over 30 hours was 2 minutes, a
- *  `wait` call (the turn-timeouts thread, 43920af1). */
-export const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+ *  stuck. Reset on every byte it writes. Codex had none while it had a
+ *  ceiling; without one, nothing else would stop a wedged Codex.
+ *
+ *  Thirty minutes, the old ceiling, not the Claude runner's five. `codex exec
+ *  --json` reports items as they start and complete, with no token deltas, so
+ *  a long reasoning item or a long command is silent on stdout until it ends.
+ *  The longest such silence in 30 hours of session logs was 2 minutes, but
+ *  that is a sample, not a bound (Lumen, #745). At the old ceiling no turn
+ *  the old code allowed can be stopped sooner: one silent for 30 minutes had
+ *  reached that ceiling too. */
+export const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 

@@ -110,8 +110,8 @@ describe('buildAgyArgs', () => {
   });
 
   it('tells agy a day, less the margin, when no ceiling is configured', () => {
-    // There is no ceiling unless ANTIGRAVITY_PROCESS_TIMEOUT_MS sets one
-    // (turn-ceiling.ts); agy needs a duration, so a day stands in for none.
+    // We set no ceiling unless ANTIGRAVITY_PROCESS_TIMEOUT_MS does
+    // (turn-ceiling.ts), but agy needs a duration: it keeps a 24-hour bound.
     if (process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS) return;
     const args = buildAgyArgs('hi', baseConfig());
     expect(args[args.indexOf('--print-timeout') + 1]).toBe(`${24 * 60 * 60 - 30}s`);
