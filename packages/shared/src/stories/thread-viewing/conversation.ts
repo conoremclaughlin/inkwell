@@ -37,4 +37,17 @@ export interface ConversationMessage {
   priority?: 'low' | 'normal' | 'high' | 'urgent';
   /** The body is still arriving; the row shows a caret and the view keeps pace. */
   streaming?: boolean;
+  /**
+   * Its reactions, `[]` when it has none. Undefined when the source can't
+   * say (no reactions on that server, or they could not be read): show
+   * nothing and offer nothing then.
+   */
+  reactions?: ConversationReaction[];
+}
+
+/** One emoji on a message: how many reacted, and whether the viewer did. */
+export interface ConversationReaction {
+  emoji: string;
+  count: number;
+  mine: boolean;
 }

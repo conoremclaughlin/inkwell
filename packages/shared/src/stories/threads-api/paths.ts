@@ -14,3 +14,6 @@ export function threadMessagesPath(threadKey: string, beforeId?: string): string
   const before = beforeId ? `&before=${encodeURIComponent(beforeId)}` : '';
   return `/api/admin/threads/messages?key=${encodeURIComponent(threadKey)}${before}`;
 }
+
+/** POST: add or take back the viewer's reaction on one message (spec inkling-reactions). */
+export const THREAD_REACTIONS_PATH = '/api/admin/threads/reactions';
