@@ -33,21 +33,17 @@ import {
 } from '@inklabs/shared';
 
 /** The general ceiling on a Codex turn: none unless CODEX_PROCESS_TIMEOUT_MS
- *  sets one (turn-ceiling.ts). */
-export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CODEX_PROCESS_TIMEOUT_MS);
-
-/** Time (ms) with no output from the subprocess before it is treated as
- *  stuck. Reset on every byte it writes. Codex had none while it had a
- *  ceiling; without one, nothing else would stop a wedged Codex.
+ *  sets one (turn-ceiling.ts).
  *
- *  Thirty minutes, the old ceiling, not the Claude runner's five. `codex exec
- *  --json` reports items as they start and complete, with no token deltas, so
- *  a long reasoning item or a long command is silent on stdout until it ends.
- *  The longest such silence in 30 hours of session logs was 2 minutes, but
- *  that is a sample, not a bound (Lumen, #745). At the old ceiling no turn
- *  the old code allowed can be stopped sooner: one silent for 30 minutes had
- *  reached that ceiling too. */
-export const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+ *  There is deliberately no silence timeout either. `codex exec --json`
+ *  writes nothing while the model reasons: on Codex CLI 0.160.0, five
+ *  reasoning deltas over 2.5 seconds produced no stdout or stderr, and only
+ *  the final `item.completed` carried them (Lumen, #745, a local synthetic
+ *  provider). Byte silence here is not evidence that tokens have stopped, so
+ *  a silence killer would break the rule this file follows: a turn still
+ *  producing output is never killed. A wedged Codex turn runs until the
+ *  server's run interruption or a configured ceiling stops it. */
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CODEX_PROCESS_TIMEOUT_MS);
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
@@ -251,7 +247,7 @@ export class CodexRunner implements IRunner {
      * `run()` decides `success` from this, so a timeout that resolves without
      * it is reported as a completed turn. See the timer below.
      */
-    timedOut?: { kind: 'hard' | 'idle'; message: string };
+    timedOut?: { kind: 'hard'; message: string };
   }> {
     const codexBin = await resolveBinaryPath('codex');
 
@@ -320,59 +316,40 @@ export class CodexRunner implements IRunner {
       let resolvedSessionId: string | undefined;
 
       let settled = false;
-      let lastActivityAt = Date.now();
-
-      // `timedOut`, not just the marker string. Resolving bare reports a
-      // SIGKILLed turn as a completed one: the session goes idle, a
-      // heartbeat beat records `delivered`, and the marker is
-      // auto-forwarded to the human as if the agent had written it.
-      // The word "timeout" is load-bearing — classifyError matches on
-      // it, and without it this lands in the non-retryable `unknown`
-      // category. (Same fix Lumen made in antigravity-runner, #507.)
-      const stopForTimeout = (kind: 'hard' | 'idle', message: string) => {
-        settled = true;
-        clearTimeout(timeout);
-        clearTimeout(idleTimer);
-        this.killProcess(proc);
-        resolve({
-          responses,
-          usage,
-          finalTextResponse: finalTextResponse || '[Codex process timed out]',
-          toolCalls,
-          sessionId: resolvedSessionId,
-          timedOut: { kind, message },
-        });
-      };
 
       // A configured ceiling stops the run however active it is. With none,
-      // only the silence timeout below ends it.
+      // nothing here stops it (see PROCESS_TIMEOUT_MS).
       const ceilingMs = PROCESS_TIMEOUT_MS;
       const timeout =
         ceilingMs === undefined
           ? undefined
           : setTimeout(() => {
               if (settled) return;
-              stopForTimeout(
-                'hard',
-                `Codex timeout: exceeded the ${Math.round(ceilingMs / 1000)}s ceiling, process killed`
-              );
+              settled = true;
+              this.killProcess(proc);
+              resolve({
+                responses,
+                usage,
+                finalTextResponse: finalTextResponse || '[Codex process timed out]',
+                toolCalls,
+                sessionId: resolvedSessionId,
+                // `timedOut`, not just the marker string. Resolving bare reports a
+                // SIGKILLed turn as a completed one: the session goes idle, a
+                // heartbeat beat records `delivered`, and the marker is
+                // auto-forwarded to the human as if the agent had written it.
+                // The word "timeout" is load-bearing — classifyError matches on
+                // it, and without it this lands in the non-retryable `unknown`
+                // category. (Same fix Lumen made in antigravity-runner, #507.)
+                timedOut: {
+                  kind: 'hard',
+                  message: `Codex timeout: exceeded the ${Math.round(
+                    ceilingMs / 1000
+                  )}s ceiling, process killed`,
+                },
+              });
             }, ceilingMs);
 
-      let idleTimer: NodeJS.Timeout | undefined;
-      const resetIdleTimer = () => {
-        lastActivityAt = Date.now();
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          if (settled) return;
-          const idleSecs = Math.round((Date.now() - lastActivityAt) / 1000);
-          logger.error('Codex process idle too long, killing', { idleSeconds: idleSecs });
-          stopForTimeout('idle', `Codex timeout: no output for ${idleSecs}s, process killed`);
-        }, IDLE_TIMEOUT_MS);
-      };
-      resetIdleTimer();
-
       proc.stdout.on('data', (data) => {
-        resetIdleTimer();
         stdoutBytes += data.length;
         const chunk = data.toString();
         const combined = `${stdoutRemainder}${chunk}`;
@@ -435,14 +412,12 @@ export class CodexRunner implements IRunner {
       });
 
       proc.stderr.on('data', (data) => {
-        resetIdleTimer();
         stderrBytes += data.length;
         stderr += data.toString();
       });
 
       proc.on('error', (error) => {
         clearTimeout(timeout);
-        clearTimeout(idleTimer);
         if (!settled) {
           settled = true;
           reject(new Error(`Failed to spawn Codex: ${error.message}`));
@@ -451,7 +426,6 @@ export class CodexRunner implements IRunner {
 
       proc.on('close', (code, signal) => {
         clearTimeout(timeout);
-        clearTimeout(idleTimer);
         if (settled) return;
         settled = true;
 

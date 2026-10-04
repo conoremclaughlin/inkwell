@@ -41,9 +41,7 @@ import { decideChannelForward } from '../channel-forward.js';
 vi.hoisted(() => {
   process.env.CLAUDE_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
   process.env.GEMINI_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
-  // Above Codex's 30-minute silence window, so each case reaches the timer
-  // it names.
-  process.env.CODEX_PROCESS_TIMEOUT_MS = String(60 * 60 * 1000);
+  process.env.CODEX_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
 });
 
 const spawnMock = vi.fn();
@@ -70,11 +68,7 @@ import {
   IDLE_TIMEOUT_MS as GEMINI_IDLE_TIMEOUT_MS,
   PROCESS_TIMEOUT_MS as GEMINI_PROCESS_TIMEOUT_MS,
 } from './gemini-runner.js';
-import {
-  CodexRunner,
-  IDLE_TIMEOUT_MS as CODEX_IDLE_TIMEOUT_MS,
-  PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS,
-} from './codex-runner.js';
+import { CodexRunner, PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS } from './codex-runner.js';
 import type { ClaudeRunnerConfig } from './types.js';
 
 interface FakeChild extends EventEmitter {
@@ -280,30 +274,14 @@ describe('GeminiRunner — a killed turn is reported as a failure', () => {
 });
 
 describe('CodexRunner — a killed turn is reported as a failure', () => {
-  it('classifies an idle timeout instead of resolving as a completed turn', async () => {
-    const runner = new CodexRunner();
-    const runPromise = runner.run('do the thing', { config: baseConfig() });
-    await settleSpawn();
-
-    await vi.advanceTimersByTimeAsync(CODEX_IDLE_TIMEOUT_MS - 1);
-    expect(child.kill).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-    const result = await runPromise;
-    expectClassifiedTimeout(result);
-    expect(result.error).toMatch(/no output/);
-  });
-
-  it('classifies the hard ceiling even while output keeps flowing', async () => {
+  it('classifies a configured ceiling even while output keeps flowing', async () => {
     const runner = new CodexRunner();
     const runPromise = runner.run('runaway', { config: baseConfig() });
     await settleSpawn();
 
-    // Emit steadily so the idle timer never trips — this must reach the
-    // configured ceiling, not the idle path.
-    const step = Math.floor(CODEX_IDLE_TIMEOUT_MS / 2);
+    // Codex has no silence timeout; steady output shows the ceiling alone
+    // stops it.
+    const step = 5 * 60 * 1000;
     const iterations = Math.ceil(CODEX_PROCESS_TIMEOUT_MS! / step) + 1;
     for (let i = 0; i < iterations && child.kill.mock.calls.length === 0; i++) {
       child.stdout.emit('data', `${JSON.stringify({ type: 'item.started' })}\n`);

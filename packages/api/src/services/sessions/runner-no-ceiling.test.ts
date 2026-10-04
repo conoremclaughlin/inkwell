@@ -11,8 +11,9 @@
  * Each runner is driven through a fake child with real (faked) timers:
  *   - output every half silence-window for three hours: not killed, and the
  *     turn still ends as a success when the process exits;
- *   - a silence of the full window: stopped, as before. Codex had no silence
- *     timeout while it had a ceiling, so for it this is new.
+ *   - Claude and Gemini: a silence of the full window is stopped, as before;
+ *   - Codex has no silence timeout: its stdout is quiet while the model
+ *     reasons, so two silent hours are not killed either.
  */
 
 import { EventEmitter } from 'events';
@@ -52,11 +53,7 @@ import {
   IDLE_TIMEOUT_MS as GEMINI_IDLE_TIMEOUT_MS,
   PROCESS_TIMEOUT_MS as GEMINI_PROCESS_TIMEOUT_MS,
 } from './gemini-runner.js';
-import {
-  CodexRunner,
-  IDLE_TIMEOUT_MS as CODEX_IDLE_TIMEOUT_MS,
-  PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS,
-} from './codex-runner.js';
+import { CodexRunner, PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS } from './codex-runner.js';
 import type { ClaudeRunnerConfig } from './types.js';
 
 interface FakeChild extends EventEmitter {
@@ -141,22 +138,45 @@ const runners = [
     noise: JSON.stringify({ type: 'noise' }),
     finish: () => child.emit('close', 0),
   },
-  {
-    name: 'CodexRunner',
-    make: () => new CodexRunner(),
-    idleMs: CODEX_IDLE_TIMEOUT_MS,
-    ceiling: () => CODEX_PROCESS_TIMEOUT_MS,
-    noise: JSON.stringify({ type: 'item.started' }),
-    finish: () => child.emit('close', 0),
-  },
 ];
 
-describe('CodexRunner silence window', () => {
-  it('is no shorter than the 30-minute ceiling it replaces', () => {
-    // `codex exec --json` is silent through a long reasoning item or command,
-    // so a shorter window could stop a turn the old ceiling let finish
-    // (Lumen, #745). At 30 minutes it never stops one sooner.
-    expect(CODEX_IDLE_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60 * 1000);
+describe('CodexRunner with no ceiling configured', () => {
+  it('has no ceiling', () => {
+    expect(CODEX_PROCESS_TIMEOUT_MS).toBeUndefined();
+  });
+
+  it('is not killed after three hours while output keeps flowing, and ends as a success', async () => {
+    const runPromise = new CodexRunner().run('long job', { config: baseConfig() });
+    await settleSpawn();
+
+    const elapsed = await keepWriting(
+      10 * 60 * 1000,
+      THREE_HOURS_MS,
+      JSON.stringify({ type: 'item.started' })
+    );
+    expect(elapsed).toBeGreaterThanOrEqual(THREE_HOURS_MS);
+    expect(child.kill).not.toHaveBeenCalled();
+
+    child.emit('close', 0);
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('is not killed by silence either: its stdout is quiet while the model reasons', async () => {
+    // `codex exec --json` writes nothing while reasoning deltas stream; only
+    // the final item.completed carries them (Lumen, #745). So a long silence
+    // is not proof the turn has stopped, and nothing here kills on it.
+    const runPromise = new CodexRunner().run('deep think', { config: baseConfig() });
+    await settleSpawn();
+
+    child.stdout.emit('data', `${JSON.stringify({ type: 'turn.started' })}\n`);
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+    expect(child.kill).not.toHaveBeenCalled();
+
+    child.emit('close', 0);
+    const result = await runPromise;
+    expect(result.success).toBe(true);
   });
 });
 
