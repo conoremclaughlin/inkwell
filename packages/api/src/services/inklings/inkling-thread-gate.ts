@@ -32,6 +32,9 @@ export const INKLING_THREAD_REFUSED = 'inkling_thread_refused';
 /** The most inklings one owner-present conversation may hold. */
 export const MAX_CONVERSATION_INKLINGS = 3;
 
+/** The thread-row metadata key that marks an inkling conversation from its creation. */
+export const INKLING_CONVERSATION_MARK = 'inklingConversation';
+
 export class InklingThreadRefusedError extends Error {
   constructor(
     readonly code: typeof INKLINGS_DISABLED | typeof INKLING_THREAD_REFUSED,
@@ -57,25 +60,6 @@ export interface InklingThreadVerdict {
 }
 
 /**
- * An inkling conversation's members are those of the one send that created
- * it. The thread insert is unique on its key, so when two sends each found
- * no conversation, only one creates it. Call this once the thread is found
- * or created, before anything else is written: the other send, judged
- * against no members, must not add its own to the winner's.
- */
-export function assertInklingConversationCreatedHere(
-  verdict: InklingThreadVerdict,
-  thread: { hadThread: boolean; created: boolean }
-): void {
-  if (verdict.inklingConversation && !thread.hadThread && !thread.created) {
-    throw new InklingThreadRefusedError(
-      INKLING_THREAD_REFUSED,
-      'This conversation was started by another send at the same moment'
-    );
-  }
-}
-
-/**
  * Refuses (throws) a send that would put an inkling in a conversation with
  * anyone but its owner and that owner's other inklings, or that comes from
  * anyone but that owner or, as a reply, one of those inklings. A send that
@@ -95,7 +79,20 @@ export async function assertInklingThreadAllowed(
   const people = new Set<string>();
   /** The SBs already in the conversation, before this send. */
   const members = new Set<string>();
+  /**
+   * Marked as an inkling conversation on its thread row, which is written
+   * in the same insert that creates the thread: true before any of its
+   * members' rows can be seen.
+   */
+  let marked = false;
   if (input.existingThreadId) {
+    const { data: threadRows, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('metadata')
+      .eq('id', input.existingThreadId);
+    if (threadError) throw new Error(`Failed to read the conversation: ${threadError.message}`);
+    const [threadRow] = (threadRows ?? []) as Array<{ metadata: Record<string, unknown> | null }>;
+    marked = threadRow?.metadata?.[INKLING_CONVERSATION_MARK] === true;
     const { data, error } = await supabase
       .from('inbox_thread_participants')
       .select('sb_id, user_id')
@@ -109,16 +106,27 @@ export async function assertInklingThreadAllowed(
       if (row.user_id) people.add(row.user_id.toLowerCase());
     }
   }
-  if (sbIds.size === 0) return { quiet: false, inklingConversation: false };
+  if (sbIds.size === 0 && !marked) return { quiet: false, inklingConversation: false };
 
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .select('id, user_id, metadata')
-    .in('id', [...sbIds]);
-  if (error) throw new Error(`Failed to read the conversation's SBs: ${error.message}`);
-  const identities = (data ?? []) as IdentityRow[];
+  let identities: IdentityRow[] = [];
+  if (sbIds.size > 0) {
+    const { data, error } = await supabase
+      .from('agent_identities')
+      .select('id, user_id, metadata')
+      .in('id', [...sbIds]);
+    if (error) throw new Error(`Failed to read the conversation's SBs: ${error.message}`);
+    identities = (data ?? []) as IdentityRow[];
+  }
   const inklings = identities.filter((r) => r.metadata?.client === INKLING_CLIENT);
-  if (inklings.length === 0) return { quiet: false, inklingConversation: false };
+  if (inklings.length === 0) {
+    if (!marked) return { quiet: false, inklingConversation: false };
+    // An inkling conversation whose inklings this send cannot see yet: its
+    // creator is still writing them. Nothing joins it on that view.
+    throw new InklingThreadRefusedError(
+      INKLING_THREAD_REFUSED,
+      "An inkling's conversation is only between its owner and the owner's own inklings"
+    );
+  }
 
   if (ownerTestUserIds.size === 0) {
     throw new InklingThreadRefusedError(INKLINGS_DISABLED, 'Inklings are not open on this server');

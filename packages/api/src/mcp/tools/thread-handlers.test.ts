@@ -678,7 +678,15 @@ function createThreadMockSupabase() {
         tables[name].select = vi.fn().mockImplementation(() => {
           callCount++;
           if (callCount === 1) return findChain;
-          return makeChainable({ data: threadRow, error: null });
+          const found = makeChainable({ data: threadRow, error: null });
+          // A plain select resolves to rows, as PostgREST does; single and
+          // maybeSingle resolve to the row.
+          found.then = vi
+            .fn()
+            .mockImplementation((resolve: (v: unknown) => void) =>
+              resolve({ data: [threadRow], error: null })
+            );
+          return found;
         });
         tables[name].insert = vi.fn().mockReturnValue(insertChain);
         tables[name].update = vi.fn().mockReturnValue(makeChainable({ data: null, error: null }));

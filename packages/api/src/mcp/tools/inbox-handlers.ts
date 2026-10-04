@@ -67,8 +67,8 @@ import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
 import {
-  assertInklingConversationCreatedHere,
   assertInklingThreadAllowed,
+  INKLING_CONVERSATION_MARK,
 } from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 
@@ -714,7 +714,7 @@ export async function handleSendToInbox(
     // A conversation with an inkling is only between its owner and the
     // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
     // anything is written. An inkling's own send wakes nobody (`quiet`).
-    const inklingVerdict = await assertInklingThreadAllowed(supabase, {
+    let inklingVerdict = await assertInklingThreadAllowed(supabase, {
       sender,
       participantSbs,
       existingThreadId: existingThread?.id ?? null,
@@ -735,6 +735,13 @@ export async function handleSendToInbox(
     // If sender is NOT a participant, auto-add them (join-on-send).
 
     // Find or create thread
+    // Written with the thread row only if this send creates it. An inkling
+    // conversation is marked in that same insert, so a send that loses the
+    // race to create it sees what it is before any member row is written.
+    const newThreadMetadata: Record<string, unknown> = {
+      ...(internal?.createIntent ? { createIntent: internal.createIntent } : {}),
+      ...(inklingVerdict.inklingConversation ? { [INKLING_CONVERSATION_MARK]: true } : {}),
+    };
     let thread = await findOrCreateThread(supabase, {
       workspaceId,
       threadKey,
@@ -742,19 +749,25 @@ export async function handleSendToInbox(
       title: subject || null,
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
-      ...(internal?.createIntent ? { metadata: { createIntent: internal.createIntent } } : {}),
+      ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
     });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
     // and the insert. Nothing has been written yet (findOrCreateThread writes
     // only for a thread it created), and nothing may be.
     if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
-    // Nor may a send that found no inkling conversation add its members to
-    // one another send created meanwhile (the gate judged it as the creator).
-    assertInklingConversationCreatedHere(inklingVerdict, {
-      hadThread: !!existingThread,
-      created: thread.isNew,
-    });
+    // A send that found no conversation but did not create this one lost the
+    // race to another send. It was judged as a creator, against no members,
+    // so it is judged again against the conversation that now exists, before
+    // it writes anything: no send joins a conversation it was not judged
+    // against.
+    if (!existingThread && !thread.isNew) {
+      inklingVerdict = await assertInklingThreadAllowed(supabase, {
+        sender,
+        participantSbs,
+        existingThreadId: thread.id,
+      });
+    }
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id

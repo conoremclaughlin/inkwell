@@ -610,6 +610,133 @@ describe("owner-present groups of the owner's own inklings, up to three", () => 
     expect(db.rows('inbox_thread_messages')).toHaveLength(1);
   });
 
+  it('an inkling conversation is marked as one on its thread row when it is created', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    await call(create, { key: 'chat:fern', recipients: ['fern'], content: 'hi' });
+    const markOf = (key: string) =>
+      (db.rows('inbox_threads').find((t) => t.thread_key === key)?.metadata as Row | undefined)
+        ?.inklingConversation;
+    expect(markOf(KEY)).toBe(true);
+    expect(markOf('chat:fern')).toBeUndefined();
+  });
+
+  it('a marked conversation whose inklings are not visible yet takes no other send', async () => {
+    const thread = db.seed('inbox_threads', {
+      thread_key: KEY,
+      workspace_id: WS,
+      metadata: { inklingConversation: true },
+    });
+    db.seed('inbox_thread_participants', { thread_id: thread.id, workspace_id: WS, user_id: ME });
+    await expect(ownerSend(KEY, ['fern'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    expect(await replyAs(asSb('fern'), { key: KEY })).toBeInstanceOf(InklingThreadRefusedError);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+  });
+
+  /**
+   * Holds the next send at its second inbox_threads lookup: after the
+   * gate's look found no conversation, before findOrCreateThread's own.
+   * `atPause` resolves when it is held; `release` lets it go on.
+   */
+  function holdAtSecondThreadLookup() {
+    let reached!: () => void;
+    let release!: () => void;
+    const atPause = new Promise<void>((resolve) => (reached = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const realFrom = db.from.bind(db);
+    let lookups = 0;
+    let armed = true;
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'inbox_threads' && armed) {
+        const realMaybeSingle = query.maybeSingle.bind(query);
+        query.maybeSingle = async () => {
+          lookups += 1;
+          if (armed && lookups === 2) {
+            armed = false;
+            reached();
+            await released;
+          }
+          return realMaybeSingle();
+        };
+      }
+      return query;
+    }) as typeof db.from;
+    return { atPause, release, restore: () => (db.from = realFrom) };
+  }
+
+  // Lumen, 24a82534: an ordinary conversation and an inkling conversation
+  // racing for one key, in both orders. The loser must not join a winner of
+  // the other kind on the strength of how it was judged before the race.
+  it('an ordinary send that found no conversation never joins the inkling conversation made meanwhile', async () => {
+    const hold = holdAtSecondThreadLookup();
+    const ordinary = ownerSend(KEY, ['fern']).then(
+      () => null,
+      (e: unknown) => e
+    );
+    await hold.atPause;
+    hold.restore();
+    await ownerSend(KEY, ['pip', 'tam']);
+    hold.release();
+    expect(await ordinary).toBeInstanceOf(InklingThreadRefusedError);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an inkling send that found no conversation never joins the ordinary conversation made meanwhile', async () => {
+    const hold = holdAtSecondThreadLookup();
+    const inkling = ownerSend(KEY, ['pip', 'tam']).then(
+      () => null,
+      (e: unknown) => e
+    );
+    await hold.atPause;
+    hold.restore();
+    await ownerSend(KEY, ['fern']);
+    hold.release();
+    expect(await inkling).toBeInstanceOf(InklingThreadRefusedError);
+    expect(sbMembers(KEY)).toEqual(['sb-fern']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an inkling conversation is closed to other sends from the moment its thread row exists', async () => {
+    // Hold the creating send between its thread insert and its members'.
+    let reached!: () => void;
+    let release!: () => void;
+    const atPause = new Promise<void>((resolve) => (reached = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const realFrom = db.from.bind(db);
+    let armed = true;
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'inbox_thread_participants' && armed) {
+        const realInsert = query.insert.bind(query);
+        query.insert = ((values: Row | Row[]) => {
+          realInsert(values);
+          if (armed) {
+            armed = false;
+            const realThen = query.then.bind(query);
+            query.then = ((onFulfilled, onRejected) => {
+              reached();
+              return released.then(() => realThen(onFulfilled, onRejected));
+            }) as typeof query.then;
+          }
+          return query;
+        }) as typeof query.insert;
+      }
+      return query;
+    }) as typeof db.from;
+
+    const creating = ownerSend(KEY, ['pip', 'tam']);
+    await atPause;
+    db.from = realFrom;
+    expect(db.rows('inbox_threads')).toHaveLength(1);
+    expect(sbMembers(KEY)).toEqual([]);
+    await expect(ownerSend(KEY, ['fern'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    release();
+    await creating;
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
   it('more than three is refused whole', async () => {
     const res = await call(create, {
       key: KEY,
