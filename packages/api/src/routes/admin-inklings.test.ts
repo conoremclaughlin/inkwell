@@ -199,13 +199,80 @@ describe('GET /inklings', () => {
 
     const res = await call(list, undefined, { role: 'viewer' });
     expect(res._status).toBe(200);
-    expect(res._json).toEqual({ inklings: [a._json.inkling, b._json.inkling] });
+    const idle = { state: 'idle', since: null };
+    expect(res._json).toEqual({
+      inklings: [
+        { ...(a._json.inkling as object), activity: idle },
+        { ...(b._json.inkling as object), activity: idle },
+      ],
+    });
   });
 
   it('is scoped to the resolved workspace', async () => {
     await call(awaken, { clientRequestId: REQUEST });
     const res = await call(list, undefined, { workspaceId: OTHER_WORKSPACE });
     expect(res._json).toEqual({ inklings: [] });
+  });
+
+  it("carries each inkling's own turn activity: working, stopping after Stop, idle when done", async () => {
+    const cancel = handler('post', '/inklings/:id/cancel');
+    const a = (await call(awaken, { clientRequestId: REQUEST }))._json.inkling as { id: string };
+    const b = (await call(awaken, { clientRequestId: '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a' }))
+      ._json.inkling as { id: string };
+    const activityOf = async (): Promise<Record<string, unknown>> => {
+      const res = await call(list, undefined, { role: 'viewer' });
+      const inklings = res._json.inklings as Array<{ id: string; activity: unknown }>;
+      return Object.fromEntries(inklings.map((i) => [i.id, i.activity]));
+    };
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-10-04T09:00:00.000Z'));
+      const turn = trackInklingTurn(a.id);
+      vi.setSystemTime(new Date('2026-10-04T09:02:00.000Z'));
+
+      expect(await activityOf()).toEqual({
+        [a.id]: { state: 'working', since: '2026-10-04T09:00:00.000Z' },
+        [b.id]: { state: 'idle', since: null },
+      });
+
+      expect((await call(cancel, {}, { params: { id: a.id } }))._json).toEqual({
+        cancelled: true,
+      });
+      expect(await activityOf()).toEqual({
+        [a.id]: { state: 'stopping', since: '2026-10-04T09:00:00.000Z' },
+        [b.id]: { state: 'idle', since: null },
+      });
+
+      turn.done();
+      expect(await activityOf()).toEqual({
+        [a.id]: { state: 'idle', since: null },
+        [b.id]: { state: 'idle', since: null },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never reports another person's inkling, working or not", async () => {
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', SOMEONE_ELSE);
+    const theirs = (
+      await call(
+        awaken,
+        { clientRequestId: REQUEST },
+        { userId: SOMEONE_ELSE, workspaceId: OTHER_WORKSPACE }
+      )
+    )._json.inkling as { id: string };
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+    const turn = trackInklingTurn(theirs.id);
+    try {
+      for (const workspaceId of [MY_WORKSPACE, OTHER_WORKSPACE]) {
+        const res = await call(list, undefined, { workspaceId });
+        expect(res._json, workspaceId).toEqual({ inklings: [] });
+      }
+    } finally {
+      turn.done();
+    }
   });
 });
 

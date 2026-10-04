@@ -99,6 +99,7 @@ import {
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserId } from '../config/inkling-flags';
 import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -3884,17 +3885,26 @@ function answerInklingError(res: Response, label: string, error: unknown): void 
 }
 
 /**
- * GET /api/admin/inklings → { inklings: Inkling[] }, oldest first.
+ * GET /api/admin/inklings → { inklings: [...Inkling, activity] }, oldest first.
  *
  * Only inklings born through this flow: never the account's other SBs, and
  * no fallback to /individuals. Reading is every role's, like threads; the
  * list holds only the person's own inklings.
+ *
+ * `activity` ({ state: 'idle' | 'working' | 'stopping', since }) is each
+ * listed inkling's turn state in this server process (inkling-turns.ts),
+ * read for those inklings only.
  */
 router.get('/inklings', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const inklings = await (await inklingService()).list(inklingScope(authReq));
-    res.json({ inklings });
+    res.json({
+      inklings: inklings.map((inkling) => ({
+        ...inkling,
+        activity: inklingTurnActivity(inkling.id),
+      })),
+    });
   } catch (error) {
     answerInklingError(res, 'Failed to list inklings', error);
   }

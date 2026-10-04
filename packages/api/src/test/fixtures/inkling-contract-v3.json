@@ -1,6 +1,6 @@
 {
-  "contract": "Inkling consumer awakening, v3 (inkling:thread:app-build 242d45bf, amended 58202c0a)",
-  "note": "Example wire payloads for the Inkling app's adapter. Values are illustrative; field names, presence and types are the contract. Pinned by packages/api/src/routes/inkling-contract.test.ts against the real handlers.",
+  "contract": "Inkling consumer awakening, v3 (inkling:thread:app-build 242d45bf, amended 58202c0a), plus list activity (pcp:thread:inkling-turn-activity)",
+  "note": "Example wire payloads for the Inkling app's adapter. Values are illustrative; field names, presence and types are the contract. Pinned by packages/api/src/routes/inkling-contract.test.ts against the real handlers. activity.state is 'idle', 'working' or 'stopping'; activity.since is null exactly when idle.",
   "inklings": {
     "list": {
       "status": 200,
@@ -11,7 +11,23 @@
             "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
             "displayName": null,
             "createdAt": "2026-10-02T08:00:05.000Z",
-            "nameable": true
+            "nameable": true,
+            "activity": { "state": "idle", "since": null }
+          }
+        ]
+      }
+    },
+    "listWorking": {
+      "status": 200,
+      "body": {
+        "inklings": [
+          {
+            "id": "3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10",
+            "sbSlug": "kindle-8a7b6c5d-4e3f-4a2b-9c1d-0e1f2a3b4c5d",
+            "displayName": "Pip",
+            "createdAt": "2026-10-02T08:00:05.000Z",
+            "nameable": true,
+            "activity": { "state": "working", "since": "2026-10-02T08:03:12.000Z" }
           }
         ]
       }
