@@ -123,7 +123,48 @@ export interface ThreadLinkWrite {
   note?: string | null;
   origin: 'explicit' | 'send';
   sourceMessageId?: string | null;
-  linkedBy: { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string };
+  linkedBy: { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string } | { kind: 'system' };
+}
+
+function linkRow(write: ThreadLinkWrite): Record<string, unknown> {
+  const row: Record<string, unknown> = {
+    workspace_id: write.workspaceId,
+    source_thread_id: write.sourceThreadId,
+    target_kind: write.target.kind,
+    target_thread_key: write.target.kind === 'thread' ? write.target.threadKey : null,
+    target_artifact_id: write.target.kind === 'artifact' ? write.target.artifactId : null,
+    origin: write.origin,
+    linked_by_kind: write.linkedBy.kind,
+    linked_by_sb_id: write.linkedBy.kind === 'sb' ? write.linkedBy.sbId : null,
+    linked_by_user_id: write.linkedBy.kind === 'user' ? write.linkedBy.userId : null,
+  };
+  if (write.relation !== undefined) row.relation = write.relation;
+  if (write.note !== undefined) row.note = write.note;
+  if (write.sourceMessageId !== undefined) row.source_message_id = write.sourceMessageId;
+  return row;
+}
+
+const LINK_CONFLICT_TARGET = 'source_thread_id,target_kind,target_ref';
+
+/**
+ * Write a link only if the pair is not linked yet (ON CONFLICT DO NOTHING).
+ * Used for links that arrive with a message: a send naming a target the
+ * thread already links must not overwrite the relation, note and author
+ * someone chose with link_thread. Returns the row when one was written, null
+ * when the pair was already linked.
+ */
+export async function insertThreadLinkIfAbsent(
+  supabase: SupabaseClient,
+  write: ThreadLinkWrite
+): Promise<ThreadLinkRow | null> {
+  const { data, error } = await linksTable(supabase)
+    .upsert(linkRow(write), { onConflict: LINK_CONFLICT_TARGET, ignoreDuplicates: true })
+    .select('*');
+  if (error) {
+    throw new Error(`Failed to write thread link: ${error.message}`);
+  }
+  const rows = (data ?? []) as ThreadLinkRow[];
+  return rows[0] ?? null;
 }
 
 /**
@@ -139,23 +180,8 @@ export async function upsertThreadLink(
   supabase: SupabaseClient,
   write: ThreadLinkWrite
 ): Promise<ThreadLinkRow> {
-  const row: Record<string, unknown> = {
-    workspace_id: write.workspaceId,
-    source_thread_id: write.sourceThreadId,
-    target_kind: write.target.kind,
-    target_thread_key: write.target.kind === 'thread' ? write.target.threadKey : null,
-    target_artifact_id: write.target.kind === 'artifact' ? write.target.artifactId : null,
-    origin: write.origin,
-    linked_by_kind: write.linkedBy.kind,
-    linked_by_sb_id: write.linkedBy.kind === 'sb' ? write.linkedBy.sbId : null,
-    linked_by_user_id: write.linkedBy.kind === 'user' ? write.linkedBy.userId : null,
-  };
-  if (write.relation !== undefined) row.relation = write.relation;
-  if (write.note !== undefined) row.note = write.note;
-  if (write.sourceMessageId !== undefined) row.source_message_id = write.sourceMessageId;
-
   const { data, error } = await linksTable(supabase)
-    .upsert(row, { onConflict: 'source_thread_id,target_kind,target_ref' })
+    .upsert(linkRow(write), { onConflict: LINK_CONFLICT_TARGET })
     .select('*')
     .single();
   if (error || !data) {
@@ -344,6 +370,33 @@ export async function describeThreadLinks(
   }
 
   return { linksTo, linkedFrom };
+}
+
+/**
+ * The threads linking to an artifact, for get_artifact: links to the artifact
+ * itself and, for a spec, to its `spec:<slug>` thread. Capped at
+ * THREAD_LINK_HEADER_MAX with the total beside it. Never throws: links
+ * decorate the artifact, so a failure is returned as `error` beside it.
+ */
+export async function artifactBacklinks(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  artifact: { id: string; uri: string }
+): Promise<{ threads: ThreadLinkView[]; count: number } | { error: string }> {
+  try {
+    const twin = specTwin({ kind: 'artifact', uri: artifact.uri });
+    const rows = await listLinksTo(supabase, workspaceId, {
+      artifactId: artifact.id,
+      threadKey: twin && twin.kind === 'thread' ? twin.threadKey : null,
+    });
+    const { linkedFrom } = await describeThreadLinks(supabase, workspaceId, {
+      linksTo: [],
+      linkedFrom: rows,
+    });
+    return { threads: linkedFrom.slice(0, THREAD_LINK_HEADER_MAX), count: linkedFrom.length };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 interface ThreadSummaryRow {

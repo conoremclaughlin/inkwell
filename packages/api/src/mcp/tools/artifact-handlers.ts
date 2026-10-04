@@ -18,6 +18,8 @@ import { logger } from '../../utils/logger';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
+import { resolveCallerWorkspace } from './caller-principal';
+import { artifactBacklinks } from '../../services/thread-links';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 import { EmbeddingRouter } from '../../services/embeddings/router';
 import { formatVectorLiteral } from '../../services/embeddings/memory-chunks';
@@ -701,6 +703,17 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     });
   }
 
+  // The threads that link here (thread:thread-links): for a spec, the PRs
+  // and discussions that name it. Thread links live in the caller's SB
+  // workspace, which is not the artifact's product workspace scope above.
+  const backlinks = await resolveCallerWorkspace(supabase, resolved.user.id)
+    .then(({ workspaceId: linkWorkspaceId }) =>
+      artifactBacklinks(supabase, linkWorkspaceId, { id: artifact.id, uri: artifact.uri })
+    )
+    .catch((error: unknown) => ({
+      error: error instanceof Error ? error.message : String(error),
+    }));
+
   return {
     content: [
       {
@@ -714,6 +727,12 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
                 note: `"${resolvedViaAlias}" is a former URI of this artifact; update links to ${artifact.uri}.`,
               }
             : {}),
+          ...('error' in backlinks
+            ? { linkedFromThreadsError: backlinks.error }
+            : {
+                linkedFromThreads: backlinks.threads,
+                linkedFromThreadCount: backlinks.count,
+              }),
           artifact: {
             id: artifact.id,
             uri: artifact.uri,

@@ -14,23 +14,125 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import { assertWriteRole, resolveCallerSb, type CallerSb } from './caller-principal';
 import { findThread, isParticipant, type ThreadRow } from './thread-handlers';
-import { resolveArtifactRowForUser } from './artifact-handlers';
+import { resolveLinkTarget, threadLinkViewsFor } from './thread-link-views';
 import {
   THREAD_LINK_NOTE_MAX,
   THREAD_LINK_RELATIONS,
   deleteThreadLink,
-  describeThreadLinks,
-  listLinksFrom,
-  listLinksTo,
+  insertThreadLinkIfAbsent,
   parseLinkTarget,
-  specTwin,
   upsertThreadLink,
-  type LinkTarget,
   type ResolvedLinkTarget,
-  type ThreadLinkRow,
+  type ThreadLinkWrite,
 } from '../../services/thread-links';
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
+
+/** The most links one send may carry. */
+export const SEND_LINKS_MAX = 20;
+
+export interface SendLinkTarget {
+  /** As the sender wrote it. */
+  to: string;
+  resolved: ResolvedLinkTarget;
+}
+
+/**
+ * Resolve the links a send carries, before anything is written: a bad target
+ * in `links` refuses the send, the same way a wrong address stores nothing.
+ *
+ * `relatedArtifactUri` joins them, but leniently. The threaded send path took
+ * it and dropped it until now, so callers have sent it for months with
+ * nothing checking it; an unknown URI there is reported in `skipped`, never
+ * a reason to refuse a message that used to go through.
+ */
+export async function resolveSendLinks(
+  supabase: SupabaseClient,
+  userId: string,
+  threadKey: string,
+  links: string[],
+  relatedArtifactUri?: string
+): Promise<{ targets: SendLinkTarget[]; skipped: Array<{ to: string; reason: string }> }> {
+  const targets: SendLinkTarget[] = [];
+  const skipped: Array<{ to: string; reason: string }> = [];
+  const seen = new Set<string>();
+  const add = (to: string, resolved: ResolvedLinkTarget) => {
+    const id = resolved.kind === 'thread' ? `t:${resolved.threadKey}` : `a:${resolved.artifactId}`;
+    if (seen.has(id)) return;
+    seen.add(id);
+    targets.push({ to, resolved });
+  };
+
+  for (const to of links) {
+    const parsed = parseLinkTarget(to);
+    if ('error' in parsed) throw new Error(`links: ${parsed.error}`);
+    if (parsed.kind === 'thread' && parsed.threadKey === threadKey) {
+      throw new Error(`links: a thread cannot link to itself (${threadKey})`);
+    }
+    const r = await resolveLinkTarget(supabase, userId, parsed);
+    if ('error' in r) throw new Error(`links: ${r.error}`);
+    add(to, r.resolved);
+  }
+
+  if (relatedArtifactUri) {
+    const parsed = parseLinkTarget(relatedArtifactUri);
+    if ('error' in parsed || parsed.kind !== 'artifact') {
+      skipped.push({ to: relatedArtifactUri, reason: 'relatedArtifactUri is not an ink:// URI' });
+    } else {
+      const r = await resolveLinkTarget(supabase, userId, parsed);
+      if ('error' in r) skipped.push({ to: relatedArtifactUri, reason: r.error });
+      else add(relatedArtifactUri, r.resolved);
+    }
+  }
+  return { targets, skipped };
+}
+
+/**
+ * Write a send's links once its message is stored. The message is already
+ * delivered by then, so a failed link does not fail the send; it is reported
+ * per target in `failed`, never folded into success.
+ */
+export async function writeSendLinks(
+  supabase: SupabaseClient,
+  params: {
+    workspaceId: string;
+    sourceThreadId: string;
+    messageId: string;
+    linkedBy: ThreadLinkWrite['linkedBy'];
+    targets: SendLinkTarget[];
+  }
+): Promise<{
+  linked: string[];
+  alreadyLinked: string[];
+  failed: Array<{ to: string; error: string }>;
+}> {
+  const linked: string[] = [];
+  const alreadyLinked: string[] = [];
+  const failed: Array<{ to: string; error: string }> = [];
+  for (const t of params.targets) {
+    try {
+      const row = await insertThreadLinkIfAbsent(supabase, {
+        workspaceId: params.workspaceId,
+        sourceThreadId: params.sourceThreadId,
+        target: t.resolved,
+        origin: 'send',
+        sourceMessageId: params.messageId,
+        linkedBy: params.linkedBy,
+      });
+      (row ? linked : alreadyLinked).push(t.to);
+    } catch (error) {
+      failed.push({ to: t.to, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (failed.length > 0) {
+    logger.warn('[ThreadLinks] Send links failed after the message was stored', {
+      sourceThreadId: params.sourceThreadId,
+      messageId: params.messageId,
+      failed,
+    });
+  }
+  return { linked, alreadyLinked, failed };
+}
 
 // ============== Schemas ==============
 
@@ -121,84 +223,6 @@ async function threadForWrite(
     return { error: `Agent ${sbSlug} is not a participant in thread ${threadKey}` };
   }
   return { caller, thread };
-}
-
-/**
- * Resolve a parsed target to what is stored. An artifact URI resolves through
- * aliases to its id; an unknown URI is refused, because a link to nothing is
- * a typo nobody will notice. A thread key is stored as written.
- */
-export async function resolveLinkTarget(
-  supabase: SupabaseClient,
-  userId: string,
-  target: LinkTarget
-): Promise<
-  | { resolved: ResolvedLinkTarget; uri?: string; resolvedViaAlias?: string | null }
-  | { error: string }
-> {
-  if (target.kind === 'thread') {
-    return { resolved: { kind: 'thread', threadKey: target.threadKey } };
-  }
-  const { artifact, resolvedViaAlias } = await resolveArtifactRowForUser(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    supabase as any,
-    userId,
-    undefined,
-    { uri: target.uri }
-  );
-  if (!artifact) return { error: `No artifact at ${target.uri}` };
-  return {
-    resolved: { kind: 'artifact', artifactId: artifact.id },
-    uri: artifact.uri,
-    resolvedViaAlias,
-  };
-}
-
-/**
- * Every link to and from a subject, as views. For a `spec:` thread or an
- * `ink://specs/` artifact, links to its twin count as links to it.
- */
-export async function threadLinkViewsFor(
-  supabase: SupabaseClient,
-  userId: string,
-  workspaceId: string,
-  subject: { threadKey: string; thread: ThreadRow | null } | { artifactId: string; uri: string },
-  options: { direction?: 'both' | 'to' | 'from'; relation?: string } = {}
-) {
-  const direction = options.direction ?? 'both';
-  let linksTo: ThreadLinkRow[] = [];
-  let linkedFrom: ThreadLinkRow[] = [];
-
-  if ('threadKey' in subject) {
-    if (direction !== 'from' && subject.thread) {
-      linksTo = await listLinksFrom(supabase, subject.thread.id);
-    }
-    if (direction !== 'to') {
-      const twin = specTwin({ kind: 'thread', threadKey: subject.threadKey });
-      let twinArtifactId: string | null = null;
-      if (twin && twin.kind === 'artifact') {
-        const r = await resolveLinkTarget(supabase, userId, twin);
-        if ('resolved' in r && r.resolved.kind === 'artifact')
-          twinArtifactId = r.resolved.artifactId;
-      }
-      linkedFrom = await listLinksTo(supabase, workspaceId, {
-        threadKey: subject.threadKey,
-        artifactId: twinArtifactId,
-      });
-    }
-  } else if (direction !== 'to') {
-    const twin = specTwin({ kind: 'artifact', uri: subject.uri });
-    linkedFrom = await listLinksTo(supabase, workspaceId, {
-      artifactId: subject.artifactId,
-      threadKey: twin && twin.kind === 'thread' ? twin.threadKey : null,
-    });
-  }
-
-  if (options.relation) {
-    linksTo = linksTo.filter((r) => r.relation === options.relation);
-    linkedFrom = linkedFrom.filter((r) => r.relation === options.relation);
-  }
-  return describeThreadLinks(supabase, workspaceId, { linksTo, linkedFrom });
 }
 
 // ============== Handlers ==============
@@ -321,7 +345,7 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
       supabase,
       resolved.user.id,
       caller.workspaceId,
-      { threadKey: parsed.threadKey, thread },
+      { threadKey: parsed.threadKey, threadId: thread?.id ?? null },
       options
     );
     return reply({

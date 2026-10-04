@@ -33,6 +33,7 @@ import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './th
 import { readTieRemainder } from './tie-completion.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
+import { threadLinkHeader } from './thread-link-views.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -914,6 +915,12 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     }
   }
 
+  // What the thread links to and what links to it (thread:thread-links).
+  // A delivery poll is the hot path and only wants messages, so it skips this.
+  const links = channelPoll
+    ? null
+    : await threadLinkHeader(supabase, resolved.user.id, caller.workspaceId, thread);
+
   return {
     content: [
       {
@@ -930,6 +937,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           createdBy: await creatorLabel(supabase, thread, participants),
           participants: participantSlugs(participants),
           people: participants.map((p) => p.userId).filter((id): id is string => !!id),
+          ...(links ? ('error' in links ? { linksError: links.error } : { links }) : {}),
           messageCount: messages?.length || 0,
           // Truncation is visible, never silent: how many older matching
           // messages were cut by the cold-start guard or latestN window.

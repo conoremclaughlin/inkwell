@@ -68,6 +68,7 @@ import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
 import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
+import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -140,7 +141,19 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(80)
     .optional()
     .describe('Deprecated spelling of sessionKey; use sessionKey.'),
-  relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
+  relatedArtifactUri: z
+    .string()
+    .optional()
+    .describe(
+      'Related artifact URI. With a threadKey, it links the thread to the artifact, as one of `links`; an unknown URI is reported under links.skipped rather than refusing the send.'
+    ),
+  links: z
+    .array(z.string().min(3).max(500))
+    .max(SEND_LINKS_MAX)
+    .optional()
+    .describe(
+      'Thread only: link the thread to these threads or library artifacts as the message is sent, e.g. ["spec:live-agent-surfaces", "ink://specs/thread-media"]. A target the thread already links is left as it is. An unknown ink:// URI or malformed key refuses the send before anything is stored. Read links with list_thread_links.'
+    ),
   metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
@@ -432,6 +445,7 @@ export async function handleSendToInbox(
     recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
+    links,
     metadata: callerMetadata = {},
     expiresAt,
     triggerType,
@@ -722,6 +736,20 @@ export async function handleSendToInbox(
       prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, workspaceId, threadKey);
     }
 
+    // Links the send carries (thread:thread-links), resolved before anything
+    // is written so a bad target stores nothing. relatedArtifactUri joins
+    // them: this path used to accept it and drop it.
+    const sendLinks =
+      (links && links.length > 0) || relatedArtifactUri
+        ? await resolveSendLinks(
+            supabase,
+            resolved.user.id,
+            threadKey,
+            links ?? [],
+            relatedArtifactUri
+          )
+        : null;
+
     // ── Reply semantics ──
     // A closed thread accepts replies. Closed is a work-state signal, not a
     // lock (spec inkmail-thread-scope §2): the reply is stored, counts as
@@ -908,6 +936,25 @@ export async function handleSendToInbox(
     if (tmError) {
       throw new Error(`Failed to send thread message: ${tmError.message}`);
     }
+
+    const sendLinkReport =
+      sendLinks && (sendLinks.targets.length > 0 || sendLinks.skipped.length > 0)
+        ? {
+            ...(await writeSendLinks(supabase, {
+              workspaceId,
+              sourceThreadId: thread.id,
+              messageId: threadMessage.id,
+              linkedBy:
+                sender.kind === 'sb'
+                  ? { kind: 'sb', sbId: sender.sbId }
+                  : sender.kind === 'user'
+                    ? { kind: 'user', userId: sender.userId }
+                    : { kind: 'system' },
+              targets: sendLinks.targets,
+            })),
+            ...(sendLinks.skipped.length > 0 ? { skipped: sendLinks.skipped } : {}),
+          }
+        : null;
 
     // Update thread updated_at
     await threadTable(supabase, 'inbox_threads')
@@ -1240,6 +1287,7 @@ export async function handleSendToInbox(
             // Distinct from `warning` below so a key problem and a session
             // problem can both be reported on the same send.
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
+            ...(sendLinkReport ? { links: sendLinkReport } : {}),
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
             ...explicitAddressEcho(explicitAddress),
