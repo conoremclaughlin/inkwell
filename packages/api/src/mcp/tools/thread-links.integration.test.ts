@@ -118,7 +118,7 @@ describe('thread links (DB integration)', () => {
       .from('inbox_threads')
       .select('id')
       .eq('workspace_id', workspaceId)
-      .in('thread_key', [KEY_A, KEY_B, KEY_D, KEY_REFUSED]);
+      .in('thread_key', [KEY_A, KEY_B, KEY_D, KEY_REFUSED, SPEC_KEY]);
     const ids = ((threads ?? []) as Array<{ id: string }>).map((t) => t.id);
     if (ids.length > 0) {
       await raw.from('thread_links').delete().in('source_thread_id', ids);
@@ -422,6 +422,28 @@ describe('thread links (DB integration)', () => {
     expect(teamRead.links.linksTo.map((l: { threadKey: string }) => l.threadKey).sort()).toEqual(
       [KEY_B, SPEC_KEY].sort()
     );
+
+    // A real spec conversation the inkling is not in: the inkling still sees
+    // A's spec link through the spec, but with the spec's title and no
+    // status, never the conversation's (Lumen, #737 round 3). The team sees
+    // the conversation.
+    await findOrCreateThread(raw, {
+      workspaceId,
+      threadKey: SPEC_KEY,
+      creator: echo,
+      title: 'Private spec conversation',
+      participants: [echo],
+    });
+    const inkSpec = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: INK, threadKey: KEY_A }, dataComposer)
+    ).linksTo.find((l: { threadKey: string }) => l.threadKey === SPEC_KEY);
+    expect(inkSpec).toMatchObject({ title: 'Thread links test spec', via: 'spec' });
+    expect(inkSpec).not.toHaveProperty('status');
+    const teamSpec = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: 'echo', threadKey: KEY_A }, dataComposer)
+    ).linksTo.find((l: { threadKey: string }) => l.threadKey === SPEC_KEY);
+    expect(teamSpec).toMatchObject({ title: 'Private spec conversation', status: 'open' });
+    expect(teamSpec).not.toHaveProperty('via');
 
     // Read from B's side, the same row stays hidden from the inkling: it is
     // not in B (Lumen, #737 round 2).

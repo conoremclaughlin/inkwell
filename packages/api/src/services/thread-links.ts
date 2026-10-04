@@ -454,8 +454,18 @@ export interface ThreadLinkView {
   artifactId?: string;
   artifactType?: string;
   title: string | null;
-  /** open / closed, or null when the key has no thread yet. Threads only. */
+  /**
+   * open / closed, or null when the key has no thread yet. Threads only, and
+   * absent when the end is shown `via: 'spec'`.
+   */
   status?: string | null;
+  /**
+   * 'spec': the reader may see this `spec:` key's end only through the spec
+   * it is the twin of, not as a participant of the conversation. The title is
+   * then the spec's, and the conversation's own title and status are left
+   * out, whether or not that conversation exists.
+   */
+  via?: 'spec';
   relation: string;
   note: string | null;
   origin: string;
@@ -635,6 +645,23 @@ export async function describeThreadLinks(
     if (!rowVisible(r)) continue;
     if (r.target_kind === 'thread') {
       const t = threadsByKey.get(r.target_thread_key!);
+      // Seeing the edge is one permission; seeing the conversation's title
+      // and status is another (Lumen, #737 round 3). A restricted reader that
+      // sees a `spec:` end through the spec alone gets the spec's title and
+      // no status, the same whether the conversation exists or not, so the
+      // view does not even say there is one.
+      if (visible !== null && !canSeeThread(t?.id)) {
+        const twinUri = twinUriByKey.get(r.target_thread_key!);
+        const twin = twinUri ? twinArtifacts.get(twinUri) : undefined;
+        linksTo.push({
+          kind: 'thread',
+          threadKey: r.target_thread_key!,
+          title: twin?.title ?? null,
+          via: 'spec',
+          ...common(r),
+        });
+        continue;
+      }
       linksTo.push({
         kind: 'thread',
         threadKey: r.target_thread_key!,

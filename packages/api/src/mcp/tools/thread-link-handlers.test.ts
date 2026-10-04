@@ -237,6 +237,41 @@ describe('thread link resolution across owners (Lumen, #737)', () => {
     expect(beta.linksTo).toEqual([]);
   });
 
+  // Seen through the spec, the end carries the spec's title and no status,
+  // and reads the same whether a private spec conversation exists or not
+  // (Lumen, #737 round 3).
+  it('an end seen through the spec shows the spec, not the conversation, and not whether one exists', async () => {
+    const view = async (withConversation: boolean) => {
+      const { dc, tables } = fixture();
+      tables.thread_links[0] = {
+        ...tables.thread_links[0],
+        target_kind: 'thread',
+        target_thread_key: 'spec:example',
+        target_artifact_id: null,
+        target_ref: 'spec:example',
+      };
+      if (withConversation) {
+        tables.inbox_threads.push({
+          id: 'private-spec-thread',
+          thread_key: 'spec:example',
+          workspace_id: WS,
+          title: 'Synthetic private conversation title',
+          status: 'closed',
+        });
+      }
+      const read = parsed(
+        await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+      );
+      return read.linksTo;
+    };
+    const withConversation = await view(true);
+    expect(withConversation).toEqual([
+      expect.objectContaining({ threadKey: 'spec:example', title: 'Synthetic spec', via: 'spec' }),
+    ]);
+    expect(withConversation[0]).not.toHaveProperty('status');
+    expect(await view(false)).toEqual(withConversation);
+  });
+
   // The other pole: with the workspace owner's SB in the fixture, both team
   // and spec owner agree, and a member's SB that owns the spec sees it too.
   it('the team sees every spec-twin backlink', async () => {
@@ -415,5 +450,56 @@ describe('Lumen round 2 reader boundary probes', () => {
       await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
     );
     expect(outgoing.linksTo).toEqual([]);
+  });
+});
+
+// Lumen's round-3 probe from the #737 review at 141a3b22, appended as
+// written: the twin conversation's metadata, and its participant control.
+describe('Lumen round 3 spec twin metadata boundary', () => {
+  function privateSpecThread() {
+    const f = fixture();
+    f.tables.inbox_threads.push({
+      id: 'private-spec-thread',
+      thread_key: 'spec:example',
+      workspace_id: WS,
+      title: 'Synthetic private conversation title',
+      status: 'closed',
+    });
+    f.tables.thread_links[0] = {
+      ...f.tables.thread_links[0],
+      target_kind: 'thread',
+      target_thread_key: 'spec:example',
+      target_artifact_id: null,
+      target_ref: 'spec:example',
+    };
+    return f;
+  }
+
+  it('does not grant a spec owner access to the twin conversation title', async () => {
+    const { dc, tables } = privateSpecThread();
+    expect(
+      tables.inbox_thread_participants.some(
+        (p) => p.thread_id === 'private-spec-thread' && p.sb_id === 'sb-a'
+      )
+    ).toBe(false);
+    const read = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(read.linksTo).toHaveLength(1); // Preserve the artifact-authorized edge.
+    expect(read.linksTo[0].threadKey).toBe('spec:example');
+    expect(read.linksTo[0].title).not.toBe('Synthetic private conversation title');
+  });
+
+  it('control: a participant can see the twin conversation title', async () => {
+    const { dc, tables } = privateSpecThread();
+    tables.inbox_thread_participants.push({
+      thread_id: 'private-spec-thread',
+      sb_id: 'sb-a',
+      user_id: null,
+    });
+    const read = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(read.linksTo[0].title).toBe('Synthetic private conversation title');
   });
 });
