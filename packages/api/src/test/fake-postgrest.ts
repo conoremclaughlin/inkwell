@@ -166,6 +166,18 @@ export class FakeQuery implements PromiseLike<FakeResult> {
     return this;
   }
 
+  /** PostgREST's `is`, for null and booleans; a column a row never set reads as null. */
+  is(column: string, value: null | boolean): this {
+    this.filters.push({
+      label: `${column} is ${String(value)}`,
+      test: (row) => {
+        const own = read(row, column);
+        return value === null ? own === null || own === undefined : own === value;
+      },
+    });
+    return this;
+  }
+
   gt(column: string, value: unknown): this {
     this.filters.push({
       label: `${column}>${String(value)}`,

@@ -28,6 +28,7 @@ import {
 } from './caller-identity';
 import { resolveCallerSb } from './caller-principal';
 import { findOrCreateThread } from './inbox-handlers';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate';
 import { assignThreadParticipant } from '../../services/sessions/thread-assignment';
 import type { Session } from '../../data/models/memory';
 import {
@@ -447,6 +448,16 @@ async function bindThreadHome(
       .eq('sb_id', sb.sbId)
       .maybeSingle();
     if (!row) {
+      // Joining is adding a member, and a conversation with an inkling has
+      // its members fixed when it is made (inkling-thread-gate.ts). Asked
+      // against the conversation as it now exists, so a thread another send
+      // created first is judged as what it is. A refusal throws, before the
+      // row is written; the caller reports it as the home error.
+      await assertInklingThreadAllowed(supabase, {
+        sender: sb,
+        participantSbs: [sb],
+        existingThreadId: thread.id,
+      });
       await participantTable(supabase).insert({
         thread_id: thread.id,
         workspace_id: sb.workspaceId,

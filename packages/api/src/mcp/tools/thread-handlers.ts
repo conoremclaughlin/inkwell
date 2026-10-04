@@ -24,10 +24,12 @@ import {
   resolveSbInWorkspace,
   resolveSbsByIds,
   senderColumns,
+  userPrincipal,
   type Principal,
   type SbPrincipal,
   type UserPrincipal,
 } from '../../services/principals';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { readTieRemainder } from './tie-completion.js';
@@ -1060,6 +1062,16 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       ],
     };
   }
+
+  // A conversation with an inkling has its members fixed when it is made,
+  // and no other conversation takes an inkling (inkling-thread-gate.ts):
+  // the same rule the send path asks, before anything is written or woken.
+  // Throws on refusal.
+  await assertInklingThreadAllowed(supabase, {
+    sender: actor ?? userPrincipal(resolved.user.id),
+    participantSbs: [newcomer],
+    existingThreadId: thread.id,
+  });
 
   // Add participant
   const { error: addError } = await threadTable(supabase, 'inbox_thread_participants').insert({

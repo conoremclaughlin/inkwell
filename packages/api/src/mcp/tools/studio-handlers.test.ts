@@ -92,6 +92,8 @@ vi.mock('../../services/studio-lease.service', async (importOriginal) => {
 });
 import { handleCreateStudio, handleAdoptStudio } from './studio-handlers';
 import type { DataComposer } from '../../data/composer';
+import { createInklingDb } from '../../test/fake-inkling-db';
+import type { FakePostgrest } from '../../test/fake-postgrest';
 
 function git(args: string[], cwd: string): void {
   execFileSync('git', args, { cwd, stdio: 'pipe' });
@@ -1035,6 +1037,126 @@ describe('create_studio / adopt_studio provenance', () => {
       acquired: false,
       threadKey: 'pr:601',
       holder: { sessionId: 'other', threadKey: 'pr:1' },
+    });
+  });
+
+  describe('a thread home never joins an inkling conversation (fixed membership, Lumen 0d0d6f6e)', () => {
+    // The person resolveUserOrThrow answers with: the inkling's owner here.
+    const OWNER = '00000000-0000-0000-0000-000000000001';
+    const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
+    let db: FakePostgrest;
+
+    beforeEach(() => {
+      db = createInklingDb();
+      db.seed('agent_identities', {
+        id: 'sb-1',
+        agent_id: 'wren',
+        user_id: OWNER,
+        workspace_id: 'ws-1',
+        metadata: {},
+      });
+      db.seed('agent_identities', {
+        id: 'sb-pip',
+        agent_id: 'pip',
+        user_id: OWNER,
+        workspace_id: 'ws-1',
+        metadata: INKLING,
+      });
+      db.seed('agent_identities', {
+        id: 'sb-fern',
+        agent_id: 'fern',
+        user_id: OWNER,
+        workspace_id: 'ws-1',
+        metadata: {},
+      });
+      vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', OWNER);
+      // The key names a conversation that already exists.
+      findOrCreateThreadMock.mockResolvedValue({ id: 'thread-x', isNew: false });
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    /** A conversation as stored, with these members. */
+    const seedConversation = (
+      members: Array<{ sb_id?: string; user_id?: string }>,
+      metadata: Record<string, unknown> = {}
+    ) => {
+      db.seed('inbox_threads', {
+        id: 'thread-x',
+        thread_key: 'chat:x',
+        workspace_id: 'ws-1',
+        metadata,
+      });
+      for (const member of members) {
+        db.seed('inbox_thread_participants', {
+          thread_id: 'thread-x',
+          workspace_id: 'ws-1',
+          sb_id: null,
+          user_id: null,
+          ...member,
+        });
+      }
+    };
+
+    const createFor = async () => {
+      const { dc } = composer();
+      (dc as unknown as { getClient: () => unknown }).getClient = () => db;
+      const result = await handleCreateStudio(
+        {
+          sbSlug: 'wren',
+          repoRoot,
+          slug: 'chat-x',
+          baseBranch: 'main',
+          skipGitOperations: true,
+          threadKey: 'chat:x',
+        },
+        dc
+      );
+      return JSON.parse(result.content[0].text);
+    };
+
+    const sbMembers = () =>
+      db
+        .rows('inbox_thread_participants')
+        .filter((p) => !!p.sb_id)
+        .map((p) => p.sb_id)
+        .sort();
+
+    it('an inkling conversation, marked or legacy, gets no home: the studio is made, the SB is not added', async () => {
+      for (const metadata of [{ inklingConversation: true }, {}]) {
+        db = createInklingDb();
+        for (const row of [
+          { id: 'sb-1', agent_id: 'wren', metadata: {} },
+          { id: 'sb-pip', agent_id: 'pip', metadata: INKLING },
+        ]) {
+          db.seed('agent_identities', { ...row, user_id: OWNER, workspace_id: 'ws-1' });
+        }
+        seedConversation([{ sb_id: 'sb-pip' }, { user_id: OWNER }], metadata);
+        assignMock.mockClear();
+        const payload = await createFor();
+        const label = JSON.stringify(metadata);
+        expect(payload.success, label).toBe(true);
+        expect(payload.routing, label).toMatchObject({ home: null });
+        expect(payload.routing.homeError, label).toMatch(/only between its owner/);
+        expect(sbMembers(), label).toEqual(['sb-pip']);
+        expect(assignMock, label).not.toHaveBeenCalled();
+      }
+    });
+
+    it('must not change: an ordinary conversation still takes the SB as its home', async () => {
+      seedConversation([{ sb_id: 'sb-fern' }]);
+      const payload = await createFor();
+      expect(payload.routing).toMatchObject({
+        home: { threadId: 'thread-x', threadCreated: false },
+      });
+      expect(payload.routing.homeError).toBeUndefined();
+      expect(sbMembers()).toEqual(['sb-1', 'sb-fern']);
+      expect(assignMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ threadId: 'thread-x', sbId: 'sb-1' })
+      );
     });
   });
 });
