@@ -123,7 +123,7 @@ const admitSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('stale_expectation'), epoch: z.string().nullable() }),
   z.object({ outcome: z.literal('unverified'), epoch: z.string() }),
   z.object({ outcome: z.literal('busy'), epoch: z.string() }),
-  z.object({ outcome: z.literal('unresolved'), epoch: z.string() }),
+  z.object({ outcome: z.literal('unresolved'), epoch: z.string().nullable() }),
   z.object({ outcome: z.literal('not_fifo_head'), head: z.string().uuid().nullable() }),
   held,
   notHolder,
@@ -242,6 +242,8 @@ const recordSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('recorded'), kind: z.string() }),
   z.object({ outcome: z.literal('already_recorded'), kind: z.string() }),
   z.object({ outcome: z.literal('contradiction'), kind: z.string() }),
+  /** The holder recorded this spawn unknown; only a reconciler resolves it now. */
+  z.object({ outcome: z.literal('needs_reconciler'), kind: z.string() }),
   z.object({ outcome: z.literal('no_intent') }),
   z.object({ outcome: z.literal('stale') }),
   notHolder,
@@ -311,9 +313,14 @@ const reconcileSchema = z.discriminatedUnion('outcome', [
 export type ReconcileTenureOutcome = z.infer<typeof reconcileSchema>;
 
 /**
- * Reconciler or operator path. `boot_changed` needs the boot id the tenure
- * recorded to differ from the current one; it clears process overlap only.
- * Unverified history (no tenure) can only be cleared by an operator decision.
+ * Reconciler or operator path.
+ * - `boot_changed` needs the tenure's recorded machine (`host.hostId`) to be the
+ *   current machine and its recorded boot id to differ from the current one. A
+ *   different machine or a new host instance is not a reboot. It clears process
+ *   overlap only.
+ * - `owner_tree_gone` needs the attestation the reconciler actually checked.
+ * - `operator_decision` accepts effect risk and never proves a process gone: it
+ *   clears only unverified history (no tenure) and is refused for a tenure.
  */
 export async function reconcileTenure(
   client: SupabaseClient,
@@ -322,6 +329,8 @@ export async function reconcileTenure(
     expectedTenureId: string | null;
     evidence: 'boot_changed' | 'owner_tree_gone' | 'operator_decision';
     currentBootId?: string;
+    /** The machine the reconciler runs on, for `boot_changed`. */
+    currentHostId?: string;
     evidenceRef?: string;
     authority: string;
     hostInstanceId: string;
@@ -332,6 +341,7 @@ export async function reconcileTenure(
     p_expected_tenure_id: input.expectedTenureId,
     p_evidence: input.evidence,
     p_current_boot_id: input.currentBootId ?? null,
+    p_current_host_id: input.currentHostId ?? null,
     p_evidence_ref: input.evidenceRef ?? null,
     p_authority: input.authority,
     p_host_instance_id: input.hostInstanceId,
