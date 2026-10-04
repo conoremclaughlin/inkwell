@@ -109,23 +109,18 @@ export function reactorOf(principal: UserPrincipal | SbPrincipal): ReactorRef {
 
 // ── The emoji ──
 
-const FLAG = /^\p{Regional_Indicator}{2}$/u;
-// A pictograph with its presentation selector, skin tone or tag characters,
-// optionally joined (ZWJ) to more of the same: ❤️, 👍🏽, 👩‍❤️‍👨, 🏴 with tags.
-// Everything after the first pictograph is Extend or ZWJ + pictograph under
-// UAX #29 (GB9, GB11), and two regional indicators pair (GB12), so whatever
-// either pattern matches is one grapheme: no separate count is needed.
-const PICTOGRAPH =
-  /^\p{Extended_Pictographic}[\p{Emoji_Modifier}\u{FE0E}\u{FE0F}\u{E0020}-\u{E007F}]*(?:\u{200D}\p{Extended_Pictographic}[\p{Emoji_Modifier}\u{FE0E}\u{FE0F}\u{E0020}-\u{E007F}]*)*$/u;
+// The contract's rule, the same pattern the Inkling app uses
+// (src/inkling/reactions.ts), so the two agree byte for byte: a regional-
+// indicator flag pair, or a pictograph with at most one presentation
+// selector and one skin tone, ZWJ-joined to more of the same. Every match is
+// one grapheme under UAX #29 (GB9, GB11, GB12), so no separate count is
+// needed. No text, keycaps, tag sequences or bidi controls.
+const ONE_EMOJI =
+  /^(?:\p{Regional_Indicator}{2}|\p{Extended_Pictographic}\u{FE0F}?[\u{1F3FB}-\u{1F3FF}]?(?:\u{200D}\p{Extended_Pictographic}\u{FE0F}?[\u{1F3FB}-\u{1F3FF}]?)*)$/u;
 
-/**
- * One emoji: a single grapheme that is a pictograph (with its modifiers) or
- * a regional-indicator flag pair, at most 16 UTF-16 units. No text, no
- * custom images, no shortcodes.
- */
+/** One emoji under the contract's rule, at most 16 UTF-16 units. */
 export function isReactionEmoji(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length > 16) return false;
-  return FLAG.test(value) || PICTOGRAPH.test(value);
+  return typeof value === 'string' && value.length <= 16 && ONE_EMOJI.test(value);
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

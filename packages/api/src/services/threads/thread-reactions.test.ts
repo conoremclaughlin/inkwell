@@ -130,40 +130,56 @@ async function refusal(promise: Promise<unknown>): Promise<{ status: number; cod
 }
 
 describe('isReactionEmoji', () => {
+  // The contract's cases, as the app's test has them (b6f0295a, ee0f59a2),
+  // spelled by code point so no invisible character can be lost in a copy.
   it.each([
-    ...REACTION_CHOICES,
-    '❤',
-    '🇮🇪',
-    '👍🏽',
-    '👩‍❤️‍👨',
-    '👨‍👩‍👧‍👦',
-    '🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}',
-  ])('accepts %s', (emoji) => {
+    ['❤️ heart with presentation selector', '\u{2764}\u{FE0F}'],
+    ['❤ bare heart', '\u{2764}'],
+    ['👍', '\u{1F44D}'],
+    ['👍🏽 with a skin tone', '\u{1F44D}\u{1F3FD}'],
+    ['🙏', '\u{1F64F}'],
+    ['🇮🇪 flag', '\u{1F1EE}\u{1F1EA}'],
+    ['👨‍👩‍👧 ZWJ family', '\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}'],
+  ])('accepts %s', (_label, emoji) => {
     expect(isReactionEmoji(emoji)).toBe(true);
   });
 
   it.each([
-    ['empty', ''],
-    ['a space', ' '],
+    ['漢字', '\u{6F22}\u{5B57}'],
+    ['a bidi override alone', '\u{202E}'],
+    ['a bidi override before a heart', '\u{202E}\u{2764}\u{FE0F}'],
+    ['a keycap', '1\u{FE0F}\u{20E3}'],
     ['a letter', 'a'],
-    ['a word', 'ok'],
-    ['a shortcode', ':heart:'],
-    ['two emoji', '❤️❤️'],
-    ['an emoji and a space', '👍 '],
-    ['a space and an emoji', ' 👍'],
-    ['text and an emoji', 'yes👍'],
-    ['one regional indicator', '🇮'],
-    ['two flags', '🇮🇪🇫🇷'],
-    ['a keycap', '1️⃣'],
-    ['markup', '<b>👍</b>'],
-    ['a combining accent', '❤́'],
-    // One grapheme, every part allowed, 19 UTF-16 units: only the length refuses it.
-    ['over 16 UTF-16 units', '👨🏻‍👩🏻‍👧🏻‍👦🏻'],
+    ['two hearts and a letter', '\u{2764}\u{FE0F}\u{2764}\u{FE0F}x'],
+    ['👍 and a trailing space', '\u{1F44D} '],
   ])('refuses %s', (_label, emoji) => {
     expect(isReactionEmoji(emoji)).toBe(false);
   });
 
-  it.each([null, undefined, 1, {}, ['👍']])('refuses a non-string (%s)', (value) => {
+  it('accepts every choice the app offers', () => {
+    for (const emoji of REACTION_CHOICES) expect(isReactionEmoji(emoji)).toBe(true);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['two flags', '\u{1F1EE}\u{1F1EA}\u{1F1EB}\u{1F1F7}'],
+    ['a tag sequence', '\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}'],
+    ['a text presentation selector', '\u{2764}\u{FE0E}'],
+    ['two skin tones', '\u{1F44D}\u{1F3FD}\u{1F3FD}'],
+  ])('refuses %s, beyond the contract’s list', (_label, emoji) => {
+    expect(isReactionEmoji(emoji)).toBe(false);
+  });
+
+  it('holds the 16 UTF-16 unit bound on a sequence the pattern accepts', () => {
+    // 👨🏻‍👩🏻‍👧🏻‍❤ is 16 units; with ❤’s presentation selector it is 17.
+    const sixteen =
+      '\u{1F468}\u{1F3FB}\u{200D}\u{1F469}\u{1F3FB}\u{200D}\u{1F467}\u{1F3FB}\u{200D}\u{2764}';
+    expect(sixteen.length).toBe(16);
+    expect(isReactionEmoji(sixteen)).toBe(true);
+    expect(isReactionEmoji(`${sixteen}\u{FE0F}`)).toBe(false);
+  });
+
+  it.each([null, undefined, 1, {}, ['\u{1F44D}']])('refuses a non-string (%s)', (value) => {
     expect(isReactionEmoji(value)).toBe(false);
   });
 });
