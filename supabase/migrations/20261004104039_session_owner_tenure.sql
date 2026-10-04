@@ -233,6 +233,16 @@ AS $$
      )
 $$;
 
+-- A process id the integer columns can hold: a typed refusal for anything
+-- else, never a cast error. CASE keeps the cast behind the shape check.
+CREATE FUNCTION public.session_admission_valid_pid(p_pid text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE WHEN p_pid ~ '^[1-9][0-9]{0,9}$' THEN p_pid::bigint <= 2147483647 ELSE false END
+$$;
+
 -- NULL when the caller holds the session's current tenure: the pointer names
 -- it, it is held, and the capability and host instance match. Call it only
 -- with the sessions row already locked.
@@ -304,12 +314,14 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'capability');
   END IF;
   IF jsonb_typeof(p_host) IS DISTINCT FROM 'object'
-     OR length(COALESCE(p_host->>'instanceId', '')) NOT BETWEEN 1 AND 200 THEN
+     OR length(COALESCE(p_host->>'instanceId', '')) NOT BETWEEN 1 AND 200
+     OR (p_host->>'hostId' IS NOT NULL AND length(p_host->>'hostId') NOT BETWEEN 1 AND 200)
+     OR (p_host->>'bootId' IS NOT NULL AND length(p_host->>'bootId') NOT BETWEEN 1 AND 200) THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'host');
   END IF;
   IF p_owner IS NOT NULL AND (
        jsonb_typeof(p_owner) IS DISTINCT FROM 'object'
-       OR (p_owner->>'pid') IS NULL OR (p_owner->>'pid') !~ '^[1-9][0-9]{0,9}$'
+       OR NOT public.session_admission_valid_pid(p_owner->>'pid')
        OR length(COALESCE(p_owner->>'startIdentity', '')) NOT BETWEEN 1 AND 200
      ) THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'owner');
@@ -688,7 +700,7 @@ BEGIN
   v_transcript := p_detail->>'providerTranscriptId';
   v_start := p_detail->>'startIdentity';
   IF p_kind = 'process_binding' THEN
-    IF (p_detail->>'pid') IS NULL OR (p_detail->>'pid') !~ '^[1-9][0-9]{0,9}$'
+    IF NOT public.session_admission_valid_pid(p_detail->>'pid')
        OR length(COALESCE(v_start, '')) NOT BETWEEN 1 AND 200 THEN
       RETURN jsonb_build_object('outcome', 'invalid', 'field', 'detail');
     END IF;
@@ -948,7 +960,7 @@ BEGIN
   IF p_evidence = 'boot_changed' AND length(COALESCE(p_current_boot_id, '')) NOT BETWEEN 1 AND 200 THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'boot');
   END IF;
-  IF p_evidence IN ('owner_tree_gone', 'legacy_quiescence_attested')
+  IF (p_evidence IN ('owner_tree_gone', 'legacy_quiescence_attested') OR p_evidence_ref IS NOT NULL)
      AND length(COALESCE(p_evidence_ref, '')) NOT BETWEEN 1 AND 200 THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'evidenceRef');
   END IF;
@@ -1044,7 +1056,13 @@ BEGIN
     IF v_tenure.host_boot_id IS NULL OR v_tenure.host_boot_id = p_current_boot_id THEN
       RETURN jsonb_build_object('outcome', 'refused', 'reason', 'boot_evidence_absent_or_same');
     END IF;
-    v_ref := COALESCE(p_evidence_ref, 'boot_changed:' || p_current_host_id || ':' || p_current_boot_id);
+    -- The default reference names exactly what was compared, at a bounded
+    -- length whatever the ids: a digest over the length-prefixed machine,
+    -- recorded boot and current boot. The values themselves are in the scope.
+    v_ref := COALESCE(p_evidence_ref, 'boot_changed:sha256:' || encode(sha256(convert_to(
+      length(v_tenure.host_id) || ':' || v_tenure.host_id
+      || length(v_tenure.host_boot_id) || ':' || v_tenure.host_boot_id
+      || length(p_current_boot_id) || ':' || p_current_boot_id, 'UTF8')), 'hex'));
     v_scope := jsonb_build_object('hostId', v_tenure.host_id, 'recordedBootId', v_tenure.host_boot_id,
                                   'currentBootId', p_current_boot_id);
   ELSE
@@ -1082,6 +1100,8 @@ REVOKE ALL ON FUNCTION public.session_admission_mode_refusal(integer) FROM PUBLI
 GRANT EXECUTE ON FUNCTION public.session_admission_mode_refusal(integer) TO service_role;
 REVOKE ALL ON FUNCTION public.session_turn_unresolved_invocations(uuid, text, boolean) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.session_turn_unresolved_invocations(uuid, text, boolean) TO service_role;
+REVOKE ALL ON FUNCTION public.session_admission_valid_pid(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.session_admission_valid_pid(text) TO service_role;
 REVOKE ALL ON FUNCTION public.session_tenure_holder_refusal(uuid, uuid, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.session_tenure_holder_refusal(uuid, uuid, text, text) TO service_role;
 REVOKE ALL ON FUNCTION public.register_tenure(uuid, jsonb, text, text, jsonb, jsonb, jsonb, integer) FROM PUBLIC, anon, authenticated;

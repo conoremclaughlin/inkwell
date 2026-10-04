@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getDataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
@@ -1037,6 +1037,15 @@ describe('durable command admission', () => {
 
     const LEGACY_PROOF = 'legacy-quiescence-attestation-fixture';
 
+    // The default boot_changed reference: a digest over the length-prefixed
+    // machine, recorded boot and current boot (ASCII fixtures, so length agrees).
+    function bootRef(hostId: string, recordedBootId: string, currentBootId: string): string {
+      const encoded = [hostId, recordedBootId, currentBootId]
+        .map((v) => `${v.length}:${v}`)
+        .join('');
+      return `boot_changed:sha256:${createHash('sha256').update(encoded, 'utf8').digest('hex')}`;
+    }
+
     function attestLegacy(
       sessionId: string,
       expectedLegacy: LegacySessionState | undefined,
@@ -2020,7 +2029,7 @@ describe('durable command admission', () => {
         expect(await tenureProof(rebootedHolder.tenureId)).toEqual({
           state: 'reconciled',
           end_evidence: 'boot_changed',
-          end_evidence_ref: `boot_changed:${HOST.hostId}:boot-fixture-2`,
+          end_evidence_ref: bootRef(HOST.hostId, HOST.bootId, 'boot-fixture-2'),
           end_evidence_scope: {
             hostId: HOST.hostId,
             recordedBootId: HOST.bootId,
@@ -2080,6 +2089,134 @@ describe('durable command admission', () => {
         }
         // Control: the coverage row itself is accepted.
         expect((await commandless('reconciled_legacy_epoch')).error).toBeNull();
+      });
+    });
+
+    // Lumen 332f2a27 (non-blocking): inputs that reach a bounded column get a
+    // typed result, never a constraint or cast error.
+    describe('bounded inputs', () => {
+      async function tenureProof(tenureId: string) {
+        const { data, error } = await supabase
+          .from('session_owner_tenures')
+          .select('state, end_evidence_ref, end_evidence_scope')
+          .eq('id', tenureId)
+          .single();
+        if (error || !data) throw new Error(`tenure read failed: ${error?.message}`);
+        return data;
+      }
+
+      it('reconciles boot evidence for the longest valid ids, under a bounded reference', async () => {
+        const host = {
+          instanceId: HOST.instanceId,
+          hostId: 'h'.repeat(200),
+          bootId: 'a'.repeat(200),
+        };
+        const currentBootId = 'b'.repeat(200);
+        const sessionId = await newSession(suiteSbId);
+        const { capability, capabilityHash } = mintTenureCapability();
+        const r = await registerTenure(supabase, {
+          sessionId,
+          expected: { kind: 'never_owned' },
+          mode: 'interactive_wrapper',
+          capabilityHash,
+          host,
+        });
+        if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+        const holder = { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId };
+        const a = await turn(sessionId, holder, null);
+        await settledSpawn(sessionId, holder, a.epoch, 'inv-1', [
+          { kind: 'process_binding', pid: 4260, startIdentity: 'start-fixture-bounded' },
+        ]);
+        const reconcile = (evidenceRef?: string) =>
+          reconcileTenure(supabase, {
+            sessionId,
+            expectedTenureId: r.tenureId,
+            evidence: 'boot_changed',
+            currentBootId,
+            currentHostId: host.hostId,
+            evidenceRef,
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          });
+        // A supplied reference is bounded for every kind, boot evidence included.
+        expect(await reconcile('r'.repeat(201))).toEqual({
+          outcome: 'invalid',
+          field: 'evidenceRef',
+        });
+        expect(await tenureProof(r.tenureId)).toMatchObject({ state: 'held' });
+
+        expect(await reconcile()).toEqual({ outcome: 'reconciled', tenureId: r.tenureId });
+        const ref = bootRef(host.hostId, host.bootId, currentBootId);
+        expect(ref.length).toBeLessThanOrEqual(200);
+        expect(await tenureProof(r.tenureId)).toMatchObject({
+          state: 'reconciled',
+          end_evidence_ref: ref,
+          end_evidence_scope: { hostId: host.hostId, recordedBootId: host.bootId, currentBootId },
+        });
+        const { data } = await supabase
+          .from('session_turn_invocations')
+          .select('resolution, resolution_evidence_ref')
+          .eq('session_id', sessionId)
+          .eq('epoch', a.epoch)
+          .single();
+        expect(data).toEqual({ resolution: 'tree_quiescent', resolution_evidence_ref: ref });
+      });
+
+      it('refuses an over-long machine or boot id, and a pid past the integer range, as invalid', async () => {
+        const registerWith = (
+          host: { instanceId: string; hostId?: string; bootId?: string },
+          owner?: number
+        ) =>
+          newSession(suiteSbId).then((sessionId) =>
+            registerTenure(supabase, {
+              sessionId,
+              expected: { kind: 'never_owned' },
+              mode: 'interactive_wrapper',
+              capabilityHash: mintTenureCapability().capabilityHash,
+              host,
+              owner:
+                owner === undefined ? undefined : { pid: owner, startIdentity: 'start-fixture' },
+            })
+          );
+        expect(
+          await registerWith({ instanceId: HOST.instanceId, hostId: 'h'.repeat(201) })
+        ).toEqual({
+          outcome: 'invalid',
+          field: 'host',
+        });
+        expect(
+          await registerWith({ instanceId: HOST.instanceId, bootId: 'a'.repeat(201) })
+        ).toEqual({
+          outcome: 'invalid',
+          field: 'host',
+        });
+        expect(await registerWith(HOST, 2147483648)).toEqual({
+          outcome: 'invalid',
+          field: 'owner',
+        });
+        // Control: the largest integer pid is a valid owner.
+        expect(await registerWith(HOST, 2147483647)).toMatchObject({ outcome: 'registered' });
+
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const a = await turn(sessionId, holder, null);
+        const bind = (pid: number) =>
+          recordInvocation(supabase, {
+            sessionId,
+            holder,
+            epoch: a.epoch,
+            invocationId: 'inv-1',
+            record: { kind: 'process_binding', pid, startIdentity: 'start-fixture' },
+          });
+        await recordInvocation(supabase, {
+          sessionId,
+          holder,
+          epoch: a.epoch,
+          invocationId: 'inv-1',
+          record: { kind: 'intent' },
+        });
+        expect(await bind(2147483648)).toEqual({ outcome: 'invalid', field: 'detail' });
+        expect(await bind(2147483647)).toEqual({ outcome: 'recorded', kind: 'process_binding' });
       });
     });
   });
