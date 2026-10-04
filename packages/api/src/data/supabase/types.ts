@@ -3251,6 +3251,30 @@ export type Database = {
           },
         ];
       };
+      runtime_admission_mode: {
+        Row: {
+          changed_at: string;
+          changed_reason: string;
+          mode: string;
+          protocol: number;
+          singleton: boolean;
+        };
+        Insert: {
+          changed_at?: string;
+          changed_reason: string;
+          mode: string;
+          protocol: number;
+          singleton?: boolean;
+        };
+        Update: {
+          changed_at?: string;
+          changed_reason?: string;
+          mode?: string;
+          protocol?: number;
+          singleton?: boolean;
+        };
+        Relationships: [];
+      };
       scheduled_reminders: {
         Row: {
           created_at: string | null;
@@ -3323,6 +3347,188 @@ export type Database = {
             foreignKeyName: 'scheduled_reminders_user_id_fkey';
             columns: ['user_id'];
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      session_command_events: {
+        Row: {
+          command_uuid: string;
+          created_at: string;
+          reason_code: string | null;
+          revision: number;
+          state: string;
+        };
+        Insert: {
+          command_uuid: string;
+          created_at?: string;
+          reason_code?: string | null;
+          revision: number;
+          state: string;
+        };
+        Update: {
+          command_uuid?: string;
+          created_at?: string;
+          reason_code?: string | null;
+          revision?: number;
+          state?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_command_events_command_uuid_fkey';
+            columns: ['command_uuid'];
+            isOneToOne: false;
+            referencedRelation: 'session_commands';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      session_command_receipts: {
+        Row: {
+          command_uuid: string;
+          created_at: string;
+          delivered_at: string | null;
+          recipient_id: string;
+          recipient_kind: string;
+          revision: number;
+        };
+        Insert: {
+          command_uuid: string;
+          created_at?: string;
+          delivered_at?: string | null;
+          recipient_id: string;
+          recipient_kind: string;
+          revision: number;
+        };
+        Update: {
+          command_uuid?: string;
+          created_at?: string;
+          delivered_at?: string | null;
+          recipient_id?: string;
+          recipient_kind?: string;
+          revision?: number;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_command_receipts_command_uuid_revision_fkey';
+            columns: ['command_uuid', 'revision'];
+            isOneToOne: false;
+            referencedRelation: 'session_command_events';
+            referencedColumns: ['command_uuid', 'revision'];
+          },
+        ];
+      };
+      session_commands: {
+        Row: {
+          addressee: string | null;
+          admission_seq: number;
+          command_id: string;
+          created_at: string;
+          digest_version: number;
+          executing_epoch: string | null;
+          expected_turn: string | null;
+          id: string;
+          kind: string;
+          origin_kind: string;
+          origin_ref: string | null;
+          payload: Json | null;
+          payload_digest: string;
+          principal_id: string;
+          principal_kind: string;
+          reason_code: string | null;
+          recovery_decided_at: string | null;
+          recovery_decided_revision: number | null;
+          recovery_decision: Json | null;
+          revision: number;
+          session_id: string;
+          source_message_id: string | null;
+          source_message_ref: string | null;
+          started_at: string | null;
+          state: string;
+          tombstoned_at: string | null;
+          updated_at: string;
+          workspace_id: string;
+        };
+        Insert: {
+          addressee?: string | null;
+          admission_seq: number;
+          command_id: string;
+          created_at?: string;
+          digest_version: number;
+          executing_epoch?: string | null;
+          expected_turn?: string | null;
+          id?: string;
+          kind: string;
+          origin_kind: string;
+          origin_ref?: string | null;
+          payload?: Json | null;
+          payload_digest: string;
+          principal_id: string;
+          principal_kind: string;
+          reason_code?: string | null;
+          recovery_decided_at?: string | null;
+          recovery_decided_revision?: number | null;
+          recovery_decision?: Json | null;
+          revision?: number;
+          session_id: string;
+          source_message_id?: string | null;
+          source_message_ref?: string | null;
+          started_at?: string | null;
+          state: string;
+          tombstoned_at?: string | null;
+          updated_at?: string;
+          workspace_id: string;
+        };
+        Update: {
+          addressee?: string | null;
+          admission_seq?: number;
+          command_id?: string;
+          created_at?: string;
+          digest_version?: number;
+          executing_epoch?: string | null;
+          expected_turn?: string | null;
+          id?: string;
+          kind?: string;
+          origin_kind?: string;
+          origin_ref?: string | null;
+          payload?: Json | null;
+          payload_digest?: string;
+          principal_id?: string;
+          principal_kind?: string;
+          reason_code?: string | null;
+          recovery_decided_at?: string | null;
+          recovery_decided_revision?: number | null;
+          recovery_decision?: Json | null;
+          revision?: number;
+          session_id?: string;
+          source_message_id?: string | null;
+          source_message_ref?: string | null;
+          started_at?: string | null;
+          state?: string;
+          tombstoned_at?: string | null;
+          updated_at?: string;
+          workspace_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_commands_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_commands_source_message_id_fkey';
+            columns: ['source_message_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_thread_messages';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_commands_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -5404,6 +5610,27 @@ export type Database = {
         };
         Returns: Json;
       };
+      admit_command: {
+        Args: {
+          p_addressee: string;
+          p_command_id: string;
+          p_digest_version: number;
+          p_expected_turn: string;
+          p_kind: string;
+          p_origin_kind: string;
+          p_origin_ref: string;
+          p_payload: Json;
+          p_payload_digest: string;
+          p_principal_id: string;
+          p_principal_kind: string;
+          p_protocol: number;
+          p_recipients: Json;
+          p_session_id: string;
+          p_source_message_ref: string;
+          p_workspace_id: string;
+        };
+        Returns: Json;
+      };
       reconcile_graph_dispatch_stamps: {
         Args: {
           p_stale_before: string;
@@ -5816,6 +6043,21 @@ export type Database = {
         };
         Returns: Json;
       };
+      session_command_recipients_valid: {
+        Args: { p_recipients: Json };
+        Returns: boolean;
+      };
+      session_command_record_receipts: {
+        Args: {
+          p_command_uuid: string;
+          p_principal_id: string;
+          p_principal_kind: string;
+          p_recipients: Json;
+          p_revision: number;
+        };
+        Returns: undefined;
+      };
+      session_dispatch_head: { Args: { p_session_id: string }; Returns: Json };
       supersede_gate: {
         Args: {
           p_user_id: string;
@@ -5865,6 +6107,20 @@ export type Database = {
         Args: {
           p_user_id: string;
           p_task_group_id: string;
+        };
+        Returns: Json;
+      };
+      transition_command: {
+        Args: {
+          p_command_uuid: string;
+          p_executing_epoch: string;
+          p_expected_revision: number;
+          p_expected_state: string;
+          p_mark_started: boolean;
+          p_new_state: string;
+          p_protocol: number;
+          p_reason_code: string;
+          p_recipients: Json;
         };
         Returns: Json;
       };
