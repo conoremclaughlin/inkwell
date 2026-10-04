@@ -93,6 +93,7 @@ import {
 } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
+import { fenceInkling, inklingFenceHolds } from '../inklings/inkling-stop-fence.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import {
   inklingOwnerTestUserIds,
@@ -2335,6 +2336,17 @@ export class SessionService implements ISessionService {
             `inkling turns run only on the Claude runner, which bounds them (not ${resolvedBackend})`
           );
         }
+        // A stopped turn whose processes were not confirmed gone fences the
+        // inkling until its group is (inkling-stop-fence.ts): no new turn
+        // runs beside them. Asked before the cap, so a refused turn counts
+        // nothing, and retryable, because the fence lifts once the group is
+        // observed gone.
+        if (inklingFenceHolds(inklingIdentity.id)) {
+          return refuseInklingTurn(
+            "its previous turn's processes are not yet confirmed stopped",
+            true
+          );
+        }
         // A bounded first test: each turn is counted against the inkling's
         // cap before anything is spawned.
         const cap = inklingTurnCap();
@@ -2756,6 +2768,14 @@ export class SessionService implements ISessionService {
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
           },
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+        })
+        .then((ran) => {
+          // Fenced before the turn is released below, so no admission can
+          // fall between the two.
+          if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
+            fenceInkling(inklingSbId, ran.stopUnconfirmed);
+          }
+          return ran;
         })
         .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;

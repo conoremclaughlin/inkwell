@@ -39,6 +39,9 @@ import type {
 import type { IActivityStream } from './session-service.js';
 import { ClaudeRunner } from './claude-runner.js';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { spawn } from 'child_process';
+import { STOP_GRACE_MS } from './stop-process.js';
+import { clearInklingFences, fenceInkling } from '../inklings/inkling-stop-fence.js';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -1298,18 +1301,49 @@ describe('SessionService', () => {
 
       describe('a stopped turn holds its session until its process has exited (two processes on one Claude session)', () => {
         let leaderPid = 0;
+        let toolPid = 0;
 
         afterEach(() => {
-          if (leaderPid) {
+          for (const pid of [leaderPid, toolPid]) {
+            if (!pid) continue;
             try {
-              process.kill(leaderPid, 'SIGKILL');
+              process.kill(pid, 'SIGKILL');
             } catch {
               // already gone
             }
           }
           leaderPid = 0;
+          toolPid = 0;
           stopFake.binary = '';
+          clearInklingFences();
         });
+
+        /**
+         * A fake `claude` that exits as soon as it gets SIGTERM, having started
+         * a tool that ignores it. Each reports its pid once its handler is set.
+         */
+        const writeFakeWithStubbornTool = async (): Promise<{ leader: string; tool: string }> => {
+          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-tool-'));
+          const leader = join(dir, 'leader.pid');
+          const tool = join(dir, 'tool.pid');
+          const script = join(dir, 'claude.mjs');
+          const toolCode = `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(tool)}, String(process.pid)); setInterval(() => {}, 1000);`;
+          writeFileSync(
+            script,
+            [
+              '#!/usr/bin/env node',
+              "import { spawn } from 'child_process';",
+              "import { writeFileSync } from 'fs';",
+              "process.on('SIGTERM', () => process.exit(0));",
+              `spawn(process.execPath, ['-e', ${JSON.stringify(toolCode)}], { stdio: 'ignore' });`,
+              `writeFileSync(${JSON.stringify(leader)}, String(process.pid));`,
+              'setInterval(() => {}, 1000);',
+            ].join('\n'),
+            { mode: 0o755 }
+          );
+          stopFake.binary = script;
+          return { leader, tool };
+        };
 
         /**
          * A fake `claude` that exits 400 ms after SIGTERM, the way a CLI
@@ -1356,11 +1390,12 @@ describe('SessionService', () => {
         /** Turn 1 runs the real ClaudeRunner on the fake; turn 2 records when it began. */
         const wire = (stoppedAt: () => number) => {
           const real = new ClaudeRunner();
-          const second: { leaderAlive?: boolean; afterStopMs?: number } = {};
+          const second: { leaderAlive?: boolean; toolAlive?: boolean; afterStopMs?: number } = {};
           vi.mocked(mockClaudeRunner.run)
             .mockImplementationOnce((message, options) => real.run(message, options))
             .mockImplementationOnce(async () => {
               second.leaderAlive = alive(leaderPid);
+              second.toolAlive = toolPid ? alive(toolPid) : undefined;
               second.afterStopMs = Date.now() - stoppedAt();
               return {
                 success: true,
@@ -1409,6 +1444,86 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
           expect(second.leaderAlive).toBe(false);
           expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        it('Stop, then the owner sends at once: a TERM-ignoring tool the stopped turn left holds the next turn until it is gone (Lumen 42298771)', async () => {
+          const files = await writeFakeWithStubbornTool();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(files.leader);
+          toolPid = await pidOf(files.tool);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          await first;
+          const next = await lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          expect(next.success).toBe(true);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+          // The leader went at once; the tool only at the group's SIGKILL,
+          // and the next turn waited for it.
+          expect(second.leaderAlive).toBe(false);
+          expect(second.toolAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+        }, 20_000);
+
+        it('a run that reports an unconfirmed stop fences its inkling: the next turn is refused until that group is gone', async () => {
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          vi.mocked(mockClaudeRunner.run).mockResolvedValueOnce({
+            success: false,
+            responses: [],
+            backendSessionId: 'claude-abc',
+            error: 'Claude Code turn cancelled; its processes did not confirm they had stopped',
+            stopUnconfirmed: { leaderExited: true, pgid: toolPid, group: 'unknown' },
+          } as never);
+          await turn(INKLING);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+
+          const gone = new Promise((resolve) => survivor.once('exit', resolve));
+          process.kill(toolPid, 'SIGKILL');
+          await gone;
+          await turn(INKLING);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+        }, 20_000);
+
+        it('a fenced inkling is refused, retryably, spawning and counting nothing, until its group is observed gone', async () => {
+          // A stand-in for a stopped turn's surviving group: a disposable
+          // group of our own, recorded as an unconfirmed stop records one.
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          fenceInkling(SB, { leaderExited: true, pgid: toolPid, group: 'alive' });
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expect(turnsCounted()).toBeUndefined();
+
+          const gone = new Promise((resolve) => survivor.once('exit', resolve));
+          process.kill(toolPid, 'SIGKILL');
+          await gone;
+          const admitted = await turn(INKLING);
+          expect(admitted.errorCode).not.toBe('INKLING_TURN_REFUSED');
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
         }, 20_000);
       });
 

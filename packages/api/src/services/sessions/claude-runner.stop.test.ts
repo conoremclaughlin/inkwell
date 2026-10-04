@@ -13,21 +13,26 @@ import { tmpdir } from 'os';
 
 const fixtures = mkdtempSync(join(tmpdir(), 'claude-fake-stop-'));
 const pidsPath = join(fixtures, 'pids.json');
-const hoisted = vi.hoisted(() => ({ binary: '', exitNeverConfirmed: false }));
+const hoisted = vi.hoisted(() => ({
+  binary: '',
+  scriptedStop: null as null | { exited: boolean; group?: 'empty' | 'alive' | 'unknown' },
+}));
 
 vi.mock('./resolve-binary.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./resolve-binary.js')>();
   return { ...actual, resolveBinaryPath: () => Promise.resolve(hoisted.binary) };
 });
 
-// The real stop, except where a test needs a process whose exit is never
-// confirmed: no real process outlives SIGKILL, so that one answer is scripted.
+// The real stop, except where a test needs a stop that is never confirmed:
+// no real process outlives SIGKILL, so that one answer is scripted.
 vi.mock('./stop-process.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./stop-process.js')>();
   return {
     ...actual,
     stopProcessAndWait: (...args: Parameters<typeof actual.stopProcessAndWait>) =>
-      hoisted.exitNeverConfirmed ? Promise.resolve(false) : actual.stopProcessAndWait(...args),
+      hoisted.scriptedStop
+        ? Promise.resolve(hoisted.scriptedStop)
+        : actual.stopProcessAndWait(...args),
   };
 });
 
@@ -94,6 +99,39 @@ function writeSlowToExitFake(exitAfterMs: number): string {
       "import { writeFileSync } from 'fs';",
       `process.on('SIGTERM', () => setTimeout(() => process.exit(0), ${exitAfterMs}));`,
       `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+  chmodSync(fake, 0o755);
+  return fake;
+}
+
+/**
+ * A fake claude that exits as soon as it gets SIGTERM, having started a tool
+ * that ignores SIGTERM: the shape a wait on the leader alone cannot see. Both
+ * report their pids only once their handlers are in place.
+ */
+function writeLeaderWithStubbornTool(): string {
+  const fake = join(fixtures, 'claude-leaves-a-tool.mjs');
+  const toolPidPath = join(fixtures, 'tool.pid');
+  const tool = `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(toolPidPath)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  writeFileSync(
+    fake,
+    [
+      '#!/usr/bin/env node',
+      "import { spawn } from 'child_process';",
+      "import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';",
+      `rmSync(${JSON.stringify(toolPidPath)}, { force: true });`,
+      "process.on('SIGTERM', () => process.exit(0));",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(tool)}], { stdio: 'ignore' });`,
+      'const wait = setInterval(() => {',
+      `  if (!existsSync(${JSON.stringify(toolPidPath)})) return;`,
+      `  const toolPid = Number(readFileSync(${JSON.stringify(toolPidPath)}, 'utf-8'));`,
+      '  if (!(toolPid > 0)) return;',
+      '  clearInterval(wait);',
+      `  writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid, toolPid]));`,
+      '}, 20);',
       'setInterval(() => {}, 1000);',
     ].join('\n'),
     { mode: 0o755 }
@@ -234,7 +272,7 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
 
   it('a process that never confirms its exit is given up on at the bound, and the outcome says so', async () => {
     hoisted.binary = writeSlowToExitFake(400);
-    hoisted.exitNeverConfirmed = true;
+    hoisted.scriptedStop = { exited: false, group: 'alive' };
     try {
       const controller = new AbortController();
       const run = new ClaudeRunner().run('hello', {
@@ -245,17 +283,80 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
           signal: controller.signal,
         },
       });
-      await whenReported();
+      const [fakeClaude] = await whenReported();
       controller.abort();
       const result = await run;
       expect(result).toMatchObject({ success: false });
       expect(result.error).toBe(
-        'Claude Code turn cancelled; its process did not confirm it had exited'
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
       );
       expect(String(result.error)).not.toMatch(/timeout/i);
+      // The group to fence on; process metadata only.
+      expect(result.stopUnconfirmed).toEqual({
+        leaderExited: false,
+        pgid: fakeClaude,
+        group: 'alive',
+      });
     } finally {
-      hoisted.exitNeverConfirmed = false;
+      hoisted.scriptedStop = null;
     }
+  }, 20_000);
+
+  it('a leader that exited is not enough: a group that could not be observed leaves the stop unconfirmed', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    hoisted.scriptedStop = { exited: true, group: 'unknown' };
+    try {
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude] = await whenReported();
+      controller.abort();
+      const result = await run;
+      expect(result.error).toBe(
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
+      );
+      expect(result.stopUnconfirmed).toMatchObject({
+        leaderExited: true,
+        pgid: fakeClaude,
+        group: 'unknown',
+      });
+    } finally {
+      hoisted.scriptedStop = null;
+    }
+  }, 20_000);
+
+  it('a cancelled run whose leader exits on SIGTERM settles only once its TERM-ignoring tool is gone (Lumen 42298771)', async () => {
+    hoisted.binary = writeLeaderWithStubbornTool();
+    const controller = new AbortController();
+    const run = new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        signal: controller.signal,
+      },
+    });
+    const [fakeClaude, tool] = await whenReported();
+    const abortedAt = Date.now();
+    controller.abort();
+    const result = await run;
+    const settledAfter = Date.now() - abortedAt;
+    // The leader went at once; the run waited for the tool, which only the
+    // group's SIGKILL ends.
+    expect(alive(fakeClaude)).toBe(false);
+    expect(alive(tool)).toBe(false);
+    expect(settledAfter).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Claude Code turn cancelled, process stopped',
+    });
+    expect(result.stopUnconfirmed).toBeUndefined();
   }, 20_000);
 
   it('stops at the run ceiling, and nothing it started is left running', async () => {

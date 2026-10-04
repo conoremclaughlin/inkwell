@@ -6,6 +6,7 @@
 
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
+import type { GroupState } from './stop-process';
 
 // ─── Channel Types ───
 
@@ -934,6 +935,18 @@ export interface RunnerResult {
   finalTextResponse?: string;
   /** Tool calls captured during this run (for activity stream logging) */
   toolCalls?: ToolCall[];
+  /**
+   * Set when the run was stopped and the stop could not confirm, by the
+   * bound, that the process (and, for a group stop, its whole group) had
+   * gone. The caller must not let replacement work overlap whatever is still
+   * running (stop-process.ts, inkling-stop-fence.ts).
+   */
+  stopUnconfirmed?: {
+    leaderExited: boolean;
+    /** The group's number, for a group stop: the only thing a fence may release on. */
+    pgid?: number;
+    group?: GroupState;
+  };
 }
 
 /** @deprecated Use RunnerResult */

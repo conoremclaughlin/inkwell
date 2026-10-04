@@ -6,7 +6,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { stopProcess, stopProcessAndWait } from './stop-process';
+import { isGroupId, probeGroup, stopProcess, stopProcessAndWait } from './stop-process';
 
 const IGNORES_TERM = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
 /** Starts a grandchild that also ignores SIGTERM, prints its pid, then idles. */
@@ -101,36 +101,42 @@ const READY_EXITS_ON_TERM = `
 `;
 
 describe('stopProcessAndWait', () => {
-  it('settles true once a process that ignores SIGTERM has exited at the SIGKILL, not before', async () => {
+  it('settles as exited once a process that ignores SIGTERM has exited at the SIGKILL, not before', async () => {
     const proc = start(READY_IGNORES_TERM);
     await firstLine(proc);
     const started = Date.now();
-    expect(await stopProcessAndWait(proc, { graceMs: 300, giveUpMs: 2000 })).toBe(true);
+    expect(await stopProcessAndWait(proc, { graceMs: 300, giveUpMs: 2000 })).toEqual({
+      exited: true,
+    });
     expect(Date.now() - started).toBeGreaterThanOrEqual(280);
     expect(alive(proc.pid as number)).toBe(false);
   });
 
-  it('settles true as soon as a process exits on SIGTERM, without waiting out the grace', async () => {
+  it('settles as exited as soon as a process exits on SIGTERM, without waiting out the grace', async () => {
     const proc = start(READY_EXITS_ON_TERM);
     await firstLine(proc);
     const started = Date.now();
-    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toBe(true);
+    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toEqual({
+      exited: true,
+    });
     expect(Date.now() - started).toBeLessThan(2000);
     expect(alive(proc.pid as number)).toBe(false);
   });
 
-  it('settles true at once for a process that has already exited', async () => {
+  it('settles as exited at once for a process that has already exited', async () => {
     const proc = start(READY_EXITS_ON_TERM);
     await firstLine(proc);
     const gone = exited(proc);
     proc.kill('SIGKILL');
     await gone;
     const started = Date.now();
-    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toBe(true);
+    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toEqual({
+      exited: true,
+    });
     expect(Date.now() - started).toBeLessThan(500);
   });
 
-  it('settles false at grace plus give-up when the process never exits, and leaves no listener behind', async () => {
+  it('settles as not exited at grace plus give-up when the process never exits, and leaves no listener behind', async () => {
     // No real process outlives SIGKILL, so this one is a stand-in that is
     // never signalled: no pid, and a kill that does nothing.
     const proc = Object.assign(new EventEmitter(), {
@@ -140,7 +146,9 @@ describe('stopProcessAndWait', () => {
       kill: () => true,
     }) as unknown as ChildProcess;
     const started = Date.now();
-    expect(await stopProcessAndWait(proc, { graceMs: 100, giveUpMs: 150 })).toBe(false);
+    expect(await stopProcessAndWait(proc, { graceMs: 100, giveUpMs: 150 })).toEqual({
+      exited: false,
+    });
     expect(Date.now() - started).toBeGreaterThanOrEqual(240);
     expect(proc.listenerCount('exit')).toBe(0);
   });
@@ -158,11 +166,121 @@ describe('stopProcessAndWait', () => {
       // stopProcess's own SIGKILL escalation, and this helper's give-up.
       expect(vi.getTimerCount()).toBe(2);
       proc.emit('exit', 0, null);
-      expect(await settled).toBe(true);
+      expect(await settled).toEqual({ exited: true });
       // Only the escalation is left (stopProcess unrefs it); the give-up is gone.
       expect(vi.getTimerCount()).toBe(1);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+/** Its tool reports its own pid once its handler is set; the leader passes it on. */
+const toolScript = (ignoresTerm: boolean) =>
+  (ignoresTerm ? "process.on('SIGTERM', () => {}); " : '') +
+  "process.stdout.write(process.pid + '\\n'); setInterval(() => {}, 1000);";
+/** A leader that exits at once on SIGTERM, having started one tool. */
+const leaderWithTool = (toolIgnoresTerm: boolean) => `
+  const { spawn } = require('node:child_process');
+  process.on('SIGTERM', () => process.exit(0));
+  const tool = spawn(process.execPath, ['-e', ${JSON.stringify(toolScript(toolIgnoresTerm))}], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  tool.stdout.once('data', (d) => process.stdout.write(String(d)));
+  setInterval(() => {}, 1000);
+`;
+
+/** A group leader and its tool's pid, both tracked for cleanup. */
+async function startGroup(toolIgnoresTerm: boolean): Promise<{ proc: ChildProcess; tool: number }> {
+  const proc = start(leaderWithTool(toolIgnoresTerm), true);
+  const tool = await firstLine(proc);
+  pids.push(tool);
+  return { proc, tool };
+}
+
+/** process.kill, recording every call, with group probes answering EPERM when asked. */
+function spyOnKill(opts: { probesDenied?: boolean } = {}) {
+  const original = process.kill.bind(process);
+  const calls: Array<[number, NodeJS.Signals | number | undefined]> = [];
+  const spy = vi.spyOn(process, 'kill').mockImplementation(((
+    pid: number,
+    signal?: NodeJS.Signals | number
+  ) => {
+    calls.push([pid, signal]);
+    if (opts.probesDenied && pid < 0 && signal === 0) {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    }
+    return original(pid, signal);
+  }) as typeof process.kill);
+  return { calls, restore: () => spy.mockRestore() };
+}
+
+describe('process groups: a stop is over when the whole group is gone', () => {
+  it('probeGroup: alive while a member lives, empty only on ESRCH, unknown on any other error', async () => {
+    const { proc, tool } = await startGroup(false);
+    const pgid = proc.pid as number;
+    expect(probeGroup(pgid)).toBe('alive');
+    const kill = spyOnKill({ probesDenied: true });
+    try {
+      expect(probeGroup(pgid)).toBe('unknown');
+    } finally {
+      kill.restore();
+    }
+    process.kill(tool, 'SIGKILL');
+    const gone = exited(proc);
+    process.kill(pgid, 'SIGKILL');
+    await gone;
+    await settle(200);
+    expect(probeGroup(pgid)).toBe('empty');
+  });
+
+  it('a group stop settles only once a TERM-ignoring tool has gone, though its leader exits at once', async () => {
+    const { proc, tool } = await startGroup(true);
+    const started = Date.now();
+    const outcome = await stopProcessAndWait(proc, { group: true, graceMs: 400, giveUpMs: 2000 });
+    expect(outcome).toEqual({ exited: true, group: 'empty' });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(380);
+    expect(alive(tool)).toBe(false);
+  });
+
+  it('once the group is seen empty, its SIGKILL is called off: a reused group number is never signalled', async () => {
+    const { proc } = await startGroup(false);
+    const pgid = proc.pid as number;
+    const kill = spyOnKill();
+    try {
+      const outcome = await stopProcessAndWait(proc, { group: true, graceMs: 300, giveUpMs: 2000 });
+      expect(outcome).toEqual({ exited: true, group: 'empty' });
+      await settle(450);
+      expect(kill.calls.filter(([pid, signal]) => pid === -pgid && signal === 'SIGKILL')).toEqual(
+        []
+      );
+    } finally {
+      kill.restore();
+    }
+  });
+
+  it('a group that cannot be observed settles at the bound as unknown, never as empty', async () => {
+    const { proc } = await startGroup(true);
+    const kill = spyOnKill({ probesDenied: true });
+    try {
+      const started = Date.now();
+      const outcome = await stopProcessAndWait(proc, { group: true, graceMs: 200, giveUpMs: 300 });
+      expect(outcome).toEqual({ exited: true, group: 'unknown' });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(480);
+    } finally {
+      kill.restore();
+    }
+  });
+
+  it('only a positive group id above 1 is ever probed: 0 would be our own group, 1 every process', () => {
+    expect([0, 1, -5, 1.5, Number.NaN].map(isGroupId)).toEqual([false, false, false, false, false]);
+    expect(isGroupId(4242)).toBe(true);
+    const kill = spyOnKill();
+    try {
+      for (const pgid of [0, 1, -5, 1.5, Number.NaN]) expect(probeGroup(pgid)).toBe('unknown');
+      expect(kill.calls).toEqual([]);
+    } finally {
+      kill.restore();
     }
   });
 });
