@@ -708,9 +708,10 @@ export async function handleSendToInbox(
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
 
-    // A conversation with an inkling is only between it and its owner, in
-    // the owner test (Lumen 97b1d66a). Asked before anything is written.
-    await assertInklingThreadAllowed(supabase, {
+    // A conversation with an inkling is only between its owner and the
+    // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
+    // anything is written. An inkling's own send wakes nobody (`quiet`).
+    const inklingVerdict = await assertInklingThreadAllowed(supabase, {
       sender,
       participantSbs,
       existingThreadId: existingThread?.id ?? null,
@@ -952,7 +953,7 @@ export async function handleSendToInbox(
     // resolution — same predicate as the sender-advance exemption above.
     const selfStudioTarget = explicitSelfTarget;
 
-    if (trigger !== false && !missingSenderSession) {
+    if (trigger !== false && !missingSenderSession && !inklingVerdict.quiet) {
       // Dispatch operates on the SB participants only (§7): a person's row
       // never changes the routing, and a person's reply wakes every SB.
       const currentParticipants = await getParticipants(supabase, thread.id);
