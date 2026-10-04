@@ -263,9 +263,9 @@ describe('ThreadConversation', () => {
   });
 
   it('gives the header a solid background, with no backdrop-filter layer', () => {
-    // The header sat over nothing, so its blur did no work, but it made the
-    // header a backdrop-filter layer. Conor's recording showed that region
-    // painting blank for single frames (task 190eeb01).
+    // Guards the mitigation, not the symptom: the blank frames in Conor's
+    // recording (task 190eeb01) came from the browser's rendering path,
+    // which this test cannot see. It keeps the blur from coming back.
     fake.newest = pageOf(1, 20);
     mount(at(20));
     const header = document.querySelector('header');
