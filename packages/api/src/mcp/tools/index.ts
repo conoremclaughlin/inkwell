@@ -230,6 +230,8 @@ import {
   threadTool,
 } from './thread-handlers';
 
+import { threadLinkToolDefinitions } from './thread-link-handlers';
+
 import {
   handleTriggerAgent,
   handleListRegisteredAgents,
@@ -4705,6 +4707,38 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       }
     }
   );
+
+  // Thread links: link_thread, unlink_thread, list_thread_links.
+  for (const tool of threadLinkToolDefinitions) {
+    server.registerTool(
+      tool.name,
+      {
+        description: `${tool.description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+        inputSchema: tool.schema,
+      },
+      async (args: Record<string, unknown>) => {
+        try {
+          return await tool.handler(args, dataComposer);
+        } catch (error) {
+          logger.error(`Error in ${tool.name}:`, error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
 
   // =====================================================
   // AGENT TRIGGER TOOLS (real-time agent-to-agent wakeup)
