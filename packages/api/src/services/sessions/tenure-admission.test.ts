@@ -1,0 +1,126 @@
+import { describe, it, expect, vi } from 'vitest';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { ADMISSION_PROTOCOL } from './command-admission';
+import {
+  admitTurn,
+  mintTenureCapability,
+  recordInvocation,
+  registerTenure,
+  releaseTenure,
+  tenureCapabilityHash,
+  type TenureHolder,
+} from './tenure-admission';
+
+const SESSION = '11111111-1111-4111-8111-111111111111';
+const TENURE = '22222222-2222-4222-8222-222222222222';
+const COMMAND = '33333333-3333-4333-8333-333333333333';
+
+function clientReturning(data: unknown, error: unknown = null) {
+  const rpc = vi.fn().mockResolvedValue({ data, error });
+  return { client: { rpc } as unknown as SupabaseClient, rpc };
+}
+
+const holder: TenureHolder = {
+  tenureId: TENURE,
+  capability: 'holder-secret-fixture',
+  hostInstanceId: 'host-fixture',
+};
+
+describe('tenure capability', () => {
+  it('mints a fresh secret each time, with the hash the database stores', () => {
+    const a = mintTenureCapability();
+    const b = mintTenureCapability();
+    expect(a.capability).not.toBe(b.capability);
+    expect(a.capability.length).toBeGreaterThanOrEqual(43);
+    expect(a.capabilityHash).toBe(tenureCapabilityHash(a.capability));
+    expect(a.capabilityHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('sends only the hash of the holder secret, never the secret', async () => {
+    const { client, rpc } = clientReturning({ outcome: 'not_holder' });
+    await admitTurn(client, {
+      sessionId: SESSION,
+      holder,
+      expectedPriorEpoch: null,
+      epoch: 'epoch-1',
+      commandUuid: COMMAND,
+    });
+    const args = rpc.mock.calls[0][1] as Record<string, unknown>;
+    expect(args.p_capability_hash).toBe(tenureCapabilityHash(holder.capability));
+    expect(JSON.stringify(args)).not.toContain(holder.capability);
+  });
+});
+
+describe('registerTenure', () => {
+  it('passes the exact expected prior, the host and the protocol', async () => {
+    const { client, rpc } = clientReturning({ outcome: 'registered', tenureId: TENURE });
+    const { capabilityHash } = mintTenureCapability();
+    const result = await registerTenure(client, {
+      sessionId: SESSION,
+      expected: { kind: 'released', tenureId: TENURE },
+      mode: 'interactive_wrapper',
+      capabilityHash,
+      host: { instanceId: 'host-fixture', bootId: 'boot-fixture' },
+    });
+    expect(result).toEqual({ outcome: 'registered', tenureId: TENURE });
+    expect(rpc).toHaveBeenCalledWith('register_tenure', {
+      p_session_id: SESSION,
+      p_expected: { kind: 'released', tenureId: TENURE },
+      p_mode: 'interactive_wrapper',
+      p_capability_hash: capabilityHash,
+      p_host: { instanceId: 'host-fixture', bootId: 'boot-fixture' },
+      p_owner: null,
+      p_endpoint: null,
+      p_protocol: ADMISSION_PROTOCOL,
+    });
+  });
+
+  it('throws on a reply outside the contract', async () => {
+    for (const reply of [
+      null,
+      { outcome: 'registered' },
+      { outcome: 'free' },
+      { outcome: 'occupied', tenureId: TENURE, state: 'settled' },
+    ]) {
+      const { client } = clientReturning(reply);
+      await expect(
+        registerTenure(client, {
+          sessionId: SESSION,
+          expected: { kind: 'never_owned' },
+          mode: 'server_hosted',
+          capabilityHash: mintTenureCapability().capabilityHash,
+          host: { instanceId: 'host-fixture' },
+        })
+      ).rejects.toThrow(/outside its contract/);
+    }
+  });
+});
+
+describe('recordInvocation', () => {
+  it('sends the record kind apart from its detail', async () => {
+    const { client, rpc } = clientReturning({ outcome: 'recorded', kind: 'process_binding' });
+    await recordInvocation(client, {
+      sessionId: SESSION,
+      holder,
+      epoch: 'epoch-1',
+      invocationId: 'inv-1',
+      record: { kind: 'process_binding', pid: 4242, startIdentity: 'start-fixture' },
+    });
+    const args = rpc.mock.calls[0][1] as Record<string, unknown>;
+    expect(args.p_kind).toBe('process_binding');
+    expect(args.p_detail).toEqual({ pid: 4242, startIdentity: 'start-fixture' });
+  });
+});
+
+describe('releaseTenure', () => {
+  it('reads an unresolved refusal and throws on an unknown one', async () => {
+    const ok = clientReturning({ outcome: 'unresolved', invocations: 2 });
+    expect(
+      await releaseTenure(ok.client, { sessionId: SESSION, holder, evidence: 'controller_retired' })
+    ).toEqual({ outcome: 'unresolved', invocations: 2 });
+    const bad = clientReturning({ outcome: 'released' });
+    await expect(
+      releaseTenure(bad.client, { sessionId: SESSION, holder, evidence: 'controller_retired' })
+    ).rejects.toThrow(/outside its contract/);
+  });
+});

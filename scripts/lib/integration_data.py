@@ -66,6 +66,9 @@ WINDOWED_FIXTURE_TABLES = (
     ("20261004094856", "",
      ("runtime_admission_mode", "session_command_events", "session_command_receipts",
       "session_commands")),
+    ("20261004104039", "",
+     ("session_admission_origins", "session_owner_tenures", "session_turn_generations",
+      "session_turn_invocations")),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +

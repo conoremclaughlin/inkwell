@@ -151,12 +151,13 @@ class DataTests(unittest.TestCase):
         self.assertEqual(len(set(names)), len(names))
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539); the
         # revocation amendment's four tables (#678), the browser companion's
-        # two (#671), the wake-source breaker's one (T1) and the command
-        # admission's four (#701 R4) join through created-at windows, not this
-        # base list, so a rehearsal cut before them is exact.
+        # two (#671), the wake-source breaker's one (T1), the command
+        # admission's four (#701 R4) and the owner tenure's four (#701 R3) join
+        # through created-at windows, not this base list, so a rehearsal cut
+        # before them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 84)
+        self.assertEqual(len(names), 88)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -231,7 +232,9 @@ class DataTests(unittest.TestCase):
         breaker = ("wake_source_breakers",)
         admission = ("runtime_admission_mode", "session_command_events", "session_command_receipts",
                      "session_commands")
-        created = companion + revocation + breaker + admission
+        tenure = ("session_admission_origins", "session_owner_tenures", "session_turn_generations",
+                  "session_turn_invocations")
+        created = companion + revocation + breaker + admission + tenure
         # Every migration applied: the dropped window is absent, the open ones present.
         self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES + created)
         # The CI rehearsal cut: the attestations' creator applied and dropper withheld;
@@ -255,8 +258,13 @@ class DataTests(unittest.TestCase):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until),
                                  data.FIXTURE_TABLES + companion + revocation + breaker)
+        # Past the admission tables' creator and at or before the tenure tables'.
+        for until in ("20261004094857", "20261004104039"):
+            with self.subTest(until=until):
+                self.assertEqual(data.fixture_tables(until),
+                                 data.FIXTURE_TABLES + companion + revocation + breaker + admission)
         # A cut past every creator carries them all, without the attestations.
-        for until in ("20261004094857", "20270101000000"):
+        for until in ("20261004104040", "20270101000000"):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + created)
         # Every window is part of the policy, so changing any invalidates cached baselines.
@@ -266,6 +274,7 @@ class DataTests(unittest.TestCase):
         self.assertIn("20260925080025-:", data.POLICY)
         self.assertIn("20261002225412-:", data.POLICY)
         self.assertIn("20261004094856-:", data.POLICY)
+        self.assertIn("20261004104039-:", data.POLICY)
 
     def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
         window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
@@ -292,7 +301,7 @@ class DataTests(unittest.TestCase):
 
     def test_created_window_tables_are_missing_only_before_their_migration(self):
         created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
-        self.assertEqual(len(created), 11)
+        self.assertEqual(len(created), 15)
         # A full-schema stack carries them and cleanup truncates them ...
         self.clean()
         truncate = self.mutations()[0]
