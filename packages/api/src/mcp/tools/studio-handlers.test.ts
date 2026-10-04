@@ -1163,6 +1163,30 @@ describe('create_studio / adopt_studio provenance', () => {
       );
     });
 
+    it('an inkling already in its conversation with its owner still binds a studio home to it, adding no one (Lumen 41aa17c5)', async () => {
+      db = createInklingDb();
+      db.seed('agent_identities', {
+        id: 'sb-1',
+        agent_id: 'wren',
+        user_id: OWNER,
+        workspace_id: 'ws-1',
+        metadata: INKLING,
+      });
+      seedConversation([{ sb_id: 'sb-1' }, { user_id: OWNER }], { inklingConversation: true });
+      assignMock.mockClear();
+      const payload = await createFor();
+      expect(payload.routing).toMatchObject({
+        home: { threadId: 'thread-x', threadCreated: false },
+      });
+      expect(payload.routing.homeError).toBeUndefined();
+      expect(db.rows('inbox_thread_participants')).toHaveLength(2);
+      expect(sbMembers()).toEqual(['sb-1']);
+      expect(assignMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ threadId: 'thread-x', sbId: 'sb-1' })
+      );
+    });
+
     /** A new key, through the real findOrCreateThread, with the caller seeded as given. */
     const createNewHome = async (callerMetadata: Record<string, unknown>) => {
       db = createInklingDb();

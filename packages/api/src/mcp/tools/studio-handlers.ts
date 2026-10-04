@@ -415,6 +415,9 @@ function studioOwnershipMismatch(
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const participantTable = (supabase: ReturnType<DataComposer['getClient']>) =>
   (supabase as unknown as { from: (t: string) => any }).from('inbox_thread_participants');
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const threadsTable = (supabase: ReturnType<DataComposer['getClient']>) =>
+  (supabase as unknown as { from: (t: string) => any }).from('inbox_threads');
 
 /**
  * Give the thread a home: this agent's participant row on the thread points at
@@ -433,15 +436,24 @@ async function bindThreadHome(
   const supabase = dataComposer.getClient();
   // The agent is a principal in exactly one workspace; the thread lives there.
   const sb = await resolveCallerSb(supabase, opts.userId, opts.sbSlug);
-  // An inkling never starts a conversation, and a studio is not where an
-  // inkling works: an inkling caller is refused here, judged as the creator
-  // of a conversation holding only itself, before any thread or member row
-  // exists (Lumen, #740 round 4). For an ordinary SB this is a pass.
-  await assertInklingThreadAllowed(supabase, {
-    sender: sb,
-    participantSbs: [sb],
-    existingThreadId: null,
-  });
+  // A key no thread carries yet would create one holding only this SB, and an
+  // inkling never starts a conversation: that creation is judged before any
+  // thread or member row exists (Lumen, #740 round 4). An existing thread is
+  // judged as what it is, below, so an inkling already in its conversation
+  // can still bind a home to it. For an ordinary SB this is a pass.
+  const { data: existing, error: lookupError } = await threadsTable(supabase)
+    .select('id')
+    .eq('workspace_id', sb.workspaceId)
+    .eq('thread_key', opts.threadKey)
+    .maybeSingle();
+  if (lookupError) throw new Error(`Failed to look up the thread: ${lookupError.message}`);
+  if (!existing) {
+    await assertInklingThreadAllowed(supabase, {
+      sender: sb,
+      participantSbs: [sb],
+      existingThreadId: null,
+    });
+  }
   const thread = await findOrCreateThread(supabase, {
     workspaceId: sb.workspaceId,
     threadKey: opts.threadKey,
