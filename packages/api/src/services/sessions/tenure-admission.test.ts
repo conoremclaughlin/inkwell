@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { ADMISSION_PROTOCOL } from './command-admission';
 import {
+  admitLeasedTurn,
   admitTurn,
   mintTenureCapability,
   reconcileTenure,
@@ -182,6 +183,54 @@ describe('reconcileTenure', () => {
       { ...stale, legacy: { ...changed, updatedAt: undefined } },
     ]) {
       await expect(reconcileTenure(clientReturning(reply).client, input)).rejects.toThrow();
+    }
+  });
+});
+
+describe('admitLeasedTurn', () => {
+  const input = {
+    sessionId: SESSION,
+    holder,
+    expectedPriorEpoch: null,
+    epoch: 'epoch-1',
+    commandUuid: COMMAND,
+    studioId: TENURE,
+  };
+
+  it('sends the named studio with the admission and only the capability hash', async () => {
+    const { client, rpc } = clientReturning({
+      outcome: 'admitted',
+      epoch: 'epoch-1',
+      restamped: 2,
+    });
+    expect(await admitLeasedTurn(client, input)).toEqual({
+      outcome: 'admitted',
+      epoch: 'epoch-1',
+      restamped: 2,
+    });
+    expect(rpc).toHaveBeenCalledWith('admit_leased_turn', {
+      p_session_id: SESSION,
+      p_tenure_id: TENURE,
+      p_capability_hash: tenureCapabilityHash(holder.capability),
+      p_host_instance_id: 'host-fixture',
+      p_expected_prior_epoch: null,
+      p_epoch: 'epoch-1',
+      p_command_uuid: COMMAND,
+      p_studio_id: TENURE,
+      p_protocol: ADMISSION_PROTOCOL,
+    });
+  });
+
+  it('reads lease refusals, and fails closed on an admission without its restamp count', async () => {
+    for (const reply of [{ outcome: 'lease_lost' }, { outcome: 'forbidden' }]) {
+      expect(await admitLeasedTurn(clientReturning(reply).client, input)).toEqual(reply);
+    }
+    for (const reply of [
+      { outcome: 'admitted', epoch: 'epoch-1' },
+      { outcome: 'admitted', epoch: 'epoch-1', restamped: -1 },
+      { outcome: 'leased' },
+    ]) {
+      await expect(admitLeasedTurn(clientReturning(reply).client, input)).rejects.toThrow();
     }
   });
 });

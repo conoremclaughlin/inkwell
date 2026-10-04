@@ -12,6 +12,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createHash, randomUUID } from 'crypto';
+import { Client } from 'pg';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getDataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
@@ -23,6 +24,7 @@ import {
   type AdmitCommandInput,
 } from './command-admission';
 import {
+  admitLeasedTurn,
   admitTurn,
   finishTurn,
   markTenureLost,
@@ -31,6 +33,7 @@ import {
   recordInvocation,
   registerTenure,
   releaseTenure,
+  tenureCapabilityHash,
   type InvocationRecord,
   type LegacySessionState,
   type TenureHolder,
@@ -2217,6 +2220,574 @@ describe('durable command admission', () => {
         });
         expect(await bind(2147483648)).toEqual({ outcome: 'invalid', field: 'detail' });
         expect(await bind(2147483647)).toEqual({ outcome: 'recorded', kind: 'process_binding' });
+      });
+    });
+
+    // Slice C1 (pr:701 d51cf192, f18c275d): studio leases join admission.
+    describe('leases join admission', () => {
+      const studioIds: string[] = [];
+      const GRANTED = '2026-10-04T00:00:00.000Z';
+
+      afterAll(async () => {
+        if (studioIds.length) await supabase.from('studios').delete().in('id', studioIds);
+      });
+
+      // A studio on its own tree; `lease` is written as the lease service would.
+      async function studio(
+        lease: Record<string, unknown> | null,
+        owner: string = userId
+      ): Promise<string> {
+        const path = `/tmp/ink-c1-${RUN}-${studioIds.length}`;
+        const { data, error } = await supabase
+          .from('studios')
+          .insert({
+            user_id: owner,
+            agent_id: SUITE_SB,
+            repo_root: path,
+            worktree_path: path,
+            branch: `c1-fixture-${studioIds.length}`,
+            status: 'active',
+          })
+          .select('id')
+          .single();
+        if (error || !data) throw new Error(`studio insert failed: ${error?.message}`);
+        studioIds.push(data.id as string);
+        if (lease) {
+          const { error: leaseErr } = await supabase
+            .from('studios')
+            .update({ lease })
+            .eq('id', data.id);
+          if (leaseErr) throw new Error(`lease write failed: ${leaseErr.message}`);
+        }
+        return data.id as string;
+      }
+
+      function leaseFor(
+        sessionId: string,
+        extra: Record<string, unknown> = {}
+      ): Record<string, unknown> {
+        return {
+          sessionId,
+          threadKey: 'thread:c1-fixture',
+          acquiredAt: GRANTED,
+          heartbeatAt: GRANTED,
+          turnEpoch: 'epoch-granted',
+          ...extra,
+        };
+      }
+
+      async function leases(ids: string[]) {
+        const { data } = await supabase.from('studios').select('id, lease').in('id', ids);
+        return Object.fromEntries((data ?? []).map((r) => [r.id as string, r.lease]));
+      }
+
+      // Everything an admission could write, for one session.
+      async function snapshot(sessionId: string, ids: string[], commands: string[]) {
+        const [session, generations, commandRows, leaseRows] = await Promise.all([
+          supabase
+            .from('sessions')
+            .select('turn_epoch, lifecycle, studio_id, owner_tenure_id')
+            .eq('id', sessionId)
+            .single(),
+          supabase
+            .from('session_turn_generations')
+            .select('epoch, state')
+            .eq('session_id', sessionId),
+          supabase.from('session_commands').select('id, state, revision').in('id', commands),
+          leases(ids),
+        ]);
+        return {
+          session: session.data,
+          generations: generations.data,
+          commands: commandRows.data,
+          leases: leaseRows,
+        };
+      }
+
+      async function leased(
+        sessionId: string,
+        holder: TenureHolder,
+        prior: string | null,
+        studioId: string
+      ) {
+        const command = await queued(sessionId);
+        const epoch = randomUUID();
+        const r = await admitLeasedTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: prior,
+          epoch,
+          commandUuid: command,
+          studioId,
+        });
+        return { r, epoch, command };
+      }
+
+      it('admits under the named lease and moves exactly the session’s live leases, keeping their markers', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const other = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const marked = leaseFor(sessionId, {
+          pendingRelease: { requestedAt: GRANTED, threadKey: 'thread:c1-other' },
+          threadKeys: ['thread:c1-fixture', 'thread:c1-other'],
+        });
+        const named = await studio(marked);
+        const second = await studio(leaseFor(sessionId));
+        const quarantined = await studio(leaseFor(sessionId, { quarantined: true }));
+        const othersLease = await studio(leaseFor(other));
+        const ids = [named, second, quarantined, othersLease];
+        const before = await leases(ids);
+
+        const { r, epoch } = await leased(sessionId, holder, null, named);
+        expect(r).toEqual({ outcome: 'admitted', epoch, restamped: 2 });
+        const after = await leases(ids);
+        for (const id of [named, second]) {
+          const lease = after[id] as Record<string, unknown>;
+          expect(lease.turnEpoch).toBe(epoch);
+          expect(lease.heartbeatAt).not.toBe(GRANTED);
+          const { turnEpoch: _t, heartbeatAt: _h, ...rest } = lease;
+          const {
+            turnEpoch: _bt,
+            heartbeatAt: _bh,
+            ...restBefore
+          } = before[id] as Record<string, unknown>;
+          expect(rest).toEqual(restBefore);
+        }
+        expect((after[named] as Record<string, unknown>).pendingRelease).toEqual(
+          marked.pendingRelease
+        );
+        expect((after[named] as Record<string, unknown>).threadKeys).toEqual(marked.threadKeys);
+        expect(after[quarantined]).toEqual(before[quarantined]);
+        expect(after[othersLease]).toEqual(before[othersLease]);
+      });
+
+      it('refuses without this session’s live named lease, and writes nothing', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const other = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const held = await studio(leaseFor(sessionId));
+        const cases: Array<[string, string]> = [
+          ['lease_lost', await studio(null)],
+          ['lease_lost', await studio(leaseFor(other))],
+          ['lease_lost', await studio(leaseFor(sessionId, { quarantined: true }))],
+          ['lease_lost', randomUUID()],
+          ['forbidden', await studio(leaseFor(sessionId), otherUserId!)],
+        ];
+        const command = await queued(sessionId);
+        const ids = [held, ...cases.map(([, id]) => id)];
+        const before = await snapshot(sessionId, ids, [command]);
+        for (const [outcome, studioId] of cases) {
+          expect(
+            await admitLeasedTurn(supabase, {
+              sessionId,
+              holder,
+              expectedPriorEpoch: null,
+              epoch: randomUUID(),
+              commandUuid: command,
+              studioId,
+            })
+          ).toEqual({ outcome });
+        }
+        expect(await snapshot(sessionId, ids, [command])).toEqual(before);
+      });
+
+      it('returns admission refusals unchanged, and writes nothing', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const named = await studio(leaseFor(sessionId));
+        const first = await turn(sessionId, holder, null);
+        const behind = await queued(sessionId);
+        const ids = [named];
+        const before = await snapshot(sessionId, ids, [first.command, behind]);
+        const attempt = (over: Partial<Parameters<typeof admitLeasedTurn>[1]>) =>
+          admitLeasedTurn(supabase, {
+            sessionId,
+            holder,
+            expectedPriorEpoch: first.epoch,
+            epoch: randomUUID(),
+            commandUuid: behind,
+            studioId: named,
+            ...over,
+          });
+        // The prior turn is still active: busy.
+        expect(await attempt({})).toEqual({ outcome: 'busy', epoch: first.epoch });
+        expect(await attempt({ expectedPriorEpoch: null })).toEqual({
+          outcome: 'stale_expectation',
+          epoch: first.epoch,
+        });
+        expect(
+          await attempt({ holder: { ...holder, capability: 'not-the-holder-secret' } })
+        ).toEqual({ outcome: 'not_holder' });
+        expect(await snapshot(sessionId, ids, [first.command, behind])).toEqual(before);
+
+        await setMode('legacy');
+        try {
+          expect(await attempt({})).toMatchObject({ outcome: 'mode_mismatch' });
+        } finally {
+          await setMode('conditional');
+        }
+        expect(await snapshot(sessionId, ids, [first.command, behind])).toEqual(before);
+      });
+
+      it('treats a retry naming its own epoch as a refusal: lost acknowledgement, wrong command, finished turn', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const named = await studio(leaseFor(sessionId));
+        const first = await leased(sessionId, holder, null, named);
+        expect(first.r).toMatchObject({ outcome: 'admitted', restamped: 1 });
+        const otherCommand = await queued(sessionId);
+        const ids = [named];
+        const retry = (commandUuid: string) =>
+          admitLeasedTurn(supabase, {
+            sessionId,
+            holder,
+            expectedPriorEpoch: null,
+            epoch: first.epoch,
+            commandUuid,
+            studioId: named,
+          });
+        const afterAdmit = await snapshot(sessionId, ids, [first.command, otherCommand]);
+        expect(await retry(first.command)).toEqual({
+          outcome: 'stale_expectation',
+          epoch: first.epoch,
+        });
+        expect(await retry(otherCommand)).toEqual({
+          outcome: 'stale_expectation',
+          epoch: first.epoch,
+        });
+        expect(await snapshot(sessionId, ids, [first.command, otherCommand])).toEqual(afterAdmit);
+
+        await finish(sessionId, holder, first.epoch);
+        const afterFinish = await snapshot(sessionId, ids, [first.command, otherCommand]);
+        expect(await retry(first.command)).toEqual({
+          outcome: 'stale_expectation',
+          epoch: first.epoch,
+        });
+        expect(await snapshot(sessionId, ids, [first.command, otherCommand])).toEqual(afterFinish);
+      });
+
+      // Interleavings over direct connections, so a transaction can hold a
+      // lock while an admission waits on it. Every client is closed, and every
+      // open transaction rolled back, on every path.
+      describe('interleavings', () => {
+        const clients: Client[] = [];
+
+        afterAll(async () => {
+          for (const c of clients) await c.end().catch(() => undefined);
+        });
+
+        async function connect(): Promise<{ client: Client; pid: number }> {
+          const url = process.env.INTEGRATION_DB_URL;
+          if (!url) throw new Error('INTEGRATION_DB_URL is required (managed harness)');
+          const client = new Client({ connectionString: url, statement_timeout: 15_000 });
+          await client.connect();
+          clients.push(client);
+          const { rows } = await client.query('SELECT pg_backend_pid() AS pid');
+          return { client, pid: rows[0].pid as number };
+        }
+
+        function admitSql(
+          client: Client,
+          a: {
+            sessionId: string;
+            holder: TenureHolder;
+            prior: string | null;
+            epoch: string;
+            command: string;
+            studioId: string;
+          }
+        ): Promise<Record<string, unknown>> {
+          return client
+            .query('SELECT public.admit_leased_turn($1, $2, $3, $4, $5, $6, $7, $8, $9) AS r', [
+              a.sessionId,
+              a.holder.tenureId,
+              tenureCapabilityHash(a.holder.capability),
+              a.holder.hostInstanceId,
+              a.prior,
+              a.epoch,
+              a.command,
+              a.studioId,
+              ADMISSION_PROTOCOL,
+            ])
+            .then((res) => res.rows[0].r as Record<string, unknown>);
+        }
+
+        // Bounded: resolves once every pid is waiting on a lock, else throws.
+        async function waitingOnLocks(observer: Client, pids: number[]): Promise<void> {
+          for (let i = 0; i < 100; i += 1) {
+            const { rows } = await observer.query(
+              "SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = ANY($1) AND wait_event_type = 'Lock'",
+              [pids]
+            );
+            if (rows[0].n === pids.length) return;
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          throw new Error(`not all of ${pids.join(',')} reached a lock wait`);
+        }
+
+        // Whether a row can be locked right now, without waiting.
+        async function lockableNow(observer: Client, table: string, id: string): Promise<boolean> {
+          await observer.query('BEGIN');
+          try {
+            await observer.query(`SELECT 1 FROM public.${table} WHERE id = $1 FOR UPDATE NOWAIT`, [
+              id,
+            ]);
+            return true;
+          } catch (error) {
+            if ((error as { code?: string }).code === '55P03') return false;
+            throw error;
+          } finally {
+            await observer.query('ROLLBACK');
+          }
+        }
+
+        it('locks the whole studio set in one order: admissions naming different studios cannot deadlock', async () => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const pair = [
+            await studio(leaseFor(sessionId)),
+            await studio(leaseFor(sessionId)),
+          ].sort();
+          const [low, high] = pair;
+          const command = await queued(sessionId);
+          const holderTx = await connect();
+          const a = await connect();
+          const b = await connect();
+          const observer = await connect();
+          await holderTx.client.query('BEGIN');
+          try {
+            await holderTx.client.query('SELECT 1 FROM public.studios WHERE id = $1 FOR UPDATE', [
+              low,
+            ]);
+            const settled = Promise.allSettled([
+              admitSql(a.client, {
+                sessionId,
+                holder,
+                prior: null,
+                epoch: randomUUID(),
+                command,
+                studioId: low,
+              }),
+              admitSql(b.client, {
+                sessionId,
+                holder,
+                prior: null,
+                epoch: randomUUID(),
+                command,
+                studioId: high,
+              }),
+            ]);
+            await waitingOnLocks(observer.client, [a.pid, b.pid]);
+            // Both wait on the lower row: neither holds the higher studio row
+            // ahead of it, and neither has reached the session row.
+            expect(await lockableNow(observer.client, 'studios', high)).toBe(true);
+            expect(await lockableNow(observer.client, 'sessions', sessionId)).toBe(true);
+            await holderTx.client.query('COMMIT');
+            const results = await settled;
+            const outcomes = results.map((r) => {
+              if (r.status === 'rejected') throw r.reason;
+              return r.value;
+            });
+            const winner = outcomes.find((o) => o.outcome === 'admitted');
+            expect(outcomes.filter((o) => o.outcome === 'admitted')).toHaveLength(1);
+            expect(winner?.restamped).toBe(2);
+            expect(outcomes.find((o) => o !== winner)).toEqual({
+              outcome: 'stale_expectation',
+              epoch: winner?.epoch,
+            });
+            const after = await leases([low, high]);
+            expect((after[low] as Record<string, unknown>).turnEpoch).toBe(winner?.epoch);
+            expect((after[high] as Record<string, unknown>).turnEpoch).toBe(winner?.epoch);
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+        });
+
+        it.each(['reassigned', 'released'] as const)(
+          'refuses when the named lease is %s while the admission waits, and writes nothing',
+          async (change) => {
+            const sessionId = await newSession(suiteSbId);
+            const other = await newSession(suiteSbId);
+            const holder = await register(sessionId);
+            const named = await studio(leaseFor(sessionId));
+            const command = await queued(sessionId);
+            const before = await snapshot(sessionId, [], [command]);
+            const holderTx = await connect();
+            const a = await connect();
+            const observer = await connect();
+            await holderTx.client.query('BEGIN');
+            try {
+              await holderTx.client.query('SELECT 1 FROM public.studios WHERE id = $1 FOR UPDATE', [
+                named,
+              ]);
+              const pending = admitSql(a.client, {
+                sessionId,
+                holder,
+                prior: null,
+                epoch: randomUUID(),
+                command,
+                studioId: named,
+              });
+              await waitingOnLocks(observer.client, [a.pid]);
+              const replacement = change === 'reassigned' ? JSON.stringify(leaseFor(other)) : null;
+              await holderTx.client.query('UPDATE public.studios SET lease = $2 WHERE id = $1', [
+                named,
+                replacement,
+              ]);
+              await holderTx.client.query('COMMIT');
+              expect(await pending).toEqual({ outcome: 'lease_lost' });
+              const after = await leases([named]);
+              expect(after[named]).toEqual(replacement === null ? null : leaseFor(other));
+            } finally {
+              await holderTx.client.query('ROLLBACK').catch(() => undefined);
+            }
+            expect(await snapshot(sessionId, [], [command])).toEqual(before);
+          }
+        );
+
+        it('revalidates every locked row under its lock: a moved named studio is lost, and a row that changed tenant is not restamped', async () => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const named = await studio(leaseFor(sessionId));
+          const second = await studio(leaseFor(sessionId));
+          const command = await queued(sessionId);
+          const holderTx = await connect();
+          const a = await connect();
+          const observer = await connect();
+          const attempt = (epoch: string) =>
+            admitSql(a.client, { sessionId, holder, prior: null, epoch, command, studioId: named });
+
+          // The named studio's tree moves while the admission waits for it.
+          await holderTx.client.query('BEGIN');
+          try {
+            // The tree can't move while leased, so the holder releases it,
+            // moves it and leases it to the same session again, all before
+            // the admission can look.
+            await holderTx.client.query('UPDATE public.studios SET lease = NULL WHERE id = $1', [
+              named,
+            ]);
+            await holderTx.client.query(
+              'UPDATE public.studios SET worktree_path = $2, repo_root = $2 WHERE id = $1',
+              [named, `/tmp/ink-c1-${RUN}-moved`]
+            );
+            await holderTx.client.query('UPDATE public.studios SET lease = $2 WHERE id = $1', [
+              named,
+              JSON.stringify(leaseFor(sessionId)),
+            ]);
+            const pending = attempt(randomUUID());
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('COMMIT');
+            expect(await pending).toEqual({ outcome: 'lease_lost' });
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+
+          // Another locked row changes tenant while the admission waits.
+          const epoch = randomUUID();
+          await holderTx.client.query('BEGIN');
+          try {
+            await holderTx.client.query('SELECT 1 FROM public.studios WHERE id = $1 FOR UPDATE', [
+              named,
+            ]);
+            await holderTx.client.query('UPDATE public.studios SET user_id = $2 WHERE id = $1', [
+              second,
+              otherUserId,
+            ]);
+            const pending = attempt(epoch);
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('COMMIT');
+            expect(await pending).toEqual({ outcome: 'admitted', epoch, restamped: 1 });
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+          const after = await leases([named, second]);
+          expect((after[named] as Record<string, unknown>).turnEpoch).toBe(epoch);
+          expect((after[second] as Record<string, unknown>).turnEpoch).toBe('epoch-granted');
+
+          // The named studio itself changes tenant while the admission waits.
+          await holderTx.client.query('BEGIN');
+          try {
+            await holderTx.client.query('UPDATE public.studios SET user_id = $2 WHERE id = $1', [
+              named,
+              otherUserId,
+            ]);
+            const pending = attempt(randomUUID());
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('COMMIT');
+            expect(await pending).toEqual({ outcome: 'forbidden' });
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+
+          // The session itself changes tenant while an admission waits on its
+          // (still same-tenant) lease: the session lock sees it.
+          const moved = await newSession(suiteSbId);
+          const movedHolder = await register(moved);
+          const movedStudio = await studio(leaseFor(moved));
+          const movedCommand = await queued(moved);
+          await holderTx.client.query('BEGIN');
+          try {
+            await holderTx.client.query('SELECT 1 FROM public.studios WHERE id = $1 FOR UPDATE', [
+              movedStudio,
+            ]);
+            await holderTx.client.query('UPDATE public.sessions SET user_id = $2 WHERE id = $1', [
+              moved,
+              otherUserId,
+            ]);
+            const pending = admitSql(a.client, {
+              sessionId: moved,
+              holder: movedHolder,
+              prior: null,
+              epoch: randomUUID(),
+              command: movedCommand,
+              studioId: movedStudio,
+            });
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('COMMIT');
+            expect(await pending).toEqual({ outcome: 'forbidden' });
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+        });
+
+        it('restamps only the rows it locked: a lease gained while it waits keeps its granted epoch', async () => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const named = await studio(leaseFor(sessionId));
+          const later = await studio(null);
+          const command = await queued(sessionId);
+          const holderTx = await connect();
+          const a = await connect();
+          const observer = await connect();
+          await holderTx.client.query('BEGIN');
+          try {
+            await holderTx.client.query('SELECT 1 FROM public.studios WHERE id = $1 FOR UPDATE', [
+              named,
+            ]);
+            const epoch = randomUUID();
+            const pending = admitSql(a.client, {
+              sessionId,
+              holder,
+              prior: null,
+              epoch,
+              command,
+              studioId: named,
+            });
+            await waitingOnLocks(observer.client, [a.pid]);
+            // The session gains a lease after the admission chose its rows.
+            await observer.client.query('UPDATE public.studios SET lease = $2 WHERE id = $1', [
+              later,
+              JSON.stringify(leaseFor(sessionId)),
+            ]);
+            await holderTx.client.query('COMMIT');
+            expect(await pending).toEqual({ outcome: 'admitted', epoch, restamped: 1 });
+            const after = await leases([named, later]);
+            expect((after[named] as Record<string, unknown>).turnEpoch).toBe(epoch);
+            expect((after[later] as Record<string, unknown>).turnEpoch).toBe('epoch-granted');
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+          }
+        });
       });
     });
   });
