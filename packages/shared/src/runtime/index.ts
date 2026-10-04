@@ -32,3 +32,4 @@ export * from './clone-outcomes.js';
 export * from './session-history.js';
 export * from './provider-recovery.js';
 export * from './serial-input-drain.js';
+export * from './paragraph-stream.js';

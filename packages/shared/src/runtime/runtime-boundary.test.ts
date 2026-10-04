@@ -654,6 +654,7 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'auto-evict.ts',
         'clone-outcomes.ts',
         'serial-input-drain.ts',
+        'paragraph-stream.ts',
       ])
     );
   });

@@ -108,6 +108,22 @@ An append's returned ID is reserved, not a commit acknowledgment. Await
 there is no added fsync/power-loss guarantee, replay engine, write-buffer bound
 or safe automatic replay of an unresolved external effect.
 
+## Guarded paragraph streaming
+
+`ParagraphStreamBuffer` and `StreamedTurnRenderer` are the existing CLI text
+state machines, now shared without changing their behavior. Each instance keeps
+its own fence context, imitated-result cutoff, attribution and final-message
+deduplication. The CLI compatibility path re-exports these exact classes.
+The host still supplies the display transform and guard appropriate to its tool
+routing; this is not a raw provider stream or an authorization boundary.
+
+This extraction prepares the same guarded text for terminal and hosted sinks;
+it does not wire participant fanout, input delivery, durable replay or ownership.
+Output still releases at safe paragraph boundaries, not every token. Existing
+raw-text retention is not newly bounded by this move: hosted integration must
+enforce output/replay budgets without breaking whole-spawn guard context. No
+observer projection or current terminal behavior changes here.
+
 ## Ordinary input drain
 
 `SerialInputDrain` is the shared FIFO used by the CLI for user, system and
