@@ -26,6 +26,7 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { ceilingFromEnv } from './turn-ceiling.js';
 import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
 import {
   injectSessionHeaders,
@@ -58,16 +59,12 @@ class BackendExitError extends Error {
   }
 }
 
-// Absolute wall-clock backstop for a single ink turn — a final safety net for a
-// truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
-// can't distinguish a turn that's still legitimately working from a hung one,
-// so it sits far above any realistic turn. The primary guard is the inactivity
-// timeout below. Override with INK_PROCESS_TIMEOUT_MS.
-//
-// 4 hours: agents doing real multi-step work on the user's behalf can run a
-// long time — the goal is to keep going wherever possible, not to reap eagerly.
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
+// Absolute wall-clock backstop for a single ink turn: none unless
+// INK_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). It can't distinguish a
+// turn that's still legitimately working from a hung one, so a working turn is
+// never killed on wall-clock (Conor, 2026-10-04); the inactivity timeout below
+// and Stop end a stuck one. It was 4 hours.
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.INK_PROCESS_TIMEOUT_MS);
 
 // Continuation-loop turn cap when the SB's dashboard settings don't specify
 // one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
@@ -619,11 +616,15 @@ export class InkRunner implements IRunner {
         resetIdleTimer();
       });
 
-      // Absolute backstop — fires regardless of activity, for a process wedged
-      // in a way that still emits output (or none at all).
-      const absoluteTimer = setTimeout(() => {
-        killProcess(`exceeded ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s absolute backstop`);
-      }, PROCESS_TIMEOUT_MS);
+      // Absolute backstop, only when one is configured: fires regardless of
+      // activity, for a process wedged in a way that still emits output.
+      const absoluteMs = PROCESS_TIMEOUT_MS;
+      const absoluteTimer =
+        absoluteMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              killProcess(`exceeded ${Math.round(absoluteMs / 1000)}s absolute backstop`);
+            }, absoluteMs);
 
       // Start the inactivity countdown immediately so a process that never
       // emits anything (wedged at startup) is still reaped.

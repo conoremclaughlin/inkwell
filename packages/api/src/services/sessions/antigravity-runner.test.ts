@@ -108,6 +108,14 @@ describe('buildAgyArgs', () => {
     // Anything at or under agy's own 300s default would cap agent work.
     expect(Number(raw.replace('s', ''))).toBeGreaterThan(300);
   });
+
+  it('tells agy a day, less the margin, when no ceiling is configured', () => {
+    // There is no ceiling unless ANTIGRAVITY_PROCESS_TIMEOUT_MS sets one
+    // (turn-ceiling.ts); agy needs a duration, so a day stands in for none.
+    if (process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS) return;
+    const args = buildAgyArgs('hi', baseConfig());
+    expect(args[args.indexOf('--print-timeout') + 1]).toBe(`${24 * 60 * 60 - 30}s`);
+  });
 });
 
 describe('extractTextDelta', () => {

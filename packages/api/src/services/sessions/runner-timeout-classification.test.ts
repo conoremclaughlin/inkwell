@@ -35,6 +35,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { classifyError } from '@inklabs/shared';
 import { decideChannelForward } from '../channel-forward.js';
 
+// A ceiling exists only when configured (turn-ceiling.ts). These tests are
+// about what a configured one does, so they configure one before the runners
+// read their env at import. runner-no-ceiling.test.ts covers the default.
+vi.hoisted(() => {
+  process.env.CLAUDE_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
+  process.env.GEMINI_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
+  process.env.CODEX_PROCESS_TIMEOUT_MS = String(30 * 60 * 1000);
+});
+
 const spawnMock = vi.fn();
 
 vi.mock('child_process', () => ({ spawn: (...args: unknown[]) => spawnMock(...args) }));
@@ -59,7 +68,11 @@ import {
   IDLE_TIMEOUT_MS as GEMINI_IDLE_TIMEOUT_MS,
   PROCESS_TIMEOUT_MS as GEMINI_PROCESS_TIMEOUT_MS,
 } from './gemini-runner.js';
-import { CodexRunner, PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS } from './codex-runner.js';
+import {
+  CodexRunner,
+  IDLE_TIMEOUT_MS as CODEX_IDLE_TIMEOUT_MS,
+  PROCESS_TIMEOUT_MS as CODEX_PROCESS_TIMEOUT_MS,
+} from './codex-runner.js';
 import type { ClaudeRunnerConfig } from './types.js';
 
 interface FakeChild extends EventEmitter {
@@ -179,7 +192,7 @@ describe('ClaudeRunner — a killed turn is reported as a failure', () => {
     // Emit steadily so the idle timer never trips — this must reach the
     // absolute backstop, not the idle path.
     const step = Math.floor(IDLE_TIMEOUT_MS / 2);
-    const iterations = Math.ceil(PROCESS_TIMEOUT_MS / step) + 1;
+    const iterations = Math.ceil(PROCESS_TIMEOUT_MS! / step) + 1;
     for (let i = 0; i < iterations && child.kill.mock.calls.length === 0; i++) {
       child.stdout.emit('data', `${JSON.stringify({ type: 'system', subtype: 'noise' })}\n`);
       await vi.advanceTimersByTimeAsync(step);
@@ -238,7 +251,7 @@ describe('GeminiRunner — a killed turn is reported as a failure', () => {
     await settleSpawn();
 
     const step = Math.floor(GEMINI_IDLE_TIMEOUT_MS / 2);
-    const iterations = Math.ceil(GEMINI_PROCESS_TIMEOUT_MS / step) + 1;
+    const iterations = Math.ceil(GEMINI_PROCESS_TIMEOUT_MS! / step) + 1;
     for (let i = 0; i < iterations && child.kill.mock.calls.length === 0; i++) {
       child.stdout.emit('data', `${JSON.stringify({ type: 'noise' })}\n`);
       await vi.advanceTimersByTimeAsync(step);
@@ -265,15 +278,35 @@ describe('GeminiRunner — a killed turn is reported as a failure', () => {
 });
 
 describe('CodexRunner — a killed turn is reported as a failure', () => {
-  it('classifies the hard ceiling instead of resolving as a completed turn', async () => {
+  it('classifies an idle timeout instead of resolving as a completed turn', async () => {
     const runner = new CodexRunner();
     const runPromise = runner.run('do the thing', { config: baseConfig() });
     await settleSpawn();
 
-    await vi.advanceTimersByTimeAsync(CODEX_PROCESS_TIMEOUT_MS - 1);
+    await vi.advanceTimersByTimeAsync(CODEX_IDLE_TIMEOUT_MS - 1);
     expect(child.kill).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+
+    const result = await runPromise;
+    expectClassifiedTimeout(result);
+    expect(result.error).toMatch(/no output/);
+  });
+
+  it('classifies the hard ceiling even while output keeps flowing', async () => {
+    const runner = new CodexRunner();
+    const runPromise = runner.run('runaway', { config: baseConfig() });
+    await settleSpawn();
+
+    // Emit steadily so the idle timer never trips — this must reach the
+    // configured ceiling, not the idle path.
+    const step = Math.floor(CODEX_IDLE_TIMEOUT_MS / 2);
+    const iterations = Math.ceil(CODEX_PROCESS_TIMEOUT_MS! / step) + 1;
+    for (let i = 0; i < iterations && child.kill.mock.calls.length === 0; i++) {
+      child.stdout.emit('data', `${JSON.stringify({ type: 'item.started' })}\n`);
+      await vi.advanceTimersByTimeAsync(step);
+    }
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
 
     const result = await runPromise;

@@ -42,15 +42,18 @@ export function isInklingOwnerTestUser(
   return ownerTestUserId !== null && userId.toLowerCase() === ownerTestUserId.toLowerCase();
 }
 
-/** The first test's ceiling on one inkling turn: five minutes. */
-export const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
-
 /**
  * How long one inkling turn may run before it is stopped, with everything
- * it started: INKLING_TURN_TIMEOUT_MS, else five minutes.
+ * it started: INKLING_TURN_TIMEOUT_MS when it is a positive whole number,
+ * else no ceiling. A turn still producing output is not killed on
+ * wall-clock (Conor, 2026-10-04, the turn-timeouts thread); the runner's
+ * silence timeout and the owner's Stop end a stuck one. This was five
+ * minutes for the first test. The turn cap still bounds how many turns
+ * an inkling takes.
  */
-export function inklingTurnTimeoutMs(source: EnvSource = process.env): number {
-  return positiveInt(source.INKLING_TURN_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS);
+export function inklingTurnTimeoutMs(source: EnvSource = process.env): number | undefined {
+  const value = positiveInt(source.INKLING_TURN_TIMEOUT_MS, 0);
+  return value > 0 ? value : undefined;
 }
 
 /** The first test's turns per inkling, unless INKLING_TURN_CAP says otherwise. */

@@ -32,15 +32,15 @@ import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
 import { stopProcessAndWait } from './stop-process.js';
+import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 
 /** Where the sandbox orchestrator mounts the studio checkout in a container. */
 const CONTAINER_STUDIO_ROOT = '/studio';
 
-/** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
- *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.CLAUDE_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
+/** The general ceiling on a Claude Code turn: none unless
+ *  CLAUDE_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). */
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CLAUDE_PROCESS_TIMEOUT_MS);
 
 /** Time (ms) with no output from the subprocess before it is treated as stuck.
  *  Activity-based: reset every time the process writes anything, so this
@@ -571,8 +571,9 @@ export class ClaudeRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
-      // The run's own ceiling may be lower than the module's (an inkling turn's).
-      const ceilingMs = Math.min(PROCESS_TIMEOUT_MS, config.timeoutMs ?? PROCESS_TIMEOUT_MS);
+      // No ceiling unless one is configured, for the module or for this run;
+      // the lower one wins when both are.
+      const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);
 
       let stderr = '';
       const responses: ChannelResponse[] = [];
@@ -662,25 +663,29 @@ export class ClaudeRunner implements IRunner {
       };
       resetIdleTimer();
 
-      // Hard ceiling: no process should run longer than this regardless of activity
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          logger.error('Claude Code process hit hard timeout, killing', {
-            timeoutMs: ceilingMs,
-            hasResponses: responses.length > 0,
-            hasFinalText: !!finalTextResponse,
-          });
-          const message = `Claude Code timeout: exceeded the ${Math.round(
-            ceilingMs / 1000
-          )}s ceiling, process killed`;
-          stopThenSettle(() => ({
-            finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
-            kind: 'hard',
-            message,
-            unconfirmedMessage: `${message}, but it did not confirm it had exited`,
-          }));
-        }
-      }, ceilingMs);
+      // A configured ceiling stops the run however active it is. With none,
+      // only the silence timeout above or a cancel ends it.
+      const timeout =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              if (!settled) {
+                logger.error('Claude Code process hit hard timeout, killing', {
+                  timeoutMs: ceilingMs,
+                  hasResponses: responses.length > 0,
+                  hasFinalText: !!finalTextResponse,
+                });
+                const message = `Claude Code timeout: exceeded the ${Math.round(
+                  ceilingMs / 1000
+                )}s ceiling, process killed`;
+                stopThenSettle(() => ({
+                  finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+                  kind: 'hard',
+                  message,
+                  unconfirmedMessage: `${message}, but it did not confirm it had exited`,
+                }));
+              }
+            }, ceilingMs);
 
       // Cancellation (an owner stopping an inkling's turn): the same stop as
       // a timeout, reported without the word "timeout", which the retry
