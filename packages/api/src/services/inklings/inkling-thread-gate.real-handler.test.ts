@@ -552,6 +552,64 @@ describe("owner-present groups of the owner's own inklings, up to three", () => 
     expect(woken()).toEqual(['myra', 'sage']);
   });
 
+  /** A send by the owner, as a person, through the handler (not create-only). */
+  const ownerSend = (key: string, recipients: string[]) =>
+    handleSendToInbox(
+      { userId: ME, threadKey: key, recipients, content: 'from the owner' },
+      { repositories: {}, getClient: () => db } as never,
+      { sender: { principal: { kind: 'user', userId: ME } as never, workspaceId: WS } }
+    );
+  const sbMembers = (key: string) => {
+    const thread = db.rows('inbox_threads').find((t) => t.thread_key === key);
+    return db
+      .rows('inbox_thread_participants')
+      .filter((p) => p.thread_id === thread?.id && !!p.sb_id)
+      .map((p) => p.sb_id as string)
+      .sort();
+  };
+
+  it('a conversation keeps the inklings it was created with: the owner may not add one', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    const before = written();
+    await expect(ownerSend(KEY, ['wisp'])).rejects.toBeInstanceOf(InklingThreadRefusedError);
+    expect(written()).toEqual(before);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+  });
+
+  // Lumen's review of #740 at 290990dc: two concurrent additions each read
+  // the two-member conversation, each passed the cap, and it ended with 4.
+  it('concurrent owner additions never grow the conversation', async () => {
+    await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
+    const results = await Promise.allSettled([ownerSend(KEY, ['wisp']), ownerSend(KEY, ['kit'])]);
+    expect(results.map((r) => r.status)).toEqual(['rejected', 'rejected']);
+    expect(sbMembers(KEY)).toEqual(['sb-pip', 'sb-tam']);
+  });
+
+  it('of two sends that each find no conversation, only the one that creates it writes', async () => {
+    // inbox_threads_workspace_key: UNIQUE (workspace_id, thread_key).
+    db.unique.inbox_threads = [
+      {
+        name: 'inbox_threads_workspace_key',
+        key: (r) => `${String(r.workspace_id)}:${String(r.thread_key)}`,
+      },
+    ];
+    const results = await Promise.allSettled([
+      ownerSend(KEY, ['pip', 'tam']),
+      ownerSend(KEY, ['wisp', 'kit']),
+    ]);
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual(['fulfilled', 'rejected']);
+    const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(lost.reason).toBeInstanceOf(InklingThreadRefusedError);
+    expect(db.rows('inbox_threads').filter((t) => t.thread_key === KEY)).toHaveLength(1);
+    const members = sbMembers(KEY);
+    expect([
+      ['sb-pip', 'sb-tam'],
+      ['sb-kit', 'sb-wisp'],
+    ]).toContainEqual(members);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
   it('more than three is refused whole', async () => {
     const res = await call(create, {
       key: KEY,

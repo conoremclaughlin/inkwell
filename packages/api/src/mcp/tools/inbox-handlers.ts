@@ -66,7 +66,10 @@ import {
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
-import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
+import {
+  assertInklingConversationCreatedHere,
+  assertInklingThreadAllowed,
+} from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 
 // The thread tables are new and not yet in generated Supabase types.
@@ -746,6 +749,12 @@ export async function handleSendToInbox(
     // and the insert. Nothing has been written yet (findOrCreateThread writes
     // only for a thread it created), and nothing may be.
     if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
+    // Nor may a send that found no inkling conversation add its members to
+    // one another send created meanwhile (the gate judged it as the creator).
+    assertInklingConversationCreatedHere(inklingVerdict, {
+      hadThread: !!existingThread,
+      created: thread.isNew,
+    });
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id

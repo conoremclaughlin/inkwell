@@ -52,6 +52,27 @@ interface IdentityRow {
 export interface InklingThreadVerdict {
   /** True when an inkling is the sender: its send must wake nobody. */
   quiet: boolean;
+  /** True when the conversation holds an inkling, so its members are fixed at creation. */
+  inklingConversation: boolean;
+}
+
+/**
+ * An inkling conversation's members are those of the one send that created
+ * it. The thread insert is unique on its key, so when two sends each found
+ * no conversation, only one creates it. Call this once the thread is found
+ * or created, before anything else is written: the other send, judged
+ * against no members, must not add its own to the winner's.
+ */
+export function assertInklingConversationCreatedHere(
+  verdict: InklingThreadVerdict,
+  thread: { hadThread: boolean; created: boolean }
+): void {
+  if (verdict.inklingConversation && !thread.hadThread && !thread.created) {
+    throw new InklingThreadRefusedError(
+      INKLING_THREAD_REFUSED,
+      'This conversation was started by another send at the same moment'
+    );
+  }
 }
 
 /**
@@ -88,7 +109,7 @@ export async function assertInklingThreadAllowed(
       if (row.user_id) people.add(row.user_id.toLowerCase());
     }
   }
-  if (sbIds.size === 0) return { quiet: false };
+  if (sbIds.size === 0) return { quiet: false, inklingConversation: false };
 
   const { data, error } = await supabase
     .from('agent_identities')
@@ -97,7 +118,7 @@ export async function assertInklingThreadAllowed(
   if (error) throw new Error(`Failed to read the conversation's SBs: ${error.message}`);
   const identities = (data ?? []) as IdentityRow[];
   const inklings = identities.filter((r) => r.metadata?.client === INKLING_CLIENT);
-  if (inklings.length === 0) return { quiet: false };
+  if (inklings.length === 0) return { quiet: false, inklingConversation: false };
 
   if (ownerTestUserIds.size === 0) {
     throw new InklingThreadRefusedError(INKLINGS_DISABLED, 'Inklings are not open on this server');
@@ -107,17 +128,19 @@ export async function assertInklingThreadAllowed(
   const sender = input.sender;
   const fromOwner = sender.kind === 'user' && sender.userId.toLowerCase() === owner;
   // A member answering: in a conversation it is already in, with its owner
-  // in it too, to members already there. Never a new conversation, never
-  // one its owner has left, and never bringing anyone in. Every SB here is
-  // one of the owner's inklings (below), so a member sender is one too.
-  const replyFromInkling =
-    sender.kind === 'sb' &&
-    members.has(sender.sbId) &&
-    input.participantSbs.every((sb) => members.has(sb.sbId)) &&
-    people.has(owner);
+  // in it too. Never a new conversation, and never one its owner has left.
+  // Every SB here is one of the owner's inklings (below), so a member
+  // sender is one too.
+  const replyFromInkling = sender.kind === 'sb' && members.has(sender.sbId) && people.has(owner);
+  // Members are fixed when a conversation is created: no send, the
+  // owner's included, adds an SB to one that exists. Adding is what two
+  // concurrent sends could each do against the same snapshot of members.
+  const noNewMembers =
+    input.existingThreadId === null || input.participantSbs.every((sb) => members.has(sb.sbId));
   const allowed =
     isInklingOwnerTestUser(owner, ownerTestUserIds) &&
     (fromOwner || replyFromInkling) &&
+    noNewMembers &&
     // Every SB in the conversation is an inkling: none is another SB, and
     // none is an id with no identity row.
     inklings.length === sbIds.size &&
@@ -132,5 +155,5 @@ export async function assertInklingThreadAllowed(
       "An inkling's conversation is only between its owner and the owner's own inklings"
     );
   }
-  return { quiet: sender.kind === 'sb' };
+  return { quiet: sender.kind === 'sb', inklingConversation: true };
 }
