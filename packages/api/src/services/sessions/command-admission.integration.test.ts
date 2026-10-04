@@ -2541,6 +2541,138 @@ describe('durable command admission', () => {
           }
         }
 
+        // Lumen 16643e65 (C1-R1), ported from the review's probes.
+        it('serializes same-path replacement before locking and restamps the actual replacement row', async () => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const named = await studio(leaseFor(sessionId));
+          const command = await queued(sessionId);
+          const holderTx = await connect();
+          const a = await connect();
+          const observer = await connect();
+          let pending: Promise<Record<string, unknown>> | undefined;
+          await holderTx.client.query('BEGIN');
+          try {
+            // The production INSERT trigger takes this same path lock. A
+            // replacing writer must take it before locking/deleting the row.
+            const {
+              rows: [location],
+            } = await holderTx.client.query(
+              'SELECT user_id, public.normalize_worktree_path(worktree_path) AS path FROM public.studios WHERE id = $1',
+              [named]
+            );
+            await holderTx.client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+              `studio-path:${location.user_id}:${location.path}`,
+            ]);
+            const {
+              rows: [old],
+            } = await holderTx.client.query(
+              'SELECT * FROM public.studios WHERE id = $1 FOR UPDATE',
+              [named]
+            );
+            pending = admitSql(a.client, {
+              sessionId,
+              holder,
+              prior: null,
+              epoch: randomUUID(),
+              command,
+              studioId: named,
+            });
+            // Ensure errors are observed even when a setup assertion fails.
+            void pending.catch(() => undefined);
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('DELETE FROM public.studios WHERE id = $1', [named]);
+            await holderTx.client.query(
+              `INSERT INTO public.studios
+                (id, user_id, agent_id, repo_root, worktree_path, branch, status, lease)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [
+                old.id,
+                old.user_id,
+                old.agent_id,
+                old.repo_root,
+                old.worktree_path,
+                old.branch,
+                old.status,
+                JSON.stringify(old.lease),
+              ]
+            );
+            await holderTx.client.query('COMMIT');
+            const outcome = await pending;
+            expect(outcome).toMatchObject({ outcome: 'admitted', restamped: 1 });
+            const after = await leases([named]);
+            expect((after[named] as Record<string, unknown>).turnEpoch).toBe(outcome.epoch);
+            const admitted = await snapshot(sessionId, [], [command]);
+            expect(admitted.session?.turn_epoch).toBe(outcome.epoch);
+            expect(admitted.generations).toHaveLength(1);
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+            if (pending) await pending.catch(() => undefined);
+          }
+        });
+
+        it('refuses an unlocked replacement after unleased insertion and direct lease assignment', async () => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const named = await studio(leaseFor(sessionId));
+          const command = await queued(sessionId);
+          const before = await snapshot(sessionId, [], [command]);
+          const holderTx = await connect();
+          const a = await connect();
+          const observer = await connect();
+          let pending: Promise<Record<string, unknown>> | undefined;
+          await holderTx.client.query('BEGIN');
+          try {
+            const {
+              rows: [old],
+            } = await holderTx.client.query(
+              'SELECT * FROM public.studios WHERE id = $1 FOR UPDATE',
+              [named]
+            );
+            pending = admitSql(a.client, {
+              sessionId,
+              holder,
+              prior: null,
+              epoch: randomUUID(),
+              command,
+              studioId: named,
+            });
+            // Ensure errors are observed even when a setup assertion fails.
+            void pending.catch(() => undefined);
+            await waitingOnLocks(observer.client, [a.pid]);
+            await holderTx.client.query('DELETE FROM public.studios WHERE id = $1', [named]);
+            await holderTx.client.query(
+              `INSERT INTO public.studios
+                (id, user_id, agent_id, repo_root, worktree_path, branch, status, lease)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,NULL)`,
+              [
+                old.id,
+                old.user_id,
+                old.agent_id,
+                old.repo_root,
+                old.worktree_path,
+                old.branch,
+                old.status,
+              ]
+            );
+            // Match the fixture writer's existing unleased-insert then
+            // lease-assignment shape, without a preleased INSERT trigger.
+            await holderTx.client.query('UPDATE public.studios SET lease = $2 WHERE id = $1', [
+              named,
+              JSON.stringify(old.lease),
+            ]);
+            await holderTx.client.query('COMMIT');
+            const outcome = await pending;
+            expect(outcome).toEqual({ outcome: 'lease_lost' });
+            expect(await snapshot(sessionId, [], [command])).toEqual(before);
+            const after = await leases([named]);
+            expect((after[named] as Record<string, unknown>).turnEpoch).toBe('epoch-granted');
+          } finally {
+            await holderTx.client.query('ROLLBACK').catch(() => undefined);
+            if (pending) await pending.catch(() => undefined);
+          }
+        });
+
         it('locks the whole studio set in one order: admissions naming different studios cannot deadlock', async () => {
           const sessionId = await newSession(suiteSbId);
           const holder = await register(sessionId);
