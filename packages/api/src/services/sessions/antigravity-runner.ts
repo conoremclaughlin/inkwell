@@ -47,12 +47,6 @@ import { buildSessionEnv, resolveSpawnTarget } from '@inklabs/shared';
  *  ANTIGRAVITY_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). */
 const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS);
 
-/** What agy is told when we set no ceiling. `--print-timeout` takes a
- *  duration and we have not verified a spelling that means "never", so agy
- *  itself still ends a turn after a day: a 24-hour bound that agy imposes,
- *  far past any observed turn, not the absence of one (Lumen, #745). */
-const UNBOUNDED_PRINT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-
 /** Idle timeout: no output for this long = stuck. */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -60,13 +54,13 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const KILL_ESCALATION_MS = 5_000;
 const KILL_GIVEUP_MS = 5_000;
 
-/** agy's own `--print-timeout` defaults to 5m, which is far too short for agent
- *  work. Keep it just under our ceiling, when one is set, so agy reports the
- *  timeout itself (as a structured result event) before we resort to killing
- *  the process. */
-const PRINT_TIMEOUT_SECONDS = Math.floor(
-  ((PROCESS_TIMEOUT_MS ?? UNBOUNDED_PRINT_TIMEOUT_MS) - 30_000) / 1000
-);
+/** agy's `--print-timeout`. With a ceiling of ours, just under it, so agy
+ *  reports the timeout itself (as a structured result event) before we resort
+ *  to killing the process. With none, `0s`: agy's help says 0 waits until the
+ *  turn completes (Lumen checked the installed agy, #745). It is passed
+ *  explicitly rather than left to agy's default, which was once 5m. */
+const PRINT_TIMEOUT =
+  PROCESS_TIMEOUT_MS === undefined ? '0s' : `${Math.floor((PROCESS_TIMEOUT_MS - 30_000) / 1000)}s`;
 
 /**
  * The single host-global file `agy` reads MCP servers from.
@@ -860,7 +854,7 @@ export function buildAgyArgs(
     'stream-json',
     '--dangerously-skip-permissions',
     '--print-timeout',
-    `${PRINT_TIMEOUT_SECONDS}s`,
+    PRINT_TIMEOUT,
   ];
 
   // Ephemeral-studio root (spec:studio-materialization v8, PR #544 r3):
