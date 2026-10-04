@@ -58,6 +58,7 @@ vi.mock('../../utils/logger', () => ({
 
 import router from '../../routes/admin';
 import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
+import { getRequestContext } from '../../utils/request-context';
 import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
@@ -217,7 +218,6 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
     await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
     // An SB writes with its owner's role, read from the membership table.
     db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
-    const { getRequestContext } = await import('../../utils/request-context');
     // A turn's MCP token binds the inkling's own identity.
     vi.mocked(getRequestContext).mockImplementation(
       () => ({ userId: ME, sbId: 'sb-pip', sbSlug: 'pip' }) as never
