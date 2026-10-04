@@ -32,6 +32,9 @@ import {
   buildSessionEnv,
   buildCleanEnv,
   RUN_TURN_EPOCH_ENV,
+  TURN_REPLY_TOKEN_ENV,
+  TURN_REPLY_EVENT,
+  parseTurnReplyEvent,
   writeRuntimeSessionHint,
   describeExitResult,
   type ErrorClassification,
@@ -439,6 +442,9 @@ export class InkRunner implements IRunner {
       delegationSecret: config.inkDelegationSecret,
     });
 
+    // Minted per spawn, so a line that looks like an event is not one.
+    const turnReplyToken = config.onTurnReply ? randomUUID() : undefined;
+
     // The child inherits an allowlist of the server's env (buildCleanEnv),
     // never the whole of it: spec:sender-token-binding Phase 0. Everything
     // else it needs is set here, explicitly.
@@ -457,6 +463,11 @@ export class InkRunner implements IRunner {
       // lifecycle request; without it the chat claimed a fresh epoch at each
       // outer turn and this run's finalize matched zero rows.
       ...(config.turnEpoch ? { [RUN_TURN_EPOCH_ENV]: config.turnEpoch } : {}),
+      // Only when someone forwards the turn replies. The chat prints it on
+      // each turn_reply line, and those lines are accepted on nothing else:
+      // its stdout also carries whatever it echoes, the delivered message
+      // included (Lumen, PR #735).
+      ...(turnReplyToken ? { [TURN_REPLY_TOKEN_ENV]: turnReplyToken } : {}),
     }) as Record<string, string>;
 
     // Turn-scope the observer replay tail: drop anything buffered from a prior
@@ -478,6 +489,39 @@ export class InkRunner implements IRunner {
       // Carries a partial trailing line between stdout chunks so we only parse
       // complete NDJSON events for live fan-out.
       let stdoutLineBuffer = '';
+      // Each outer turn's reply, handed over as its line arrives, in arrival
+      // order. Everything the caller decides about the turn is on that line,
+      // the turn's own sends included; its completion is chained so the run
+      // does not settle while a reply is still being sent.
+      let turnRepliesSettled: Promise<void> = Promise.resolve();
+      const handOverTurnReply = (event: Record<string, unknown>): void => {
+        const handler = config.onTurnReply;
+        if (!handler || !turnReplyToken) return;
+        const reply = parseTurnReplyEvent(event);
+        if (!reply || reply.token !== turnReplyToken) {
+          // Not this run's event: echoed text shaped like one. Logged without
+          // its content, which may be anyone's.
+          logger.warn('Ignored a turn_reply line without this run token', {
+            sessionId: config.inkSessionId,
+            reason: reply ? 'token-mismatch' : 'malformed',
+          });
+          return;
+        }
+        const handled = handler({
+          turn: reply.turn,
+          label: reply.label,
+          text: reply.text,
+          sends: reply.sends,
+          ...(config.inkSessionId ? { sessionId: config.inkSessionId } : {}),
+        }).catch((error: unknown) => {
+          logger.error('Turn reply handler failed', {
+            sessionId: config.inkSessionId,
+            turn: reply.turn,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        turnRepliesSettled = turnRepliesSettled.then(() => handled);
+      };
 
       // Live fan-out: the worker emits one NDJSON event per line as it works
       // (tool_call, result, status chrome). Parse complete lines as they arrive
@@ -487,7 +531,7 @@ export class InkRunner implements IRunner {
       // human-readable chrome are ignored; the authoritative RunnerResult is
       // still assembled from the full stdout in parseOutput on close.
       const publishStreamEvents = (text: string): void => {
-        if (!config.inkSessionId) return;
+        if (!config.inkSessionId && !config.onTurnReply) return;
         stdoutLineBuffer += text;
         let nl: number;
         while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
@@ -506,6 +550,13 @@ export class InkRunner implements IRunner {
             typeof (evt as { type?: unknown }).type === 'string'
           ) {
             const typed = evt as { type: string } & Record<string, unknown>;
+            // Never republished: the line carries the run's token, and
+            // observers already get the turn's text from its ledger entry.
+            if (typed.type === TURN_REPLY_EVENT) {
+              handOverTurnReply(typed);
+              continue;
+            }
+            if (!config.inkSessionId) continue;
             if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
               // Canonical ledger entry (spec:observer-attach §4.2) — the exact
               // appended transcript object, ledger eid included. Publish on the
@@ -596,25 +647,36 @@ export class InkRunner implements IRunner {
           sessionEventBus.releaseObserverSession(config.inkSessionId);
         }
 
+        // The run's caller decides what the run delivered once it settles, so
+        // it must not settle while a turn's reply is still on its way out.
+        // turnRepliesSettled never rejects: each handler's failure is logged.
+        const afterTurnReplies = (settle: () => void): void => {
+          void turnRepliesSettled.then(settle);
+        };
+
         if (code !== 0) {
           // The child refused to answer without identity context. Recoverable:
           // the server holds that context and can supply it directly.
           if (stderr.includes(BOOTSTRAP_REQUIRED_EXIT_MARKER)) {
-            resolve({
-              responses: [],
-              bootstrapRequiredFailure: true,
-              toolCalls: [],
-            });
+            afterTurnReplies(() =>
+              resolve({
+                responses: [],
+                bootstrapRequiredFailure: true,
+                toolCalls: [],
+              })
+            );
             return;
           }
 
           // Check for resume failure
           if (stderr.includes('session not found') || stderr.includes('No such session')) {
-            resolve({
-              responses: [],
-              resumeFailedNoSession: true,
-              toolCalls: [],
-            });
+            afterTurnReplies(() =>
+              resolve({
+                responses: [],
+                resumeFailedNoSession: true,
+                toolCalls: [],
+              })
+            );
             return;
           }
 
@@ -647,12 +709,14 @@ export class InkRunner implements IRunner {
             stderr,
             backend: 'ink',
           });
-          reject(new BackendExitError(described.text, described.classification));
+          afterTurnReplies(() =>
+            reject(new BackendExitError(described.text, described.classification))
+          );
           return;
         }
 
         const result = this.parseOutput(stdout, stderr);
-        resolve(result);
+        afterTurnReplies(() => resolve(result));
       });
 
       child.on('error', (err) => {

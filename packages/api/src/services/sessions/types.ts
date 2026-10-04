@@ -4,7 +4,7 @@
  * Core types for the stateless SessionService architecture.
  */
 
-import type { ErrorClassification } from '@inklabs/shared';
+import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 
 // ─── Channel Types ───
@@ -228,6 +228,17 @@ export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 
 // ─── Request/Response Types ───
 
+/**
+ * One outer turn's reply from a run that takes several (an `ink chat` spawn),
+ * handed over as the turn ends so it reaches the channel before the next turn
+ * starts. `sessionId` is the session that ran it, for the message_out row.
+ */
+export interface RunnerTurnReply extends TurnReply {
+  sessionId?: string;
+}
+
+export type TurnReplyHandler = (reply: RunnerTurnReply) => Promise<void>;
+
 export interface SessionRequest {
   // Auth context (required)
   userId: string;
@@ -296,6 +307,14 @@ export interface SessionRequest {
      */
     triggerThreadMessageId?: string;
   };
+
+  /**
+   * Called as each outer turn of the run ends, by runners whose run has more
+   * than one (InkRunner). Set by a caller that delivers replies to a channel;
+   * a runner that reports no turns never calls it, and the caller falls back
+   * to the run's final text.
+   */
+  onTurnReply?: TurnReplyHandler;
 }
 
 export interface ChannelResponse {
@@ -826,6 +845,12 @@ export interface ClaudeRunnerConfig {
    * this only caps runaway continuations.
    */
   maxTurns?: number;
+  /**
+   * InkRunner calls this with each outer turn's reply as the turn ends, and
+   * tells the chat its continuation text is forwarded. Other runners run one
+   * turn and ignore it.
+   */
+  onTurnReply?: TurnReplyHandler;
   /**
    * Tool routing for InkRunner spawns, from the SB's dashboard settings
    * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
