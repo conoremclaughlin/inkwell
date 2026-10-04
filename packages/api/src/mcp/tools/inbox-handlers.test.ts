@@ -3346,3 +3346,26 @@ describe('handleSendToInbox — caller-named sessions (T4)', () => {
     );
   });
 });
+
+// Lumen's probe from the #737 review: links without a thread were accepted,
+// the legacy inbox row was written, and the links were dropped.
+describe('send_to_inbox links precondition', () => {
+  it('refuses links without a thread instead of silently delivering and dropping them', async () => {
+    const sb = createMockSupabase();
+    const dc = createMockDataComposer(sb);
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'sender@example.com',
+          recipientSlug: 'lumen',
+          senderSlug: 'wren',
+          content: 'Synthetic message with thread links but no source thread',
+          links: ['spec:example'],
+          trigger: false,
+        },
+        dc as never
+      )
+    ).rejects.toThrow(/threadKey/);
+    expect(sb.from).not.toHaveBeenCalledWith('agent_inbox');
+  });
+});
