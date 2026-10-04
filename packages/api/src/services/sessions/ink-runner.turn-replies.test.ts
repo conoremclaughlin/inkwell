@@ -392,6 +392,8 @@ describe('InkRunner turn replies', () => {
     await run;
     await forwarder.finish({ success: true });
     expect(sent).toEqual(['first answer']);
+    // Read once, in finish, and cleared there: it does not outlive the run.
+    expect(marker).toBe(false);
   });
 
   /**
