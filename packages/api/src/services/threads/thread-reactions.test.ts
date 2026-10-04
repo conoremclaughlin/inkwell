@@ -14,7 +14,7 @@ vi.mock('../../utils/logger', () => ({
 }));
 
 import { FakePostgrest, type Row } from '../../test/fake-postgrest';
-import { withReactionsTable } from '../../test/fake-reactions-db';
+import { withReactionsTable, withUuidCanonicalization } from '../../test/fake-reactions-db';
 import { userPrincipal, type SbPrincipal } from '../principals';
 import {
   REACTION_CHOICES,
@@ -485,6 +485,55 @@ describe('reactToMessage', () => {
         participantSbs: [],
         existingThreadId: inklingThread.id,
       });
+    });
+  });
+
+  describe('a message id in another case than the database spells it (Lumen, #741 r1)', () => {
+    // PostgreSQL accepts a UUID in any case and answers in lowercase. The
+    // seeded ids above are all digits, where case cannot matter.
+    const LETTERED = 'abcdefab-cdef-4abc-8def-abcdefabcdef';
+    let lettered: Row;
+    beforeEach(() => {
+      withUuidCanonicalization(db);
+      lettered = db.seed('inbox_thread_messages', {
+        id: LETTERED,
+        thread_id: team.id,
+        sender_kind: 'system',
+        content: 'hello again',
+      });
+    });
+    const upper = () => String(lettered.id).toUpperCase();
+    const mine = (emoji: string, reactor = wren) => ({
+      emoji,
+      count: 1,
+      reactors: [{ kind: 'sb', id: reactor.sbId }],
+      mine: true,
+    });
+
+    it('answers an add with what it stored, under the canonical id', async () => {
+      const answer = await react({ reactor: wren, messageId: upper(), emoji: '👍' });
+      expect(answer).toEqual({ messageId: LETTERED, reactions: [mine('👍')] });
+      expect(db.rows(REACTIONS_TABLE).map((r) => r.message_id)).toEqual([LETTERED]);
+    });
+
+    it('answers an idempotent add with what is already there', async () => {
+      await react({ reactor: wren, messageId: LETTERED, emoji: '👍' });
+      const answer = await react({ reactor: wren, messageId: upper(), emoji: '👍' });
+      expect(answer).toEqual({ messageId: LETTERED, reactions: [mine('👍')] });
+      expect(db.rows(REACTIONS_TABLE)).toHaveLength(1);
+    });
+
+    it('answers a removal with the reactions that remain', async () => {
+      await react({ reactor: wren, messageId: LETTERED, emoji: '👍' });
+      await react({ reactor: wren, messageId: LETTERED, emoji: '❤️' });
+      const answer = await react({ reactor: wren, messageId: upper(), emoji: '👍', remove: true });
+      expect(answer).toEqual({ messageId: LETTERED, reactions: [mine('❤️')] });
+      expect(db.rows(REACTIONS_TABLE).map((r) => r.emoji)).toEqual(['❤️']);
+    });
+
+    it('answers the same for the canonical spelling (the control)', async () => {
+      const answer = await react({ reactor: wren, messageId: LETTERED, emoji: '👍' });
+      expect(answer).toEqual({ messageId: LETTERED, reactions: [mine('👍')] });
     });
   });
 

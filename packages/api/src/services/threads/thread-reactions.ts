@@ -307,6 +307,10 @@ export async function reactToMessage(
   if (!message) {
     throw new ReactionRefusedError(404, 'message_not_found', 'That message is not in this thread');
   }
+  // The id as the database spells it. PostgreSQL takes a UUID in any case and
+  // answers in lowercase, so everything after the lookup, the write, the
+  // read-back and the answer, uses the row's id, never the request's.
+  const canonicalMessageId = (message as { id: string }).id;
 
   // Members only. A person who is not in the thread is reading it in the
   // background, and a background thread stays read-only for them.
@@ -357,13 +361,13 @@ export async function reactToMessage(
     const { error } = await client
       .from(REACTIONS_TABLE)
       .delete()
-      .eq('message_id', messageId)
+      .eq('message_id', canonicalMessageId)
       .eq(reactor.kind === 'sb' ? 'reactor_sb_id' : 'reactor_user_id', reactorId)
       .eq('emoji', emoji);
     if (error) throw new Error(`Failed to remove the reaction: ${error.message}`);
   } else {
     const { error } = await client.from(REACTIONS_TABLE).insert({
-      message_id: messageId,
+      message_id: canonicalMessageId,
       thread_id: threadRow.id,
       workspace_id: threadRow.workspace_id,
       ...reactorColumns,
@@ -393,6 +397,9 @@ export async function reactToMessage(
     }
   }
 
-  const reactions = await loadReactions(client, [messageId], reactorOf(reactor));
-  return { messageId, reactions: reactions.get(messageId) ?? [] };
+  const reactions = await loadReactions(client, [canonicalMessageId], reactorOf(reactor));
+  return {
+    messageId: canonicalMessageId,
+    reactions: reactions.get(canonicalMessageId) ?? [],
+  };
 }

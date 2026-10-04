@@ -59,3 +59,40 @@ export function withReactionsTable(db: FakePostgrest): FakePostgrest {
   };
   return db;
 }
+
+/**
+ * PostgreSQL takes a UUID in any case and stores and returns it in
+ * lowercase; a FakePostgrest compares strings exactly, so an uppercase id
+ * would find nothing there. This models the conversion on every table:
+ * filter and inserted values on `id` and `*_id` columns are lowercased, the
+ * way Lumen's PR #741 round-1 probes model it. Apply it after
+ * withReactionsTable, so the table's own checks see canonical values.
+ */
+export function withUuidCanonicalization(db: FakePostgrest): FakePostgrest {
+  const canonical = (column: string, value: unknown): unknown =>
+    (column === 'id' || column.endsWith('_id')) && typeof value === 'string'
+      ? value.toLowerCase()
+      : value;
+  const canonicalRow = (row: Row): Row =>
+    Object.fromEntries(
+      Object.entries(row).map(([column, value]) => [column, canonical(column, value)])
+    );
+  const originalFrom = db.from.bind(db);
+  db.from = (table: string) => {
+    const query = originalFrom(table);
+    const eq = query.eq.bind(query);
+    const inList = query.in.bind(query);
+    const insert = query.insert.bind(query);
+    query.eq = (column: string, value: unknown) => eq(column, canonical(column, value));
+    query.in = (column: string, values: unknown[]) =>
+      inList(
+        column,
+        values.map((value) => canonical(column, value))
+      );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (query as any).insert = (values: Row | Row[]) =>
+      insert(Array.isArray(values) ? values.map(canonicalRow) : canonicalRow(values));
+    return query;
+  };
+  return db;
+}
