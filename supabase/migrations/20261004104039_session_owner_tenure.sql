@@ -88,12 +88,20 @@ CREATE TABLE public.session_owner_tenures (
   registered_at timestamptz NOT NULL DEFAULT now(),
   ended_at timestamptz,
   end_evidence text CHECK (end_evidence IS NULL OR end_evidence ~ '^[a-z0-9_.:-]{1,100}$'),
+  -- The checked proof a successor trusts, kept on this record: the attestation
+  -- actually checked, and the exact state or machine scope it covered.
+  end_evidence_ref text CHECK (end_evidence_ref IS NULL OR length(end_evidence_ref) BETWEEN 1 AND 200),
+  end_evidence_scope jsonb,
   ended_by text CHECK (ended_by IS NULL OR length(ended_by) BETWEEN 1 AND 200),
   CONSTRAINT session_owner_tenures_open_iff_held CHECK ((state = 'held') = (ended_at IS NULL)),
   CONSTRAINT session_owner_tenures_capability_iff_held
     CHECK ((state = 'held') = (capability_hash IS NOT NULL)),
   CONSTRAINT session_owner_tenures_owner_pair
-    CHECK ((owner_pid IS NULL) = (owner_start_identity IS NULL))
+    CHECK ((owner_pid IS NULL) = (owner_start_identity IS NULL)),
+  -- A reconciled tenure is trusted by its successor only on the proof it keeps.
+  CONSTRAINT session_owner_tenures_reconciled_keeps_proof
+    CHECK (state IS DISTINCT FROM 'reconciled'
+           OR (end_evidence_ref IS NOT NULL AND end_evidence_scope IS NOT NULL))
 );
 
 -- At most one occupying tenure per session, whatever any caller believes.
@@ -117,8 +125,10 @@ CREATE TABLE public.session_turn_generations (
   PRIMARY KEY (session_id, epoch),
   CONSTRAINT session_turn_generations_finished_pair
     CHECK ((state = 'finished') = (finished_at IS NOT NULL)),
+  -- Null-safe: a NULL finish_evidence must fail this, not pass it as UNKNOWN.
   CONSTRAINT session_turn_generations_command_or_legacy_coverage
-    CHECK (command_uuid IS NOT NULL OR (state = 'finished' AND finish_evidence = 'reconciled_legacy_epoch'))
+    CHECK (command_uuid IS NOT NULL
+           OR (state = 'finished' AND finish_evidence IS NOT DISTINCT FROM 'reconciled_legacy_epoch'))
 );
 
 CREATE UNIQUE INDEX session_turn_generations_one_active
@@ -854,22 +864,49 @@ BEGIN
 END;
 $$;
 
+-- The legacy state a quiescence attestation is bound to: the session row's
+-- turn, provider session, lifecycle, turn stamps, and the row's own updated_at,
+-- so any write after the inspection (a live process reporting in included)
+-- makes the attestation stale.
+CREATE FUNCTION public.session_legacy_state(p_session public.sessions)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT jsonb_build_object(
+    'turnEpoch', p_session.turn_epoch,
+    'backendSessionId', p_session.backend_session_id,
+    'lifecycle', p_session.lifecycle,
+    'cliTurnAt', p_session.cli_turn_at,
+    'cliTurnStoppedAt', p_session.cli_turn_stopped_at,
+    'updatedAt', p_session.updated_at
+  )
+$$;
+
 -- reconcile_tenure (transition 6): clears an occupying tenure, or a session's
--- unverified history, on positive evidence of the right kind:
+-- unverified history, on positive process evidence of the right kind:
 --   boot_changed       the tenure recorded the machine it ran on (host_id) and
 --                      that machine's boot id, and the reconciler reports the
 --                      same machine with a different boot. A different machine,
 --                      a new host instance, or a missing machine or boot id is
---                      not this machine rebooting, and is refused. It clears
---                      process overlap only; effects stay with their commands.
+--                      not this machine rebooting, and is refused.
 --   owner_tree_gone    the reconciler verified the owner and its whole process
 --                      tree gone, by the attestation named in p_evidence_ref.
---   operator_decision  an authorized operator's decision, naming its evidence.
---                      It accepts effect risk and never proves a process gone,
---                      so it clears only unverified history (no tenure), and is
---                      refused for an existing tenure.
--- Clearing unverified history keeps a legacy turn_epoch and records coverage
--- for it, so the next owner's first turn names that epoch as its exact prior.
+--   legacy_quiescence_attested
+--                      unverified history only (no tenure): the reconciler, on
+--                      the machine p_current_host_id, verified that no process
+--                      of the session's legacy runtime is alive, by the
+--                      attestation named in p_evidence_ref, and binds it to the
+--                      legacy state it inspected (p_expected_legacy, the shape
+--                      session_legacy_state returns). Any difference from the
+--                      current row is stale_expectation.
+-- All of them clear process overlap only; effects stay with their commands,
+-- where an unknown outcome keeps holding the session. operator_decision is
+-- refused everywhere: it accepts effect risk and never proves a process gone.
+-- The tenure keeps the proof it was cleared on (end_evidence_ref and
+-- end_evidence_scope). Clearing unverified history keeps a legacy turn_epoch
+-- and records coverage for it, so the next owner's first turn names that epoch
+-- as its exact prior.
 CREATE FUNCTION public.reconcile_tenure(
   p_session_id uuid,
   p_expected_tenure_id uuid,
@@ -877,6 +914,7 @@ CREATE FUNCTION public.reconcile_tenure(
   p_current_boot_id text,
   p_current_host_id text,
   p_evidence_ref text,
+  p_expected_legacy jsonb,
   p_authority text,
   p_host_instance_id text,
   p_protocol integer
@@ -886,27 +924,62 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   v_refusal jsonb;
-  v_session record;
+  v_session public.sessions%ROWTYPE;
+  v_legacy jsonb;
+  v_turn_at timestamptz;
+  v_turn_stopped_at timestamptz;
+  v_updated_at timestamptz;
   v_tenure record;
+  v_ref text;
+  v_scope jsonb;
   v_id uuid;
 BEGIN
   v_refusal := public.session_admission_mode_refusal(p_protocol);
   IF v_refusal IS NOT NULL THEN RETURN v_refusal; END IF;
-  IF p_evidence IS NULL OR p_evidence NOT IN ('boot_changed', 'owner_tree_gone', 'operator_decision')
+  IF p_evidence IS NULL
+     OR p_evidence NOT IN ('boot_changed', 'owner_tree_gone', 'legacy_quiescence_attested', 'operator_decision')
      OR length(COALESCE(p_authority, '')) NOT BETWEEN 1 AND 200
      OR length(COALESCE(p_host_instance_id, '')) NOT BETWEEN 1 AND 200 THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'evidence');
   END IF;
+  IF p_evidence = 'operator_decision' THEN
+    RETURN jsonb_build_object('outcome', 'refused', 'reason', 'operator_decision_cannot_prove_quiescence');
+  END IF;
   IF p_evidence = 'boot_changed' AND length(COALESCE(p_current_boot_id, '')) NOT BETWEEN 1 AND 200 THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'boot');
   END IF;
-  IF p_evidence IN ('owner_tree_gone', 'operator_decision')
+  IF p_evidence IN ('owner_tree_gone', 'legacy_quiescence_attested')
      AND length(COALESCE(p_evidence_ref, '')) NOT BETWEEN 1 AND 200 THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'evidenceRef');
   END IF;
+  IF p_evidence = 'legacy_quiescence_attested' THEN
+    IF length(COALESCE(p_current_host_id, '')) NOT BETWEEN 1 AND 200 THEN
+      RETURN jsonb_build_object('outcome', 'invalid', 'field', 'host');
+    END IF;
+    -- Every field named, none extra, each a string or null: an attestation
+    -- binds the state its reconciler read, not a subset it chose.
+    IF p_expected_legacy IS NULL OR jsonb_typeof(p_expected_legacy) IS DISTINCT FROM 'object'
+       OR (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(p_expected_legacy) AS k)
+          IS DISTINCT FROM ARRAY['backendSessionId', 'cliTurnAt', 'cliTurnStoppedAt', 'lifecycle',
+                                 'turnEpoch', 'updatedAt']
+       OR EXISTS (SELECT 1 FROM jsonb_each(p_expected_legacy) e
+                   WHERE jsonb_typeof(e.value) NOT IN ('string', 'null')) THEN
+      RETURN jsonb_build_object('outcome', 'invalid', 'field', 'expectedLegacy');
+    END IF;
+    -- Timestamps compare as instants, so the client's spelling of one is free.
+    -- One that does not parse is invalid, never read as null.
+    BEGIN
+      v_turn_at := (p_expected_legacy->>'cliTurnAt')::timestamptz;
+      v_turn_stopped_at := (p_expected_legacy->>'cliTurnStoppedAt')::timestamptz;
+      v_updated_at := (p_expected_legacy->>'updatedAt')::timestamptz;
+    EXCEPTION WHEN data_exception THEN
+      RETURN jsonb_build_object('outcome', 'invalid', 'field', 'expectedLegacy');
+    END;
+  ELSIF p_expected_legacy IS NOT NULL THEN
+    RETURN jsonb_build_object('outcome', 'invalid', 'field', 'expectedLegacy');
+  END IF;
 
-  SELECT s.id, s.owner_tenure_id, s.turn_epoch INTO v_session
-    FROM public.sessions s WHERE s.id = p_session_id FOR UPDATE;
+  SELECT * INTO v_session FROM public.sessions s WHERE s.id = p_session_id FOR UPDATE;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('outcome', 'session_missing');
   END IF;
@@ -915,14 +988,28 @@ BEGIN
   END IF;
 
   IF v_session.owner_tenure_id IS NULL THEN
-    IF p_evidence <> 'operator_decision' THEN
-      RETURN jsonb_build_object('outcome', 'refused', 'reason', 'unverified_history_needs_operator');
+    IF p_evidence <> 'legacy_quiescence_attested' THEN
+      RETURN jsonb_build_object('outcome', 'refused', 'reason', 'unverified_history_needs_legacy_attestation');
     END IF;
-    -- The decision becomes a reconciled tenure: the next owner names it.
+    v_legacy := public.session_legacy_state(v_session);
+    IF v_session.turn_epoch IS DISTINCT FROM p_expected_legacy->>'turnEpoch'
+       OR v_session.backend_session_id IS DISTINCT FROM p_expected_legacy->>'backendSessionId'
+       OR v_session.lifecycle IS DISTINCT FROM p_expected_legacy->>'lifecycle'
+       OR v_session.cli_turn_at IS DISTINCT FROM v_turn_at
+       OR v_session.cli_turn_stopped_at IS DISTINCT FROM v_turn_stopped_at
+       OR v_session.updated_at IS DISTINCT FROM v_updated_at THEN
+      RETURN jsonb_build_object('outcome', 'stale_expectation', 'tenureId', NULL, 'legacy', v_legacy);
+    END IF;
+    -- The attestation becomes a reconciled tenure that keeps it: the next
+    -- owner names this tenure, and the proof, the machine it was checked on
+    -- and the state it covered stay on it. Nothing ran under this tenure, so
+    -- it records no host_id of its own.
     INSERT INTO public.session_owner_tenures (
-      session_id, mode, state, host_instance_id, ended_at, end_evidence, ended_by
+      session_id, mode, state, host_instance_id, ended_at, end_evidence,
+      end_evidence_ref, end_evidence_scope, ended_by
     ) VALUES (
-      p_session_id, 'server_hosted', 'reconciled', p_host_instance_id, now(), p_evidence, p_authority
+      p_session_id, 'server_hosted', 'reconciled', p_host_instance_id, now(), p_evidence,
+      p_evidence_ref, jsonb_build_object('reconcilerHostId', p_current_host_id, 'legacy', v_legacy), p_authority
     )
     RETURNING id INTO v_id;
     UPDATE public.sessions SET owner_tenure_id = v_id WHERE id = p_session_id;
@@ -939,11 +1026,11 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'reconciled', 'tenureId', v_id);
   END IF;
 
-  IF p_evidence = 'operator_decision' THEN
-    RETURN jsonb_build_object('outcome', 'refused', 'reason', 'operator_decision_cannot_prove_quiescence');
+  IF p_evidence = 'legacy_quiescence_attested' THEN
+    RETURN jsonb_build_object('outcome', 'refused', 'reason', 'legacy_attestation_needs_unverified_history');
   END IF;
 
-  SELECT t.id, t.state, t.host_boot_id, t.host_id INTO v_tenure
+  SELECT t.id, t.state, t.host_boot_id, t.host_id, t.owner_pid, t.owner_start_identity INTO v_tenure
     FROM public.session_owner_tenures t
    WHERE t.id = v_session.owner_tenure_id AND t.session_id = p_session_id;
   IF NOT FOUND OR v_tenure.state NOT IN ('held', 'recovery_required') THEN
@@ -957,21 +1044,26 @@ BEGIN
     IF v_tenure.host_boot_id IS NULL OR v_tenure.host_boot_id = p_current_boot_id THEN
       RETURN jsonb_build_object('outcome', 'refused', 'reason', 'boot_evidence_absent_or_same');
     END IF;
+    v_ref := COALESCE(p_evidence_ref, 'boot_changed:' || p_current_host_id || ':' || p_current_boot_id);
+    v_scope := jsonb_build_object('hostId', v_tenure.host_id, 'recordedBootId', v_tenure.host_boot_id,
+                                  'currentBootId', p_current_boot_id);
+  ELSE
+    v_ref := p_evidence_ref;
+    v_scope := jsonb_build_object('hostId', v_tenure.host_id, 'ownerPid', v_tenure.owner_pid,
+                                  'ownerStartIdentity', v_tenure.owner_start_identity,
+                                  'reconcilerHostId', p_current_host_id);
   END IF;
 
   UPDATE public.session_owner_tenures
      SET state = 'reconciled', ended_at = COALESCE(ended_at, now()), end_evidence = p_evidence,
+         end_evidence_ref = v_ref, end_evidence_scope = v_scope,
          ended_by = p_authority, capability_hash = NULL
    WHERE id = v_tenure.id;
   -- Process overlap is cleared for every spawn under this tenure, uncertain
   -- and contradictory ones included: this evidence is about the whole tree,
-  -- not one record. Effects stay on their commands, where an unknown outcome
-  -- keeps holding the session.
+  -- not one record.
   UPDATE public.session_turn_invocations i
-     SET resolution = 'tree_quiescent',
-         resolution_evidence_ref = COALESCE(
-           p_evidence_ref, 'boot_changed:' || p_current_host_id || ':' || p_current_boot_id
-         )
+     SET resolution = 'tree_quiescent', resolution_evidence_ref = v_ref
     FROM public.session_turn_generations g
    WHERE g.session_id = p_session_id AND g.tenure_id = v_tenure.id
      AND i.session_id = g.session_id AND i.epoch = g.epoch
@@ -1004,5 +1096,7 @@ REVOKE ALL ON FUNCTION public.record_invocation(uuid, uuid, text, text, text, te
 GRANT EXECUTE ON FUNCTION public.record_invocation(uuid, uuid, text, text, text, text, text, jsonb, integer) TO service_role;
 REVOKE ALL ON FUNCTION public.mark_tenure_lost(uuid, uuid, text, text, integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.mark_tenure_lost(uuid, uuid, text, text, integer) TO service_role;
-REVOKE ALL ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, text, integer) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, text, integer) TO service_role;
+REVOKE ALL ON FUNCTION public.session_legacy_state(public.sessions) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.session_legacy_state(public.sessions) TO service_role;
+REVOKE ALL ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, jsonb, text, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, jsonb, text, text, integer) TO service_role;

@@ -32,6 +32,7 @@ import {
   registerTenure,
   releaseTenure,
   type InvocationRecord,
+  type LegacySessionState,
   type TenureHolder,
   type TenureMode,
 } from './tenure-admission';
@@ -998,6 +999,62 @@ describe('durable command admission', () => {
       }
     }
 
+    // Created while the database was legacy, so it has no admission origin;
+    // `fields` are legacy writes, such as a running turn.
+    async function legacySession(fields: Record<string, unknown> = {}): Promise<string> {
+      await setMode('legacy');
+      try {
+        const sessionId = await newSession(suiteSbId);
+        if (Object.keys(fields).length) {
+          const { error } = await supabase.from('sessions').update(fields).eq('id', sessionId);
+          if (error) throw new Error(`legacy update failed: ${error.message}`);
+        }
+        return sessionId;
+      } finally {
+        await setMode('conditional');
+      }
+    }
+
+    // What a reconciler reads before it attests: the row as it stands.
+    async function inspectLegacy(sessionId: string): Promise<LegacySessionState> {
+      const { data, error } = await supabase
+        .from('sessions')
+        .select(
+          'turn_epoch, backend_session_id, lifecycle, cli_turn_at, cli_turn_stopped_at, updated_at'
+        )
+        .eq('id', sessionId)
+        .single();
+      if (error || !data) throw new Error(`inspect failed: ${error?.message}`);
+      return {
+        turnEpoch: data.turn_epoch,
+        backendSessionId: data.backend_session_id,
+        lifecycle: data.lifecycle,
+        cliTurnAt: data.cli_turn_at,
+        cliTurnStoppedAt: data.cli_turn_stopped_at,
+        updatedAt: data.updated_at,
+      };
+    }
+
+    const LEGACY_PROOF = 'legacy-quiescence-attestation-fixture';
+
+    function attestLegacy(
+      sessionId: string,
+      expectedLegacy: LegacySessionState | undefined,
+      overrides: Partial<Parameters<typeof reconcileTenure>[1]> = {}
+    ) {
+      return reconcileTenure(supabase, {
+        sessionId,
+        expectedTenureId: null,
+        evidence: 'legacy_quiescence_attested',
+        currentHostId: HOST.hostId,
+        evidenceRef: LEGACY_PROOF,
+        expectedLegacy,
+        authority: 'reconciler-fixture',
+        hostInstanceId: HOST.instanceId,
+        ...overrides,
+      });
+    }
+
     it('refuses in legacy mode', async () => {
       const sessionId = await newSession(suiteSbId);
       await setMode('legacy');
@@ -1446,35 +1503,32 @@ describe('durable command admission', () => {
       ).toEqual({ outcome: 'refused', reason: 'machine_scope_absent_or_different' });
     });
 
-    it('clears unverified history only by an operator decision', async () => {
-      await setMode('legacy');
-      let legacy: string;
-      try {
-        legacy = await newSession(suiteSbId);
-      } finally {
-        await setMode('conditional');
-      }
-      const reconcile = (evidence: 'boot_changed' | 'operator_decision') =>
+    it('clears unverified history only by a legacy quiescence attestation', async () => {
+      const legacy = await legacySession();
+      const reconcile = (evidence: 'boot_changed' | 'owner_tree_gone') =>
         reconcileTenure(supabase, {
           sessionId: legacy,
           expectedTenureId: null,
           evidence,
           currentBootId: 'boot-fixture-9',
-          evidenceRef: 'operator-window-fixture',
-          authority: 'operator-fixture',
+          currentHostId: HOST.hostId,
+          evidenceRef: 'reconciler-attestation-fixture',
+          authority: 'reconciler-fixture',
           hostInstanceId: HOST.instanceId,
         });
-      expect(await reconcile('boot_changed')).toEqual({
-        outcome: 'refused',
-        reason: 'unverified_history_needs_operator',
-      });
-      const decided = await reconcile('operator_decision');
-      if (decided.outcome !== 'reconciled') throw new Error(`unexpected ${decided.outcome}`);
+      for (const evidence of ['boot_changed', 'owner_tree_gone'] as const) {
+        expect(await reconcile(evidence)).toEqual({
+          outcome: 'refused',
+          reason: 'unverified_history_needs_legacy_attestation',
+        });
+      }
+      const attested = await attestLegacy(legacy, await inspectLegacy(legacy));
+      if (attested.outcome !== 'reconciled') throw new Error(`unexpected ${attested.outcome}`);
       const { capabilityHash } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId: legacy,
-          expected: { kind: 'reconciled', tenureId: decided.tenureId },
+          expected: { kind: 'reconciled', tenureId: attested.tenureId },
           mode: 'server_hosted',
           capabilityHash,
           host: HOST,
@@ -1626,23 +1680,10 @@ describe('durable command admission', () => {
       });
 
       it('B5: a reconciled legacy epoch admits its first conditional turn, naming that epoch', async () => {
-        await setMode('legacy');
-        let legacy: string;
-        try {
-          legacy = await newSession(suiteSbId);
-        } finally {
-          await setMode('conditional');
-        }
         const oldEpoch = randomUUID();
-        await supabase.from('sessions').update({ turn_epoch: oldEpoch }).eq('id', legacy);
-        const decided = await reconcileTenure(supabase, {
-          sessionId: legacy,
-          expectedTenureId: null,
-          evidence: 'operator_decision',
-          evidenceRef: 'operator-window-fixture',
-          authority: 'operator-fixture',
-          hostInstanceId: HOST.instanceId,
-        });
+        const legacy = await legacySession({ turn_epoch: oldEpoch });
+        // Cleared by the process proof, bound to the state the reconciler read.
+        const decided = await attestLegacy(legacy, await inspectLegacy(legacy));
         if (decided.outcome !== 'reconciled') throw new Error(`unexpected ${decided.outcome}`);
         const { capability, capabilityHash } = mintTenureCapability();
         const r = await registerTenure(supabase, {
@@ -1728,6 +1769,317 @@ describe('durable command admission', () => {
         expect((await scoped('machine-a', 'boot-a2', 'restarted-instance')).outcome).toBe(
           'reconciled'
         );
+      });
+    });
+
+    // Round 3 (Lumen 71956b3f): the legacy reconciliation boundary.
+    describe('review round 3', () => {
+      const RUNNING = {
+        lifecycle: 'running',
+        backend_session_id: 'fixture-native-session',
+      };
+
+      async function tenureProof(tenureId: string) {
+        const { data, error } = await supabase
+          .from('session_owner_tenures')
+          .select('state, end_evidence, end_evidence_ref, end_evidence_scope')
+          .eq('id', tenureId)
+          .single();
+        if (error || !data) throw new Error(`tenure read failed: ${error?.message}`);
+        return data;
+      }
+
+      it('C1: accepting effect risk cannot make a running legacy session executable', async () => {
+        const epoch = randomUUID();
+        const legacy = await legacySession({ ...RUNNING, turn_epoch: epoch });
+        const { capabilityHash } = mintTenureCapability();
+        const registerNever = () =>
+          registerTenure(supabase, {
+            sessionId: legacy,
+            expected: { kind: 'never_owned' },
+            mode: 'interactive_wrapper',
+            capabilityHash,
+            host: HOST,
+          });
+        expect(await registerNever()).toEqual({ outcome: 'unverified' });
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: legacy,
+            expectedTenureId: null,
+            evidence: 'operator_decision',
+            evidenceRef: 'effect-risk-acceptance-fixture',
+            authority: 'operator-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'operator_decision_cannot_prove_quiescence' });
+        // Nothing was written: no tenure, no pointer, still unverified.
+        const { data: tenures } = await supabase
+          .from('session_owner_tenures')
+          .select('id')
+          .eq('session_id', legacy);
+        expect(tenures).toEqual([]);
+        const { data: row } = await supabase
+          .from('sessions')
+          .select('owner_tenure_id')
+          .eq('id', legacy)
+          .single();
+        expect(row).toEqual({ owner_tenure_id: null });
+        expect(await registerNever()).toEqual({ outcome: 'unverified' });
+      });
+
+      it('C1: a legacy attestation holds only for the exact state it inspected', async () => {
+        const epoch = randomUUID();
+        const legacy = await legacySession({ ...RUNNING, turn_epoch: epoch });
+        const inspected = await inspectLegacy(legacy);
+        expect(inspected).toMatchObject({
+          turnEpoch: epoch,
+          lifecycle: 'running',
+          backendSessionId: 'fixture-native-session',
+        });
+
+        // The legacy process writes after the inspection: the proof is stale,
+        // and the reply carries the state to inspect again.
+        const { error: writeErr } = await supabase
+          .from('sessions')
+          .update({ context: 'invented progress note' })
+          .eq('id', legacy);
+        expect(writeErr).toBeNull();
+        const current = await inspectLegacy(legacy);
+        expect(current.updatedAt).not.toEqual(inspected.updatedAt);
+        const stale = await attestLegacy(legacy, inspected);
+        expect(stale).toMatchObject({ outcome: 'stale_expectation', tenureId: null });
+        if (stale.outcome !== 'stale_expectation' || !stale.legacy) throw new Error('no state');
+        expect(stale.legacy).toMatchObject({
+          turnEpoch: epoch,
+          lifecycle: 'running',
+          backendSessionId: 'fixture-native-session',
+        });
+        expect(Date.parse(stale.legacy.updatedAt!)).toBe(Date.parse(current.updatedAt!));
+
+        // Every field is bound: one changed field is stale, null or not.
+        const changed: LegacySessionState[] = [
+          { ...current, turnEpoch: randomUUID() },
+          { ...current, turnEpoch: null },
+          { ...current, backendSessionId: 'other-native-session' },
+          { ...current, backendSessionId: null },
+          { ...current, lifecycle: 'idle' },
+          { ...current, cliTurnAt: '2026-01-01T00:00:00Z' },
+          { ...current, cliTurnStoppedAt: '2026-01-01T00:00:00Z' },
+          { ...current, updatedAt: '2026-01-01T00:00:00Z' },
+          { ...current, updatedAt: null },
+        ];
+        for (const expectedLegacy of changed) {
+          expect(await attestLegacy(legacy, expectedLegacy)).toMatchObject({
+            outcome: 'stale_expectation',
+          });
+        }
+
+        // The binding names every field and nothing else; an instant that does
+        // not parse is invalid, never read as the null it might match.
+        const { updatedAt: _omitted, ...missing } = current;
+        const malformed: unknown[] = [
+          missing,
+          { ...current, extra: null },
+          { ...current, lifecycle: 7 },
+          { ...current, cliTurnAt: 'not-an-instant' },
+        ];
+        for (const expectedLegacy of malformed) {
+          expect(await attestLegacy(legacy, expectedLegacy as LegacySessionState)).toEqual({
+            outcome: 'invalid',
+            field: 'expectedLegacy',
+          });
+        }
+        expect(await attestLegacy(legacy, undefined)).toEqual({
+          outcome: 'invalid',
+          field: 'expectedLegacy',
+        });
+        expect(await attestLegacy(legacy, current, { evidenceRef: undefined })).toEqual({
+          outcome: 'invalid',
+          field: 'evidenceRef',
+        });
+        expect(await attestLegacy(legacy, current, { currentHostId: undefined })).toEqual({
+          outcome: 'invalid',
+          field: 'host',
+        });
+        // Another kind of evidence carries no legacy binding.
+        expect(
+          await attestLegacy(legacy, current, {
+            evidence: 'owner_tree_gone',
+            evidenceRef: 'reconciler-attestation-fixture',
+          })
+        ).toEqual({ outcome: 'invalid', field: 'expectedLegacy' });
+        const { data: before } = await supabase
+          .from('session_owner_tenures')
+          .select('id')
+          .eq('session_id', legacy);
+        expect(before).toEqual([]);
+
+        // The proof bound to the state as it stands clears the history, and
+        // the next owner's first turn names the legacy epoch.
+        const attested = await attestLegacy(legacy, current);
+        if (attested.outcome !== 'reconciled') throw new Error(`unexpected ${attested.outcome}`);
+        const { capability, capabilityHash } = mintTenureCapability();
+        const r = await registerTenure(supabase, {
+          sessionId: legacy,
+          expected: { kind: 'reconciled', tenureId: attested.tenureId },
+          mode: 'interactive_wrapper',
+          capabilityHash,
+          host: HOST,
+        });
+        if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+        const command = await queued(legacy);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: legacy,
+            holder: { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId },
+            expectedPriorEpoch: epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toMatchObject({ outcome: 'admitted' });
+      });
+
+      it('C1: a legacy attestation cannot retire a registered tenure', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        expect(
+          await attestLegacy(sessionId, await inspectLegacy(sessionId), {
+            expectedTenureId: holder.tenureId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'legacy_attestation_needs_unverified_history' });
+        expect((await tenureProof(holder.tenureId)).state).toBe('held');
+      });
+
+      it('C2: the reconciled tenure keeps the proof and the scope it covered', async () => {
+        // Legacy: the attestation and the exact state it was bound to.
+        const epoch = randomUUID();
+        const legacy = await legacySession({ ...RUNNING, turn_epoch: epoch });
+        const inspected = await inspectLegacy(legacy);
+        const attested = await attestLegacy(legacy, inspected);
+        if (attested.outcome !== 'reconciled') throw new Error(`unexpected ${attested.outcome}`);
+        const legacyProof = await tenureProof(attested.tenureId);
+        expect(legacyProof).toMatchObject({
+          state: 'reconciled',
+          end_evidence: 'legacy_quiescence_attested',
+          end_evidence_ref: LEGACY_PROOF,
+          end_evidence_scope: {
+            reconcilerHostId: HOST.hostId,
+            legacy: {
+              turnEpoch: epoch,
+              lifecycle: 'running',
+              backendSessionId: 'fixture-native-session',
+              cliTurnAt: inspected.cliTurnAt,
+              cliTurnStoppedAt: inspected.cliTurnStoppedAt,
+            },
+          },
+        });
+        const scope = legacyProof.end_evidence_scope as { legacy: LegacySessionState };
+        expect(Object.keys(scope).sort()).toEqual(['legacy', 'reconcilerHostId']);
+        expect(Date.parse(scope.legacy.updatedAt!)).toBe(Date.parse(inspected.updatedAt!));
+
+        // A tenure with no spawns at all still keeps its owner-tree proof.
+        const quiet = await newSession(suiteSbId);
+        const quietHolder = await register(quiet);
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: quiet,
+            expectedTenureId: quietHolder.tenureId,
+            evidence: 'owner_tree_gone',
+            currentHostId: HOST.hostId,
+            evidenceRef: 'owner-tree-attestation-fixture',
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'reconciled', tenureId: quietHolder.tenureId });
+        expect(await tenureProof(quietHolder.tenureId)).toEqual({
+          state: 'reconciled',
+          end_evidence: 'owner_tree_gone',
+          end_evidence_ref: 'owner-tree-attestation-fixture',
+          end_evidence_scope: {
+            hostId: HOST.hostId,
+            ownerPid: null,
+            ownerStartIdentity: null,
+            reconcilerHostId: HOST.hostId,
+          },
+        });
+
+        // Boot evidence keeps the machine and both boots it compared.
+        const rebooted = await newSession(suiteSbId);
+        const rebootedHolder = await register(rebooted);
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: rebooted,
+            expectedTenureId: rebootedHolder.tenureId,
+            evidence: 'boot_changed',
+            currentBootId: 'boot-fixture-2',
+            currentHostId: HOST.hostId,
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'reconciled', tenureId: rebootedHolder.tenureId });
+        expect(await tenureProof(rebootedHolder.tenureId)).toEqual({
+          state: 'reconciled',
+          end_evidence: 'boot_changed',
+          end_evidence_ref: `boot_changed:${HOST.hostId}:boot-fixture-2`,
+          end_evidence_scope: {
+            hostId: HOST.hostId,
+            recordedBootId: HOST.bootId,
+            currentBootId: 'boot-fixture-2',
+          },
+        });
+      });
+
+      it('C2: a reconciled tenure cannot be stored without its proof', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const row = {
+          session_id: sessionId,
+          mode: 'server_hosted',
+          state: 'reconciled',
+          host_instance_id: HOST.instanceId,
+          ended_at: new Date().toISOString(),
+          end_evidence: 'owner_tree_gone',
+          ended_by: 'reconciler-fixture',
+        };
+        for (const proof of [
+          {},
+          { end_evidence_ref: 'owner-tree-attestation-fixture' },
+          { end_evidence_scope: { hostId: HOST.hostId } },
+        ]) {
+          const { error } = await supabase
+            .from('session_owner_tenures')
+            .insert({ ...row, ...proof });
+          expect(error?.code).toBe('23514');
+          expect(error?.message).toContain('session_owner_tenures_reconciled_keeps_proof');
+        }
+        // Control: the same row with both is accepted.
+        const { error } = await supabase.from('session_owner_tenures').insert({
+          ...row,
+          end_evidence_ref: 'owner-tree-attestation-fixture',
+          end_evidence_scope: { hostId: HOST.hostId },
+        });
+        expect(error).toBeNull();
+      });
+
+      it('C3: a commandless generation needs legacy coverage evidence, null included', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const commandless = (finishEvidence: string | null) =>
+          supabase.from('session_turn_generations').insert({
+            session_id: sessionId,
+            epoch: randomUUID(),
+            tenure_id: holder.tenureId,
+            command_uuid: null,
+            state: 'finished',
+            finished_at: new Date().toISOString(),
+            finish_evidence: finishEvidence,
+          });
+        for (const finishEvidence of [null, 'cli_stop']) {
+          const { error } = await commandless(finishEvidence);
+          expect(error?.code).toBe('23514');
+          expect(error?.message).toContain('session_turn_generations_command_or_legacy_coverage');
+        }
+        // Control: the coverage row itself is accepted.
+        expect((await commandless('reconciled_legacy_epoch')).error).toBeNull();
       });
     });
   });
