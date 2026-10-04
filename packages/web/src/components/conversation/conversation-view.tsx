@@ -53,6 +53,8 @@ export interface ConversationViewProps {
   onReadThrough?: (message: ConversationMessage) => void;
   /** Offered while unread messages remain above: skip them, explicitly. */
   onMarkAllRead?: () => void;
+  /** Reacting is open to the viewer here; without it reactions are read-only. */
+  onReact?: (messageId: string, emoji: string) => void;
   /** Shown above the first message once there is no older history. */
   intro?: ReactNode;
   /** Shown when there are no messages at all. */
@@ -81,6 +83,7 @@ export function ConversationView({
   onLoadOlder,
   onReadThrough,
   onMarkAllRead,
+  onReact,
   intro,
   empty,
   className,
@@ -337,6 +340,7 @@ export function ConversationView({
                     key={item.key}
                     message={item.message}
                     continuation={item.continuation}
+                    onReact={onReact}
                   />
                 );
               })}

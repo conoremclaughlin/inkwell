@@ -1,26 +1,32 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, Info, MessageSquareDashed } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
+  THREAD_REACTIONS_PATH,
   threadMessagesPath,
   type ThreadMessagesResponse,
+  type ThreadReactionRequest,
+  type ThreadReactionResponse,
   type ThreadSpine,
 } from '@inklabs/shared/stories/threads-api';
 import { displayTitle, liveAgentsOf, spineStatus } from '@inklabs/shared/stories/thread-browsing';
 import {
   creatorLabel,
   formatDayLabel,
+  reactionToggle,
   readableThrough,
   sbAuthor,
   toConversationMessage,
   unreadBeyondLoaded,
   useThreadHistory,
+  withReactionOverrides,
   type ConversationMessage,
+  type ConversationReaction,
   type NameFor,
 } from '@inklabs/shared/stories/thread-viewing';
-import { apiGet, useWorkspaceApiQuery } from '@/lib/api';
+import { apiGet, useApiPost, useQueryClient, useWorkspaceApiQuery } from '@/lib/api';
 import { AvatarStack } from '@/components/conversation/author-avatar';
 import { ConversationView } from '@/components/conversation/conversation-view';
 import type { ReadCursorStore } from './read-cursors';
@@ -95,9 +101,54 @@ export function ThreadConversation({
     openingCursor: cursors.cursorFor(key),
   });
 
+  // A reaction request answers with the message's reactions. Older pages are
+  // never refetched, so that answer stands in until a newest page carries
+  // the message again.
+  const [reactionOverrides, setReactionOverrides] = useState<
+    ReadonlyMap<string, ConversationReaction[]>
+  >(() => new Map());
+  useEffect(() => {
+    const refreshed = new Set((data?.messages ?? []).map((m) => m.id));
+    setReactionOverrides((current) => {
+      if (![...current.keys()].some((id) => refreshed.has(id))) return current;
+      return new Map([...current].filter(([id]) => !refreshed.has(id)));
+    });
+  }, [data, dataUpdatedAt]);
+
   const messages = useMemo<ConversationMessage[]>(
-    () => history.messages.map((m) => toConversationMessage(m, nameFor)),
-    [history.messages, nameFor]
+    () =>
+      withReactionOverrides(
+        history.messages.map((m) => toConversationMessage(m, nameFor)),
+        reactionOverrides
+      ),
+    [history.messages, nameFor, reactionOverrides]
+  );
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  // Members only (spec inkling-reactions): a person reading a thread they are
+  // not in sees its reactions but is offered nothing. The server refuses
+  // anyone else regardless.
+  const member = hasThread && (spine.thread?.people ?? []).some((person) => person.isOwn);
+  const queryClient = useQueryClient();
+  const react = useApiPost<ThreadReactionResponse, ThreadReactionRequest>(THREAD_REACTIONS_PATH, {
+    onSuccess: (result) => {
+      setReactionOverrides((current) =>
+        new Map(current).set(
+          result.messageId,
+          result.reactions.map((r) => ({ emoji: r.emoji, count: r.count, mine: r.mine }))
+        )
+      );
+      void queryClient.invalidateQueries({ queryKey: ['thread-messages', key] });
+    },
+  });
+  const reactMutate = react.mutate;
+  const onReact = useCallback(
+    (messageId: string, emoji: string) => {
+      const current = messagesRef.current.find((m) => m.id === messageId)?.reactions;
+      reactMutate({ threadKey: key, messageId, ...reactionToggle(emoji, current) });
+    },
+    [key, reactMutate]
   );
 
   // Reading is acknowledged only as far as the history is whole. The
@@ -197,6 +248,12 @@ export function ThreadConversation({
         </button>
       </header>
 
+      {react.isError && (
+        <div className="shrink-0 border-b bg-destructive/10 px-4 py-1.5 text-center text-[11px] text-destructive">
+          Couldn&apos;t save that reaction: {react.error.message}
+        </div>
+      )}
+
       {olderError && (
         <div className="shrink-0 border-b bg-destructive/10 px-4 py-1.5 text-center text-[11px] text-destructive">
           {olderError}
@@ -214,6 +271,7 @@ export function ThreadConversation({
         onLoadOlder={() => void loadOlder()}
         onReadThrough={onReadThrough}
         onMarkAllRead={markAllRead}
+        onReact={member ? onReact : undefined}
         intro={
           <div className="px-4 pb-2 pt-8 md:px-6">
             <ParticipantCluster participants={spine.participants} nameFor={nameFor} />

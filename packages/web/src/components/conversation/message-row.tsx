@@ -11,6 +11,7 @@ import {
   type ConversationMessage,
 } from '@inklabs/shared/stories/thread-viewing';
 import { MessageMarkdown } from './message-markdown';
+import { ReactionChips } from './reaction-chips';
 
 function FoldableBody({ message }: { message: ConversationMessage }) {
   const foldable = !message.streaming && shouldFold(message.body);
@@ -53,9 +54,12 @@ function FoldableBody({ message }: { message: ConversationMessage }) {
 export const MessageRow = memo(function MessageRow({
   message,
   continuation = false,
+  onReact,
 }: {
   message: ConversationMessage;
   continuation?: boolean;
+  /** The viewer may react here: chips toggle and a picker is offered. */
+  onReact?: (messageId: string, emoji: string) => void;
 }) {
   const { author } = message;
   const clock = formatClockTime(message.createdAt);
@@ -152,6 +156,7 @@ export const MessageRow = memo(function MessageRow({
           </div>
         )}
         <FoldableBody message={message} />
+        <ReactionChips messageId={message.id} reactions={message.reactions} onToggle={onReact} />
       </div>
     </div>
   );
