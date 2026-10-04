@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   FrameFanout,
+  FrameReadPendingError,
   FrameStreamEnded,
   FrameSubscribeRefusal,
   type FrameFanoutLimits,
@@ -204,9 +205,25 @@ describe('FrameFanout', () => {
     const source = fanout();
     const reader = source.subscribe();
     const first = reader.next();
-    await expect(reader.next()).rejects.toThrow('already pending');
+    const duplicate = reader.next();
+    await expect(duplicate).rejects.toBeInstanceOf(FrameReadPendingError);
+    await expect(duplicate).rejects.not.toBeInstanceOf(FrameStreamEnded);
+    expect(reader.endReason).toBeUndefined();
     source.publish('first read survives');
     expect(await first).toEqual({ done: false, value: 'first read survives' });
+    reader.close();
+  });
+
+  it('keeps queued final frames and subscriptions usable across turn boundaries', async () => {
+    const source = fanout();
+    const reader = source.subscribe();
+    // Encoded fixture frames only: the host, not this primitive, supplies
+    // completion evidence. No close() belongs at a normal turn boundary.
+    source.publish('turn-one:final');
+    source.publish('turn-two:partial');
+    expect(await reader.next()).toEqual({ done: false, value: 'turn-one:final' });
+    expect(await reader.next()).toEqual({ done: false, value: 'turn-two:partial' });
+    expect(reader.endReason).toBeUndefined();
     reader.close();
   });
 

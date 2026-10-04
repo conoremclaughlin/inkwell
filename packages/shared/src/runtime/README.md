@@ -150,6 +150,13 @@ Oversized publishes return `too_large` without delivering to anyone, and must
 be handled rather than treated as success. Overflow/source closure require the
 host's authorized replay/snapshot recovery, not skipping ahead.
 
+`FrameFanout.close()` is for failure and teardown only. It does not drain: even
+a queued final frame is discarded and readers fail with `source_closed`. Keep
+the fanout open across normal turns; completion comes from a durable record,
+not source closure. A concurrent second `next()` rejects with
+`FrameReadPendingError`, which is consumer misuse, not a stream ending. The
+original pending read and the subscription remain usable.
+
 This primitive is not yet wired to hosted sessions or the CLI. It retains no
 history, grants no participant access, creates no cursors, and supplies no
 generation fencing or replay/live stitching. The existing observer projection

@@ -30,6 +30,14 @@ export class FrameSubscribeRefusal extends Error {
   }
 }
 
+/** Consumer misuse, not a stream end: the existing pending read stays usable. */
+export class FrameReadPendingError extends Error {
+  constructor() {
+    super('A live frame read is already pending');
+    this.name = 'FrameReadPendingError';
+  }
+}
+
 export interface FrameSubscription extends AsyncIterableIterator<string> {
   /** Always resolves, including while a consumer is busy writing its last frame. */
   readonly ended: Promise<FrameStreamEndReason>;
@@ -90,7 +98,7 @@ class FrameReader implements FrameSubscription {
     }
     // Bound retained read promises too. A pull consumer needs one pending read,
     // not an unbounded list of prefetch requests when the source is quiet.
-    if (this.pending) return Promise.reject(new Error('A live frame read is already pending'));
+    if (this.pending) return Promise.reject(new FrameReadPendingError());
     const next = this.queue.shift();
     if (next) {
       this.bytes -= next.bytes;
@@ -204,7 +212,11 @@ export class FrameFanout {
     return { outcome: 'published', readers, overflowed };
   }
 
-  /** Source disappearance is an explicit failure, never proof of turn completion. */
+  /**
+   * Failure/teardown only: discards backlog, with no drain, and fails all readers.
+   * Keep the fanout open across normal turns; completion comes from the host's
+   * durable record, never from closing this source.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
