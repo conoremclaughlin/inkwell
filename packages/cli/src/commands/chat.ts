@@ -22,7 +22,12 @@ import {
 import { promptTransportFor } from '../backends/index.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
-import { continuationPrompt, turnReplyEvent } from '../repl/turn-reply.js';
+import {
+  backendSendTarget,
+  continuationPrompt,
+  localDeliveredSend,
+  turnReplyEvent,
+} from '../repl/turn-reply.js';
 import {
   CloneRegistry,
   formatCloneLine,
@@ -218,8 +223,9 @@ import {
   encodeContextToken,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
-  TURN_REPLIES_FORWARDED_ENV,
+  TURN_REPLY_TOKEN_ENV,
   verifyDelegationToken,
+  type TurnSend,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
 
@@ -3487,6 +3493,11 @@ export async function prepareChatStudio(
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
+  // Read once and removed before anything is spawned: the token is how the
+  // server tells this process's turn_reply lines from anything else on its
+  // stdout, so no tool or provider child may inherit it (turn-reply.ts).
+  const turnReplyToken = process.env[TURN_REPLY_TOKEN_ENV] || undefined;
+  delete process.env[TURN_REPLY_TOKEN_ENV];
   const debugFile = initSbDebug({
     enabled: options.sbDebug,
     context: {
@@ -4076,6 +4087,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // stored none (aborted, failed before the ledger write). The non-interactive
   // loop reads it after each turn to report that turn's reply (turn_reply).
   let lastTurnAssistantText: string | null = null;
+  // The send_response calls the current outer turn made that delivered, for
+  // its turn_reply line. Backend-routed calls are held by id from tool-use
+  // until their tool-result says whether they failed.
+  let turnSends: TurnSend[] = [];
+  const pendingBackendSends = new Map<string, TurnSend>();
   // This spawn's assistant text, UNCUT, and the dialogue entry it is written
   // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
   // earlier block (`Looking.\nuser`) is retracted when a later block reveals
@@ -4202,6 +4218,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      const sendTarget = backendSendTarget(evt.name, evt.input);
+      if (sendTarget && evt.id) pendingBackendSends.set(evt.id, sendTarget);
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
       printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
@@ -4221,6 +4239,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
+      const sendTarget = evt.id ? pendingBackendSends.get(evt.id) : undefined;
+      if (sendTarget) {
+        pendingBackendSends.delete(evt.id!);
+        if (!evt.isError) turnSends.push(sendTarget);
+      }
       runtime.log.append({
         type: 'backend_tool',
         status: evt.isError ? 'error' : 'done',
@@ -6904,6 +6927,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             })
             .then((outcome) => outcome.approved),
         onResult: (result: ToolCallResult) => {
+          const delivered = localDeliveredSend(result);
+          if (delivered) turnSends.push(delivered);
           if (result.status === 'blocked' || result.status === 'denied') {
             const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
             printEvent(
@@ -8313,7 +8338,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const messageLabel = options.messageLabel?.trim();
     // Each outer turn's reply goes out as one line the moment the turn ends;
     // the server forwards it to the channel then, not after the last turn.
-    // Only the last turn's text used to survive the run (turn-reply.ts).
+    // Only the last turn's text used to survive the run (turn-reply.ts). The
+    // server mints the token only when it forwards these lines, so without one
+    // nothing is printed.
     const runTurnAndReport = async (
       turn: number,
       raw: string,
@@ -8321,11 +8348,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
       label: string | undefined
     ): Promise<void> => {
       lastTurnAssistantText = null;
+      turnSends = [];
+      pendingBackendSends.clear();
       await enqueueTurn(raw, source, label);
-      console.log(JSON.stringify(turnReplyEvent(turn, label || 'user', lastTurnAssistantText)));
+      if (!turnReplyToken) return;
+      console.log(
+        JSON.stringify(
+          turnReplyEvent({
+            turn,
+            label: label || 'user',
+            assistantText: lastTurnAssistantText,
+            sends: turnSends,
+            token: turnReplyToken,
+          })
+        )
+      );
     };
-    // Set by the server only when it forwards these lines to a channel.
-    const repliesForwarded = process.env[TURN_REPLIES_FORWARDED_ENV] === '1';
+    const repliesForwarded = Boolean(turnReplyToken);
     clearLastSignal();
     await runTurnAndReport(1, message, messageLabel ? 'system' : 'user', messageLabel);
     // Actual completed outer turns — reported instead of the configured cap,

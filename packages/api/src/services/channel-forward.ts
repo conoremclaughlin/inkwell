@@ -162,23 +162,33 @@ export type TurnReplyDecision =
   | { action: 'no-text' };
 
 /**
- * The per-turn form of `decideChannelForward`: a turn that delivered through
- * send_response keeps its text to itself, and a turn that did not has its text
- * forwarded. The same rule a one-turn runner gets, applied to each turn rather
- * than to whichever turn happened to be last.
+ * The per-turn form of `decideChannelForward`: a turn that delivered to this
+ * conversation through send_response keeps its text to itself, and a turn
+ * that did not has its text forwarded. The same rule a one-turn runner gets,
+ * applied to each turn rather than to whichever turn happened to be last.
+ *
+ * `sentHere` comes from the turn's own report of its sends, never from the
+ * conversation's marker. The marker is set by an MCP request and the turn's
+ * line arrives on stdout; nothing orders the two, so a turn that read the
+ * marker could take a later turn's send for its own and keep its reply back
+ * (Lumen, PR #735, reproduced with a line split across stdout chunks).
  */
 export function decideTurnReply(input: {
-  hadExplicitResponse: boolean;
+  sentHere: boolean;
   text: string | null | undefined;
 }): TurnReplyDecision {
-  if (input.hadExplicitResponse) return { action: 'explicit-response' };
+  if (input.sentHere) return { action: 'explicit-response' };
   const text = userFacingReplyText(input.text);
   if (!text) return { action: 'no-text' };
   return { action: 'forward', content: text };
 }
 
 export interface TurnReplyForwarderEffects {
-  /** Read AND clear the conversation's explicit-send marker (consumeExplicitResponse). */
+  /**
+   * Read AND clear the conversation's explicit-send marker
+   * (consumeExplicitResponse). Read once, when the run ends: evidence that
+   * something was delivered, and cleared so it does not outlive the run.
+   */
   consumeExplicitResponse(): boolean;
   /** Send one message to the conversation without releasing it. */
   send(payload: ChannelForwardPayload): Promise<void>;
@@ -189,7 +199,7 @@ export interface TurnReplyForwarderEffects {
 }
 
 export interface TurnReplyForwarder {
-  /** For SessionRequest.onTurnReply. Reads the marker before its first await. */
+  /** For SessionRequest.onTurnReply. Decides from the reply alone. */
   onTurnReply(reply: TurnReply & { sessionId?: string }): Promise<void>;
   /** How many turns the run reported. Zero means the runner reports none. */
   readonly turnsSeen: number;
@@ -200,10 +210,10 @@ export interface TurnReplyForwarder {
 /**
  * Deliver a multi-turn run's replies as its turns end.
  *
- * The explicit-send marker is consumed synchronously when a turn's reply
- * arrives, so it answers for that turn and no later one: the chat prints a
- * turn's reply before it starts the next turn. Sends are queued, so replies
- * reach the user in turn order even if one send is slow.
+ * Each turn is decided from its own line: its text, and the sends it reports
+ * making. A send to another conversation does not stand in for a reply here.
+ * Sends are queued, so replies reach the user in turn order even if one send
+ * is slow.
  *
  * `finish` releases the conversation without a payload, because the last
  * turn's text was already decided as that turn ended. It warns when the whole
@@ -222,10 +232,10 @@ export function createTurnReplyForwarder(
 
   const onTurnReply = (reply: TurnReply & { sessionId?: string }): Promise<void> => {
     turnsSeen += 1;
-    const decision = decideTurnReply({
-      hadExplicitResponse: effects.consumeExplicitResponse(),
-      text: reply.text,
-    });
+    const sentHere = reply.sends.some(
+      (send) => send.channel === channel && send.conversationId === conversationId
+    );
+    const decision = decideTurnReply({ sentHere, text: reply.text });
     const meta = { channel, conversationId, turn: reply.turn, label: reply.label };
 
     if (decision.action === 'explicit-response') {
@@ -267,10 +277,11 @@ export function createTurnReplyForwarder(
 
   const finish = async (run: { success: boolean }): Promise<void> => {
     await sends;
-    // A send after the last reported turn (a run that crashed mid-turn after
-    // calling send_response) still delivered something, and its marker must
-    // not outlive this run.
-    const lateExplicit = effects.consumeExplicitResponse();
+    // A send the turns did not report (a run that crashed mid-turn after
+    // calling send_response, or a backend call with no id to match its
+    // result) still delivered something, and its marker must not outlive
+    // this run.
+    const explicitMarker = effects.consumeExplicitResponse();
     const meta = {
       channel,
       conversationId,
@@ -278,10 +289,10 @@ export function createTurnReplyForwarder(
       forwardedTurns: forwarded,
       explicitTurns: explicit,
       failedTurns: failed,
-      lateExplicit,
+      explicitMarker,
       runSucceeded: run.success,
     };
-    if (forwarded.length === 0 && explicit.length === 0 && !lateExplicit) {
+    if (forwarded.length === 0 && explicit.length === 0 && !explicitMarker) {
       effects.warn('Nothing delivered to the user for this run', {
         ...meta,
         reason: !run.success ? 'run-failed' : failed.length > 0 ? 'send-failed' : 'no-final-text',

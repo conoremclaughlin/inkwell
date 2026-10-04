@@ -29,12 +29,13 @@ export { writeRuntimeSessionHint } from './runtime-hints.js';
 
 export {
   TURN_REPLY_EVENT,
-  TURN_REPLIES_FORWARDED_ENV,
+  TURN_REPLY_TOKEN_ENV,
   LOCAL_TOOL_CALL_PLACEHOLDER,
   userFacingReplyText,
   parseTurnReplyEvent,
   type TurnReply,
   type TurnReplyEvent,
+  type TurnSend,
 } from './turn-reply.js';
 
 export {

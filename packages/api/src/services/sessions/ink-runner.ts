@@ -32,7 +32,7 @@ import {
   buildSessionEnv,
   buildCleanEnv,
   RUN_TURN_EPOCH_ENV,
-  TURN_REPLIES_FORWARDED_ENV,
+  TURN_REPLY_TOKEN_ENV,
   TURN_REPLY_EVENT,
   parseTurnReplyEvent,
   writeRuntimeSessionHint,
@@ -442,6 +442,9 @@ export class InkRunner implements IRunner {
       delegationSecret: config.inkDelegationSecret,
     });
 
+    // Minted per spawn, so a line that looks like an event is not one.
+    const turnReplyToken = config.onTurnReply ? randomUUID() : undefined;
+
     // The child inherits an allowlist of the server's env (buildCleanEnv),
     // never the whole of it: spec:sender-token-binding Phase 0. Everything
     // else it needs is set here, explicitly.
@@ -460,9 +463,11 @@ export class InkRunner implements IRunner {
       // lifecycle request; without it the chat claimed a fresh epoch at each
       // outer turn and this run's finalize matched zero rows.
       ...(config.turnEpoch ? { [RUN_TURN_EPOCH_ENV]: config.turnEpoch } : {}),
-      // Only when someone forwards the turn replies: the chat then tells the
-      // SB that continuation text reaches the user.
-      ...(config.onTurnReply ? { [TURN_REPLIES_FORWARDED_ENV]: '1' } : {}),
+      // Only when someone forwards the turn replies. The chat prints it on
+      // each turn_reply line, and those lines are accepted on nothing else:
+      // its stdout also carries whatever it echoes, the delivered message
+      // included (Lumen, PR #735).
+      ...(turnReplyToken ? { [TURN_REPLY_TOKEN_ENV]: turnReplyToken } : {}),
     }) as Record<string, string>;
 
     // Turn-scope the observer replay tail: drop anything buffered from a prior
@@ -484,20 +489,29 @@ export class InkRunner implements IRunner {
       // Carries a partial trailing line between stdout chunks so we only parse
       // complete NDJSON events for live fan-out.
       let stdoutLineBuffer = '';
-      // Each outer turn's reply, handed over as its line arrives. The handler
-      // is called at once, so whatever it reads about that turn (the explicit-
-      // send marker) is read before the next turn can run; its completion is
-      // chained so the run does not settle while a reply is still being sent.
+      // Each outer turn's reply, handed over as its line arrives, in arrival
+      // order. Everything the caller decides about the turn is on that line,
+      // the turn's own sends included; its completion is chained so the run
+      // does not settle while a reply is still being sent.
       let turnRepliesSettled: Promise<void> = Promise.resolve();
       const handOverTurnReply = (event: Record<string, unknown>): void => {
         const handler = config.onTurnReply;
-        if (!handler) return;
+        if (!handler || !turnReplyToken) return;
         const reply = parseTurnReplyEvent(event);
-        if (!reply) return;
+        if (!reply || reply.token !== turnReplyToken) {
+          // Not this run's event: echoed text shaped like one. Logged without
+          // its content, which may be anyone's.
+          logger.warn('Ignored a turn_reply line without this run token', {
+            sessionId: config.inkSessionId,
+            reason: reply ? 'token-mismatch' : 'malformed',
+          });
+          return;
+        }
         const handled = handler({
           turn: reply.turn,
           label: reply.label,
           text: reply.text,
+          sends: reply.sends,
           ...(config.inkSessionId ? { sessionId: config.inkSessionId } : {}),
         }).catch((error: unknown) => {
           logger.error('Turn reply handler failed', {
@@ -536,7 +550,12 @@ export class InkRunner implements IRunner {
             typeof (evt as { type?: unknown }).type === 'string'
           ) {
             const typed = evt as { type: string } & Record<string, unknown>;
-            if (typed.type === TURN_REPLY_EVENT) handOverTurnReply(typed);
+            // Never republished: the line carries the run's token, and
+            // observers already get the turn's text from its ledger entry.
+            if (typed.type === TURN_REPLY_EVENT) {
+              handOverTurnReply(typed);
+              continue;
+            }
             if (!config.inkSessionId) continue;
             if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
               // Canonical ledger entry (spec:observer-attach §4.2) — the exact

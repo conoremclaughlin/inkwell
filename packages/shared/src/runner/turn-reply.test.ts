@@ -29,19 +29,41 @@ describe('userFacingReplyText', () => {
 });
 
 describe('parseTurnReplyEvent', () => {
-  it('reads a well-formed event and filters its text', () => {
+  const event = {
+    type: 'turn_reply',
+    token: 'run-token',
+    turn: 2,
+    label: 'continuation',
+    text: 'the reply',
+    sends: [{ channel: 'telegram', conversationId: '100200300' }],
+  };
+
+  it('reads a well-formed event', () => {
+    expect(parseTurnReplyEvent(event)).toEqual(event);
+  });
+
+  it('filters the text and keeps only the send targets', () => {
     expect(
-      parseTurnReplyEvent({ type: 'turn_reply', turn: 2, label: 'continuation', text: '  ' })
-    ).toEqual({ type: 'turn_reply', turn: 2, label: 'continuation', text: null });
+      parseTurnReplyEvent({
+        ...event,
+        text: '  ',
+        sends: [{ channel: 'telegram', conversationId: '100200300', content: 'x' }],
+      })
+    ).toEqual({ ...event, text: null });
   });
 
   it.each([
-    ['another type', { type: 'result', turn: 1, label: 'x', text: 'a' }],
-    ['a zero turn', { type: 'turn_reply', turn: 0, label: 'x', text: 'a' }],
-    ['a fractional turn', { type: 'turn_reply', turn: 1.5, label: 'x', text: 'a' }],
-    ['a missing label', { type: 'turn_reply', turn: 1, text: 'a' }],
-    ['a numeric text', { type: 'turn_reply', turn: 1, label: 'x', text: 3 }],
-    ['a missing text', { type: 'turn_reply', turn: 1, label: 'x' }],
+    ['another type', { ...event, type: 'result' }],
+    ['no token', { ...event, token: undefined }],
+    ['an empty token', { ...event, token: '' }],
+    ['a zero turn', { ...event, turn: 0 }],
+    ['a fractional turn', { ...event, turn: 1.5 }],
+    ['a missing label', { ...event, label: undefined }],
+    ['a numeric text', { ...event, text: 3 }],
+    ['a missing text', { ...event, text: undefined }],
+    ['no sends', { ...event, sends: undefined }],
+    ['a send without a conversation', { ...event, sends: [{ channel: 'telegram' }] }],
+    ['a send with an empty channel', { ...event, sends: [{ channel: '', conversationId: '1' }] }],
     ['null', null],
   ])('refuses %s', (_label, value) => {
     expect(parseTurnReplyEvent(value)).toBeNull();

@@ -12,7 +12,18 @@
  * arrived only because she noticed and re-sent it with send_response.
  *
  * The chat now prints one `turn_reply` line as each outer turn ends, and the
- * server decides per turn, while the run is still going.
+ * server decides per turn, while the run is still going. Two properties of
+ * that line are load-bearing (Lumen, PR #735):
+ *
+ * - It carries the run's token. The chat's stdout also carries everything it
+ *   echoes, the delivered message included, so a line that merely looks like
+ *   an event is not one. The server mints the token per spawn and accepts only
+ *   lines that carry it.
+ * - It carries the turn's own successful sends. Whether a turn already
+ *   answered through send_response used to be read from a server-side marker
+ *   the send sets over MCP, a different channel from stdout with no ordering
+ *   between the two, so turn 1 could read turn 2's send. The chat knows which
+ *   sends each turn made; it says so on the same line as the text.
  */
 
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from '../runtime/local-tool-placeholder.js';
@@ -22,12 +33,19 @@ export { LOCAL_TOOL_CALL_PLACEHOLDER };
 export const TURN_REPLY_EVENT = 'turn_reply';
 
 /**
- * Set by the server on a chat whose turn replies it forwards to the user, so
- * the chat can tell the SB that text in a continuation turn reaches the user.
- * An environment variable rather than a flag: a CLI build that predates it
- * ignores it, where an unknown flag would refuse to start.
+ * The token the server mints for one spawn whose turn replies it forwards. The
+ * chat reads it once at startup and removes it from its own environment, so
+ * its tools and provider children never carry it, and prints it only on its
+ * `turn_reply` lines. An environment variable rather than a flag: a CLI build
+ * that predates it ignores it, where an unknown flag would refuse to start.
  */
-export const TURN_REPLIES_FORWARDED_ENV = 'INK_TURN_REPLIES_FORWARDED';
+export const TURN_REPLY_TOKEN_ENV = 'INK_TURN_REPLY_TOKEN';
+
+/** One send_response that delivered during the turn, by its target. */
+export interface TurnSend {
+  channel: string;
+  conversationId: string;
+}
 
 export interface TurnReply {
   /** 1-based outer turn number within the process. */
@@ -36,10 +54,13 @@ export interface TurnReply {
   label: string;
   /** The turn's user-facing text, or null when it wrote none. */
   text: string | null;
+  /** The send_response calls this turn made that delivered something. */
+  sends: TurnSend[];
 }
 
 export interface TurnReplyEvent extends TurnReply {
   type: typeof TURN_REPLY_EVENT;
+  token: string;
 }
 
 /**
@@ -54,20 +75,41 @@ export function userFacingReplyText(text: string | null | undefined): string | n
   return text;
 }
 
-/** A parsed stdout line, if it is a well-formed `turn_reply` event. */
+function isTurnSend(value: unknown): value is TurnSend {
+  if (!value || typeof value !== 'object') return false;
+  const send = value as Record<string, unknown>;
+  return (
+    typeof send.channel === 'string' &&
+    send.channel.length > 0 &&
+    typeof send.conversationId === 'string' &&
+    send.conversationId.length > 0
+  );
+}
+
+/**
+ * A parsed stdout line, if it is a well-formed `turn_reply` event. Whether its
+ * token is the run's is the caller's check: this only says the shape is right.
+ */
 export function parseTurnReplyEvent(value: unknown): TurnReplyEvent | null {
   if (!value || typeof value !== 'object') return null;
   const event = value as Record<string, unknown>;
   if (event.type !== TURN_REPLY_EVENT) return null;
+  if (typeof event.token !== 'string' || !event.token) return null;
   if (typeof event.turn !== 'number' || !Number.isInteger(event.turn) || event.turn < 1) {
     return null;
   }
   if (typeof event.label !== 'string') return null;
   if (event.text !== null && typeof event.text !== 'string') return null;
+  if (!Array.isArray(event.sends) || !event.sends.every(isTurnSend)) return null;
   return {
     type: TURN_REPLY_EVENT,
+    token: event.token,
     turn: event.turn,
     label: event.label,
     text: userFacingReplyText(event.text as string | null),
+    sends: event.sends.map((send) => ({
+      channel: send.channel,
+      conversationId: send.conversationId,
+    })),
   };
 }
