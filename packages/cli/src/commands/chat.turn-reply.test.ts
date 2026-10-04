@@ -29,6 +29,18 @@ const sentinel = await vi.hoisted(async () => {
   return { home, originalHome };
 });
 
+// The API's InkRunner is imported below, and its modules validate the API's
+// environment as they load. The API workspace's test setup supplies these
+// fallbacks; this CLI workspace has none, so the same ones are set here,
+// before that import. A value already in the environment wins.
+await vi.hoisted(async () => {
+  const { fakeProcessEnv } = await import('../../../api/src/test/fake-env.js');
+  process.env.SUPABASE_URL ||= 'https://example.supabase.co';
+  process.env.SUPABASE_PUBLISHABLE_KEY ||= fakeProcessEnv.SUPABASE_PUBLISHABLE_KEY;
+  process.env.SUPABASE_SECRET_KEY ||= fakeProcessEnv.SUPABASE_SECRET_KEY;
+  process.env.JWT_SECRET ||= fakeProcessEnv.JWT_SECRET;
+});
+
 const testState = vi.hoisted(() => ({
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
