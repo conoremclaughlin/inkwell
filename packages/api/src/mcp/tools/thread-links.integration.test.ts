@@ -24,6 +24,7 @@ import {
 } from './thread-link-handlers';
 import { handleCreateArtifact, handleGetArtifact } from './artifact-handlers';
 import type { SbPrincipal } from '../../services/principals';
+import { INKLING_CLIENT } from '../../services/inklings/inkling-service';
 
 const RUN = randomUUID().slice(0, 8);
 const SPEC_SLUG = `tltest-${RUN}`;
@@ -33,8 +34,12 @@ const KEY_A = `test:tl-a-${RUN}`;
 const KEY_B = `test:tl-b-${RUN}`;
 const KEY_REFUSED = `test:tl-refused-${RUN}`;
 const KEY_D = `test:tl-d-${RUN}`;
-// A suite-owned SB: a participant of A and B, never of D.
+// A suite-owned SB: a participant of A and B, never of D. Its owner owns the
+// workspace, so it reads links with the team's full view.
 const OTHER = `echo-tl-${RUN}`;
+// A suite-owned inkling: restricted to links between threads it is in. Made a
+// participant of A only.
+const INK = `echo-tl-ink-${RUN}`;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parse(raw: { content: Array<{ type: string; text?: string }> }): any {
@@ -49,6 +54,7 @@ describe('thread links (DB integration)', () => {
   let workspaceId: string;
   let echo: SbPrincipal;
   let otherSbId: string | null = null;
+  let inkSbId: string | null = null;
   let artifactId: string;
   let threadB: { id: string };
   let threadD: { id: string };
@@ -63,6 +69,12 @@ describe('thread links (DB integration)', () => {
     workspaceId = fixture.workspaceId;
     echo = { kind: 'sb', sbId: fixture.echoSbId, sbSlug: 'echo', userId, workspaceId };
     otherSbId = await ensureSuiteIdentity(dataComposer, fixture, OTHER);
+    inkSbId = await ensureSuiteIdentity(dataComposer, fixture, INK);
+    const { error: inkErr } = await raw
+      .from('agent_identities')
+      .update({ metadata: { fixture: true, suite: true, client: INKLING_CLIENT } })
+      .eq('id', inkSbId);
+    if (inkErr) throw new Error(`inkling identity: ${inkErr.message}`);
 
     const created = parse(
       await handleCreateArtifact(
@@ -116,6 +128,7 @@ describe('thread links (DB integration)', () => {
     }
     await raw.from('artifacts').delete().eq('uri', SPEC_URI);
     if (otherSbId) await raw.from('agent_identities').delete().eq('id', otherSbId);
+    if (inkSbId) await raw.from('agent_identities').delete().eq('id', inkSbId);
   });
 
   it('a send with a bad link stores nothing, not even the thread', async () => {
@@ -346,6 +359,56 @@ describe('thread links (DB integration)', () => {
       .select('id', { count: 'exact', head: true })
       .eq('source_thread_id', threadD.id);
     expect(count).toBe(1);
+  });
+
+  // Thread titles carry real content, so only the team reads every link
+  // (Myra, thread:thread-links). An inkling sees links between threads it is
+  // in, and nothing else, even though its owner owns the workspace.
+  it('an inkling sees only links between threads it takes part in', async () => {
+    const { data: a } = await raw
+      .from('inbox_threads')
+      .select('id')
+      .eq('workspace_id', workspaceId)
+      .eq('thread_key', KEY_A)
+      .single();
+    const { error: joinErr } = await raw
+      .from('inbox_thread_participants')
+      .insert({ thread_id: a.id, workspace_id: workspaceId, sb_id: inkSbId });
+    if (joinErr) throw new Error(`join A: ${joinErr.message}`);
+
+    // The spec's backlinks: A (it is in A) but not B (it is not in B).
+    const byUri = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: INK, uri: SPEC_URI }, dataComposer)
+    );
+    expect(byUri.linkedFrom.map((l: { threadKey: string }) => l.threadKey)).toEqual([KEY_A]);
+    // The control: the team sees both.
+    const team = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: 'echo', uri: SPEC_URI }, dataComposer)
+    );
+    expect(team.linkedFrom).toHaveLength(2);
+
+    // D links to pr:1, and the inkling is not in D.
+    const d = parse(
+      await handleListThreadLinks({ ...base(), sbSlug: INK, threadKey: KEY_D }, dataComposer)
+    );
+    expect(d.linksTo).toEqual([]);
+
+    // A links to the spec key, which has no thread the inkling could list.
+    const read = parse(
+      await handleGetThreadMessages(
+        { ...base(), sbSlug: INK, threadKey: KEY_A, fullHistory: true, markRead: false },
+        dataComposer
+      )
+    );
+    expect(read.success).toBe(true);
+    expect(read.links).toMatchObject({ linksTo: [], linksToCount: 0 });
+    const teamRead = parse(
+      await handleGetThreadMessages(
+        { ...base(), sbSlug: 'echo', threadKey: KEY_A, fullHistory: true, markRead: false },
+        dataComposer
+      )
+    );
+    expect(teamRead.links.linksToCount).toBe(1);
   });
 
   it('refuses a self-link, a web URL and an unknown artifact without writing', async () => {

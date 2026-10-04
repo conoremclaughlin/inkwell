@@ -919,7 +919,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // A delivery poll is the hot path and only wants messages, so it skips this.
   const links = channelPoll
     ? null
-    : await threadLinkHeader(supabase, resolved.user.id, caller.workspaceId, thread);
+    : await threadLinkHeader(supabase, resolved.user.id, caller, thread);
 
   return {
     content: [

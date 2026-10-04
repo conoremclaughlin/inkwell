@@ -1,5 +1,68 @@
 import { describe, it, expect } from 'vitest';
-import { parseLinkTarget, specTwin } from './thread-links';
+import { linkReaderForSb, linkReaderForUser, parseLinkTarget, specTwin } from './thread-links';
+import { INKLING_CLIENT } from './inklings/inkling-service';
+
+/** An agent_identities lookup answering with one row (or an error), counting reads. */
+function identityClient(reply: { data?: unknown; error?: unknown }) {
+  const calls = { count: 0 };
+  const chain = {
+    select: () => chain,
+    eq: () => chain,
+    maybeSingle: async () => {
+      calls.count += 1;
+      return { data: reply.data ?? null, error: reply.error ?? null };
+    },
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return { client: { from: () => chain } as any, calls };
+}
+
+const SB = { sbId: 'sb-1', userId: 'user-1' };
+
+describe('linkReaderForSb', () => {
+  it("gives the workspace owner's own SB the full view", async () => {
+    const { client } = identityClient({ data: { id: 'sb-1', user_id: 'user-1', metadata: {} } });
+    expect(await linkReaderForSb(client, { ...SB, ownerRole: 'owner' })).toEqual({ kind: 'full' });
+  });
+
+  it('restricts an inkling even when its owner owns the workspace', async () => {
+    const { client } = identityClient({
+      data: { id: 'sb-1', user_id: 'user-1', metadata: { client: INKLING_CLIENT } },
+    });
+    expect(await linkReaderForSb(client, { ...SB, ownerRole: 'owner' })).toEqual({
+      kind: 'participant',
+      principal: { kind: 'sb', sbId: 'sb-1' },
+      userId: 'user-1',
+    });
+  });
+
+  // An identity that cannot be read is not shown as the team's.
+  it('restricts when the identity cannot be classified', async () => {
+    const { client } = identityClient({ error: { message: 'connection reset' } });
+    expect((await linkReaderForSb(client, { ...SB, ownerRole: 'owner' })).kind).toBe('participant');
+  });
+
+  it("restricts a member's, admin's or viewer's SB without reading the identity", async () => {
+    for (const ownerRole of ['member', 'admin', 'viewer']) {
+      const { client, calls } = identityClient({ data: { id: 'sb-1', metadata: {} } });
+      expect((await linkReaderForSb(client, { ...SB, ownerRole })).kind, ownerRole).toBe(
+        'participant'
+      );
+      expect(calls.count, ownerRole).toBe(0);
+    }
+  });
+});
+
+describe('linkReaderForUser', () => {
+  it('gives the owner the full view and restricts everyone else by their own participation', () => {
+    expect(linkReaderForUser('owner', 'u')).toEqual({ kind: 'full' });
+    expect(linkReaderForUser('member', 'u')).toEqual({
+      kind: 'participant',
+      principal: { kind: 'user', userId: 'u' },
+      userId: 'u',
+    });
+  });
+});
 
 describe('parseLinkTarget', () => {
   it('reads an ink:// URI as an artifact', () => {

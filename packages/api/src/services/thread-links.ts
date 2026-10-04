@@ -15,6 +15,7 @@
 
 import type { DataComposer } from '../data/composer';
 import { resolveSbsByIds } from './principals';
+import { classifyIdentityById } from './inklings/inkling-turn-gate';
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
 // thread_links is not in the generated types until they are regenerated
@@ -23,7 +24,12 @@ const linksTable = (supabase: SupabaseClient) =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (supabase as any).from('thread_links');
 
-/** The relations a link may carry. Validated here, not by a DB CHECK. */
+/**
+ * The relations link_thread accepts. Validated here, not by a DB CHECK.
+ * `album` is reserved for the media path to write when albums land
+ * (spec:thread-media): a system-written link from a thread to its album, which
+ * link_thread does not take.
+ */
 export const THREAD_LINK_RELATIONS = ['relates', 'implements', 'continues', 'supersedes'] as const;
 export type ThreadLinkRelation = (typeof THREAD_LINK_RELATIONS)[number];
 
@@ -62,6 +68,9 @@ export function parseLinkTarget(raw: string): LinkTarget | { error: string } {
       error: `Not a thread key or ink:// URI: "${raw}". A thread key looks like "pr:701" or "spec:live-agent-surfaces".`,
     };
   }
+  // Stored as written. In-repo `pr:701` and `inkwell:pr:701` are two keys
+  // here, as everywhere else, until key-schemes decision 4 settles which
+  // spelling is canonical; folding them now would decide it in this table.
   return { kind: 'thread', threadKey: value };
 }
 
@@ -283,14 +292,86 @@ export interface ThreadLinkViews {
 }
 
 /**
+ * Who is reading links, and so how much of them they see. Every read names
+ * one; there is no default (Myra, thread:thread-links). A link view shows the
+ * title and status of a thread the reader may not be in, and thread titles
+ * carry real content, so "anyone in the workspace" must never be what a read
+ * falls back to.
+ *
+ * - `full`: the team. The workspace owner in person, and the owner's own SBs
+ *   that are not inklings.
+ * - `participant`: everyone else (members, viewers, inklings, an identity that
+ *   cannot be classified). They see a link only when they take part in the
+ *   thread at both ends, which is what they could already list, and an
+ *   artifact end only when the artifact is their own user's.
+ */
+export type LinkReader =
+  | { kind: 'full' }
+  | {
+      kind: 'participant';
+      principal: { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string };
+      userId: string;
+    };
+
+/**
+ * The reader scope of an SB caller. Full only for a non-inkling SB whose owner
+ * owns the workspace. An identity that cannot be classified (a transient read
+ * failure included) is read as restricted: the narrower view is the safe one.
+ */
+export async function linkReaderForSb(
+  supabase: SupabaseClient,
+  caller: { sbId: string; userId: string; ownerRole: string }
+): Promise<LinkReader> {
+  if (caller.ownerRole === 'owner') {
+    const identity = await classifyIdentityById(
+      supabase as unknown as Parameters<typeof classifyIdentityById>[0],
+      caller.sbId
+    );
+    if (identity.kind === 'other') return { kind: 'full' };
+  }
+  return {
+    kind: 'participant',
+    principal: { kind: 'sb', sbId: caller.sbId },
+    userId: caller.userId,
+  };
+}
+
+/** The reader scope of a person acting as themselves. */
+export function linkReaderForUser(role: string, userId: string): LinkReader {
+  return role === 'owner'
+    ? { kind: 'full' }
+    : { kind: 'participant', principal: { kind: 'user', userId }, userId };
+}
+
+/** Which of these threads the principal takes part in. */
+async function participatingThreadIds(
+  supabase: SupabaseClient,
+  threadIds: string[],
+  principal: { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string }
+): Promise<Set<string>> {
+  if (threadIds.length === 0) return new Set();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let q = (supabase as any)
+    .from('inbox_thread_participants')
+    .select('thread_id')
+    .in('thread_id', threadIds);
+  q = principal.kind === 'sb' ? q.eq('sb_id', principal.sbId) : q.eq('user_id', principal.userId);
+  const { data, error } = await q;
+  if (error) throw new Error(`Failed to check thread participation: ${error.message}`);
+  return new Set(((data ?? []) as Array<{ thread_id: string }>).map((r) => r.thread_id));
+}
+
+/**
  * Turn rows into views: `linksTo` describes each row's target, `linkedFrom`
  * each row's source thread. Titles and statuses come from batched lookups,
- * one query per table, never one per row.
+ * one query per table, never one per row. The reader decides what survives:
+ * see LinkReader.
  */
 export async function describeThreadLinks(
   supabase: SupabaseClient,
   workspaceId: string,
-  rows: { linksTo: ThreadLinkRow[]; linkedFrom: ThreadLinkRow[] }
+  rows: { linksTo: ThreadLinkRow[]; linkedFrom: ThreadLinkRow[] },
+  reader: LinkReader
 ): Promise<ThreadLinkViews> {
   const targetKeys = unique(
     rows.linksTo.filter((r) => r.target_kind === 'thread').map((r) => r.target_thread_key!)
@@ -312,6 +393,24 @@ export async function describeThreadLinks(
     resolveSbsByIds(supabase, sbIds).then((sbs) => new Map(sbs.map((sb) => [sb.sbId, sb.sbSlug]))),
   ]);
 
+  // A restricted reader sees a link only between threads it takes part in.
+  // Both ends are checked: the source of every row (the subject thread, for
+  // linksTo) and the thread at the other end.
+  const visible =
+    reader.kind === 'full'
+      ? null
+      : await participatingThreadIds(
+          supabase,
+          unique([
+            ...rows.linksTo.map((r) => r.source_thread_id),
+            ...[...threadsByKey.values()].map((t) => t.id),
+            ...sourceIds,
+          ]),
+          reader.principal
+        );
+  const canSee = (threadId: string | undefined): boolean =>
+    visible === null || (threadId !== undefined && visible.has(threadId));
+
   const linkedBy = (r: ThreadLinkRow): string =>
     r.linked_by_kind === 'sb'
       ? ((r.linked_by_sb_id && slugBySbId.get(r.linked_by_sb_id)) ?? 'unknown-sb')
@@ -326,8 +425,12 @@ export async function describeThreadLinks(
 
   const linksTo: ThreadLinkView[] = [];
   for (const r of rows.linksTo) {
+    if (!canSee(r.source_thread_id)) continue;
     if (r.target_kind === 'thread') {
       const t = threadsByKey.get(r.target_thread_key!);
+      // A restricted reader cannot list a key with no thread either, so it
+      // stays hidden with the rest.
+      if (visible !== null && !canSee(t?.id)) continue;
       linksTo.push({
         kind: 'thread',
         threadKey: r.target_thread_key!,
@@ -341,6 +444,8 @@ export async function describeThreadLinks(
       // between the two reads. Leave it out rather than show an id with no
       // address.
       if (!a) continue;
+      // Artifacts are owned by a user; a restricted reader sees its own.
+      if (reader.kind === 'participant' && a.user_id !== reader.userId) continue;
       linksTo.push({
         kind: 'artifact',
         uri: a.uri,
@@ -356,7 +461,7 @@ export async function describeThreadLinks(
   const seenSources = new Set<string>();
   for (const r of rows.linkedFrom) {
     const t = sourcesById.get(r.source_thread_id);
-    if (!t) continue;
+    if (!t || !canSee(t.id)) continue;
     // A thread that linked both a spec and its thread appears once.
     if (seenSources.has(r.source_thread_id)) continue;
     seenSources.add(r.source_thread_id);
@@ -381,7 +486,8 @@ export async function describeThreadLinks(
 export async function artifactBacklinks(
   supabase: SupabaseClient,
   workspaceId: string,
-  artifact: { id: string; uri: string }
+  artifact: { id: string; uri: string },
+  reader: LinkReader
 ): Promise<{ threads: ThreadLinkView[]; count: number } | { error: string }> {
   try {
     const twin = specTwin({ kind: 'artifact', uri: artifact.uri });
@@ -389,10 +495,12 @@ export async function artifactBacklinks(
       artifactId: artifact.id,
       threadKey: twin && twin.kind === 'thread' ? twin.threadKey : null,
     });
-    const { linkedFrom } = await describeThreadLinks(supabase, workspaceId, {
-      linksTo: [],
-      linkedFrom: rows,
-    });
+    const { linkedFrom } = await describeThreadLinks(
+      supabase,
+      workspaceId,
+      { linksTo: [], linkedFrom: rows },
+      reader
+    );
     return { threads: linkedFrom.slice(0, THREAD_LINK_HEADER_MAX), count: linkedFrom.length };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -429,6 +537,7 @@ interface ArtifactSummaryRow {
   uri: string;
   title: string;
   artifact_type: string;
+  user_id: string;
 }
 
 async function artifactsWhereId(
@@ -438,7 +547,7 @@ async function artifactsWhereId(
   if (ids.length === 0) return new Map();
   const { data, error } = await supabase
     .from('artifacts')
-    .select('id, uri, title, artifact_type')
+    .select('id, uri, title, artifact_type, user_id')
     .in('id', ids);
   if (error) throw new Error(`Failed to read linked artifacts: ${error.message}`);
   return new Map(((data ?? []) as ArtifactSummaryRow[]).map((a) => [a.id, a]));

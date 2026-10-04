@@ -12,9 +12,11 @@ import { resolveArtifactRowForUser } from './artifact-handlers';
 import {
   THREAD_LINK_HEADER_MAX,
   describeThreadLinks,
+  linkReaderForSb,
   listLinksFrom,
   listLinksTo,
   specTwin,
+  type LinkReader,
   type LinkTarget,
   type ResolvedLinkTarget,
   type ThreadLinkRow,
@@ -56,13 +58,15 @@ export async function resolveLinkTarget(
 
 /**
  * Every link to and from a subject, as views. For a `spec:` thread or an
- * `ink://specs/` artifact, links to its twin count as links to it.
+ * `ink://specs/` artifact, links to its twin count as links to it. The reader
+ * is required: it decides which links survive (LinkReader).
  */
 export async function threadLinkViewsFor(
   supabase: SupabaseClient,
   userId: string,
   workspaceId: string,
   subject: { threadKey: string; threadId: string | null } | { artifactId: string; uri: string },
+  reader: LinkReader,
   options: { direction?: 'both' | 'to' | 'from'; relation?: string } = {}
 ) {
   const direction = options.direction ?? 'both';
@@ -99,7 +103,7 @@ export async function threadLinkViewsFor(
     linksTo = linksTo.filter((r) => r.relation === options.relation);
     linkedFrom = linkedFrom.filter((r) => r.relation === options.relation);
   }
-  return describeThreadLinks(supabase, workspaceId, { linksTo, linkedFrom });
+  return describeThreadLinks(supabase, workspaceId, { linksTo, linkedFrom }, reader);
 }
 
 export interface ThreadLinkHeader {
@@ -121,14 +125,18 @@ export interface ThreadLinkHeader {
 export async function threadLinkHeader(
   supabase: SupabaseClient,
   userId: string,
-  workspaceId: string,
+  caller: { sbId: string; userId: string; workspaceId: string; ownerRole: string },
   thread: { id: string; thread_key: string }
 ): Promise<ThreadLinkHeader | { error: string }> {
   try {
-    const views = await threadLinkViewsFor(supabase, userId, workspaceId, {
-      threadKey: thread.thread_key,
-      threadId: thread.id,
-    });
+    const reader = await linkReaderForSb(supabase, caller);
+    const views = await threadLinkViewsFor(
+      supabase,
+      userId,
+      caller.workspaceId,
+      { threadKey: thread.thread_key, threadId: thread.id },
+      reader
+    );
     return {
       linksTo: views.linksTo.slice(0, THREAD_LINK_HEADER_MAX),
       linkedFrom: views.linkedFrom.slice(0, THREAD_LINK_HEADER_MAX),

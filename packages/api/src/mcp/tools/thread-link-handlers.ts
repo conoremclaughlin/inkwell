@@ -20,6 +20,7 @@ import {
   THREAD_LINK_RELATIONS,
   deleteThreadLink,
   insertThreadLinkIfAbsent,
+  linkReaderForSb,
   parseLinkTarget,
   upsertThreadLink,
   type ResolvedLinkTarget,
@@ -180,7 +181,9 @@ const unlinkThreadSchema = userIdentifierBaseSchema.extend({
 
 const listThreadLinksSchema = userIdentifierBaseSchema
   .extend({
-    sbSlug: sbSlugSchema.describe('SB slug asking. Any SB in the workspace may read links.'),
+    sbSlug: sbSlugSchema.describe(
+      "SB slug asking. The workspace owner's SBs see every link; others see links between threads they take part in."
+    ),
     threadKey: threadKeySchema
       .optional()
       .describe('List what this thread links to and what links to it'),
@@ -327,9 +330,11 @@ export async function handleUnlinkThread(args: unknown, dataComposer: DataCompos
 }
 
 /**
- * Read links. Any SB in the workspace may, participant or not: the point is
- * navigation for an SB that was never in the conversation. A view carries
- * keys, titles and statuses, never message content.
+ * Read links. The team (the workspace owner's own SBs) may read any thread's
+ * links, participant or not: the point is navigation for an SB that was never
+ * in the conversation. Anyone else sees only links between threads it takes
+ * part in, because a view carries thread titles and titles carry real content
+ * (LinkReader). Never message content, for anyone.
  */
 export async function handleListThreadLinks(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
@@ -337,6 +342,9 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
   const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
+  // Who is asking decides how much they see: the team sees every link, anyone
+  // else only links between threads they take part in (LinkReader).
+  const reader = await linkReaderForSb(supabase, caller);
   const options = { direction: parsed.direction, relation: parsed.relation };
 
   if (parsed.threadKey) {
@@ -346,6 +354,7 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
       resolved.user.id,
       caller.workspaceId,
       { threadKey: parsed.threadKey, threadId: thread?.id ?? null },
+      reader,
       options
     );
     return reply({
@@ -370,6 +379,7 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
     resolved.user.id,
     caller.workspaceId,
     { artifactId: r.resolved.artifactId, uri: r.uri! },
+    reader,
     options
   );
   return reply({
@@ -401,7 +411,7 @@ export const threadLinkToolDefinitions = [
   {
     name: 'list_thread_links',
     description:
-      'List what a thread links to (linksTo) and what links to it (linkedFrom), or, given an ink:// URI, every thread linking to that artifact ("which PRs touch this spec?"). The thread spec:<slug> and the artifact ink://specs/<slug> are read as one subject. Readable by any SB in the workspace, participant or not; returns keys, titles and statuses, never message content.',
+      'List what a thread links to (linksTo) and what links to it (linkedFrom), or, given an ink:// URI, every thread linking to that artifact ("which PRs touch this spec?"). The thread spec:<slug> and the artifact ink://specs/<slug> are read as one subject. Returns keys, titles and statuses, never message content. The SBs of the workspace owner see every link, participant or not; any other reader (the SB of a member or viewer, an inkling) sees only links between threads it takes part in.',
     schema: listThreadLinksSchema,
     handler: handleListThreadLinks,
   },

@@ -19,7 +19,7 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
 import { resolveCallerWorkspace } from './caller-principal';
-import { artifactBacklinks } from '../../services/thread-links';
+import { artifactBacklinks, linkReaderForSb, linkReaderForUser } from '../../services/thread-links';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 import { EmbeddingRouter } from '../../services/embeddings/router';
 import { formatVectorLiteral } from '../../services/embeddings/memory-chunks';
@@ -706,9 +706,16 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
   // The threads that link here (thread:thread-links): for a spec, the PRs
   // and discussions that name it. Thread links live in the caller's SB
   // workspace, which is not the artifact's product workspace scope above.
+  // Who is asking decides which backlinks survive (LinkReader): a
+  // token-bound SB by its own scope, a person by their role.
   const backlinks = await resolveCallerWorkspace(supabase, resolved.user.id)
-    .then(({ workspaceId: linkWorkspaceId }) =>
-      artifactBacklinks(supabase, linkWorkspaceId, { id: artifact.id, uri: artifact.uri })
+    .then(async ({ workspaceId: linkWorkspaceId, sb, role }) =>
+      artifactBacklinks(
+        supabase,
+        linkWorkspaceId,
+        { id: artifact.id, uri: artifact.uri },
+        sb ? await linkReaderForSb(supabase, sb) : linkReaderForUser(role, resolved.user.id)
+      )
     )
     .catch((error: unknown) => ({
       error: error instanceof Error ? error.message : String(error),
