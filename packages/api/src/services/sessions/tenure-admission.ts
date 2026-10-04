@@ -159,6 +159,54 @@ export async function admitTurn(
   return parseReply(admitSchema, 'admit_turn', data, error);
 }
 
+const leasedAdmitSchema = z.discriminatedUnion('outcome', [
+  z.object({
+    outcome: z.literal('admitted'),
+    epoch: z.string(),
+    restamped: z.number().int().nonnegative(),
+  }),
+  z.object({ outcome: z.literal('stale_expectation'), epoch: z.string().nullable() }),
+  z.object({ outcome: z.literal('unverified'), epoch: z.string() }),
+  z.object({ outcome: z.literal('busy'), epoch: z.string() }),
+  z.object({ outcome: z.literal('unresolved'), epoch: z.string().nullable() }),
+  z.object({ outcome: z.literal('not_fifo_head'), head: z.string().uuid().nullable() }),
+  /** The named studio's lease is not this session's live lease, or the studio is gone. */
+  z.object({ outcome: z.literal('lease_lost') }),
+  /** The studio belongs to another tenant than the session. */
+  z.object({ outcome: z.literal('forbidden') }),
+  held,
+  notHolder,
+  sessionMissing,
+  invalid,
+  modeMismatch,
+]);
+export type AdmitLeasedTurnOutcome = z.infer<typeof leasedAdmitSchema>;
+
+/**
+ * Admits a turn exactly as {@link admitTurn} does, for a session that holds
+ * the named studio's lease, and moves the session's live leases to the new
+ * epoch in the same transaction. A refusal is returned unchanged: a
+ * `stale_expectation` naming the caller's own epoch is a refusal and carries
+ * no permission to dispatch. `restamped` counts the leases moved to the epoch.
+ */
+export async function admitLeasedTurn(
+  client: SupabaseClient,
+  input: AdmitTurnInput & { studioId: string }
+): Promise<AdmitLeasedTurnOutcome> {
+  const { data, error } = await client.rpc('admit_leased_turn', {
+    p_session_id: input.sessionId,
+    p_tenure_id: input.holder.tenureId,
+    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_host_instance_id: input.holder.hostInstanceId,
+    p_expected_prior_epoch: input.expectedPriorEpoch,
+    p_epoch: input.epoch,
+    p_command_uuid: input.commandUuid,
+    p_studio_id: input.studioId,
+    p_protocol: ADMISSION_PROTOCOL,
+  });
+  return parseReply(leasedAdmitSchema, 'admit_leased_turn', data, error);
+}
+
 const finishSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('finished'), epoch: z.string() }),
   z.object({
