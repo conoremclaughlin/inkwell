@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AWAKEN_CAP,
   DEFAULT_TURN_CAP,
-  DEFAULT_TURN_TIMEOUT_MS,
   inklingAwakenCap,
   inklingOwnerTestAllowlist,
   inklingOwnerTestUserIds,
@@ -12,11 +11,13 @@ import {
 } from './inkling-flags';
 
 describe('inklingTurnTimeoutMs', () => {
-  it('is five minutes unless INKLING_TURN_TIMEOUT_MS is a positive whole number', () => {
-    expect(DEFAULT_TURN_TIMEOUT_MS).toBe(300_000);
-    expect(inklingTurnTimeoutMs({})).toBe(300_000);
+  it('is no ceiling unless INKLING_TURN_TIMEOUT_MS is a positive whole number', () => {
+    expect(inklingTurnTimeoutMs({})).toBeUndefined();
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '' })).toBeUndefined();
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: 'soon' })).toBeUndefined();
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '0' })).toBeUndefined();
+    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '-5' })).toBeUndefined();
     expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '90000' })).toBe(90_000);
-    expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: 'soon' })).toBe(300_000);
   });
 });
 

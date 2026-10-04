@@ -194,6 +194,19 @@ interface PendingMessage {
   turnEpochCandidate: string;
 }
 
+/**
+ * How an inkling's turn is bounded: a stop takes the tools it started with
+ * it, and a ceiling applies only when one is configured.
+ */
+function inklingRunBounds(ceilingMs: number | undefined): {
+  killProcessGroup: true;
+  timeoutMs?: number;
+} {
+  return ceilingMs === undefined
+    ? { killProcessGroup: true }
+    : { killProcessGroup: true, timeoutMs: ceilingMs };
+}
+
 // ── Route pattern matching (spec:trigger-studio-routing) ──
 
 /**
@@ -2421,9 +2434,9 @@ export class SessionService implements ISessionService {
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
-      // An inkling turn is bounded: its own ceiling, and a stop that takes
-      // the tools it started with it.
-      ...(inklingTurn ? { timeoutMs: inklingTurnTimeoutMs(), killProcessGroup: true } : {}),
+      // An inkling turn's stop takes the tools it started with it. It has a
+      // ceiling only when INKLING_TURN_TIMEOUT_MS sets one.
+      ...(inklingTurn ? inklingRunBounds(inklingTurnTimeoutMs()) : {}),
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(

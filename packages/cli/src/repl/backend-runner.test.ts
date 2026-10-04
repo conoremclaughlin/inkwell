@@ -29,7 +29,7 @@ vi.mock('child_process', () => ({
   spawn: spawnMock,
 }));
 
-import { runBackendTurn, DEFAULT_TURN_HARD_TIMEOUT_MS } from './backend-runner.js';
+import { runBackendTurn } from './backend-runner.js';
 
 function createMockChild(exitCode = 0): EventEmitter & {
   stdout: EventEmitter & { setEncoding: (encoding: string) => void };
@@ -161,22 +161,27 @@ describe('runBackendTurn', () => {
     }
   });
 
-  it('default hard backstop is the 4h runaway ceiling, not the old 20-minute cap', async () => {
+  /** A long-lived child: never closes on its own, tracks kill(). */
+  function longLivedChild() {
+    const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+    stdout.setEncoding = () => undefined;
+    const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
+    stderr.setEncoding = () => undefined;
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: typeof stdout;
+      stderr: typeof stderr;
+      kill: ReturnType<typeof vi.fn>;
+    };
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.kill = vi.fn();
+    return child;
+  }
+
+  it('has no hard backstop by default: a working turn runs past the old 4h ceiling', async () => {
     vi.useFakeTimers();
     try {
-      // Long-lived child: never closes on its own, tracks kill().
-      const stdout = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
-      stdout.setEncoding = () => undefined;
-      const stderr = new EventEmitter() as EventEmitter & { setEncoding: (e: string) => void };
-      stderr.setEncoding = () => undefined;
-      const child = new EventEmitter() as EventEmitter & {
-        stdout: typeof stdout;
-        stderr: typeof stderr;
-        kill: ReturnType<typeof vi.fn>;
-      };
-      child.stdout = stdout;
-      child.stderr = stderr;
-      child.kill = vi.fn();
+      const child = longLivedChild();
       spawnMock.mockImplementation(() => child);
 
       const resultPromise = runBackendTurn({
@@ -185,16 +190,38 @@ describe('runBackendTurn', () => {
         prompt: 'marathon',
       });
 
-      // A working turn crosses the old 20-minute cap unharmed.
-      await vi.advanceTimersByTimeAsync(25 * 60 * 1000);
-      child.stdout.emit('data', 'still working\n');
+      // Six hours of work, past the old 20-minute cap and the 4h backstop
+      // that replaced it (both gone; Conor, 2026-10-04).
+      for (let hour = 0; hour < 6; hour++) {
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+        child.stdout.emit('data', 'still working\n');
+      }
       expect(child.kill).not.toHaveBeenCalled();
 
-      // Still alive just short of the 4h backstop…
-      await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HARD_TIMEOUT_MS - 25 * 60 * 1000 - 1);
-      expect(child.kill).not.toHaveBeenCalled();
+      child.emit('close', 0);
+      const result = await resultPromise;
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
-      // …and reaped as a hard timeout once it crosses.
+  it('an explicit timeoutMs is still a hard ceiling', async () => {
+    vi.useFakeTimers();
+    try {
+      const child = longLivedChild();
+      spawnMock.mockImplementation(() => child);
+
+      const resultPromise = runBackendTurn({
+        backend: 'claude',
+        sbSlug: 'wren',
+        prompt: 'bounded',
+        timeoutMs: 60 * 60 * 1000,
+      });
+
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000 - 1);
+      expect(child.kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(2);
       expect(child.kill).toHaveBeenCalledWith('SIGTERM');
       const result = await resultPromise;

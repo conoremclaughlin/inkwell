@@ -3567,7 +3567,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? Number.parseInt(options.backendTimeoutSeconds, 10)
       : Number.NaN;
   // Hard ceiling: an explicit --backend-timeout-seconds override, else undefined
-  // (→ backend-runner's 4-hour runaway backstop). The old blunt 120s
+  // (→ no ceiling at all; the 4-hour backstop went on 2026-10-04). The old blunt 120s
   // non-interactive wall is GONE — it killed legitimately long turns at the
   // completion boundary (exit 124 → false backend-error). Long turns are now
   // governed by the idle/token-flow timeout below, not wall-clock.

@@ -24,6 +24,7 @@ import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { ceilingFromEnv } from './turn-ceiling.js';
 import {
   buildSessionEnv,
   writeRuntimeSessionHint,
@@ -31,10 +32,20 @@ import {
   CONTAINER_RUNNER_FILES,
 } from '@inklabs/shared';
 
-/** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
- *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.CODEX_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
+/** The general ceiling on a Codex turn: none unless CODEX_PROCESS_TIMEOUT_MS
+ *  sets one (turn-ceiling.ts).
+ *
+ *  There is deliberately no silence timeout either. `codex exec --json`
+ *  writes nothing while the model reasons: on Codex CLI 0.160.0, five
+ *  reasoning deltas over 2.5 seconds produced no stdout or stderr, and only
+ *  the final `item.completed` carried them (Lumen, #745, a local synthetic
+ *  provider). Byte silence here is not evidence that tokens have stopped, so
+ *  a silence killer would break the rule this file follows: a turn still
+ *  producing output is never killed. A wedged Codex turn is stopped only by a
+ *  configured ceiling or a kill by hand: the server's run interruption at
+ *  restart records the run as interrupted but does not kill its process
+ *  (Lumen, #745). */
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CODEX_PROCESS_TIMEOUT_MS);
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
@@ -307,32 +318,38 @@ export class CodexRunner implements IRunner {
       let resolvedSessionId: string | undefined;
 
       let settled = false;
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          this.killProcess(proc);
-          resolve({
-            responses,
-            usage,
-            finalTextResponse: finalTextResponse || '[Codex process timed out]',
-            toolCalls,
-            sessionId: resolvedSessionId,
-            // `timedOut`, not just the marker string. Resolving bare reports a
-            // SIGKILLed turn as a completed one: the session goes idle, a
-            // heartbeat beat records `delivered`, and the marker above is
-            // auto-forwarded to the human as if the agent had written it.
-            // The word "timeout" is load-bearing — classifyError matches on
-            // it, and without it this lands in the non-retryable `unknown`
-            // category. (Same fix Lumen made in antigravity-runner, #507.)
-            timedOut: {
-              kind: 'hard',
-              message: `Codex timeout: exceeded the ${Math.round(
-                PROCESS_TIMEOUT_MS / 1000
-              )}s ceiling, process killed`,
-            },
-          });
-        }
-      }, PROCESS_TIMEOUT_MS);
+
+      // A configured ceiling stops the run however active it is. With none,
+      // nothing here stops it (see PROCESS_TIMEOUT_MS).
+      const ceilingMs = PROCESS_TIMEOUT_MS;
+      const timeout =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              this.killProcess(proc);
+              resolve({
+                responses,
+                usage,
+                finalTextResponse: finalTextResponse || '[Codex process timed out]',
+                toolCalls,
+                sessionId: resolvedSessionId,
+                // `timedOut`, not just the marker string. Resolving bare reports a
+                // SIGKILLed turn as a completed one: the session goes idle, a
+                // heartbeat beat records `delivered`, and the marker is
+                // auto-forwarded to the human as if the agent had written it.
+                // The word "timeout" is load-bearing — classifyError matches on
+                // it, and without it this lands in the non-retryable `unknown`
+                // category. (Same fix Lumen made in antigravity-runner, #507.)
+                timedOut: {
+                  kind: 'hard',
+                  message: `Codex timeout: exceeded the ${Math.round(
+                    ceilingMs / 1000
+                  )}s ceiling, process killed`,
+                },
+              });
+            }, ceilingMs);
 
       proc.stdout.on('data', (data) => {
         stdoutBytes += data.length;

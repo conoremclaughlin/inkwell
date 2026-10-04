@@ -1210,10 +1210,7 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
           await turn(INKLING, fromOwner, OWNER, { session: { sbId: null } });
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
-          expect(configPassedToRunner()).toMatchObject({
-            timeoutMs: 300_000,
-            killProcessGroup: true,
-          });
+          expect(configPassedToRunner()).toMatchObject({ killProcessGroup: true });
           expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
         });
 
@@ -1262,7 +1259,16 @@ describe('SessionService', () => {
         expect((await fs.stat(join(inklingsRoot, SB))).isDirectory()).toBe(true);
       });
 
-      it('its turn is bounded: its own ceiling, and a stop that takes its tools with it', async () => {
+      it('its stop takes its tools with it, and it has a ceiling only when one is configured', async () => {
+        vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '');
+        await turn(INKLING);
+        const unset = configPassedToRunner() as Record<string, unknown>;
+        expect(unset.killProcessGroup).toBe(true);
+        // A working turn is not killed on wall-clock (Conor, 2026-10-04): the
+        // first test's five minutes is gone unless the env sets a ceiling.
+        expect('timeoutMs' in unset).toBe(false);
+
+        vi.mocked(mockClaudeRunner.run).mockClear();
         vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '90000');
         await turn(INKLING);
         expect(configPassedToRunner()).toMatchObject({ timeoutMs: 90000, killProcessGroup: true });
