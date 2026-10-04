@@ -1,11 +1,13 @@
 /**
- * Durable command admission against a real database (migration
- * 20261004094856): ordering, dedupe, mode binding, transitions and the
- * unknown-effect hold. These are the invariants concurrency or Postgres
- * semantics decide, so a mock cannot stand in for them.
+ * Durable command admission (migration 20261004094856) and owner tenure with
+ * turn generations (20261004104039) against a real database: ordering, dedupe,
+ * mode binding, transitions, the unknown-effect hold, holder authority, turn
+ * serialization and release evidence. These are the invariants concurrency or
+ * Postgres semantics decide, so a mock cannot stand in for them.
  *
  * The suite flips the global admission mode to `conditional` and restores
- * `legacy` afterwards. Nothing else reads that row yet.
+ * `legacy` afterwards. Both migrations' tests live in this one file because
+ * integration files run in parallel and every one of these reads that row.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -20,6 +22,19 @@ import {
   transitionCommand,
   type AdmitCommandInput,
 } from './command-admission';
+import {
+  admitTurn,
+  finishTurn,
+  markTenureLost,
+  mintTenureCapability,
+  reconcileTenure,
+  recordInvocation,
+  registerTenure,
+  releaseTenure,
+  type InvocationRecord,
+  type TenureHolder,
+  type TenureMode,
+} from './tenure-admission';
 
 const SUITE_SB = 'command-admission-suite';
 const OTHER_SB = 'command-admission-other';
@@ -907,6 +922,562 @@ describe('durable command admission', () => {
         holdingCommand: null,
         head: f.id,
       });
+    });
+  });
+
+  describe('owner tenure and turn generations', () => {
+    const HOST = { instanceId: `host-${RUN}`, bootId: 'boot-fixture-1', hostId: 'host-fixture' };
+
+    async function register(sessionId: string, mode: TenureMode = 'interactive_wrapper') {
+      const { capability, capabilityHash } = mintTenureCapability();
+      const r = await registerTenure(supabase, {
+        sessionId,
+        expected: { kind: 'never_owned' },
+        mode,
+        capabilityHash,
+        host: HOST,
+      });
+      if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+      return { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId };
+    }
+
+    async function queued(sessionId: string): Promise<string> {
+      const r = await admitCommand(supabase, input(sessionId));
+      if (r.outcome !== 'admitted') throw new Error(`unexpected ${r.outcome}`);
+      return r.id;
+    }
+
+    async function turn(sessionId: string, holder: TenureHolder, prior: string | null) {
+      const command = await queued(sessionId);
+      const epoch = randomUUID();
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: prior,
+          epoch,
+          commandUuid: command,
+        })
+      ).toEqual({ outcome: 'admitted', epoch });
+      return { epoch, command };
+    }
+
+    // The claimed command, finished with terminal evidence.
+    async function complete(command: string): Promise<void> {
+      const { data } = await supabase
+        .from('session_commands')
+        .select('revision, state')
+        .eq('id', command)
+        .single();
+      const r = await transitionCommand(supabase, {
+        commandUuid: command,
+        expected: { revision: data!.revision as number, state: data!.state as 'queued' },
+        to: 'completed',
+      });
+      if (r.outcome !== 'transitioned') throw new Error(`unexpected ${r.outcome}`);
+    }
+
+    async function finish(sessionId: string, holder: TenureHolder, epoch: string) {
+      expect(
+        await finishTurn(supabase, { sessionId, holder, epoch, evidence: 'cli_stop' })
+      ).toEqual({
+        outcome: 'finished',
+        epoch,
+      });
+    }
+
+    async function settledSpawn(
+      sessionId: string,
+      holder: TenureHolder,
+      epoch: string,
+      invocationId: string,
+      records: InvocationRecord[]
+    ) {
+      for (const record of [{ kind: 'intent' } as InvocationRecord, ...records]) {
+        await recordInvocation(supabase, { sessionId, holder, epoch, invocationId, record });
+      }
+    }
+
+    it('refuses in legacy mode', async () => {
+      const sessionId = await newSession(suiteSbId);
+      await setMode('legacy');
+      try {
+        const { capabilityHash } = mintTenureCapability();
+        expect(
+          await registerTenure(supabase, {
+            sessionId,
+            expected: { kind: 'never_owned' },
+            mode: 'server_hosted',
+            capabilityHash,
+            host: HOST,
+          })
+        ).toEqual({ outcome: 'mode_mismatch', mode: 'legacy', protocol: ADMISSION_PROTOCOL });
+      } finally {
+        await setMode('conditional');
+      }
+    });
+
+    it('takes never-owned only from evidence recorded at creation; a legacy session is occupied', async () => {
+      // Created while the database was legacy: no origin, null markers or not.
+      await setMode('legacy');
+      let legacy: string;
+      try {
+        legacy = await newSession(suiteSbId);
+      } finally {
+        await setMode('conditional');
+      }
+      const { capabilityHash } = mintTenureCapability();
+      expect(
+        await registerTenure(supabase, {
+          sessionId: legacy,
+          expected: { kind: 'never_owned' },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toEqual({ outcome: 'unverified' });
+
+      // A legacy turn epoch with no record of its turn reads the same way.
+      const fresh = await newSession(suiteSbId);
+      await supabase.from('sessions').update({ turn_epoch: randomUUID() }).eq('id', fresh);
+      expect(
+        await registerTenure(supabase, {
+          sessionId: fresh,
+          expected: { kind: 'never_owned' },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toEqual({ outcome: 'unverified' });
+
+      const created = await newSession(suiteSbId);
+      const holder = await register(created);
+      expect(holder.tenureId).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it('lets only the holder act: knowing the tenure id is not enough', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const command = await queued(sessionId);
+      const attempt = (h: TenureHolder) =>
+        admitTurn(supabase, {
+          sessionId,
+          holder: h,
+          expectedPriorEpoch: null,
+          epoch: randomUUID(),
+          commandUuid: command,
+        });
+      expect(await attempt({ ...holder, capability: mintTenureCapability().capability })).toEqual({
+        outcome: 'not_holder',
+      });
+      expect(await attempt({ ...holder, hostInstanceId: 'another-host' })).toEqual({
+        outcome: 'not_holder',
+      });
+      expect(await attempt({ ...holder, tenureId: randomUUID() })).toEqual({
+        outcome: 'not_holder',
+      });
+      expect((await attempt(holder)).outcome).toBe('admitted');
+    });
+
+    it('serializes turns under one tenure: busy while active, then the next turn on exact CAS', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      const next = await queued(sessionId);
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch: randomUUID(),
+          commandUuid: next,
+        })
+      ).toEqual({ outcome: 'busy', epoch: first.epoch });
+      await finish(sessionId, holder, first.epoch);
+      // Finishing kept the tenure: another owner cannot register.
+      const { capabilityHash } = mintTenureCapability();
+      expect(
+        await registerTenure(supabase, {
+          sessionId,
+          expected: { kind: 'never_owned' },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toEqual({ outcome: 'occupied', tenureId: holder.tenureId, state: 'held' });
+      // The claimed command still holds until terminal evidence.
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch: randomUUID(),
+          commandUuid: next,
+        })
+      ).toMatchObject({
+        outcome: 'held',
+        hold: 'unresolved_dispatch',
+        holdingCommand: first.command,
+      });
+      await complete(first.command);
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: null,
+          epoch: randomUUID(),
+          commandUuid: next,
+        })
+      ).toEqual({ outcome: 'stale_expectation', epoch: first.epoch });
+      const epoch = randomUUID();
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch,
+          commandUuid: next,
+        })
+      ).toEqual({ outcome: 'admitted', epoch });
+    });
+
+    it('takes only the FIFO head', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const head = await queued(sessionId);
+      const later = await queued(sessionId);
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: null,
+          epoch: randomUUID(),
+          commandUuid: later,
+        })
+      ).toEqual({ outcome: 'not_fifo_head', head });
+    });
+
+    it('holds the next turn behind an unbound spawn of a finished turn, and lets a bound one continue', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      await settledSpawn(sessionId, holder, first.epoch, 'inv-1', []);
+      await finish(sessionId, holder, first.epoch);
+      await complete(first.command);
+      const next = await queued(sessionId);
+      const attempt = () =>
+        admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch: randomUUID(),
+          commandUuid: next,
+        });
+      expect(await attempt()).toEqual({ outcome: 'unresolved', epoch: first.epoch });
+      // Bound: a tracked process of the owner's own, not unknown merely because alive.
+      await recordInvocation(supabase, {
+        sessionId,
+        holder,
+        epoch: first.epoch,
+        invocationId: 'inv-1',
+        record: { kind: 'process_binding', pid: 4242, startIdentity: 'start-fixture-1' },
+      });
+      expect((await attempt()).outcome).toBe('admitted');
+    });
+
+    it('holds the next turn behind a claimed command whose status write was lost', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      await finish(sessionId, holder, first.epoch);
+      // No terminal write ever lands for first.command.
+      const next = await queued(sessionId);
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch: randomUUID(),
+          commandUuid: next,
+        })
+      ).toMatchObject({
+        outcome: 'held',
+        hold: 'unresolved_dispatch',
+        holdingCommand: first.command,
+      });
+    });
+
+    it('releases only on resolved spawns: an empty process group is not tree quiescence', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      await settledSpawn(sessionId, holder, first.epoch, 'inv-1', [
+        { kind: 'process_binding', pid: 4243, startIdentity: 'start-fixture-2' },
+        { kind: 'parent_exited' },
+        { kind: 'group_empty' },
+      ]);
+      await finish(sessionId, holder, first.epoch);
+      await complete(first.command);
+      const release = () =>
+        releaseTenure(supabase, { sessionId, holder, evidence: 'wrapper_exit_tree_quiescent' });
+      expect(await release()).toEqual({ outcome: 'unresolved', invocations: 1 });
+      await recordInvocation(supabase, {
+        sessionId,
+        holder,
+        epoch: first.epoch,
+        invocationId: 'inv-1',
+        record: { kind: 'tree_quiescent', evidenceRef: 'attestation-fixture-1' },
+      });
+      expect(await release()).toEqual({ outcome: 'released', tenureId: holder.tenureId });
+    });
+
+    it('refuses a retained holder after release, and admits the next owner on the exact prior', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId, 'server_hosted');
+      const first = await turn(sessionId, holder, null);
+      await finish(sessionId, holder, first.epoch);
+      await complete(first.command);
+      expect(
+        await releaseTenure(supabase, { sessionId, holder, evidence: 'controller_retired' })
+      ).toEqual({ outcome: 'released', tenureId: holder.tenureId });
+
+      // The retired controller object still has its capability and tenure id.
+      const next = await queued(sessionId);
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder,
+          expectedPriorEpoch: first.epoch,
+          epoch: randomUUID(),
+          commandUuid: next,
+        })
+      ).toEqual({ outcome: 'not_holder' });
+      expect(
+        await recordInvocation(supabase, {
+          sessionId,
+          holder,
+          epoch: first.epoch,
+          invocationId: 'late',
+          record: { kind: 'intent' },
+        })
+      ).toEqual({ outcome: 'not_holder' });
+
+      const { capability, capabilityHash } = mintTenureCapability();
+      const base = { sessionId, mode: 'interactive_wrapper' as const, capabilityHash, host: HOST };
+      expect(
+        await registerTenure(supabase, { ...base, expected: { kind: 'never_owned' } })
+      ).toMatchObject({
+        outcome: 'stale_expectation',
+        state: 'released',
+      });
+      expect(
+        await registerTenure(supabase, {
+          ...base,
+          expected: { kind: 'released', tenureId: randomUUID() },
+        })
+      ).toMatchObject({ outcome: 'stale_expectation', tenureId: holder.tenureId });
+      const r = await registerTenure(supabase, {
+        ...base,
+        expected: { kind: 'released', tenureId: holder.tenureId },
+      });
+      if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+      const successor = { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId };
+      const epoch = randomUUID();
+      expect(
+        await admitTurn(supabase, {
+          sessionId,
+          holder: successor,
+          expectedPriorEpoch: first.epoch,
+          epoch,
+          commandUuid: next,
+        })
+      ).toEqual({ outcome: 'admitted', epoch });
+    });
+
+    it('treats an identical binding retry as a no-op and a conflicting one as a contradiction only a reconciler clears', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      const record = (r: InvocationRecord) =>
+        recordInvocation(supabase, {
+          sessionId,
+          holder,
+          epoch: first.epoch,
+          invocationId: 'inv-1',
+          record: r,
+        });
+      expect(await record({ kind: 'intent' })).toEqual({ outcome: 'recorded', kind: 'intent' });
+      expect(await record({ kind: 'intent' })).toEqual({
+        outcome: 'already_recorded',
+        kind: 'intent',
+      });
+      const binding = {
+        kind: 'process_binding' as const,
+        pid: 4244,
+        startIdentity: 'start-fixture-3',
+      };
+      expect(await record(binding)).toEqual({ outcome: 'recorded', kind: 'process_binding' });
+      expect(await record(binding)).toEqual({
+        outcome: 'already_recorded',
+        kind: 'process_binding',
+      });
+      expect(await record({ ...binding, pid: 4245 })).toEqual({
+        outcome: 'contradiction',
+        kind: 'process_binding',
+      });
+      // The holder's later evidence is no longer accepted for it.
+      expect(
+        await record({ kind: 'tree_quiescent', evidenceRef: 'attestation-fixture-2' })
+      ).toEqual({
+        outcome: 'contradiction',
+        kind: 'tree_quiescent',
+      });
+      await finish(sessionId, holder, first.epoch);
+      await complete(first.command);
+      expect(
+        await releaseTenure(supabase, {
+          sessionId,
+          holder,
+          evidence: 'wrapper_exit_tree_quiescent',
+        })
+      ).toEqual({ outcome: 'unresolved', invocations: 1 });
+
+      // Only a whole-tree verification by the reconciler clears it.
+      expect(
+        await reconcileTenure(supabase, {
+          sessionId,
+          expectedTenureId: holder.tenureId,
+          evidence: 'owner_tree_gone',
+          evidenceRef: 'reconciler-attestation-fixture',
+          authority: 'reconciler-fixture',
+          hostInstanceId: HOST.instanceId,
+        })
+      ).toEqual({ outcome: 'reconciled', tenureId: holder.tenureId });
+      const { capabilityHash } = mintTenureCapability();
+      expect(
+        await registerTenure(supabase, {
+          sessionId,
+          expected: { kind: 'reconciled', tenureId: holder.tenureId },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toMatchObject({ outcome: 'registered' });
+    });
+
+    it('keeps a lost owner occupied until boot evidence the tenure itself recorded', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const holder = await register(sessionId);
+      const first = await turn(sessionId, holder, null);
+      expect(
+        await markTenureLost(supabase, {
+          sessionId,
+          tenureId: holder.tenureId,
+          authority: 'reconciler-fixture',
+          reasonCode: 'owner_unreachable',
+        })
+      ).toEqual({ outcome: 'recovery_required', tenureId: holder.tenureId });
+      const { capabilityHash } = mintTenureCapability();
+      expect(
+        await registerTenure(supabase, {
+          sessionId,
+          expected: { kind: 'never_owned' },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toEqual({ outcome: 'occupied', tenureId: holder.tenureId, state: 'recovery_required' });
+      const reconcile = (currentBootId: string) =>
+        reconcileTenure(supabase, {
+          sessionId,
+          expectedTenureId: holder.tenureId,
+          evidence: 'boot_changed',
+          currentBootId,
+          authority: 'reconciler-fixture',
+          hostInstanceId: HOST.instanceId,
+        });
+      expect(await reconcile(HOST.bootId)).toEqual({
+        outcome: 'refused',
+        reason: 'boot_evidence_absent_or_same',
+      });
+      expect(await reconcile('boot-fixture-2')).toEqual({
+        outcome: 'reconciled',
+        tenureId: holder.tenureId,
+      });
+      // Process overlap is cleared; the turn's command is still unresolved and holds.
+      const next = await queued(sessionId);
+      const r = await registerTenure(supabase, {
+        sessionId,
+        expected: { kind: 'reconciled', tenureId: holder.tenureId },
+        mode: 'server_hosted',
+        capabilityHash,
+        host: HOST,
+      });
+      expect(r).toMatchObject({
+        outcome: 'held',
+        hold: 'unresolved_dispatch',
+        holdingCommand: first.command,
+      });
+      void next;
+    });
+
+    it('refuses boot evidence when the tenure never recorded a boot', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const { capabilityHash } = mintTenureCapability();
+      const r = await registerTenure(supabase, {
+        sessionId,
+        expected: { kind: 'never_owned' },
+        mode: 'interactive_wrapper',
+        capabilityHash,
+        host: { instanceId: HOST.instanceId },
+      });
+      if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+      expect(
+        await reconcileTenure(supabase, {
+          sessionId,
+          expectedTenureId: r.tenureId,
+          evidence: 'boot_changed',
+          currentBootId: 'any-boot',
+          authority: 'reconciler-fixture',
+          hostInstanceId: HOST.instanceId,
+        })
+      ).toEqual({ outcome: 'refused', reason: 'boot_evidence_absent_or_same' });
+    });
+
+    it('clears unverified history only by an operator decision', async () => {
+      await setMode('legacy');
+      let legacy: string;
+      try {
+        legacy = await newSession(suiteSbId);
+      } finally {
+        await setMode('conditional');
+      }
+      const reconcile = (evidence: 'boot_changed' | 'operator_decision') =>
+        reconcileTenure(supabase, {
+          sessionId: legacy,
+          expectedTenureId: null,
+          evidence,
+          currentBootId: 'boot-fixture-9',
+          evidenceRef: 'operator-window-fixture',
+          authority: 'operator-fixture',
+          hostInstanceId: HOST.instanceId,
+        });
+      expect(await reconcile('boot_changed')).toEqual({
+        outcome: 'refused',
+        reason: 'unverified_history_needs_operator',
+      });
+      const decided = await reconcile('operator_decision');
+      if (decided.outcome !== 'reconciled') throw new Error(`unexpected ${decided.outcome}`);
+      const { capabilityHash } = mintTenureCapability();
+      expect(
+        await registerTenure(supabase, {
+          sessionId: legacy,
+          expected: { kind: 'reconciled', tenureId: decided.tenureId },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        })
+      ).toMatchObject({ outcome: 'registered' });
     });
   });
 });
