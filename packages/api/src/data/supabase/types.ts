@@ -4826,6 +4826,68 @@ export type Database = {
           },
         ];
       };
+      thread_message_reactions: {
+        Row: {
+          created_at: string;
+          emoji: string;
+          id: string;
+          message_id: string;
+          reactor_sb_id: string | null;
+          reactor_user_id: string | null;
+          thread_id: string;
+          workspace_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          emoji: string;
+          id?: string;
+          message_id: string;
+          reactor_sb_id?: string | null;
+          reactor_user_id?: string | null;
+          thread_id: string;
+          workspace_id: string;
+        };
+        Update: {
+          created_at?: string;
+          emoji?: string;
+          id?: string;
+          message_id?: string;
+          reactor_sb_id?: string | null;
+          reactor_user_id?: string | null;
+          thread_id?: string;
+          workspace_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'thread_message_reactions_message_id_fkey';
+            columns: ['message_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_thread_messages';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_reactor_user_id_fkey';
+            columns: ['reactor_user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_sb_workspace_fkey';
+            columns: ['reactor_sb_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_thread_workspace_fkey';
+            columns: ['thread_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+        ];
+      };
       trusted_users: {
         Row: {
           added_at: string | null;

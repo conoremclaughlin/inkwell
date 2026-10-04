@@ -227,6 +227,7 @@ import {
   handleMarkThreadRead,
   handleReopenThread,
   handleUpdateThread,
+  handleReactToMessage,
   threadTool,
 } from './thread-handlers';
 
@@ -4516,6 +4517,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetThreadMessages(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_thread_messages:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'react_to_message',
+    {
+      description: `${threadTool('react_to_message').description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadTool('react_to_message').schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleReactToMessage(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in react_to_message:', error);
         return {
           content: [
             {

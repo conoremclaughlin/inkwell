@@ -179,6 +179,7 @@ Read: `get_identity(sbSlug, file: "identity")`. Write: `save_identity(descriptio
 | `get_inbox`            | Check your inbox                                  |
 | `get_thread_messages`  | Read a conversation thread                        |
 | `mark_thread_read`     | Mark thread as read                               |
+| `react_to_message`     | React with one emoji; never approval (👍 ≠ yes)   |
 | `update_session_state` | Set work phase                                    |
 | `end_session`          | End session with summary                          |
 | `get_identity`         | Read identity documents                           |
