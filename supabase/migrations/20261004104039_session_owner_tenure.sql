@@ -106,7 +106,9 @@ CREATE TABLE public.session_turn_generations (
   session_id uuid NOT NULL REFERENCES public.sessions(id) ON DELETE CASCADE,
   epoch text NOT NULL CHECK (length(epoch) BETWEEN 1 AND 200),
   tenure_id uuid NOT NULL REFERENCES public.session_owner_tenures(id) ON DELETE CASCADE,
-  command_uuid uuid NOT NULL REFERENCES public.session_commands(id) ON DELETE CASCADE,
+  -- NULL only on the coverage row a reconciler writes for a legacy epoch that
+  -- ran before admission existed; every admitted turn names its command.
+  command_uuid uuid REFERENCES public.session_commands(id) ON DELETE CASCADE,
   prior_epoch text,
   state text NOT NULL CHECK (state IN ('active', 'finished', 'recovery_required')),
   admitted_at timestamptz NOT NULL DEFAULT now(),
@@ -114,7 +116,9 @@ CREATE TABLE public.session_turn_generations (
   finish_evidence text CHECK (finish_evidence IS NULL OR finish_evidence ~ '^[a-z0-9_.:-]{1,100}$'),
   PRIMARY KEY (session_id, epoch),
   CONSTRAINT session_turn_generations_finished_pair
-    CHECK ((state = 'finished') = (finished_at IS NOT NULL))
+    CHECK ((state = 'finished') = (finished_at IS NOT NULL)),
+  CONSTRAINT session_turn_generations_command_or_legacy_coverage
+    CHECK (command_uuid IS NOT NULL OR (state = 'finished' AND finish_evidence = 'reconciled_legacy_epoch'))
 );
 
 CREATE UNIQUE INDEX session_turn_generations_one_active
@@ -126,12 +130,17 @@ CREATE UNIQUE INDEX session_turn_generations_one_active
 -- has to see, inside its own transaction, whether any spawn of a turn is still
 -- pending or uncertain, so the host records the same facts here as it records
 -- them there, keyed by the same invocation identity.
---   bound          a verified process identity is recorded (process_pid);
+--   bound          a verified process identity is recorded (process_pid). A
+--                  transcript binding is the provider's own report after the
+--                  spawn, so it is backend execution evidence too; a resume
+--                  target chosen before spawn is not recorded here;
 --   resolved       resolution is tree_quiescent (with the attestation actually
 --                  checked) or not_spawned (a refusal recorded before spawn);
 --   contradiction  two records disagreed: its resolution is cleared, the
 --                  holder's evidence is no longer accepted for it, and only a
 --                  reconciler can resolve it.
+--   unknown        the holder lost track of it (unknown_reason): any earlier
+--                  resolution is cleared, and only a reconciler can resolve it.
 -- Parent exit and an empty process group are recorded as what they are and
 -- never count as quiescence.
 CREATE TABLE public.session_turn_invocations (
@@ -157,7 +166,8 @@ CREATE TABLE public.session_turn_invocations (
   CONSTRAINT session_turn_invocations_resolution_evidence
     CHECK (resolution IS NULL OR resolution_evidence_ref IS NOT NULL),
   CONSTRAINT session_turn_invocations_not_spawned_unbound
-    CHECK (resolution IS DISTINCT FROM 'not_spawned' OR process_pid IS NULL)
+    CHECK (resolution IS DISTINCT FROM 'not_spawned'
+           OR (process_pid IS NULL AND provider_transcript_id IS NULL))
 );
 
 CREATE TRIGGER session_turn_invocations_updated_at
@@ -364,10 +374,10 @@ $$;
 -- ── admit_turn ──────────────────────────────────────────────────────────────
 -- Transition 2: the holder begins a turn for the session's FIFO head command.
 -- The expected prior epoch is the session's current turn_epoch, exactly (null
--- before the first turn). The prior turn must not be running or uncertain, and
--- if it ran under this tenure its spawns must all be bound or resolved; if it
--- ran under an earlier tenure, release already required them resolved and
--- this checks again. Release of the tenure is never required.
+-- before the first turn). The prior turn must not be running, no turn may be
+-- uncertain, and every spawn of every turn the session ran is checked: bound
+-- or resolved for the holder's own turns, resolved for any other tenure's.
+-- Release of the tenure is never required.
 CREATE FUNCTION public.admit_turn(
   p_session_id uuid,
   p_tenure_id uuid,
@@ -389,6 +399,7 @@ DECLARE
   v_head jsonb;
   v_command record;
   v_claim jsonb;
+  v_unresolved integer;
 BEGIN
   v_refusal := public.session_admission_mode_refusal(p_protocol);
   IF v_refusal IS NOT NULL THEN RETURN v_refusal; END IF;
@@ -433,11 +444,25 @@ BEGIN
     IF v_prior.state = 'recovery_required' THEN
       RETURN jsonb_build_object('outcome', 'unresolved', 'epoch', v_session.turn_epoch);
     END IF;
-    IF public.session_turn_unresolved_invocations(
-         p_session_id, v_session.turn_epoch, v_prior.tenure_id IS DISTINCT FROM p_tenure_id
-       ) > 0 THEN
-      RETURN jsonb_build_object('outcome', 'unresolved', 'epoch', v_session.turn_epoch);
-    END IF;
+  END IF;
+
+  -- Every turn the session has run, not only the last: a background spawn of
+  -- an older turn can turn uncertain after later turns finished. The holder's
+  -- own turns need their spawns bound or resolved with nothing uncertain;
+  -- turns under any other tenure need them resolved.
+  IF EXISTS (
+    SELECT 1 FROM public.session_turn_generations g
+     WHERE g.session_id = p_session_id AND g.state = 'recovery_required'
+  ) THEN
+    RETURN jsonb_build_object('outcome', 'unresolved', 'epoch', v_session.turn_epoch);
+  END IF;
+  SELECT COALESCE(sum(public.session_turn_unresolved_invocations(
+           p_session_id, g.epoch, g.tenure_id IS DISTINCT FROM p_tenure_id)), 0)
+    INTO v_unresolved
+    FROM public.session_turn_generations g
+   WHERE g.session_id = p_session_id;
+  IF v_unresolved > 0 THEN
+    RETURN jsonb_build_object('outcome', 'unresolved', 'epoch', v_session.turn_epoch);
   END IF;
 
   v_head := public.session_dispatch_head(p_session_id);
@@ -721,7 +746,9 @@ BEGIN
       v_contradiction := true;
     END IF;
   ELSIF p_kind = 'transcript_binding' THEN
-    IF v_inv.provider_transcript_id IS NULL THEN
+    IF v_inv.resolution = 'not_spawned' THEN
+      v_contradiction := true;
+    ELSIF v_inv.provider_transcript_id IS NULL THEN
       UPDATE public.session_turn_invocations SET provider_transcript_id = v_transcript
        WHERE session_id = p_session_id AND epoch = p_epoch AND invocation_id = p_invocation_id;
       RETURN jsonb_build_object('outcome', 'recorded', 'kind', p_kind);
@@ -739,8 +766,12 @@ BEGIN
     UPDATE public.session_turn_invocations SET group_empty = true
      WHERE session_id = p_session_id AND epoch = p_epoch AND invocation_id = p_invocation_id;
     RETURN jsonb_build_object('outcome', 'recorded', 'kind', p_kind);
+  ELSIF p_kind IN ('not_spawned', 'tree_quiescent') AND v_inv.unknown_reason IS NOT NULL THEN
+    -- The holder said it lost track of this spawn; only a reconciler resolves it now.
+    RETURN jsonb_build_object('outcome', 'needs_reconciler', 'kind', p_kind);
   ELSIF p_kind = 'not_spawned' THEN
-    IF v_inv.process_pid IS NOT NULL OR v_inv.resolution = 'tree_quiescent' THEN
+    IF v_inv.process_pid IS NOT NULL OR v_inv.provider_transcript_id IS NOT NULL
+       OR v_inv.resolution = 'tree_quiescent' THEN
       v_contradiction := true;
     ELSIF v_inv.resolution = 'not_spawned' THEN
       RETURN jsonb_build_object('outcome', 'already_recorded', 'kind', p_kind);
@@ -762,7 +793,9 @@ BEGIN
       RETURN jsonb_build_object('outcome', 'recorded', 'kind', p_kind);
     END IF;
   ELSIF p_kind = 'unknown' THEN
-    UPDATE public.session_turn_invocations SET unknown_reason = v_reason
+    -- New uncertainty outranks an earlier resolution: it is cleared, not kept beside it.
+    UPDATE public.session_turn_invocations
+       SET unknown_reason = v_reason, resolution = NULL, resolution_evidence_ref = NULL
      WHERE session_id = p_session_id AND epoch = p_epoch AND invocation_id = p_invocation_id;
     RETURN jsonb_build_object('outcome', 'recorded', 'kind', p_kind);
   END IF;
@@ -822,19 +855,27 @@ END;
 $$;
 
 -- reconcile_tenure (transition 6): clears an occupying tenure, or a session's
--- unverified history, on positive evidence:
---   boot_changed       the tenure recorded its host boot id and the current boot
---                      differs. Never inferred from a missing or default boot.
---                      Clears process overlap only; effects stay with commands.
+-- unverified history, on positive evidence of the right kind:
+--   boot_changed       the tenure recorded the machine it ran on (host_id) and
+--                      that machine's boot id, and the reconciler reports the
+--                      same machine with a different boot. A different machine,
+--                      a new host instance, or a missing machine or boot id is
+--                      not this machine rebooting, and is refused. It clears
+--                      process overlap only; effects stay with their commands.
 --   owner_tree_gone    the reconciler verified the owner and its whole process
 --                      tree gone, by the attestation named in p_evidence_ref.
---   operator_decision  an authorized operator decided, naming the evidence.
--- For unverified history (no tenure pointer), only operator_decision applies.
+--   operator_decision  an authorized operator's decision, naming its evidence.
+--                      It accepts effect risk and never proves a process gone,
+--                      so it clears only unverified history (no tenure), and is
+--                      refused for an existing tenure.
+-- Clearing unverified history keeps a legacy turn_epoch and records coverage
+-- for it, so the next owner's first turn names that epoch as its exact prior.
 CREATE FUNCTION public.reconcile_tenure(
   p_session_id uuid,
   p_expected_tenure_id uuid,
   p_evidence text,
   p_current_boot_id text,
+  p_current_host_id text,
   p_evidence_ref text,
   p_authority text,
   p_host_instance_id text,
@@ -864,7 +905,7 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'evidenceRef');
   END IF;
 
-  SELECT s.id, s.owner_tenure_id INTO v_session
+  SELECT s.id, s.owner_tenure_id, s.turn_epoch INTO v_session
     FROM public.sessions s WHERE s.id = p_session_id FOR UPDATE;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('outcome', 'session_missing');
@@ -885,34 +926,52 @@ BEGIN
     )
     RETURNING id INTO v_id;
     UPDATE public.sessions SET owner_tenure_id = v_id WHERE id = p_session_id;
-    UPDATE public.session_turn_generations SET state = 'finished', finished_at = now(),
-           finish_evidence = 'reconciled_operator_decision'
-     WHERE session_id = p_session_id AND state IN ('active', 'recovery_required');
+    IF v_session.turn_epoch IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM public.session_turn_generations g
+       WHERE g.session_id = p_session_id AND g.epoch = v_session.turn_epoch
+    ) THEN
+      INSERT INTO public.session_turn_generations (
+        session_id, epoch, tenure_id, command_uuid, prior_epoch, state, finished_at, finish_evidence
+      ) VALUES (
+        p_session_id, v_session.turn_epoch, v_id, NULL, NULL, 'finished', now(), 'reconciled_legacy_epoch'
+      );
+    END IF;
     RETURN jsonb_build_object('outcome', 'reconciled', 'tenureId', v_id);
   END IF;
 
-  SELECT t.id, t.state, t.host_boot_id INTO v_tenure
+  IF p_evidence = 'operator_decision' THEN
+    RETURN jsonb_build_object('outcome', 'refused', 'reason', 'operator_decision_cannot_prove_quiescence');
+  END IF;
+
+  SELECT t.id, t.state, t.host_boot_id, t.host_id INTO v_tenure
     FROM public.session_owner_tenures t
    WHERE t.id = v_session.owner_tenure_id AND t.session_id = p_session_id;
   IF NOT FOUND OR v_tenure.state NOT IN ('held', 'recovery_required') THEN
     RETURN jsonb_build_object('outcome', 'stale', 'state', v_tenure.state);
   END IF;
-  IF p_evidence = 'boot_changed'
-     AND (v_tenure.host_boot_id IS NULL OR v_tenure.host_boot_id = p_current_boot_id) THEN
-    RETURN jsonb_build_object('outcome', 'refused', 'reason', 'boot_evidence_absent_or_same');
+  IF p_evidence = 'boot_changed' THEN
+    IF v_tenure.host_id IS NULL OR p_current_host_id IS NULL
+       OR v_tenure.host_id IS DISTINCT FROM p_current_host_id THEN
+      RETURN jsonb_build_object('outcome', 'refused', 'reason', 'machine_scope_absent_or_different');
+    END IF;
+    IF v_tenure.host_boot_id IS NULL OR v_tenure.host_boot_id = p_current_boot_id THEN
+      RETURN jsonb_build_object('outcome', 'refused', 'reason', 'boot_evidence_absent_or_same');
+    END IF;
   END IF;
 
   UPDATE public.session_owner_tenures
      SET state = 'reconciled', ended_at = COALESCE(ended_at, now()), end_evidence = p_evidence,
          ended_by = p_authority, capability_hash = NULL
    WHERE id = v_tenure.id;
-  -- Process overlap is cleared for every spawn under this tenure, contradictory
-  -- ones included: the evidence here is about the whole tree, not one record.
-  -- Effects stay on their commands, where an unknown outcome keeps holding the
-  -- session.
+  -- Process overlap is cleared for every spawn under this tenure, uncertain
+  -- and contradictory ones included: this evidence is about the whole tree,
+  -- not one record. Effects stay on their commands, where an unknown outcome
+  -- keeps holding the session.
   UPDATE public.session_turn_invocations i
      SET resolution = 'tree_quiescent',
-         resolution_evidence_ref = COALESCE(p_evidence_ref, 'boot_changed:' || p_current_boot_id)
+         resolution_evidence_ref = COALESCE(
+           p_evidence_ref, 'boot_changed:' || p_current_host_id || ':' || p_current_boot_id
+         )
     FROM public.session_turn_generations g
    WHERE g.session_id = p_session_id AND g.tenure_id = v_tenure.id
      AND i.session_id = g.session_id AND i.epoch = g.epoch
@@ -945,5 +1004,5 @@ REVOKE ALL ON FUNCTION public.record_invocation(uuid, uuid, text, text, text, te
 GRANT EXECUTE ON FUNCTION public.record_invocation(uuid, uuid, text, text, text, text, text, jsonb, integer) TO service_role;
 REVOKE ALL ON FUNCTION public.mark_tenure_lost(uuid, uuid, text, text, integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.mark_tenure_lost(uuid, uuid, text, text, integer) TO service_role;
-REVOKE ALL ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, integer) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, integer) TO service_role;
+REVOKE ALL ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reconcile_tenure(uuid, uuid, text, text, text, text, text, text, integer) TO service_role;

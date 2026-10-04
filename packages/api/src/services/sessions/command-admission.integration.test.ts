@@ -1393,6 +1393,7 @@ describe('durable command admission', () => {
           expectedTenureId: holder.tenureId,
           evidence: 'boot_changed',
           currentBootId,
+          currentHostId: HOST.hostId,
           authority: 'reconciler-fixture',
           hostInstanceId: HOST.instanceId,
         });
@@ -1421,7 +1422,7 @@ describe('durable command admission', () => {
       void next;
     });
 
-    it('refuses boot evidence when the tenure never recorded a boot', async () => {
+    it('refuses boot evidence when the tenure never recorded its machine or boot', async () => {
       const sessionId = await newSession(suiteSbId);
       const { capabilityHash } = mintTenureCapability();
       const r = await registerTenure(supabase, {
@@ -1438,10 +1439,11 @@ describe('durable command admission', () => {
           expectedTenureId: r.tenureId,
           evidence: 'boot_changed',
           currentBootId: 'any-boot',
+          currentHostId: HOST.hostId,
           authority: 'reconciler-fixture',
           hostInstanceId: HOST.instanceId,
         })
-      ).toEqual({ outcome: 'refused', reason: 'boot_evidence_absent_or_same' });
+      ).toEqual({ outcome: 'refused', reason: 'machine_scope_absent_or_different' });
     });
 
     it('clears unverified history only by an operator decision', async () => {
@@ -1478,6 +1480,255 @@ describe('durable command admission', () => {
           host: HOST,
         })
       ).toMatchObject({ outcome: 'registered' });
+    });
+
+    // Round 2 (Lumen 03ae1d66): each case ported from the review's probes.
+    describe('review round 2', () => {
+      async function boundSpawn(
+        sessionId: string,
+        holder: TenureHolder,
+        epoch: string,
+        invocationId = 'inv-1'
+      ) {
+        await settledSpawn(sessionId, holder, epoch, invocationId, [
+          { kind: 'process_binding', pid: 4250, startIdentity: 'start-fixture-r2' },
+        ]);
+      }
+
+      it('B1: holds a later turn when an older turn’s background spawn turns unknown', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const a = await turn(sessionId, holder, null);
+        await boundSpawn(sessionId, holder, a.epoch);
+        await finish(sessionId, holder, a.epoch);
+        await complete(a.command);
+        const b = await turn(sessionId, holder, a.epoch);
+        await finish(sessionId, holder, b.epoch);
+        await complete(b.command);
+        expect(
+          await recordInvocation(supabase, {
+            sessionId,
+            holder,
+            epoch: a.epoch,
+            invocationId: 'inv-1',
+            record: { kind: 'unknown', reasonCode: 'containment_lost' },
+          })
+        ).toEqual({ outcome: 'recorded', kind: 'unknown' });
+        const next = await queued(sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId,
+            holder,
+            expectedPriorEpoch: b.epoch,
+            epoch: randomUUID(),
+            commandUuid: next,
+          })
+        ).toEqual({ outcome: 'unresolved', epoch: b.epoch });
+      });
+
+      it('B2: a new unknown clears an earlier quiescence, and the holder cannot resolve it again', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const a = await turn(sessionId, holder, null);
+        await boundSpawn(sessionId, holder, a.epoch);
+        const record = (r: InvocationRecord) =>
+          recordInvocation(supabase, {
+            sessionId,
+            holder,
+            epoch: a.epoch,
+            invocationId: 'inv-1',
+            record: r,
+          });
+        await record({ kind: 'tree_quiescent', evidenceRef: 'attestation-fixture-old' });
+        expect(await record({ kind: 'unknown', reasonCode: 'containment_lost' })).toEqual({
+          outcome: 'recorded',
+          kind: 'unknown',
+        });
+        expect(
+          await record({ kind: 'tree_quiescent', evidenceRef: 'attestation-fixture-new' })
+        ).toEqual({ outcome: 'needs_reconciler', kind: 'tree_quiescent' });
+        await finish(sessionId, holder, a.epoch);
+        await complete(a.command);
+        expect(
+          await releaseTenure(supabase, {
+            sessionId,
+            holder,
+            evidence: 'wrapper_exit_tree_quiescent',
+          })
+        ).toEqual({ outcome: 'unresolved', invocations: 1 });
+      });
+
+      it.each(['transcript_first', 'refusal_first'] as const)(
+        'B3: not_spawned contradicts a transcript binding (%s)',
+        async (order) => {
+          const sessionId = await newSession(suiteSbId);
+          const holder = await register(sessionId);
+          const a = await turn(sessionId, holder, null);
+          const record = (r: InvocationRecord) =>
+            recordInvocation(supabase, {
+              sessionId,
+              holder,
+              epoch: a.epoch,
+              invocationId: 'inv-1',
+              record: r,
+            });
+          await record({ kind: 'intent' });
+          const transcript: InvocationRecord = {
+            kind: 'transcript_binding',
+            providerTranscriptId: 'transcript-fixture',
+          };
+          const refusal: InvocationRecord = { kind: 'not_spawned', evidenceRef: 'refusal-fixture' };
+          await record(order === 'transcript_first' ? transcript : refusal);
+          const second = order === 'transcript_first' ? refusal : transcript;
+          expect(await record(second)).toEqual({ outcome: 'contradiction', kind: second.kind });
+          await finish(sessionId, holder, a.epoch);
+          await complete(a.command);
+          expect(
+            await releaseTenure(supabase, {
+              sessionId,
+              holder,
+              evidence: 'wrapper_exit_tree_quiescent',
+            })
+          ).toEqual({ outcome: 'unresolved', invocations: 1 });
+        }
+      );
+
+      it('B4: an operator decision cannot retire a tenure or manufacture quiescence', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId);
+        const a = await turn(sessionId, holder, null);
+        await boundSpawn(sessionId, holder, a.epoch);
+        await finish(sessionId, holder, a.epoch);
+        await complete(a.command);
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId,
+            expectedTenureId: holder.tenureId,
+            evidence: 'operator_decision',
+            evidenceRef: 'effect-risk-acceptance-fixture',
+            authority: 'operator-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'operator_decision_cannot_prove_quiescence' });
+        const { data } = await supabase
+          .from('session_turn_invocations')
+          .select('resolution')
+          .eq('session_id', sessionId)
+          .eq('epoch', a.epoch)
+          .single();
+        expect(data).toEqual({ resolution: null });
+        const { data: tenure } = await supabase
+          .from('session_owner_tenures')
+          .select('state')
+          .eq('id', holder.tenureId)
+          .single();
+        expect(tenure).toEqual({ state: 'held' });
+      });
+
+      it('B5: a reconciled legacy epoch admits its first conditional turn, naming that epoch', async () => {
+        await setMode('legacy');
+        let legacy: string;
+        try {
+          legacy = await newSession(suiteSbId);
+        } finally {
+          await setMode('conditional');
+        }
+        const oldEpoch = randomUUID();
+        await supabase.from('sessions').update({ turn_epoch: oldEpoch }).eq('id', legacy);
+        const decided = await reconcileTenure(supabase, {
+          sessionId: legacy,
+          expectedTenureId: null,
+          evidence: 'operator_decision',
+          evidenceRef: 'operator-window-fixture',
+          authority: 'operator-fixture',
+          hostInstanceId: HOST.instanceId,
+        });
+        if (decided.outcome !== 'reconciled') throw new Error(`unexpected ${decided.outcome}`);
+        const { capability, capabilityHash } = mintTenureCapability();
+        const r = await registerTenure(supabase, {
+          sessionId: legacy,
+          expected: { kind: 'reconciled', tenureId: decided.tenureId },
+          mode: 'interactive_wrapper',
+          capabilityHash,
+          host: HOST,
+        });
+        if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+        const holder = { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId };
+        const command = await queued(legacy);
+        // The legacy epoch is kept, not cleared: a turn naming no prior is stale.
+        expect(
+          await admitTurn(supabase, {
+            sessionId: legacy,
+            holder,
+            expectedPriorEpoch: null,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'stale_expectation', epoch: oldEpoch });
+        expect(
+          await admitTurn(supabase, {
+            sessionId: legacy,
+            holder,
+            expectedPriorEpoch: oldEpoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toMatchObject({ outcome: 'admitted' });
+      });
+
+      it('B6: boot evidence counts only for the same recorded machine', async () => {
+        const boot = async (host: { instanceId: string; hostId?: string; bootId?: string }) => {
+          const sessionId = await newSession(suiteSbId);
+          const r = await registerTenure(supabase, {
+            sessionId,
+            expected: { kind: 'never_owned' },
+            mode: 'interactive_wrapper',
+            capabilityHash: mintTenureCapability().capabilityHash,
+            host,
+          });
+          if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+          return (currentHostId: string | undefined, currentBootId: string, instance: string) =>
+            reconcileTenure(supabase, {
+              sessionId,
+              expectedTenureId: r.tenureId,
+              evidence: 'boot_changed',
+              currentBootId,
+              currentHostId,
+              authority: 'reconciler-fixture',
+              hostInstanceId: instance,
+            });
+        };
+        // A boot id with no machine id: another machine's boot proves nothing.
+        const noMachine = await boot({ instanceId: HOST.instanceId, bootId: 'boot-a1' });
+        expect(await noMachine('machine-b', 'boot-b1', 'other-instance')).toEqual({
+          outcome: 'refused',
+          reason: 'machine_scope_absent_or_different',
+        });
+        expect(await noMachine(undefined, 'boot-b1', 'other-instance')).toEqual({
+          outcome: 'refused',
+          reason: 'machine_scope_absent_or_different',
+        });
+        // The same machine, but no boot was recorded: there is nothing to compare.
+        const noBoot = await boot({ instanceId: HOST.instanceId, hostId: 'machine-c' });
+        expect(await noBoot('machine-c', 'boot-c1', HOST.instanceId)).toEqual({
+          outcome: 'refused',
+          reason: 'boot_evidence_absent_or_same',
+        });
+        // A different machine is not this machine rebooting.
+        const scoped = await boot({
+          instanceId: HOST.instanceId,
+          hostId: 'machine-a',
+          bootId: 'boot-a1',
+        });
+        expect(await scoped('machine-b', 'boot-b1', HOST.instanceId)).toEqual({
+          outcome: 'refused',
+          reason: 'machine_scope_absent_or_different',
+        });
+        // The same machine on a new boot, from a restarted reconciler instance.
+        expect((await scoped('machine-a', 'boot-a2', 'restarted-instance')).outcome).toBe(
+          'reconciled'
+        );
+      });
     });
   });
 });
