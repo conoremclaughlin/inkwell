@@ -559,6 +559,31 @@ export class InkRunner implements IRunner {
         settled = true;
         finish();
       };
+      // Set once the run's outcome is known (a stop's, or a normal close).
+      // From then on this process is no longer heard: no fresh turn reply is
+      // accepted and no fresh activity is published, so the replies the run
+      // waits for are exactly those accepted before (Lumen's review of #748).
+      let sealed = false;
+      // The run's own cleanup, once, whichever of a normal close and a stop's
+      // outcome comes first. A late close of a stopped child must not touch
+      // the session's observer state: a replacement run may own it by then.
+      let cleanedUp = false;
+      const cleanupOnce = (): void => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimers();
+        mcpInjection?.cleanup();
+        config.signal?.removeEventListener('abort', onAbort);
+        if (config.inkSessionId) {
+          // Turn over: the buffered tail now describes a COMPLETED turn, so
+          // drop it. A later idle attach must not replay it as live activity.
+          sessionEventBus.clearReplay(config.inkSessionId);
+          // Observer channel: start the retention window; observers detach
+          // after it unless a new turn re-registers the session. The durable
+          // ledger remains the replay source regardless.
+          sessionEventBus.releaseObserverSession(config.inkSessionId);
+        }
+      };
       let idleTimer: NodeJS.Timeout;
       // Carries a partial trailing line between stdout chunks so we only parse
       // complete NDJSON events for live fan-out.
@@ -706,6 +731,10 @@ export class InkRunner implements IRunner {
               group: outcome.group,
             });
           }
+          // The outcome is known: seal the run, then clean up once. The replies
+          // it waits for below are only those already accepted.
+          sealed = true;
+          cleanupOnce();
           const partial = this.parseOutput(stdout, stderr);
           afterTurnReplies(() =>
             settleOnce(() =>
@@ -756,13 +785,16 @@ export class InkRunner implements IRunner {
         }, INACTIVITY_TIMEOUT_MS);
       };
 
+      // Once sealed, the process is no longer heard (see `sealed`).
       child.stdout?.on('data', (chunk: Buffer) => {
+        if (sealed) return;
         const text = chunk.toString();
         stdout += text;
         publishStreamEvents(text);
         resetIdleTimer();
       });
       child.stderr?.on('data', (chunk: Buffer) => {
+        if (sealed) return;
         stderr += chunk.toString();
         resetIdleTimer();
       });
@@ -796,23 +828,15 @@ export class InkRunner implements IRunner {
       config.signal?.addEventListener('abort', onAbort, { once: true });
 
       child.on('close', (code) => {
-        clearTimers();
-        mcpInjection?.cleanup();
-        // Turn over: the buffered tail now describes a COMPLETED turn, so drop
-        // it. A later idle attach must not replay it as live activity.
-        if (config.inkSessionId) {
-          sessionEventBus.clearReplay(config.inkSessionId);
-          // Observer channel: start the retention window; observers detach
-          // after it unless a new turn re-registers the session. The durable
-          // ledger remains the replay source regardless.
-          sessionEventBus.releaseObserverSession(config.inkSessionId);
-        }
-        config.signal?.removeEventListener('abort', onAbort);
+        // A no-op when a stop's outcome already cleaned up: this may be the
+        // old child closing long after a replacement run took the session.
+        cleanupOnce();
 
         // A requested stop settles on its own path once its processes are
         // gone. This exit is part of that stop: never a result to classify,
         // and never a reason for a recovery attempt (Lumen 0a811b37).
         if (stopping) return;
+        sealed = true;
 
         if (code !== 0) {
           // The child refused to answer without identity context. Recoverable:
