@@ -462,6 +462,38 @@ describe('createTurnReplyForwarder', () => {
     expect(h.log.info.at(-1)![1]).toMatchObject({ explicitMarker: true });
     expect(h.markerStanding()).toBe(false);
   });
+
+  /**
+   * A send through a path the turns do not observe (a shell wrapper, a backend
+   * with no stream parser) leaves the turn's text to be forwarded too. That is
+   * a duplicate, the chosen failure direction, and `finish` names it.
+   */
+  it('names a send no turn reported, and a likely duplicate, at info', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'the reply'));
+    h.setMarker();
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent.map((p) => p.content)).toEqual(['the reply']);
+    const unobserved = h.log.info.filter(([m]) => String(m).includes('no turn reported'));
+    expect(unobserved).toEqual([
+      [
+        'A send reached this conversation that no turn reported',
+        expect.objectContaining({ possibleDuplicate: true, explicitMarker: true }),
+      ],
+    ]);
+    expect(h.log.warn).toHaveLength(0);
+  });
+
+  it('says nothing of an unobserved send when a turn reported the send', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'sent it', [HERE]));
+    h.setMarker();
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent).toEqual([]);
+    expect(h.log.info.some(([m]) => String(m).includes('no turn reported'))).toBe(false);
+  });
 });
 
 /**

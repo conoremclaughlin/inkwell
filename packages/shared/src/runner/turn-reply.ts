@@ -54,7 +54,17 @@ export interface TurnReply {
   label: string;
   /** The turn's user-facing text, or null when it wrote none. */
   text: string | null;
-  /** The send_response calls this turn made that delivered something. */
+  /**
+   * The send_response calls this turn made that delivered something, as far
+   * as the chat can observe them. Observed: local tool routing on any backend
+   * (the call goes through InkClient), and Claude backend routing (its stream
+   * parser reports the tool-use input and the result's error flag). Not
+   * observed: a send made through a shell or CLI wrapper, which the stream
+   * shows only as Bash, and Codex or Gemini backend routing, which have no
+   * stream parser. So an empty list is not proof that nothing was delivered.
+   * On an unobserved path the turn's text is forwarded too: the worst case is
+   * a duplicate, never a dropped reply.
+   */
   sends: TurnSend[];
 }
 

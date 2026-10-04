@@ -215,6 +215,14 @@ export interface TurnReplyForwarder {
  * Sends are queued, so replies reach the user in turn order even if one send
  * is slow.
  *
+ * A turn reports only the sends the chat can observe: local tool routing on
+ * any backend, and Claude backend routing. A send through a shell or CLI
+ * wrapper, or through Codex or Gemini backend routing, is not reported, so
+ * that turn's text is forwarded too. The worst case is a duplicate, never a
+ * dropped reply, which is the direction we want: nothing may go missing
+ * silently. `finish` still reads the marker, and says so at info when the
+ * marker shows a send no turn reported.
+ *
  * `finish` releases the conversation without a payload, because the last
  * turn's text was already decided as that turn ended. It warns when the whole
  * run delivered nothing, the same promise `applyChannelForward` keeps.
@@ -299,6 +307,16 @@ export function createTurnReplyForwarder(
       });
     } else {
       effects.info('Run replies settled', meta);
+    }
+    if (explicitMarker && explicit.length === 0) {
+      // Something reached this conversation that no turn's line accounts for:
+      // a path the turns do not observe (a shell wrapper, a backend without a
+      // stream parser), or a turn that never printed its line. If a turn's
+      // text was forwarded as well, the user probably got it twice.
+      effects.info('A send reached this conversation that no turn reported', {
+        ...meta,
+        possibleDuplicate: forwarded.length > 0,
+      });
     }
     await effects.release();
   };

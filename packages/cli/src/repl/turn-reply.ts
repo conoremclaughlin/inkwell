@@ -69,6 +69,11 @@ function sendTarget(source: unknown): TurnSend | null {
  * send that reached nobody, so only `success: true` counts. The target is the
  * one the server echoes back, which is the one it sent to; the arguments are
  * the fallback.
+ *
+ * One of the two send paths the chat observes, with `backendSendTarget`. A
+ * send made any other way (a shell or CLI wrapper, or backend routing on
+ * Codex or Gemini) is not seen, and that turn's text is forwarded as well:
+ * a possible duplicate, never a dropped reply (TurnReply.sends).
  */
 export function localDeliveredSend(input: {
   tool: string;
@@ -88,6 +93,9 @@ export function localDeliveredSend(input: {
  * call's input on `tool-use`, then only an error flag on `tool-result`. The
  * handler returns `isError` for every send that reached nobody, so a result
  * without it means the target in the input was sent to.
+ *
+ * Only a backend with a stream parser reports these events, which today is
+ * Claude alone. Codex and Gemini backend routing report no sends.
  */
 export function backendSendTarget(name: string, input: unknown): TurnSend | null {
   return isSendResponseTool(name) ? sendTarget(input) : null;
