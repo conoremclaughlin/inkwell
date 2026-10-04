@@ -3351,6 +3351,32 @@ export type Database = {
           },
         ];
       };
+      session_admission_origins: {
+        Row: {
+          origin: string;
+          recorded_at: string;
+          session_id: string;
+        };
+        Insert: {
+          origin: string;
+          recorded_at?: string;
+          session_id: string;
+        };
+        Update: {
+          origin?: string;
+          recorded_at?: string;
+          session_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_admission_origins_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: true;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_command_events: {
         Row: {
           command_uuid: string;
@@ -3671,6 +3697,74 @@ export type Database = {
           },
         ];
       };
+      session_owner_tenures: {
+        Row: {
+          capability_hash: string | null;
+          end_evidence: string | null;
+          end_evidence_ref: string | null;
+          end_evidence_scope: Json | null;
+          ended_at: string | null;
+          ended_by: string | null;
+          endpoint: Json | null;
+          host_boot_id: string | null;
+          host_id: string | null;
+          host_instance_id: string;
+          id: string;
+          mode: string;
+          owner_pid: number | null;
+          owner_start_identity: string | null;
+          registered_at: string;
+          session_id: string;
+          state: string;
+        };
+        Insert: {
+          capability_hash?: string | null;
+          end_evidence?: string | null;
+          end_evidence_ref?: string | null;
+          end_evidence_scope?: Json | null;
+          ended_at?: string | null;
+          ended_by?: string | null;
+          endpoint?: Json | null;
+          host_boot_id?: string | null;
+          host_id?: string | null;
+          host_instance_id: string;
+          id?: string;
+          mode: string;
+          owner_pid?: number | null;
+          owner_start_identity?: string | null;
+          registered_at?: string;
+          session_id: string;
+          state: string;
+        };
+        Update: {
+          capability_hash?: string | null;
+          end_evidence?: string | null;
+          end_evidence_ref?: string | null;
+          end_evidence_scope?: Json | null;
+          ended_at?: string | null;
+          ended_by?: string | null;
+          endpoint?: Json | null;
+          host_boot_id?: string | null;
+          host_id?: string | null;
+          host_instance_id?: string;
+          id?: string;
+          mode?: string;
+          owner_pid?: number | null;
+          owner_start_identity?: string | null;
+          registered_at?: string;
+          session_id?: string;
+          state?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_owner_tenures_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_transcript_archives: {
         Row: {
           backend: string | null;
@@ -3729,6 +3823,123 @@ export type Database = {
           },
         ];
       };
+      session_turn_generations: {
+        Row: {
+          admitted_at: string;
+          command_uuid: string | null;
+          epoch: string;
+          finish_evidence: string | null;
+          finished_at: string | null;
+          prior_epoch: string | null;
+          session_id: string;
+          state: string;
+          tenure_id: string;
+        };
+        Insert: {
+          admitted_at?: string;
+          command_uuid?: string | null;
+          epoch: string;
+          finish_evidence?: string | null;
+          finished_at?: string | null;
+          prior_epoch?: string | null;
+          session_id: string;
+          state: string;
+          tenure_id: string;
+        };
+        Update: {
+          admitted_at?: string;
+          command_uuid?: string | null;
+          epoch?: string;
+          finish_evidence?: string | null;
+          finished_at?: string | null;
+          prior_epoch?: string | null;
+          session_id?: string;
+          state?: string;
+          tenure_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_turn_generations_command_uuid_fkey';
+            columns: ['command_uuid'];
+            isOneToOne: false;
+            referencedRelation: 'session_commands';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_turn_generations_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_turn_generations_tenure_id_fkey';
+            columns: ['tenure_id'];
+            isOneToOne: false;
+            referencedRelation: 'session_owner_tenures';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      session_turn_invocations: {
+        Row: {
+          contradiction: boolean;
+          created_at: string;
+          epoch: string;
+          group_empty: boolean;
+          invocation_id: string;
+          parent_exited: boolean;
+          process_pid: number | null;
+          process_start_identity: string | null;
+          provider_transcript_id: string | null;
+          resolution: string | null;
+          resolution_evidence_ref: string | null;
+          session_id: string;
+          unknown_reason: string | null;
+          updated_at: string;
+        };
+        Insert: {
+          contradiction?: boolean;
+          created_at?: string;
+          epoch: string;
+          group_empty?: boolean;
+          invocation_id: string;
+          parent_exited?: boolean;
+          process_pid?: number | null;
+          process_start_identity?: string | null;
+          provider_transcript_id?: string | null;
+          resolution?: string | null;
+          resolution_evidence_ref?: string | null;
+          session_id: string;
+          unknown_reason?: string | null;
+          updated_at?: string;
+        };
+        Update: {
+          contradiction?: boolean;
+          created_at?: string;
+          epoch?: string;
+          group_empty?: boolean;
+          invocation_id?: string;
+          parent_exited?: boolean;
+          process_pid?: number | null;
+          process_start_identity?: string | null;
+          provider_transcript_id?: string | null;
+          resolution?: string | null;
+          resolution_evidence_ref?: string | null;
+          session_id?: string;
+          unknown_reason?: string | null;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_turn_invocations_session_id_epoch_fkey';
+            columns: ['session_id', 'epoch'];
+            isOneToOne: false;
+            referencedRelation: 'session_turn_generations';
+            referencedColumns: ['session_id', 'epoch'];
+          },
+        ];
+      };
       sessions: {
         Row: {
           active_thread_key: string | null;
@@ -3762,6 +3973,7 @@ export type Database = {
           metadata: Json | null;
           model: string | null;
           observer_ledger_path: string | null;
+          owner_tenure_id: string | null;
           sb_id: string | null;
           started_at: string | null;
           status: string | null;
@@ -3805,6 +4017,7 @@ export type Database = {
           metadata?: Json | null;
           model?: string | null;
           observer_ledger_path?: string | null;
+          owner_tenure_id?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -3848,6 +4061,7 @@ export type Database = {
           metadata?: Json | null;
           model?: string | null;
           observer_ledger_path?: string | null;
+          owner_tenure_id?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -5631,10 +5845,38 @@ export type Database = {
         };
         Returns: Json;
       };
+      admit_turn: {
+        Args: {
+          p_capability_hash: string;
+          p_command_uuid: string;
+          p_epoch: string;
+          p_expected_prior_epoch: string;
+          p_host_instance_id: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
+      };
       reconcile_graph_dispatch_stamps: {
         Args: {
           p_stale_before: string;
           p_live_window_ms?: number;
+        };
+        Returns: Json;
+      };
+      reconcile_tenure: {
+        Args: {
+          p_authority: string;
+          p_current_boot_id: string;
+          p_current_host_id: string;
+          p_evidence: string;
+          p_evidence_ref: string;
+          p_expected_legacy: Json;
+          p_expected_tenure_id: string;
+          p_host_instance_id: string;
+          p_protocol: number;
+          p_session_id: string;
         };
         Returns: Json;
       };
@@ -5655,6 +5897,18 @@ export type Database = {
           p_attempts: Json;
         };
         Returns: string;
+      };
+      finish_turn: {
+        Args: {
+          p_capability_hash: string;
+          p_epoch: string;
+          p_evidence: string;
+          p_host_instance_id: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
       };
       repoint_sessions_off_ephemeral: {
         Args: {
@@ -5795,6 +6049,19 @@ export type Database = {
           isOneToOne: true;
           isSetofReturn: false;
         };
+      };
+      register_tenure: {
+        Args: {
+          p_capability_hash: string;
+          p_endpoint: Json;
+          p_expected: Json;
+          p_host: Json;
+          p_mode: string;
+          p_owner: Json;
+          p_protocol: number;
+          p_session_id: string;
+        };
+        Returns: Json;
       };
       ingest_alert_event: {
         Args: {
@@ -5971,6 +6238,16 @@ export type Database = {
         Args: { p_claim_token?: string | null; p_event_id: string; p_severity?: string };
         Returns: undefined;
       };
+      mark_tenure_lost: {
+        Args: {
+          p_authority: string;
+          p_protocol: number;
+          p_reason: string;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
+      };
       release_alert_claim: {
         Args: { p_claim_token?: string | null; p_event_id: string };
         Returns: undefined;
@@ -5996,6 +6273,20 @@ export type Database = {
         };
         Returns: Json;
       };
+      record_invocation: {
+        Args: {
+          p_capability_hash: string;
+          p_detail: Json;
+          p_epoch: string;
+          p_host_instance_id: string;
+          p_invocation_id: string;
+          p_kind: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
+      };
       release_graph_claim: {
         Args: {
           p_user_id: string;
@@ -6006,6 +6297,17 @@ export type Database = {
           p_reason?: string | null;
           p_fence_turn_epoch?: boolean;
           p_expected_turn_epoch?: string | null;
+        };
+        Returns: Json;
+      };
+      release_tenure: {
+        Args: {
+          p_capability_hash: string;
+          p_evidence: string;
+          p_host_instance_id: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_tenure_id: string;
         };
         Returns: Json;
       };
@@ -6043,6 +6345,10 @@ export type Database = {
         };
         Returns: Json;
       };
+      session_admission_mode_refusal: {
+        Args: { p_protocol: number };
+        Returns: Json;
+      };
       session_command_recipients_valid: {
         Args: { p_recipients: Json };
         Returns: boolean;
@@ -6058,6 +6364,27 @@ export type Database = {
         Returns: undefined;
       };
       session_dispatch_head: { Args: { p_session_id: string }; Returns: Json };
+      session_legacy_state: {
+        Args: { p_session: Database['public']['Tables']['sessions']['Row'] };
+        Returns: Json;
+      };
+      session_tenure_holder_refusal: {
+        Args: {
+          p_capability_hash: string;
+          p_host_instance_id: string;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: string;
+      };
+      session_turn_unresolved_invocations: {
+        Args: {
+          p_epoch: string;
+          p_require_resolution: boolean;
+          p_session_id: string;
+        };
+        Returns: number;
+      };
       supersede_gate: {
         Args: {
           p_user_id: string;
