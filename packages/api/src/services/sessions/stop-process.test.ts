@@ -283,4 +283,44 @@ describe('process groups: a stop is over when the whole group is gone', () => {
       kill.restore();
     }
   });
+
+  // Lumen's review of #747: asking for a group stop and being able to address
+  // the group are two things. Fully mocked, so nothing reaches the host
+  // whatever the code under test sends.
+  it.each([undefined, 0, 1, -7, 1.5, Number.NaN])(
+    'a group stop asked for without a valid group id (%s) settles with the group unknown, and signals no group',
+    async (pid) => {
+      const kill = vi
+        .spyOn(process, 'kill')
+        .mockImplementation((() => true) as typeof process.kill);
+      const proc = Object.assign(new EventEmitter(), {
+        pid,
+        exitCode: null as number | null,
+        signalCode: null,
+        kill: vi.fn(() => true),
+      });
+      vi.useFakeTimers();
+      try {
+        const settled = stopProcessAndWait(proc as unknown as ChildProcess, {
+          group: true,
+          graceMs: 50,
+          giveUpMs: 50,
+        });
+        let done = false;
+        void settled.then(() => (done = true));
+        proc.exitCode = 0;
+        proc.emit('exit', 0, null);
+        // There is no group to look at, so it settles at the exit.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(done).toBe(true);
+        expect(await settled).toEqual({ exited: true, group: 'unknown' });
+        expect(kill).not.toHaveBeenCalled();
+        // Only the process itself was signalled.
+        expect(proc.kill.mock.calls).toEqual([['SIGTERM']]);
+      } finally {
+        vi.useRealTimers();
+        kill.mockRestore();
+      }
+    }
+  );
 });

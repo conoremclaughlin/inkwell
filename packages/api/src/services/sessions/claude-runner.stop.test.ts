@@ -16,6 +16,8 @@ const pidsPath = join(fixtures, 'pids.json');
 const hoisted = vi.hoisted(() => ({
   binary: '',
   scriptedStop: null as null | { exited: boolean; group?: 'empty' | 'alive' | 'unknown' },
+  /** Stands in for the permission overlay, the last await before the spawn; returns its restore. */
+  overlay: null as null | (() => () => Promise<void>),
 }));
 
 vi.mock('./resolve-binary.js', async (importOriginal) => {
@@ -33,6 +35,15 @@ vi.mock('./stop-process.js', async (importOriginal) => {
       hoisted.scriptedStop
         ? Promise.resolve(hoisted.scriptedStop)
         : actual.stopProcessAndWait(...args),
+  };
+});
+
+vi.mock('../studio-settings.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../studio-settings.js')>();
+  return {
+    ...actual,
+    applyPermissionOverlay: (...args: Parameters<typeof actual.applyPermissionOverlay>) =>
+      hoisted.overlay ? Promise.resolve(hoisted.overlay()) : actual.applyPermissionOverlay(...args),
   };
 });
 
@@ -331,6 +342,31 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
     }
   }, 20_000);
 
+  it('a group stop is confirmed only by an empty group: an outcome that says nothing of the group leaves it unconfirmed', async () => {
+    hoisted.binary = writeSlowToExitFake(400);
+    hoisted.scriptedStop = { exited: true };
+    try {
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude] = await whenReported();
+      controller.abort();
+      const result = await run;
+      expect(result.error).toBe(
+        'Claude Code turn cancelled; its processes did not confirm they had stopped'
+      );
+      expect(result.stopUnconfirmed).toEqual({ leaderExited: true, pgid: fakeClaude });
+    } finally {
+      hoisted.scriptedStop = null;
+    }
+  }, 20_000);
+
   it('a cancelled run whose leader exits on SIGTERM settles only once its TERM-ignoring tool is gone (Lumen 42298771)', async () => {
     hoisted.binary = writeLeaderWithStubbornTool();
     const controller = new AbortController();
@@ -398,4 +434,78 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
     expect(alive(fakeClaude)).toBe(false);
     expect(alive(grandchild)).toBe(false);
   }, 20_000);
+});
+
+describe("ClaudeRunner: the caller's admission is asked again at the spawn seam (Lumen's review of #747)", () => {
+  /** A fake claude that records its pid and exits at once, so a spawn by mistake ends cleanly. */
+  function writeExitsAtOnceFake(): string {
+    const fake = join(fixtures, 'claude-exits.mjs');
+    writeFileSync(
+      fake,
+      [
+        '#!/usr/bin/env node',
+        "import { writeFileSync } from 'fs';",
+        `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+    chmodSync(fake, 0o755);
+    return fake;
+  }
+
+  /**
+   * Starts a run whose gate reads `refuse` when asked, recording each answer.
+   * The run has a permission overlay, its last await before the spawn, and
+   * `refuse` turns while that await is in flight.
+   */
+  function runGated(refuse: { now: boolean; during: boolean }) {
+    const asked: boolean[] = [];
+    const overlay = { restored: false };
+    hoisted.overlay = () => {
+      if (refuse.during) refuse.now = true;
+      return async () => {
+        overlay.restored = true;
+      };
+    };
+    const run = new ClaudeRunner().run('hello', {
+      config: {
+        workingDirectory: fixtures,
+        mcpConfigPath: join(fixtures, '.mcp.json'),
+        killProcessGroup: true,
+        permissionOverlay: { allow: [] },
+        admitSpawn: () => {
+          asked.push(refuse.now);
+          return refuse.now ? 'Synthetic refusal' : undefined;
+        },
+      },
+    });
+    return { run, asked, overlay };
+  }
+
+  afterEach(() => {
+    hoisted.overlay = null;
+  });
+
+  it('a refusal that arrives during the last await of the run’s preparation starts nothing, undoes the overlay, and says so', async () => {
+    hoisted.binary = writeExitsAtOnceFake();
+    const { run, asked, overlay } = runGated({ now: false, during: true });
+    const result = await run;
+    expect(asked).toEqual([true]);
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Synthetic refusal',
+      refusedBeforeSpawn: true,
+    });
+    expect(reported()).toEqual([]);
+    expect(overlay.restored).toBe(true);
+  });
+
+  it('an admitting gate spawns as before (control: the fake records itself when it runs)', async () => {
+    hoisted.binary = writeExitsAtOnceFake();
+    const { run, asked } = runGated({ now: false, during: false });
+    const result = await run;
+    expect(asked).toEqual([false]);
+    expect(result.refusedBeforeSpawn).toBeUndefined();
+    expect(reported()).toHaveLength(1);
+  });
 });

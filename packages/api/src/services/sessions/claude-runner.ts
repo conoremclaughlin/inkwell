@@ -285,8 +285,18 @@ export class ClaudeRunner implements IRunner {
       messageLength: fullMessage.length,
     });
 
+    // Refused at the spawn seam: no process, so no session either.
+    const refusedRun = (reason: string): RunnerResult => ({
+      success: false,
+      backendSessionId: backendSessionId ?? null,
+      responses: [],
+      error: reason,
+      refusedBeforeSpawn: true,
+    });
+
     try {
       const result = await this.spawnProcess(args, fullMessage, runConfig);
+      if (result.refusedBeforeSpawn !== undefined) return refusedRun(result.refusedBeforeSpawn);
 
       // Check if resume failed because session doesn't exist
       if (result.resumeFailedNoSession && isResume) {
@@ -307,6 +317,9 @@ export class ClaudeRunner implements IRunner {
 
         logger.info('Retrying with fresh session', { sessionId });
         const retryResult = await this.spawnProcess(args, fullMessage, runConfig);
+        if (retryResult.refusedBeforeSpawn !== undefined) {
+          return refusedRun(retryResult.refusedBeforeSpawn);
+        }
 
         return {
           success: !retryResult.timedOut,
@@ -416,6 +429,8 @@ export class ClaudeRunner implements IRunner {
      */
     timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
     stopUnconfirmed?: RunnerResult['stopUnconfirmed'];
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -508,6 +523,21 @@ export class ClaudeRunner implements IRunner {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    // A refusal undoes what was prepared and starts nothing.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      mcpInjection?.cleanup();
+      restoreOverlay?.().catch(() => {});
+      launchSettings?.cleanup().catch(() => {});
+      logger.warn('Claude Code spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
     }
 
     // If headers were injected, patch the --mcp-config arg to point to the temp file.
@@ -619,13 +649,16 @@ export class ClaudeRunner implements IRunner {
         clearTimeout(idleTimer);
         void stopProcessAndWait(proc, { group: killGroup }).then((stop) => {
           const outcome = stopped();
-          const confirmed = stop.exited && (stop.group === undefined || stop.group === 'empty');
+          // A group stop is confirmed only by a group seen empty, never by an
+          // outcome that says nothing of the group.
+          const confirmed = stop.exited && (!killGroup || stop.group === 'empty');
           let stopUnconfirmed: RunnerResult['stopUnconfirmed'];
           if (!confirmed) {
             const pgid = killGroup && isGroupId(proc.pid) ? proc.pid : undefined;
             stopUnconfirmed = {
               leaderExited: stop.exited,
-              ...(pgid !== undefined ? { pgid, group: stop.group } : {}),
+              ...(pgid !== undefined ? { pgid } : {}),
+              ...(stop.group !== undefined ? { group: stop.group } : {}),
             };
             // Process metadata only: never arguments, environment or content.
             logger.error('Claude Code stop could not confirm its processes had gone', {

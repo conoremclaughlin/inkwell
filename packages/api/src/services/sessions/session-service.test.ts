@@ -1525,6 +1525,92 @@ describe('SessionService', () => {
           expect(admitted.errorCode).not.toBe('INKLING_TURN_REFUSED');
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
         }, 20_000);
+
+        /** A disposable group of our own, standing in for a stopped turn's survivors. */
+        const startSurvivor = () => {
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          return toolPid;
+        };
+
+        it("a fence that lands while the turn is being prepared still keeps the runner from starting (Lumen's review of #747)", async () => {
+          const pgid = startSurvivor();
+          // The takeover write is an await past the early check: hold the
+          // turn there, and fence the inkling as another conversation's
+          // stopped turn would.
+          let reached!: () => void;
+          const atTakeover = new Promise<void>((resolve) => (reached = resolve));
+          let release!: () => void;
+          const held = new Promise<void>((resolve) => (release = resolve));
+          const update = vi.mocked(mockRepository.update);
+          const plain = update.getMockImplementation()!;
+          update.mockImplementation(async (id, updates) => {
+            if ((updates as { lifecycle?: string }).lifecycle === 'running') {
+              reached();
+              await held;
+            }
+            return plain(id, updates);
+          });
+          const pending = turn(INKLING);
+          await atTakeover;
+          fenceInkling(SB, { leaderExited: true, pgid, group: 'alive' });
+          release();
+          const refused = await pending;
+
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          // Nothing ran, so the turn records no outcome and leaves no run registered.
+          expect(update.mock.calls.at(-1)?.[1]).toEqual({ backend: 'claude-code' });
+          expect(activeRunCount()).toBe(0);
+          // The cost, stated: the cap slot claimed at admission stays spent.
+          expect(turnsCounted()).toBe(1);
+        }, 20_000);
+
+        it("a fence that lands during the runner's own preparation stops it at the spawn seam: nothing starts", async () => {
+          const pgid = startSurvivor();
+          // A fake claude that records its pid and exits at once, so a spawn
+          // by mistake ends cleanly and leaves its mark.
+          const dir = await mkdtemp(join(tmpdir(), 'fenced-at-spawn-'));
+          const pidFile = join(dir, 'leader.pid');
+          const script = join(dir, 'claude.mjs');
+          writeFileSync(
+            script,
+            [
+              '#!/usr/bin/env node',
+              "import { writeFileSync } from 'fs';",
+              `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+            ].join('\n'),
+            { mode: 0o755 }
+          );
+          stopFake.binary = script;
+          const real = new ClaudeRunner();
+          vi.mocked(mockClaudeRunner.run).mockImplementationOnce((message, options) => {
+            const ran = real.run(message, options);
+            // The real runner is suspended in its preparation; the fence lands now.
+            fenceInkling(SB, { leaderExited: true, pgid, group: 'alive' });
+            return ran;
+          });
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(existsSync(pidFile)).toBe(false);
+          expect(activeRunCount()).toBe(0);
+          expect(liveInklingTurns(SB)).toBe(0);
+        }, 20_000);
       });
 
       it('a threaded message is placed in its folder, not held for want of a studio', async () => {

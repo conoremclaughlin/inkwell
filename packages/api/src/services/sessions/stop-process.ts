@@ -10,7 +10,8 @@
  * With `group`, the whole process group is signalled. The child must have
  * been spawned with `detached: true`, which makes it a group leader. That
  * takes the tools it started (shells, servers, scripts) down with it,
- * where signalling the child alone would leave them running.
+ * where signalling the child alone would leave them running. A child
+ * without a valid group id (isGroupId) has only itself signalled.
  */
 
 import type { ChildProcess } from 'node:child_process';
@@ -95,8 +96,9 @@ export interface StopOutcome {
   /** The process itself exited before the bound. */
   exited: boolean;
   /**
-   * With `group`: the group as last seen. 'empty' only on an observed ESRCH;
-   * the stop is confirmed only then.
+   * With `group`: the group as last seen, and 'unknown' for a process with
+   * no valid group id. 'empty' only on an observed ESRCH; the stop is
+   * confirmed only then.
    */
   group?: GroupState;
 }
@@ -118,13 +120,19 @@ export interface StopOutcome {
  * seen: past that the processes cannot be reached, and waiting longer helps
  * nobody. A process that left the group (its own session) is never
  * signalled and never seen here.
+ *
+ * Asking for a group stop and being able to address the group are two
+ * things (Lumen's review of #747). A process without a valid group id has
+ * only itself signalled, its group is never probed, and the outcome says the
+ * group is unknown: the leader's exit alone never confirms a group stop.
  */
 export function stopProcessAndWait(
   proc: ChildProcess,
   options: { group?: boolean; graceMs?: number; giveUpMs?: number; pollMs?: number } = {}
 ): Promise<StopOutcome> {
-  const group = options.group === true && isGroupId(proc.pid);
-  const pgid = proc.pid as number;
+  const group = options.group === true;
+  const pgid = isGroupId(proc.pid) ? proc.pid : undefined;
+  const lookAt = (): GroupState => (pgid === undefined ? 'unknown' : probeGroup(pgid));
   return new Promise((resolve) => {
     let exited = false;
     let state: GroupState | undefined;
@@ -138,10 +146,10 @@ export function stopProcessAndWait(
       if (giveUp) clearTimeout(giveUp);
       if (poll) clearTimeout(poll);
       proc.off('exit', onExit);
-      resolve(group ? { exited, group: state ?? probeGroup(pgid) } : { exited });
+      resolve(group ? { exited, group: state ?? lookAt() } : { exited });
     };
     const look = () => {
-      state = probeGroup(pgid);
+      state = lookAt();
       if (state === 'empty') {
         handle?.cancelEscalation();
         finish();
@@ -151,7 +159,8 @@ export function stopProcessAndWait(
     };
     const onExit = () => {
       exited = true;
-      if (group) look();
+      // A group that cannot be addressed cannot be seen to empty either.
+      if (group && pgid !== undefined) look();
       else finish();
     };
     proc.once('exit', onExit);
@@ -163,7 +172,7 @@ export function stopProcessAndWait(
     if (settled) return;
     giveUp = setTimeout(
       () => {
-        if (group) state = probeGroup(pgid);
+        if (group) state = lookAt();
         finish();
       },
       (options.graceMs ?? STOP_GRACE_MS) + (options.giveUpMs ?? STOP_GIVE_UP_MS)

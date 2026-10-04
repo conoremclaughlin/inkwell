@@ -2,7 +2,10 @@
  * An inkling whose turn was stopped without confirming that its processes
  * had gone is fenced: no new turn is admitted for it until that group is
  * observed gone. A replacement turn must not run beside work the stopped one
- * may still be doing (Lumen, inkling:thread:app-build 42298771).
+ * may still be doing (Lumen, inkling:thread:app-build 42298771). A turn asks
+ * at admission and again at the spawn seam, with no await between that
+ * answer and the spawn, because a fence can land while the turn is being
+ * prepared (Lumen's review of #747).
  *
  * Each unconfirmed stop is its own entry, so a second one for the same
  * inkling (it can run in two conversations at once) never replaces the
@@ -25,6 +28,9 @@ import type { RunnerResult } from '../sessions/types';
 import { isGroupId, probeGroup } from '../sessions/stop-process';
 
 type Unconfirmed = NonNullable<RunnerResult['stopUnconfirmed']>;
+
+/** Why a fenced inkling's turn is refused. */
+export const INKLING_FENCE_REASON = "its previous turn's processes are not yet confirmed stopped";
 
 /** Per inkling: its unconfirmed stops, by the order they were recorded. */
 const fences = new Map<string, Map<number, Unconfirmed>>();

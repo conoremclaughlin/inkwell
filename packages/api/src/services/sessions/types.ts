@@ -796,6 +796,15 @@ export interface ClaudeRunnerConfig {
    * inkling's turn). The Claude runner honours it.
    */
   signal?: AbortSignal;
+  /**
+   * The caller's admission, asked again at the spawn seam: synchronously,
+   * after the last await of the runner's own preparation, with none between
+   * it and the spawn. A reason refuses the run, which starts nothing and
+   * returns `refusedBeforeSpawn` with the reason as its error. An admission
+   * made earlier can go stale while the run is prepared (Lumen's review of
+   * #747). The Claude runner honours it.
+   */
+  admitSpawn?: () => string | undefined;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
@@ -947,6 +956,8 @@ export interface RunnerResult {
     pgid?: number;
     group?: GroupState;
   };
+  /** `admitSpawn` refused this run: nothing was started, and `error` is its reason. */
+  refusedBeforeSpawn?: true;
 }
 
 /** @deprecated Use RunnerResult */

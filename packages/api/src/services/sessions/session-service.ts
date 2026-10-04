@@ -25,6 +25,7 @@ import type {
   ISessionService,
   ClaudeRunnerConfig,
   IRunner,
+  RunnerResult,
   ISessionRepository,
   IContextBuilder,
   ToolCall,
@@ -93,7 +94,11 @@ import {
 } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
-import { fenceInkling, inklingFenceHolds } from '../inklings/inkling-stop-fence.js';
+import {
+  INKLING_FENCE_REASON,
+  fenceInkling,
+  inklingFenceHolds,
+} from '../inklings/inkling-stop-fence.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import {
   inklingOwnerTestUserIds,
@@ -2340,12 +2345,10 @@ export class SessionService implements ISessionService {
         // inkling until its group is (inkling-stop-fence.ts): no new turn
         // runs beside them. Asked before the cap, so a refused turn counts
         // nothing, and retryable, because the fence lifts once the group is
-        // observed gone.
+        // observed gone. Asked again at the spawn seam (below), because this
+        // answer can go stale while the turn is prepared.
         if (inklingFenceHolds(inklingIdentity.id)) {
-          return refuseInklingTurn(
-            "its previous turn's processes are not yet confirmed stopped",
-            true
-          );
+          return refuseInklingTurn(INKLING_FENCE_REASON, true);
         }
         // A bounded first test: each turn is counted against the inkling's
         // cap before anything is spawned.
@@ -2744,12 +2747,39 @@ export class SessionService implements ISessionService {
     await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     const turnStartMs = Date.now();
+    // The inkling's fence, asked again where the answer cannot go stale:
+    // here, with no await before the runner is entered, and by the runner at
+    // its spawn seam, past its own preparation. Everything since the
+    // admission check has awaited, and a fence can land in between (Lumen's
+    // review of #747). A refusal here is a run that never began, and is
+    // recorded as one (refusedBeforeAcceptance, below).
+    const fencedSbId = inklingTurn ? inklingSbId : undefined;
+    const admitSpawn = fencedSbId
+      ? () =>
+          inklingFenceHolds(fencedSbId)
+            ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
+            : undefined
+      : undefined;
+    const refusedAtEntry = admitSpawn?.();
     // A live inkling turn its owner can cancel (inkling-turns.ts), released
     // however the run ends.
     const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
+    // Refused here, the turn goes to a stand-in that starts nothing.
+    const turnRunner: Pick<IRunner, 'run'> =
+      refusedAtEntry === undefined
+        ? runner
+        : {
+            run: async (): Promise<RunnerResult> => ({
+              success: false,
+              backendSessionId: session.backendSessionId ?? null,
+              responses: [],
+              error: refusedAtEntry,
+              refusedBeforeSpawn: true,
+            }),
+          };
 
     try {
-      result = await runner
+      result = await turnRunner
         .run(formattedMessage, {
           backendSessionId: session.backendSessionId || undefined,
           // Always handed over, including on resume. Every runner already gates
@@ -2766,6 +2796,7 @@ export class SessionService implements ISessionService {
             ...runnerConfig,
             turnEpoch,
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+            ...(admitSpawn ? { admitSpawn } : {}),
           },
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
         })
@@ -2803,16 +2834,22 @@ export class SessionService implements ISessionService {
       // PR #662). A runner that saw the whole output classified it there.
       // Runners without that seam carry nothing, and this falls back to
       // exactly what it did before.
-      errorClassification =
-        !result.success && result.error
+      //
+      // A run refused at the spawn seam started nothing. It is classified as
+      // the admission refusal is (refuseInklingTurn: retryable, because the
+      // fence lifts once its group is observed gone), and recorded as a run
+      // that never began.
+      errorClassification = result.refusedBeforeSpawn
+        ? { category: 'network', summary: result.error ?? 'Refused before spawn', retryable: true }
+        : !result.success && result.error
           ? (result.classification ??
             classifyError({ errorText: result.error, backend: resolvedBackend }))
           : null;
-      refusedBeforeAcceptance = errorClassification
-        ? isPreAcceptanceRefusal(errorClassification.category)
-        : false;
+      refusedBeforeAcceptance =
+        result.refusedBeforeSpawn === true ||
+        (errorClassification ? isPreAcceptanceRefusal(errorClassification.category) : false);
       if (refusedBeforeAcceptance) {
-        logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+        logger.warn('The run was refused before it was accepted; not recording an outcome', {
           sessionId: session.id,
           backend: resolvedBackend,
           category: errorClassification!.category,
@@ -3287,6 +3324,8 @@ export class SessionService implements ISessionService {
       compactionTriggered: false,
       finalTextResponse: result.finalTextResponse,
       error: result.error,
+      // A run refused at the spawn seam answers as the admission refusal does.
+      ...(result.refusedBeforeSpawn ? { errorCode: 'INKLING_TURN_REFUSED' as const } : {}),
       // The verdict this turn was judged by, not a fresh reading of `error`.
       // The heartbeat outage alert prints a category to a human; deriving it
       // again from the excerpt is how the alert could name one category while
