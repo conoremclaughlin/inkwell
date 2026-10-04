@@ -40,12 +40,12 @@ import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { ceilingFromEnv } from './turn-ceiling.js';
 import { buildSessionEnv, resolveSpawnTarget } from '@inklabs/shared';
 
-/** Maximum time (ms) to wait for an agy subprocess before killing it.
- *  Override with ANTIGRAVITY_PROCESS_TIMEOUT_MS. */
-const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000;
+/** The general ceiling on an agy turn: none unless
+ *  ANTIGRAVITY_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). */
+const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS);
 
 /** Idle timeout: no output for this long = stuck. */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -54,10 +54,13 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const KILL_ESCALATION_MS = 5_000;
 const KILL_GIVEUP_MS = 5_000;
 
-/** agy's own `--print-timeout` defaults to 5m, which is far too short for agent
- *  work. Keep it just under our hard ceiling so agy reports the timeout itself
- *  (as a structured result event) before we resort to killing the process. */
-const PRINT_TIMEOUT_SECONDS = Math.floor((PROCESS_TIMEOUT_MS - 30_000) / 1000);
+/** agy's `--print-timeout`. With a ceiling of ours, just under it, so agy
+ *  reports the timeout itself (as a structured result event) before we resort
+ *  to killing the process. With none, `0s`: agy's help says 0 waits until the
+ *  turn completes (Lumen checked the installed agy, #745). It is passed
+ *  explicitly rather than left to agy's default, which was once 5m. */
+const PRINT_TIMEOUT =
+  PROCESS_TIMEOUT_MS === undefined ? '0s' : `${Math.floor((PROCESS_TIMEOUT_MS - 30_000) / 1000)}s`;
 
 /**
  * The single host-global file `agy` reads MCP servers from.
@@ -615,25 +618,31 @@ export class AntigravityRunner implements IRunner {
       };
       resetIdleTimer();
 
-      const timeout = setTimeout(() => {
-        if (settled) return;
-        logger.error('Antigravity CLI hit hard timeout, killing', {
-          timeoutMs: PROCESS_TIMEOUT_MS,
-        });
-        settled = true;
-        void this.killProcess(proc)
-          .catch((error) => {
-            logger.error('Antigravity teardown failed after hard timeout', { error });
-          })
-          .then(() => {
-            resolve({
-              ...finish(),
-              status: 'TIMEOUT',
-              error: `Antigravity timeout: exceeded the ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s ceiling, process killed`,
-              finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
-            });
-          });
-      }, PROCESS_TIMEOUT_MS);
+      // A configured ceiling stops the run however active it is. With none,
+      // only the silence timeout above ends it.
+      const ceilingMs = PROCESS_TIMEOUT_MS;
+      const timeout =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              if (settled) return;
+              logger.error('Antigravity CLI hit hard timeout, killing', {
+                timeoutMs: ceilingMs,
+              });
+              settled = true;
+              void this.killProcess(proc)
+                .catch((error) => {
+                  logger.error('Antigravity teardown failed after hard timeout', { error });
+                })
+                .then(() => {
+                  resolve({
+                    ...finish(),
+                    status: 'TIMEOUT',
+                    error: `Antigravity timeout: exceeded the ${Math.round(ceilingMs / 1000)}s ceiling, process killed`,
+                    finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+                  });
+                });
+            }, ceilingMs);
 
       const acc: AgyStreamState = {
         responses,
@@ -845,7 +854,7 @@ export function buildAgyArgs(
     'stream-json',
     '--dangerously-skip-permissions',
     '--print-timeout',
-    `${PRINT_TIMEOUT_SECONDS}s`,
+    PRINT_TIMEOUT,
   ];
 
   // Ephemeral-studio root (spec:studio-materialization v8, PR #544 r3):

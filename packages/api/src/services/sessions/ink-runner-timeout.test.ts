@@ -101,17 +101,20 @@ describe('InkRunner inactivity timeout', () => {
     expect(result.success).toBe(false);
   });
 
-  it('keeps a long-but-working turn alive as long as stdout flows', async () => {
+  it('has no absolute backstop unless INK_PROCESS_TIMEOUT_MS sets one', () => {
+    expect(PROCESS_TIMEOUT_MS).toBeUndefined();
+  });
+
+  it('keeps a long-but-working turn alive as long as stdout flows, past the old 4-hour backstop', async () => {
     const runner = new InkRunner();
     const runPromise = runner.run('bulk download', { config: baseConfig as never });
     await vi.advanceTimersByTimeAsync(0);
 
-    // Emit a tool_call line every (window - 1s) for well past the window's worth
-    // of wall-clock. Each emission resets the idle timer, so it never trips.
-    // Stay under the absolute backstop (derive from the constants so this holds
-    // regardless of their exact values / ratio).
+    // Emit a tool_call line every (window - 1s) for six hours of wall-clock.
+    // Each emission resets the idle timer, so it never trips, and there is no
+    // absolute backstop (it was 4 hours until 2026-10-04).
     const step = INACTIVITY_TIMEOUT_MS - 1000;
-    const iterations = Math.max(2, Math.floor(PROCESS_TIMEOUT_MS / step) - 1);
+    const iterations = Math.ceil((6 * 60 * 60 * 1000) / step);
     for (let i = 0; i < iterations; i++) {
       await vi.advanceTimersByTimeAsync(step);
       child.stdout.emit(
@@ -146,22 +149,35 @@ describe('InkRunner inactivity timeout', () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
 
-  it('reaps via the absolute backstop even if output never stops', async () => {
-    const runner = new InkRunner();
-    const runPromise = runner.run('runaway', { config: baseConfig as never });
-    await vi.advanceTimersByTimeAsync(0);
+  it('reaps via a configured absolute backstop even if output never stops', async () => {
+    // The backstop is read at import, so configure it and load a fresh copy.
+    const configuredMs = 2 * 60 * 60 * 1000;
+    vi.stubEnv('INK_PROCESS_TIMEOUT_MS', String(configuredMs));
+    vi.resetModules();
+    try {
+      const fresh = await import('./ink-runner');
+      expect(fresh.PROCESS_TIMEOUT_MS).toBe(configuredMs);
+      const runner = new fresh.InkRunner();
+      const runPromise = runner.run('runaway', { config: baseConfig as never });
+      await vi.advanceTimersByTimeAsync(0);
 
-    // Emit steadily (resets inactivity forever) until just past the absolute cap.
-    const step = 30_000;
-    const iterations = Math.ceil(PROCESS_TIMEOUT_MS / step) + 1;
-    for (let i = 0; i < iterations && !child.kill.mock.calls.length; i++) {
-      child.stdout.emit('data', Buffer.from('noise\n'));
-      await vi.advanceTimersByTimeAsync(step);
+      // Emit steadily (resets inactivity forever) until just past the cap.
+      const step = 30_000;
+      const iterations = Math.ceil(configuredMs / step) + 1;
+      let elapsed = 0;
+      for (let i = 0; i < iterations && !child.kill.mock.calls.length; i++) {
+        child.stdout.emit('data', Buffer.from('noise\n'));
+        await vi.advanceTimersByTimeAsync(step);
+        elapsed += step;
+      }
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(elapsed).toBeGreaterThanOrEqual(configuredMs);
+
+      child.emit('close', 143);
+      await runPromise;
+    } finally {
+      vi.unstubAllEnvs();
     }
-    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-    child.emit('close', 143);
-    await runPromise;
   });
 
   it('classifies a provider stall from stderr in the kill log', async () => {

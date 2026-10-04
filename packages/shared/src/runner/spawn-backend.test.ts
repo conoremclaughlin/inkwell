@@ -340,6 +340,22 @@ describe('spawnBackend (mocked process boundary)', () => {
     }
   );
 
+  it('arms no hard ceiling unless timeoutMs is given', async () => {
+    vi.useFakeTimers();
+    try {
+      const { result } = spawnBackend({ binary: 'codex', args: [] });
+      // The default was 30 minutes until 2026-10-04 (Conor: a working turn is
+      // never killed on wall-clock). Six hours later nothing has been killed.
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1000);
+      expect(child.kill).not.toHaveBeenCalled();
+      child.emit('close', 0);
+      expect(await result).toMatchObject({ timedOut: false, exitCode: 0 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('cleans process environment and merges explicit variables', async () => {
     vi.stubEnv('CLAUDECODE', '1');
     const { result } = spawnBackend({ binary: 'codex', args: [], env: { SYNTHETIC_TEST: 'yes' } });

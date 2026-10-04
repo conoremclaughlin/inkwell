@@ -231,7 +231,10 @@ beforeEach(() => {
   backgroundMessage = message(background, 'not yours');
   inklingThread = thread('chat:pip', [pip, ME]);
   inklingMessage = message(inklingThread, 'hi pip');
+  // Both allowlist keys, so one inherited from local configuration cannot
+  // widen the owner test here.
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+  vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', '');
   context.current = { userId: ME };
 });
 
@@ -502,7 +505,8 @@ describe('react_to_message (MCP)', () => {
     expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
   });
 
-  it('refuses the inkling in its own conversation, for now', async () => {
+  it('lets the inkling react in its own conversation, waking nobody and writing no message', async () => {
+    const messagesBefore = db.rows('inbox_thread_messages').length;
     const answer = await asSb(pip.id as string, 'react_to_message', {
       userId: ME,
       sbSlug: 'pip',
@@ -510,7 +514,26 @@ describe('react_to_message (MCP)', () => {
       messageId: inklingMessage.id,
       emoji: '❤️',
     });
-    expect(answer).toMatchObject({ success: false, status: 403, code: 'inkling_reaction_refused' });
+    expect(answer).toMatchObject({
+      success: true,
+      messageId: inklingMessage.id,
+      reactions: [{ emoji: '❤️', count: 1, reactors: [{ kind: 'sb', id: pip.id }], mine: true }],
+    });
+    expect(gateway.dispatchTrigger).not.toHaveBeenCalled();
+    expect(gateway.processTrigger).not.toHaveBeenCalled();
+    expect(db.rows('inbox_thread_messages')).toHaveLength(messagesBefore);
+  });
+
+  it('refuses the inkling once another SB is in its conversation', async () => {
+    db.seed('inbox_thread_participants', { thread_id: inklingThread.id, sb_id: wren.id });
+    const answer = await asSb(pip.id as string, 'react_to_message', {
+      userId: ME,
+      sbSlug: 'pip',
+      threadKey: inklingThread.thread_key,
+      messageId: inklingMessage.id,
+      emoji: '❤️',
+    });
+    expect(answer).toMatchObject({ success: false, status: 403, code: 'inkling_thread_refused' });
     expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
   });
 
