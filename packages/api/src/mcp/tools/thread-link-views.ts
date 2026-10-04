@@ -8,14 +8,19 @@
 
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
-import { resolveArtifactRowForUser } from './artifact-handlers';
+import type { Principal } from '../../services/principals';
+import { roleOfUserIn } from './caller-principal';
 import {
   THREAD_LINK_HEADER_MAX,
   describeThreadLinks,
+  findLinkArtifact,
   linkReaderForSb,
+  linkReaderForUser,
   listLinksFrom,
   listLinksTo,
+  readerSeesArtifact,
   specTwin,
+  specTwinKeysOf,
   type LinkReader,
   type LinkTarget,
   type ResolvedLinkTarget,
@@ -25,14 +30,25 @@ import {
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
 
+/** Where a link is resolved: its workspace, the caller's user, and what the caller may see. */
+export interface LinkScope {
+  workspaceId: string;
+  /** The caller's user: an SB's owner, or the person. Scopes legacy artifacts. */
+  callerUserId: string;
+  reader: LinkReader;
+}
+
 /**
- * Resolve a parsed target to what is stored. An artifact URI resolves through
- * aliases to its id; an unknown URI is refused, because a link to nothing is
- * a typo nobody will notice. A thread key is stored as written.
+ * Resolve a parsed target to what is stored. A thread key is stored as
+ * written. An artifact URI, current or former, resolves to an artifact in the
+ * link's workspace that the caller may see; anything else is refused with the
+ * same message, so a refusal does not say whether an artifact exists that the
+ * caller cannot see. Linking, unlinking and listing all resolve here, so what
+ * a caller sees, it can also link and unlink (Lumen, #737).
  */
 export async function resolveLinkTarget(
   supabase: SupabaseClient,
-  userId: string,
+  scope: LinkScope,
   target: LinkTarget
 ): Promise<
   | { resolved: ResolvedLinkTarget; uri?: string; resolvedViaAlias?: string | null }
@@ -41,18 +57,68 @@ export async function resolveLinkTarget(
   if (target.kind === 'thread') {
     return { resolved: { kind: 'thread', threadKey: target.threadKey } };
   }
-  const { artifact, resolvedViaAlias } = await resolveArtifactRowForUser(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    supabase as any,
-    userId,
-    undefined,
-    { uri: target.uri }
-  );
-  if (!artifact) return { error: `No artifact at ${target.uri}` };
+  const found = await findLinkArtifact(supabase, scope.workspaceId, scope.callerUserId, target.uri);
+  if (!found || !readerSeesArtifact(scope.reader, found.artifact)) {
+    return { error: `No artifact at ${target.uri}` };
+  }
   return {
-    resolved: { kind: 'artifact', artifactId: artifact.id },
-    uri: artifact.uri,
-    resolvedViaAlias,
+    resolved: { kind: 'artifact', artifactId: found.artifact.id },
+    uri: found.artifact.uri,
+    resolvedViaAlias: found.resolvedViaAlias,
+  };
+}
+
+/**
+ * The reader scope of any sending principal, for links that travel with a
+ * send: an SB by its owner's role and kind, a person by their role, the
+ * system in full.
+ */
+export async function linkReaderForPrincipal(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  principal: Principal
+): Promise<LinkReader> {
+  if (principal.kind === 'system') return { kind: 'full' };
+  const role = await roleOfUserIn(
+    supabase,
+    workspaceId,
+    principal.userId,
+    principal.kind === 'sb' ? `${principal.sbSlug}'s owner` : 'You'
+  );
+  return principal.kind === 'sb'
+    ? linkReaderForSb(supabase, { sbId: principal.sbId, userId: principal.userId, ownerRole: role })
+    : linkReaderForUser(role, principal.userId);
+}
+
+/**
+ * The thread keys and artifact a subject stands for. A `spec:` thread and an
+ * `ink://specs/` artifact are one subject, and so are the `spec:` keys of the
+ * artifact's former URIs: a Library rename does not split it (Lumen, #737).
+ *
+ * The twin artifact is found in the workspace whoever asks, so every reader
+ * gathers the same rows; what each reader then sees of them is
+ * describeThreadLinks' decision.
+ */
+async function subjectOf(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  callerUserId: string,
+  subject: { threadKey: string } | { artifactId: string; uri: string }
+): Promise<{ threadKeys: string[]; artifactId: string | null }> {
+  if ('artifactId' in subject) {
+    return {
+      artifactId: subject.artifactId,
+      threadKeys: await specTwinKeysOf(supabase, { id: subject.artifactId, uri: subject.uri }),
+    };
+  }
+  const twin = specTwin({ kind: 'thread', threadKey: subject.threadKey });
+  if (!twin || twin.kind !== 'artifact')
+    return { threadKeys: [subject.threadKey], artifactId: null };
+  const found = await findLinkArtifact(supabase, workspaceId, callerUserId, twin.uri);
+  if (!found) return { threadKeys: [subject.threadKey], artifactId: null };
+  return {
+    artifactId: found.artifact.id,
+    threadKeys: [subject.threadKey, ...(await specTwinKeysOf(supabase, found.artifact))],
   };
 }
 
@@ -63,7 +129,7 @@ export async function resolveLinkTarget(
  */
 export async function threadLinkViewsFor(
   supabase: SupabaseClient,
-  userId: string,
+  callerUserId: string,
   workspaceId: string,
   subject: { threadKey: string; threadId: string | null } | { artifactId: string; uri: string },
   reader: LinkReader,
@@ -73,30 +139,12 @@ export async function threadLinkViewsFor(
   let linksTo: ThreadLinkRow[] = [];
   let linkedFrom: ThreadLinkRow[] = [];
 
-  if ('threadKey' in subject) {
-    if (direction !== 'from' && subject.threadId) {
-      linksTo = await listLinksFrom(supabase, subject.threadId);
-    }
-    if (direction !== 'to') {
-      const twin = specTwin({ kind: 'thread', threadKey: subject.threadKey });
-      let twinArtifactId: string | null = null;
-      if (twin && twin.kind === 'artifact') {
-        const r = await resolveLinkTarget(supabase, userId, twin);
-        if ('resolved' in r && r.resolved.kind === 'artifact') {
-          twinArtifactId = r.resolved.artifactId;
-        }
-      }
-      linkedFrom = await listLinksTo(supabase, workspaceId, {
-        threadKey: subject.threadKey,
-        artifactId: twinArtifactId,
-      });
-    }
-  } else if (direction !== 'to') {
-    const twin = specTwin({ kind: 'artifact', uri: subject.uri });
-    linkedFrom = await listLinksTo(supabase, workspaceId, {
-      artifactId: subject.artifactId,
-      threadKey: twin && twin.kind === 'thread' ? twin.threadKey : null,
-    });
+  if (direction !== 'from' && 'threadKey' in subject && subject.threadId) {
+    linksTo = await listLinksFrom(supabase, subject.threadId);
+  }
+  if (direction !== 'to') {
+    const whole = await subjectOf(supabase, workspaceId, callerUserId, subject);
+    linkedFrom = await listLinksTo(supabase, workspaceId, whole);
   }
 
   if (options.relation) {
@@ -124,7 +172,6 @@ export interface ThreadLinkHeader {
  */
 export async function threadLinkHeader(
   supabase: SupabaseClient,
-  userId: string,
   caller: { sbId: string; userId: string; workspaceId: string; ownerRole: string },
   thread: { id: string; thread_key: string }
 ): Promise<ThreadLinkHeader | { error: string }> {
@@ -132,7 +179,7 @@ export async function threadLinkHeader(
     const reader = await linkReaderForSb(supabase, caller);
     const views = await threadLinkViewsFor(
       supabase,
-      userId,
+      caller.userId,
       caller.workspaceId,
       { threadKey: thread.thread_key, threadId: thread.id },
       reader

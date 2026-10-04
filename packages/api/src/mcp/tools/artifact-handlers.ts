@@ -364,7 +364,7 @@ type ArtifactRow = Database['public']['Tables']['artifacts']['Row'];
  * (spec:library). resolvedViaAlias carries the requested URI when the alias
  * path was taken, so callers can tell readers the canonical address.
  */
-export async function resolveArtifactRowForUser(
+async function resolveArtifactRowForUser(
   supabase: SupabaseClient<Database>,
   userId: string,
   workspaceId: string | undefined,

@@ -14,7 +14,7 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import { assertWriteRole, resolveCallerSb, type CallerSb } from './caller-principal';
 import { findThread, isParticipant, type ThreadRow } from './thread-handlers';
-import { resolveLinkTarget, threadLinkViewsFor } from './thread-link-views';
+import { resolveLinkTarget, threadLinkViewsFor, type LinkScope } from './thread-link-views';
 import {
   THREAD_LINK_NOTE_MAX,
   THREAD_LINK_RELATIONS,
@@ -49,7 +49,7 @@ export interface SendLinkTarget {
  */
 export async function resolveSendLinks(
   supabase: SupabaseClient,
-  userId: string,
+  scope: LinkScope,
   threadKey: string,
   links: string[],
   relatedArtifactUri?: string
@@ -70,7 +70,7 @@ export async function resolveSendLinks(
     if (parsed.kind === 'thread' && parsed.threadKey === threadKey) {
       throw new Error(`links: a thread cannot link to itself (${threadKey})`);
     }
-    const r = await resolveLinkTarget(supabase, userId, parsed);
+    const r = await resolveLinkTarget(supabase, scope, parsed);
     if ('error' in r) throw new Error(`links: ${r.error}`);
     add(to, r.resolved);
   }
@@ -80,7 +80,7 @@ export async function resolveSendLinks(
     if ('error' in parsed || parsed.kind !== 'artifact') {
       skipped.push({ to: relatedArtifactUri, reason: 'relatedArtifactUri is not an ink:// URI' });
     } else {
-      const r = await resolveLinkTarget(supabase, userId, parsed);
+      const r = await resolveLinkTarget(supabase, scope, parsed);
       if ('error' in r) skipped.push({ to: relatedArtifactUri, reason: r.error });
       else add(relatedArtifactUri, r.resolved);
     }
@@ -228,6 +228,15 @@ async function threadForWrite(
   return { caller, thread };
 }
 
+/** A calling SB's link scope: its workspace, its owner, and what it may see. */
+async function scopeOf(supabase: SupabaseClient, caller: CallerSb): Promise<LinkScope> {
+  return {
+    workspaceId: caller.workspaceId,
+    callerUserId: caller.userId,
+    reader: await linkReaderForSb(supabase, caller),
+  };
+}
+
 // ============== Handlers ==============
 
 /**
@@ -258,7 +267,7 @@ export async function handleLinkThread(args: unknown, dataComposer: DataComposer
   );
   if ('error' in access) return reply({ success: false, error: access.error });
 
-  const r = await resolveLinkTarget(supabase, resolved.user.id, target);
+  const r = await resolveLinkTarget(supabase, await scopeOf(supabase, access.caller), target);
   if ('error' in r) return reply({ success: false, error: r.error });
 
   const row = await upsertThreadLink(supabase, {
@@ -315,7 +324,7 @@ export async function handleUnlinkThread(args: unknown, dataComposer: DataCompos
   );
   if ('error' in access) return reply({ success: false, error: access.error });
 
-  const r = await resolveLinkTarget(supabase, resolved.user.id, target);
+  const r = await resolveLinkTarget(supabase, await scopeOf(supabase, access.caller), target);
   if ('error' in r) return reply({ success: false, error: r.error });
 
   const removed = await deleteThreadLink(supabase, access.thread.id, r.resolved);
@@ -344,14 +353,15 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
   // Who is asking decides how much they see: the team sees every link, anyone
   // else only links between threads they take part in (LinkReader).
-  const reader = await linkReaderForSb(supabase, caller);
+  const scope = await scopeOf(supabase, caller);
+  const reader = scope.reader;
   const options = { direction: parsed.direction, relation: parsed.relation };
 
   if (parsed.threadKey) {
     const thread = await findThread(supabase, caller.workspaceId, parsed.threadKey);
     const views = await threadLinkViewsFor(
       supabase,
-      resolved.user.id,
+      caller.userId,
       caller.workspaceId,
       { threadKey: parsed.threadKey, threadId: thread?.id ?? null },
       reader,
@@ -369,14 +379,14 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   if ('error' in target || target.kind !== 'artifact') {
     return reply({ success: false, error: `Not an ink:// URI: ${parsed.uri}` });
   }
-  const r = await resolveLinkTarget(supabase, resolved.user.id, target);
+  const r = await resolveLinkTarget(supabase, scope, target);
   if ('error' in r) return reply({ success: false, error: r.error });
   if (r.resolved.kind !== 'artifact') {
     return reply({ success: false, error: `Not an ink:// URI: ${parsed.uri}` });
   }
   const views = await threadLinkViewsFor(
     supabase,
-    resolved.user.id,
+    caller.userId,
     caller.workspaceId,
     { artifactId: r.resolved.artifactId, uri: r.uri! },
     reader,

@@ -917,9 +917,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   // What the thread links to and what links to it (thread:thread-links).
   // A delivery poll is the hot path and only wants messages, so it skips this.
-  const links = channelPoll
-    ? null
-    : await threadLinkHeader(supabase, resolved.user.id, caller, thread);
+  const links = channelPoll ? null : await threadLinkHeader(supabase, caller, thread);
 
   return {
     content: [

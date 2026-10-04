@@ -22,7 +22,7 @@ import {
   handleListThreadLinks,
   handleUnlinkThread,
 } from './thread-link-handlers';
-import { handleCreateArtifact, handleGetArtifact } from './artifact-handlers';
+import { handleCreateArtifact, handleGetArtifact, handleUpdateArtifact } from './artifact-handlers';
 import type { SbPrincipal } from '../../services/principals';
 import { INKLING_CLIENT } from '../../services/inklings/inkling-service';
 
@@ -30,6 +30,7 @@ const RUN = randomUUID().slice(0, 8);
 const SPEC_SLUG = `tltest-${RUN}`;
 const SPEC_URI = `ink://specs/${SPEC_SLUG}`;
 const SPEC_KEY = `spec:${SPEC_SLUG}`;
+const SPEC_URI_RENAMED = `ink://specs/${SPEC_SLUG}-renamed`;
 const KEY_A = `test:tl-a-${RUN}`;
 const KEY_B = `test:tl-b-${RUN}`;
 const KEY_REFUSED = `test:tl-refused-${RUN}`;
@@ -126,7 +127,8 @@ describe('thread links (DB integration)', () => {
       await raw.from('inbox_thread_participants').delete().in('thread_id', ids);
       await raw.from('inbox_threads').delete().in('id', ids);
     }
-    await raw.from('artifacts').delete().eq('uri', SPEC_URI);
+    if (artifactId) await raw.from('artifact_uri_aliases').delete().eq('artifact_id', artifactId);
+    await raw.from('artifacts').delete().in('uri', [SPEC_URI, SPEC_URI_RENAMED]);
     if (otherSbId) await raw.from('agent_identities').delete().eq('id', otherSbId);
     if (inkSbId) await raw.from('agent_identities').delete().eq('id', inkSbId);
   });
@@ -440,5 +442,41 @@ describe('thread links (DB integration)', () => {
       )
     );
     expect(second.success).toBe(false);
+  });
+
+  // A Library rename leaves A's link stored under the old spec: key. The
+  // renamed artifact still answers for it (Lumen, #737), through the alias
+  // row the rename wrote.
+  it('a renamed spec keeps the links made to its old spec: thread', async () => {
+    const renamed = parse(
+      await handleUpdateArtifact(
+        {
+          userId,
+          workspaceId,
+          uri: SPEC_URI,
+          newUri: SPEC_URI_RENAMED,
+          changeSummary: 'renamed for the thread-links suite',
+          sbSlug: 'echo',
+        },
+        dataComposer
+      )
+    );
+    expect(renamed.success).toBe(true);
+
+    const artifact = parse(
+      await handleGetArtifact({ ...base(), uri: SPEC_URI_RENAMED }, dataComposer)
+    );
+    expect(artifact.linkedFromThreadsError).toBeUndefined();
+    expect(artifact.linkedFromThreads.map((l: { threadKey: string }) => l.threadKey)).toContain(
+      KEY_A
+    );
+
+    const byNewKey = parse(
+      await handleListThreadLinks(
+        { ...base(), sbSlug: 'echo', threadKey: `spec:${SPEC_SLUG}-renamed` },
+        dataComposer
+      )
+    );
+    expect(byNewKey.linkedFrom.map((l: { threadKey: string }) => l.threadKey)).toContain(KEY_A);
   });
 });

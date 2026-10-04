@@ -69,6 +69,7 @@ import { ThreadKeyTakenError } from './thread-key-taken.js';
 import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
+import { linkReaderForPrincipal } from './thread-link-views.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -496,6 +497,12 @@ export async function handleSendToInbox(
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
+  // A link is made by a thread; without one there is nothing to link from,
+  // and the non-thread path would deliver the message and drop the links
+  // (Lumen, #737).
+  if (links?.length && !threadKey) {
+    throw new Error('threadKey is required when using links[]: links are made by a thread');
+  }
   if (
     recipients &&
     (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionKey)
@@ -743,7 +750,13 @@ export async function handleSendToInbox(
       (links && links.length > 0) || relatedArtifactUri
         ? await resolveSendLinks(
             supabase,
-            resolved.user.id,
+            {
+              workspaceId,
+              callerUserId: sender.kind === 'system' ? resolved.user.id : sender.userId,
+              // The sender links only what it may see, the same rule as
+              // link_thread (thread-link-views).
+              reader: await linkReaderForPrincipal(supabase, workspaceId, sender),
+            },
             threadKey,
             links ?? [],
             relatedArtifactUri

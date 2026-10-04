@@ -235,23 +235,24 @@ export async function listLinksFrom(
 
 /**
  * Links naming a subject, from any thread in the workspace, newest first.
- * The subject is a thread key, an artifact id, or both (a spec and its
- * thread). Two queries rather than one `.or()`, so neither value is spliced
- * into a PostgREST filter string.
+ * The subject is some thread keys, an artifact id, or both (a spec, its
+ * thread, and the threads of its former URIs). Two queries rather than one
+ * `.or()`, so no value is spliced into a PostgREST filter string.
  */
 export async function listLinksTo(
   supabase: SupabaseClient,
   workspaceId: string,
-  subject: { threadKey?: string | null; artifactId?: string | null }
+  subject: { threadKeys?: string[]; artifactId?: string | null }
 ): Promise<ThreadLinkRow[]> {
   const rows: ThreadLinkRow[] = [];
-  if (subject.threadKey) {
+  const keys = unique(subject.threadKeys ?? []);
+  if (keys.length > 0) {
     const { data, error } = await linksTable(supabase)
       .select('*')
       .eq('workspace_id', workspaceId)
       .eq('target_kind', 'thread')
-      .eq('target_thread_key', subject.threadKey);
-    if (error) throw new Error(`Failed to list links to ${subject.threadKey}: ${error.message}`);
+      .in('target_thread_key', keys);
+    if (error) throw new Error(`Failed to list links to ${keys.join(', ')}: ${error.message}`);
     rows.push(...((data ?? []) as ThreadLinkRow[]));
   }
   if (subject.artifactId) {
@@ -264,6 +265,119 @@ export async function listLinksTo(
     rows.push(...((data ?? []) as ThreadLinkRow[]));
   }
   return rows.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+}
+
+/** An artifact as a link sees it: its address and who owns it, never content. */
+export interface LinkArtifactRow {
+  id: string;
+  uri: string;
+  title: string;
+  artifact_type: string;
+  user_id: string;
+  workspace_id: string | null;
+}
+
+const LINK_ARTIFACT_COLUMNS = 'id, uri, title, artifact_type, user_id, workspace_id';
+
+/**
+ * Is this artifact in the link's workspace? An artifact from before artifacts
+ * carried a workspace (workspace_id null) counts when it is the caller's
+ * user's own.
+ */
+function artifactInWorkspace(
+  artifact: LinkArtifactRow,
+  workspaceId: string,
+  callerUserId: string
+): boolean {
+  return (
+    artifact.workspace_id === workspaceId ||
+    (artifact.workspace_id === null && artifact.user_id === callerUserId)
+  );
+}
+
+/** May this reader see the artifact at a link's end: its URI and title. */
+export function readerSeesArtifact(reader: LinkReader, artifact: { user_id: string }): boolean {
+  return reader.kind === 'full' || artifact.user_id === reader.userId;
+}
+
+/**
+ * Find the artifact a link names, by its URI or a former one, in the link's
+ * workspace.
+ *
+ * One resolver for writing, removing and reading links (Lumen, #737). It
+ * used to resolve through the caller's own artifacts, so two SBs with
+ * different owners in one workspace saw different backlinks for the same
+ * spec, and a participant could see a link it could not remove. URIs and
+ * aliases are each globally unique, so the lookup needs no owner; the scope is
+ * checked on the row found. Whether a reader may see the artifact is a
+ * separate question (readerSeesArtifact).
+ */
+export async function findLinkArtifact(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  callerUserId: string,
+  uri: string
+): Promise<{ artifact: LinkArtifactRow; resolvedViaAlias: string | null } | null> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const client = supabase as any;
+  const { data: direct, error } = await client
+    .from('artifacts')
+    .select(LINK_ARTIFACT_COLUMNS)
+    .eq('uri', uri)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to resolve artifact ${uri}: ${error.message}`);
+  let artifact = direct as LinkArtifactRow | null;
+  let resolvedViaAlias: string | null = null;
+  if (!artifact) {
+    const { data: alias, error: aliasError } = await client
+      .from('artifact_uri_aliases')
+      .select('artifact_id')
+      .eq('alias_uri', uri)
+      .maybeSingle();
+    // A lookup failure is infrastructure, not a miss.
+    if (aliasError)
+      throw new Error(`Failed to resolve artifact alias ${uri}: ${aliasError.message}`);
+    if (alias) {
+      const { data: aliased, error: aliasedError } = await client
+        .from('artifacts')
+        .select(LINK_ARTIFACT_COLUMNS)
+        .eq('id', (alias as { artifact_id: string }).artifact_id)
+        .maybeSingle();
+      if (aliasedError) throw new Error(`Failed to resolve artifact: ${aliasedError.message}`);
+      artifact = aliased as LinkArtifactRow | null;
+      resolvedViaAlias = artifact ? uri : null;
+    }
+  }
+  if (!artifact || !artifactInWorkspace(artifact, workspaceId, callerUserId)) return null;
+  return { artifact, resolvedViaAlias };
+}
+
+/**
+ * Every `spec:` thread key that names this artifact: the twin of its current
+ * URI and of each former one. A Library rename leaves links stored under the
+ * old `spec:<slug>` key, and they still belong to the same subject (Lumen,
+ * #737).
+ */
+export async function specTwinKeysOf(
+  supabase: SupabaseClient,
+  artifact: { id: string; uri: string }
+): Promise<string[]> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data, error } = await (supabase as any)
+    .from('artifact_uri_aliases')
+    .select('alias_uri')
+    .eq('artifact_id', artifact.id);
+  if (error) throw new Error(`Failed to read former URIs of ${artifact.uri}: ${error.message}`);
+  const uris = [
+    artifact.uri,
+    ...((data ?? []) as Array<{ alias_uri: string }>).map((a) => a.alias_uri),
+  ];
+  const keys: string[] = [];
+  for (const uri of uris) {
+    const twin = specTwin({ kind: 'artifact', uri });
+    if (twin && twin.kind === 'thread') keys.push(twin.threadKey);
+  }
+  return unique(keys);
 }
 
 /** One link as a reader sees it, from either end. */
@@ -444,8 +558,10 @@ export async function describeThreadLinks(
       // between the two reads. Leave it out rather than show an id with no
       // address.
       if (!a) continue;
-      // Artifacts are owned by a user; a restricted reader sees its own.
-      if (reader.kind === 'participant' && a.user_id !== reader.userId) continue;
+      // Never an artifact outside the workspace, and a restricted reader
+      // sees only its own user's (readerSeesArtifact).
+      if (a.workspace_id !== null && a.workspace_id !== workspaceId) continue;
+      if (!readerSeesArtifact(reader, a)) continue;
       linksTo.push({
         kind: 'artifact',
         uri: a.uri,
@@ -479,7 +595,7 @@ export async function describeThreadLinks(
 
 /**
  * The threads linking to an artifact, for get_artifact: links to the artifact
- * itself and, for a spec, to its `spec:<slug>` thread. Capped at
+ * itself and, for a spec, to its `spec:<slug>` threads, former URIs included. Capped at
  * THREAD_LINK_HEADER_MAX with the total beside it. Never throws: links
  * decorate the artifact, so a failure is returned as `error` beside it.
  */
@@ -490,10 +606,9 @@ export async function artifactBacklinks(
   reader: LinkReader
 ): Promise<{ threads: ThreadLinkView[]; count: number } | { error: string }> {
   try {
-    const twin = specTwin({ kind: 'artifact', uri: artifact.uri });
     const rows = await listLinksTo(supabase, workspaceId, {
       artifactId: artifact.id,
-      threadKey: twin && twin.kind === 'thread' ? twin.threadKey : null,
+      threadKeys: await specTwinKeysOf(supabase, artifact),
     });
     const { linkedFrom } = await describeThreadLinks(
       supabase,
@@ -532,25 +647,17 @@ async function threadsWhere(
   return new Map(rows.map((t) => [column === 'id' ? t.id : t.thread_key, t]));
 }
 
-interface ArtifactSummaryRow {
-  id: string;
-  uri: string;
-  title: string;
-  artifact_type: string;
-  user_id: string;
-}
-
 async function artifactsWhereId(
   supabase: SupabaseClient,
   ids: string[]
-): Promise<Map<string, ArtifactSummaryRow>> {
+): Promise<Map<string, LinkArtifactRow>> {
   if (ids.length === 0) return new Map();
   const { data, error } = await supabase
     .from('artifacts')
-    .select('id, uri, title, artifact_type, user_id')
+    .select(LINK_ARTIFACT_COLUMNS)
     .in('id', ids);
   if (error) throw new Error(`Failed to read linked artifacts: ${error.message}`);
-  return new Map(((data ?? []) as ArtifactSummaryRow[]).map((a) => [a.id, a]));
+  return new Map(((data ?? []) as LinkArtifactRow[]).map((a) => [a.id, a]));
 }
 
 function unique(values: string[]): string[] {
