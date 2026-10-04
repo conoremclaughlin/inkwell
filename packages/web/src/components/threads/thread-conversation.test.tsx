@@ -261,4 +261,17 @@ describe('ThreadConversation', () => {
     expect(screen.getByTestId('loading').textContent).toBe('false');
     expect(fake.apiGet).not.toHaveBeenCalled();
   });
+
+  it('gives the header a solid background, with no backdrop-filter layer', () => {
+    // The header sat over nothing, so its blur did no work, but it made the
+    // header a backdrop-filter layer. Conor's recording showed that region
+    // painting blank for single frames (task 190eeb01).
+    fake.newest = pageOf(1, 20);
+    mount(at(20));
+    const header = document.querySelector('header');
+    expect(header, 'the conversation header rendered').not.toBeNull();
+    const classes = header!.className.split(/\s+/);
+    expect(classes.filter((c) => c.startsWith('backdrop-'))).toEqual([]);
+    expect(classes).toContain('bg-background');
+  });
 });
