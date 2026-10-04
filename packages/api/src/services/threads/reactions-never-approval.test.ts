@@ -136,6 +136,9 @@ const REGISTRIES: Record<string, Registry> = {
 const REACTION_MODULES = [
   'packages/api/src/services/threads/thread-reactions.ts',
   'packages/api/src/test/fake-reactions-db.ts',
+  // Renders the reaction context an SB is shown with its next turn: display
+  // only, pure, and it opens with REACTIONS_ARE_NOT_APPROVAL.
+  'packages/api/src/services/threads/reaction-context-format.ts',
 ];
 
 /**
