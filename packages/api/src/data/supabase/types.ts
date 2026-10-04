@@ -5718,6 +5718,20 @@ export type Database = {
         };
         Returns: Json;
       };
+      admit_leased_turn: {
+        Args: {
+          p_capability_hash: string;
+          p_command_uuid: string;
+          p_epoch: string;
+          p_expected_prior_epoch: string;
+          p_host_instance_id: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_studio_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
+      };
       admit_turn: {
         Args: {
           p_capability_hash: string;
