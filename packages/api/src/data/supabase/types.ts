@@ -6218,6 +6218,7 @@ export type Database = {
         Args: { p_protocol: number };
         Returns: Json;
       };
+      session_admission_valid_pid: { Args: { p_pid: string }; Returns: boolean };
       session_command_recipients_valid: {
         Args: { p_recipients: Json };
         Returns: boolean;
