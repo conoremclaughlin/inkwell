@@ -138,6 +138,20 @@ const REACTION_MODULES = [
   'packages/api/src/test/fake-reactions-db.ts',
 ];
 
+/**
+ * The wire shape and the display model the chat surfaces draw from: types,
+ * the route path, the wire-to-view mapping and the chip helpers. None of
+ * them decides anything.
+ */
+const SHARED_DISPLAY = [
+  'packages/shared/src/stories/thread-viewing/authors.ts',
+  'packages/shared/src/stories/thread-viewing/conversation.ts',
+  'packages/shared/src/stories/thread-viewing/index.ts',
+  'packages/shared/src/stories/thread-viewing/reactions.ts',
+  'packages/shared/src/stories/threads-api/paths.ts',
+  'packages/shared/src/stories/threads-api/wire.ts',
+];
+
 describe('reactions are never approval', () => {
   it('A: only the files that display or write reactions mention them', async () => {
     const files = (await Promise.all(ROOTS.map(sourceFiles))).flat();
@@ -150,7 +164,9 @@ describe('reactions are never approval', () => {
         mentioning.push(file);
       }
     }
-    expect(mentioning.sort()).toEqual([...REACTION_MODULES, ...Object.keys(REGISTRIES)].sort());
+    expect(mentioning.sort()).toEqual(
+      [...REACTION_MODULES, ...SHARED_DISPLAY, ...Object.keys(REGISTRIES)].sort()
+    );
   });
 
   it.each(Object.entries(REGISTRIES))(
