@@ -124,3 +124,44 @@ describe('inklingTurnActivity', () => {
     myTurn.done();
   });
 });
+
+// Lumen's review probes of #736 at 11bff2c0, kept as regressions.
+describe('completion and Stop, in any order', () => {
+  it("a finished turn's late done() cannot remove a newer turn", () => {
+    const sb = freshSb();
+    const old = trackInklingTurn(sb);
+    old.done();
+    const fresh = trackInklingTurn(sb);
+    old.done();
+    expect(liveInklingTurns(sb)).toBe(1);
+    expect(inklingTurnActivity(sb).state).toBe('working');
+    expect(fresh.signal.aborted).toBe(false);
+    fresh.done();
+    expect(inklingTurnActivity(sb)).toEqual({ state: 'idle', since: null });
+  });
+
+  it('a runner that returns inside Stop leaves no stale activity', () => {
+    const sb = freshSb();
+    const first = trackInklingTurn(sb);
+    const second = trackInklingTurn(sb);
+    first.signal.addEventListener('abort', first.done, { once: true });
+    second.signal.addEventListener('abort', second.done, { once: true });
+    expect(cancelInklingTurns(sb)).toBe(2);
+    expect(first.signal.aborted && second.signal.aborted).toBe(true);
+    expect(inklingTurnActivity(sb)).toEqual({ state: 'idle', since: null });
+  });
+
+  it('Stop and completion settle to idle whichever runs first', async () => {
+    for (const stopFirst of [true, false]) {
+      const sb = freshSb();
+      const turn = trackInklingTurn(sb);
+      const stop = () => cancelInklingTurns(sb);
+      const steps = stopFirst ? [stop, turn.done] : [turn.done, stop];
+      await Promise.all(steps.map((step) => Promise.resolve().then(step)));
+      expect(inklingTurnActivity(sb), `stop first: ${stopFirst}`).toEqual({
+        state: 'idle',
+        since: null,
+      });
+    }
+  });
+});

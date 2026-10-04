@@ -56,8 +56,10 @@ export function trackInklingTurn(sbId: string): { signal: AbortSignal; done: () 
 export function cancelInklingTurns(sbId: string): number {
   const turns = live.get(sbId);
   if (!turns) return 0;
+  // Counted first: a runner may return, and release its turn, inside abort().
+  const running = turns.size;
   for (const turn of turns) turn.controller.abort();
-  return turns.size;
+  return running;
 }
 
 /** How many turns are live for `sbId` (for tests and logs). */
