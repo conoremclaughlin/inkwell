@@ -125,23 +125,29 @@ function writeSlowToExitFake(exitAfterMs: number): string {
  */
 function writeLeaderWithStubbornTool(): string {
   const fake = join(fixtures, 'claude-leaves-a-tool.mjs');
-  const toolPidPath = join(fixtures, 'tool.pid');
-  const tool = `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(toolPidPath)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  // Paths come from the fake's own location (the runner hands it a clean
+  // env), and the tool is handed its pid file as an argument: no path is
+  // spliced into code.
   writeFileSync(
     fake,
     [
       '#!/usr/bin/env node',
       "import { spawn } from 'child_process';",
       "import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs';",
-      `rmSync(${JSON.stringify(toolPidPath)}, { force: true });`,
+      "import { dirname, join } from 'path';",
+      "import { fileURLToPath } from 'url';",
+      'const here = dirname(fileURLToPath(import.meta.url));',
+      "const toolPidPath = join(here, 'tool.pid');",
+      'rmSync(toolPidPath, { force: true });',
       "process.on('SIGTERM', () => process.exit(0));",
-      `spawn(process.execPath, ['-e', ${JSON.stringify(tool)}], { stdio: 'ignore' });`,
+      `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
+      "spawn(process.execPath, ['-e', tool, toolPidPath], { stdio: 'ignore' });",
       'const wait = setInterval(() => {',
-      `  if (!existsSync(${JSON.stringify(toolPidPath)})) return;`,
-      `  const toolPid = Number(readFileSync(${JSON.stringify(toolPidPath)}, 'utf-8'));`,
+      '  if (!existsSync(toolPidPath)) return;',
+      "  const toolPid = Number(readFileSync(toolPidPath, 'utf-8'));",
       '  if (!(toolPid > 0)) return;',
       '  clearInterval(wait);',
-      `  writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid, toolPid]));`,
+      "  writeFileSync(join(here, 'pids.json'), JSON.stringify([process.pid, toolPid]));",
       '}, 20);',
       'setInterval(() => {}, 1000);',
     ].join('\n'),
@@ -252,14 +258,22 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
 
   it('a cancelled run keeps what its process wrote while it wound down', async () => {
     const fake = join(fixtures, 'claude-says-goodbye.mjs');
-    const lastWord = JSON.stringify({ type: 'result', result: 'stopped mid-thought' });
+    // Its last word is data in a file beside it, read when it is stopped,
+    // never spliced into its code.
+    writeFileSync(
+      join(fixtures, 'last-word.jsonl'),
+      JSON.stringify({ type: 'result', result: 'stopped mid-thought' }) + '\n'
+    );
     writeFileSync(
       fake,
       [
         '#!/usr/bin/env node',
-        "import { writeFileSync } from 'fs';",
-        `process.on('SIGTERM', () => { process.stdout.write(${JSON.stringify(lastWord + '\n')}); setTimeout(() => process.exit(0), 100); });`,
-        `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid]));`,
+        "import { readFileSync, writeFileSync } from 'fs';",
+        "import { dirname, join } from 'path';",
+        "import { fileURLToPath } from 'url';",
+        'const here = dirname(fileURLToPath(import.meta.url));',
+        "process.on('SIGTERM', () => { process.stdout.write(readFileSync(join(here, 'last-word.jsonl'), 'utf-8')); setTimeout(() => process.exit(0), 100); });",
+        "writeFileSync(join(here, 'pids.json'), JSON.stringify([process.pid]));",
         'setInterval(() => {}, 1000);',
       ].join('\n'),
       { mode: 0o755 }

@@ -37,9 +37,12 @@ async function waitFor(check: () => boolean, ms = 5000): Promise<void> {
   }
 }
 
-/** A group leader of our own, once its handlers are in place. */
-async function startLeader(code: string): Promise<ChildProcess> {
-  const leader = spawn(process.execPath, ['-e', code], {
+/**
+ * A group leader of our own, once its handlers are in place. `args` reach it
+ * as data (`process.argv[1]` on), never spliced into its code.
+ */
+async function startLeader(code: string, args: string[] = []): Promise<ChildProcess> {
+  const leader = spawn(process.execPath, ['-e', code, ...args], {
     detached: true,
     stdio: ['ignore', 'pipe', 'ignore'],
   });
@@ -51,10 +54,15 @@ async function startLeader(code: string): Promise<ChildProcess> {
 describe('the inkling stop fence, with real processes', () => {
   it('a member that forks a replacement after the snapshot and exits leaves the fence held until the replacement is gone', async () => {
     const replacementFile = join(dir, 'replacement.pid');
-    const replacement = `require('fs').writeFileSync(${JSON.stringify(replacementFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+    // The replacement's code, and the file it writes its pid to, are handed
+    // down as arguments: argv[1] and argv[2] for the leader, argv[1] for the
+    // replacement.
+    const replacement =
+      "require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";
     // On SIGUSR2 the leader starts a replacement in its own group, then exits.
     const leader = await startLeader(
-      `process.on('SIGUSR2', () => { require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(replacement)}], { stdio: 'ignore' }); setTimeout(() => process.exit(0), 200); }); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`
+      "process.on('SIGUSR2', () => { require('child_process').spawn(process.execPath, ['-e', process.argv[1], process.argv[2]], { stdio: 'ignore' }); setTimeout(() => process.exit(0), 200); }); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);",
+      [replacement, replacementFile]
     );
     const pgid = leader.pid as number;
     // At this point the leader is the group's only member.

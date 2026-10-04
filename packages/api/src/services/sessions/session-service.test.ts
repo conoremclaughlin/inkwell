@@ -1333,16 +1333,22 @@ describe('SessionService', () => {
           const leader = join(dir, 'leader.pid');
           const tool = join(dir, 'tool.pid');
           const script = join(dir, 'claude.mjs');
-          const toolCode = `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(tool)}, String(process.pid)); setInterval(() => {}, 1000);`;
+          // Paths come from the fake's own location (the runner hands it a
+          // clean env), and the tool is handed its pid file as an argument:
+          // no path is spliced into code.
           writeFileSync(
             script,
             [
               '#!/usr/bin/env node',
               "import { spawn } from 'child_process';",
               "import { writeFileSync } from 'fs';",
+              "import { dirname, join } from 'path';",
+              "import { fileURLToPath } from 'url';",
+              'const here = dirname(fileURLToPath(import.meta.url));',
               "process.on('SIGTERM', () => process.exit(0));",
-              `spawn(process.execPath, ['-e', ${JSON.stringify(toolCode)}], { stdio: 'ignore' });`,
-              `writeFileSync(${JSON.stringify(leader)}, String(process.pid));`,
+              `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
+              "spawn(process.execPath, ['-e', tool, join(here, 'tool.pid')], { stdio: 'ignore' });",
+              "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
               'setInterval(() => {}, 1000);',
             ].join('\n'),
             { mode: 0o755 }
