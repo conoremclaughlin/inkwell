@@ -93,6 +93,8 @@ export interface FeedMeta {
   fetched: number;
   total: number;
   truncated: boolean;
+  /** Messages carry no `reactions` because they could not be read. */
+  reactionsUnavailable?: boolean;
 }
 
 export interface ThreadsResponse {
@@ -133,6 +135,35 @@ export interface ThreadMessage {
   priority: string;
   metadata?: Record<string, unknown> | null;
   createdAt: string;
+  /**
+   * The message's reactions (spec inkling-reactions), `[]` when it has none.
+   * Absent from a server without reactions, or when they could not be read
+   * (`meta.reactionsUnavailable`): show nothing then, never "no reactions".
+   */
+  reactions?: ThreadReaction[];
+}
+
+/** One emoji on one message, with who reacted. A reaction is never approval. */
+export interface ThreadReaction {
+  emoji: string;
+  count: number;
+  reactors: Array<{ kind: 'user' | 'sb'; id: string }>;
+  /** The viewer is one of the reactors. */
+  mine: boolean;
+}
+
+/** POST /api/admin/threads/reactions: add or (with `remove`) take back one reaction. */
+export interface ThreadReactionRequest {
+  threadKey: string;
+  messageId: string;
+  emoji: string;
+  remove?: boolean;
+}
+
+/** The message's reactions after the change, as the viewer sees them. */
+export interface ThreadReactionResponse {
+  messageId: string;
+  reactions: ThreadReaction[];
 }
 
 export interface ThreadMessagesResponse {

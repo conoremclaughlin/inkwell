@@ -21,4 +21,5 @@ export * from './timeline.js';
 export * from './history.js';
 export * from './message-display.js';
 export * from './markdown.js';
+export * from './reactions.js';
 export * from './use-thread-history.js';
