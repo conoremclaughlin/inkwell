@@ -131,24 +131,45 @@ export function ThreadConversation({
   // anyone else regardless.
   const member = hasThread && (spine.thread?.people ?? []).some((person) => person.isOwn);
   const queryClient = useQueryClient();
-  const react = useApiPost<ThreadReactionResponse, ThreadReactionRequest>(THREAD_REACTIONS_PATH, {
-    onSuccess: (result) => {
-      setReactionOverrides((current) =>
-        new Map(current).set(
-          result.messageId,
-          result.reactions.map((r) => ({ emoji: r.emoji, count: r.count, mine: r.mine }))
-        )
-      );
-      void queryClient.invalidateQueries({ queryKey: ['thread-messages', key] });
-    },
-  });
-  const reactMutate = react.mutate;
+  const react = useApiPost<ThreadReactionResponse, ThreadReactionRequest>(THREAD_REACTIONS_PATH);
+  const reactMutateAsync = react.mutateAsync;
+  // One write at a time per message. Two in flight could be applied by the
+  // server in one order and answered in the other, and the older answer
+  // would then stand on a message no newer page will carry again. So a
+  // message's writes queue, and each works out its toggle when it is sent,
+  // from the answer before it (or, after a failure, from what is shown).
+  const reactionQueues = useRef(new Map<string, Promise<ConversationReaction[] | undefined>>());
   const onReact = useCallback(
     (messageId: string, emoji: string) => {
-      const current = messagesRef.current.find((m) => m.id === messageId)?.reactions;
-      reactMutate({ threadKey: key, messageId, ...reactionToggle(emoji, current) });
+      const queues = reactionQueues.current;
+      const previous = queues.get(messageId) ?? Promise.resolve(undefined);
+      const next = previous.then(async (answered) => {
+        const current = answered ?? messagesRef.current.find((m) => m.id === messageId)?.reactions;
+        try {
+          const result = await reactMutateAsync({
+            threadKey: key,
+            messageId,
+            ...reactionToggle(emoji, current),
+          });
+          const reactions = result.reactions.map((r) => ({
+            emoji: r.emoji,
+            count: r.count,
+            mine: r.mine,
+          }));
+          setReactionOverrides((overrides) => new Map(overrides).set(messageId, reactions));
+          void queryClient.invalidateQueries({ queryKey: ['thread-messages', key] });
+          return reactions;
+        } catch {
+          // The banner says so; the next write reads what the message shows.
+          return undefined;
+        }
+      });
+      queues.set(messageId, next);
+      void next.then(() => {
+        if (queues.get(messageId) === next) queues.delete(messageId);
+      });
     },
-    [key, reactMutate]
+    [key, reactMutateAsync, queryClient]
   );
 
   // Reading is acknowledged only as far as the history is whole. The

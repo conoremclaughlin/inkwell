@@ -38,7 +38,13 @@ export const ReactionChips = memo(function ReactionChips({
   };
 
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-1" data-reactions-for={messageId}>
+    <div
+      className="mt-1 flex flex-wrap items-center gap-1"
+      data-reactions-for={messageId}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') setPicking(false);
+      }}
+    >
       {reactions.map((reaction) => {
         const chipClass = cn(
           'inline-flex items-center gap-1 rounded-full border px-2 py-px text-xs tabular-nums',
@@ -76,44 +82,44 @@ export const ReactionChips = memo(function ReactionChips({
         );
       })}
       {interactive && (
-        <div
-          className="relative"
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') setPicking(false);
-          }}
-        >
-          <button
-            type="button"
-            aria-label="React"
-            aria-expanded={picking}
-            onClick={() => setPicking(!picking)}
-            className={cn(
-              'inline-flex h-5 items-center rounded-full px-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:opacity-100',
-              reactions.length === 0 && !picking && 'opacity-0 group-hover:opacity-100'
-            )}
-          >
-            <SmilePlus className="h-3.5 w-3.5" />
-          </button>
-          {picking && (
-            <div
-              role="group"
-              aria-label="Choose a reaction"
-              className="absolute bottom-full left-0 z-10 mb-1 flex gap-0.5 rounded-full border bg-background p-1 shadow-md"
-            >
-              {REACTION_CHOICES.map((choice) => (
-                <button
-                  key={choice.emoji}
-                  type="button"
-                  aria-label={reactionChoiceLabel(choice)}
-                  disabled={!canAddReaction(choice.emoji, reactions)}
-                  onClick={() => toggle(choice.emoji)}
-                  className="rounded-full px-1.5 py-0.5 text-base hover:bg-muted disabled:opacity-40"
-                >
-                  {choice.emoji}
-                </button>
-              ))}
-            </div>
+        <button
+          type="button"
+          aria-label="React"
+          aria-expanded={picking}
+          onClick={() => setPicking(!picking)}
+          className={cn(
+            'inline-flex h-5 items-center rounded-full px-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:opacity-100',
+            reactions.length === 0 && !picking && 'opacity-0 group-hover:opacity-100'
           )}
+        >
+          <SmilePlus className="h-3.5 w-3.5" />
+        </button>
+      )}
+      {/*
+        The choices sit in this row's own flow, after the React button. A
+        popover anchored to the button ran past the conversation's right edge
+        once a few chips had pushed the button along (Lumen, #742 r1); in the
+        row they wrap to the next line, and wrap within themselves on a
+        narrower column still.
+      */}
+      {interactive && picking && (
+        <div
+          role="group"
+          aria-label="Choose a reaction"
+          className="flex flex-wrap gap-0.5 rounded-2xl border bg-background p-1 shadow-sm"
+        >
+          {REACTION_CHOICES.map((choice) => (
+            <button
+              key={choice.emoji}
+              type="button"
+              aria-label={reactionChoiceLabel(choice)}
+              disabled={!canAddReaction(choice.emoji, reactions)}
+              onClick={() => toggle(choice.emoji)}
+              className="rounded-full px-1.5 py-0.5 text-base hover:bg-muted disabled:opacity-40"
+            >
+              {choice.emoji}
+            </button>
+          ))}
         </div>
       )}
     </div>

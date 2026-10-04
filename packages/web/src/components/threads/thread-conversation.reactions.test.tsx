@@ -3,45 +3,43 @@
  * ThreadConversation and reactions (spec inkling-reactions): offered to a
  * member only, a tap posts the right toggle, and the answer shows on the
  * message until a newer page carries it. The view is a probe that records
- * what it is given.
+ * what it is given. The mutation hook and QueryClient are the real ones;
+ * only the HTTP transport is faked, so each write is a request the test
+ * answers when it chooses (Lumen's #742 harness).
  */
 
-import { act, cleanup, render } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, render, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { AxiosAdapter, InternalAxiosRequestConfig } from 'axios';
 import {
   THREAD_REACTIONS_PATH,
   type ThreadMessage,
   type ThreadMessagesResponse,
+  type ThreadReaction,
+  type ThreadReactionRequest,
   type ThreadSpine,
 } from '@inklabs/shared/stories/threads-api';
+import { apiClient } from '@/lib/api/client';
 import { createReadCursorStore } from './read-cursors';
 
 const fake = vi.hoisted(() => ({
   page: undefined as unknown,
   updatedAt: 1,
-  mutate: vi.fn(),
-  invalidate: vi.fn(),
-  postPath: '',
-  onSuccess: undefined as undefined | ((result: unknown) => void),
   view: {
     onReact: undefined as unknown,
     messages: [] as Array<{ id: string; reactions?: unknown }>,
   },
 }));
 
-vi.mock('@/lib/api', () => ({
+vi.mock('@/lib/api', async (original) => ({
+  ...(await original<typeof import('@/lib/api')>()),
   useWorkspaceApiQuery: () => ({
     data: fake.page,
     dataUpdatedAt: fake.updatedAt,
     isLoading: false,
   }),
   apiGet: () => Promise.resolve({ thread: null, messages: [] }),
-  useApiPost: (path: string, options: { onSuccess: (result: unknown) => void }) => {
-    fake.postPath = path;
-    fake.onSuccess = options.onSuccess;
-    return { mutate: fake.mutate, isError: false, error: null };
-  },
-  useQueryClient: () => ({ invalidateQueries: fake.invalidate }),
 }));
 vi.mock('./reply-composer', () => ({ ReplyComposer: () => null }));
 vi.mock('./reopen-button', () => ({ ReopenThreadButton: () => null }));
@@ -74,7 +72,13 @@ const page = (...messages: ThreadMessage[]): ThreadMessagesResponse => ({
   messages,
   meta: { fetched: messages.length, total: messages.length, truncated: false },
 });
-const heartMine = [{ emoji: '❤️', count: 1, reactors: [], mine: true }];
+const mine = (emoji: string): ThreadReaction => ({
+  emoji,
+  count: 1,
+  reactors: [{ kind: 'user', id: 'u-me' }],
+  mine: true,
+});
+const shown = (emoji: string) => ({ emoji, count: 1, mine: true });
 
 function spineWith(people: Array<{ userId: string; name: string; isOwn: boolean }>): ThreadSpine {
   return {
@@ -99,29 +103,89 @@ function spineWith(people: Array<{ userId: string; name: string; isOwn: boolean 
 const ME = { userId: 'u-me', name: 'You', isOwn: true };
 const SOMEONE = { userId: 'u-else', name: 'Someone', isOwn: false };
 
+/** One reaction request in flight, answered (or failed) when the test says. */
+interface Pending {
+  body: ThreadReactionRequest;
+  answer: (reactions: ThreadReaction[]) => void;
+  fail: () => void;
+}
+let pending: Pending[];
+let client: QueryClient;
+let savedAdapter: typeof apiClient.defaults.adapter;
+
+beforeEach(() => {
+  pending = [];
+  fake.updatedAt = 1;
+  client = new QueryClient({
+    defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+  });
+  savedAdapter = apiClient.defaults.adapter;
+  const adapter: AxiosAdapter = (config: InternalAxiosRequestConfig) => {
+    if (config.method !== 'post' || config.url !== THREAD_REACTIONS_PATH) {
+      throw new Error(`Unexpected request: ${config.method} ${config.url}`);
+    }
+    const body = JSON.parse(config.data as string) as ThreadReactionRequest;
+    return new Promise((resolve, reject) =>
+      pending.push({
+        body,
+        answer: (reactions) =>
+          resolve({
+            data: { messageId: body.messageId, reactions },
+            status: 200,
+            statusText: 'OK',
+            headers: {},
+            config,
+          }),
+        fail: () =>
+          reject(
+            Object.assign(new Error('Request failed with status code 500'), {
+              isAxiosError: true,
+              config,
+              response: {
+                data: { error: 'boom' },
+                status: 500,
+                statusText: 'Error',
+                headers: {},
+                config,
+              },
+            })
+          ),
+      })
+    );
+  };
+  apiClient.defaults.adapter = adapter;
+});
+
+afterEach(() => {
+  cleanup();
+  client.clear();
+  apiClient.defaults.adapter = savedAdapter;
+});
+
 function mount(spine: ThreadSpine) {
+  const cursors = createReadCursorStore(null, () => new Date(at(100)));
   const ui = () => (
-    <ThreadConversation
-      spine={spine}
-      workspaceId="fixture-workspace"
-      nameFor={(s) => s}
-      cursors={createReadCursorStore(null, () => new Date(at(100)))}
-      onBack={() => {}}
-      detailsOpen={false}
-      onToggleDetails={() => {}}
-    />
+    <QueryClientProvider client={client}>
+      <ThreadConversation
+        spine={spine}
+        workspaceId="fixture-workspace"
+        nameFor={(s) => s}
+        cursors={cursors}
+        onBack={() => {}}
+        detailsOpen={false}
+        onToggleDetails={() => {}}
+      />
+    </QueryClientProvider>
   );
   const rendered = render(ui());
   return { rerender: () => rendered.rerender(ui()) };
 }
+const react = (messageId: string, emoji: string) =>
+  act(() => (fake.view.onReact as (messageId: string, emoji: string) => void)(messageId, emoji));
 const reactionsOf = (id: string) => fake.view.messages.find((m) => m.id === id)?.reactions;
-
-afterEach(() => {
-  cleanup();
-  fake.mutate.mockReset();
-  fake.invalidate.mockReset();
-  fake.updatedAt = 1;
-});
+const bodies = () => pending.map((p) => p.body);
+/** Let any queued write start, so a held one would have shown up. */
+const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 20)));
 
 describe('ThreadConversation reactions', () => {
   it('offers reacting to a member of the thread only', () => {
@@ -136,44 +200,132 @@ describe('ThreadConversation reactions', () => {
     expect(fake.view.onReact).toBeUndefined();
   });
 
-  it('posts the toggle: takes back the viewer’s own emoji, adds any other', () => {
-    fake.page = page(message('m1', 1, heartMine));
+  it('posts the toggle: takes back the viewer’s own emoji, adds any other', async () => {
+    fake.page = page(message('m1', 1, [mine('❤️')]));
     mount(spineWith([ME]));
-    const onReact = fake.view.onReact as (messageId: string, emoji: string) => void;
-    onReact('m1', '❤️');
-    onReact('m1', '👍');
-    expect(fake.postPath).toBe(THREAD_REACTIONS_PATH);
-    expect(fake.mutate.mock.calls.map(([body]) => body)).toEqual([
+    react('m1', '❤️');
+    await waitFor(() => expect(pending).toHaveLength(1));
+    await act(async () => pending[0].answer([]));
+    react('m1', '👍');
+    await waitFor(() => expect(pending).toHaveLength(2));
+    expect(bodies()).toEqual([
       { threadKey: KEY, messageId: 'm1', emoji: '❤️', remove: true },
       { threadKey: KEY, messageId: 'm1', emoji: '👍', remove: false },
     ]);
   });
 
-  it('shows the answer on the message until a newer page carries that message', () => {
+  it('shows the answer on the message until a newer page carries that message', async () => {
     fake.page = page(message('m1', 1, []), message('m2', 2, []));
     const view = mount(spineWith([ME]));
-    const answer = [
-      { emoji: '👍', count: 1, reactors: [{ kind: 'user', id: 'u-me' }], mine: true },
-    ];
-    act(() => {
-      fake.onSuccess?.({ messageId: 'm1', reactions: answer });
-      fake.onSuccess?.({ messageId: 'm2', reactions: answer });
+    react('m1', '👍');
+    react('m2', '👍');
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => {
+      pending[0].answer([mine('👍')]);
+      pending[1].answer([mine('👍')]);
     });
-    expect(reactionsOf('m1')).toEqual([{ emoji: '👍', count: 1, mine: true }]);
-    expect(fake.invalidate).toHaveBeenCalledWith({ queryKey: ['thread-messages', KEY] });
+    await waitFor(() => expect(reactionsOf('m1')).toEqual([shown('👍')]));
 
     // The next poll carries m2 (with what the server now says) but not m1.
-    fake.page = page(message('m2', 2, heartMine));
+    fake.page = page(message('m2', 2, [mine('❤️')]));
     fake.updatedAt = 2;
     act(() => view.rerender());
-    expect(reactionsOf('m2')).toEqual([{ emoji: '❤️', count: 1, mine: true }]);
-    expect(reactionsOf('m1')).toEqual([{ emoji: '👍', count: 1, mine: true }]);
+    expect(reactionsOf('m2')).toEqual([shown('❤️')]);
+    expect(reactionsOf('m1')).toEqual([shown('👍')]);
   });
 
-  it('never shows reactions on a message from a server that sent none', () => {
+  it('never shows reactions on a message from a server that sent none', async () => {
     fake.page = page(message('m1', 1, undefined));
     mount(spineWith([ME]));
-    act(() => fake.onSuccess?.({ messageId: 'm1', reactions: [] }));
+    react('m1', '👍');
+    await waitFor(() => expect(pending).toHaveLength(1));
+    await act(async () => pending[0].answer([]));
+    await settle();
     expect(reactionsOf('m1')).toBeUndefined();
+  });
+
+  describe('one write at a time per message (Lumen, #742 r1)', () => {
+    it('holds a message’s second write until the first answers', async () => {
+      // An older message the newest page no longer carries: no poll repairs it.
+      fake.page = page(message('older', 1, []), message('newer', 2, []));
+      const view = mount(spineWith([ME]));
+      fake.page = page(message('newer', 2, []));
+      fake.updatedAt = 2;
+      act(() => view.rerender());
+
+      react('older', '❤️');
+      react('older', '👍');
+      await waitFor(() => expect(pending).toHaveLength(1));
+      await settle();
+      expect(pending).toHaveLength(1);
+
+      await act(async () => pending[0].answer([mine('❤️')]));
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(bodies()[1]).toEqual({
+        threadKey: KEY,
+        messageId: 'older',
+        emoji: '👍',
+        remove: false,
+      });
+      await act(async () => pending[1].answer([mine('❤️'), mine('👍')]));
+      await waitFor(() => expect(reactionsOf('older')).toEqual([shown('❤️'), shown('👍')]));
+    });
+
+    it('works out each queued toggle from the answer before it: a double tap adds, then takes back', async () => {
+      fake.page = page(message('m1', 1, []));
+      mount(spineWith([ME]));
+      react('m1', '❤️');
+      react('m1', '❤️');
+      await waitFor(() => expect(pending).toHaveLength(1));
+      await act(async () => pending[0].answer([mine('❤️')]));
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(bodies()).toEqual([
+        { threadKey: KEY, messageId: 'm1', emoji: '❤️', remove: false },
+        { threadKey: KEY, messageId: 'm1', emoji: '❤️', remove: true },
+      ]);
+      await act(async () => pending[1].answer([]));
+      await waitFor(() => expect(reactionsOf('m1')).toEqual([]));
+    });
+
+    it('sends the next write after a failed one, from what the message shows', async () => {
+      fake.page = page(message('m1', 1, [mine('❤️')]));
+      mount(spineWith([ME]));
+      react('m1', '👍');
+      react('m1', '❤️');
+      await waitFor(() => expect(pending).toHaveLength(1));
+      await act(async () => pending[0].fail());
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(bodies()[1]).toEqual({ threadKey: KEY, messageId: 'm1', emoji: '❤️', remove: true });
+    });
+
+    it('after a failure, reads what the message shows, not an answer from before it', async () => {
+      fake.page = page(message('m1', 1, []));
+      const view = mount(spineWith([ME]));
+      // Three taps queue up: ❤️, then 👍 twice.
+      react('m1', '❤️');
+      react('m1', '👍');
+      react('m1', '👍');
+      await waitFor(() => expect(pending).toHaveLength(1));
+      await act(async () => pending[0].answer([mine('❤️')]));
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(bodies()[1]).toEqual({ threadKey: KEY, messageId: 'm1', emoji: '👍', remove: false });
+      // A newer page carries the message with the 👍 stored after all, and
+      // then the write that stored it answers with a failure.
+      fake.page = page(message('m1', 1, [mine('❤️'), mine('👍')]));
+      fake.updatedAt = 2;
+      act(() => view.rerender());
+      await act(async () => pending[1].fail());
+      await waitFor(() => expect(pending).toHaveLength(3));
+      expect(bodies()[2]).toEqual({ threadKey: KEY, messageId: 'm1', emoji: '👍', remove: true });
+    });
+
+    it('does not hold one message’s write behind another’s', async () => {
+      fake.page = page(message('m1', 1, []), message('m2', 2, []));
+      mount(spineWith([ME]));
+      react('m1', '❤️');
+      react('m2', '❤️');
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(bodies().map((b) => b.messageId)).toEqual(['m1', 'm2']);
+    });
   });
 });

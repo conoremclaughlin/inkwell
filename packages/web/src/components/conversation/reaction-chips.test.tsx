@@ -51,6 +51,28 @@ describe('ReactionChips', () => {
     expect(screen.queryByRole('group', { name: 'Choose a reaction' })).toBeNull();
   });
 
+  it('opens the choices inside the chips’ own row, so they wrap with it (Lumen, #742 r1)', () => {
+    // Anchored beside a trailing React button, the choices ran past the
+    // conversation's right edge at 390px with three chips. In the row's own
+    // flow they wrap to the next line instead. jsdom has no layout, so this
+    // holds the structure; the width is measured in a browser.
+    const three = [
+      { emoji: '❤️', count: 2, mine: true },
+      { emoji: '👍', count: 1, mine: false },
+      { emoji: '😂', count: 1, mine: false },
+    ];
+    const { container } = render(
+      <ReactionChips messageId="m1" reactions={three} onToggle={() => {}} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'React' }));
+    const row = container.querySelector('[data-reactions-for="m1"]');
+    const choices = screen.getByRole('group', { name: 'Choose a reaction' });
+    expect(choices.parentElement).toBe(row);
+    expect(row?.className).toContain('flex-wrap');
+    expect(choices.className).not.toMatch(/\b(absolute|fixed)\b/);
+    expect(choices.className).toContain('flex-wrap');
+  });
+
   it('closes the choices on Escape', () => {
     render(<ReactionChips messageId="m1" reactions={[]} onToggle={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'React' }));
