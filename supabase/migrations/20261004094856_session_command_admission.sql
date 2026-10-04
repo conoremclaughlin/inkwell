@@ -2,7 +2,9 @@
 -- pr:701 eca1da3f, f59a705a, 83425b10).
 --
 -- DARK. Nothing calls these yet, no existing object changes, and the mode row
--- starts at 'legacy', in which every function here refuses with mode_mismatch.
+-- starts at 'legacy', in which admit_command and transition_command refuse with
+-- mode_mismatch. session_dispatch_head is a read, not dispatch authority, and
+-- is not mode-gated.
 -- Owner tenure, turn generations and the running-write guard are deliberately
 -- absent: their layout is still under review, and they land in later slices.
 --
@@ -20,7 +22,7 @@
 --                              that stops it.
 
 -- ── Mode ────────────────────────────────────────────────────────────────────
--- One row. A caller states the protocol it speaks, and a function refuses
+-- One row. A caller states the protocol it speaks, and a write refuses
 -- whenever the row disagrees, so an old caller on a new database and a new
 -- caller on an old one both stop instead of writing under the wrong rules.
 -- Activation and rollback change this row inside a reviewed window.
@@ -218,7 +220,13 @@ GRANT EXECUTE ON FUNCTION public.session_command_recipients_valid(jsonb) TO serv
 
 -- ── admit_command ───────────────────────────────────────────────────────────
 -- Admits one command into its session's order, or returns the command that
--- already holds this identity. It takes the session row FOR UPDATE: the same
+-- already holds this identity. A repeat is the same command only if its whole
+-- envelope is: digest, kind, principal, origin, addressee, expected turn and
+-- message. Anything else under the same identity is a conflict, so a command
+-- is never acknowledged to a caller who aimed it somewhere else. The envelope
+-- is compared here, not only through the caller's digest.
+--
+-- It takes the session row FOR UPDATE: the same
 -- lock turn admission will take, so assigning the next position and choosing
 -- the head can never interleave. The caller has already resolved and
 -- authorized the session (routing); this re-checks only that the session
@@ -253,6 +261,7 @@ DECLARE
   v_session_workspace uuid;
   v_session_found boolean;
   v_existing record;
+  v_existing_found boolean;
   v_message_workspace uuid;
   v_seq bigint;
   v_id uuid;
@@ -300,7 +309,7 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'forbidden');
   END IF;
 
-  SELECT id, payload_digest, digest_version, state, revision, admission_seq
+  SELECT *
     INTO v_existing
     FROM public.session_commands
    WHERE workspace_id = p_workspace_id
@@ -308,8 +317,27 @@ BEGIN
      AND principal_id = p_principal_id
      AND session_id = p_session_id
      AND command_id = p_command_id;
-  IF FOUND THEN
-    IF v_existing.payload_digest = p_payload_digest AND v_existing.digest_version = p_digest_version THEN
+  v_existing_found := FOUND;
+  -- An Inkmail redelivery under another command id is the same command, never
+  -- a second one: the message is its second identity.
+  IF NOT v_existing_found AND p_origin_kind = 'inkmail' AND p_source_message_ref IS NOT NULL THEN
+    SELECT *
+      INTO v_existing
+      FROM public.session_commands
+     WHERE session_id = p_session_id AND source_message_ref = p_source_message_ref;
+    v_existing_found := FOUND;
+  END IF;
+  IF v_existing_found THEN
+    IF v_existing.payload_digest = p_payload_digest
+       AND v_existing.digest_version = p_digest_version
+       AND v_existing.kind = p_kind
+       AND v_existing.principal_kind = p_principal_kind
+       AND v_existing.principal_id = p_principal_id
+       AND v_existing.origin_kind = p_origin_kind
+       AND v_existing.origin_ref IS NOT DISTINCT FROM p_origin_ref
+       AND v_existing.addressee IS NOT DISTINCT FROM p_addressee
+       AND v_existing.expected_turn IS NOT DISTINCT FROM p_expected_turn
+       AND v_existing.source_message_ref IS NOT DISTINCT FROM p_source_message_ref THEN
       RETURN jsonb_build_object(
         'outcome', 'existing', 'id', v_existing.id, 'admissionSeq', v_existing.admission_seq,
         'state', v_existing.state, 'revision', v_existing.revision
@@ -321,20 +349,6 @@ BEGIN
   IF p_origin_kind = 'inkmail' THEN
     IF p_source_message_ref IS NULL OR p_payload IS NOT NULL THEN
       RETURN jsonb_build_object('outcome', 'invalid', 'field', 'source');
-    END IF;
-    -- A redelivery under another command id is the same command, never a second one.
-    SELECT id, payload_digest, digest_version, state, revision, admission_seq
-      INTO v_existing
-      FROM public.session_commands
-     WHERE session_id = p_session_id AND source_message_ref = p_source_message_ref;
-    IF FOUND THEN
-      IF v_existing.payload_digest = p_payload_digest AND v_existing.digest_version = p_digest_version THEN
-        RETURN jsonb_build_object(
-          'outcome', 'existing', 'id', v_existing.id, 'admissionSeq', v_existing.admission_seq,
-          'state', v_existing.state, 'revision', v_existing.revision
-        );
-      END IF;
-      RETURN jsonb_build_object('outcome', 'conflict', 'id', v_existing.id);
     END IF;
     SELECT t.workspace_id INTO v_message_workspace
       FROM public.inbox_thread_messages m
@@ -392,11 +406,18 @@ GRANT EXECUTE ON FUNCTION public.admit_command(
 -- state, writing the command, its event and its receipts in one transaction.
 --
 -- What it refuses, whatever the caller believes:
+--   * an expected revision or state that is missing or malformed: the CAS
+--     compares both exactly, so a NULL can never match by falling through;
 --   * leaving completed, rejected or interrupted;
 --   * a started command returning to a not-started state, or being rejected:
 --     it may already have been delivered, and only evidence can say otherwise;
---   * unknown + recovery_required without an operator recipient: a hold
---     ships with the notice that can end it, or not at all.
+--   * entering unknown without an operator recipient, whatever reason code the
+--     caller gives. That write creates the recovery hold, or reinstates it over
+--     a decision for an earlier revision, and the hold ships with the notice
+--     that can end it or not at all. Ordinary in-flight serialization (a
+--     handoff or acceptance waiting for its outcome) pages no one; when the
+--     reconciler finds that outcome lost, it moves the command to unknown, and
+--     that write carries the notice.
 -- Entering backend_accepted, input_consumed, completed, interrupted or
 -- unknown marks the command started. p_mark_started records a handoff before
 -- any outcome exists: a write to the command's current not-started state that
@@ -435,6 +456,13 @@ BEGIN
   ) THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'state');
   END IF;
+  IF p_expected_revision IS NULL OR p_expected_revision < 1
+     OR p_expected_state IS NULL OR p_expected_state NOT IN (
+       'stored', 'queued', 'waiting_for_consumer', 'backend_accepted', 'input_consumed',
+       'completed', 'rejected', 'interrupted', 'unknown'
+     ) THEN
+    RETURN jsonb_build_object('outcome', 'invalid', 'field', 'expected');
+  END IF;
   IF p_reason_code IS NOT NULL AND p_reason_code !~ '^[a-z0-9_.:-]{1,100}$' THEN
     RETURN jsonb_build_object('outcome', 'invalid', 'field', 'reasonCode');
   END IF;
@@ -453,8 +481,13 @@ BEGIN
     FROM public.session_commands c
    WHERE c.id = p_command_uuid
      FOR UPDATE;
+  -- The command can go between the first read and the locks, with its session.
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('outcome', 'missing');
+  END IF;
 
-  IF v_command.revision <> p_expected_revision OR v_command.state <> p_expected_state THEN
+  IF v_command.revision IS DISTINCT FROM p_expected_revision
+     OR v_command.state IS DISTINCT FROM p_expected_state THEN
     RETURN jsonb_build_object(
       'outcome', 'stale', 'revision', v_command.revision, 'state', v_command.state
     );
@@ -477,7 +510,7 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'illegal_transition', 'from', v_command.state, 'to', p_new_state);
   END IF;
 
-  IF p_new_state = 'unknown' AND p_reason_code = 'recovery_required' AND NOT EXISTS (
+  IF p_new_state = 'unknown' AND NOT EXISTS (
     SELECT 1 FROM jsonb_array_elements(COALESCE(p_recipients, '[]'::jsonb)) r
      WHERE r->>'kind' = 'operator'
   ) THEN
@@ -515,13 +548,19 @@ GRANT EXECUTE ON FUNCTION public.transition_command(
 -- a started command has no terminal outcome and no recovery decision recorded
 -- for its current revision. Then later ordinary work waits (live-agent-surfaces
 -- v29 R3), and this names the command holding it:
---   recovery_required    its outcome is unknown;
+--   recovery_required    its outcome is unknown. Actionable: every write into
+--                        unknown carried an operator notice (transition_command).
 --   unresolved_dispatch  it was handed off or accepted and nothing terminal has
---                        been recorded since, which is also what a lost status
---                        write looks like.
+--                        been recorded since. Ordinary in-flight serialization,
+--                        which pages no one; it is also what a lost status
+--                        write looks like, until the reconciler finds it lost
+--                        and moves the command to unknown with the notice.
 -- The hold is computed from the commands themselves, never from a flag that a
 -- lost write could leave unset. Process quiescence does not lift it; only
 -- terminal evidence or a decision addressing that exact revision does.
+--
+-- A read, not dispatch authority, so it is not mode-gated: turn admission
+-- re-checks under the session lock.
 CREATE FUNCTION public.session_dispatch_head(p_session_id uuid)
 RETURNS jsonb
 LANGUAGE sql

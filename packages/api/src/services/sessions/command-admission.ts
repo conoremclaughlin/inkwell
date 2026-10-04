@@ -8,7 +8,9 @@
  * the session, not to whichever owner later executes it.
  *
  * DARK. Nothing in the server calls this yet, and the database starts in
- * `legacy` mode, where every call returns `mode_mismatch`. Parsing is strict:
+ * `legacy` mode, where admission and transitions return `mode_mismatch`.
+ * `readDispatchHead` is a read, not dispatch authority, and is not mode-gated.
+ * Parsing is strict:
  * a reply outside the contract throws, so an unknown outcome is never read as
  * success or as refusal.
  */
@@ -139,7 +141,26 @@ const dispatchHeadSchema = z.union([
 ]);
 export type DispatchHead = z.infer<typeof dispatchHeadSchema>;
 
-/** Sorted keys at every depth, so equal values always serialize equally. */
+/**
+ * The payload exactly as JSON transport carries it to the database: `toJSON`
+ * runs once, array holes and non-finite numbers become null, and undefined
+ * members drop out. Admission hashes and sends this one value, so the row
+ * stores what the digest covers. A payload JSON cannot carry (a BigInt, a
+ * cycle, a bare function) is refused here rather than sent as something else.
+ */
+export function toJsonPayload(payload: unknown): unknown {
+  if (payload === undefined) return undefined;
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(payload);
+  } catch {
+    text = undefined;
+  }
+  if (text === undefined) throw new Error('command payload is not representable as JSON');
+  return JSON.parse(text);
+}
+
+/** Sorted keys at every depth over a JSON value, so equal values serialize equally. */
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -151,13 +172,17 @@ function canonicalJson(value: unknown): string {
 
 /**
  * The versioned digest that decides whether a repeat is the same command.
- * It covers the immutable target and the expected-turn binding as well as
- * the body, so the same id and text aimed at another session or turn is a
- * conflict, not a duplicate.
+ * It covers the immutable target, the authenticated origin, the addressee and
+ * the expected-turn binding as well as the body, so the same id and text
+ * aimed at another session, turn or addressee is a conflict, not a duplicate.
+ * Transport credentials are never part of it. The database also compares the
+ * envelope itself, so a caller's digest is not the only guard.
  */
 export function commandPayloadDigest(input: {
   sessionId: string;
   kind: CommandKind;
+  origin?: { kind: CommandOriginKind; ref?: string };
+  addressee?: string;
   payload?: unknown;
   sourceMessageRef?: string;
   expectedTurn?: string;
@@ -166,7 +191,9 @@ export function commandPayloadDigest(input: {
     v: COMMAND_DIGEST_VERSION,
     sessionId: input.sessionId,
     kind: input.kind,
-    payload: input.payload,
+    origin: input.origin && { kind: input.origin.kind, ref: input.origin.ref },
+    addressee: input.addressee,
+    payload: toJsonPayload(input.payload),
     sourceMessageRef: input.sourceMessageRef,
     expectedTurn: input.expectedTurn,
   });
@@ -188,19 +215,21 @@ export async function admitCommand(
   client: SupabaseClient,
   input: AdmitCommandInput
 ): Promise<AdmitCommandOutcome> {
+  // Normalized once: the digest and the RPC carry this same value.
+  const payload = toJsonPayload(input.payload);
   const { data, error } = await client.rpc('admit_command', {
     p_session_id: input.sessionId,
     p_workspace_id: input.workspaceId,
     p_principal_kind: input.principal.kind,
     p_principal_id: input.principal.id,
     p_command_id: input.commandId,
-    p_payload_digest: commandPayloadDigest(input),
+    p_payload_digest: commandPayloadDigest({ ...input, payload }),
     p_digest_version: COMMAND_DIGEST_VERSION,
     p_kind: input.kind,
     p_origin_kind: input.origin.kind,
     p_origin_ref: input.origin.ref ?? null,
     p_addressee: input.addressee ?? null,
-    p_payload: input.payload === undefined ? null : input.payload,
+    p_payload: payload === undefined ? null : payload,
     p_source_message_ref: input.sourceMessageRef ?? null,
     p_expected_turn: input.expectedTurn ?? null,
     p_recipients: input.recipients ?? [],

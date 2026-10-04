@@ -217,6 +217,58 @@ describe('durable command admission', () => {
       });
     });
 
+    // Lumen, pr:701 9a5d87ef A3: the old addressee was acknowledged for a new one.
+    it('conflicts when only the addressee or the origin changes under the same id and body', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const first = input(sessionId, { origin: { kind: 'browser' }, addressee: 'fixture-alpha' });
+      const admitted = await admitCommand(supabase, first);
+      if (admitted.outcome !== 'admitted') throw new Error(`unexpected ${admitted.outcome}`);
+      for (const changed of [
+        { addressee: 'fixture-beta' },
+        { addressee: undefined },
+        { origin: { kind: 'terminal' as const } },
+        { origin: { kind: 'browser' as const, ref: 'tab-2' } },
+      ]) {
+        expect(await admitCommand(supabase, { ...first, ...changed })).toEqual({
+          outcome: 'conflict',
+          id: admitted.id,
+        });
+      }
+      expect(await admitCommand(supabase, first)).toMatchObject({
+        outcome: 'existing',
+        id: admitted.id,
+      });
+    });
+
+    it('compares the envelope itself, not only the digest the caller sends', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const args = {
+        p_session_id: sessionId,
+        p_workspace_id: workspaceId,
+        p_principal_kind: 'user',
+        p_principal_id: userId,
+        p_command_id: randomUUID(),
+        p_payload_digest: 'sha256:caller-digest-without-the-addressee',
+        p_digest_version: 1,
+        p_kind: 'input.enqueue',
+        p_origin_kind: 'browser',
+        p_origin_ref: null,
+        p_addressee: 'fixture-alpha',
+        p_payload: { text: 'invented input' },
+        p_source_message_ref: null,
+        p_expected_turn: null,
+        p_recipients: [],
+        p_protocol: ADMISSION_PROTOCOL,
+      };
+      const { data: first } = await supabase.rpc('admit_command', args);
+      expect(first).toMatchObject({ outcome: 'admitted' });
+      const { data: second } = await supabase.rpc('admit_command', {
+        ...args,
+        p_addressee: 'fixture-beta',
+      });
+      expect(second).toEqual({ outcome: 'conflict', id: first.id });
+    });
+
     it('records the queued event and the originator receipt with the command', async () => {
       const sessionId = await newSession(suiteSbId);
       const r = await admitCommand(supabase, input(sessionId));
@@ -320,6 +372,29 @@ describe('durable command admission', () => {
       });
     });
 
+    it('conflicts on a redelivery that changes the envelope, through the message identity too', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const messageId = await newMessage(workspaceId, suiteSbId, SUITE_SB);
+      const delivery = input(sessionId, {
+        origin: { kind: 'inkmail' },
+        addressee: 'fixture-alpha',
+        payload: undefined,
+        sourceMessageRef: messageId,
+        principal: { kind: 'sb', id: suiteSbId },
+      });
+      const admitted = await admitCommand(supabase, delivery);
+      if (admitted.outcome !== 'admitted') throw new Error(`unexpected ${admitted.outcome}`);
+      for (const changed of [
+        { addressee: 'fixture-beta' },
+        { principal: { kind: 'user' as const, id: userId } },
+        { expectedTurn: 'another-turn' },
+      ]) {
+        expect(
+          await admitCommand(supabase, { ...delivery, ...changed, commandId: randomUUID() })
+        ).toEqual({ outcome: 'conflict', id: admitted.id });
+      }
+    });
+
     it('refuses a message from another workspace, and one that does not exist', async () => {
       const sessionId = await newSession(suiteSbId);
       const { data: otherSb, error } = await supabase
@@ -378,12 +453,15 @@ describe('durable command admission', () => {
     it('never returns a started command to not-started, and never rejects it', async () => {
       const sessionId = await newSession(suiteSbId);
       const c = await admitted(sessionId);
-      await transitionCommand(supabase, {
-        commandUuid: c.id,
-        expected: { revision: 1, state: 'queued' },
-        to: 'unknown',
-        reasonCode: 'acceptance_unresolved',
-      });
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: c.id,
+          expected: { revision: 1, state: 'queued' },
+          to: 'unknown',
+          reasonCode: 'acceptance_unresolved',
+          recipients: [{ kind: 'operator', id: 'operator-fixture' }],
+        })
+      ).toEqual({ outcome: 'transitioned', revision: 2, state: 'unknown' });
       for (const to of ['queued', 'waiting_for_consumer', 'rejected'] as const) {
         expect(
           await transitionCommand(supabase, {
@@ -502,6 +580,145 @@ describe('durable command admission', () => {
         { recipient_kind: 'user', recipient_id: userId },
       ]);
     });
+
+    async function writes(commandUuid: string) {
+      const { data: row } = await supabase
+        .from('session_commands')
+        .select('revision, state, started_at')
+        .eq('id', commandUuid)
+        .single();
+      const { count: events } = await supabase
+        .from('session_command_events')
+        .select('revision', { count: 'exact', head: true })
+        .eq('command_uuid', commandUuid);
+      const { count: receipts } = await supabase
+        .from('session_command_receipts')
+        .select('revision', { count: 'exact', head: true })
+        .eq('command_uuid', commandUuid);
+      return { row, events, receipts };
+    }
+
+    // Lumen, pr:701 9a5d87ef A1: `<>` against a NULL is NULL, and the CAS fell through.
+    it.each([
+      { revision: null, state: 'queued' },
+      { revision: 1, state: null },
+      { revision: null, state: null },
+      { revision: 0, state: 'queued' },
+      { revision: 1, state: 'running' },
+    ])('refuses a missing or malformed expected CAS component %j, writing nothing', async (cas) => {
+      const sessionId = await newSession(suiteSbId);
+      const c = await admitted(sessionId);
+      const { data, error } = await supabase.rpc('transition_command', {
+        p_command_uuid: c.id,
+        p_expected_revision: cas.revision,
+        p_expected_state: cas.state,
+        p_new_state: 'backend_accepted',
+        p_reason_code: null,
+        p_mark_started: false,
+        p_executing_epoch: null,
+        p_recipients: [],
+        p_protocol: ADMISSION_PROTOCOL,
+      });
+      expect(error).toBeNull();
+      expect(data).toEqual({ outcome: 'invalid', field: 'expected' });
+      expect(await writes(c.id)).toEqual({
+        row: { revision: 1, state: 'queued', started_at: null },
+        events: 1,
+        receipts: 1,
+      });
+    });
+
+    it('answers missing for a command that does not exist', async () => {
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: randomUUID(),
+          expected: { revision: 1, state: 'queued' },
+          to: 'backend_accepted',
+        })
+      ).toEqual({ outcome: 'missing' });
+    });
+
+    // Lumen, pr:701 9a5d87ef A2: the notice was keyed to one reason label, the hold is not.
+    it.each([undefined, 'acceptance_unresolved', 'recovery_required'])(
+      'refuses any move into unknown without an operator notice (reason %s), writing nothing',
+      async (reasonCode) => {
+        const sessionId = await newSession(suiteSbId);
+        const c = await admitted(sessionId);
+        expect(
+          await transitionCommand(supabase, {
+            commandUuid: c.id,
+            expected: { revision: 1, state: 'queued' },
+            to: 'unknown',
+            reasonCode,
+            recipients: [{ kind: 'sb', id: 'sb-fixture' }],
+          })
+        ).toEqual({ outcome: 'notice_required' });
+        expect(await writes(c.id)).toEqual({
+          row: { revision: 1, state: 'queued', started_at: null },
+          events: 1,
+          receipts: 1,
+        });
+        expect(await readDispatchHead(supabase, sessionId)).toEqual({
+          hold: null,
+          holdingCommand: null,
+          head: c.id,
+        });
+      }
+    );
+
+    it('keeps in-flight work quiet, and lets the reconciler record a lost outcome with its notice', async () => {
+      const sessionId = await newSession(suiteSbId);
+      const c = await admitted(sessionId);
+      // Handoff and acceptance: ordinary serialization, owed to no operator.
+      await transitionCommand(supabase, {
+        commandUuid: c.id,
+        expected: { revision: 1, state: 'queued' },
+        to: 'queued',
+        markStarted: true,
+      });
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: c.id,
+          expected: { revision: 2, state: 'queued' },
+          to: 'backend_accepted',
+        })
+      ).toEqual({ outcome: 'transitioned', revision: 3, state: 'backend_accepted' });
+      expect(await readDispatchHead(supabase, sessionId)).toMatchObject({
+        hold: 'unresolved_dispatch',
+      });
+      const { count: operatorSoFar } = await supabase
+        .from('session_command_receipts')
+        .select('revision', { count: 'exact', head: true })
+        .eq('command_uuid', c.id)
+        .eq('recipient_kind', 'operator');
+      expect(operatorSoFar).toBe(0);
+
+      // The reconciler finds the completion lost: unknown, with the notice.
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: c.id,
+          expected: { revision: 3, state: 'backend_accepted' },
+          to: 'unknown',
+          reasonCode: 'acceptance_unresolved',
+          recipients: [{ kind: 'operator', id: 'operator-fixture' }],
+        })
+      ).toEqual({ outcome: 'transitioned', revision: 4, state: 'unknown' });
+      expect(await readDispatchHead(supabase, sessionId)).toEqual({
+        hold: 'recovery_required',
+        holdingCommand: c.id,
+        head: null,
+      });
+      const { data: receipts } = await supabase
+        .from('session_command_receipts')
+        .select('recipient_kind, recipient_id')
+        .eq('command_uuid', c.id)
+        .eq('revision', 4)
+        .order('recipient_kind');
+      expect(receipts).toEqual([
+        { recipient_kind: 'operator', recipient_id: 'operator-fixture' },
+        { recipient_kind: 'user', recipient_id: userId },
+      ]);
+    });
   });
 
   describe('dispatch head and the unknown-effect hold', () => {
@@ -556,13 +773,31 @@ describe('durable command admission', () => {
         holdingCommand: null,
         head: ids[1],
       });
-      // The command moving on voids the decision, and the hold comes back.
-      await transitionCommand(supabase, {
-        commandUuid: ids[0],
-        expected: { revision: 2, state: 'unknown' },
-        to: 'unknown',
-        reasonCode: 'acceptance_unresolved',
+      // The command moving on voids the decision, and the hold comes back. That
+      // write reinstates the hold, so it needs the notice like the first one,
+      // whatever its reason code; refused, it writes nothing.
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: ids[0],
+          expected: { revision: 2, state: 'unknown' },
+          to: 'unknown',
+          reasonCode: 'acceptance_unresolved',
+        })
+      ).toEqual({ outcome: 'notice_required' });
+      expect(await readDispatchHead(supabase, sessionId)).toEqual({
+        hold: null,
+        holdingCommand: null,
+        head: ids[1],
       });
+      expect(
+        await transitionCommand(supabase, {
+          commandUuid: ids[0],
+          expected: { revision: 2, state: 'unknown' },
+          to: 'unknown',
+          reasonCode: 'acceptance_unresolved',
+          recipients: [{ kind: 'operator', id: 'operator-fixture' }],
+        })
+      ).toEqual({ outcome: 'transitioned', revision: 3, state: 'unknown' });
       expect(await readDispatchHead(supabase, sessionId)).toMatchObject({
         hold: 'recovery_required',
         holdingCommand: ids[0],
