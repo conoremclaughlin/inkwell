@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { FakePostgrest, type Row } from '../../test/fake-postgrest';
-import { withReactionsTable } from '../../test/fake-reactions-db';
+import { withReactionsTable, withUuidCanonicalization } from '../../test/fake-reactions-db';
 
 const ME = '11111111-1111-4111-8111-111111111111';
 const SOMEONE = '22222222-2222-4222-8222-222222222222';
@@ -252,6 +252,43 @@ describe('POST /api/admin/threads/reactions', () => {
         messageId: first.id,
         reactions: [{ emoji: '👍', count: 1, reactors: [{ kind: 'user', id: ME }], mine: true }],
       },
+    });
+  });
+
+  it('answers with what it stored when the message id comes in uppercase (Lumen, #741 r1)', async () => {
+    // PostgreSQL accepts a UUID in any case and answers in lowercase.
+    withUuidCanonicalization(db);
+    const lettered = db.seed('inbox_thread_messages', {
+      id: 'abcdefab-cdef-4abc-8def-abcdefabcdef',
+      thread_id: team.id,
+      sender_kind: 'user',
+      sender_user_id: ME,
+      content: 'lettered',
+      message_type: 'message',
+      priority: 'normal',
+    });
+    const messageId = String(lettered.id).toUpperCase();
+    await postReaction({ threadKey: team.thread_key, messageId, emoji: '❤️' });
+    const added = await postReaction({ threadKey: team.thread_key, messageId, emoji: '👍' });
+    const mineOf = (emoji: string) => ({
+      emoji,
+      count: 1,
+      reactors: [{ kind: 'user', id: ME }],
+      mine: true,
+    });
+    expect(added).toEqual({
+      status: 200,
+      body: { messageId: lettered.id, reactions: [mineOf('❤️'), mineOf('👍')] },
+    });
+    const removed = await postReaction({
+      threadKey: team.thread_key,
+      messageId,
+      emoji: '👍',
+      remove: true,
+    });
+    expect(removed).toEqual({
+      status: 200,
+      body: { messageId: lettered.id, reactions: [mineOf('❤️')] },
     });
   });
 
