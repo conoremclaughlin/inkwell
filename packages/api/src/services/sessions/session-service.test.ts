@@ -38,6 +38,8 @@ import type {
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
 import { ClaudeRunner } from './claude-runner.js';
+import { InkRunner } from './ink-runner.js';
+import { resolveInkCli } from '../ink-cli.js';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { STOP_GRACE_MS } from './stop-process.js';
@@ -1225,14 +1227,86 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
         });
 
-        it('an inkling session on another backend is refused, never run unbounded', async () => {
-          for (const backend of ['codex-cli', 'ink']) {
+        it('an inkling session on a runner that cannot bound it (Codex, Gemini) is refused, never run unbounded', async () => {
+          for (const backend of ['codex-cli', 'gemini']) {
             const result = await turn(INKLING, fromOwner, OWNER, { session: { backend } });
             expect(result.errorCode, backend).toBe('INKLING_TURN_REFUSED');
           }
           expect(mockCodexRunner.run).not.toHaveBeenCalled();
           expect(mockInkRunner.run).not.toHaveBeenCalled();
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        });
+
+        /** The config the ink runner was handed on its first call. */
+        const configPassedToInkRunner = () =>
+          (
+            vi.mocked(mockInkRunner.run).mock.calls[0] as unknown as [
+              string,
+              { config: Record<string, unknown> },
+            ]
+          )[1].config;
+
+        it('an inkling session on ink runs on InkRunner, bounded as on Claude, one outer cycle and local tools whatever the dashboard says', async () => {
+          vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '60000');
+          const result = await turn(
+            { ...INKLING, runtimeConfig: { maxTurns: 7, toolRouting: 'backend' } },
+            fromOwner,
+            OWNER,
+            { session: { backend: 'ink' } }
+          );
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          const config = configPassedToInkRunner();
+          expect(config).toMatchObject({
+            killProcessGroup: true,
+            timeoutMs: 60000,
+            maxTurns: 1,
+            toolRouting: 'local',
+            workingDirectory: join(inklingsRoot, SB),
+          });
+          expect(config.signal).toBeInstanceOf(AbortSignal);
+          expect(typeof config.admitSpawn).toBe('function');
+        });
+
+        it("another SB on ink keeps its dashboard's outer cycles and tool routing (the pins are the inkling's)", async () => {
+          await turn(
+            { runtimeConfig: { maxTurns: 7, toolRouting: 'backend' } },
+            { sender: { id: 'system', name: 'x' } },
+            OWNER,
+            { session: { backend: 'ink' } }
+          );
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          const config = configPassedToInkRunner();
+          expect(config).toMatchObject({ maxTurns: 7, toolRouting: 'backend' });
+          expect(config.killProcessGroup).toBeUndefined();
+        });
+
+        it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
+          vi.mocked(mockInkRunner.run).mockResolvedValueOnce({
+            success: false,
+            responses: [],
+            backendSessionId: 'ink-session-1',
+            error: 'ink chat turn cancelled; its processes did not confirm they had stopped',
+            stopUnconfirmed: { leaderExited: false, pgid: 4242, group: 'unknown' },
+          } as never);
+          // Fully mocked: the fence's probe of the synthetic group never reaches the host.
+          const kill = vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
+            if (pid < 0) throw Object.assign(new Error('synthetic'), { code: 'EPERM' });
+            return true;
+          }) as typeof process.kill);
+          try {
+            await turn(INKLING, fromOwner, OWNER, { session: { backend: 'ink' } });
+            const refused = await turn(INKLING, fromOwner, OWNER, { session: { backend: 'ink' } });
+            expect(refused).toMatchObject({
+              errorCode: 'INKLING_TURN_REFUSED',
+              classification: { retryable: true },
+            });
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          } finally {
+            kill.mockRestore();
+            clearInklingFences();
+          }
         });
 
         it('an inkling session is never compacted; another SB still is', async () => {
@@ -1433,6 +1507,89 @@ describe('SessionService', () => {
           expect(next.success).toBe(true);
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
           // Never a second `--resume` of the session beside the first.
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        /**
+         * A fake `ink` (INK_CLI_PATH) that exits 400 ms after SIGTERM, the
+         * way a CLI winding down does, and reports its pid beside itself once
+         * that handler is set. Refuses to go on unless InkRunner will run this
+         * fake: the checkout's real CLI would start a real `ink chat`.
+         */
+        const writeFakeInk = async (): Promise<string> => {
+          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-ink-'));
+          const script = join(dir, 'ink.mjs');
+          writeFileSync(
+            script,
+            [
+              "import { writeFileSync } from 'fs';",
+              "import { dirname, join } from 'path';",
+              "import { fileURLToPath } from 'url';",
+              'const here = dirname(fileURLToPath(import.meta.url));',
+              "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
+              "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+              'setInterval(() => {}, 1000);',
+            ].join('\n')
+          );
+          vi.stubEnv('INK_CLI_PATH', script);
+          if (resolveInkCli()?.path !== script) {
+            throw new Error('InkRunner would not run the fake ink; refusing to spawn anything');
+          }
+          return join(dir, 'leader.pid');
+        };
+
+        /** Turn 1 runs the real InkRunner on the fake; turn 2 records when it began. */
+        const wireInk = (stoppedAt: () => number) => {
+          const real = new InkRunner();
+          const second: { leaderAlive?: boolean; afterStopMs?: number } = {};
+          vi.mocked(mockInkRunner.run)
+            .mockImplementationOnce((message, options) => real.run(message, options))
+            .mockImplementationOnce(async () => {
+              second.leaderAlive = alive(leaderPid);
+              second.afterStopMs = Date.now() - stoppedAt();
+              return { success: true, responses: [], backendSessionId: 'ink-session-1' } as never;
+            });
+          return second;
+        };
+
+        const onInk = { session: { backend: 'ink' } };
+
+        it('on ink, Stop then the owner sends at once: the next turn starts only once the stopped one has exited', async () => {
+          const pidFile = await writeFakeInk();
+          let stoppedAt = 0;
+          const second = wireInk(() => stoppedAt);
+          const first = turn(INKLING, fromOwner, OWNER, onInk);
+          leaderPid = await pidOf(pidFile);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          await first;
+          const next = await lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          expect(next.success).toBe(true);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        it('on ink, the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
+          const pidFile = await writeFakeInk();
+          let stoppedAt = 0;
+          const second = wireInk(() => stoppedAt);
+          const first = turn(INKLING, fromOwner, OWNER, onInk);
+          leaderPid = await pidOf(pidFile);
+          const queued = lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          // Long enough to reach the session lock and queue behind it.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          const [, next] = await Promise.all([first, queued]);
+          expect(next.success).toBe(true);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
           expect(second.leaderAlive).toBe(false);
           expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
         }, 20_000);
