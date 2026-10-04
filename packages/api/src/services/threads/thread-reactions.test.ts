@@ -101,12 +101,21 @@ beforeEach(() => {
   inklingMessage = message(inklingThread);
   background = thread('thread:background', [wren]);
   backgroundMessage = message(background);
+  // The owner test's allowlist is both keys (inkling-flags.ts). Set both, so
+  // a list inherited from local configuration cannot open or close it here.
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+  vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', '');
 });
 
 afterEach(() => {
   vi.unstubAllEnvs();
 });
+
+/** Inklings closed on this server: neither allowlist key names anyone. */
+function closeInklings(): void {
+  vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+  vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', '');
+}
 
 const asMe = userPrincipal(ME);
 
@@ -449,7 +458,7 @@ describe('reactToMessage', () => {
     });
 
     it('refuses the inkling while inklings are closed on this server', async () => {
-      vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+      closeInklings();
       expect(await refusal(inInklingThread(pip))).toEqual({
         status: 403,
         code: 'inklings_disabled',
@@ -501,7 +510,7 @@ describe('reactToMessage', () => {
     });
 
     it('refuses everyone while inklings are closed on this server', async () => {
-      vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+      closeInklings();
       expect(await refusal(inInklingThread(asMe))).toEqual({
         status: 403,
         code: 'inklings_disabled',

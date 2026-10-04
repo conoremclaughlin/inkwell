@@ -231,7 +231,10 @@ beforeEach(() => {
   backgroundMessage = message(background, 'not yours');
   inklingThread = thread('chat:pip', [pip, ME]);
   inklingMessage = message(inklingThread, 'hi pip');
+  // Both allowlist keys, so one inherited from local configuration cannot
+  // widen the owner test here.
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+  vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', '');
   context.current = { userId: ME };
 });
 
