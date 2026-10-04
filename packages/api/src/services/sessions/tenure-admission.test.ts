@@ -228,6 +228,7 @@ describe('admitLeasedTurn', () => {
     for (const reply of [
       { outcome: 'admitted', epoch: 'epoch-1' },
       { outcome: 'admitted', epoch: 'epoch-1', restamped: -1 },
+      { outcome: 'admitted', epoch: 'epoch-1', restamped: 0 },
       { outcome: 'leased' },
     ]) {
       await expect(admitLeasedTurn(clientReturning(reply).client, input)).rejects.toThrow();

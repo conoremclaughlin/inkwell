@@ -20,9 +20,9 @@
 --   3. the sessions row, then admit_turn's own admission, history and
 --      command locks.
 -- No studio lock is taken after the sessions row: the restamp touches only
--- rows already locked in step 2. A lease the session gains after the
--- candidate set was read is outside this admission and is not restamped; it
--- keeps the turnEpoch it was granted with.
+-- rows already locked in step 2, and the named studio must be one of them.
+-- A lease the session gains after the candidate set was read is outside this
+-- admission and is not restamped; it keeps the turnEpoch it was granted with.
 --
 -- A refusal from admit_turn is returned unchanged. A stale_expectation that
 -- names the caller's own epoch is a refusal, never a replay success: it is
@@ -109,6 +109,13 @@ BEGIN
   LOOP
     v_locked := v_locked || v_row.id;
   END LOOP;
+
+  -- The named row must be one this statement locked. A row deleted while we
+  -- waited is skipped by the loop, and a later read could see a replacement
+  -- inserted under the same id that this transaction never locked.
+  IF NOT (p_studio_id = ANY(v_locked)) THEN
+    RETURN jsonb_build_object('outcome', 'lease_lost');
+  END IF;
 
   -- The named lease, under its lock: same tenant, same path, held by this
   -- session, not quarantined.

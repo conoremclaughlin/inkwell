@@ -163,7 +163,9 @@ const leasedAdmitSchema = z.discriminatedUnion('outcome', [
   z.object({
     outcome: z.literal('admitted'),
     epoch: z.string(),
-    restamped: z.number().int().nonnegative(),
+    // At least the named lease: an admission that moved no lease is outside
+    // the contract, whatever the database says.
+    restamped: z.number().int().positive(),
   }),
   z.object({ outcome: z.literal('stale_expectation'), epoch: z.string().nullable() }),
   z.object({ outcome: z.literal('unverified'), epoch: z.string() }),
