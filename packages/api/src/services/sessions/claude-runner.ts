@@ -5,7 +5,7 @@
  * Handles message processing and response parsing.
  */
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
@@ -31,7 +31,7 @@ import { homedir, tmpdir } from 'os';
 import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
-import { stopProcess } from './stop-process.js';
+import { stopProcessAndWait } from './stop-process.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 
 /** Where the sandbox orchestrator mounts the studio checkout in a container. */
@@ -590,6 +590,49 @@ export class ClaudeRunner implements IRunner {
       // we get output from the process.
       let idleTimer: NodeJS.Timeout;
 
+      /**
+       * Stop the process, and settle once it has exited, not when it was
+       * signalled. The caller releases the session when this settles, and a
+       * process still winding down can still write to that session: settling
+       * at the signal let a queued or new turn start a second `--resume` of
+       * the same Claude session beside it (measured on the #740 thread,
+       * a0b00a78). Past the bound the turn settles anyway, and says the exit
+       * was not confirmed. The outcome is read at settle time, so it carries
+       * whatever the process emitted while it wound down.
+       */
+      const stopThenSettle = (
+        stopped: () => {
+          finalTextResponse: string;
+          kind: 'idle' | 'hard' | 'cancelled';
+          message: string;
+          unconfirmedMessage: string;
+        }
+      ) => {
+        settled = true;
+        clearTimeout(timeout);
+        clearTimeout(idleTimer);
+        void stopProcessAndWait(proc, { group: killGroup }).then((exited) => {
+          const outcome = stopped();
+          if (!exited) {
+            logger.error('Claude Code process did not confirm its exit after the stop', {
+              pid: proc.pid,
+              kind: outcome.kind,
+            });
+          }
+          resolve({
+            responses,
+            usage,
+            servedModel,
+            toolCalls,
+            finalTextResponse: outcome.finalTextResponse,
+            timedOut: {
+              kind: outcome.kind,
+              message: exited ? outcome.message : outcome.unconfirmedMessage,
+            },
+          });
+        });
+      };
+
       const resetIdleTimer = () => {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
@@ -600,26 +643,20 @@ export class ClaudeRunner implements IRunner {
               hasResponses: responses.length > 0,
               hasFinalText: !!finalTextResponse,
             });
-            this.killProcess(proc, killGroup);
-            settled = true;
-            resolve({
-              responses,
-              usage,
-              servedModel,
-              toolCalls,
+            // `timedOut`, not just the marker string. Resolving bare reports a
+            // SIGKILLed turn as a completed one: the session goes idle, a
+            // heartbeat beat records `delivered`, and the marker is
+            // auto-forwarded to the human as if the agent had written it.
+            // The word "timeout" is load-bearing — classifyError matches on
+            // it, and without it this lands in the non-retryable `unknown`
+            // category. (Same fix Lumen made in antigravity-runner, #507.)
+            const message = `Claude Code timeout: no output for ${idleSecs}s, process killed`;
+            stopThenSettle(() => ({
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
-              // `timedOut`, not just the marker string. Resolving bare reports a
-              // SIGKILLed turn as a completed one: the session goes idle, a
-              // heartbeat beat records `delivered`, and the marker above is
-              // auto-forwarded to the human as if the agent had written it.
-              // The word "timeout" is load-bearing — classifyError matches on
-              // it, and without it this lands in the non-retryable `unknown`
-              // category. (Same fix Lumen made in antigravity-runner, #507.)
-              timedOut: {
-                kind: 'idle',
-                message: `Claude Code timeout: no output for ${idleSecs}s, process killed`,
-              },
-            });
+              kind: 'idle',
+              message,
+              unconfirmedMessage: `${message}, but it did not confirm it had exited`,
+            }));
           }
         }, IDLE_TIMEOUT_MS);
       };
@@ -633,21 +670,15 @@ export class ClaudeRunner implements IRunner {
             hasResponses: responses.length > 0,
             hasFinalText: !!finalTextResponse,
           });
-          this.killProcess(proc, killGroup);
-          settled = true;
-          resolve({
-            responses,
-            usage,
-            servedModel,
-            toolCalls,
+          const message = `Claude Code timeout: exceeded the ${Math.round(
+            ceilingMs / 1000
+          )}s ceiling, process killed`;
+          stopThenSettle(() => ({
             finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
-            timedOut: {
-              kind: 'hard',
-              message: `Claude Code timeout: exceeded the ${Math.round(
-                ceilingMs / 1000
-              )}s ceiling, process killed`,
-            },
-          });
+            kind: 'hard',
+            message,
+            unconfirmedMessage: `${message}, but it did not confirm it had exited`,
+          }));
         }
       }, ceilingMs);
 
@@ -659,18 +690,13 @@ export class ClaudeRunner implements IRunner {
         logger.warn('Claude Code turn cancelled, stopping', {
           hasResponses: responses.length > 0,
         });
-        clearTimeout(timeout);
-        clearTimeout(idleTimer);
-        this.killProcess(proc, killGroup);
-        settled = true;
-        resolve({
-          responses,
-          usage,
-          servedModel,
-          toolCalls,
+        stopThenSettle(() => ({
           finalTextResponse: finalTextResponse || '[Turn cancelled]',
-          timedOut: { kind: 'cancelled', message: 'Claude Code turn cancelled, process stopped' },
-        });
+          kind: 'cancelled',
+          message: 'Claude Code turn cancelled, process stopped',
+          unconfirmedMessage:
+            'Claude Code turn cancelled; its process did not confirm it had exited',
+        }));
       };
       if (config.signal?.aborted) onAbort();
       else config.signal?.addEventListener('abort', onAbort, { once: true });
@@ -808,13 +834,6 @@ export class ClaudeRunner implements IRunner {
       proc.stdin.write(message);
       proc.stdin.end();
     });
-  }
-
-  /**
-   * Kill a Claude Code subprocess gracefully, with escalation to SIGKILL.
-   */
-  private killProcess(proc: ChildProcess, group = false): void {
-    stopProcess(proc, { group });
   }
 
   /**

@@ -4,8 +4,9 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { afterEach, describe, expect, it } from 'vitest';
-import { stopProcess } from './stop-process';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { stopProcess, stopProcessAndWait } from './stop-process';
 
 const IGNORES_TERM = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
 /** Starts a grandchild that also ignores SIGTERM, prints its pid, then idles. */
@@ -85,5 +86,83 @@ describe('stopProcess', () => {
     await exited(proc);
     await settle(300);
     expect(alive(grandchild)).toBe(true);
+  });
+});
+
+/** Prints its pid once its SIGTERM handler is in place, so a stop never lands before it. */
+const READY_IGNORES_TERM = `
+  process.on('SIGTERM', () => {});
+  process.stdout.write(process.pid + '\\n');
+  setInterval(() => {}, 1000);
+`;
+const READY_EXITS_ON_TERM = `
+  process.stdout.write(process.pid + '\\n');
+  setInterval(() => {}, 1000);
+`;
+
+describe('stopProcessAndWait', () => {
+  it('settles true once a process that ignores SIGTERM has exited at the SIGKILL, not before', async () => {
+    const proc = start(READY_IGNORES_TERM);
+    await firstLine(proc);
+    const started = Date.now();
+    expect(await stopProcessAndWait(proc, { graceMs: 300, giveUpMs: 2000 })).toBe(true);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(280);
+    expect(alive(proc.pid as number)).toBe(false);
+  });
+
+  it('settles true as soon as a process exits on SIGTERM, without waiting out the grace', async () => {
+    const proc = start(READY_EXITS_ON_TERM);
+    await firstLine(proc);
+    const started = Date.now();
+    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(alive(proc.pid as number)).toBe(false);
+  });
+
+  it('settles true at once for a process that has already exited', async () => {
+    const proc = start(READY_EXITS_ON_TERM);
+    await firstLine(proc);
+    const gone = exited(proc);
+    proc.kill('SIGKILL');
+    await gone;
+    const started = Date.now();
+    expect(await stopProcessAndWait(proc, { graceMs: 3000, giveUpMs: 2000 })).toBe(true);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it('settles false at grace plus give-up when the process never exits, and leaves no listener behind', async () => {
+    // No real process outlives SIGKILL, so this one is a stand-in that is
+    // never signalled: no pid, and a kill that does nothing.
+    const proc = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    }) as unknown as ChildProcess;
+    const started = Date.now();
+    expect(await stopProcessAndWait(proc, { graceMs: 100, giveUpMs: 150 })).toBe(false);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(240);
+    expect(proc.listenerCount('exit')).toBe(0);
+  });
+
+  it('clears its give-up timer once the process exits, so nothing is left holding the event loop', async () => {
+    const proc = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    }) as unknown as ChildProcess;
+    vi.useFakeTimers();
+    try {
+      const settled = stopProcessAndWait(proc, { graceMs: 100, giveUpMs: 150 });
+      // stopProcess's own SIGKILL escalation, and this helper's give-up.
+      expect(vi.getTimerCount()).toBe(2);
+      proc.emit('exit', 0, null);
+      expect(await settled).toBe(true);
+      // Only the escalation is left (stopProcess unrefs it); the give-up is gone.
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
