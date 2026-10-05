@@ -7,6 +7,7 @@
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 import type { GroupState } from './stop-process';
+import type { InklingProvider } from '../inklings/inkling-runtime';
 
 // ─── Channel Types ───
 
@@ -845,6 +846,13 @@ export interface ClaudeRunnerConfig {
    * Only ever true on a fresh spawn — a resume carries the original in history.
    */
   constitutionInjected?: boolean;
+  /**
+   * The provider InkRunner tells `ink chat` to run (`--backend`). Unset leaves
+   * the chat's own default, as every ordinary SB's spawn does. An inkling's
+   * turn always sets it (inklings/inkling-runtime.ts), so its provider never
+   * rests on that default.
+   */
+  inkProvider?: InklingProvider;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts
