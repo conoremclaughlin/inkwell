@@ -1974,6 +1974,53 @@ router.post('/browser-companion/pairing-code', async (req: Request, res: Respons
  * GET /api/admin/workspaces
  * List workspaces available to the authenticated user.
  */
+// =============================================================================
+// Account deletion (App Store Review Guideline 5.1.1(v))
+// =============================================================================
+
+/**
+ * POST /api/admin/account/deletion
+ *   → 202 { deletion: { status: 'pending' | 'completed', requestedAt } }
+ *
+ * Records that the signed-in person asked, from inside the app, for their
+ * account to be deleted. That is all it does. It ends no session, blocks no
+ * sign-in and deletes no data: fulfilling the request (what is deleted, by
+ * whom, how long it takes and how the person hears it is done) is a separate,
+ * reviewed step that sets completed_at. Until that exists, no client should
+ * present this as account deletion.
+ *
+ * Asking again changes nothing and answers with the first request's time.
+ */
+router.post('/account/deletion', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AdminAuthRequest).inkUserId;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { error: recordError } = await supabase
+      .from('account_deletion_requests')
+      .upsert({ user_id: userId }, { onConflict: 'user_id', ignoreDuplicates: true });
+    if (recordError) throw recordError;
+    const { data: recorded, error: readError } = await supabase
+      .from('account_deletion_requests')
+      .select('requested_at, completed_at')
+      .eq('user_id', userId)
+      .single();
+    if (readError || !recorded) throw readError ?? new Error('Deletion request was not recorded');
+
+    res.status(202).json({
+      deletion: {
+        status: recorded.completed_at ? 'completed' : 'pending',
+        requestedAt: recorded.requested_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Account deletion request error:', error);
+    res.status(500).json(errorJson('Could not record the deletion request', error));
+  }
+});
+
 router.get('/workspaces', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
