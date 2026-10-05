@@ -33,6 +33,13 @@ const HOLD_REASONS = [
 /**
  * Host-only D1 store. DARK: no live caller. The caller supplies its stateless
  * service client and the holder capability, never an agent/tool-supplied one.
+ * That client must use persistSession:false and autoRefreshToken:false and must
+ * not be shared with auth.* callers. Its credential is not frozen by this port.
+ * The submitted hash is bearer-equivalent in A2, not safe diagnostic data.
+ *
+ * Before live wiring the host must bound/abort RPC transport; this adapter has
+ * no intrinsic timeout. A hung call remains unknown, not not-spawned. Expiry
+ * must stop dispatch without claiming rollback or releasing authority.
  *
  * Use through JournalWriter: this port bounds/detaches transport data but does
  * not turn a reply into a verified commit receipt or execution permission.
