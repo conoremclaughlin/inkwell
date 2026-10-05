@@ -802,7 +802,7 @@ export interface ClaudeRunnerConfig {
    * it and the spawn. A reason refuses the run, which starts nothing and
    * returns `refusedBeforeSpawn` with the reason as its error. An admission
    * made earlier can go stale while the run is prepared (Lumen's review of
-   * #747). The Claude and ink runners honour it.
+   * #747). Every runner honours it.
    */
   admitSpawn?: () => string | undefined;
   /**

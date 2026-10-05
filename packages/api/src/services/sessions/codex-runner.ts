@@ -118,6 +118,15 @@ export class CodexRunner implements IRunner {
       });
 
       const result = await this.spawnProcess(args, runConfig);
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // Only return a backend session ID if we actually extracted one from
       // the Codex event stream, or if we were resuming an existing session.
@@ -250,8 +259,20 @@ export class CodexRunner implements IRunner {
      * it is reported as a completed turn. See the timer below.
      */
     timedOut?: { kind: 'hard'; message: string };
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const codexBin = await resolveBinaryPath('codex');
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Codex spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
 
     const runtimeLinkId = randomUUID();
     if (config.inkSessionId && config.workingDirectory) {

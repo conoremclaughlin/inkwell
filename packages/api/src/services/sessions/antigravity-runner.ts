@@ -353,6 +353,15 @@ export class AntigravityRunner implements IRunner {
       });
 
       const result = await this.spawnProcess(args, runConfig, bridgePath);
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // agy reports failure in the result envelope, on stdout, with a real
       // message. Trust that over the exit code — reading the exit code is what
@@ -508,9 +517,21 @@ export class AntigravityRunner implements IRunner {
     conversationId?: string;
     status?: string;
     error?: string;
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const agyBin = await resolveBinaryPath('agy');
     const mcpUrl = await resolveInkMcpUrl(config);
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Antigravity spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
     return new Promise((resolve, reject) => {
       // The child inherits an allowlist of the server's env (resolveSpawnTarget
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding

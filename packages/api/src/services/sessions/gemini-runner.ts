@@ -158,6 +158,15 @@ export class GeminiRunner implements IRunner {
           ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsEnvPath }
           : undefined
       );
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // Use session ID from Gemini's init event, fall back to the one we passed in
       const resolvedSessionId = result.sessionId || backendSessionId || undefined;
@@ -246,8 +255,20 @@ export class GeminiRunner implements IRunner {
      * it is reported as a completed turn. See the timers below.
      */
     timedOut?: { kind: 'idle' | 'hard'; message: string };
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const geminiBin = await resolveBinaryPath('gemini');
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Gemini CLI spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
     return new Promise((resolve, reject) => {
       // The child inherits an allowlist of the server's env (resolveSpawnTarget
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
