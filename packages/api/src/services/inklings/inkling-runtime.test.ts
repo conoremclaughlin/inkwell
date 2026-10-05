@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { inklingRuntime, type InklingRuntimeInput } from './inkling-runtime';
 
-/** A fresh session from an identity that names nothing: the common case. */
+/** A session created as an inkling's, from an identity that names nothing: the common case. */
 const fresh: InklingRuntimeInput = {
-  sessionBackend: 'claude-code',
-  backendSessionId: null,
+  sessionBackend: 'ink',
   identityBackend: null,
   identityProvider: null,
 };
@@ -23,7 +22,7 @@ describe('inklingRuntime', () => {
     }
   });
 
-  it('moves an inkling to ink whatever runtime its identity stored, a direct Claude one included', () => {
+  it('runs an inkling on ink whatever runtime its identity stored, a direct Claude one included', () => {
     for (const identityBackend of ['claude-code', 'claude', 'ink', 'direct-api', 'direct', 'api']) {
       expect(inklingRuntime({ ...fresh, identityBackend }), identityBackend).toEqual({
         ok: true,
@@ -57,36 +56,25 @@ describe('inklingRuntime', () => {
     }
   });
 
-  it('refuses a conversation that began natively on another runtime: its history would not come with it', () => {
-    for (const sessionBackend of ['claude-code', 'codex-cli', 'gemini', null, '']) {
-      const decision = inklingRuntime({ ...fresh, sessionBackend, backendSessionId: 'native-1' });
+  it('refuses every session that stored another runtime: its history would not come with it (Lumen 36c31fe3)', () => {
+    for (const sessionBackend of ['claude-code', 'claude', 'codex-cli', 'gemini', null, '']) {
+      const decision = inklingRuntime({ ...fresh, sessionBackend });
       expect(decision.ok, String(sessionBackend)).toBe(false);
       expect(!decision.ok && decision.reason, String(sessionBackend)).toMatch(
         /would not carry its history/
       );
     }
     // A row naming no runtime began on the schema's default, claude-code.
-    const unnamed = inklingRuntime({
-      ...fresh,
-      sessionBackend: null,
-      backendSessionId: 'native-1',
-    });
+    const unnamed = inklingRuntime({ ...fresh, sessionBackend: null });
     expect(!unnamed.ok && unnamed.reason).toContain('"claude-code"');
   });
 
-  it('moves a session with no native conversation, whatever runtime it stored, and keeps an ink one', () => {
-    for (const sessionBackend of ['claude-code', 'codex-cli', 'gemini', null]) {
-      expect(inklingRuntime({ ...fresh, sessionBackend }), String(sessionBackend)).toEqual({
+  it("runs a session that is already ink's, in any spelling of ink", () => {
+    for (const sessionBackend of ['ink', 'direct-api', ' INK ']) {
+      expect(inklingRuntime({ ...fresh, sessionBackend }), sessionBackend).toEqual({
         ok: true,
         provider: 'claude',
       });
-    }
-    // An ink session's id is ink's own.
-    for (const sessionBackend of ['ink', 'direct-api', ' INK ']) {
-      expect(
-        inklingRuntime({ ...fresh, sessionBackend, backendSessionId: 'session-1' }),
-        sessionBackend
-      ).toEqual({ ok: true, provider: 'claude' });
     }
   });
 });

@@ -997,6 +997,8 @@ describe('SessionService', () => {
           readError?: boolean;
           /** These reads (table and select columns) fail, as a dropped connection would. */
           failReads?: Array<{ table: string; columns: string }>;
+          /** No session exists yet: routing creates one. */
+          create?: boolean;
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -1062,15 +1064,20 @@ describe('SessionService', () => {
           undefined,
           mockInkRunner
         );
-        // A session as routing creates one: the runtime its identity names
-        // (none, so claude-code) and no native conversation yet.
+        // A session as routing creates one, with no native conversation yet:
+        // ink for an inkling, else the runtime its identity names (none, so
+        // claude-code).
+        const asCreated = metadata.client === 'inkling-mobile' ? { backend: 'ink' } : {};
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({
-            sbId: SB,
-            userId: OWNER,
-            backendSessionId: null,
-            ...extra.session,
-          } as never)
+          extra.create
+            ? null
+            : createMockSession({
+                sbId: SB,
+                userId: OWNER,
+                backendSessionId: null,
+                ...asCreated,
+                ...extra.session,
+              } as never)
         );
         lastService = service;
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
@@ -1259,45 +1266,65 @@ describe('SessionService', () => {
             .mock.calls.map(([, updates]) => updates as Record<string, unknown>)
             .filter((updates) => 'backend' in updates || 'backendSessionId' in updates);
 
-        it('every inkling runs on ink, whatever runtime its session stored, when no native conversation is there to carry (Conor, 5:08 PM)', async () => {
-          const stored = ['claude-code', 'codex-cli', 'gemini', 'antigravity', 'ink', null];
+        it('a new inkling session is created as ink and runs there; another SB keeps the runtime its identity names (Conor, 5:08 PM)', async () => {
+          await turn(INKLING, fromOwner, OWNER, { create: true });
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, OWNER, { create: true });
+          const created = vi
+            .mocked(mockRepository.create)
+            .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+          expect(created).toEqual(['ink', 'claude-code']);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            inkProvider: 'claude',
+            model: 'claude-test-model',
+          });
+        });
+
+        it('an inkling runs on ink whatever runtime its identity stored, a direct Claude one included, with Claude as its provider and model', async () => {
+          const stored = ['claude-code', 'claude', 'ink', null];
           for (const backend of stored) {
-            const result = await turn(INKLING, fromOwner, OWNER, { session: { backend } });
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ backend }));
+            const result = await turn(INKLING);
             expect(result.errorCode, String(backend)).not.toBe('INKLING_TURN_REFUSED');
           }
           expect(mockInkRunner.run).toHaveBeenCalledTimes(stored.length);
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
           expect(mockCodexRunner.run).not.toHaveBeenCalled();
-          // Each runs Claude, with Claude's model: a stored Codex runtime never
-          // picks the model ink is handed.
           for (const [, options] of vi.mocked(mockInkRunner.run).mock.calls) {
             expect(options.config).toMatchObject({
               inkProvider: 'claude',
               model: 'claude-test-model',
             });
           }
-          // Each session is recorded as the ink session it now is.
-          expect(runtimeRewrites().filter((updates) => updates.backend === 'ink')).toHaveLength(
-            stored.length
-          );
-          expect(runtimeRewrites().some((updates) => updates.backend !== 'ink')).toBe(false);
         });
 
-        it('a conversation that began natively on another runtime is refused, not moved: its history would not come with it (Lumen aec2aae7)', async () => {
+        it('a session that stored another runtime is refused, native id or not, with its earlier messages in the thread (Lumen 36c31fe3)', async () => {
+          // The thread already holds a conversation: the owner's messages and
+          // the inkling's own earlier reply. A missing native id says nothing
+          // about that history.
+          expect(
+            THREAD_TABLES.inbox_thread_messages.some(
+              (message) => message.id === 'msg-inkling' && message.sender_sb_id === SB
+            )
+          ).toBe(true);
           for (const backend of ['claude-code', 'codex-cli', null]) {
-            const result = await turn(INKLING, fromOwner, OWNER, {
-              session: { backend, backendSessionId: 'native-conversation-1' },
-            });
-            expect(result.errorCode, String(backend)).toBe('INKLING_TURN_REFUSED');
-            expect(result.classification?.retryable, String(backend)).toBe(false);
-            expect(result.error, String(backend)).toMatch(/would not carry its history/);
+            for (const backendSessionId of [null, 'native-conversation-1']) {
+              const label = `${backend} / ${backendSessionId}`;
+              const result = await turn(INKLING, fromOwner, OWNER, {
+                session: { backend, backendSessionId },
+              });
+              expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+              expect(result.classification?.retryable, label).toBe(false);
+              expect(result.error, label).toMatch(/would not carry its history/);
+            }
           }
           expectNothingRan();
           expect(mockCodexRunner.run).not.toHaveBeenCalled();
           // The row keeps the runtime and the native id it had: nothing is relabelled.
           expect(runtimeRewrites()).toEqual([]);
 
-          // Control: a native id on an ink session is ink's own, and the turn runs.
+          // Control: an ink session, its own native id and all, runs.
           await turn(INKLING, fromOwner, OWNER, {
             session: { backend: 'ink', backendSessionId: 'session-123' },
           });
@@ -1863,7 +1890,12 @@ describe('SessionService', () => {
           mockInkRunner
         );
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ sbId: SB, userId: OWNER, backendSessionId: null } as never)
+          createMockSession({
+            sbId: SB,
+            userId: OWNER,
+            backend: 'ink',
+            backendSessionId: null,
+          } as never)
         );
         const results = [];
         for (let i = 0; i < 3; i++) {

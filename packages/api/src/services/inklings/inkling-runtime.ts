@@ -8,14 +8,16 @@
  *
  * Nothing here is translated quietly (Lumen 638d1a75). A provider ink cannot
  * run for an inkling yet, a runtime that is not one of the inkling's own, and
- * a conversation that began natively on another runtime are each refused
- * with a reason that names what was found:
+ * a conversation that began on another runtime are each refused with a
+ * reason that names what was found:
  * - Codex under ink is not wired yet, so a Codex provider is refused rather
  *   than run as Claude, or handed a Codex model id.
- * - A session that stored another runtime and that runtime's own native
- *   session id holds a conversation ink cannot carry: nothing imports its
- *   history yet (Lumen aec2aae7). One with no native id holds nothing to
- *   carry, and moves to ink.
+ * - A session that stored another runtime may hold a conversation ink cannot
+ *   carry, whether or not a native session id was ever recorded: the owner's
+ *   messages live in the thread either way (Lumen 36c31fe3). Nothing imports
+ *   that history yet (Lumen aec2aae7), so the turn is refused and the row is
+ *   left as it is. A new inkling session is created as ink, so only a
+ *   session from before this rule meets the refusal.
  */
 
 /** The providers an inkling's turn may run under ink, as `ink chat --backend` names them. */
@@ -28,8 +30,6 @@ export type InklingRuntimeDecision =
 export interface InklingRuntimeInput {
   /** The runtime the session row stored (sessions.backend). */
   sessionBackend: string | null | undefined;
-  /** The native session id the row stored (sessions.backend_session_id). */
-  backendSessionId: string | null | undefined;
   /** The runtime the identity stored (agent_identities.backend). */
   identityBackend: string | null | undefined;
   /** The provider the identity stored (agent_identities.provider). */
@@ -73,9 +73,11 @@ export function inklingRuntime(input: InklingRuntimeInput): InklingRuntimeDecisi
   }
 
   // The schema's default runtime for a session row is claude-code, so a row
-  // that names none began there too.
+  // that names none began there too. A missing native session id proves
+  // nothing about its history: a turn's persistence can fail after the
+  // turn ran, and the thread holds the conversation regardless.
   const sessionBackend = spelled(input.sessionBackend) || 'claude-code';
-  if (!INK_RUNTIMES.has(sessionBackend) && input.backendSessionId) {
+  if (!INK_RUNTIMES.has(sessionBackend)) {
     return {
       ok: false,
       reason: `this conversation began on the "${sessionBackend}" runtime, and moving it to ink would not carry its history`,

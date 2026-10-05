@@ -2256,15 +2256,15 @@ export class SessionService implements ISessionService {
       session
     );
 
-    // 4. Select runtime backend and model. An inkling's turn replaces both
-    // below, once its identity is read (inkling-runtime.ts).
-    let resolvedBackend = this.resolveRuntimeBackend(
+    // 4. Select runtime backend and model. An inkling's session is stored as
+    // ink, and its turn is refused below if it is not (inkling-runtime.ts).
+    const resolvedBackend = this.resolveRuntimeBackend(
       session.backend,
       injectedContext.agent.backend
     );
     // For ink, model selection is based on the provider (the LLM underneath),
     // not the backend itself. For direct backends, backend === provider.
-    let modelKey =
+    const modelKey =
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
@@ -2347,23 +2347,22 @@ export class SessionService implements ISessionService {
       }
 
       if (inklingIdentity.kind === 'inkling') {
-        // Every inkling runs on ink, whatever runtime its session or identity
-        // stored, under a provider chosen on its own (inkling-runtime.ts).
-        // InkRunner enforces an inkling's ceiling, group stop, cancellation and
-        // spawn-seam admission (task 7d9aa453). A setting it cannot honour, or
-        // a conversation it cannot carry, is refused, never translated.
+        // Every inkling runs on ink, under a provider chosen on its own
+        // (inkling-runtime.ts). Its session is created as ink, and one that
+        // stored another runtime is refused here, so an admitted turn always
+        // reaches InkRunner, which enforces its ceiling, group stop,
+        // cancellation and spawn-seam admission (task 7d9aa453). A setting ink
+        // cannot honour, or a conversation it cannot carry, is refused, never
+        // translated.
         const runtime = inklingRuntime({
           sessionBackend: session.backend,
-          backendSessionId: session.backendSessionId,
           identityBackend: injectedContext.agent.backend,
           identityProvider: injectedContext.agent.provider,
         });
         if (!runtime.ok) {
           return refuseInklingTurn(runtime.reason);
         }
-        resolvedBackend = 'ink';
         inkProvider = runtime.provider;
-        modelKey = 'claude-code';
         // A stopped turn whose processes were not confirmed gone fences the
         // inkling until its group is (inkling-stop-fence.ts): no new turn
         // runs beside them. Retryable, because the fence lifts once the group
@@ -4510,7 +4509,11 @@ export class SessionService implements ISessionService {
       totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
-      backend,
+      // An inkling's session is ink's from birth (Conor, Oct 4 2026, 5:08 PM):
+      // its turns run nowhere else, and a session that stored another runtime
+      // is refused rather than moved (inkling-runtime.ts). Routing read the
+      // identity and placed it in its folder.
+      backend: routing.tier === 'inkling-folder' ? 'ink' : backend,
       // Null until a turn runs — the model that actually served the turn is
       // recorded post-run, so this never claims a model that was only asked for.
       model: null,
