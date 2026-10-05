@@ -47,7 +47,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
-import { recordLaunch } from './launched-processes.js';
+import { launchHoldFor, recordLaunch } from './launched-processes.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -2778,7 +2778,7 @@ export class SessionService implements ISessionService {
             ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
             : undefined
       : undefined;
-    const refusedAtEntry = admitSpawn?.();
+    const refusedAtEntry = admitSpawn?.() ?? launchHoldFor(session.id);
     // A live inkling turn its owner can cancel (inkling-turns.ts), released
     // however the run ends.
     const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
@@ -2825,6 +2825,9 @@ export class SessionService implements ISessionService {
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
         })
         .then((ran) => {
+          // A stop the runner could not confirm leaves its rows open, for the
+          // next start's sweep to look at.
+          if (!ran.stopUnconfirmed) for (const launch of launches) launch.exited();
           // Fenced before the turn is released below, so no admission can
           // fall between the two.
           if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
@@ -2832,10 +2835,7 @@ export class SessionService implements ISessionService {
           }
           return ran;
         })
-        .finally(() => {
-          for (const launch of launches) launch.exited();
-          inklingTracking?.done();
-        });
+        .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most
@@ -5726,10 +5726,17 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
+      const compactionLaunches: Array<{ exited(): void }> = [];
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
-        config: runnerConfig,
+        config: {
+          ...runnerConfig,
+          onSpawned: (spawned) => {
+            compactionLaunches.push(recordLaunch(sessionId, runtimeBackend, spawned));
+          },
+        },
       });
+      if (!result.stopUnconfirmed) for (const launch of compactionLaunches) launch.exited();
 
       // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
       if (result.responses.length > 0 && this.config.responseHandler) {

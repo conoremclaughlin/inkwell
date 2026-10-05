@@ -160,7 +160,21 @@ export function recordLaunch(
       })
     )
     .catch((error: unknown) => {
-      logger.warn('Could not record a backend launch', {
+      // Without a row a restart cannot find it, so at least no second turn of
+      // this session starts beside it while this server runs.
+      held.set(sessionId, [
+        ...(held.get(sessionId) ?? []),
+        {
+          id: '',
+          sessionId,
+          backend,
+          pid: spawned.pid,
+          pgid: spawned.pgid ?? null,
+          startIdentity: null,
+          bootId: r.bootId,
+        },
+      ]);
+      logger.error('Could not record a backend launch; holding its session while it runs', {
         sessionId,
         backend,
         pid: spawned.pid,
@@ -180,6 +194,50 @@ export function recordLaunch(
         });
     },
   };
+}
+
+// ── Holds: no new turn beside a survivor that may still be alive ───────────
+
+const held = new Map<string, LaunchRow[]>();
+let sweepPending = false;
+
+/**
+ * Why a new turn for this session must not start now, or undefined. A
+ * session is held while a process the sweep could not confirm or could not
+ * stop may still be alive; each check looks again and lets the session go
+ * once its processes are gone. Every session is held while the startup sweep
+ * has not yet run (it failed, and is being retried).
+ */
+export function launchHoldFor(sessionId: string): string | undefined {
+  if (sweepPending) {
+    return 'The startup check for backend processes left by the previous server has not completed; not starting a turn beside them.';
+  }
+  const rows = held.get(sessionId);
+  if (!rows) return undefined;
+  const remaining = rows.filter((row) => !targetGone(row));
+  if (remaining.length === 0) {
+    held.delete(sessionId);
+    const store = recording?.store;
+    if (store) {
+      void store.markExited(rows.map((row) => row.id).filter(Boolean)).catch(() => undefined);
+    }
+    return undefined;
+  }
+  held.set(sessionId, remaining);
+  return `A backend process from before the restart (pid ${remaining[0].pid}) may still be running this session; not starting another beside it.`;
+}
+
+/** Hold each session the sweep could not resolve (uncertain or unstoppable). */
+export function holdSurvivors(outcome: SweepOutcome): void {
+  for (const row of [...outcome.uncertain, ...outcome.unstoppable]) {
+    held.set(row.sessionId, [...(held.get(row.sessionId) ?? []), row]);
+  }
+}
+
+/** For tests: forget every hold. */
+export function resetLaunchHolds(): void {
+  held.clear();
+  sweepPending = false;
 }
 
 // ── The sweep, at startup ──────────────────────────────────────────────────
@@ -269,13 +327,17 @@ export async function stopSurvivingLaunches(
       }
       const leaderAlive = pidAlive(row.pid);
       if (!leaderAlive) {
-        // A leader gone with its group still populated is still ours: the
-        // kernel does not reuse a pid while a group of that id exists.
-        const groupAlive = row.pgid !== null && probeGroup(row.pgid) === 'alive';
-        if (!groupAlive) {
+        // With the leader gone there is no start time to compare, and a group
+        // number can be reused once the old group has emptied. A group seen
+        // empty is gone; one still populated, or one that cannot be probed,
+        // is never signalled or cleared on a guess.
+        const group = row.pgid !== null ? probeGroup(row.pgid) : 'empty';
+        if (group === 'empty') {
           outcome.gone.push(row);
           return;
         }
+        outcome.uncertain.push(row);
+        return;
       } else {
         const now = await identityOf(row.pid);
         if (now === null || row.startIdentity === null) {
@@ -316,23 +378,42 @@ export async function startLaunchTracking(
     return undefined;
   }
   const store = supabaseLaunchStore(client);
-  let outcome: SweepOutcome | undefined;
-  try {
-    outcome = await stopSurvivingLaunches(store, { serverInstance, bootId });
+  configureLaunchRecording({ store, serverInstance, bootId });
+  const sweep = async (): Promise<SweepOutcome> => {
+    const outcome = await stopSurvivingLaunches(store, { serverInstance, bootId });
+    holdSurvivors(outcome);
     const summary = (rows: LaunchRow[]) =>
       rows.map((r) => ({ sessionId: r.sessionId, backend: r.backend, pid: r.pid }));
     if (outcome.stopped.length || outcome.uncertain.length || outcome.unstoppable.length) {
       logger.warn('Stopped backend processes left running by the previous server', {
         stopped: summary(outcome.stopped),
-        uncertain: summary(outcome.uncertain),
-        unstoppable: summary(outcome.unstoppable),
+        held: summary([...outcome.uncertain, ...outcome.unstoppable]),
       });
     }
+    return outcome;
+  };
+  try {
+    return await sweep();
   } catch (error) {
-    logger.error('The startup sweep of launched processes failed', {
-      error: error instanceof Error ? error.message : String(error),
-    });
+    // Not knowing what survived is a reason to hold every turn, not to stop
+    // the server: channels and routes still come up, and the sweep retries.
+    sweepPending = true;
+    logger.error(
+      'The startup sweep of launched processes failed; holding agent turns until it runs',
+      {
+        error: error instanceof Error ? error.message : String(error),
+      }
+    );
+    const retry = setInterval(() => {
+      void sweep()
+        .then(() => {
+          sweepPending = false;
+          clearInterval(retry);
+          logger.info('The startup sweep of launched processes ran; agent turns resume');
+        })
+        .catch(() => undefined);
+    }, 30_000);
+    retry.unref();
+    return undefined;
   }
-  configureLaunchRecording({ store, serverInstance, bootId });
-  return outcome;
 }

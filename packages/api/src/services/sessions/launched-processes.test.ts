@@ -4,7 +4,11 @@ import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   configureLaunchRecording,
+  holdSurvivors,
+  launchHoldFor,
   processStartIdentity,
+  resetLaunchHolds,
+  startLaunchTracking,
   recordLaunch,
   stopSurvivingLaunches,
   type LaunchRow,
@@ -141,14 +145,40 @@ describe('stopSurvivingLaunches', () => {
     expect(probeGroup(leader.pid!)).toBe('empty');
   });
 
-  it('stops a group whose leader already exited, since its id cannot be reused', async () => {
+  it('holds, and never signals, a group whose leader already exited: it cannot be verified', async () => {
     const leader = start('sleep 30 &', { detached: true });
     await exited(leader);
     expect(probeGroup(leader.pid!)).toBe('alive');
-    const { store } = fakeStore([row({ pid: leader.pid!, pgid: leader.pid!, startIdentity: 'x' })]);
+    const { store, exitedIds } = fakeStore([
+      row({ pid: leader.pid!, pgid: leader.pid!, startIdentity: 'x' }),
+    ]);
     const outcome = await sweep(store);
-    expect(outcome.stopped).toHaveLength(1);
-    expect(probeGroup(leader.pid!)).toBe('empty');
+    expect(outcome.uncertain).toHaveLength(1);
+    expect(probeGroup(leader.pid!)).toBe('alive');
+    expect(exitedIds).toEqual([]);
+  });
+
+  it('holds a group it cannot probe, rather than calling it gone', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((
+      pid: number,
+      signal?: number | string
+    ) => {
+      if (signal !== 0) throw Object.assign(new Error('unexpected signal'), { code: 'EINVAL' });
+      // The leader is gone; the group answers EPERM, which says nothing either way.
+      throw Object.assign(new Error(pid < 0 ? 'EPERM' : 'ESRCH'), {
+        code: pid < 0 ? 'EPERM' : 'ESRCH',
+      });
+    }) as never);
+    try {
+      const { store, exitedIds } = fakeStore([
+        row({ pid: 999_991, pgid: 999_991, startIdentity: 'x' }),
+      ]);
+      const outcome = await sweep(store);
+      expect(outcome.uncertain).toHaveLength(1);
+      expect(exitedIds).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
   });
 
   it('escalates to SIGKILL for a process that ignores SIGINT and SIGTERM', async () => {
@@ -191,7 +221,7 @@ describe('recordLaunch', () => {
     });
   });
 
-  it('never throws into the turn when the store fails', async () => {
+  it('never throws into the turn when the store fails, and holds the session while that process lives', async () => {
     const store: LaunchStore = {
       record: vi.fn(async () => {
         throw new Error('db down');
@@ -204,6 +234,11 @@ describe('recordLaunch', () => {
     launch.exited();
     await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
     expect(store.markExited).not.toHaveBeenCalled();
+    // This test process is the "launch": alive, so its session is held.
+    await vi.waitFor(() =>
+      expect(launchHoldFor('session-fixture')).toMatch(/may still be running/)
+    );
+    resetLaunchHolds();
   });
 });
 
@@ -232,5 +267,35 @@ describe('every runner reports its launches', () => {
       const after = lines.slice(i, i + 12).join('\n');
       expect(after, `${file}:${i + 1}`).toMatch(/onSpawned\?\.\(\{ pid: (proc|child)\.pid/);
     }
+  });
+});
+
+describe('launchHoldFor', () => {
+  afterEach(() => resetLaunchHolds());
+
+  it('holds a session while its unresolved survivor lives, and lets it go once it has gone', async () => {
+    const child = start('sleep 30');
+    const { store } = fakeStore([]);
+    configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
+    const held = row({ pid: child.pid!, sessionId: 'held-session' });
+    holdSurvivors({ stopped: [], gone: [], unstoppable: [], uncertain: [held] });
+    expect(launchHoldFor('held-session')).toMatch(/may still be running this session/);
+    expect(launchHoldFor('another-session')).toBeUndefined();
+    child.kill('SIGKILL');
+    await exited(child);
+    expect(launchHoldFor('held-session')).toBeUndefined();
+    await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith([held.id]));
+  });
+
+  it('holds every session when the startup sweep could not run', async () => {
+    const failing = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({ is: async () => ({ data: null, error: { message: 'db down' } }) }),
+        }),
+      }),
+    };
+    expect(await startLaunchTracking(failing as never, 3001)).toBeUndefined();
+    expect(launchHoldFor('any-session')).toMatch(/startup check/);
   });
 });

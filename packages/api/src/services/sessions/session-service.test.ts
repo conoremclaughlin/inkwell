@@ -12,6 +12,7 @@ import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { configureLaunchRecording, holdSurvivors, resetLaunchHolds } from './launched-processes.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
@@ -1286,6 +1287,78 @@ describe('SessionService', () => {
           const config = configPassedToInkRunner();
           expect(config).toMatchObject({ maxTurns: 7, toolRouting: 'backend' });
           expect(config.killProcessGroup).toBeUndefined();
+        });
+
+        describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const fromSystem = { sender: { id: 'system', name: 'x' } };
+          const launchSession = { backend: 'ink', id: 'launch-session' };
+          const fakeStore = () => ({
+            record: vi.fn(async () => 'row-1'),
+            markExited: vi.fn(async () => undefined),
+            listOpen: vi.fn(async () => []),
+          });
+          const reportingSpawn = (result: Record<string, unknown>) =>
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+            ) => {
+              options.config.onSpawned?.({ pid: 4242 });
+              return result;
+            }) as never);
+          afterEach(() => {
+            configureLaunchRecording(undefined);
+            resetLaunchHolds();
+          });
+
+          it('records each process the runner reports, and stamps it once the run confirmed its exit', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            reportingSpawn({ success: true, responses: [], backendSessionId: 'ink-1' });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
+            expect(store.record).toHaveBeenCalledWith(
+              expect.objectContaining({ sessionId: 'launch-session', pid: 4242 })
+            );
+          });
+
+          it('leaves the row open when the runner could not confirm its processes stopped', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            reportingSpawn({
+              success: false,
+              responses: [],
+              backendSessionId: 'ink-1',
+              error: 'stopped, unconfirmed',
+              stopUnconfirmed: { leaderExited: false },
+            });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(store.markExited).not.toHaveBeenCalled();
+          });
+
+          it('starts nothing for a session held by a survivor that may still be alive', async () => {
+            holdSurvivors({
+              stopped: [],
+              gone: [],
+              unstoppable: [],
+              // This test process: certainly alive.
+              uncertain: [
+                {
+                  id: 'row-held',
+                  sessionId: 'launch-session',
+                  backend: 'ink',
+                  pid: process.pid,
+                  pgid: null,
+                  startIdentity: null,
+                  bootId: 'boot',
+                },
+              ],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/may still be running this session/);
+          });
         });
 
         it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
@@ -3070,6 +3143,34 @@ describe('SessionService', () => {
       // longer a usable proxy, since the post-finalize boundary ownership
       // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+    });
+
+    it('records the compaction run’s launch, so a restart can stop it too', async () => {
+      const store = {
+        record: vi.fn(async () => 'row-compaction'),
+        markExited: vi.fn(async () => undefined),
+        listOpen: vi.fn(async () => []),
+      };
+      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+      try {
+        const session = createMockSession({ backendSessionId: 'claude-abc' });
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+        ) => {
+          options.config.onSpawned?.({ pid: 4343 });
+          return createMockClaudeResult({ success: true });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
+        expect(store.record).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-123', pid: 4343 })
+        );
+      } finally {
+        configureLaunchRecording(undefined);
+      }
     });
 
     it('should skip compaction when lock is already held (re-entry guard)', async () => {
