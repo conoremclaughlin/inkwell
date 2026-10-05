@@ -78,23 +78,13 @@ export function isInklingOwnerTestUser(
  * else no ceiling. A turn still producing output is not killed on
  * wall-clock (Conor, 2026-10-04, the turn-timeouts thread); the runner's
  * silence timeout and the owner's Stop end a stuck one. This was five
- * minutes for the first test. The turn cap still bounds how many turns
- * an inkling takes.
+ * minutes for the first test. There is no cap on how many turns an inkling
+ * takes either (Conor, Oct 4 2026, 5:00 PM); usage limits will be monthly
+ * token allowances (ink://specs/inkling-model-access).
  */
 export function inklingTurnTimeoutMs(source: EnvSource = process.env): number | undefined {
   const value = positiveInt(source.INKLING_TURN_TIMEOUT_MS, 0);
   return value > 0 ? value : undefined;
-}
-
-/** The first test's turns per inkling, unless INKLING_TURN_CAP says otherwise. */
-export const DEFAULT_TURN_CAP = 20;
-
-/**
- * How many turns one inkling may take in the owner test: INKLING_TURN_CAP,
- * else 20. Counted on the identity before each turn is spawned.
- */
-export function inklingTurnCap(source: EnvSource = process.env): number {
-  return positiveInt(source.INKLING_TURN_CAP, DEFAULT_TURN_CAP);
 }
 
 /**

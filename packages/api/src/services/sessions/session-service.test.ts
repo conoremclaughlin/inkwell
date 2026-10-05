@@ -1071,7 +1071,11 @@ describe('SessionService', () => {
       };
       let lastService: SessionService;
       let lastTables: Record<string, Row[]>;
-      /** The turns counted against the inkling's cap in the last turn's tables. */
+      /**
+       * The old turn counter (metadata.ownerTestTurns) in the last turn's
+       * tables. Nothing writes it since the cap was dropped, so it stays as
+       * the test set it: undefined unless seeded.
+       */
       const turnsCounted = () =>
         (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
           ?.ownerTestTurns;
@@ -1103,10 +1107,12 @@ describe('SessionService', () => {
         expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
       });
 
-      it("the inkling's own reply starts no turn and takes nothing from its cap", async () => {
-        // Control: the owner's message is counted, so the count is observable.
+      it("the inkling's own reply starts no turn", async () => {
+        // Control: the owner's message does start one. Nothing is counted
+        // either way: there is no turn cap (Conor, Oct 4 2026, 5:00 PM).
         await turn(INKLING);
-        expect(turnsCounted()).toBe(1);
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        expect(turnsCounted()).toBeUndefined();
         vi.mocked(mockClaudeRunner.run).mockClear();
 
         const result = await turn(INKLING, {
@@ -1739,8 +1745,9 @@ describe('SessionService', () => {
           // Nothing ran, so the turn records no outcome and leaves no run registered.
           expect(update.mock.calls.at(-1)?.[1]).toEqual({ backend: 'claude-code' });
           expect(activeRunCount()).toBe(0);
-          // The cost, stated: the cap slot claimed at admission stays spent.
-          expect(turnsCounted()).toBe(1);
+          // No turn-count slot is claimed at admission any more (the cap is
+          // gone), so a late refusal spends nothing.
+          expect(turnsCounted()).toBeUndefined();
         }, 20_000);
 
         it("a fence that lands during the runner's own preparation stops it at the spawn seam: nothing starts", async () => {
@@ -1810,7 +1817,11 @@ describe('SessionService', () => {
         }
       });
 
-      it('the turn past the cap is refused before anything is spawned', async () => {
+      it('an inkling is admitted however many turns its old counter records: there is no turn cap', async () => {
+        // Conor, Oct 4 2026, 5:00 PM: drop the turn cap now. The counter is
+        // already past the old default of 20, and a leftover INKLING_TURN_CAP
+        // must not bring the cap back. Old counters are left as they are:
+        // neither reset nor advanced.
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', OWNER);
         vi.stubEnv('INKLING_TURN_CAP', '2');
         const row = {
@@ -1818,7 +1829,7 @@ describe('SessionService', () => {
           agent_id: 'myra',
           user_id: OWNER,
           sandbox_bypass: false,
-          metadata: INKLING,
+          metadata: { ...INKLING, ownerTestTurns: 25 },
           updated_at: '2026-10-02T08:00:00.000Z',
         };
         const service = new SessionService(
@@ -1841,13 +1852,11 @@ describe('SessionService', () => {
             await service.handleMessage(createMockRequest({ userId: OWNER, ...fromOwner }))
           );
         }
-        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
-        expect(results[2]).toMatchObject({
-          errorCode: 'INKLING_TURN_REFUSED',
-          error: expect.stringContaining('turn cap reached (2 of 2)'),
-          classification: { retryable: false },
-        });
-        expect((row.metadata as Record<string, unknown>).ownerTestTurns).toBe(2);
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
+        for (const result of results) {
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+        }
+        expect((row.metadata as Record<string, unknown>).ownerTestTurns).toBe(25);
       });
 
       it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
