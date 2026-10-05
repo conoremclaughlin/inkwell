@@ -326,12 +326,15 @@ describe('reserveLaunch', () => {
 describe('launches found by their tag', () => {
   it('finds a launch by the id in its environment, and stops it, when its pid never reached the row', async () => {
     const child = startTagged({ INK_LAUNCH_ID: 'row-tagged' }, [], asClaude());
-    await vi.waitFor(async () =>
-      expect(
-        (await findTaggedProcesses(new Set(['row-tagged']))).tagged
-          .get('row-tagged')
-          ?.map((p) => p.pid)
-      ).toEqual([child.pid])
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await findTaggedProcesses(new Set(['row-tagged']))).tagged
+            .get('row-tagged')
+            ?.map((p) => p.pid)
+        ).toEqual([child.pid]),
+      // A real process-table scan: two `ps -E` passes on macOS, slow under load.
+      { timeout: 10_000 }
     );
     const { store, exitedIds } = fakeStore([row({ id: 'row-tagged', pid: null })]);
     const outcome = await sweep(store);
@@ -344,10 +347,13 @@ describe('launches found by their tag', () => {
     const earlier = start('true');
     await exited(earlier);
     const later = startTagged({ INK_LAUNCH_ID: 'row-retried' }, [], asClaude());
-    await vi.waitFor(async () =>
-      expect(
-        (await findTaggedProcesses(new Set(['row-retried']))).tagged.get('row-retried')
-      ).toHaveLength(1)
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await findTaggedProcesses(new Set(['row-retried']))).tagged.get('row-retried')
+        ).toHaveLength(1),
+      // A real process-table scan: two `ps -E` passes on macOS, slow under load.
+      { timeout: 10_000 }
     );
     const { store, exitedIds } = fakeStore([row({ id: 'row-retried', pid: earlier.pid! })]);
     const outcome = await sweep(store);
@@ -372,10 +378,13 @@ describe('launches found by their tag', () => {
       env: target.env as NodeJS.ProcessEnv,
     });
     children.push(child);
-    await vi.waitFor(async () =>
-      expect(
-        (await findTaggedProcesses(new Set(['row-wrapped']))).tagged.get('row-wrapped')
-      ).toEqual([{ pid: child.pid, pgid: null, command: expect.stringContaining('codex exec') }])
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await findTaggedProcesses(new Set(['row-wrapped']))).tagged.get('row-wrapped')
+        ).toEqual([{ pid: child.pid, pgid: null, command: expect.stringContaining('codex exec') }]),
+      // A real process-table scan: two `ps -E` passes on macOS, slow under load.
+      { timeout: 10_000 }
     );
   });
 
