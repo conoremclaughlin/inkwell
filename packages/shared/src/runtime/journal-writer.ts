@@ -291,6 +291,7 @@ export class JournalWriter {
       !['committed', 'already_committed'].includes(parsed.outcome as string)
     )
       throw new JournalWriterFailure('invalid_receipt');
+    // parsed.entry is a key-presence placeholder, not the captured entry echo.
     const echoed = freezeJournalEntry(entry, this.limits.maxEntryBytes);
     if (
       echoed.json !== snapshot.json ||
