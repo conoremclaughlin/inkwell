@@ -23,7 +23,13 @@ function entry(eid: number, text = 'hello'): JournalEntry {
   };
 }
 function header(committed_eid: number) {
-  return { id: scope.journalId, session_id: scope.sessionId, kind: 'db_v1', committed_eid };
+  return {
+    id: scope.journalId,
+    session_id: scope.sessionId,
+    kind: 'db_v1',
+    hold_reason: null,
+    committed_eid,
+  };
 }
 function meta(entries: JournalEntry[]) {
   return entries.map((e) => ({
@@ -103,7 +109,7 @@ describe('D1 bounded participant replay (mock queries, no live endpoint)', () =>
     expect(f.queries).toEqual([
       {
         table: 'session_journals',
-        columns: 'id,session_id,kind,committed_eid',
+        columns: 'id,session_id,kind,committed_eid,hold_reason',
         ops: [
           ['eq', 'id', scope.journalId],
           ['eq', 'session_id', scope.sessionId],
@@ -181,6 +187,31 @@ describe('D1 bounded participant replay (mock queries, no live endpoint)', () =>
       expect(page.committedEid).toBe(head + 10);
       expect(f.queries).toHaveLength(1);
       expect(f.authorize).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it('preserves a stored hold while allowing the authorized historical read', async () => {
+    const e = entry(1);
+    const f = fixture([{ ...header(1), hold_reason: 'store_capacity' }, meta([e]), rows([e])]);
+    const page = await readSessionJournalPage(f.client, f.options);
+    expect(page.holdReason).toBe('store_capacity');
+    expect(page.entries).toEqual([e]);
+  });
+
+  it('budgets expanded SQL jsonb text without treating it as oversized compact JSON', async () => {
+    const e = entry(1);
+    const f = fixture([header(1), [{ eid: 1, entry_bytes: 512 * 1024 }], rows([e])]);
+    expect((await readSessionJournalPage(f.client, f.options)).entries).toEqual([e]);
+  });
+
+  it.each([undefined, '', 'free text', 'x'.repeat(101)])(
+    'refuses malformed hold metadata',
+    async (hold_reason) => {
+      const f = fixture([{ ...header(1), hold_reason }]);
+      await expect(readSessionJournalPage(f.client, f.options)).rejects.toMatchObject({
+        code: 'invalid_page',
+      });
+      expect(f.queries).toHaveLength(1);
     }
   );
 
@@ -325,7 +356,7 @@ describe('D1 bounded participant replay (mock queries, no live endpoint)', () =>
       [],
       [{ eid: 2, entry_bytes: 500 }],
       [{ eid: 1, entry_bytes: -1 }],
-      [{ eid: 1, entry_bytes: 256 * 1024 + 1 }],
+      [{ eid: 1, entry_bytes: 512 * 1024 + 1 }],
       [{ eid: 1, entry_bytes: '500' }],
       [
         { eid: 1, entry_bytes: 500 },

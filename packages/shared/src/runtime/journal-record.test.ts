@@ -42,6 +42,37 @@ function spawn(type = 'provider_spawn_intent'): JournalEntry {
 }
 
 describe('D1 journal record snapshot', () => {
+  it.each(['journalId', 'sessionId', 'writerTenureId'] as const)(
+    'requires canonical lowercase UUIDs for %s before a database round trip',
+    (field) => {
+      const lower = 'abcdef01-abcd-4abc-8abc-abcdef012345';
+      const good = { ...entry(), [field]: lower };
+      expect(freezeJournalEntry(good, 4096).entry[field]).toBe(lower);
+      expect(() => freezeJournalEntry({ ...good, [field]: lower.toUpperCase() }, 4096)).toThrow(
+        'invalid_entry'
+      );
+    }
+  );
+  it.each(['tenureId', 'commandUuid'] as const)(
+    'requires lowercase target %s even for cross-tenure negatives',
+    (field) => {
+      const lower = 'abcdef01-abcd-4abc-8abc-abcdef012345';
+      const original = spawn('provider_spawn_observation');
+      const good = {
+        ...original,
+        target: { ...original.target!, [field]: lower },
+        body: { kind: 'unknown', reasonCode: 'fixture' },
+      };
+      expect(freezeJournalEntry(good, 4096).entry.target?.[field]).toBe(lower);
+      expect(() =>
+        freezeJournalEntry(
+          { ...good, target: { ...good.target, [field]: lower.toUpperCase() } },
+          4096
+        )
+      ).toThrow('invalid_entry');
+    }
+  );
+
   it('matches existing projection text/reason/PID bounds rather than deferring overflow to SQL', () => {
     const binding = spawn('provider_spawn_binding');
     const body = {

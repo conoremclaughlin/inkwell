@@ -21,6 +21,8 @@ export interface SessionJournalPage {
   readonly throughEid: number;
   /** Head observed this call; NOT dispatch authority or an incarnation proof. */
   readonly committedEid: number;
+  /** A held lineage is readable history, never permission to resume. */
+  readonly holdReason: string | null;
   readonly more: boolean;
 }
 export class SessionJournalReadError extends Error {
@@ -40,6 +42,9 @@ export class SessionJournalReadError extends Error {
 }
 
 const MAX_ENTRY_BYTES = 256 * 1024;
+// SQL counts uncompressed jsonb text (spacing and decimal number expansion),
+// not JS compact JSON or TOAST's compressed storage size.
+const MAX_STORED_ENTRY_BYTES = 512 * 1024;
 const PAGE_OVERHEAD = 512;
 
 /**
@@ -118,7 +123,7 @@ export async function readSessionJournalPage(
   const rawHeader = await query(() =>
     client
       .from('session_journals')
-      .select('id,session_id,kind,committed_eid')
+      .select('id,session_id,kind,committed_eid,hold_reason')
       .eq('id', scope.journalId)
       .eq('session_id', scope.sessionId)
       .maybeSingle()
@@ -129,7 +134,11 @@ export async function readSessionJournalPage(
     header.id !== scope.journalId ||
     header.session_id !== scope.sessionId ||
     header.kind !== 'db_v1' ||
-    !cursorNumber(header.committed_eid)
+    !cursorNumber(header.committed_eid) ||
+    !(
+      header.hold_reason === null ||
+      (typeof header.hold_reason === 'string' && /^[a-z0-9_.:-]{1,100}$/.test(header.hold_reason))
+    )
   )
     invalidPage();
   const committedEid = header.committed_eid as number;
@@ -163,7 +172,7 @@ export async function readSessionJournalPage(
         row.eid !== afterEid + i + 1 ||
         !cursorNumber(row.entry_bytes) ||
         (row.entry_bytes as number) < 1 ||
-        (row.entry_bytes as number) > MAX_ENTRY_BYTES
+        (row.entry_bytes as number) > MAX_STORED_ENTRY_BYTES
       )
         invalidPage();
       const bytes = row.entry_bytes as number;
@@ -217,6 +226,7 @@ export async function readSessionJournalPage(
     cursor: Object.freeze({ journalId: scope.journalId, afterEid: scanned }),
     throughEid,
     committedEid,
+    holdReason: header.hold_reason as string | null,
     more: scanned < throughEid,
   });
   try {
