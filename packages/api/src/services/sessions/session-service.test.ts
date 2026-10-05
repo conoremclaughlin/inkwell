@@ -1037,75 +1037,62 @@ describe('SessionService', () => {
         };
         lastTables = tables;
         const supabase = makeFakeSupabase(tables);
+        // makeFakeSupabase is typed `never`, so it fits any client parameter.
+        // The read faults below wrap its tables' select, so they reach it
+        // through the part of its shape they use.
+        type FaultableQuery = { maybeSingle: () => Promise<unknown>; then?: unknown };
+        type FaultableTable = { select: (cols?: string) => FaultableQuery };
+        const client = supabase as unknown as { from: (table: string) => FaultableTable };
+        /**
+         * From now on, a read of `table` whose select columns `matches` answers
+         * `answer` (and counts as one of its `times`, when given), instead of
+         * reaching the fake's rows.
+         */
+        const faultReads = (
+          table: string | undefined,
+          matches: (cols: string | undefined) => boolean,
+          answer: { data: null; error: { message: string } | null },
+          times = Infinity
+        ) => {
+          let left = times;
+          const from = client.from.bind(client);
+          client.from = (name: string) => {
+            const query = from(name);
+            if (table !== undefined && name !== table) return query;
+            const select = query.select.bind(query);
+            query.select = (cols?: string) => {
+              const q = select(cols);
+              if (left > 0 && matches(cols)) {
+                left -= 1;
+                q.maybeSingle = async () => answer;
+                q.then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(answer).then(resolve);
+              }
+              return q;
+            };
+            return query;
+          };
+        };
+        const failed = { data: null, error: { message: 'fixture read failed' } };
         const failing = [
           ...(extra.failReads ?? []),
           ...(extra.readError
             ? [{ table: 'agent_identities', columns: 'id, user_id, metadata' }]
             : []),
         ];
-        if (failing.length > 0) {
-          const failed = { data: null, error: { message: 'fixture read failed' } };
-          const from = supabase.from.bind(supabase);
-          (supabase as { from: unknown }).from = (table: string) => {
-            const query = from(table);
-            const select = query.select.bind(query);
-            query.select = ((cols?: string) => {
-              const q = select(cols);
-              if (failing.some((f) => f.table === table && f.columns === cols)) {
-                q.maybeSingle = async () => failed as never;
-                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
-                  Promise.resolve(failed).then(resolve);
-              }
-              return q;
-            }) as never;
-            return query;
-          };
+        for (const { table, columns } of failing) {
+          faultReads(table, (cols) => cols === columns, failed);
         }
         if (extra.metadataFaults) {
-          let left = extra.metadataFaults.times;
-          const answer =
-            extra.metadataFaults.mode === 'error'
-              ? { data: null, error: { message: 'fixture read failed' } }
-              : { data: null, error: null };
-          const from = supabase.from.bind(supabase);
-          (supabase as { from: unknown }).from = (table: string) => {
-            const query = from(table);
-            if (table !== 'agent_identities') return query;
-            const select = query.select.bind(query);
-            query.select = ((cols?: string) => {
-              const q = select(cols);
-              const columns = (cols ?? '').split(',').map((col) => col.trim());
-              if (left > 0 && columns.includes('metadata')) {
-                left -= 1;
-                q.maybeSingle = async () => answer as never;
-                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
-                  Promise.resolve(answer).then(resolve);
-              }
-              return q;
-            }) as never;
-            return query;
-          };
+          faultReads(
+            'agent_identities',
+            (cols) => (cols ?? '').split(',').some((col) => col.trim() === 'metadata'),
+            extra.metadataFaults.mode === 'error' ? failed : { data: null, error: null },
+            extra.metadataFaults.times
+          );
         }
         if (extra.scopeReadFaults) {
-          let left = extra.scopeReadFaults;
-          const failed = { data: null, error: { message: 'fixture read failed' } };
-          const from = supabase.from.bind(supabase);
-          (supabase as { from: unknown }).from = (table: string) => {
-            const query = from(table);
-            if (table !== 'agent_identities') return query;
-            const select = query.select.bind(query);
-            query.select = ((cols?: string) => {
-              const q = select(cols);
-              if (left > 0 && cols === 'id') {
-                left -= 1;
-                q.maybeSingle = async () => failed as never;
-                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
-                  Promise.resolve(failed).then(resolve);
-              }
-              return q;
-            }) as never;
-            return query;
-          };
+          faultReads('agent_identities', (cols) => cols === 'id', failed, extra.scopeReadFaults);
         }
         const service = new SessionService(
           mockRepository,
