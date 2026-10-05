@@ -3325,6 +3325,16 @@ describe('durable command admission', () => {
           });
         }
         expect(await journalState(w)).toEqual(before);
+        // A retry is confirmed only against the turn it named: once an
+        // administrator or a restore removes that record, nothing confirms it.
+        await admin(
+          'DELETE FROM public.session_turn_generations WHERE session_id = $1 AND epoch = $2',
+          [w.sessionId, t.epoch]
+        );
+        expect(await appendRaw(w, 1, second)).toEqual({
+          outcome: 'refused',
+          reasonCode: 'stale_target',
+        });
       });
 
       it('refuses the same host under a new tenure retrying an earlier tenure entry', async () => {
@@ -3413,6 +3423,14 @@ describe('durable command admission', () => {
             'an observation kind the contract does not name',
             {
               ...entryOf(w, 3, observed(targetOf(w.holder, t, 'inv-known'), 'tree_quiescent')),
+              body: { kind: 'gone', evidenceRef: 'e' },
+            },
+          ],
+          [
+            // The index alone would answer no_intent here: the validator decides first.
+            'an unnamed observation kind for a spawn never opened',
+            {
+              ...entryOf(w, 3, observed(targetOf(w.holder, t, 'inv-never'), 'tree_quiescent')),
               body: { kind: 'gone', evidenceRef: 'e' },
             },
           ],
@@ -4025,14 +4043,28 @@ describe('durable command admission', () => {
         });
         await client.connect();
         try {
-          const attempt = async (journalId: string | null, eid: number | null) => {
+          const attempt = async (
+            journalId: string | null,
+            eid: number | null,
+            record: { kind: string; detail: Record<string, unknown> } = {
+              kind: 'tree_quiescent',
+              detail: { evidenceRef: 'forged' },
+            }
+          ) => {
             await client.query('BEGIN');
             try {
               await client.query('SET LOCAL ROLE ink_admission_writer');
               await client.query(
-                `SELECT ink_admission.reduce_invocation($1, $2, $3, 'inv-guard', 'tree_quiescent',
-                   '{"evidenceRef":"forged"}'::jsonb, $4, $5)`,
-                [w.sessionId, w.holder.tenureId, t.epoch, journalId, eid]
+                `SELECT ink_admission.reduce_invocation($1, $2, $3, 'inv-guard', $4, $5::jsonb, $6, $7)`,
+                [
+                  w.sessionId,
+                  w.holder.tenureId,
+                  t.epoch,
+                  record.kind,
+                  JSON.stringify(record.detail),
+                  journalId,
+                  eid,
+                ]
               );
               return 'projected';
             } catch (error) {
@@ -4045,11 +4077,62 @@ describe('durable command admission', () => {
           // The committed intent is not the head+1 entry, and says something else.
           expect(await attempt(w.journalId, 1)).toBe('IJ002');
           expect(await attempt(w.journalId, 2)).toBe('IJ002');
+          // Matching content is not enough: a committed entry is never replayed.
+          expect(await attempt(w.journalId, 1, { kind: 'intent', detail: {} })).toBe('IJ002');
         } finally {
           await client.end();
         }
         expect(await invocationRow(w.sessionId, t.epoch, 'inv-guard')).toMatchObject({
           resolution: null,
+        });
+      });
+
+      it('keeps positive records on the writer turns in the reducer itself, below the append checks', async () => {
+        // An entry that reached the head without append's validation (a
+        // restore, an administrator) still cannot resolve another tenure's spawn.
+        const { w1, t1, inv, w2 } = await twoTenures();
+        const [journal] = await admin<{ committed_eid: string }>(
+          'SELECT committed_eid FROM public.session_journals WHERE id = $1',
+          [w2.journalId]
+        );
+        const eid = Number(journal.committed_eid) + 1;
+        const forged = {
+          version: 1,
+          journalId: w2.journalId,
+          sessionId: w2.sessionId,
+          writerTenureId: w2.holder.tenureId,
+          hostInstanceId: w2.holder.hostInstanceId,
+          eid,
+          ts: '2026-10-05T04:00:00.000Z',
+          type: 'provider_spawn_observation',
+          target: targetOf(w1.holder, t1, inv),
+          body: { kind: 'not_spawned', evidenceRef: 'forged' },
+        };
+        const client = new Client({
+          connectionString: process.env.INTEGRATION_DB_URL,
+          statement_timeout: 15_000,
+        });
+        await client.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query('SET LOCAL ROLE ink_admission_writer');
+          await client.query(
+            "INSERT INTO public.session_journal_entries (journal_id, eid, entry, projection) VALUES ($1, $2, $3::jsonb, 'none')",
+            [w2.journalId, eid, JSON.stringify(forged)]
+          );
+          const { rows } = await client.query(
+            `SELECT ink_admission.reduce_invocation($1, $2, $3, $4, 'not_spawned',
+               '{"evidenceRef":"forged"}'::jsonb, $5, $6) AS r`,
+            [w2.sessionId, w2.holder.tenureId, t1.epoch, inv, w2.journalId, eid]
+          );
+          expect(rows[0].r).toEqual({ outcome: 'stale' });
+        } finally {
+          await client.query('ROLLBACK').catch(() => undefined);
+          await client.end();
+        }
+        expect(await invocationRow(w2.sessionId, t1.epoch, inv)).toMatchObject({
+          resolution: 'tree_quiescent',
+          contradiction: false,
         });
       });
 
