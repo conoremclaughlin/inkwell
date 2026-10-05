@@ -98,7 +98,8 @@ import {
   fenceInkling,
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
-import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
+import { inklingRuntime } from '../inklings/inkling-runtime.js';
+import { inkProviderFor, type InkProvider } from './ink-provider.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
@@ -2311,9 +2312,10 @@ export class SessionService implements ISessionService {
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
-    // The provider `ink chat` is told to run. Only an inkling's turn names
-    // one; every other ink spawn keeps the chat's own default.
-    let inkProvider: InklingProvider | undefined;
+    // The provider `ink chat` is told to run: an inkling's from its runtime
+    // decision below, an ordinary SB's from the provider its identity names.
+    // None named keeps the chat's own default.
+    let inkProvider: InkProvider | undefined;
     let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
@@ -2458,6 +2460,36 @@ export class SessionService implements ISessionService {
           sandboxBypass = studio.sandbox_bypass;
         }
       }
+    }
+
+    // An ordinary SB's ink turn runs the provider its identity names, named to
+    // `ink chat` so the model chosen for that provider meets the provider that
+    // runs it (ink-provider.ts). One ink does not run is refused here, before
+    // anything is written or spawned, never run as Claude in its place. An
+    // inkling's provider was decided with its runtime above.
+    if (resolvedBackend === 'ink' && !inklingTurn) {
+      const choice = inkProviderFor(injectedContext.agent.provider);
+      if (!choice.ok) {
+        const summary = `Ink turn refused: ${choice.reason}`;
+        logger.warn('[InkProvider] Turn refused', {
+          sbSlug,
+          sbId: session.sbId,
+          reason: choice.reason,
+        });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: summary,
+          errorCode: 'INK_PROVIDER_UNSUPPORTED',
+          classification: { category: 'config', summary, retryable: false },
+        };
+      }
+      inkProvider = choice.provider;
     }
 
     // A Claude session in a studio gets its profile at launch, from the row
