@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'child_process';
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,7 @@ import {
   type LaunchRow,
   type LaunchStore,
 } from './launched-processes';
+import { buildCleanEnv, resolveSpawnTarget } from '@inklabs/shared';
 import { probeGroup } from './stop-process';
 
 const BOOT = 'boot-fixture';
@@ -74,9 +75,10 @@ function startTagged(
   args: string[] = [],
   executable: string = process.execPath
 ): ChildProcess {
+  // Through buildCleanEnv, as every runner's env is: a launch tag goes first.
   const child = spawn(executable, ['-e', 'setTimeout(() => {}, 30000)', ...args], {
     stdio: 'ignore',
-    env: { ...process.env, ...env },
+    env: buildCleanEnv({ ...env, PATH: process.env.PATH ?? '' }) as NodeJS.ProcessEnv,
   });
   children.push(child);
   return child;
@@ -354,6 +356,62 @@ describe('launches found by their tag', () => {
     expect(exitedIds).toEqual(['row-retried']);
   });
 
+  it('keeps the tag first through the wrapper path a runner takes: resolveSpawnTarget, then a /usr/bin/env node script', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-wrapper-'));
+    fakeBackendDirs.push(dir);
+    const script = join(dir, 'codex');
+    writeFileSync(script, '#!/usr/bin/env node\nsetTimeout(() => {}, 30000);\n');
+    chmodSync(script, 0o755);
+    const target = resolveSpawnTarget({
+      binary: script,
+      args: ['exec'],
+      env: { PATH: process.env.PATH ?? '', HOME: '/h', INK_LAUNCH_ID: 'row-wrapped' },
+    });
+    const child = spawn(target.binary, target.args, {
+      stdio: 'ignore',
+      env: target.env as NodeJS.ProcessEnv,
+    });
+    children.push(child);
+    await vi.waitFor(async () =>
+      expect(
+        (await findTaggedProcesses(new Set(['row-wrapped']))).tagged.get('row-wrapped')
+      ).toEqual([{ pid: child.pid, pgid: null, command: expect.stringContaining('codex exec') }])
+    );
+  });
+
+  it('never matches the tag’s text inside another variable, even in a process named as the backend', async () => {
+    const bystander = spawn(asClaude(), ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+      env: { ...process.env, FIXTURE_NOTE: 'prefix INK_LAUNCH_ID=row-named suffix' },
+    });
+    children.push(bystander);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(
+      (await findTaggedProcesses(new Set(['row-named']))).tagged.get('row-named')
+    ).toBeUndefined();
+    const { store } = fakeStore([row({ id: 'row-named', pid: null })]);
+    await sweep(store);
+    expect(alive(bystander.pid!)).toBe(true);
+  });
+
+  it('holds a launch whose found attempt is stopped while another that could be it cannot be read', async () => {
+    const found = start('sleep 30');
+    const sibling = start('sleep 30');
+    const { store, exitedIds } = fakeStore([row({ id: 'row-two', pid: null })]);
+    const outcome = await stopSurvivingLaunches(store, {
+      serverInstance: INSTANCE,
+      bootId: BOOT,
+      graceMs: 300,
+      findTagged: async () => ({
+        tagged: new Map([['row-two', [{ pid: found.pid!, pgid: null, command: '/x/claude -p' }]]]),
+        unreadable: [{ pid: sibling.pid!, pgid: null, command: '/x/claude -p' }],
+      }),
+    });
+    expect(outcome.stopped.map((r) => r.pid)).toEqual([found.pid]);
+    expect(outcome.uncertain.map((r) => r.pid)).toEqual([sibling.pid]);
+    expect(exitedIds).toEqual([]);
+  });
+
   it('never signals a process that is not the backend, whatever its environment says', async () => {
     // Another variable's value holding the tag's text: space-joined `ps -E`
     // cannot tell it from the tag, so the process's own name decides.
@@ -462,6 +520,8 @@ describe('launches found by their tag', () => {
     expect(couldBeBackend('claude-code', 'node -e setTimeout()')).toBe(false);
     expect(couldBeBackend('claude-code', '/bin/zsh -c claude')).toBe(false);
     expect(couldBeBackend('some-new-backend', 'anything')).toBe(true);
+    // A command line that could not be read could be any backend.
+    expect(couldBeBackend('claude-code', null)).toBe(true);
   });
 });
 

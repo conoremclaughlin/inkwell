@@ -9,6 +9,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { buildCleanEnv } from '@inklabs/shared';
 import { getDataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 import {
@@ -110,7 +111,8 @@ describe('launched_processes', () => {
     symlinkSync(process.execPath, codex);
     const child = spawn(codex, ['-e', 'setTimeout(() => {}, 30000)'], {
       stdio: 'ignore',
-      env: { ...process.env, INK_LAUNCH_ID: id },
+      // Through buildCleanEnv, as a runner's env is: the tag goes first.
+      env: buildCleanEnv({ PATH: process.env.PATH ?? '', INK_LAUNCH_ID: id }) as NodeJS.ProcessEnv,
     });
     children.push(child);
     expect((await store.listOpen(MAIN)).find((row) => row.id === id)?.pid).toBeNull();

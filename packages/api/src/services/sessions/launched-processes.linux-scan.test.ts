@@ -21,6 +21,14 @@ const proc = vi.hoisted(() => {
     '/proc/102/stat': '102 (sh) S 1 1 1 0',
     '/proc/102/environ': gone,
     '/proc/102/cmdline': gone,
+    // Its state cannot be read: unknown, not exited.
+    '/proc/104/stat': denied,
+    '/proc/104/environ': denied,
+    '/proc/104/cmdline': 'codex\0exec\0',
+    // Its command line cannot be read: unknown, so it could be any backend.
+    '/proc/105/stat': '105 (x) S 1 105 105 0',
+    '/proc/105/environ': denied,
+    '/proc/105/cmdline': denied,
     // Another user's process.
     '/proc/103/stat': '103 (sshd) S 1 103 103 0',
     '/proc/103/environ': denied,
@@ -33,7 +41,7 @@ vi.mock('fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs/promises')>();
   return {
     ...actual,
-    readdir: vi.fn(async () => ['100', '101', '102', '103', 'self', 'cpuinfo']),
+    readdir: vi.fn(async () => ['100', '101', '102', '103', '104', '105', 'self', 'cpuinfo']),
     stat: vi.fn(async (path: string) => ({ uid: path === '/proc/103' ? proc.uid + 1 : proc.uid })),
     readFile: vi.fn(async (path: string) => {
       const value = proc.files[path];
@@ -60,6 +68,10 @@ describe('findTaggedProcesses on Linux', () => {
     expect(inventory.tagged.get('row-1')).toEqual([
       { pid: 101, pgid: 101, command: 'node /x/cli.js chat ' },
     ]);
-    expect(inventory.unreadable).toEqual([{ pid: 100, pgid: 100, command: 'claude --print ' }]);
+    expect(inventory.unreadable).toEqual([
+      { pid: 100, pgid: 100, command: 'claude --print ' },
+      { pid: 104, pgid: null, command: 'codex exec ' },
+      { pid: 105, pgid: 105, command: null },
+    ]);
   });
 });
