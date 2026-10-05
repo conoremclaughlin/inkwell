@@ -204,21 +204,33 @@ describe('recordLaunch', () => {
     const child = start('sleep 30');
     const { store } = fakeStore([]);
     configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
-    const launch = recordLaunch('session-fixture', 'claude-code', {
-      pid: child.pid!,
-      pgid: child.pid!,
-    });
+    const launch = recordLaunch('session-fixture', 'claude-code', { pid: child.pid! });
+    await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
+    // Stamped only once the process is seen gone.
+    child.kill('SIGKILL');
+    await exited(child);
     launch.exited();
     await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-new']));
     expect(store.record).toHaveBeenCalledWith({
       sessionId: 'session-fixture',
       backend: 'claude-code',
       pid: child.pid,
-      pgid: child.pid,
-      startIdentity: await processStartIdentity(child.pid!),
+      pgid: null,
+      startIdentity: expect.any(String),
       bootId: BOOT,
       serverInstance: INSTANCE,
     });
+  });
+
+  it('never stamps a launch whose process is still alive, whatever the runner said', async () => {
+    const child = start('sleep 30');
+    const { store } = fakeStore([]);
+    configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
+    const launch = recordLaunch('session-fixture', 'codex-cli', { pid: child.pid! });
+    await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
+    launch.exited();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.markExited).not.toHaveBeenCalled();
   });
 
   it('never throws into the turn when the store fails, and holds the session while that process lives', async () => {
@@ -285,6 +297,21 @@ describe('launchHoldFor', () => {
     await exited(child);
     expect(launchHoldFor('held-session')).toBeUndefined();
     await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith([held.id]));
+  });
+
+  it('holds every session while the boot cannot be read, and lets go once a retry reads it', async () => {
+    const listing = { is: async () => ({ data: [], error: null }) };
+    const client = { from: () => ({ select: () => ({ eq: () => listing }) }) };
+    let reads = 0;
+    const readBoot = async () => {
+      reads += 1;
+      if (reads === 1) throw new Error('sysctl failed');
+      return BOOT;
+    };
+    expect(await startLaunchTracking(client as never, 3001, 50, readBoot)).toBeUndefined();
+    expect(launchHoldFor('any-session')).toMatch(/startup check/);
+    await vi.waitFor(() => expect(launchHoldFor('any-session')).toBeUndefined());
+    expect(reads).toBe(2);
   });
 
   it('holds every session when the startup sweep could not run', async () => {

@@ -3173,6 +3173,36 @@ describe('SessionService', () => {
       }
     });
 
+    it('does not compact a session held by a survivor that may still be alive', async () => {
+      holdSurvivors({
+        stopped: [],
+        gone: [],
+        unstoppable: [],
+        uncertain: [
+          {
+            id: 'row-held',
+            sessionId: 'session-123',
+            backend: 'claude-code',
+            pid: process.pid,
+            pgid: null,
+            startIdentity: null,
+            bootId: 'boot',
+          },
+        ],
+      });
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
     it('should skip compaction when lock is already held (re-entry guard)', async () => {
       const session = createMockSession({ backendSessionId: 'claude-abc' });
       vi.mocked(mockRepository.findById).mockResolvedValue(session);

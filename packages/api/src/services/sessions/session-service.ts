@@ -5619,6 +5619,14 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A compaction is a launch too: never beside a survivor that may still be
+    // running this session (launched-processes.ts).
+    const launchHold = launchHoldFor(sessionId);
+    if (launchHold) {
+      logger.warn('Not compacting a held session', { sessionId, reason: launchHold });
+      return;
+    }
+
     // Acquire database-backed compaction lock (atomic, multi-server safe)
     const lockAcquired = await this.repository.tryAcquireCompactionLock(sessionId);
     if (!lockAcquired) {

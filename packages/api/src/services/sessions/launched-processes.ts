@@ -182,8 +182,21 @@ export function recordLaunch(
       });
       return null;
     });
+  const target: LaunchRow = {
+    id: '',
+    sessionId,
+    backend,
+    pid: spawned.pid,
+    pgid: spawned.pgid ?? null,
+    startIdentity: null,
+    bootId: r.bootId,
+  };
   return {
     exited() {
+      // Settled is not exited: a runner can settle with its process still
+      // alive (a timeout's kill not waited for). Only a pid or group seen
+      // gone is stamped; anything else stays open for the next sweep.
+      if (!targetGone(target)) return;
       void id
         .then((rowId) => (rowId ? r.store.markExited([rowId]) : undefined))
         .catch((error: unknown) => {
@@ -271,10 +284,10 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** Gone means the pid is dead and, when the run led a group, the group is empty. */
 function targetGone(row: LaunchRow): boolean {
-  return row.pgid !== null && isGroupId(row.pgid)
-    ? probeGroup(row.pgid) === 'empty'
-    : !pidAlive(row.pid);
+  if (pidAlive(row.pid)) return false;
+  return row.pgid === null || !isGroupId(row.pgid) || probeGroup(row.pgid) === 'empty';
 }
 
 async function waitGone(row: LaunchRow, ms: number): Promise<boolean> {
@@ -359,29 +372,26 @@ export async function stopSurvivingLaunches(
 }
 
 /**
- * Server startup: sweep, then record from here on. A host whose boot cannot
- * be read gets neither, and the server runs as it did before this existed,
- * saying so loudly, rather than refusing to start.
+ * Server startup: sweep, then record from here on. Until one attempt has
+ * read this host's boot and swept, every agent turn is held and the attempt
+ * retries every 30s; the server itself still comes up, channels and routes
+ * included.
  */
 export async function startLaunchTracking(
   client: SupabaseClient,
-  port: number | string
+  port: number | string,
+  retryMs = 30_000,
+  readBoot: () => Promise<string> = readBootId
 ): Promise<SweepOutcome | undefined> {
   const serverInstance = serverInstanceOf(port);
-  let bootId: string;
-  try {
-    bootId = await readBootId();
-  } catch (error) {
-    logger.error('Launch tracking is off: this host boot could not be read', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return undefined;
-  }
   const store = supabaseLaunchStore(client);
-  configureLaunchRecording({ store, serverInstance, bootId });
-  const sweep = async (): Promise<SweepOutcome> => {
+  const attempt = async (): Promise<SweepOutcome> => {
+    // Without the boot, this boot's survivors cannot be told from an earlier one's.
+    const bootId = await readBoot();
+    configureLaunchRecording({ store, serverInstance, bootId });
     const outcome = await stopSurvivingLaunches(store, { serverInstance, bootId });
     holdSurvivors(outcome);
+    sweepPending = false;
     const summary = (rows: LaunchRow[]) =>
       rows.map((r) => ({ sessionId: r.sessionId, backend: r.backend, pid: r.pid }));
     if (outcome.stopped.length || outcome.uncertain.length || outcome.unstoppable.length) {
@@ -393,26 +403,23 @@ export async function startLaunchTracking(
     return outcome;
   };
   try {
-    return await sweep();
+    return await attempt();
   } catch (error) {
-    // Not knowing what survived is a reason to hold every turn, not to stop
-    // the server: channels and routes still come up, and the sweep retries.
     sweepPending = true;
     logger.error(
-      'The startup sweep of launched processes failed; holding agent turns until it runs',
+      'The startup check of launched processes failed; holding agent turns until it runs',
       {
         error: error instanceof Error ? error.message : String(error),
       }
     );
     const retry = setInterval(() => {
-      void sweep()
+      void attempt()
         .then(() => {
-          sweepPending = false;
           clearInterval(retry);
-          logger.info('The startup sweep of launched processes ran; agent turns resume');
+          logger.info('The startup check of launched processes ran; agent turns resume');
         })
         .catch(() => undefined);
-    }, 30_000);
+    }, retryMs);
     retry.unref();
     return undefined;
   }
