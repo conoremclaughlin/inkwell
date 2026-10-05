@@ -74,6 +74,22 @@ function intent(): JournalRecord {
 }
 
 describe('D1 bounded journal writer (fake store only)', () => {
+  it.each(['depth', 'nodes'])(
+    'does not count receipt wrappers against a valid entry %s limit',
+    async (boundary) => {
+      const { writer } = fixture({ maxEntryBytes: 256 * 1024, maxPendingBytes: 1024 * 1024 });
+      let nested: import('./journal-record.js').JournalJson = 'leaf';
+      for (let i = 0; i < 62; i++) nested = { child: nested };
+      const body: JournalRecord['body'] =
+        boundary === 'depth' ? { nested } : { values: Array(99_988).fill(0) };
+      expect((await writer.append({ type: 'assistant', target: null, body })).entry.body).toEqual(
+        body
+      );
+      expect(writer.committedEid).toBe(1);
+      expect(writer.failure).toBeUndefined();
+    }
+  );
+
   it('serializes writes, freezes at admission, and exposes only committed cursors', async () => {
     const gate = deferred<unknown>();
     const { writer, append } = fixture();

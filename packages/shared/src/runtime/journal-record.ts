@@ -166,6 +166,45 @@ export function canonicalJournalJson(value: unknown, maxBytes: number): string {
   return chunks.join('');
 }
 
+/**
+ * Separate an RPC's small metadata envelope from its one entry. Validate that
+ * entry immediately with freezeJournalEntry/canonicalJournalJson, before any
+ * await. Applying the per-entry depth/node budget to an RPC wrapper would
+ * reject the deepest/largest structurally valid entry AFTER its commit.
+ * Accessors, custom roots and extra-large metadata are never invoked/coerced.
+ */
+export function splitJournalEntryEnvelope(
+  value: unknown,
+  maxEnvelopeBytes: number
+): { envelope: Record<string, unknown>; entry: unknown } {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  )
+    fail();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > 16) fail();
+  const envelope: Record<string, unknown> = Object.create(null);
+  let entry: unknown;
+  for (const key of keys) {
+    if (typeof key !== 'string') fail();
+    const field = Object.getOwnPropertyDescriptor(value, key);
+    if (!field?.enumerable || !('value' in field)) fail();
+    if (key === 'entry') {
+      entry = field.value;
+      envelope[key] = null;
+    } else envelope[key] = field.value;
+  }
+  return {
+    envelope: JSON.parse(canonicalJournalJson(envelope, maxEnvelopeBytes)) as Record<
+      string,
+      unknown
+    >,
+    entry,
+  };
+}
+
 function fail(): never {
   throw new JournalRecordError('invalid_entry');
 }

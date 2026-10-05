@@ -43,7 +43,7 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-function fixture() {
+function fixture(maxEntryBytes = 4096) {
   const rpc = vi.fn(
     async (name: string, args: Record<string, unknown>) =>
       ({
@@ -67,16 +67,16 @@ function fixture() {
     client,
     identity: mutableIdentity,
     capability,
-    maxEntryBytes: 4096,
+    maxEntryBytes,
   });
   const writer = new JournalWriter({
     identity,
     store,
     committedEid: 0,
     now: () => ts,
-    maxEntryBytes: 4096,
+    maxEntryBytes,
     maxPendingEntries: 4,
-    maxPendingBytes: 16384,
+    maxPendingBytes: maxEntryBytes * 4,
   });
   return { rpc, client, store, writer, mutableIdentity };
 }
@@ -290,6 +290,21 @@ describe('D1 session journal store (mock transport, no live caller)', () => {
       'hold_session_journal',
     ]);
   });
+
+  it.each(['depth', 'nodes'])(
+    'preserves a valid entry at its %s boundary through request and receipt wrappers',
+    async (boundary) => {
+      const { writer } = fixture(256 * 1024);
+      let nested: import('@inklabs/shared/runtime').JournalJson = 'leaf';
+      for (let i = 0; i < 62; i++) nested = { child: nested };
+      const body: JournalEntry['body'] =
+        boundary === 'depth' ? { nested } : { values: Array(99_988).fill(0) };
+      const receipt = await writer.append({ type: 'assistant', target: null, body });
+      expect(receipt.entry.body).toEqual(body);
+      expect(writer.committedEid).toBe(1);
+      expect(writer.failure).toBeUndefined();
+    }
+  );
 
   it('does not retry a lost commit response: the writer stops and requests the hold once', async () => {
     const { writer, rpc } = fixture();

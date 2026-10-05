@@ -1,6 +1,7 @@
 import {
   canonicalJournalJson,
   freezeJournalEntry,
+  splitJournalEntryEnvelope,
   JournalRecordError,
   type JournalEntry,
   type JournalIdentity,
@@ -280,10 +281,8 @@ export class JournalWriter {
     reply: unknown,
     snapshot: ReturnType<typeof freezeJournalEntry>
   ): JournalCommitReceipt {
-    // Bound the untrusted store response, including the full entry echo.
-    const parsed = JSON.parse(
-      canonicalJournalJson(reply, this.limits.maxEntryBytes + 2048)
-    ) as Record<string, unknown>;
+    // Metadata and entry each retain their own structural/byte budget.
+    const { envelope: parsed, entry } = splitJournalEntryEnvelope(reply, 2048);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
       throw new JournalWriterFailure('invalid_receipt');
     if (parsed.outcome === 'refused') throw new JournalWriterFailure('store_refused');
@@ -292,7 +291,7 @@ export class JournalWriter {
       !['committed', 'already_committed'].includes(parsed.outcome as string)
     )
       throw new JournalWriterFailure('invalid_receipt');
-    const echoed = freezeJournalEntry(parsed.entry, this.limits.maxEntryBytes);
+    const echoed = freezeJournalEntry(entry, this.limits.maxEntryBytes);
     if (
       echoed.json !== snapshot.json ||
       typeof parsed.committedEid !== 'number' ||

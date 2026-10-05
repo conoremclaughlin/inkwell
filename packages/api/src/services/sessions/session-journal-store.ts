@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   canonicalJournalJson,
   freezeJournalEntry,
+  splitJournalEntryEnvelope,
   type JournalAppendRequest,
   type JournalHoldRequest,
   type JournalIdentity,
@@ -103,11 +104,10 @@ export class SessionJournalStore implements JournalStore {
     let snapshot: ReturnType<typeof freezeJournalEntry>;
     let expectedCommittedEid: number;
     try {
-      const input = JSON.parse(
-        canonicalJournalJson(request, this.#maxEntryBytes + 128)
-      ) as JournalAppendRequest;
+      const { envelope: input, entry } = splitJournalEntryEnvelope(request, 128);
       if (Object.keys(input).sort().join(',') !== 'entry,expectedCommittedEid') throw new Error();
-      snapshot = freezeJournalEntry(input.entry, this.#maxEntryBytes);
+      snapshot = freezeJournalEntry(entry, this.#maxEntryBytes);
+      if (typeof input.expectedCommittedEid !== 'number') throw new Error();
       expectedCommittedEid = input.expectedCommittedEid;
       if (
         !this.matches(snapshot.entry) ||
@@ -119,15 +119,11 @@ export class SessionJournalStore implements JournalStore {
     } catch {
       throw new SessionJournalStoreError('invalid_request');
     }
-    return this.call(
-      'append_session_journal',
-      {
-        ...this.authority(),
-        p_expected_committed_eid: expectedCommittedEid,
-        p_entry: snapshot.entry,
-      },
-      this.#maxEntryBytes + 2048
-    );
+    return this.call('append_session_journal', {
+      ...this.authority(),
+      p_expected_committed_eid: expectedCommittedEid,
+      p_entry: snapshot.entry,
+    });
   }
 
   async hold(request: Readonly<JournalHoldRequest>): Promise<unknown> {
@@ -144,14 +140,10 @@ export class SessionJournalStore implements JournalStore {
     } catch {
       throw new SessionJournalStoreError('invalid_request');
     }
-    return this.call(
-      'hold_session_journal',
-      {
-        ...this.authority(),
-        p_reason_code: input.reasonCode,
-      },
-      2048
-    );
+    return this.call('hold_session_journal', {
+      ...this.authority(),
+      p_reason_code: input.reasonCode,
+    });
   }
 
   private matches(identity: JournalIdentity): boolean {
@@ -175,9 +167,8 @@ export class SessionJournalStore implements JournalStore {
   }
 
   private async call(
-    name: string,
-    args: Record<string, unknown>,
-    maxReplyBytes: number
+    name: 'append_session_journal' | 'hold_session_journal',
+    args: Record<string, unknown>
   ): Promise<unknown> {
     let data: unknown;
     try {
@@ -192,7 +183,13 @@ export class SessionJournalStore implements JournalStore {
     try {
       // JournalWriter separately verifies the complete expected echo and the
       // projection. A bounded malformed reply is not normalized into success.
-      return JSON.parse(canonicalJournalJson(data, maxReplyBytes)) as unknown;
+      if (name === 'append_session_journal') {
+        const { envelope, entry } = splitJournalEntryEnvelope(data, 2048);
+        if (Object.hasOwn(envelope, 'entry'))
+          envelope.entry = JSON.parse(canonicalJournalJson(entry, this.#maxEntryBytes)) as unknown;
+        return envelope;
+      }
+      return JSON.parse(canonicalJournalJson(data, 2048)) as unknown;
     } catch {
       throw new SessionJournalStoreError('invalid_reply');
     }

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   canonicalJournalJson,
   freezeJournalEntry,
   journalReplayEvent,
+  splitJournalEntryEnvelope,
   type JournalEntry,
 } from './journal-record.js';
 
@@ -330,5 +331,40 @@ describe('D1 journal record snapshot', () => {
     expect(() =>
       freezeJournalEntry({ ...original, type: 'assistant', body: { text: 'x' } }, 4096)
     ).toThrow();
+  });
+});
+
+describe('journal RPC envelope separation', () => {
+  it('snapshots metadata and leaves the one entry for immediate independent validation', () => {
+    const raw = { entry: entry(), expectedCommittedEid: 0 };
+    const split = splitJournalEntryEnvelope(raw, 128);
+    raw.expectedCommittedEid = 99;
+    expect(split.envelope).toEqual({ entry: null, expectedCommittedEid: 0 });
+    expect(split.entry).toBe(raw.entry);
+    expect(freezeJournalEntry(split.entry, 4096).entry.eid).toBe(1);
+  });
+  it('supports a bounded refusal with no entry', () => {
+    expect(
+      splitJournalEntryEnvelope({ outcome: 'refused', reasonCode: 'not_holder' }, 128)
+    ).toEqual({ envelope: { outcome: 'refused', reasonCode: 'not_holder' }, entry: undefined });
+  });
+  it.each(['entry', 'outcome'])('never invokes a root %s getter', (key) => {
+    const getter = vi.fn(() => 'private');
+    const raw = Object.defineProperty({}, key, { get: getter, enumerable: true });
+    expect(() => splitJournalEntryEnvelope(raw, 128)).toThrow();
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it.each(
+    [
+      null,
+      [],
+      new Date(),
+      Object.create({ inherited: true }),
+      Object.fromEntries(Array.from({ length: 17 }, (_, i) => [String(i), i])),
+      { error: 'x'.repeat(129) },
+      { entry: entry(), extra: undefined },
+    ].map((value: unknown) => ({ value }))
+  )('refuses non-data/oversize root metadata', ({ value }) => {
+    expect(() => splitJournalEntryEnvelope(value, 128)).toThrow();
   });
 });
