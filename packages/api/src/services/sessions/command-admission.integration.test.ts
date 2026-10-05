@@ -4408,6 +4408,11 @@ describe('durable command admission', () => {
             holdReason: null,
           });
           expect(page.cursor.afterEid).toBe(3);
+          const stored = await storedEntries(w.journalId);
+          // Pin both bounds: metadata-first SQL payload selection (including
+          // its row/envelope allowance), and the returned compact wire page.
+          const selectedBytes = stored.reduce((sum, row) => sum + row.entry_bytes + 128, 512);
+          expect(selectedBytes).toBeLessThanOrEqual(1024 * 1024);
           expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
         });
 
@@ -4465,6 +4470,7 @@ describe('durable command admission', () => {
           await expect(writer.flush()).rejects.toMatchObject({ code: 'append_failed' });
           expect(calls).toBe(1);
           expect(writer.committedEid).toBe(0);
+          expect((await header(w.journalId)).committed_eid).toBe(1);
           expect(writer.failure).toEqual({ code: 'append_failed', hold: 'confirmed' });
           const page = await readSessionJournalPage(supabase, h.read);
           expect(page.entries.map((entry) => entry.body.text)).toEqual(['committed']);
