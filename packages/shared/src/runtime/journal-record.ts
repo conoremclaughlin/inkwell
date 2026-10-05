@@ -181,7 +181,15 @@ function keys(value: Record<string, unknown>, expected: string[]): void {
     fail();
 }
 function id(value: unknown): void {
-  if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,255}$/.test(value)) fail();
+  // The existing tenure/invocation projection stores these in <=200 chars.
+  if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}$/.test(value)) fail();
+}
+function reasonCode(value: unknown): void {
+  if (typeof value !== 'string' || !/^[a-z0-9_.:-]{1,100}$/.test(value)) fail();
+}
+function pid(value: unknown): void {
+  positive(value);
+  if ((value as number) > 2_147_483_647) fail();
 }
 function uuid(value: unknown): void {
   if (
@@ -217,18 +225,18 @@ function validateSpawn(type: string, body: Record<string, unknown>): void {
     } else {
       keys(execution, ['kind', 'reasonCode']);
       oneOf(execution.kind, ['unverified']);
-      id(execution.reasonCode);
+      reasonCode(execution.reasonCode);
     }
   } else if (type === 'provider_spawn_binding') {
     if (body.kind === 'process_binding') {
       keys(body, ['kind', 'pid', 'startIdentity', 'containment']);
-      positive(body.pid);
+      pid(body.pid);
       id(body.startIdentity);
       const containment = object(body.containment);
       if (containment.kind === 'unknown') keys(containment, ['kind']);
       else if (containment.kind === 'process_group') {
         keys(containment, ['kind', 'pgid', 'evidenceRef']);
-        positive(containment.pgid);
+        pid(containment.pgid);
         id(containment.evidenceRef);
       } else {
         keys(containment, ['kind', 'identity', 'evidenceRef']);
@@ -244,7 +252,7 @@ function validateSpawn(type: string, body: Record<string, unknown>): void {
   } else if (type === 'provider_spawn_observation') {
     if (body.kind === 'unknown') {
       keys(body, ['kind', 'reasonCode']);
-      id(body.reasonCode);
+      reasonCode(body.reasonCode);
     } else {
       keys(body, ['kind', 'evidenceRef']);
       oneOf(body.kind, [

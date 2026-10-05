@@ -42,6 +42,56 @@ function spawn(type = 'provider_spawn_intent'): JournalEntry {
 }
 
 describe('D1 journal record snapshot', () => {
+  it('matches existing projection text/reason/PID bounds rather than deferring overflow to SQL', () => {
+    const binding = spawn('provider_spawn_binding');
+    const body = {
+      kind: 'process_binding',
+      pid: 2_147_483_647,
+      startIdentity: 'x'.repeat(200),
+      containment: { kind: 'unknown' },
+    };
+    expect(freezeJournalEntry({ ...binding, body }, 4096).entry.body.pid).toBe(2_147_483_647);
+    expect(() =>
+      freezeJournalEntry({ ...binding, body: { ...body, pid: 2_147_483_648 } }, 4096)
+    ).toThrow('invalid_entry');
+    expect(() =>
+      freezeJournalEntry({ ...binding, body: { ...body, startIdentity: 'x'.repeat(201) } }, 4096)
+    ).toThrow('invalid_entry');
+    expect(() =>
+      freezeJournalEntry(
+        {
+          ...binding,
+          body: {
+            ...body,
+            containment: { kind: 'process_group', pgid: 2_147_483_648, evidenceRef: 'fixture' },
+          },
+        },
+        4096
+      )
+    ).toThrow('invalid_entry');
+    const observation = spawn('provider_spawn_observation');
+    expect(
+      freezeJournalEntry(
+        { ...observation, body: { kind: 'unknown', reasonCode: 'x'.repeat(100) } },
+        4096
+      ).entry.body.kind
+    ).toBe('unknown');
+    for (const reasonCode of ['x'.repeat(101), 'Uppercase', 'path/reason', 'free form']) {
+      expect(() =>
+        freezeJournalEntry({ ...observation, body: { kind: 'unknown', reasonCode } }, 4096)
+      ).toThrow('invalid_entry');
+    }
+    const original = spawn();
+    expect(() =>
+      freezeJournalEntry(
+        {
+          ...original,
+          body: { ...original.body, execution: { kind: 'unverified', reasonCode: 'Uppercase' } },
+        },
+        4096
+      )
+    ).toThrow('invalid_entry');
+  });
   it('detaches and deeply freezes data, canonicalizes key order, and preserves replay fields', () => {
     const original = entry();
     original.body = { nested: { z: 1, a: ['x'] } };
