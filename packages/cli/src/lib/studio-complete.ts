@@ -253,27 +253,27 @@ export function ensureMcpJson(
   if (existsSync(mcpPath)) {
     const existing = readJson(mcpPath);
     if (!existing) return { label: '.mcp.json', status: 'exists', detail: 'unparseable, skipping' };
-    const servers = (existing.mcpServers as Record<string, unknown> | undefined) || {};
-    if (servers.inkwell) {
-      if (!servers.inkmail) {
-        const channelPath = resolveChannelPluginPath(pluginBase);
-        if (channelPath) {
-          const updated = {
-            ...existing,
-            mcpServers: { ...servers, inkmail: { command: 'npx', args: ['tsx', channelPath] } },
-          };
-          writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-          return { label: '.mcp.json', status: 'updated', detail: 'added inkmail channel plugin' };
-        }
+    // Both entries in one pass, every other server kept: a file with neither
+    // that gained only inkwell read complete to the checklist, so nothing
+    // came back for inkmail (Lumen, PR #752).
+    const servers = { ...((existing.mcpServers as Record<string, unknown> | undefined) || {}) };
+    const added: string[] = [];
+    if (!servers.inkwell) {
+      servers.inkwell = { type: 'http', url: `${serverUrl}/mcp` };
+      added.push('inkwell server');
+    }
+    if (!servers.inkmail) {
+      const channelPath = resolveChannelPluginPath(pluginBase);
+      if (channelPath) {
+        servers.inkmail = { command: 'npx', args: ['tsx', channelPath] };
+        added.push('inkmail channel plugin');
       }
+    }
+    if (added.length === 0) {
       return { label: '.mcp.json', status: 'exists', detail: 'inkwell server configured' };
     }
-    const updated = {
-      ...existing,
-      mcpServers: { ...servers, inkwell: { type: 'http', url: `${serverUrl}/mcp` } },
-    };
-    writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-    return { label: '.mcp.json', status: 'updated', detail: 'added inkwell server' };
+    writeFileSync(mcpPath, JSON.stringify({ ...existing, mcpServers: servers }, null, 2) + '\n');
+    return { label: '.mcp.json', status: 'updated', detail: `added ${added.join(' and ')}` };
   }
   writeFileSync(
     mcpPath,

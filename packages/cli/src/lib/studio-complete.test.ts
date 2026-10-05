@@ -419,6 +419,23 @@ describe("completeStudio — a repo that is not Inkwell gets inkmail from the CL
     expect(mcp.mcpServers.trusted).toEqual({ command: 'node', args: ['trusted.js'] });
   });
 
+  it('a root whose .mcp.json has only other servers gains inkwell and inkmail in one pass (Lumen, PR #752)', async () => {
+    // Adding inkwell alone left the checklist complete, so the next launch
+    // never asked again and the session had no inbox push.
+    writeFileSync(
+      join(main, '.mcp.json'),
+      JSON.stringify({ mcpServers: { other: { command: 'node', args: ['other.js'] } } })
+    );
+    const report = await completeStudio(main, { ...baseOptions(), mainRoot: null });
+    expect(statusOf(report.steps, '.mcp.json')).toBe('updated');
+    const mcp = readJson(join(main, '.mcp.json')) as {
+      mcpServers: Record<string, { args?: string[]; url?: string }>;
+    };
+    expect(mcp.mcpServers.inkwell?.url).toBe('http://localhost:3001/mcp');
+    expect(mcp.mcpServers.inkmail?.args).toEqual(['tsx', plugin]);
+    expect(mcp.mcpServers.other).toEqual({ command: 'node', args: ['other.js'] });
+  });
+
   it("a studio of that repo names the CLI checkout's plugin, never its own copy", async () => {
     mkdirSync(join(studio, 'packages', 'channel-plugin'), { recursive: true });
     writeFileSync(join(studio, 'packages', 'channel-plugin', 'index.ts'), '// untrusted');
