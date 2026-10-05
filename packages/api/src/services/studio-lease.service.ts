@@ -546,6 +546,12 @@ export class StudioLeaseService {
    *
    * FAILS CLOSED: a liveness read that errors reports LIVE — "could not
    * verify the holder is gone" must never authorize a release or reclaim.
+   *
+   * The run registry is asked again AFTER the read (Lumen, PR #724): a run
+   * that registers while the SELECT is in flight, a resumed turn, is
+   * in-process truth the row snapshot cannot show. Callers that mutate on the
+   * answer still fence the mutation itself; this only stops the answer being
+   * stale on arrival.
    */
   async isSessionLive(sessionId: string, userId?: string): Promise<boolean> {
     if (hasActiveRun(sessionId)) return true;
@@ -555,6 +561,7 @@ export class StudioLeaseService {
       .eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
+    if (hasActiveRun(sessionId)) return true;
     if (error) {
       logger.warn('[StudioLease] Liveness read failed — treating session as LIVE (fail closed)', {
         sessionId,
@@ -648,6 +655,8 @@ export class StudioLeaseService {
     let query = this.supabase.from('sessions').select('cli_turn_at').eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
+    // Asked again after the read, as in isSessionLive (PR #724).
+    if (hasActiveRun(sessionId)) return true;
     if (error) {
       logger.warn('[StudioLease] Turn read failed — treating session as MID-TURN (fail closed)', {
         sessionId,

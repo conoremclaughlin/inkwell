@@ -62,7 +62,7 @@ export const triggerAgentSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Convenience studio routing hint (e.g., "main" for shared main studio, or a studio name)'
+      'Convenience studio routing hint: "main" for the shared main studio, or a studio `slug` as list_studios and get_studio return it (not `worktreeFolder`). studioId is unambiguous and preferred when you have it.'
     ),
   recipientSessionId: z
     .string()
@@ -125,6 +125,15 @@ export async function handleTriggerAgent(
       senderIsBridge = false;
     }
 
+    // A wake-source tag is server-issued accounting for the no-progress
+    // breaker (wake-source-breaker.ts), never caller data. The tag is signed
+    // and the hook verifies it; dropping the key here keeps a caller's copy
+    // out of the payload altogether, as send_to_inbox does.
+    const callerMetadata =
+      args.metadata && typeof args.metadata === 'object'
+        ? Object.fromEntries(Object.entries(args.metadata).filter(([key]) => key !== 'wakeSource'))
+        : args.metadata;
+
     const payload: AgentTriggerPayload = {
       fromSlug: args.fromSlug,
       toSlug: args.toSlug,
@@ -144,11 +153,12 @@ export async function handleTriggerAgent(
       ...(args.recipientSessionId || args.studioId || args.studioHint
         ? { explicitRecipientTarget: true }
         : {}),
+      ...(args.recipientSessionId ? { explicitRecipientSession: true } : {}),
       // Caller-repo inference degrades silently to refuse-and-hold on any
       // dispatch path that forgets this (Lumen, PR #514 round 1).
       ...senderRoutingContext(senderIsBridge),
       ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
-      metadata: args.metadata,
+      metadata: callerMetadata,
     };
 
     const result = gateway.dispatchTrigger(payload);

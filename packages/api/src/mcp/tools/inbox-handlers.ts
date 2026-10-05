@@ -32,6 +32,11 @@ import {
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { boundThreadTitle } from './thread-bounds.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { normaliseSessionKey } from '../../services/sessions/session-key';
+import {
+  resolveExplicitAddress,
+  type ResolvedExplicitAddress,
+} from '../../services/sessions/explicit-address';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types';
@@ -59,6 +64,15 @@ import {
   handleGetThreadMessages,
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
+import { readTieRemainder } from './tie-completion.js';
+import { ThreadKeyTakenError } from './thread-key-taken.js';
+import {
+  assertInklingThreadAllowed,
+  INKLING_CONVERSATION_MARK,
+} from '../../services/inklings/inkling-thread-gate.js';
+import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
+import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
+import { linkReaderForPrincipal } from './thread-link-views.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -108,7 +122,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(100)
     .optional()
     .describe(
-      'Recipient studio slug for routing (matches studios.slug). Pass "main" to target the user\'s root-repo studio. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
+      'Recipient studio slug for routing: the `slug` field list_studios and get_studio return, not `worktreeFolder` (the two often differ). Pass "main" to target the user\'s root-repo studio. recipientStudioId is unambiguous and preferred when you have it. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
     ),
   recipientStudioHint: z
     .enum(['main'])
@@ -116,15 +130,34 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .describe(
       'DEPRECATED — use recipientStudioSlug instead. Kept for backward compatibility with callers that pass the literal string "main".'
     ),
+  sessionKey: z
+    .string()
+    .min(1)
+    .max(80)
+    .optional()
+    .describe(
+      'Route to the recipient session carrying this key (e.g., "wren:inkwell:main"), ahead of thread routing. ' +
+        'Case-insensitive. The recipient must have a live session with this key (list_sessions shows keys); single-recipient sends only.'
+    ),
   sessionAlias: z
     .string()
     .min(1)
-    .max(64)
+    .max(80)
+    .optional()
+    .describe('Deprecated spelling of sessionKey; use sessionKey.'),
+  relatedArtifactUri: z
+    .string()
     .optional()
     .describe(
-      'Target a recipient session by alias (e.g., "main", "review"). The recipient agent must have an active session with this alias.'
+      'Related artifact URI. With a threadKey, it links the thread to the artifact, as one of `links`; an unknown URI is reported under links.skipped rather than refusing the send.'
     ),
-  relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
+  links: z
+    .array(z.string().min(3).max(500))
+    .max(SEND_LINKS_MAX)
+    .optional()
+    .describe(
+      'Thread only: link the thread to these threads or library artifacts as the message is sent, e.g. ["spec:live-agent-surfaces", "ink://specs/thread-media"]. A target the thread already links is left as it is. An unknown ink:// URI or malformed key refuses the send before anything is stored. Read links with list_thread_links.'
+    ),
   metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
@@ -366,9 +399,33 @@ export interface InternalSendContext {
    * The trusted server-side sender. A system sender may leave `workspaceId`
    * null: the message lands in the first recipient's workspace, as a
    * watchdog or heartbeat send always has. This context is the ONLY way a
-   * message is authored as the system — no tool call reaches it.
+   * message is authored as the system — no tool call reaches it. Absent, the
+   * sender resolves as it does for a tool call.
    */
-  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  sender?: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  /**
+   * A wake source's tag (wake-source-breaker.ts): the trigger handler counts
+   * the wake's completed turn against it. Written to the message metadata
+   * only from here; a `wakeSource` a caller puts in `metadata` is dropped, so
+   * a tool call can never count attempts against someone else's source.
+   */
+  wakeSource?: WakeSourceTag;
+  /**
+   * The send must create its thread, never join one. When the key is already
+   * taken, whether before the send or by a concurrent request racing it, the
+   * send throws ThreadKeyTakenError before any participant or message is
+   * written. POST /api/admin/threads sets this for a client-identified create,
+   * so a retried submission can never add anyone to a conversation.
+   */
+  createOnly?: boolean;
+  /**
+   * What a client-identified create intends (its clientMessageId, recipients
+   * and title). Written to `inbox_threads.metadata.createIntent` by the same
+   * insert that creates the thread, so before any participant exists. A
+   * retry may adopt a conversation its own interrupted create left only when
+   * this record matches it exactly (POST /api/admin/threads).
+   */
+  createIntent?: Record<string, unknown>;
 }
 
 export async function handleSendToInbox(
@@ -392,7 +449,8 @@ export async function handleSendToInbox(
     recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
-    metadata = {},
+    links,
+    metadata: callerMetadata = {},
     expiresAt,
     triggerType,
     triggerSummary,
@@ -401,6 +459,31 @@ export async function handleSendToInbox(
     triggerAgents,
     sessionAlias,
   } = parsed;
+
+  // The wake-source tag is server-set only (InternalSendContext.wakeSource).
+  const metadata: Record<string, unknown> = { ...callerMetadata };
+  delete metadata.wakeSource;
+  if (internal?.wakeSource) metadata.wakeSource = internal.wakeSource;
+
+  // One spelling on the wire: sessionKey, with sessionAlias accepted for a
+  // release. Normalised here so the key the resolver sees is the key the
+  // setter stored; a key it cannot normalise is refused before anything is
+  // written or triggered.
+  let sessionKey: string | undefined;
+  const sessionKeyInput = parsed.sessionKey ?? sessionAlias;
+  if (sessionKeyInput !== undefined) {
+    const normalised = normaliseSessionKey(sessionKeyInput);
+    if (!normalised.ok) throw new Error(normalised.reason);
+    // A blank key is not "no key": the caller asked to target a session and
+    // named none. Sending anyway would dispatch without its target and
+    // report success (Lumen, #717 review).
+    if (normalised.value === '') {
+      throw new Error(
+        'sessionKey must not be blank: pass a key such as "wren:inkwell:main", or omit it'
+      );
+    }
+    sessionKey = normalised.value;
+  }
 
   // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).
   // Downstream code treats these uniformly — both resolve via resolveStudioHint,
@@ -417,12 +500,18 @@ export async function handleSendToInbox(
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
+  // A link is made by a thread; without one there is nothing to link from,
+  // and the non-thread path would deliver the message and drop the links
+  // (Lumen, #737).
+  if (links?.length && !threadKey) {
+    throw new Error('threadKey is required when using links[]: links are made by a thread');
+  }
   if (
     recipients &&
-    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionAlias)
+    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionKey)
   ) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionAlias are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionKey are only valid for single-recipient sends'
     );
   }
 
@@ -452,7 +541,30 @@ export async function handleSendToInbox(
       'permission_grant messages cannot be sent by agents — must originate from platform verification'
     );
   }
-  const effectiveRecipientSessionId = recipientSessionId;
+  // The session the send delivers to, when the caller named one. Replaced by
+  // the checked id once the recipient is resolved (T4): a sessionKey becomes
+  // the id it resolved to, so queued delivery keeps that session.
+  let effectiveRecipientSessionId = recipientSessionId;
+  let explicitAddress: ResolvedExplicitAddress | null = null;
+  // The studio a key lookup is scoped to: the one the caller named, if any.
+  const keyStudioScope = async (): Promise<string | undefined> => {
+    if (!sessionKey) return undefined;
+    if (recipientStudioId) return recipientStudioId;
+    if (!recipientStudioSlugOrHint || !recipientSlug) return undefined;
+    try {
+      return (
+        (await resolveStudioHint(
+          supabase,
+          resolved.user.id,
+          recipientStudioSlugOrHint,
+          recipientSlug,
+          getRequestContext()?.repoRoot
+        )) || undefined
+      );
+    } catch {
+      return undefined;
+    }
+  };
 
   // Default trigger behavior:
   // All message types trigger by default. Most agents don't have heartbeats,
@@ -597,6 +709,21 @@ export async function handleSendToInbox(
       sender.kind === 'sb' ? sender.sbSlug : sender.kind === 'system' ? 'system' : 'user';
     const senderSb: SbPrincipal | null = sender.kind === 'sb' ? sender : null;
     const recipientSbs = await resolveSbsInWorkspace(supabase, workspaceId, allRecipients);
+
+    // A caller-named session (spec session-lifecycle-model §3, T4) is checked
+    // here, before the thread, its participant rows or the message exist, so
+    // a wrong address stores nothing.
+    if (recipientSlug && (recipientSessionId || sessionKey)) {
+      explicitAddress = await resolveExplicitAddress(supabase, {
+        userId: resolved.user.id,
+        recipientSlug,
+        recipientSbId: recipientSbs[0]?.sbId ?? null,
+        recipientSessionId,
+        sessionKey,
+        studioId: await keyStudioScope(),
+      });
+      effectiveRecipientSessionId = explicitAddress?.sessionId;
+    }
     const participantSbs: SbPrincipal[] = [];
     for (const sb of senderSb ? [senderSb, ...recipientSbs] : recipientSbs) {
       if (!participantSbs.some((p) => p.sbId === sb.sbId)) participantSbs.push(sb);
@@ -605,11 +732,40 @@ export async function handleSendToInbox(
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
 
+    // A conversation with an inkling is only between its owner and the
+    // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
+    // anything is written. An inkling's own send wakes nobody (`quiet`).
+    let inklingVerdict = await assertInklingThreadAllowed(supabase, {
+      sender,
+      participantSbs,
+      existingThreadId: existingThread?.id ?? null,
+    });
+
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.
     if (!existingThread) {
       prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, workspaceId, threadKey);
     }
+
+    // Links the send carries (thread:thread-links), resolved before anything
+    // is written so a bad target stores nothing. relatedArtifactUri joins
+    // them: this path used to accept it and drop it.
+    const sendLinks =
+      (links && links.length > 0) || relatedArtifactUri
+        ? await resolveSendLinks(
+            supabase,
+            {
+              workspaceId,
+              callerUserId: sender.kind === 'system' ? resolved.user.id : sender.userId,
+              // The sender links only what it may see, the same rule as
+              // link_thread (thread-link-views).
+              reader: await linkReaderForPrincipal(supabase, workspaceId, sender),
+            },
+            threadKey,
+            links ?? [],
+            relatedArtifactUri
+          )
+        : null;
 
     // ── Reply semantics ──
     // A closed thread accepts replies. Closed is a work-state signal, not a
@@ -620,6 +776,13 @@ export async function handleSendToInbox(
     // If sender is NOT a participant, auto-add them (join-on-send).
 
     // Find or create thread
+    // Written with the thread row only if this send creates it. An inkling
+    // conversation is marked in that same insert, so a send that loses the
+    // race to create it sees what it is before any member row is written.
+    const newThreadMetadata: Record<string, unknown> = {
+      ...(internal?.createIntent ? { createIntent: internal.createIntent } : {}),
+      ...(inklingVerdict.inklingConversation ? { [INKLING_CONVERSATION_MARK]: true } : {}),
+    };
     let thread = await findOrCreateThread(supabase, {
       workspaceId,
       threadKey,
@@ -627,7 +790,25 @@ export async function handleSendToInbox(
       title: subject || null,
       participants: participantSbs,
       person: sender.kind === 'user' ? sender : null,
+      ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
     });
+    // A create-only send stops here when the key was already taken, whether
+    // before this send or by a concurrent request between the lookup above
+    // and the insert. Nothing has been written yet (findOrCreateThread writes
+    // only for a thread it created), and nothing may be.
+    if (internal?.createOnly && !thread.isNew) throw new ThreadKeyTakenError(threadKey);
+    // A send that found no conversation but did not create this one lost the
+    // race to another send. It was judged as a creator, against no members,
+    // so it is judged again against the conversation that now exists, before
+    // it writes anything: no send joins a conversation it was not judged
+    // against.
+    if (!existingThread && !thread.isNew) {
+      inklingVerdict = await assertInklingThreadAllowed(supabase, {
+        sender,
+        participantSbs,
+        existingThreadId: thread.id,
+      });
+    }
 
     // Cross-studio self-message: sender targets themselves in a different studio.
     // There is only ONE participant row per principal — stamping session_id
@@ -648,7 +829,7 @@ export async function handleSendToInbox(
           ? null
           : isSender
             ? senderSessionId
-            : recipientSessionId || null;
+            : effectiveRecipientSessionId || null;
 
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
         .select('sb_id, session_id')
@@ -792,6 +973,25 @@ export async function handleSendToInbox(
       throw new Error(`Failed to send thread message: ${tmError.message}`);
     }
 
+    const sendLinkReport =
+      sendLinks && (sendLinks.targets.length > 0 || sendLinks.skipped.length > 0)
+        ? {
+            ...(await writeSendLinks(supabase, {
+              workspaceId,
+              sourceThreadId: thread.id,
+              messageId: threadMessage.id,
+              linkedBy:
+                sender.kind === 'sb'
+                  ? { kind: 'sb', sbId: sender.sbId }
+                  : sender.kind === 'user'
+                    ? { kind: 'user', userId: sender.userId }
+                    : { kind: 'system' },
+              targets: sendLinks.targets,
+            })),
+            ...(sendLinks.skipped.length > 0 ? { skipped: sendLinks.skipped } : {}),
+          }
+        : null;
+
     // Update thread updated_at
     await threadTable(supabase, 'inbox_threads')
       .update({ updated_at: new Date().toISOString() })
@@ -815,7 +1015,7 @@ export async function handleSendToInbox(
     const explicitSelfTarget = !!(
       senderSlug &&
       allRecipients.includes(senderSlug) &&
-      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionKey)
     );
     if (sender.kind !== 'system' && threadMessage?.id && !explicitSelfTarget) {
       await advanceThreadReadPointer(supabase, {
@@ -835,7 +1035,7 @@ export async function handleSendToInbox(
     // resolution — same predicate as the sender-advance exemption above.
     const selfStudioTarget = explicitSelfTarget;
 
-    if (trigger !== false && !missingSenderSession) {
+    if (trigger !== false && !missingSenderSession && !inklingVerdict.quiet) {
       // Dispatch operates on the SB participants only (§7): a person's row
       // never changes the routing, and a person's reply wakes every SB.
       const currentParticipants = await getParticipants(supabase, thread.id);
@@ -913,6 +1113,18 @@ export async function handleSendToInbox(
     }
     for (const t of agentsToTrigger) routingById.set(t.sbId, t);
     const routingSet = [...routingById.values()];
+    // The wake prompt prints a trigger's metadata. A person's retry key and
+    // the record of what their create asked for are the stored message's,
+    // not the recipient's: an SB that echoed clientMessageId on its own send
+    // in this thread would have that send refused by the unique index.
+    const wakeMetadata: Record<string, unknown> = { ...rawMeta };
+    delete wakeMetadata.clientMessageId;
+    if (wakeMetadata.pcp && typeof wakeMetadata.pcp === 'object') {
+      const inkForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
+      delete inkForWake.createRequest;
+      if (Object.keys(inkForWake).length > 0) wakeMetadata.pcp = inkForWake;
+      else delete wakeMetadata.pcp;
+    }
     const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
@@ -1010,7 +1222,7 @@ export async function handleSendToInbox(
         // recipientSessionId is a continuity hint, never an overwrite.
         const explicitRecipientTarget = !!(
           isAddressedRecipient &&
-          (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
+          (recipientSessionId || sessionKey || recipientStudioId || recipientStudioSlugOrHint)
         );
         const payload: AgentTriggerPayload = {
           fromSlug: triggerSenderId,
@@ -1031,7 +1243,10 @@ export async function handleSendToInbox(
           // metadata.pcp.sender.studioId — never caller body data.
           ...senderRoutingContext(senderIsBridge),
           ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
-          ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
+          ...(isAddressedRecipient && (recipientSessionId || sessionKey)
+            ? { explicitRecipientSession: true }
+            : {}),
+          ...(isAddressedRecipient && sessionKey ? { sessionKey } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
@@ -1042,7 +1257,7 @@ export async function handleSendToInbox(
           // the boundary where their intent enters the gateway, instead of the
           // trigger handler rediscovering it from metadata.
           ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
-          ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
+          ...(Object.keys(wakeMetadata).length > 0 ? { metadata: wakeMetadata } : {}),
         };
 
         // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
@@ -1108,8 +1323,15 @@ export async function handleSendToInbox(
             // Distinct from `warning` below so a key problem and a session
             // problem can both be reported on the same send.
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
+            ...(sendLinkReport ? { links: sendLinkReport } : {}),
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
+            ...explicitAddressEcho(explicitAddress),
+            // Who this send actually routed to, which can be wider than
+            // `recipients` (a reply wakes the thread's other SBs too), and
+            // whether each was meant to be woken. A send receipt judges
+            // delivery from this, never from the requested list.
+            dispatched: routingSet.map((t) => ({ sbSlug: t.sbSlug, wake: wakeIds.has(t.sbId) })),
             messageType,
             priority,
             triggered: triggeredAgents,
@@ -1127,6 +1349,23 @@ export async function handleSendToInbox(
   }
 
   // ── Legacy path: simple inbox message (no threadKey) ──
+  // Canonical identity UUIDs for recipient and sender.
+  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
+  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
+
+  // A caller-named session is checked before anything is stored (T4).
+  if (recipientSessionId || sessionKey) {
+    explicitAddress = await resolveExplicitAddress(supabase, {
+      userId: resolved.user.id,
+      recipientSlug: recipientSlug!,
+      recipientSbId,
+      recipientSessionId,
+      sessionKey,
+      studioId: await keyStudioScope(),
+    });
+    effectiveRecipientSessionId = explicitAddress?.sessionId;
+  }
+
   const hasRoutingAnchor = Boolean(
     effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
   );
@@ -1166,10 +1405,6 @@ export async function handleSendToInbox(
       },
     },
   };
-
-  // Resolve canonical identity UUIDs for sender and recipient
-  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
-  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
 
   const { data: message, error } = await supabase
     .from('agent_inbox')
@@ -1228,8 +1463,15 @@ export async function handleSendToInbox(
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       recipientSessionId: effectiveRecipientSessionId,
+      // Caller intent, as on the thread path: the unthreaded path never
+      // carried it, so a caller-named session reached routing as an inferred
+      // hint (T4).
+      ...(effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
+        ? { explicitRecipientTarget: true }
+        : {}),
+      ...(effectiveRecipientSessionId ? { explicitRecipientSession: true } : {}),
       ...senderRoutingContext(senderIsBridge),
-      sessionAlias,
+      sessionKey,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
       // v18 S3: explicit spawn admission for strategy dispatches (see the
@@ -1275,6 +1517,7 @@ export async function handleSendToInbox(
           priority,
           threadKey: null,
           recipientSessionId: effectiveRecipientSessionId || null,
+          ...explicitAddressEcho(explicitAddress),
           recipientStudioId: recipientStudioId || null,
           recipientStudioSlug: recipientStudioSlugOrHint || null,
           createdAt: message.created_at,
@@ -1295,6 +1538,20 @@ export async function handleSendToInbox(
         }),
       },
     ],
+  };
+}
+
+/**
+ * The session a caller-named address resolved to, echoed on the send's
+ * result (spec session-lifecycle-model §3 rung 2): the caller sees which
+ * session its key named, and that an ended one will be reopened.
+ */
+function explicitAddressEcho(address: ResolvedExplicitAddress | null): Record<string, unknown> {
+  if (!address) return {};
+  return {
+    resolvedSessionId: address.sessionId,
+    addressedBy: address.via,
+    ...(address.ended ? { reopens: true } : {}),
   };
 }
 
@@ -1325,6 +1582,8 @@ export async function findOrCreateThread(
     title: string | null;
     participants: SbPrincipal[];
     person?: UserPrincipal | null;
+    /** Written with the new thread row only; an existing thread is not touched. */
+    metadata?: Record<string, unknown>;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
@@ -1352,6 +1611,7 @@ export async function findOrCreateThread(
       created_by_sb_id: creator.kind === 'sb' ? creator.sbId : null,
       created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: boundThreadTitle(opts.title),
+      ...(opts.metadata ? { metadata: opts.metadata } : {}),
     })
     .select()
     .single();
@@ -1670,28 +1930,29 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // siblings. Extend the page with every remaining row that shares the
   // boundary timestamp so a tie group is always delivered whole.
   let page = fetched ?? [];
-  // Only ack-capable shapes (no narrowing filters) extend: a filtered page
-  // never advances the pointer OR acks, so completion there would smuggle
-  // rows the caller filtered OUT (urgent-only limit:1 returned a normal
-  // task request sharing the boundary timestamp — Lumen #504 r3 P2).
-  const tieCompletionApplies = oldestFirst && !priority && !messageType && !since;
+  // Narrowing filters don't extend: completion there would smuggle in rows
+  // the caller filtered OUT (urgent-only limit:1 returned a normal task
+  // request sharing the boundary timestamp — Lumen #504 r3 P2). `since` is a
+  // range, not a narrowing filter: every row sharing the boundary timestamp
+  // is past it too. A `since` pager (ink wait --follow) needs the group whole
+  // as much as the pointer does: it pages on the last timestamp it read
+  // (Lumen, #702). The remainder is paged by id (readTieRemainder), since one
+  // select stops at max_rows without saying so.
+  const tieCompletionApplies = oldestFirst && !priority && !messageType;
   if (tieCompletionApplies && page.length >= limit && page.length > 0) {
-    const boundary = (page[page.length - 1] as { created_at: string }).created_at;
-    const pageIds = page.map((m) => (m as { id: string }).id);
-    let tieQuery = supabase
-      .from('agent_inbox')
-      .select('*')
-      .eq('recipient_user_id', resolved.user.id)
-      .eq('created_at', boundary)
-      .not('id', 'in', `(${pageIds.join(',')})`)
-      .order('id', { ascending: true });
-    if (sbSlug) tieQuery = tieQuery.eq('recipient_agent_id', sbSlug);
-    tieQuery = tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
-    const { data: siblings, error: tieError } = await tieQuery;
-    if (tieError) {
-      throw new Error(`Failed to complete timestamp tie group: ${tieError.message}`);
-    }
-    if (siblings?.length) page = [...page, ...siblings];
+    const last = page[page.length - 1] as { created_at: string; id: string };
+    const siblings = await readTieRemainder((afterId, withCount) => {
+      let tieQuery = supabase
+        .from('agent_inbox')
+        .select('*', withCount ? { count: 'exact' } : undefined)
+        .eq('recipient_user_id', resolved.user.id)
+        .eq('created_at', last.created_at)
+        .gt('id', afterId)
+        .order('id', { ascending: true });
+      if (sbSlug) tieQuery = tieQuery.eq('recipient_agent_id', sbSlug);
+      return tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+    }, last.id);
+    if (siblings.length) page = [...page, ...(siblings as typeof page)];
   }
 
   // Display contract stays newest-first; only the SELECTION flipped.

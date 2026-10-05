@@ -1521,14 +1521,18 @@ export type Database = {
           created_at: string;
           delivered_at: string | null;
           destination: string | null;
+          drain_owned: boolean;
           episode_closed_at: string | null;
           episode_key: string;
           failed_beats: number;
+          held_until: string | null;
+          hold_reason: string | null;
           id: string;
           kind: string;
           last_attempt_at: string | null;
           last_error: string | null;
           next_attempt_at: string | null;
+          payload: Json | null;
           reminder_id: string;
           status: string;
           updated_at: string;
@@ -1539,14 +1543,18 @@ export type Database = {
           created_at?: string;
           delivered_at?: string | null;
           destination?: string | null;
+          drain_owned?: boolean;
           episode_closed_at?: string | null;
           episode_key: string;
           failed_beats?: number;
+          held_until?: string | null;
+          hold_reason?: string | null;
           id?: string;
           kind: string;
           last_attempt_at?: string | null;
           last_error?: string | null;
           next_attempt_at?: string | null;
+          payload?: Json | null;
           reminder_id: string;
           status?: string;
           updated_at?: string;
@@ -1557,14 +1565,18 @@ export type Database = {
           created_at?: string;
           delivered_at?: string | null;
           destination?: string | null;
+          drain_owned?: boolean;
           episode_closed_at?: string | null;
           episode_key?: string;
           failed_beats?: number;
+          held_until?: string | null;
+          hold_reason?: string | null;
           id?: string;
           kind?: string;
           last_attempt_at?: string | null;
           last_error?: string | null;
           next_attempt_at?: string | null;
+          payload?: Json | null;
           reminder_id?: string;
           status?: string;
           updated_at?: string;
@@ -3276,6 +3288,7 @@ export type Database = {
           metadata: Json | null;
           next_run_at: string;
           run_count: number | null;
+          run_during_quiet_hours: boolean;
           sb_id: string | null;
           status: string;
           studio_hint: string | null;
@@ -3295,6 +3308,7 @@ export type Database = {
           metadata?: Json | null;
           next_run_at: string;
           run_count?: number | null;
+          run_during_quiet_hours?: boolean;
           sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
@@ -3314,6 +3328,7 @@ export type Database = {
           metadata?: Json | null;
           next_run_at?: string;
           run_count?: number | null;
+          run_during_quiet_hours?: boolean;
           sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
@@ -3930,6 +3945,8 @@ export type Database = {
           active_thread_key: string | null;
           agent_id: string | null;
           alias: string | null;
+          archived_at: string | null;
+          archived_reason: string | null;
           backend: string | null;
           backend_session_id: string | null;
           claude_session_id: string | null;
@@ -3972,6 +3989,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
@@ -4014,6 +4033,8 @@ export type Database = {
           active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
+          archived_at?: string | null;
+          archived_reason?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
@@ -5225,6 +5246,68 @@ export type Database = {
           },
         ];
       };
+      thread_message_reactions: {
+        Row: {
+          created_at: string;
+          emoji: string;
+          id: string;
+          message_id: string;
+          reactor_sb_id: string | null;
+          reactor_user_id: string | null;
+          thread_id: string;
+          workspace_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          emoji: string;
+          id?: string;
+          message_id: string;
+          reactor_sb_id?: string | null;
+          reactor_user_id?: string | null;
+          thread_id: string;
+          workspace_id: string;
+        };
+        Update: {
+          created_at?: string;
+          emoji?: string;
+          id?: string;
+          message_id?: string;
+          reactor_sb_id?: string | null;
+          reactor_user_id?: string | null;
+          thread_id?: string;
+          workspace_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'thread_message_reactions_message_id_fkey';
+            columns: ['message_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_thread_messages';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_reactor_user_id_fkey';
+            columns: ['reactor_user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_sb_workspace_fkey';
+            columns: ['reactor_sb_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
+            foreignKeyName: 'thread_message_reactions_thread_workspace_fkey';
+            columns: ['thread_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+        ];
+      };
       trusted_users: {
         Row: {
           added_at: string | null;
@@ -5490,6 +5573,80 @@ export type Database = {
         };
         Relationships: [];
       };
+      wake_source_breakers: {
+        Row: {
+          created_at: string;
+          id: string;
+          last_counted_at: string | null;
+          last_fingerprint: string | null;
+          last_notice_at: string | null;
+          last_tripped_at: string | null;
+          no_progress_count: number;
+          owner_sb_id: string | null;
+          revision: string;
+          source: string;
+          task_group_id: string | null;
+          trip_count: number;
+          tripped_at: string | null;
+          tripped_fingerprint: string | null;
+          updated_at: string;
+          user_id: string;
+          version: number;
+          work_id: string;
+          work_kind: string;
+        };
+        Insert: {
+          created_at?: string;
+          id?: string;
+          last_counted_at?: string | null;
+          last_fingerprint?: string | null;
+          last_notice_at?: string | null;
+          last_tripped_at?: string | null;
+          no_progress_count?: number;
+          owner_sb_id?: string | null;
+          revision?: string;
+          source: string;
+          task_group_id?: string | null;
+          trip_count?: number;
+          tripped_at?: string | null;
+          tripped_fingerprint?: string | null;
+          updated_at?: string;
+          user_id: string;
+          version?: number;
+          work_id: string;
+          work_kind: string;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          last_counted_at?: string | null;
+          last_fingerprint?: string | null;
+          last_notice_at?: string | null;
+          last_tripped_at?: string | null;
+          no_progress_count?: number;
+          owner_sb_id?: string | null;
+          revision?: string;
+          source?: string;
+          task_group_id?: string | null;
+          trip_count?: number;
+          tripped_at?: string | null;
+          tripped_fingerprint?: string | null;
+          updated_at?: string;
+          user_id?: string;
+          version?: number;
+          work_id?: string;
+          work_kind?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'wake_source_breakers_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       workspace_members: {
         Row: {
           created_at: string | null;
@@ -5581,7 +5738,39 @@ export type Database = {
       };
     };
     Views: {
-      [_ in never]: never;
+      heartbeat_notifications_drain_eligible: {
+        Row: {
+          created_at: string | null;
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          kind: string | null;
+          next_attempt_at: string | null;
+          payload: Json | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
+      heartbeat_notifications_drain_users: {
+        Row: {
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
+      heartbeat_notifications_owed_recoveries: {
+        Row: {
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          recovered_at: string | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
       swap_memory_embedding: {
@@ -5906,6 +6095,8 @@ export type Database = {
       redeem_kindle_token: {
         Args: {
           p_identity: Json;
+          p_awaken_cap?: number;
+          p_kindle_method?: string;
           p_new_user_id: string;
           p_token: string;
           p_workspace_id: string;
@@ -6180,6 +6371,8 @@ export type Database = {
           p_session_id?: string | null;
           p_reclaim?: boolean;
           p_reason?: string | null;
+          p_fence_turn_epoch?: boolean;
+          p_expected_turn_epoch?: string | null;
         };
         Returns: Json;
       };

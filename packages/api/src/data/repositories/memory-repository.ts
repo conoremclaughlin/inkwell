@@ -3,6 +3,8 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from '../../services/sessions/session-key';
+import { parseArchivedReason } from '../../services/sessions/session-archive';
 import type { Database, TablesInsert } from '../supabase/types';
 import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
@@ -1724,6 +1726,12 @@ export class MemoryRepository {
     if (input.contactId) {
       insertData.contact_id = input.contactId;
     }
+    if (input.backendSessionId) {
+      // Both columns, as updateSession writes them: readers still fall back
+      // to claude_session_id for rows older than the backend rename.
+      insertData.backend_session_id = input.backendSessionId;
+      insertData.claude_session_id = input.backendSessionId;
+    }
 
     const { data, error } = await this.supabase
       .from('sessions')
@@ -1959,47 +1967,124 @@ export class MemoryRepository {
      * unique only per (user_id, workspace_id), so matching on it alone can
      * return a same-named identity's session from another workspace.
      */
+    sbId?: string,
+    /**
+     * Keep crashed rows (lifecycle 'failed'). start_session passes this so a
+     * plain relaunch after a crash lands on the crashed row rather than
+     * minting a second one for the same transcript; nothing else does,
+     * because a crashed session is not what a badge means by "active".
+     */
+    options?: { includeFailed?: boolean }
+  ): Promise<Session | null> {
+    // Live first, crashed as the fallback. One ordered query over both would
+    // let a newer crashed row outrank an older live one under started_at
+    // DESC, and a relaunch would land on the crash instead of the
+    // conversation still running (Lumen, #718).
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = this.supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .is('ended_at', null)
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live' ? query.neq('lifecycle', 'failed') : query.eq('lifecycle', 'failed');
+
+      // Prefer the canonical owner; the slug is the fallback for callers that
+      // have no canonical identity.
+      if (sbId) {
+        query = query.eq('sb_id', sbId);
+      } else if (sbSlug) {
+        query = query.eq('agent_id', sbSlug);
+      }
+
+      if (studioId !== undefined) {
+        if (studioId === null) {
+          query = query.is('studio_id', null);
+        } else {
+          query = query.eq('studio_id', studioId);
+        }
+      }
+
+      // Per-sender isolation: always scope by contact to prevent collision.
+      // Contact sessions match their contact; owner sessions match NULL.
+      if (contactId) {
+        query = query.eq('contact_id', contactId);
+      } else {
+        query = query.is('contact_id', null);
+      }
+      const { data, error } = await query.single();
+
+      if (error) {
+        if (error.code === 'PGRST116') return null;
+        logger.error('Failed to get active session:', error);
+        throw new Error(`Failed to get active session: ${error.message}`);
+      }
+
+      return data ? this.rowToSession(data) : null;
+    };
+
+    const live = await run('live');
+    if (live || !options?.includeFailed) return live;
+    return run('failed');
+  }
+
+  /**
+   * The live session already linked to a backend conversation (a Claude Code
+   * session id, a Codex thread id), for one identity.
+   *
+   * One backend conversation is one Inkwell session. A launcher resuming a
+   * transcript asks here before creating anything, so the row the hooks have
+   * been writing to is the row it lands on — not a second one for the same
+   * conversation. Both link columns are read: rows written since the backend
+   * rename carry both, older rows only claude_session_id. Crashed rows
+   * (lifecycle 'failed') count: relaunching the transcript is how a crashed
+   * session resumes. Ended rows do not, nor rows whose lifecycle or status
+   * says completed with ended_at still null: those are fences the caller
+   * must lift deliberately (update_session_state reopen), never by
+   * resolution.
+   * Newest-updated first, so of several live rows for one conversation (the
+   * duplicates this lookup now prevents) the one being written to wins.
+   */
+  async getActiveSessionByBackendSessionId(
+    userId: string,
+    backendSessionId: string,
+    sbSlug?: string,
     sbId?: string
   ): Promise<Session | null> {
+    // The id goes into a PostgREST filter expression; refuse anything that
+    // could carry its own separators rather than escape it.
+    if (!/^[A-Za-z0-9._:-]{1,200}$/.test(backendSessionId)) return null;
+
     let query = this.supabase
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
-      .order('started_at', { ascending: false })
+      // The same fences the pickers apply (isSessionResumable,
+      // isAttachableSessionSummary): a row whose lifecycle or status says
+      // completed is finished even with ended_at null, and handing it back
+      // would resume into a session every picker rejects. 'failed' passes.
+      .neq('lifecycle', 'completed')
+      .or('status.is.null,status.not.ilike.completed')
+      .or('status.is.null,status.not.ilike.completed:*')
+      .or(`backend_session_id.eq.${backendSessionId},claude_session_id.eq.${backendSessionId}`)
+      .order('updated_at', { ascending: false })
       .limit(1);
 
-    // Prefer the canonical owner; the slug is the fallback for callers that
-    // have no canonical identity.
     if (sbId) {
       query = query.eq('sb_id', sbId);
     } else if (sbSlug) {
       query = query.eq('agent_id', sbSlug);
     }
 
-    if (studioId !== undefined) {
-      if (studioId === null) {
-        query = query.is('studio_id', null);
-      } else {
-        query = query.eq('studio_id', studioId);
-      }
-    }
-
-    // Per-sender isolation: always scope by contact to prevent collision.
-    // Contact sessions match their contact; owner sessions match NULL.
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    } else {
-      query = query.is('contact_id', null);
-    }
-
     const { data, error } = await query.single();
 
     if (error) {
       if (error.code === 'PGRST116') return null;
-      logger.error('Failed to get active session:', error);
-      throw new Error(`Failed to get active session: ${error.message}`);
+      logger.error('Failed to get active session by backend session id:', error);
+      throw new Error(`Failed to get active session by backend session id: ${error.message}`);
     }
 
     return data ? this.rowToSession(data) : null;
@@ -2016,47 +2101,56 @@ export class MemoryRepository {
     studioId?: string | null,
     contactId?: string,
     /** Canonical owner; replaces the slug filter when supplied. */
-    sbId?: string
+    sbId?: string,
+    /** See getActiveSession: start_session keeps crashed rows, nothing else does. */
+    options?: { includeFailed?: boolean }
   ): Promise<Session | null> {
-    let query = this.supabase
-      .from('sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('thread_key', threadKey)
-      .is('ended_at', null)
-      .neq('lifecycle', 'failed')
-      .order('started_at', { ascending: false })
-      .limit(1);
+    // Live first, crashed as the fallback; see getActiveSession.
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = this.supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .is('ended_at', null)
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live' ? query.neq('lifecycle', 'failed') : query.eq('lifecycle', 'failed');
 
-    // Prefer the canonical owner; the slug is the fallback for callers that
-    // have no canonical identity.
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
+      // Prefer the canonical owner; the slug is the fallback for callers that
+      // have no canonical identity.
+      query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
-    if (studioId !== undefined) {
-      if (studioId === null) {
-        query = query.is('studio_id', null);
-      } else {
-        query = query.eq('studio_id', studioId);
+      if (studioId !== undefined) {
+        if (studioId === null) {
+          query = query.is('studio_id', null);
+        } else {
+          query = query.eq('studio_id', studioId);
+        }
       }
-    }
 
-    // Per-sender isolation: always scope by contact to prevent collision.
-    // Contact sessions match their contact; owner sessions match NULL.
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    } else {
-      query = query.is('contact_id', null);
-    }
+      // Per-sender isolation: always scope by contact to prevent collision.
+      // Contact sessions match their contact; owner sessions match NULL.
+      if (contactId) {
+        query = query.eq('contact_id', contactId);
+      } else {
+        query = query.is('contact_id', null);
+      }
+      const { data, error } = await query.single();
 
-    const { data, error } = await query.single();
+      if (error) {
+        if (error.code === 'PGRST116') return null;
+        logger.error('Failed to get active session by threadKey:', error);
+        throw new Error(`Failed to get active session by threadKey: ${error.message}`);
+      }
 
-    if (error) {
-      if (error.code === 'PGRST116') return null;
-      logger.error('Failed to get active session by threadKey:', error);
-      throw new Error(`Failed to get active session by threadKey: ${error.message}`);
-    }
+      return data ? this.rowToSession(data) : null;
+    };
 
-    return data ? this.rowToSession(data) : null;
+    const live = await run('live');
+    if (live || !options?.includeFailed) return live;
+    return run('failed');
   }
 
   /**
@@ -2101,6 +2195,8 @@ export class MemoryRepository {
       filterNullStudio?: boolean;
       backend?: string;
       status?: SessionStatusFilter;
+      /** Exact match on the session key (the `alias` column), already normalised. */
+      sessionKey?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -2121,6 +2217,11 @@ export class MemoryRepository {
 
     if (options.backend) {
       query = query.eq('backend', options.backend);
+    }
+
+    if (options.sessionKey) {
+      // Exact but case-insensitive: see sessionKeyMatchPattern.
+      query = query.ilike('alias', sessionKeyMatchPattern(options.sessionKey));
     }
 
     if (options.status) {
@@ -2154,23 +2255,33 @@ export class MemoryRepository {
         // trigger routing and wrong for attach.
         query = query.is('ended_at', null).neq('lifecycle', 'completed');
 
-        // The agent-declared terminal markers belong here too, not just in
-        // the client predicate. `update_session_state({ phase: 'complete' })`
-        // writes current_phase alone — no ended_at, no lifecycle change — so
-        // a filter that stops at the authoritative columns hands back rows
-        // the caller is about to discard, and `range()` has already spent the
-        // page on them. That is the same limit-before-filter defect as
-        // filtering entirely client-side, one column further in.
+        // The agent-declared terminal STATUS belongs here too, not just in
+        // the client predicate: a filter that stops at the authoritative
+        // columns hands back rows the caller is about to discard, and
+        // `range()` has already spent the page on them — the same
+        // limit-before-filter defect as filtering entirely client-side, one
+        // column further in.
+        //
+        // The agent-set work PHASE is deliberately not read. `update_session_
+        // state({ phase: 'complete' })` closes a piece of work, not the
+        // conversation: ended_at stays null, lifecycle stays 'idle', and the
+        // row is still the identity of a live backend transcript. This branch
+        // used to exclude phase 'complete' as well, the client predicates
+        // agreed, and the row then vanished from every picker while its
+        // transcript lived on; the launcher read the transcript as untracked
+        // and minted a second Inkwell session for the same conversation on
+        // every relaunch (2026-10-01: four live rows for one Claude session;
+        // nineteen conversations with two to five each). Mirrors
+        // isAttachableSessionSummary (chat.ts) and isSessionResumable
+        // (claude.ts), which read the same three columns.
         //
         // Each exclusion is paired with an explicit NULL allowance: a session
-        // that never declared a phase is attachable, but SQL's `col <> x`
+        // that never declared a status is attachable, but SQL's `col <> x`
         // over NULL yields NULL and would drop it. `ilike` rather than `like`
         // to match the client predicate's lowercasing; the client also trims,
-        // which SQL does not, so a phase stored with surrounding whitespace
+        // which SQL does not, so a status stored with surrounding whitespace
         // still relies on the backstop.
         query = query
-          .or('current_phase.is.null,current_phase.not.ilike.complete')
-          .or('current_phase.is.null,current_phase.not.ilike.complete:*')
           .or('status.is.null,status.not.ilike.completed')
           .or('status.is.null,status.not.ilike.completed:*');
       } else {
@@ -2517,6 +2628,7 @@ export class MemoryRepository {
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,
+      alias: row.alias || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,
@@ -2531,6 +2643,8 @@ export class MemoryRepository {
       headlineUpdatedAt: row.headline_updated_at ? new Date(row.headline_updated_at) : undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
+      archivedAt: row.archived_at ? new Date(row.archived_at) : undefined,
+      archivedReason: parseArchivedReason(row.archived_reason),
       summary: row.summary || undefined,
       updatedAt: row.updated_at ? new Date(row.updated_at) : undefined,
       metadata: row.metadata,

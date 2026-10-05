@@ -152,11 +152,11 @@ class DataTests(unittest.TestCase):
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539); the
         # revocation amendment's four tables (#678), the browser companion's
         # two (#671), command admission's four (#701 R4), and owner tenure's
-        # four (#701 R3) join through created-at windows, not this base list,
+        # four (#701 R3), breaker/links/reactions (one each) join through windows,
         # so a rehearsal cut before them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 87)
+        self.assertEqual(len(names), 90)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -232,41 +232,33 @@ class DataTests(unittest.TestCase):
                      "session_commands")
         tenure = ("session_admission_origins", "session_owner_tenures", "session_turn_generations",
                   "session_turn_invocations")
-        created = companion + revocation + admission + tenure
-        # Every migration applied: the dropped window is absent, the open ones present.
+        breaker = ("wake_source_breakers",)
+        links = ("thread_links",)
+        reactions = ("thread_message_reactions",)
+        created = companion + revocation + breaker + links + admission + reactions + tenure
         self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES + created)
-        # The CI rehearsal cut: the attestations' creator applied and dropper withheld;
-        # both open windows' creators withheld.
         self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
-        # Cut at or before the attestations' creator (never created), or after the
-        # dropper (dropped) but at or before the companion tables' creator.
-        for until in ("20260913081634", "20260913081633", "20260913090001", "20260924070106"):
-            with self.subTest(until=until):
-                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES)
-        # Past the companion tables' creator and at or before the revocation tables'.
-        for until in ("20260924070107", "20260925080025"):
-            with self.subTest(until=until):
-                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + companion)
-        # Past the revocation tables' creator and at or before admission's.
-        for until in ("20260925080026", "20261004094856"):
-            with self.subTest(until=until):
-                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + companion + revocation)
-        # Past the admission tables' creator and at or before the tenure tables'.
-        for until in ("20261004094857", "20261004104039"):
-            with self.subTest(until=until):
-                self.assertEqual(data.fixture_tables(until),
-                                 data.FIXTURE_TABLES + companion + revocation + admission)
-        # A cut past every creator carries them all, without the attestations.
-        for until in ("20261004104040", "20270101000000"):
-            with self.subTest(until=until):
-                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + created)
-        # Every window is part of the policy, so changing any invalidates cached baselines.
-        for name in window + created:
-            self.assertIn(name, data.POLICY)
-        self.assertIn("20260924070106-:", data.POLICY)
-        self.assertIn("20260925080025-:", data.POLICY)
-        self.assertIn("20261004094856-:", data.POLICY)
-        self.assertIn("20261004104039-:", data.POLICY)
+        self.assertEqual(data.fixture_tables("20260913081634"), data.FIXTURE_TABLES)
+        self.assertEqual(data.fixture_tables("20260913090001"), data.FIXTURE_TABLES)
+        # Literal chronological windows from BOTH branches; equality at a stamp
+        # still excludes its migration, and the next stamp includes it.
+        cumulative = data.FIXTURE_TABLES
+        for stamp, following, names in (
+            ("20260924070106", "20260924070107", companion),
+            ("20260925080025", "20260925080026", revocation),
+            ("20261002225412", "20261002225413", breaker),
+            ("20261004085434", "20261004085435", links),
+            ("20261004094856", "20261004094857", admission),
+            ("20261004095944", "20261004095945", reactions),
+            ("20261004104039", "20261004104040", tenure),
+        ):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(data.fixture_tables(stamp), cumulative)
+                cumulative += names
+                self.assertEqual(data.fixture_tables(following), cumulative)
+                self.assertIn(stamp + "-:", data.POLICY)
+        self.assertEqual(data.fixture_tables("20270101000000"), cumulative)
+        self.assertNotIn("2026", ",".join(data.FIXTURE_TABLES))
 
     def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
         window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
@@ -293,7 +285,7 @@ class DataTests(unittest.TestCase):
 
     def test_created_window_tables_are_missing_only_before_their_migration(self):
         created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
-        self.assertEqual(len(created), 14)
+        self.assertEqual(len(created), 17)
         # A full-schema stack carries them and cleanup truncates them ...
         self.clean()
         truncate = self.mutations()[0]

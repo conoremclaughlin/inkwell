@@ -53,4 +53,9 @@ describe('ink claude launcher cleanup', () => {
     );
     expect(source).not.toMatch(/\bcleanedUp\b/);
   });
+  it('awaits async per-spawn cleanup on the Codex-mail exit path too', () => {
+    // A new branch from main must not fire-and-forget the extracted cleanup.
+    expect(source).not.toMatch(/^\s*prepared\.cleanup\(\);/m);
+    expect(source).toContain('runCodexMailInteractive');
+  });
 });

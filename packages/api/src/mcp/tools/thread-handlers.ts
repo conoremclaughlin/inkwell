@@ -24,14 +24,25 @@ import {
   resolveSbInWorkspace,
   resolveSbsByIds,
   senderColumns,
+  userPrincipal,
   type Principal,
   type SbPrincipal,
   type UserPrincipal,
 } from '../../services/principals';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
+import { readTieRemainder } from './tie-completion.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
+import { threadLinkHeader } from './thread-link-views.js';
+import {
+  REACTIONS_ARE_NOT_APPROVAL,
+  ReactionRefusedError,
+  loadReactions,
+  reactToMessage,
+  type ReactionSummary,
+} from '../../services/threads/thread-reactions.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -211,6 +222,20 @@ const markThreadReadSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Exact-id acknowledgement (spec inkmail-read-state §1): advance the read pointer through THIS message only — the last one actually delivered — instead of the whole thread. Used by delivery consumers (channel plugin) to ack after successful injection.'
     ),
+});
+
+const reactToMessageSchema = userIdentifierBaseSchema.extend({
+  threadKey: threadKeySchema,
+  sbSlug: sbSlugSchema.describe('SB slug reacting (must be a participant)'),
+  // Shapes are the service's to judge, so a malformed id or emoji is refused
+  // with the same code the dashboard route answers with.
+  messageId: z.string().max(64).describe('The message to react to (a message id in this thread)'),
+  emoji: z.string().max(64).describe('A single emoji, e.g. "❤️" or "👍"'),
+  remove: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('Remove your reaction instead of adding it'),
 });
 
 // ============== Helpers (exported for use by inbox-handlers) ==============
@@ -699,24 +724,50 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   if (!newestFirst) {
     const { data, error } = await buildQuery('*')
       .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
       .limit(effectiveLimit);
     if (error) {
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
-    messages = data;
+    let page: Record<string, unknown>[] = data ?? [];
 
-    if ((messages?.length ?? 0) === effectiveLimit) {
-      // The page filled exactly, so newer messages may exist past it. This
-      // branch is oldest-first, so a truncated page silently hands back the
-      // WRONG END of the thread — the caller asked what is going on and got
-      // the beginning of the conversation.
+    // A page never ends partway through a timestamp. Rows written together
+    // (one transaction, say) share one created_at, and every floor here is
+    // strict (`created_at >`, for newerThan and afterMessageId alike). A page
+    // cut inside that group would leave its remainder behind the next cursor
+    // for good (Lumen, #702). Completing the group makes the page's last
+    // timestamp a safe exclusive floor.
+    if (page.length === effectiveLimit && page.length > 0) {
+      const last = page[page.length - 1] as { created_at: string; id: string };
+      page = [
+        ...page,
+        ...(await readTieRemainder((afterId, withCount) => {
+          let q = threadTable(supabase, 'inbox_thread_messages')
+            .select('*', withCount ? { count: 'exact' } : undefined)
+            .eq('thread_id', thread.id)
+            .eq('created_at', last.created_at)
+            .gt('id', afterId)
+            .order('id', { ascending: true });
+          if (!includeSystemEvents) q = q.neq('message_type', 'system');
+          return q;
+        }, last.id)),
+      ];
+    }
+
+    messages = page;
+
+    if (page.length >= effectiveLimit) {
+      // The page filled, so newer messages may exist past it. This branch is
+      // oldest-first, so a truncated page silently hands back the WRONG END
+      // of the thread — the caller asked what is going on and got the
+      // beginning of the conversation.
       const { count, error: truncErr } = await buildQuery('id', true);
       if (truncErr) {
         // An unknown count must not read as a complete page. Say the number is
         // missing rather than implying there is nothing past the end.
         diagnosticsUnavailable = truncErr.message;
       } else {
-        truncatedNewer = Math.max(0, (count ?? 0) - effectiveLimit);
+        truncatedNewer = Math.max(0, (count ?? 0) - page.length);
       }
     }
   } else {
@@ -817,6 +868,26 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
+  // Reactions on the messages returned, as the calling SB sees them. When
+  // they cannot be read the answer says so, rather than putting [] on every
+  // message, which would claim that nobody reacted.
+  let reactionsByMessage: Map<string, ReactionSummary[]> | null = null;
+  try {
+    reactionsByMessage = await loadReactions(
+      supabase,
+      (messages || []).map((m) => String(m.id)),
+      { kind: 'sb', id: caller.sbId }
+    );
+  } catch (error) {
+    logger.error('[GetThreadMessages] reactions unavailable', {
+      threadKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const anyReactions =
+    reactionsByMessage !== null &&
+    [...reactionsByMessage.values()].some((reactions) => reactions.length > 0);
+
   // Pointer advance semantics (Lumen, PR #473):
   // - GUARD MODE (cold-start delivery poll): fetched-but-not-yet-rendered
   //   messages must remain unread — the delivery consumer acks after
@@ -887,6 +958,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     }
   }
 
+  // What the thread links to and what links to it (thread:thread-links).
+  // A delivery poll is the hot path and only wants messages, so it skips this.
+  const links = channelPoll ? null : await threadLinkHeader(supabase, caller, thread);
+
   return {
     content: [
       {
@@ -903,6 +978,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           createdBy: await creatorLabel(supabase, thread, participants),
           participants: participantSlugs(participants),
           people: participants.map((p) => p.userId).filter((id): id is string => !!id),
+          ...(links ? ('error' in links ? { linksError: links.error } : { links }) : {}),
           messageCount: messages?.length || 0,
           // Truncation is visible, never silent: how many older matching
           // messages were cut by the cold-start guard or latestN window.
@@ -941,12 +1017,13 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
               }
             : {}),
           // The page filled and this branch is oldest-first, so what came back
-          // is the START of the thread, not the latest of it.
+          // is the START of the thread, not the latest of it. A completed tie
+          // group can make the page longer than the limit; say what was sent.
           ...(truncatedNewer > 0
             ? {
                 truncatedNewerCount: truncatedNewer,
                 hint:
-                  `Returned the OLDEST ${effectiveLimit} messages; ${truncatedNewer} newer ` +
+                  `Returned the OLDEST ${messages?.length ?? effectiveLimit} messages; ${truncatedNewer} newer ` +
                   `ones were cut. Pass latestN to get the most recent instead.`,
               }
             : {}),
@@ -960,6 +1037,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
                   'read-pointer advance failed — read state is stale; messages may re-deliver',
               }
             : {}),
+          ...(reactionsByMessage === null ? { reactionsUnavailable: true } : {}),
+          // Beside the reactions, every time there are any (spec
+          // inkling-reactions: never approval).
+          ...(anyReactions ? { reactionsNote: REACTIONS_ARE_NOT_APPROVAL } : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => {
             // The sender's subject, whole. send_to_inbox stores it under
             // metadata.pcp so a bounded thread title is never the only copy
@@ -979,6 +1060,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
               ...(subject ? { subject } : {}),
               metadata: m.metadata,
               createdAt: m.created_at,
+              ...(reactionsByMessage
+                ? { reactions: reactionsByMessage.get(String(m.id)) ?? [] }
+                : {}),
             };
           }),
         }),
@@ -1032,6 +1116,16 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       ],
     };
   }
+
+  // A conversation with an inkling has its members fixed when it is made,
+  // and no other conversation takes an inkling (inkling-thread-gate.ts):
+  // the same rule the send path asks, before anything is written or woken.
+  // Throws on refusal.
+  await assertInklingThreadAllowed(supabase, {
+    sender: actor ?? userPrincipal(resolved.user.id),
+    participantSbs: [newcomer],
+    existingThreadId: thread.id,
+  });
 
   // Add participant
   const { error: addError } = await threadTable(supabase, 'inbox_thread_participants').insert({
@@ -1775,6 +1869,54 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   };
 }
 
+/**
+ * react_to_message: add or remove the calling SB's reaction on one message
+ * (ink://specs/inkling-reactions), under the same rules as POST
+ * /api/admin/threads/reactions. A refusal answers with the status and code
+ * the route would use. Wakes nobody: no message, no trigger, no read
+ * pointer, no recency.
+ */
+export async function handleReactToMessage(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = reactToMessageSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
+  assertWriteRole(caller.ownerRole, 'react to a message');
+
+  const answer = (body: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(body) }],
+  });
+  try {
+    const result = await reactToMessage(supabase, {
+      workspaceId: caller.workspaceId,
+      threadKey: parsed.threadKey,
+      messageId: parsed.messageId,
+      emoji: parsed.emoji,
+      remove: parsed.remove,
+      reactor: {
+        kind: 'sb',
+        sbId: caller.sbId,
+        sbSlug: caller.sbSlug,
+        userId: caller.userId,
+        workspaceId: caller.workspaceId,
+      },
+    });
+    return answer({ success: true, ...result, note: REACTIONS_ARE_NOT_APPROVAL });
+  } catch (error) {
+    if (error instanceof ReactionRefusedError) {
+      return answer({
+        success: false,
+        status: error.status,
+        code: error.code,
+        error: error.message,
+      });
+    }
+    throw error;
+  }
+}
+
 // ============== Tool Registration ==============
 
 export const threadToolDefinitions = [
@@ -1826,6 +1968,13 @@ export const threadToolDefinitions = [
       "Set or update a thread's title and brief summary, so it is clear what the thread is actually about now. The threadKey is a stable identifier, not a description — one thread routinely covers several PRs, specs and incidents, and 'pr:632' says none of it. Keep the summary BRIEF AND CONCISE (bounded at 280 chars) and rewrite it as the discussion moves on; a summary that grows without bound is the thing this replaces. Any participant may edit, including on a closed thread. Each field records who changed it and when, and the age is shown wherever the summary is, so a reader can tell a current description from an old one.",
     schema: updateThreadSchema,
     handler: handleUpdateThread,
+  },
+  {
+    name: 'react_to_message',
+    description:
+      "React to a message in a thread you are a member of with one emoji (for example ❤️ 👍 😂 😮 😢 🙏), or take your reaction back with remove: true. Adding one that is already there, or removing one that is not, changes nothing; at most 6 emoji of yours on one message. A reaction is not a message: it wakes nobody and moves no unread count or thread recency, so it never stands in for a reply that is owed. A reaction is never approval of anything: a 👍 is not a yes. Never read a reaction, yours or anyone's, as consent to a gate, permission, plan, send or purchase; ask in words. Returns the message's reactions, with mine marking yours.",
+    schema: reactToMessageSchema,
+    handler: handleReactToMessage,
   },
 ];
 

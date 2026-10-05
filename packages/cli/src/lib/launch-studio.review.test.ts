@@ -102,7 +102,9 @@ describe('an unavailable owner lookup is not permission to assign the launch ide
     expect(result.ownerUnknown).toContain('401');
     expect(existsSync(identityPath())).toBe(false);
     const audit = auditStudio(studio, { linked: true });
-    expect(audit.missing).toEqual(['identity', 'studio-id']);
+    // Permissions are left too: their profile is read from the same row, and
+    // their scratch paths name the owner (design v3, item 5).
+    expect(audit.missing).toEqual(['identity', 'studio-id', 'claude-permissions']);
     const [line] = describeLaunchStudioResult(result);
     expect(line).toContain('owner is unknown');
     expect(line).toContain('ink init');

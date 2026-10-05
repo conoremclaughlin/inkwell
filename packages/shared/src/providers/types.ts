@@ -50,13 +50,16 @@ export interface BackendHost {
   /**
    * The credentials for one spawn, asked for after preparation, just before
    * the spawn. `hardTimeoutMs` is the spawn's hard ceiling, already clamped
-   * to `deadlineAt`: a host that mints makes them last that long, plus grace
+   * to `deadlineAt`, or absent when the caller selected no wall-clock bound.
+   * A host that mints must explicitly admit a finite deadline or provide a
+   * separately reviewed renewable credential policy; absence is not infinity
+   * sent to a token mint. For a finite bound, credentials last that long, plus grace
    * to settle. A child stopped at its ceiling can keep running, and writing,
    * for STOP_GRACE_MS and then STOP_GIVE_UP_MS more (runner/spawn-backend.ts),
    * so size the grace from those. Routing names in the result are dropped
    * (see startBackendTurn).
    */
-  sessionEnv(spawn: { hardTimeoutMs: number }): Promise<Record<string, string>>;
+  sessionEnv(spawn: { hardTimeoutMs?: number }): Promise<Record<string, string>>;
   /**
    * The environment the child inherits from, before the allowlist: HOME,
    * PATH and the like. Only SPAWN_ENV_INHERITED_NAMES cross

@@ -7,7 +7,7 @@ import { logger } from '../../utils/logger';
  * Spec: ink://specs/inkmail-read-state §3a (approved v9, 2026-08-08).
  *
  * Semantics:
- * - **Explicit anchor** (caller passed recipientSessionId/sessionAlias):
+ * - **Explicit anchor** (caller passed recipientSessionId/sessionKey):
  *   authorized overwrite — the anchor IS the deliberate-retarget signal.
  * - **Otherwise, first assignment is a CAS**: write only where
  *   `session_id IS NULL`. If the claim loses, reread the winner and route
@@ -35,7 +35,7 @@ export interface AssignParams {
   sbId: string;
   /** The session the router resolved for this delivery. */
   candidateSessionId: string;
-  /** Caller passed recipientSessionId/sessionAlias — authorized overwrite. */
+  /** Caller passed recipientSessionId/sessionKey — authorized overwrite. */
   explicitAnchor: boolean;
   /**
    * Project repair (PR #681 round 3): replace ONLY this stamp — the winner
@@ -87,11 +87,17 @@ async function isSessionDead(supabase: any, sessionId: string): Promise<boolean>
     });
     return false;
   }
-  // A cleanly-missing row IS dead. Current terminal gate is ended_at/failed;
-  // when the session-lifecycle-model migration lands (archived_at), this
-  // helper is the single place to update.
+  // A cleanly-missing row IS dead, and so is an ended one. A crashed row
+  // (lifecycle 'failed') is not: it is the session its agent resumes next,
+  // and rebinding the thread away from it would route the next message into
+  // a different transcript than the one the conversation lives in
+  // (finished-session audit, row 8; Lumen on #718: "no reason to break
+  // continuity because the last run crashed"). Explicit retargeting still
+  // overwrites any stamp, and a lookup error still reads as alive. When the
+  // session-lifecycle-model migration lands (archived_at), this helper is
+  // the single place to update.
   if (!data) return true;
-  return !!data.ended_at || data.lifecycle === 'failed';
+  return !!data.ended_at;
 }
 
 /**

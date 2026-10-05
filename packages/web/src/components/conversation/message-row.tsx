@@ -11,6 +11,7 @@ import {
   type ConversationMessage,
 } from '@inklabs/shared/stories/thread-viewing';
 import { MessageMarkdown } from './message-markdown';
+import { ReactionChips } from './reaction-chips';
 
 function FoldableBody({ message }: { message: ConversationMessage }) {
   const foldable = !message.streaming && shouldFold(message.body);
@@ -53,9 +54,12 @@ function FoldableBody({ message }: { message: ConversationMessage }) {
 export const MessageRow = memo(function MessageRow({
   message,
   continuation = false,
+  onReact,
 }: {
   message: ConversationMessage;
   continuation?: boolean;
+  /** The viewer may react here: chips toggle and a picker is offered. */
+  onReact?: (messageId: string, emoji: string) => void;
 }) {
   const { author } = message;
   const clock = formatClockTime(message.createdAt);
@@ -67,7 +71,10 @@ export const MessageRow = memo(function MessageRow({
     // pill cut them off mid-sentence. High and urgent ones are warnings.
     const warning = message.priority === 'high' || message.priority === 'urgent';
     return (
-      <div className="flex justify-center px-4 py-2 md:px-6" data-message-id={message.id}>
+      <div
+        className="group flex flex-col items-center px-4 py-2 md:px-6"
+        data-message-id={message.id}
+      >
         <div
           className={cn(
             'flex max-w-2xl items-start gap-2 rounded-xl px-3 py-1.5 text-[11px] leading-relaxed',
@@ -89,6 +96,8 @@ export const MessageRow = memo(function MessageRow({
             {clock}
           </time>
         </div>
+        {/* An event is a stored message too, and can carry reactions. */}
+        <ReactionChips messageId={message.id} reactions={message.reactions} onToggle={onReact} />
       </div>
     );
   }
@@ -152,6 +161,7 @@ export const MessageRow = memo(function MessageRow({
           </div>
         )}
         <FoldableBody message={message} />
+        <ReactionChips messageId={message.id} reactions={message.reactions} onToggle={onReact} />
       </div>
     </div>
   );

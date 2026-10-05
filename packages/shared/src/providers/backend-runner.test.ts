@@ -49,7 +49,6 @@ import {
   runBackendTurn,
   startBackendTurn,
   CONFIG_REFUSED_EXIT_CODE,
-  DEFAULT_TURN_HARD_TIMEOUT_MS,
   SPAWN_NOT_ADMITTED_EXIT_CODE,
   EFFECTIVE_CONFIG_CHECK_FAILED,
   type BackendRunRequest,
@@ -203,7 +202,7 @@ describe('runBackendTurn', () => {
   it('asks the host for credentials after preparation, with the spawn’s hard ceiling', async () => {
     spawnMock.mockReset().mockImplementation(() => createMockChild(0));
     state.prepareCalls = [];
-    const asked: Array<{ hardTimeoutMs: number; preparedBefore: number }> = [];
+    const asked: Array<{ hardTimeoutMs?: number; preparedBefore: number }> = [];
     try {
       for (const timeoutMs of [undefined, 1234]) {
         await runBackendTurn({
@@ -221,7 +220,7 @@ describe('runBackendTurn', () => {
         });
       }
       expect(asked).toEqual([
-        { hardTimeoutMs: DEFAULT_TURN_HARD_TIMEOUT_MS, preparedBefore: 1 },
+        { hardTimeoutMs: undefined, preparedBefore: 1 },
         { hardTimeoutMs: 1234, preparedBefore: 2 },
       ]);
     } finally {
@@ -397,7 +396,7 @@ describe('runBackendTurn', () => {
     }
   });
 
-  it('default hard backstop is the 4h runaway ceiling, not the old 20-minute cap', async () => {
+  it.each([undefined, 1000])('uses only an explicit hard ceiling (%s)', async (timeoutMs) => {
     vi.useFakeTimers();
     try {
       // Long-lived child: never closes on its own, tracks kill().
@@ -420,26 +419,29 @@ describe('runBackendTurn', () => {
         backend: 'claude',
         sbSlug: 'wren',
         prompt: 'marathon',
+        timeoutMs,
       });
 
-      // A working turn crosses the old 20-minute cap unharmed.
-      await vi.advanceTimersByTimeAsync(25 * 60 * 1000);
-      child.stdout.emit('data', 'still working\n');
-      expect(child.kill).not.toHaveBeenCalled();
-
-      // Still alive just short of the 4h backstop…
-      await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HARD_TIMEOUT_MS - 25 * 60 * 1000 - 1);
-      expect(child.kill).not.toHaveBeenCalled();
-
-      // …and reaped as a hard timeout once it crosses.
-      await vi.advanceTimersByTimeAsync(2);
-      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-      child.emit('close', null, 'SIGTERM');
-      const result = await resultPromise;
-      expect(result.timedOut).toBe(true);
-      expect(result.timeoutType).toBe('hard');
-      expect(result.exitCode).toBe(124);
-      expect(result.childExited).toBe(true);
+      if (timeoutMs === undefined) {
+        await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1000);
+        expect(child.kill).not.toHaveBeenCalled();
+        child.emit('close', 0);
+        expect(await resultPromise).toMatchObject({
+          timedOut: false,
+          exitCode: 0,
+          childExited: true,
+        });
+      } else {
+        await vi.advanceTimersByTimeAsync(timeoutMs);
+        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+        child.emit('close', null, 'SIGTERM');
+        expect(await resultPromise).toMatchObject({
+          timedOut: true,
+          timeoutType: 'hard',
+          exitCode: 124,
+          childExited: true,
+        });
+      }
     } finally {
       vi.useRealTimers();
     }
@@ -736,7 +738,7 @@ describe('runBackendTurn', () => {
         const child = createHeldChild();
         spawnMock.mockReset().mockImplementation(() => child);
         const deadlineAt = Date.now() + 1_000;
-        const asked: Array<{ hardTimeoutMs: number; leftAtMint: number }> = [];
+        const asked: Array<{ hardTimeoutMs?: number; leftAtMint: number }> = [];
         const turn = startBackendTurn({
           ...spawnContext,
           backend: 'claude',
@@ -800,7 +802,7 @@ describe('runBackendTurn', () => {
 
     it('keeps a spawn’s own ceiling when it is shorter than the time left', async () => {
       spawnMock.mockReset().mockImplementation(() => createMockChild(0));
-      const asked: number[] = [];
+      const asked: Array<number | undefined> = [];
       try {
         await runBackendTurn({
           ...spawnContext,

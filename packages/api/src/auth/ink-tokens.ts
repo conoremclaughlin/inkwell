@@ -50,6 +50,11 @@ export interface InkTokenPayload {
    */
   sessionId?: string;
   contactId?: string;
+  /**
+   * Absolute expiry, seconds since the epoch. Present on every verified
+   * token. On a payload passed to signInkAccessToken it is a ceiling.
+   */
+  exp?: number;
 }
 
 // ============================================================================
@@ -59,8 +64,21 @@ export interface InkTokenPayload {
 /**
  * Sign a Inkwell access token (self-issued JWT).
  * Both MCP and admin auth use this to issue access tokens.
+ *
+ * An `exp` already on the payload is a ceiling: the token expires then or
+ * after `expiresInSeconds`, whichever is sooner, with `iat` and `exp` taken
+ * from one clock sample. A caller that must not outlive another token passes
+ * that token's expiry here, instead of turning it into a duration on its own
+ * clock and letting jwt.sign add the duration back on a later one.
  */
 export function signInkAccessToken(payload: InkTokenPayload, expiresInSeconds: number): string {
+  if (payload.exp !== undefined) {
+    const iat = Math.floor(Date.now() / 1000);
+    return jwt.sign(
+      { ...payload, iat, exp: Math.min(payload.exp, iat + expiresInSeconds) },
+      env.JWT_SECRET
+    );
+  }
   return jwt.sign(payload, env.JWT_SECRET, {
     expiresIn: expiresInSeconds,
   });

@@ -18,6 +18,7 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
+import { pinIsolatedPlaywright, type PlaywrightServerShape } from '../runner/playwright-mcp.js';
 import {
   BakedRoutingHeaderError,
   findGeminiExtensionManifests,
@@ -66,6 +67,8 @@ export async function buildGeminiSettings(
   } catch {
     // missing or unparseable: start from no servers
   }
+
+  mcpServers = pinIsolatedPlaywright(mcpServers as Record<string, PlaywrightServerShape>).servers;
 
   // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
   // Only the canonical Inkwell server is a header-injection target.

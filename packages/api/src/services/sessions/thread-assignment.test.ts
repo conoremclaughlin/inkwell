@@ -16,6 +16,10 @@ function mockDb(opts: {
   /** stamp visible on reread after a lost race */
   stampAfterRace?: string | null;
   deadSessions?: string[];
+  /** sessions whose last run crashed: ended_at null, lifecycle 'failed' */
+  crashedSessions?: string[];
+  /** sessions whose row is cleanly missing */
+  missingSessions?: string[];
   /** sessions liveness lookup returns an error (fail-safe: must read as ALIVE) */
   sessionLookupError?: boolean;
   /** participant update returns an error (fail-safe: recover, never claim success) */
@@ -69,6 +73,12 @@ function mockDb(opts: {
           data: { id, ended_at: '2026-08-01T00:00:00Z', lifecycle: 'idle' },
           error: null,
         });
+      }
+      if (opts.crashedSessions?.includes(id)) {
+        return Promise.resolve({ data: { id, ended_at: null, lifecycle: 'failed' }, error: null });
+      }
+      if (opts.missingSessions?.includes(id)) {
+        return Promise.resolve({ data: null, error: null });
       }
       return Promise.resolve({ data: { id, ended_at: null, lifecycle: 'idle' }, error: null });
     });
@@ -143,6 +153,60 @@ describe('assignThreadParticipant', () => {
       boundVia: 'rebind-dead-session',
       stampPersisted: true,
     });
+  });
+
+  // A crashed stamp is a transcript its agent resumes next, not a dead one.
+  // Rebinding on lifecycle 'failed' routed the thread's next message into a
+  // different session than the one the conversation lives in (finished-
+  // session audit, row 8; Lumen's call on #718).
+  it('a crashed stamp keeps continuity: no rebind on lifecycle failed alone', async () => {
+    const db = mockDb({
+      currentStamp: 's-crashed',
+      updateAffects: 0,
+      crashedSessions: ['s-crashed'],
+    });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-new',
+      explicitAnchor: false,
+    });
+    expect(r).toEqual({
+      sessionId: 's-crashed',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    });
+    expect(db.getUpdates()).toHaveLength(0);
+  });
+
+  it('control: a cleanly missing stamped row still rebinds', async () => {
+    const db = mockDb({
+      currentStamp: 's-gone',
+      updateAffects: 1,
+      missingSessions: ['s-gone'],
+    });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-new',
+      explicitAnchor: false,
+    });
+    expect(r.boundVia).toBe('rebind-dead-session');
+    expect(r.sessionId).toBe('s-new');
+  });
+
+  it('control: an explicit anchor still overwrites a crashed stamp', async () => {
+    const db = mockDb({
+      currentStamp: 's-crashed',
+      updateAffects: 1,
+      crashedSessions: ['s-crashed'],
+    });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-new',
+      explicitAnchor: true,
+    });
+    expect(r.sessionId).toBe('s-new');
+    expect(r.boundVia).toBe('explicit-retarget');
   });
 
   it('explicit anchor overwrites a live stamp as deliberate retarget (Lumen test 5)', async () => {

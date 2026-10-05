@@ -35,7 +35,8 @@ import {
 } from '../session/runtime.js';
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
-import { promptAttachmentWrite } from '../lib/turn-owner.js';
+import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
+import { admitsCodexMailHook } from '../lib/codex-mail/hook-binding.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -463,16 +464,10 @@ function writeRuntimeFile(cwd: string, filename: string, content: string): void 
  * Decodes the INK_CONTEXT token set by the runner at spawn time — if cliAttached is
  * explicitly false, this is a triggered session that should NOT mark itself CLI-attached.
  * When there's no INK_CONTEXT (interactive `claude` invocation), defaults to true (attached).
+ * The wrapper reads the same token to decide whether a child's exit detaches.
  */
 export function isHeadlessSession(): boolean {
-  const raw = process.env.INK_CONTEXT?.trim();
-  if (!raw) return false;
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString());
-    return parsed.cliAttached === false;
-  } catch {
-    return false;
-  }
+  return contextDeclaresHeadless(process.env);
 }
 
 function normalizeSessionBackend(backendName: string): string {
@@ -1158,6 +1153,7 @@ export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): st
  * injection is skipped to avoid duplicate messages.
  */
 function hasActiveChannelPlugin(cwd: string): boolean {
+  if (process.env.INK_CODEX_INKMAIL === '1') return true;
   try {
     const mcpJsonPath = join(cwd, '.mcp.json');
     if (!existsSync(mcpJsonPath)) return false;
@@ -1474,10 +1470,35 @@ export function isInkHookCommand(cmd: string | undefined): boolean {
   return MANAGED_HOOK_MARKER_RE.test(cmd) || looksLikeSbEntrypoint(words[at - 1]);
 }
 
-type InstallResult = 'installed' | 'already-installed' | 'conflict';
+/**
+ * What an installer did. 'installed' wrote the Inkwell hooks where there
+ * were none; 'updated' rewrote hooks that were already there (an older form
+ * of the Inkwell hooks, a different ink path, or another tool's hooks under
+ * --force), so a repair reads as one and never as a first install;
+ * 'already-installed' found the current hooks and wrote nothing; 'conflict'
+ * found another tool's hooks and left them alone.
+ */
+type InstallResult = 'installed' | 'updated' | 'already-installed' | 'conflict';
+
+/** Whether a hooks map carries at least one entry under any event. */
+function hasHookEntries(hooks: unknown): boolean {
+  if (!hooks || typeof hooks !== 'object') return false;
+  return Object.values(hooks as Record<string, unknown>).some(
+    (entries) => Array.isArray(entries) && entries.length > 0
+  );
+}
 
 function hasCodexInkHooks(content: string): boolean {
   if (!content.trim()) return false;
+  if (
+    ['SessionStart', 'UserPromptSubmit', 'Stop'].every((event) =>
+      content.includes(`[[hooks.${event}]]`)
+    ) &&
+    ['on-session-start', 'on-prompt', 'on-stop'].every((hook) =>
+      content.includes(`hooks ${hook} --backend codex`)
+    )
+  )
+    return true;
   return (
     /session_start\s*=\s*".*hooks on-session-start[^"]*"/.test(content) &&
     /session_end\s*=\s*".*hooks on-stop[^"]*"/.test(content) &&
@@ -1617,7 +1638,7 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
   // Merge: keep existing non-hooks settings, replace hooks
   const merged = { ...existing, ...inkHooks };
   writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n');
-  return 'installed';
+  return hasHookEntries(existingHooks) ? 'updated' : 'installed';
 }
 
 function installGemini(cwd: string, force: boolean): InstallResult {
@@ -1726,16 +1747,24 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     }
   }
 
+  // Only the events Inkwell manages are replaced; entries under other
+  // events are kept, and their presence alone does not make this a repair.
+  const existingHooks = (existing.hooks as Record<string, unknown> | undefined) ?? {};
+  const hadInkEvents = Object.keys(inkHooks).some((event) => {
+    const entries = existingHooks[event];
+    return Array.isArray(entries) && entries.length > 0;
+  });
+
   const merged = {
     ...existing,
     hooks: {
-      ...((existing.hooks as Record<string, unknown>) || {}),
+      ...existingHooks,
       ...inkHooks,
     },
   };
 
   writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n');
-  return 'installed';
+  return hadInkEvents ? 'updated' : 'installed';
 }
 
 function installCodex(cwd: string, force: boolean): InstallResult {
@@ -1772,7 +1801,7 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   ].join('\n');
 
   writeFileSync(configPath, cleaned.trimEnd() + '\n' + inkSection);
-  return 'installed';
+  return existingContent.includes('[hooks]') ? 'updated' : 'installed';
 }
 
 function removeInkTomlSection(content: string): string {
@@ -1835,7 +1864,7 @@ function printInstallResult(
     return;
   }
 
-  console.log(chalk.green(`  ✓ ${targetDir} — installed (${backend.name})`));
+  console.log(chalk.green(`  ✓ ${targetDir} — ${result} (${backend.name})`));
   const events = backend.events;
   if (events.preCompact)
     console.log(
@@ -1930,7 +1959,7 @@ async function installCommand(options: {
       continue;
     }
 
-    console.log(chalk.green(`\nInkwell hooks installed (${backend.name}):`));
+    console.log(chalk.green(`\nInkwell hooks ${result} (${backend.name}):`));
     const events = backend.events;
     if (events.preCompact)
       console.log(
@@ -2176,18 +2205,21 @@ async function postCompactHandler(): Promise<void> {
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
-  // Check inbox — grab last 10 for orientation context, not delivery
-  try {
-    const inbox = await callInkTool('get_inbox', {
-      email: config?.email,
-      sbSlug,
-      limit: 10,
-    });
-    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
-    writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
-  } catch {
-    inboxBlock =
-      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+  // The Codex bridge owns fetch/receipt/ack; startup must not consume its mail.
+  if (process.env.INK_CODEX_INKMAIL !== '1') {
+    // Check inbox — grab last 10 for orientation context, not delivery
+    try {
+      const inbox = await callInkTool('get_inbox', {
+        email: config?.email,
+        sbSlug,
+        limit: 10,
+      });
+      inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
+      writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
+    } catch {
+      inboxBlock =
+        '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    }
   }
 
   // Load available skills
@@ -2250,8 +2282,15 @@ export async function hydrateThreadKeyFromServer(
   return inkThreadKey;
 }
 
-async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
+async function onSessionStartHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-session-start' });
+    return;
+  }
   const cwd = process.cwd();
   const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
@@ -2367,18 +2406,21 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
-  // Check inbox — grab last 10 for orientation context, not delivery
-  try {
-    const inbox = await callInkTool('get_inbox', {
-      email: config?.email,
-      sbSlug,
-      limit: 10,
-    });
-    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
-    writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
-  } catch {
-    inboxBlock =
-      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+  // The bridge owns all mailbox consumption for this process.
+  if (process.env.INK_CODEX_INKMAIL !== '1') {
+    // Check inbox — grab last 10 for orientation context, not delivery
+    try {
+      const inbox = await callInkTool('get_inbox', {
+        email: config?.email,
+        sbSlug,
+        limit: 10,
+      });
+      inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
+      writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
+    } catch {
+      inboxBlock =
+        '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    }
   }
 
   // Load available skills (guide content included inline)
@@ -2733,8 +2775,15 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   process.exit(1);
 }
 
-async function onPromptHandler(options?: { backend?: string }): Promise<void> {
+async function onPromptHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-prompt' });
+    return;
+  }
   const cwd = process.cwd();
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
   sbDebugLog('hooks', 'on_prompt_begin', {
@@ -2992,8 +3041,15 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   }
 }
 
-async function onStopHandler(options?: { backend?: string }): Promise<void> {
+async function onStopHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-stop' });
+    return;
+  }
   const cwd = process.cwd();
 
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
@@ -3241,6 +3297,7 @@ export function registerHooksCommands(program: Command): void {
     .command('on-session-start')
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onSessionStartHandler(opts));
 
   hooks
@@ -3253,11 +3310,13 @@ export function registerHooksCommands(program: Command): void {
     .command('on-prompt')
     .description('Hook: periodic inbox check on user prompt')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onPromptHandler(opts));
 
   hooks
     .command('on-stop')
     .description('Hook: session nudge and inbox check on stop')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onStopHandler(opts));
 }

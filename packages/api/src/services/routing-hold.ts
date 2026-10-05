@@ -28,7 +28,12 @@ export interface RoutingHoldDetail {
    * routing configuration at all: no route pattern would have helped, because
    * none was consulted.
    */
-  reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+  reason?:
+    | 'no-route'
+    | 'occupied'
+    | 'ambiguous-identity'
+    | 'project-without-repo'
+    | 'explicit-address';
   occupied?: { studioId: string; holderThreadKey: string } | null;
   /**
    * The thread's pinned project, when the decision was made by it (task
@@ -36,6 +41,8 @@ export interface RoutingHoldDetail {
    * no repo; a `no-route` hold on a project repo carries the repo too.
    */
   project?: { slug: string; cause?: string; repoRoot?: string } | null;
+  /** The caller-named session an `explicit-address` hold refused (T4). */
+  explicit?: { sessionId?: string; sessionKey?: string; cause: string } | null;
 }
 
 export interface StampHoldArgs {
@@ -95,8 +102,11 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
               ? 'de-duplicate the agent slug in agent_identities — routing config is not the cause'
               : detail.reason === 'project-without-repo'
                 ? "set the project's repo_root (save_project with repoRoot), then re-send"
-                : 'route pattern, studioHint, or project affinity',
+                : detail.reason === 'explicit-address'
+                  ? 're-send to a session the recipient owns, or without the address'
+                  : 'route pattern, studioHint, or project affinity',
         occupied: detail.occupied ?? null,
+        explicit: detail.explicit ?? null,
       },
     });
 

@@ -174,7 +174,12 @@ mcp:
       expect(merged.mcpServers.playwright).toBeDefined();
       expect(merged.mcpServers.playwright.type).toBe('stdio');
       expect(merged.mcpServers.playwright.command).toBe('npx');
-      expect(merged.mcpServers.playwright.args).toEqual(['@playwright/mcp', '--headless']);
+      // A skill copy with the old arguments launches pinned (task cd2fe361).
+      expect(merged.mcpServers.playwright.args).toEqual([
+        '@playwright/mcp',
+        '--headless',
+        '--isolated',
+      ]);
     } finally {
       await cleanup();
     }

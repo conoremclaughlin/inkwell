@@ -351,22 +351,25 @@ Without a detach event, `cliAttached` becomes a sticky flag that causes the trig
 
 Implementations that support a real-time channel plugin (e.g., Claude Code's InkMail plugin) SHOULD fire detach from the plugin's stdio close handler, as this is the most reliable signal. Implementations without a channel plugin SHOULD use a `process.on('exit')` handler.
 
-### 4.3 Session Aliasing
+### 4.3 Session Keys
 
-Sessions MAY have a human-readable `alias` that enables explicit routing without relying on threadKey matching or studio resolution heuristics.
+Sessions MAY carry a `sessionKey`: the typed, routable name of the session, enabling explicit routing without relying on threadKey matching or studio resolution heuristics. (Called `alias` until 2026-10-01; the storage column keeps that name.)
 
-| Field   | Type   | Description                                        |
-| ------- | ------ | -------------------------------------------------- |
-| `alias` | string | Short human-readable name (e.g., "main", "review") |
+| Field        | Type   | Description                                                                |
+| ------------ | ------ | -------------------------------------------------------------------------- |
+| `sessionKey` | string | Typed name, convention `<sb>:<project>:<name>` (e.g., `wren:inkwell:main`) |
 
-**Alias rules:**
+**Session key rules:**
 
-1. Aliases MUST be unique per `(userId, sbSlug)` among active sessions
-2. Aliases are case-insensitive
-3. The alias `"main"` is reserved for the agent's primary interactive session
-4. When `send_to_inbox` includes a `sessionAlias`, routing MUST match by alias before falling through to threadKey or studio resolution
+1. A key MUST be unique per `(userId, sbId, studioId)` among live sessions; a resolver that finds one key in two studios MUST refuse rather than choose
+2. Keys are normalised on write and on lookup: trimmed, lowercased, `[a-z0-9][a-z0-9:/._-]*`, at most 80 characters; an empty key clears
+3. The convention for `<name>` is `main` for the root checkout's interactive session and the studio name otherwise, so a sender can construct the key
+4. When `send_to_inbox` includes a `sessionKey`, routing MUST match by key before falling through to threadKey or studio resolution
+5. `list_sessions` and `get_session` MUST report `sessionKey`, and `update_session_state` MUST report a key change in its trace
 
-**Use case:** Cross-agent explicit routing. Instead of relying on black-box session resolution, an agent can say "route to wren's main session in main studio." This is especially valuable when the routing cascade would otherwise create a new thread-scoped session.
+The behaviour on a miss (refuse with candidates versus fall through), the echo of the resolved session id, and project-alias canonicalisation are specified in `ink://specs/key-schemes`.
+
+**Use case:** Cross-agent explicit routing. Instead of relying on black-box session resolution, an agent can say "route to `wren:inkwell:main`." This is especially valuable when the routing cascade would otherwise create a new thread-scoped session.
 
 ### 4.4 Resumability
 

@@ -231,6 +231,9 @@ export class CodexAdapter implements BackendAdapter {
       args,
       launchConfig,
       env: {
+        INK_CHANNEL_HOST: 'codex',
+        // Only the live-mail owner may opt into guarded Codex hooks.
+        INK_CODEX_INKMAIL: '0',
         SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,

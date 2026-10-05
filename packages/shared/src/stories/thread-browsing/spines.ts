@@ -5,7 +5,7 @@
  * conversation, and the sessions, studios and task groups working on it.
  */
 
-import type { SpineSession, ThreadSpine } from '../threads-api/index.js';
+import { compareInstants, type SpineSession, type ThreadSpine } from '../threads-api/index.js';
 import type { NameFor } from '../thread-viewing/index.js';
 
 export type StatusFilter = 'all' | 'unread' | 'active' | 'closed';
@@ -29,6 +29,29 @@ export const SESSION_RELATION_LABELS: Readonly<Record<SpineSession['relation'], 
  */
 export function isConversation(spine: ThreadSpine): boolean {
   return spine.thread !== null;
+}
+
+/**
+ * When a conversation last spoke: its newest message, or its last activity
+ * when it has no message yet (or the server predates `lastMessage`). The list
+ * sorts by this and each row's age shows it, so the order and the labels
+ * cannot disagree.
+ */
+export function lastSpokeAt(spine: ThreadSpine): string {
+  return spine.thread?.lastMessage?.createdAt ?? spine.lastActivityAt;
+}
+
+/**
+ * The list's order: the newest message first, ties by key so the order is
+ * stable. The server orders spines by any activity on the key, which includes
+ * a session's lifecycle updates and a task group's, so a thread whose session
+ * was busy sat above one that had just been answered while its row said "6h"
+ * (Conor, 2026-10-03).
+ */
+export function byLatestMessage(a: ThreadSpine, b: ThreadSpine): number {
+  const byTime = compareInstants(lastSpokeAt(b), lastSpokeAt(a));
+  if (byTime !== 0) return byTime;
+  return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
 }
 
 /** The server decides liveness (isSessionLive); lifecycle is the fallback for older payloads. */

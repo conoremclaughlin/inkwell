@@ -1,0 +1,133 @@
+import { describe, expect, it } from 'vitest';
+import { CodexMailDiagnostics } from './diagnostics.js';
+import { PendingCodexDelivery, UnconfirmedCodexDelivery } from './delivery.js';
+
+describe('Codex mail diagnostics', () => {
+  it('names each held message/thread once until state changes, and reports recovery', async () => {
+    const messages: string[] = [];
+    let now = 0;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    let uncertain = true;
+    const delivery = {
+      deliver: async () => {
+        if (uncertain) throw new Error('acceptance is uncertain');
+      },
+    };
+    const send = (id = 'm1', thread = 'thread:fixture') =>
+      diagnostics.deliver(delivery, id, 'hello', { thread_key: thread });
+    await expect(send()).rejects.toThrow('uncertain');
+    await expect(send()).rejects.toThrow();
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('message m1 in thread:fixture');
+    expect(messages[0]).toContain('Later mail behind this message is held unread');
+    await expect(send('m2', 'thread:other')).rejects.toThrow();
+    expect(messages[1]).toContain('message m2 in thread:other');
+    now = 60_000;
+    await expect(send()).rejects.toThrow();
+    expect(messages).toHaveLength(2);
+    // A transient scan gap can recover on the very next receipt. Do not keep
+    // presenting its initial absence as a permanent loss.
+    uncertain = false;
+    await send();
+    expect(messages[2]).toContain('Exact receipt confirmed for message m1 in thread:fixture');
+    await send();
+    expect(messages).toHaveLength(3);
+  });
+  it('keeps ordinary queue backpressure quiet and identifies the global legacy boundary', async () => {
+    const messages: string[] = [];
+    const diagnostics = new CodexMailDiagnostics((m) => messages.push(m));
+    const queued = {
+      deliver: async () => {
+        throw new PendingCodexDelivery('queued');
+      },
+    };
+    await expect(diagnostics.deliver(queued, 'm1', 'hello', {})).rejects.toThrow();
+    expect(messages).toEqual([]);
+    const lost = {
+      deliver: async () => {
+        throw new Error('uncertain');
+      },
+    };
+    await expect(diagnostics.deliver(lost, 'm1', 'hello', {})).rejects.toThrow();
+    expect(messages[0]).toContain('legacy inbox (global read pointer)');
+  });
+  it('keeps a brief not-visible scan gap and its recovery quiet, without accepting delivery', async () => {
+    const messages: string[] = [];
+    let now = 0,
+      receipt = false;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    const delivery = {
+      deliver: async () => {
+        if (!receipt) throw new UnconfirmedCodexDelivery('not visible yet');
+      },
+    };
+    const send = () => diagnostics.deliver(delivery, 'm1', 'hello', {});
+    await expect(send()).rejects.toThrow();
+    now = 5000;
+    await expect(send()).rejects.toThrow();
+    receipt = true;
+    await send();
+    expect(messages).toEqual([]);
+  });
+  it('warns after 15 seconds of missing receipts and immediately on other failures', async () => {
+    const messages: string[] = [];
+    let now = 0;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    const absent = {
+      deliver: async () => {
+        throw new UnconfirmedCodexDelivery('uncertain');
+      },
+    };
+    const send = () => diagnostics.deliver(absent, 'm1', 'hello', {});
+    await expect(send()).rejects.toThrow();
+    now = 14999;
+    await expect(send()).rejects.toThrow();
+    expect(messages).toEqual([]);
+    now = 15000;
+    await expect(send()).rejects.toThrow();
+    expect(messages[0]).toContain('message m1');
+    await expect(
+      diagnostics.deliver(
+        {
+          deliver: async () => {
+            throw new Error('transport lost');
+          },
+        },
+        'm2',
+        'hello',
+        {}
+      )
+    ).rejects.toThrow();
+    expect(messages[1]).toContain('transport lost');
+  });
+  it('suppresses stable failures indefinitely, but reports changes and failures after recovery', () => {
+    const messages: string[] = [];
+    let now = 100;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    diagnostics.warn('mailbox poll failed');
+    diagnostics.warn('mailbox poll failed');
+    expect(messages).toHaveLength(1);
+    now += 60_000;
+    diagnostics.warn('mailbox poll failed');
+    expect(messages).toHaveLength(1);
+    diagnostics.clearWarning('mailbox poll failed');
+    diagnostics.warn('mailbox poll failed');
+    expect(messages).toHaveLength(2);
+    diagnostics.warn('hooks missing', 'hooks');
+    diagnostics.warn('hooks untrusted', 'hooks');
+    diagnostics.warn('hooks untrusted', 'hooks');
+    expect(messages.slice(2)).toEqual(['hooks missing', 'hooks untrusted']);
+  });
+});

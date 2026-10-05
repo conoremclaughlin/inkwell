@@ -1,12 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { spawnSync } from 'child_process';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
+import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import { tmpdir } from 'os';
 import {
   buildBackendSessionOwnerIndex,
-  detachPrintModeExit,
+  detachOnChildExit,
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
   extractLatestPreviewFromClaudeSessionJsonl,
@@ -15,11 +25,15 @@ import {
   filterUntrackedLocalBackendSessions,
   filterInkSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  isSessionResumable,
+  dedupeInkSessionsByBackendId,
   buildSessionPickerLabel,
   getBackendLocalSessionsForProject,
   getClaudeLocalSessionsForProject,
   getKnownClaudeSessionIds,
   getCodexLocalSessionsForProject,
+  getCodexLocalSessionsFromJsonl,
+  CODEX_JSONL_FALLBACK_MAX_FILES,
   getGeminiLocalSessionsForProject,
   hasBackendSessionOverride,
   renderSessionCandidatesTable,
@@ -362,6 +376,68 @@ describe('filterUntrackedLocalClaudeSessions', () => {
     ]);
 
     expect(filtered.map((session) => session.sessionId)).toEqual(['claude-2']);
+  });
+});
+
+describe('isSessionResumable', () => {
+  const base = { id: 'ink-1', startedAt: '2026-10-01T00:00:00.000Z' };
+
+  // The row is the conversation's identity. Hiding it from the picker for a
+  // reason the server does not share makes its transcript look untracked, and
+  // the launcher then starts a second row for the same conversation
+  // (2026-10-01: four live rows for one Claude session in the root checkout).
+  it('keeps a row whose agent-set work phase is complete', () => {
+    expect(isSessionResumable({ ...base, currentPhase: 'complete' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: 'complete:merged' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: '  Complete  ' })).toBe(true);
+  });
+
+  it('keeps live and crashed rows', () => {
+    expect(isSessionResumable({ ...base })).toBe(true);
+    expect(isSessionResumable({ ...base, lifecycle: 'idle', status: 'active' })).toBe(true);
+    expect(isSessionResumable({ ...base, lifecycle: 'failed' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: 'implementing' })).toBe(true);
+  });
+
+  it('drops rows the server considers finished', () => {
+    expect(isSessionResumable({ ...base, endedAt: '2026-10-01T01:00:00.000Z' })).toBe(false);
+    expect(isSessionResumable({ ...base, lifecycle: 'completed' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: 'completed' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: 'completed:merged' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: ' COMPLETED ' })).toBe(false);
+  });
+});
+
+describe('dedupeInkSessionsByBackendId', () => {
+  const at = (iso: string) => ({ startedAt: iso, backend: 'claude' });
+
+  it('keeps one row per backend conversation, the first in list order', () => {
+    const rows = [
+      { id: 'newest', ...at('2026-10-01T20:56:56Z'), backendSessionId: 'claude-A' },
+      { id: 'older', ...at('2026-10-01T06:28:04Z'), backendSessionId: 'claude-A' },
+      { id: 'other', ...at('2026-09-30T00:00:00Z'), backendSessionId: 'claude-B' },
+    ];
+    expect(dedupeInkSessionsByBackendId(rows).map((row) => row.id)).toEqual(['newest', 'other']);
+  });
+
+  it('never collapses rows that have no backend conversation yet', () => {
+    const rows = [
+      { id: 'fresh-1', ...at('2026-10-01T00:00:00Z') },
+      { id: 'fresh-2', ...at('2026-10-01T00:00:01Z') },
+    ];
+    expect(dedupeInkSessionsByBackendId(rows).map((row) => row.id)).toEqual(['fresh-1', 'fresh-2']);
+  });
+
+  it('reads the backend id through the resolver when the row itself has none', () => {
+    const rows = [
+      { id: 'linked-by-runtime', ...at('2026-10-01T00:00:02Z') },
+      { id: 'linked-by-row', ...at('2026-10-01T00:00:01Z'), claudeSessionId: 'claude-C' },
+    ];
+    const resolve = (row: { id: string }) =>
+      row.id === 'linked-by-runtime' ? 'claude-C' : undefined;
+    expect(dedupeInkSessionsByBackendId(rows, resolve).map((row) => row.id)).toEqual([
+      'linked-by-runtime',
+    ]);
   });
 });
 
@@ -1664,16 +1740,22 @@ describe('buildBackendSessionOwnerIndex', () => {
 // Under a print-mode host it stays inert, so the one-shot wrapper takes that
 // exit over; without it, the attachment the child's prompt hook set outlives
 // the process and triggers are delivered inline to nobody (PR #685).
-describe('detachPrintModeExit', () => {
-  const deps = (fetchImpl: typeof fetch) => ({
+describe('detachOnChildExit', () => {
+  // The wrapper's own environment is pinned, so a token in the shell that
+  // runs the tests cannot decide a row.
+  const deps = (fetchImpl: typeof fetch, parentEnv: NodeJS.ProcessEnv = {}) => ({
     fetchImpl,
     getServerUrl: () => 'http://ink.test',
     getToken: async () => 'tok',
+    parentEnv,
   });
+  const inkContext = (cliAttached: boolean) =>
+    Buffer.from(JSON.stringify({ sessionId: 'sess-1', cliAttached })).toString('base64url');
 
   it('detaches the session when a print-mode child exits', async () => {
     const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
-    const ok = await detachPrintModeExit(
+    const ok = await detachOnChildExit(
+      'claude',
       { ...PRINT_MODE_CHANNEL_ENV, SB_SLUG: 'wren' },
       'sess-1',
       'wren',
@@ -1691,10 +1773,11 @@ describe('detachPrintModeExit', () => {
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok');
   });
 
-  it('leaves an interactive child alone: its plugin still detaches itself', async () => {
+  it('leaves an interactive Claude alone: its plugin still detaches itself', async () => {
     const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
-    const ok = await detachPrintModeExit(
-      { SB_SLUG: 'wren' },
+    const ok = await detachOnChildExit(
+      'claude',
+      { SB_SLUG: 'wren', INK_CONTEXT: inkContext(true) },
       'sess-1',
       'wren',
       deps(fetchImpl as unknown as typeof fetch)
@@ -1703,12 +1786,70 @@ describe('detachPrintModeExit', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  // No plugin runs in either, and their stop hooks close a turn, not the
+  // process: Lumen's interactive Codex exited and a trigger 41s later went
+  // inline to it (Myra, #701 93c9def5; task ca307a72).
+  for (const backend of ['codex', 'gemini']) {
+    it(`detaches an interactive ${backend} its hooks marked attached, with or without a token`, async () => {
+      const cases: [Record<string, string>, NodeJS.ProcessEnv][] = [
+        [{ INK_CONTEXT: inkContext(true) }, {}],
+        [{}, {}],
+        // Run from an SB's shell, the wrapper's own env carries a headless
+        // token, but the child runs with the adapter's attached token over it
+        // and its hooks write true (Myra, #701 65619ac6).
+        [{ INK_CONTEXT: inkContext(true) }, { INK_CONTEXT: inkContext(false) }],
+      ];
+      for (const [spawnEnv, parentEnv] of cases) {
+        const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+        const ok = await detachOnChildExit(
+          backend,
+          spawnEnv,
+          'sess-1',
+          'lumen',
+          deps(fetchImpl as unknown as typeof fetch, parentEnv)
+        );
+        expect(ok).toBe(true);
+        const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+        expect(url).toBe('http://ink.test/api/hooks/lifecycle');
+        expect(JSON.parse(String(init.body))).toEqual({
+          sessionId: 'sess-1',
+          cliAttached: false,
+          sbSlug: 'lumen',
+        });
+      }
+    });
+
+    it(`leaves a ${backend} its hooks never marked attached: a server spawn, or a child of ink chat`, async () => {
+      const cases: [Record<string, string>, NodeJS.ProcessEnv][] = [
+        // A server spawn wrote false itself, and its run owns the turn marker.
+        [{ INK_CONTEXT: inkContext(false) }, {}],
+        // The same token inherited from the wrapper's own environment.
+        [{}, { INK_CONTEXT: inkContext(false) }],
+        // A child of `ink chat`: its parent owns the attachment and is running.
+        [{ INK_CONTEXT: inkContext(false), ...PARENT_OWNED_TURN_ENV }, {}],
+      ];
+      for (const [spawnEnv, parentEnv] of cases) {
+        const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+        const ok = await detachOnChildExit(
+          backend,
+          spawnEnv,
+          'sess-1',
+          'lumen',
+          deps(fetchImpl as unknown as typeof fetch, parentEnv)
+        );
+        expect(ok).toBe(false);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      }
+    });
+  }
+
   it('does nothing without a session, and never throws on a failed post', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('ECONNREFUSED');
     });
     expect(
-      await detachPrintModeExit(
+      await detachOnChildExit(
+        'claude',
         { ...PRINT_MODE_CHANNEL_ENV },
         undefined,
         'wren',
@@ -1717,8 +1858,9 @@ describe('detachPrintModeExit', () => {
     ).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(
-      await detachPrintModeExit(
-        { ...PRINT_MODE_CHANNEL_ENV },
+      await detachOnChildExit(
+        'codex',
+        {},
         'sess-1',
         'wren',
         deps(fetchImpl as unknown as typeof fetch)
@@ -1729,7 +1871,8 @@ describe('detachPrintModeExit', () => {
 
   // runClaude and runClaudeInteractive spawn and exit a real process, and
   // their harness (claude.integration.test.ts) is not in CI. Pin the wiring
-  // where CI can see it: every child close handler in the file detaches.
+  // where CI can see it: every child close handler in the file detaches, and
+  // names the backend it spawned.
   it('is called from every spawned child’s close handler', () => {
     const source = readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), 'claude.ts'),
@@ -1738,8 +1881,276 @@ describe('detachPrintModeExit', () => {
     const handlers = source.split("child.on('close', async (code) => {").slice(1);
     expect(handlers.length).toBe(2);
     for (const body of handlers) {
-      const head = body.split('\n').slice(0, 5).join('\n');
-      expect(head).toContain('await detachPrintModeExit(prepared.env,');
+      const head = body.split('\n').slice(0, 8).join('\n');
+      expect(head).toMatch(/await detachOnChildExit\(\s*options\.backend,\s*prepared\.env,/);
     }
+  });
+});
+
+/**
+ * The Codex local-session scan, after task 38af403e.
+ *
+ * Measured 2026-09-29 on this machine: 6,130 rollouts, 3.0 GB. The state DB
+ * was asked for the 200 newest threads across every cwd (170 ms) and, when
+ * none matched the launch cwd — every fresh studio — the jsonl fallback
+ * listed and stat'ed every file and read the newest thousand IN FULL,
+ * 1.26 GB in 9.9 s of blocked event loop, which is how the launcher's
+ * keep-alive socket went stale. Now the DB is asked for THIS cwd (10 ms on
+ * its (archived, cwd, updated_at) index), an empty answer is trusted, and
+ * the fallback is bounded and head-first. The DB tests need the sqlite3
+ * CLI the production path shells out to; they skip where it is absent.
+ */
+describe('getCodexLocalSessionsForProject asks the state DB for this cwd (task 38af403e)', () => {
+  const hasSqlite3 = spawnSync('sqlite3', ['-version'], { encoding: 'utf-8' }).status === 0;
+
+  function withTempHome<T>(run: (home: string) => T): T {
+    const home = mkdtempSync(join(tmpdir(), 'codex-state-db-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      return run(home);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * The columns the production query reads, in a DB the sqlite3 CLI made,
+   * with Codex's backfill_state row: 'complete' unless a test says otherwise,
+   * and no table at all for `null`.
+   */
+  function makeStateDb(
+    home: string,
+    rows: Array<{ id: string; cwd: string; updatedAt: number; rolloutPath?: string }>,
+    options: { backfill?: string | null } = {}
+  ): void {
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    const db = join(home, '.codex', 'state_5.sqlite');
+    const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    const backfill = options.backfill === undefined ? 'complete' : options.backfill;
+    const sql = [
+      "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, first_user_message TEXT NOT NULL DEFAULT '');",
+      ...(backfill === null
+        ? []
+        : [
+            'CREATE TABLE backfill_state (id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL, last_watermark TEXT, last_success_at INTEGER, updated_at INTEGER NOT NULL);',
+            `INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at) VALUES (1, ${q(backfill)}, NULL, NULL, 1800000000);`,
+          ]),
+      ...rows.map(
+        (row) =>
+          `INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, first_user_message) VALUES (${q(row.id)}, ${q(row.rolloutPath ?? '')}, ${row.updatedAt}, ${row.updatedAt}, 'cli', 'openai', ${q(row.cwd)}, '', '', '', 'main', 'first prompt');`
+      ),
+    ].join('\n');
+    const made = spawnSync('sqlite3', [db, sql], { encoding: 'utf-8' });
+    if (made.status !== 0) throw new Error(`fixture sqlite3 failed: ${made.stderr}`);
+  }
+
+  function writeRollout(
+    home: string,
+    day: string,
+    id: string,
+    cwd: string,
+    extraLines: string[] = []
+  ): string {
+    const dir = join(home, '.codex', 'sessions', ...day.split('/'));
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `rollout-${day.replace(/\//g, '-')}T00-00-00-${id}.jsonl`);
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          timestamp: `${day.replace(/\//g, '-')}T00:00:00.000Z`,
+          type: 'session_meta',
+          payload: { id, cwd, timestamp: `${day.replace(/\//g, '-')}T00:00:00.000Z` },
+        }),
+        ...extraLines,
+      ].join('\n') + '\n'
+    );
+    return path;
+  }
+
+  it.skipIf(!hasSqlite3)(
+    'an empty answer from the DB is trusted: the jsonl files are not scanned',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        makeStateDb(home, [
+          { id: 'other', cwd: join(home, 'elsewhere'), updatedAt: 1_800_000_000 },
+        ]);
+        // A rollout for this project exists on disk; before, the empty DB
+        // answer fell through to the scan and this is what it found.
+        writeRollout(home, '2026/09/29', '019a0000-0000-7000-8000-000000000001', project);
+        expect(getCodexLocalSessionsForProject(project, 10)).toEqual([]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'the DB is asked for this cwd, so a project older than the newest 200 threads is still found',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        const others = Array.from({ length: 201 }, (_, i) => ({
+          id: `other-${i}`,
+          cwd: join(home, 'elsewhere'),
+          updatedAt: 1_800_000_000 + i,
+        }));
+        makeStateDb(home, [...others, { id: 'mine', cwd: project, updatedAt: 1_700_000_000 }]);
+        expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+          'mine',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a launch through a symlinked path finds the canonical path Codex records',
+    () => {
+      withTempHome((home) => {
+        // Codex canonicalises the cwd it stores; the launch may name an
+        // alias. The reverse (a row under an alias, a launch from the real
+        // path) is not covered, and the query comment says so.
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        const alias = join(home, 'alias');
+        symlinkSync(project, alias);
+        makeStateDb(home, [{ id: 'real', cwd: realpathSync(project), updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(alias, 10).map((s) => s.sessionId)).toEqual([
+          'real',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a cwd with an apostrophe is decoded as the DB stored it (Lumen, #703: -tabs quoted it and the row was dropped)',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, "repo's-root");
+        mkdirSync(project);
+        makeStateDb(home, [{ id: 'mine', cwd: project, updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+          'mine',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a DB whose backfill is not complete is not the record: the files are (Lumen, #703)',
+    () => {
+      for (const backfill of ['pending', 'interrupted', null]) {
+        withTempHome((home) => {
+          const project = join(home, 'repo');
+          mkdirSync(project);
+          // The DB has nothing for this cwd; the rollout on disk is the truth
+          // until the backfill says 'complete'. A missing table is the same.
+          makeStateDb(home, [{ id: 'other', cwd: join(home, 'elsewhere'), updatedAt: 1 }], {
+            backfill,
+          });
+          writeRollout(home, '2026/09/29', 'mine', project);
+          expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+            'mine',
+          ]);
+        });
+      }
+    }
+  );
+
+  it.skipIf(!hasSqlite3)('the preview is read from the tail of the transcript', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      const filler = JSON.stringify({
+        timestamp: '2026-09-29T00:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'x'.repeat(4000) }],
+        },
+      });
+      const rollout = writeRollout(home, '2026/09/29', 'mine', project, [
+        ...Array.from({ length: 200 }, () => filler),
+        JSON.stringify({
+          timestamp: '2026-09-29T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'the last word' }],
+          },
+        }),
+      ]);
+      makeStateDb(home, [
+        { id: 'mine', cwd: project, updatedAt: 1_800_000_000, rolloutPath: rollout },
+      ]);
+      const [session] = getCodexLocalSessionsForProject(project, 10);
+      expect(session?.latestPrompt).toContain('the last word');
+    });
+  });
+
+  it('the fallback is bounded and head-first: newest files by name, the first line of each, the tail of a match', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      const junk = JSON.stringify({ type: 'noise', payload: { text: 'j'.repeat(100 * 1024) } });
+      // 350 rollouts for other projects across three days, each 100 KB after
+      // its first line; the fallback may inspect at most the newest 300.
+      let n = 0;
+      for (const day of ['2026/09/27', '2026/09/28', '2026/09/29']) {
+        for (let i = 0; i < 116; i++) {
+          n += 1;
+          writeRollout(home, day, `other-${String(n).padStart(4, '0')}`, join(home, 'elsewhere'), [
+            junk,
+          ]);
+        }
+      }
+      // Ours is the newest file of the newest day.
+      writeRollout(home, '2026/09/29', 'zzzz-mine', project, [
+        JSON.stringify({
+          timestamp: '2026-09-29T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'found' }],
+          },
+        }),
+      ]);
+      const stats = { filesListed: 0, filesInspected: 0, headBytesRead: 0, tailBytesRead: 0 };
+      const sessions = getCodexLocalSessionsFromJsonl(project, 10, { stats });
+      expect(sessions.map((s) => s.sessionId)).toEqual(['zzzz-mine']);
+      expect(sessions[0]?.latestPrompt).toContain('found');
+      expect(stats.filesListed).toBe(CODEX_JSONL_FALLBACK_MAX_FILES);
+      expect(stats.filesInspected).toBeLessThanOrEqual(CODEX_JSONL_FALLBACK_MAX_FILES);
+      // Heads only: never the 100 KB junk that follows the first line.
+      expect(stats.headBytesRead).toBeLessThanOrEqual(stats.filesInspected * 32 * 1024);
+      expect(stats.headBytesRead).toBeLessThan(stats.filesInspected * 100 * 1024);
+      // One match, one tail.
+      expect(stats.tailBytesRead).toBeLessThanOrEqual(256 * 1024);
+      expect(stats.tailBytesRead).toBeGreaterThan(0);
+    });
+  });
+
+  it('a match older than the newest CODEX_JSONL_FALLBACK_MAX_FILES rollouts is beyond the fallback, by design', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      writeRollout(home, '2026/01/01', 'aaaa-mine-old', project);
+      for (let i = 0; i < CODEX_JSONL_FALLBACK_MAX_FILES; i++) {
+        writeRollout(
+          home,
+          '2026/09/29',
+          `other-${String(i).padStart(4, '0')}`,
+          join(home, 'elsewhere')
+        );
+      }
+      expect(getCodexLocalSessionsFromJsonl(project, 10)).toEqual([]);
+    });
   });
 });

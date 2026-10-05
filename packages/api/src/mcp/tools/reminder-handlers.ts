@@ -7,6 +7,10 @@
 
 import { z } from 'zod';
 import { quietHoursDeferralWarning } from '../../services/quiet-hours.js';
+import {
+  isStrategyWatchdog,
+  WATCHDOG_QUIET_HOURS_REFUSAL,
+} from '../../services/reminder-quiet-hours.js';
 import { isoDateTime } from './schema-primitives.js';
 import { createClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
@@ -153,6 +157,12 @@ export const createReminderSchema = z.object({
     .describe(
       'Studio to run this reminder in (e.g., "main", or a studio slug like "wren-omega"). Overrides the agent\'s default. If omitted, inherits from agent identity.'
     ),
+  runDuringQuietHours: z
+    .boolean()
+    .optional()
+    .describe(
+      "Run during the user's quiet hours instead of waiting for them to end (default false). For reminders that wake an SB to do work on its own. The SB is told not to contact the user until quiet hours end, and alerts about this reminder still wait for morning."
+    ),
 });
 
 export async function handleCreateReminder(
@@ -284,8 +294,11 @@ export async function handleCreateReminder(
     // Cron reminders that fire into the window are still held silently. That is
     // a known gap, not an oversight — recurring semantics need their own answer
     // about which occurrence to warn on.
+    //
+    // A reminder that runs during quiet hours is not deferred at all, so there
+    // is nothing to warn about and the lookup is skipped.
     let quietHoursWarning: ReturnType<typeof quietHoursDeferralWarning> = null;
-    if (args.runAt) {
+    if (args.runAt && args.runDuringQuietHours !== true) {
       try {
         const { data: quietState } = await supabase
           .from('heartbeat_state')
@@ -317,6 +330,7 @@ export async function handleCreateReminder(
         next_run_at: nextRunAt.toISOString(),
         max_runs: args.maxRuns || null,
         studio_hint: args.studioHint || null,
+        run_during_quiet_hours: args.runDuringQuietHours === true,
         status: 'active',
       })
       .select()
@@ -347,6 +361,7 @@ export async function handleCreateReminder(
         cronExpression: data.cron_expression,
         nextRunAt: data.next_run_at,
         studioHint: data.studio_hint,
+        runDuringQuietHours: data.run_during_quiet_hours,
         status: data.status,
         isRecurring: !!data.cron_expression,
       },
@@ -452,6 +467,7 @@ export async function handleListReminders(
       nextRunAt: r.next_run_at,
       lastRunAt: r.last_run_at,
       studioHint: r.studio_hint,
+      runDuringQuietHours: r.run_during_quiet_hours,
       status: r.status,
       runCount: r.run_count,
       maxRuns: r.max_runs,
@@ -523,6 +539,12 @@ export const updateReminderSchema = z.object({
     .describe(
       'Studio to run this reminder in. Set to override agent default, or empty string to clear override.'
     ),
+  runDuringQuietHours: z
+    .boolean()
+    .optional()
+    .describe(
+      "Run during the user's quiet hours instead of waiting for them to end. Refused on strategy watchdog reminders."
+    ),
 });
 
 export async function handleUpdateReminder(
@@ -574,6 +596,13 @@ export async function handleUpdateReminder(
     if (args.nextRunAt !== undefined) updates.next_run_at = args.nextRunAt;
     if (args.status !== undefined) updates.status = args.status;
     if (args.studioHint !== undefined) updates.studio_hint = args.studioHint || null;
+    if (args.runDuringQuietHours !== undefined) {
+      // Turning it ON for a watchdog is refused; turning it off is always fine.
+      if (args.runDuringQuietHours && isStrategyWatchdog(existing.metadata)) {
+        return mcpResponse({ success: false, error: WATCHDOG_QUIET_HOURS_REFUSAL }, true);
+      }
+      updates.run_during_quiet_hours = args.runDuringQuietHours;
+    }
 
     if (Object.keys(updates).length === 0) {
       return mcpResponse({ success: false, error: 'No updates provided' }, true);
@@ -599,6 +628,7 @@ export async function handleUpdateReminder(
         cronExpression: data.cron_expression,
         nextRunAt: data.next_run_at,
         studioHint: data.studio_hint,
+        runDuringQuietHours: data.run_during_quiet_hours,
         status: data.status,
       },
     });

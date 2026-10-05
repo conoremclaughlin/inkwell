@@ -16,8 +16,10 @@
  * launching slug, and then the routine registers a row for it, as `ink
  * init` there would. When the server cannot say — unreachable, a timeout,
  * a refused credential — the owner is UNKNOWN and nothing that names an
- * owner is written: hooks, permissions and backend config are completed,
- * identity and registration are left for a launch that can ask. A guess
+ * owner is written: hooks and backend config are completed; identity,
+ * registration and Claude permissions (whose profile is read from the same
+ * row, and whose scratch paths name the owner) are left for a launch that
+ * can ask. A guess
  * here is durable: completeStudio never replaces an owner it finds, so a
  * transient failure that wrote the visitor's slug would have kept it after
  * the server came back (Lumen, PR #699 round 1).
@@ -29,23 +31,19 @@
 import chalk from 'chalk';
 import { auditStudio, type StudioCheckId } from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
-import type { CompleteStudioReport } from './studio-complete.js';
-import { callInkTool } from './ink-mcp.js';
+import type { CompleteStudioReport, StepResult } from './studio-complete.js';
+import { lookupStudioByPath, type StudioLookup, type StudioRowSummary } from './studio-lookup.js';
 import { sbDebugLog } from './sb-debug.js';
 
-export interface LaunchStudioRow {
-  id?: string;
-  sbSlug?: string;
-}
+/** The studio row a launch completes against (see studio-lookup.ts). */
+export type LaunchStudioRow = StudioRowSummary;
 
 /**
  * What the server said about the worktree: a row, confirmed none, or no
- * answer. Only the first two license an identity write.
+ * answer. Only the first two license an identity write, and only the first
+ * names a permission profile.
  */
-export type LaunchStudioLookup =
-  | { status: 'found'; row: LaunchStudioRow }
-  | { status: 'none' }
-  | { status: 'unknown'; reason: string };
+export type LaunchStudioLookup = StudioLookup;
 
 export interface LaunchStudioDeps {
   placement?: (cwd: string) => WorktreePlacement;
@@ -62,38 +60,6 @@ export interface LaunchStudioResult {
   ownerUnknown?: string;
   missingBefore?: StudioCheckId[];
   report?: CompleteStudioReport;
-}
-
-/** The server's own words for a worktree it has no row for. */
-const NOT_FOUND = /studio not found/i;
-
-/**
- * The launcher's own lookup: get_studio by path, bounded. A "Studio not
- * found" from the server is the one answer that means none; every other
- * failure is no answer at all.
- */
-async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLookup> {
-  try {
-    const result = await callInkTool<{ studio?: { id?: string; sbSlug?: string } }>(
-      'get_studio',
-      { path: worktreePath },
-      { timeoutMs: 3000 }
-    );
-    if (result?.studio?.id) {
-      return {
-        status: 'found',
-        row: {
-          id: result.studio.id,
-          ...(result.studio.sbSlug ? { sbSlug: result.studio.sbSlug } : {}),
-        },
-      };
-    }
-    return { status: 'unknown', reason: 'the server returned no studio and no error' };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (NOT_FOUND.test(message)) return { status: 'none' };
-    return { status: 'unknown', reason: message };
-  }
 }
 
 /**
@@ -116,33 +82,59 @@ export async function completeStudioForLaunch(
   const lookup = await (deps.lookupStudio ?? lookupStudioByPath)(placement.toplevel);
   const init = deps.runInit ?? runInit;
   if (lookup.status === 'unknown') {
-    const report = await init(placement.toplevel, { agent: launchSlug, studioSetup: false });
+    // No row, no profile: permissions are left for a launch that can ask,
+    // as identity is. A guessed profile would be kept by every later run.
+    const report = await init(placement.toplevel, {
+      agent: launchSlug,
+      studioSetup: false,
+      permissions: false,
+    });
     return { ran: true, ownerUnknown: lookup.reason, missingBefore: audit.missing, report };
   }
   const owner = (lookup.status === 'found' && lookup.row.sbSlug) || launchSlug;
+  // Only a row names a profile. A worktree the server confirms has no row
+  // gets identity and registration as ink init would, and no permissions:
+  // in a detached PR checkout a default would be kept by every later run
+  // (review 4177f7fe, P2 1).
+  const profile = lookup.status === 'found' ? lookup.row.permissionProfile : undefined;
   const report = await init(placement.toplevel, {
     agent: owner,
     ...(lookup.status === 'found' && lookup.row.id ? { studioId: lookup.row.id } : {}),
+    ...(profile ? { permissionProfile: profile } : { permissions: false }),
   });
   return { ran: true, owner, missingBefore: audit.missing, report };
+}
+
+/**
+ * What a run wrote, created and updated named apart so a repaired file
+ * (hooks under an older ink path, an identity with a field filled in) reads
+ * as a repair and not as something the studio lacked.
+ */
+function describeStepsWritten(steps: StepResult[]): string {
+  const labels = (status: StepResult['status']) =>
+    steps.filter((step) => step.status === status).map((step) => step.label);
+  const created = labels('created');
+  const updated = labels('updated');
+  return [
+    created.length ? `created ${created.join(', ')}` : '',
+    updated.length ? `updated ${updated.join(', ')}` : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
 }
 
 /** What a run changed, one line per written step, and what it left for later. */
 export function describeLaunchStudioResult(result: LaunchStudioResult): string[] {
   if (!result.ran || !result.report) return [];
-  const changed = result.report.steps
-    .filter((step) => step.status === 'created' || step.status === 'updated')
-    .map((step) => step.label);
+  const changed = describeStepsWritten(result.report.steps);
   const lines: string[] = [];
   if (result.ownerUnknown) {
     lines.push(
-      `Studio partly completed${changed.length ? ` (${changed.join(', ')})` : ''}; its owner is unknown because the server could not be asked (${result.ownerUnknown}). Identity and registration were left alone: run ink init when the server is reachable`
+      `Studio partly completed${changed ? ` (${changed})` : ''}; its owner is unknown because the server could not be asked (${result.ownerUnknown}). Identity and registration were left alone: run ink init when the server is reachable`
     );
     return lines;
   }
-  lines.push(
-    `Studio completed for ${result.owner}${changed.length ? `: ${changed.join(', ')}` : ''}`
-  );
+  lines.push(`Studio completed for ${result.owner}${changed ? `: ${changed}` : ''}`);
   if (!result.report.audit.complete) {
     lines.push(
       `Studio still incomplete (${result.report.audit.missing.join(', ')}). Run: ink init`

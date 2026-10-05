@@ -21,6 +21,7 @@ import {
 } from '../../utils/request-context';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
+import { normaliseSessionKey } from '../../services/sessions/session-key';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
   currentWorkAudience,
@@ -360,6 +361,7 @@ const topicsSchema = z
 // Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
 // the same budgeted renderer. Re-exported here for existing importers.
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
+import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
 
 export { buildKnowledgeSummary };
@@ -530,6 +532,16 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('If true, create a new session even if an active one already exists for this scope.'),
+  backendSessionId: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'The backend conversation this session will run (Claude Code session id, Codex thread id). ' +
+        'When a live session of the same agent already carries it, that session is returned — ' +
+        'forceNew included — because one backend conversation is one Inkwell session.'
+    ),
 });
 
 export const endSessionSchema = userIdentifierBaseSchema.extend({
@@ -582,6 +594,13 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
       }
     ),
   backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
+  sessionKey: z
+    .string()
+    .max(80)
+    .optional()
+    .describe(
+      'Filter to the session carrying this key (e.g., "wren:inkwell:main"). Case-insensitive; exact match after normalisation.'
+    ),
   // `ink attach` and `ink mission` have always passed status: 'active' here.
   // The parameter was never declared, so zod stripped it and every caller
   // silently received unfiltered results. Declaring it without honouring it
@@ -666,12 +685,16 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('Whether a human is attached to the CLI session (interactive REPL)'),
-  alias: z
+  sessionKey: z
     .string()
+    .max(80)
     .optional()
     .describe(
-      'Human-readable session alias for explicit routing (e.g., "main", "review"). Unique per agent among active sessions. Use to name a session so messages can be routed to it by alias.'
+      'Name this session so others can route to it: send_to_inbox(recipientSlug, sessionKey) resolves it ahead of thread routing. ' +
+        'Convention <sb>:<project>:<name>, e.g. "wren:inkwell:main"; lowercase letters, digits, ":", "/", ".", "_", "-"; at most 80 characters; ' +
+        "trimmed and lowercased on write; empty string clears. Unique among this agent's live sessions in a studio. Shown by list_sessions and get_session."
     ),
+  alias: z.string().optional().describe('Deprecated spelling of sessionKey; use sessionKey.'),
   activeThreadKey: z
     .string()
     .optional()
@@ -1228,15 +1251,88 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   // 1. threadKey match — find active session with same identity+threadKey
   // 2. studioId match — find active session scoped by identity+studio
   let existingSession = null;
+  let reusedBy: 'backendSessionId' | undefined;
 
-  if (!params.forceNew && params.threadKey && sbSlug) {
+  // 0. backend conversation match — the live row already linked to the
+  // transcript the caller is about to resume. Ranked first and exempt from
+  // forceNew: forceNew means "do not hand me whatever is active in this
+  // scope", and a second row for a conversation that already has one is not
+  // a new session but a duplicate (the `ink claude` picker sent exactly this
+  // for every transcript whose row it had hidden, and one Claude session grew
+  // four live rows). Scoped to the caller's identity, never to a studio: the
+  // conversation is the identity, wherever its row was first recorded.
+  if (params.backendSessionId && (creator.sbId || sbSlug)) {
+    existingSession = await dataComposer.repositories.memory.getActiveSessionByBackendSessionId(
+      user.id,
+      params.backendSessionId,
+      sbSlug,
+      creator.sbId
+    );
+    // Discovery is separate from admission (T4; Lumen, #719 review). The
+    // lookup finds the transcript's row whatever its contact scope, and only
+    // then is that scope compared with the caller's. A mismatch refuses
+    // outright: reusing would hand one scope another's conversation, and
+    // falling through (to the scoped lookups below, or to an insert) would
+    // mint a second row for the same transcript. forceNew included: it never
+    // licenses a duplicate. Filtering the lookup by contact instead would
+    // make the existing transcript look absent and produce exactly that.
+    if (
+      existingSession &&
+      ((existingSession.contactId ?? null) !== (contactScope ?? null) ||
+        !isSessionAuthorized(existingSession, user.id, creator))
+    ) {
+      logger.warn('start_session refused: the backend conversation belongs to another scope', {
+        sessionId: existingSession.id,
+        sbSlug,
+        backendSessionId: params.backendSessionId,
+        sessionContactId: existingSession.contactId ?? null,
+        callerContactId: contactScope ?? null,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error:
+                  'Refusing to start a session for this backend conversation: it already ' +
+                  'belongs to a session in another contact scope. One backend conversation ' +
+                  'is one Inkwell session, so no second session was created and the ' +
+                  'existing one was not reused.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    if (existingSession) {
+      reusedBy = 'backendSessionId';
+      logger.info('start_session reused the session already linked to this backend conversation', {
+        sessionId: existingSession.id,
+        sbSlug,
+        backendSessionId: params.backendSessionId,
+        forceNew: params.forceNew === true,
+      });
+    }
+  }
+
+  if (!params.forceNew && !existingSession && params.threadKey && sbSlug) {
     existingSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
       user.id,
       sbSlug,
       params.threadKey,
       studioScope,
       contactScope,
-      creator.sbId
+      creator.sbId,
+      // A crashed session is the one its agent resumes next. The hooks'
+      // start_session carries no backend id, so this lookup is the only
+      // thing that can find the crashed row; excluding it minted a second
+      // row for the same transcript on every relaunch after a crash
+      // (finished-session audit, rows 10 and 11).
+      { includeFailed: true }
     );
   }
 
@@ -1246,7 +1342,8 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       sbSlug,
       studioScope,
       contactScope,
-      creator.sbId
+      creator.sbId,
+      { includeFailed: true }
     );
   }
 
@@ -1286,6 +1383,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
                   existingSession.backendSessionId || existingSession.claudeSessionId || null,
                 startedAt: existingSession.startedAt.toISOString(),
                 isExisting: true,
+                ...(reusedBy ? { reusedBy } : {}),
               },
             },
             null,
@@ -1317,6 +1415,9 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     model: params.model,
     metadata: params.metadata,
     contactId: contactScope,
+    // Written with the row: a link added by a later update leaves a window
+    // in which a second start for the same transcript creates a second row.
+    backendSessionId: params.backendSessionId,
   });
 
   // Persist CLI-attached flag from request context to session record.
@@ -1622,6 +1723,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               currentPhase: session.currentPhase || null,
               threadKey: session.threadKey || null,
               activeThreadKey: session.activeThreadKey || null,
+              sessionKey: session.alias || null,
               ...describeCurrentWork(session, currentWorkAudience(session, user.id, caller)),
               // Withheld for the same reason as logs, and omitted rather than
               // nulled so an unauthorized read is byte-identical to main's,
@@ -1660,12 +1762,41 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const studioId = typeof scope === 'string' ? scope : undefined;
   const filterNullStudio = scope === null;
 
+  // A key filter is normalised like a key write, and a blank or invalid
+  // filter is an error rather than "no filter": widening a targeted lookup
+  // into every session is the wrong surprise (Lumen, #717 review).
+  let sessionKeyFilter: string | undefined;
+  if (params.sessionKey !== undefined) {
+    const normalised = normaliseSessionKey(params.sessionKey);
+    if (!normalised.ok || normalised.value === '') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: normalised.ok
+                  ? 'sessionKey filter must not be blank: pass a key such as "wren:inkwell:main", or omit it'
+                  : normalised.reason,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    sessionKeyFilter = normalised.value;
+  }
+
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     sbSlug: params.sbSlug,
     studioId,
     filterNullStudio,
     backend: params.backend,
     status: params.status,
+    ...(sessionKeyFilter ? { sessionKey: sessionKeyFilter } : {}),
     limit: params.limit,
   });
 
@@ -1707,6 +1838,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                 currentPhase: s.currentPhase || null,
                 threadKey: s.threadKey || null,
                 activeThreadKey: s.activeThreadKey || null,
+                sessionKey: s.alias || null,
                 status: s.status || null,
                 backend: s.backend || null,
                 provider: (s.metadata?.provider as string) || null,
@@ -1838,7 +1970,8 @@ type SessionTraceField =
   | 'backendSessionId'
   | 'workingDir'
   | 'context'
-  | 'activeThreadKey';
+  | 'activeThreadKey'
+  | 'sessionKey';
 
 interface SessionTraceSnapshot {
   sbSlug: string | null;
@@ -1849,6 +1982,7 @@ interface SessionTraceSnapshot {
   workingDir: string | null;
   context: string | null;
   activeThreadKey: string | null;
+  sessionKey: string | null;
 }
 
 const SESSION_TRACE_FIELDS: SessionTraceField[] = [
@@ -1860,6 +1994,7 @@ const SESSION_TRACE_FIELDS: SessionTraceField[] = [
   'workingDir',
   'context',
   'activeThreadKey',
+  'sessionKey',
 ];
 
 function normalizeTraceString(value: string | null | undefined, truncateAt = 240): string | null {
@@ -1879,6 +2014,7 @@ function toSessionTraceSnapshot(session: Session | null | undefined): SessionTra
     workingDir: normalizeTraceString(session?.workingDir),
     context: normalizeTraceString(session?.context),
     activeThreadKey: normalizeTraceString(session?.activeThreadKey),
+    sessionKey: normalizeTraceString(session?.alias),
   };
 }
 
@@ -1912,6 +2048,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.workingDir &&
     params.cliAttached === undefined &&
     params.alias === undefined &&
+    params.sessionKey === undefined &&
     params.activeThreadKey === undefined &&
     // `reopen: true` is a complete request on its own — it supplies its own
     // live lifecycle below. Omitting it here rejected the one call that has
@@ -2111,8 +2248,22 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.workingDir !== undefined) {
     updates.workingDir = params.workingDir;
   }
-  if (params.alias !== undefined) {
-    updates.alias = params.alias || null;
+  const sessionKeyInput = params.sessionKey !== undefined ? params.sessionKey : params.alias;
+  let sessionKeyValue: string | null | undefined;
+  if (sessionKeyInput !== undefined) {
+    const normalised = normaliseSessionKey(sessionKeyInput);
+    if (!normalised.ok) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({ success: false, error: normalised.reason }, null, 2),
+          },
+        ],
+      };
+    }
+    sessionKeyValue = normalised.value || null;
+    updates.alias = sessionKeyValue;
   }
   if (params.activeThreadKey !== undefined) {
     updates.activeThreadKey = params.activeThreadKey || null;
@@ -2157,7 +2308,8 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.backendSessionId) messageParts.push('backendSessionId set');
   if (params.context) messageParts.push('context updated');
   if (params.workingDir) messageParts.push('workingDir updated');
-  if (params.alias !== undefined) messageParts.push(`alias → ${params.alias || '(cleared)'}`);
+  if (sessionKeyValue !== undefined)
+    messageParts.push(`sessionKey → ${sessionKeyValue || '(cleared)'}`);
   if (params.activeThreadKey !== undefined)
     messageParts.push(`activeThreadKey → ${params.activeThreadKey || '(cleared)'}`);
 
@@ -2177,6 +2329,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       // the fence is clear whether or not it is — which turns the check into
       // another proxy for the thing it was meant to confirm (PR #541).
       status: updated.status || null,
+      sessionKey: updated.alias || null,
       endedAt: updated.endedAt ? updated.endedAt.toISOString() : null,
     },
   };
@@ -2504,6 +2657,28 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 // ==============================================// BOOTSTRAP HANDLER
 // ==============================================
 /**
+ * Who bootstrap tells the calling SB it is. An inkling that hasn't been named
+ * yet gets a null name and a plain statement of that, never its stored
+ * placeholder: its first act on waking is to call bootstrap.
+ */
+export function bootstrapAgentInfo(dbIdentity: Record<string, unknown>): {
+  name: string | null;
+  role: string;
+  capabilities: Record<string, unknown> | null;
+  naming?: string;
+} {
+  const identity = dbIdentity as { name: string; metadata?: unknown };
+  return {
+    name: nameOf(identity),
+    role: dbIdentity.role as string,
+    capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
+    ...(isUnnamed(identity)
+      ? { naming: "You haven't been named yet. The person may name you, or never; don't ask." }
+      : {}),
+  };
+}
+
+/**
  * Bootstrap loads identity core + active context in one call.
  * This is the recommended way to start a new session.
  *
@@ -2597,7 +2772,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
       // All active sessions (filter by sbSlug if provided) — client picks the right one
       dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
-      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul).
+      // Keep `metadata` in this select: bootstrapAgentInfo and nameOf read
+      // metadata.named, and without it an unnamed inkling would be told its
+      // placeholder name again (review 3ce682bd).
       sbSlug
         ? dataComposer
             .getClient()
@@ -2625,7 +2803,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       // Agents cross-reference this with their personal `relationships` notes.
       supabase
         .from('agent_identities')
-        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        // `metadata` is what nameOf reads: an unnamed inkling is listed with
+        // no name, never as its placeholder.
+        .select('agent_id, name, role, backend, session_scope, capabilities, description, metadata')
         .eq('user_id', user.id)
         .order('created_at', { ascending: true })
         .then(({ data }) => data || []),
@@ -2777,13 +2957,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     : null;
 
   // Build agent info from dbIdentity
-  const agentInfo = dbIdentity
-    ? {
-        name: dbIdentity.name as string,
-        role: dbIdentity.role as string,
-        capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
-      }
-    : null;
+  const agentInfo = dbIdentity ? bootstrapAgentInfo(dbIdentity) : null;
 
   // Build knowledge summary (or use cache for the text)
   let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
@@ -2934,7 +3108,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             dbIdentity: dbIdentity
               ? {
                   sbSlug: dbIdentity.agent_id,
-                  name: dbIdentity.name,
+                  name: nameOf(dbIdentity as { name: string; metadata?: unknown }),
                   role: dbIdentity.role,
                   description: dbIdentity.description,
                   values: dbIdentity.values,
@@ -2953,7 +3127,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               .filter((s) => s.agent_id !== sbSlug)
               .map((s) => ({
                 sbSlug: s.agent_id,
-                name: s.name,
+                name: nameOf(s),
                 role: s.role,
                 backend: s.backend,
                 sessionScope: s.session_scope,

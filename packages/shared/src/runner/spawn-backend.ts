@@ -52,7 +52,8 @@ export interface SpawnBackendOptions {
    * limit (~256KB on macOS) and large transcripts trigger spawn E2BIG.
    */
   stdinData?: string;
-  /** Hard timeout in ms (default: 30 minutes) */
+  /** Hard timeout in ms, applied only when given (default: none). A working
+   *  turn is never killed on wall-clock; idleTimeoutMs ends a silent one. */
   timeoutMs?: number;
   /** Idle timeout in ms — kill if no output for this long (default: none) */
   idleTimeoutMs?: number;
@@ -489,9 +490,11 @@ export function spawnBackend(options: SpawnBackendOptions): SpawnedBackend {
   };
 
   // Hard ceiling timeout
-  const hardTimeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
-  hardTimer = setTimeout(() => timeOut('hard'), hardTimeoutMs);
-  hardTimer.unref?.();
+  const hardTimeoutMs = options.timeoutMs;
+  if (hardTimeoutMs !== undefined && hardTimeoutMs > 0) {
+    hardTimer = setTimeout(() => timeOut('hard'), hardTimeoutMs);
+    hardTimer.unref?.();
+  }
 
   // Idle timeout (optional) — resets on any output until a stop begins
   const resetIdleTimer = () => {

@@ -4,7 +4,9 @@
  * Core types for the stateless SessionService architecture.
  */
 
-import type { ErrorClassification } from '@inklabs/shared';
+import type { ErrorClassification, TurnReply } from '@inklabs/shared';
+import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
+import type { GroupState } from './stop-process';
 
 // ─── Channel Types ───
 
@@ -113,6 +115,12 @@ export interface Session {
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
+  /**
+   * The directory the session's process last reported running in (CLI hooks
+   * and update_session_state write it; routing never does). Read-only here:
+   * it is repository evidence for a studioless session, never a placement.
+   */
+  workingDir?: string;
   /** Contact scope for per-sender session isolation */
   contactId?: string;
   /** Backend-specific session ID for resume (Claude Code, Codex thread UUID, Gemini session) */
@@ -175,10 +183,21 @@ export interface Session {
   lastActivityAt: Date;
   endedAt: Date | null;
 
+  /**
+   * Archived: automatic routing never resumes it (session-lifecycle-model
+   * §2.2). Mapped from T2 on; nothing routes on it until the T11 cutover.
+   */
+  archivedAt?: Date | null;
+  archivedReason?: SessionArchivedReason;
+  /** `metadata.handedOffTo`: the successor session after a handoff. */
+  handedOffTo?: string;
+  /** `metadata.resumeRefused`: a backend refused to resume this transcript. */
+  resumeRefused?: SessionResumeRefused;
+
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
-  // Human-readable alias for explicit routing (e.g., "main", "review")
+  // The session key for explicit routing (e.g., "wren:inkwell:main"); stored in the `alias` column
   alias?: string;
 
   // Whether a CLI process with a channel plugin is attached to this session
@@ -209,6 +228,17 @@ export interface ImageContent {
 export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 
 // ─── Request/Response Types ───
+
+/**
+ * One outer turn's reply from a run that takes several (an `ink chat` spawn),
+ * handed over as the turn ends so it reaches the channel before the next turn
+ * starts. `sessionId` is the session that ran it, for the message_out row.
+ */
+export interface RunnerTurnReply extends TurnReply {
+  sessionId?: string;
+}
+
+export type TurnReplyHandler = (reply: RunnerTurnReply) => Promise<void>;
 
 export interface SessionRequest {
   // Auth context (required)
@@ -248,12 +278,18 @@ export interface SessionRequest {
      * b5c71bc3, Lumen #681 r2).
      */
     recipientSessionExplicit?: boolean;
+    /**
+     * True only when the caller named this session itself, by id or key (T4).
+     * Such a session is refused when it cannot take the message and reopened
+     * when it ended; an inferred one falls through as before.
+     */
+    recipientSessionNamed?: boolean;
     // The session that wrote the message this one replies to. A preference,
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
     replyToSessionId?: string;
-    // Target a session by alias (e.g., "main", "review")
-    sessionAlias?: string;
+    // Target a session by its key (e.g., "wren:inkwell:main"), normalised by the sender
+    sessionKey?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;
@@ -264,7 +300,22 @@ export interface SessionRequest {
     taskGroupId?: string;
     // Docker container name for sandboxed strategy execution
     sandboxContainerName?: string;
+    /**
+     * The stored thread message that prompted this trigger, copied by the
+     * trigger handler from the payload's own threadMessageId (set only by
+     * the server's send path), never from caller metadata. The inkling turn
+     * gate reads the message to learn who really sent it.
+     */
+    triggerThreadMessageId?: string;
   };
+
+  /**
+   * Called as each outer turn of the run ends, by runners whose run has more
+   * than one (InkRunner). Set by a caller that delivers replies to a channel;
+   * a runner that reports no turns never calls it, and the caller falls back
+   * to the run's final text.
+   */
+  onTurnReply?: TurnReplyHandler;
 }
 
 export interface ChannelResponse {
@@ -356,12 +407,28 @@ export interface SessionResult {
     detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it (task b5c71bc3). */
       project?: { slug: string; cause?: 'unset' | 'unresolved' | 'unreadable'; repoRoot?: string };
+      /** A caller-named session that cannot take the message (T4). */
+      explicit?: {
+        sessionId?: string;
+        sessionKey?: string;
+        cause:
+          | 'unknown-session'
+          | 'contact-scope'
+          | 'session-key-miss'
+          | 'session-key-held'
+          | 'binding-held';
+      };
     };
   };
 }
@@ -379,6 +446,12 @@ export interface ToolCall {
 export interface AgentIdentity {
   sbSlug: string;
   name: string;
+  /**
+   * An inkling the person has not named yet (metadata.named === false). Its
+   * stored name is a placeholder, so a prompt must not tell it that is who it
+   * is: render "an inkling who hasn't been named yet" instead.
+   */
+  unnamed?: boolean;
   role: string;
   description?: string;
   /** Workspace this identity belongs to — scopes which constitution it reads. */
@@ -547,6 +620,21 @@ export interface ISessionService {
 
 // ─── Repository Interface ───
 
+/**
+ * What a conditional reopen found (SessionRepository.reopenEnded):
+ * - `reopened`: this call cleared the ended state it observed.
+ * - `open`: the row is no longer ended (another resolution or a human resume
+ *   reopened it first), and `session` is it as it stands now.
+ * - `key-held`: its session key is held by another live session, so the key's
+ *   unique index refuses a second live holder.
+ * - `missing`: the row is gone.
+ */
+export type ReopenEndedResult =
+  | { kind: 'reopened'; session: Session }
+  | { kind: 'open'; session: Session }
+  | { kind: 'key-held' }
+  | { kind: 'missing' };
+
 export interface ISessionRepository {
   findById(id: string): Promise<Session | null>;
 
@@ -560,8 +648,24 @@ export interface ISessionRepository {
       contactId?: string;
       /** Canonical identity UUID — preferred over the ambiguous slug. */
       sbId?: string | null;
+      /**
+       * Return the newest unended session even when its lifecycle is
+       * `failed`. Routing reuse wants this: a crashed home session is still
+       * the session its agent resumes next, and skipping it is how a twin
+       * gets created. Session pickers and liveness readers do not.
+       */
+      includeFailed?: boolean;
     }
   ): Promise<Session | null>;
+
+  /**
+   * Reopen an ended session, conditional on the ended state the caller
+   * observed (T4; Lumen, #725). See SessionRepository.reopenEnded.
+   */
+  reopenEnded?(
+    id: string,
+    observed: Pick<Session, 'lifecycle' | 'status'>
+  ): Promise<ReopenEndedResult>;
 
   findByThreadKey?(
     userId: string,
@@ -676,6 +780,31 @@ export interface IContextBuilder {
 export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
+  /**
+   * This run's hard ceiling, when it must be lower than the runner's own
+   * (an inkling turn's). The Claude runner honours it.
+   */
+  timeoutMs?: number;
+  /**
+   * Spawn the backend as a process-group leader and stop the whole group,
+   * so the tools it started stop with it (stop-process.ts). The Claude
+   * runner honours it.
+   */
+  killProcessGroup?: boolean;
+  /**
+   * Stops the run when aborted, as a timeout would (an owner cancelling an
+   * inkling's turn). The Claude runner honours it.
+   */
+  signal?: AbortSignal;
+  /**
+   * The caller's admission, asked again at the spawn seam: synchronously,
+   * after the last await of the runner's own preparation, with none between
+   * it and the spawn. A reason refuses the run, which starts nothing and
+   * returns `refusedBeforeSpawn` with the reason as its error. An admission
+   * made earlier can go stale while the run is prepared (Lumen's review of
+   * #747). The Claude runner honours it.
+   */
+  admitSpawn?: () => string | undefined;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
@@ -727,6 +856,12 @@ export interface ClaudeRunnerConfig {
    */
   maxTurns?: number;
   /**
+   * InkRunner calls this with each outer turn's reply as the turn ends, and
+   * tells the chat its continuation text is forwarded. Other runners run one
+   * turn and ignore it.
+   */
+  onTurnReply?: TurnReplyHandler;
+  /**
    * Tool routing for InkRunner spawns, from the SB's dashboard settings
    * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
    * the ink chat loop resolves its own default ('local').
@@ -751,6 +886,24 @@ export interface ClaudeRunnerConfig {
   permissionOverlay?: {
     allow?: string[];
     deny?: string[];
+  };
+  /**
+   * The studio's permission profile, delivered with `claude --settings` in a
+   * file of this launch's own (launch-settings.ts). Read from the studio row
+   * by the session service, never from the checkout. Present for a studio
+   * session; a profile that cannot be validated fails the launch.
+   */
+  launchPermissions?: {
+    profile: unknown;
+    owner: unknown;
+    /** The main checkout, for the record of sources; null when not a worktree. */
+    mainRoot: string | null;
+    /**
+     * The studio row's worktree. The launch is refused unless it runs
+     * there: a working directory that fell back elsewhere must not be
+     * granted the studio's profile.
+     */
+    worktreePath: string;
   };
   /** Run the backend CLI inside a Docker container instead of on the host */
   container?: {
@@ -791,6 +944,20 @@ export interface RunnerResult {
   finalTextResponse?: string;
   /** Tool calls captured during this run (for activity stream logging) */
   toolCalls?: ToolCall[];
+  /**
+   * Set when the run was stopped and the stop could not confirm, by the
+   * bound, that the process (and, for a group stop, its whole group) had
+   * gone. The caller must not let replacement work overlap whatever is still
+   * running (stop-process.ts, inkling-stop-fence.ts).
+   */
+  stopUnconfirmed?: {
+    leaderExited: boolean;
+    /** The group's number, for a group stop: the only thing a fence may release on. */
+    pgid?: number;
+    group?: GroupState;
+  };
+  /** `admitSpawn` refused this run: nothing was started, and `error` is its reason. */
+  refusedBeforeSpawn?: true;
 }
 
 /** @deprecated Use RunnerResult */

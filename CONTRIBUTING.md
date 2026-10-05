@@ -413,10 +413,19 @@ Notes:
 
 ### Integration tests
 
-Local DB integration tests share a **retained, test-only Supabase stack** across
-worktrees. The first run starts it and applies migrations + seed; subsequent runs
-reuse the containers and schema. CI still starts, resets, and tears down a fresh
-stack on each job. Neither path uses an application database.
+**First ask whether the change reaches an integration point at all**: the database,
+the server, or a provider. If it does not, its unit tests are the evidence and
+nothing needs booting. When it does, run the focused files while iterating and the
+full suite once, on the head you hand over, and name that head in the review
+request so the reviewer does not repeat the run on the same head.
+
+Local DB integration tests share **one retained, test-only Supabase stack** across
+worktrees, and the single stack is deliberate. A stack is about eight containers and
+most of a GiB of Docker memory that stays resident, and a cold start replays every
+migration, on a Docker VM that other projects' stacks already mostly fill. The first
+run starts it and applies migrations + seed; subsequent runs reuse the containers
+and schema. CI still starts, resets, and tears down a fresh stack on each job.
+Neither path uses an application database.
 
 ```bash
 # Focus on the affected integration file rather than repeatedly running everything.
@@ -470,10 +479,25 @@ mismatch refuses reuse with an explicit reset/stop instruction rather than silen
 running against another branch's schema. It does not detect arbitrary SQL changes
 made directly to the running database.
 
-The harness takes project/port locks. A competing run or an occupied port prints
-its owner when available and tells the caller to **wait and retry**, without stopping
+The harness takes project/port locks. **A run that finds the stack busy waits for
+it**, printing the holder, for up to `INTEGRATION_LOCK_WAIT_SECONDS` (default 1200;
+`0` refuses at once), and refuses only if the lock is still held at the deadline. A
+warm run takes a minute or two, so waiting is far cheaper than any alternative. An
+occupied port still refuses and names its owner when available, without stopping
 that owner's stack. Run DB integration tests sparingly; prefer focused unit tests
 while iterating. Unmanaged/legacy kept stacks are never automatically adopted.
+
+**A private stack is an explicit decision.** `INTEGRATION_SUPABASE_PROJECT_ID=ink-integration-<suffix>`
+is refused unless the run also passes `--private-stack`, and the flag is for a run
+the shared stack cannot serve, such as a rehearsal with withheld migrations
+(`INTEGRATION_MIGRATIONS_UNTIL`). Never use it to get past a busy shared stack.
+Private stacks are capped at one running per machine: a machine-wide lock covers
+concurrent runs, and a run refuses while another project's private stack is up. A
+private stack is disposable by default (started, used, stopped) unless `--reuse`
+keeps it; `--stop` releases a kept one and never needs the flag. `INTEGRATION_KEEP_SUPABASE=1`
+never keeps a private stack, because what it keeps is a stack `--stop` cannot release. On 2026-10-02 four
+integration stacks came up in eleven minutes, because the lock used to refuse and a
+new suffix got past it.
 
 State lives outside the repository at
 `~/.cache/inkwell/integration-db/<project>`. `INTEGRATION_SUPABASE_CACHE_DIR` can
@@ -498,7 +522,7 @@ Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
 the six source config port fields must retain their repository defaults, or the
 harness refuses before starting containers. Use the overrides rather than editing
 `supabase/config.toml` to select integration ports.
-Project IDs must be `ink-integration` or `ink-integration-<suffix>`. `--reuse` explicitly
+Project IDs must be `ink-integration` or, with `--private-stack`, `ink-integration-<suffix>`. `--reuse` explicitly
 selects retained mode (including in a CI-marked shell). The legacy
 `INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
 release it with the printed `supabase stop --workdir ... --no-backup` command before

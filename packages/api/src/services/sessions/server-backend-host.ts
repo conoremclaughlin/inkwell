@@ -161,7 +161,11 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
     claudeSupportsPartialMessages: () => input.claudeSupportsPartialMessages(),
     skillMcpServers: (cwd) => input.skillMcpServers(cwd),
     async sessionEnv({ hardTimeoutMs }) {
-      if (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0) {
+      if (
+        typeof hardTimeoutMs !== 'number' ||
+        !Number.isFinite(hardTimeoutMs) ||
+        hardTimeoutMs <= 0
+      ) {
         throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.invalidCeiling);
       }
       // The runner already clamps the ceiling to the deadline; the lifetime

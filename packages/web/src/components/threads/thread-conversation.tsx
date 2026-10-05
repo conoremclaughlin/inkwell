@@ -1,26 +1,32 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, Info, MessageSquareDashed } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
+  THREAD_REACTIONS_PATH,
   threadMessagesPath,
   type ThreadMessagesResponse,
+  type ThreadReactionRequest,
+  type ThreadReactionResponse,
   type ThreadSpine,
 } from '@inklabs/shared/stories/threads-api';
 import { displayTitle, liveAgentsOf, spineStatus } from '@inklabs/shared/stories/thread-browsing';
 import {
   creatorLabel,
   formatDayLabel,
+  reactionToggle,
   readableThrough,
   sbAuthor,
   toConversationMessage,
   unreadBeyondLoaded,
   useThreadHistory,
+  withReactionOverrides,
   type ConversationMessage,
+  type ConversationReaction,
   type NameFor,
 } from '@inklabs/shared/stories/thread-viewing';
-import { apiGet, useWorkspaceApiQuery } from '@/lib/api';
+import { apiGet, useApiPost, useQueryClient, useWorkspaceApiQuery } from '@/lib/api';
 import { AvatarStack } from '@/components/conversation/author-avatar';
 import { ConversationView } from '@/components/conversation/conversation-view';
 import type { ReadCursorStore } from './read-cursors';
@@ -95,9 +101,75 @@ export function ThreadConversation({
     openingCursor: cursors.cursorFor(key),
   });
 
+  // A reaction request answers with the message's reactions. Older pages are
+  // never refetched, so that answer stands in until a newest page carries
+  // the message again.
+  const [reactionOverrides, setReactionOverrides] = useState<
+    ReadonlyMap<string, ConversationReaction[]>
+  >(() => new Map());
+  useEffect(() => {
+    const refreshed = new Set((data?.messages ?? []).map((m) => m.id));
+    setReactionOverrides((current) => {
+      if (![...current.keys()].some((id) => refreshed.has(id))) return current;
+      return new Map([...current].filter(([id]) => !refreshed.has(id)));
+    });
+  }, [data, dataUpdatedAt]);
+
   const messages = useMemo<ConversationMessage[]>(
-    () => history.messages.map((m) => toConversationMessage(m, nameFor)),
-    [history.messages, nameFor]
+    () =>
+      withReactionOverrides(
+        history.messages.map((m) => toConversationMessage(m, nameFor)),
+        reactionOverrides
+      ),
+    [history.messages, nameFor, reactionOverrides]
+  );
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  // Members only (spec inkling-reactions): a person reading a thread they are
+  // not in sees its reactions but is offered nothing. The server refuses
+  // anyone else regardless.
+  const member = hasThread && (spine.thread?.people ?? []).some((person) => person.isOwn);
+  const queryClient = useQueryClient();
+  const react = useApiPost<ThreadReactionResponse, ThreadReactionRequest>(THREAD_REACTIONS_PATH);
+  const reactMutateAsync = react.mutateAsync;
+  // One write at a time per message. Two in flight could be applied by the
+  // server in one order and answered in the other, and the older answer
+  // would then stand on a message no newer page will carry again. So a
+  // message's writes queue, and each works out its toggle when it is sent,
+  // from the answer before it (or, after a failure, from what is shown).
+  const reactionQueues = useRef(new Map<string, Promise<ConversationReaction[] | undefined>>());
+  const onReact = useCallback(
+    (messageId: string, emoji: string) => {
+      const queues = reactionQueues.current;
+      const previous = queues.get(messageId) ?? Promise.resolve(undefined);
+      const next = previous.then(async (answered) => {
+        const current = answered ?? messagesRef.current.find((m) => m.id === messageId)?.reactions;
+        try {
+          const result = await reactMutateAsync({
+            threadKey: key,
+            messageId,
+            ...reactionToggle(emoji, current),
+          });
+          const reactions = result.reactions.map((r) => ({
+            emoji: r.emoji,
+            count: r.count,
+            mine: r.mine,
+          }));
+          setReactionOverrides((overrides) => new Map(overrides).set(messageId, reactions));
+          void queryClient.invalidateQueries({ queryKey: ['thread-messages', key] });
+          return reactions;
+        } catch {
+          // The banner says so; the next write reads what the message shows.
+          return undefined;
+        }
+      });
+      queues.set(messageId, next);
+      void next.then(() => {
+        if (queues.get(messageId) === next) queues.delete(messageId);
+      });
+    },
+    [key, reactMutateAsync, queryClient]
   );
 
   // Reading is acknowledged only as far as the history is whole. The
@@ -129,7 +201,13 @@ export function ThreadConversation({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b bg-background/95 px-3 backdrop-blur md:px-5">
+      {/*
+        A solid header, not backdrop-blur: it sits above the scroller, so the
+        blur had nothing to blur. Removed as the likeliest cause of the
+        single-frame blank paints of this region in Conor's recording (task
+        190eeb01). The cause is a hypothesis, not proven.
+      */}
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b bg-background px-3 md:px-5">
         <button
           type="button"
           onClick={onBack}
@@ -191,6 +269,12 @@ export function ThreadConversation({
         </button>
       </header>
 
+      {react.isError && (
+        <div className="shrink-0 border-b bg-destructive/10 px-4 py-1.5 text-center text-[11px] text-destructive">
+          Couldn&apos;t save that reaction: {react.error.message}
+        </div>
+      )}
+
       {olderError && (
         <div className="shrink-0 border-b bg-destructive/10 px-4 py-1.5 text-center text-[11px] text-destructive">
           {olderError}
@@ -208,6 +292,7 @@ export function ThreadConversation({
         onLoadOlder={() => void loadOlder()}
         onReadThrough={onReadThrough}
         onMarkAllRead={markAllRead}
+        onReact={member ? onReact : undefined}
         intro={
           <div className="px-4 pb-2 pt-8 md:px-6">
             <ParticipantCluster participants={spine.participants} nameFor={nameFor} />

@@ -144,6 +144,12 @@ describe('registration records the worktree as it is', () => {
             return payload.studio.id;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       expect(report.audit.complete).toBe(true);
@@ -176,6 +182,12 @@ describe('registration records the worktree as it is', () => {
             return payload.studio.id;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       expect(report.audit.complete).toBe(true);
@@ -287,6 +299,12 @@ describe('registration reuse boundaries (Lumen, PR #692 round 2)', () => {
             return payload.success ? payload.studio.id : null;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       // Either revive the row deliberately or refuse; success with an
@@ -347,6 +365,7 @@ describe('revival is coherent (Lumen, PR #692 round 3)', () => {
       userId: '00000000-0000-0000-0000-000000000001',
       sbSlug: 'wren',
       sbId: null,
+      slug: 'wren-old-fixture',
       worktreePath: actual,
       repoRoot: main,
       branch: 'wren/fix/old',
@@ -388,6 +407,10 @@ describe('revival is coherent (Lumen, PR #692 round 3)', () => {
       expect(existing.status).toBe('active');
       expect(payload.studio.branch).toBe('wren/fix/existing');
       expect(payload.studio.status).toBe('active');
+      // The revived row keeps its own slug, whatever this call asked for, and
+      // the response says so: it is the name send_to_inbox routes on
+      // (routing spec §v19 C).
+      expect(payload.studio.slug).toBe('wren-old-fixture');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

@@ -6,6 +6,7 @@ import type { SpineIdentity, ThreadSpine } from '@inklabs/shared/stories/threads
 import {
   displayTitle,
   hasLiveSession,
+  lastSpokeAt,
   matchesThreadSearch,
   previewLine,
   spineStatus,
@@ -52,8 +53,15 @@ export function TypeChip({ identity }: { identity: SpineIdentity | null }) {
 }
 
 /**
- * A thread's face in the list: one avatar for a single participant, two
- * overlapping ones for a group.
+ * A thread's face: one avatar for a single participant, two overlapping ones
+ * for a group. The list row, the conversation header and the conversation's
+ * opening lines all show it.
+ *
+ * A group's avatars are placed absolutely inside a 40px box, so the box must
+ * be a block of its own. An inline span only took its size where a flex
+ * parent made it a block; the conversation opens with it in a plain block,
+ * where it collapsed to nothing and one avatar hung out past the left edge
+ * while the other sat on the title (Conor, 2026-10-02).
  */
 export function ParticipantCluster({
   participants,
@@ -81,7 +89,7 @@ export function ParticipantCluster({
     return <AuthorAvatar author={authors[0]} size="md" className={cn('m-0.5', className)} />;
   }
   return (
-    <span className={cn('relative h-10 w-10 shrink-0', className)}>
+    <div className={cn('relative h-10 w-10 shrink-0', className)}>
       <AuthorAvatar author={authors[0]} size="sm" className="absolute left-0 top-0" />
       <AuthorAvatar
         author={authors[1]}
@@ -93,7 +101,7 @@ export function ParticipantCluster({
           +{authors.length - 2}
         </span>
       )}
-    </span>
+    </div>
   );
 }
 
@@ -321,7 +329,7 @@ function ThreadRow({
               unread ? 'font-semibold text-sky-600 dark:text-sky-400' : 'text-muted-foreground'
             )}
           >
-            {formatShortAgo(last?.createdAt ?? spine.lastActivityAt)}
+            {formatShortAgo(lastSpokeAt(spine))}
           </span>
         </div>
         <div className="mt-0.5 flex items-center gap-2">

@@ -2,6 +2,8 @@
  * Memory and Session types for long-term memory storage
  */
 
+import type { SessionArchivedReason } from '../../services/sessions/session-archive';
+
 // Common source values — not exhaustive, DB accepts any string
 export type MemorySource =
   | 'conversation'
@@ -126,6 +128,8 @@ export interface Session {
   studioId?: string;
   threadKey?: string;
   activeThreadKey?: string;
+  /** The session key (`wren:inkwell:main`), stored in the `alias` column under its older name. */
+  alias?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
   /** @deprecated Use lifecycle. Kept for backward compat. */
@@ -147,6 +151,9 @@ export interface Session {
   headlineUpdatedAt?: Date;
   startedAt: Date;
   endedAt?: Date;
+  /** Archived: automatic routing never resumes it (session-lifecycle-model §2.2). */
+  archivedAt?: Date;
+  archivedReason?: SessionArchivedReason;
   summary?: string;
   updatedAt?: Date;
   metadata: Record<string, unknown>;
@@ -171,6 +178,14 @@ export interface SessionCreateInput {
   threadKey?: string;
   contactId?: string;
   backend?: string;
+  /**
+   * The backend conversation this session runs (Claude Code session id,
+   * Codex thread id). Written to both link columns on insert so the row is
+   * findable by it from its first moment — a link written by a later
+   * best-effort update leaves a window in which a second start for the same
+   * transcript creates a second row (Lumen, #716).
+   */
+  backendSessionId?: string;
   model?: string;
   metadata?: Record<string, unknown>;
 }
@@ -238,6 +253,8 @@ export interface SessionRow {
   contact_id?: string | null;
   studio_id: string | null;
   thread_key: string | null;
+  /** The session key, under the column's older name. */
+  alias?: string | null;
   active_thread_key?: string | null;
   lifecycle?: string | null;
   status?: string | null;
@@ -253,6 +270,8 @@ export interface SessionRow {
   headline_updated_at?: string | null;
   started_at: string;
   ended_at: string | null;
+  archived_at?: string | null;
+  archived_reason?: string | null;
   summary: string | null;
   updated_at?: string | null;
   metadata: Record<string, unknown>;

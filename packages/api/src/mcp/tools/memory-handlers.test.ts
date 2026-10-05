@@ -13,6 +13,7 @@ import {
   handleUpdateSessionState,
   handleStartSession,
   handleGetSession,
+  handleListSessions,
   handleCompactSession,
   handleEndSession,
   curateRecallSchema,
@@ -81,6 +82,7 @@ function createMockDataComposer() {
     getActiveSession: vi.fn(),
     findOwnedActiveSessions: vi.fn().mockResolvedValue([]),
     getActiveSessionByThreadKey: vi.fn(),
+    getActiveSessionByBackendSessionId: vi.fn().mockResolvedValue(null),
     updateSession: vi.fn(),
     remember: vi.fn(),
     startSession: vi.fn(),
@@ -93,6 +95,10 @@ function createMockDataComposer() {
     updateMemory: vi.fn(),
     verifyOwnership: vi.fn().mockResolvedValue(new Set()),
     verifySessionOwnership: vi.fn().mockResolvedValue(true),
+  };
+
+  const mockStudiosRepo = {
+    listByIds: vi.fn().mockResolvedValue([]),
   };
 
   const mockProjectsRepo = {
@@ -122,6 +128,7 @@ function createMockDataComposer() {
     repositories: {
       memory: mockMemoryRepo,
       projects: mockProjectsRepo,
+      studios: mockStudiosRepo,
       tasks: mockProjectTasksRepo,
       activityStream: mockActivityStreamRepo,
       recallFeedback: mockRecallFeedbackRepo,
@@ -246,6 +253,20 @@ function callerIsAnonymous(): void {
 // =====================================================
 
 describe('startSessionSchema', () => {
+  it('accepts backendSessionId, the conversation the caller is about to resume', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      sbSlug: 'wren',
+      backendSessionId: '6e9ea775-c73a-4936-8c70-51c8b50dff72',
+      forceNew: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.backendSessionId).toBe('6e9ea775-c73a-4936-8c70-51c8b50dff72');
+    }
+  });
+
   it('should accept studioId as optional UUID', () => {
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
@@ -314,6 +335,15 @@ describe('startSessionSchema', () => {
 });
 
 describe('listSessionsSchema', () => {
+  it('accepts a sessionKey filter', () => {
+    const result = listSessionsSchema.safeParse({
+      sbSlug: 'wren',
+      sessionKey: 'wren:inkwell:main',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.sessionKey).toBe('wren:inkwell:main');
+  });
+
   it('should accept studioId as optional UUID', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
@@ -365,6 +395,13 @@ describe('listSessionsSchema', () => {
 });
 
 describe('updateSessionStateSchema', () => {
+  it('accepts sessionKey, and still accepts the deprecated alias spelling', () => {
+    expect(updateSessionStateSchema.safeParse({ sessionKey: 'wren:inkwell:main' }).success).toBe(
+      true
+    );
+    expect(updateSessionStateSchema.safeParse({ alias: 'main' }).success).toBe(true);
+  });
+
   it('should accept phase only', () => {
     const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
@@ -517,6 +554,90 @@ describe('handleUpdateSessionState', () => {
     // Default: the caller owns the session it resolves/names.
     mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([mockSession]);
     mockDataComposer.repositories.memory.getSession.mockResolvedValue(mockSession);
+  });
+
+  // ---------------------------------------------------
+  // sessionKey: the typed, routable name of a session
+  // ---------------------------------------------------
+  describe('sessionKey', () => {
+    it('sets the key, normalised, and reports it in the message and the trace', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        alias: 'wren:inkwell:main',
+      });
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: '  Wren:Inkwell:Main ' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.message).toContain('sessionKey → wren:inkwell:main');
+      expect(parsed.session.sessionKey).toBe('wren:inkwell:main');
+      // Myra, 2026-08-24: the write landed but changedFields listed only
+      // currentPhase, so an agent trusting the trace concluded the rename
+      // failed and would retry forever.
+      expect(parsed.sessionTrace.changedFields).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: 'wren:inkwell:main' })
+      );
+    });
+
+    it('still honours the deprecated alias spelling', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        alias: 'main',
+      });
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', alias: 'main' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: 'main' })
+      );
+    });
+
+    it('clears the key with an empty string', async () => {
+      const keyed = { ...mockSession, alias: 'wren:inkwell:main' };
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(keyed);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(keyed);
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([keyed]);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: '' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.message).toContain('sessionKey → (cleared)');
+      expect(parsed.sessionTrace.changedFields).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: null })
+      );
+    });
+
+    it('refuses a key it cannot normalise, and writes nothing', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: 'has space' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
   });
 
   // ---------------------------------------------------
@@ -1529,6 +1650,85 @@ describe('handleUpdateSessionState', () => {
 // something weaker than the verified request identity.
 // =====================================================
 
+describe('sessionKey surfaces in listings', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+  const SESSION_UUID = '7a2f0b5e-1c3d-4e8f-9a0b-1c2d3e4f5a6b';
+  const keyed = {
+    id: SESSION_UUID,
+    userId: 'user-123',
+    sbSlug: 'wren',
+    sbId: 'sb-wren',
+    studioId: undefined,
+    alias: 'wren:inkwell:main',
+    startedAt: new Date('2026-10-01T20:56:56Z'),
+    endedAt: undefined,
+    metadata: {},
+  };
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+    callerIsAgent('wren', 'sb-wren');
+    mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([keyed]);
+    mockDataComposer.repositories.memory.getSession.mockResolvedValue(keyed);
+  });
+
+  it('list_sessions returns the key and passes a sessionKey filter to the repository', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([keyed]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren', sessionKey: 'Wren:Inkwell:Main' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.sessions[0].sessionKey).toBe('wren:inkwell:main');
+    expect(mockDataComposer.repositories.memory.listSessions).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ sessionKey: 'wren:inkwell:main' })
+    );
+  });
+
+  it('list_sessions refuses a blank key filter rather than listing everything', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([keyed]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren', sessionKey: '   ' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('sessionKey');
+    expect(mockDataComposer.repositories.memory.listSessions).not.toHaveBeenCalled();
+  });
+
+  it('list_sessions reports null for a session with no key', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([
+      { ...keyed, alias: undefined },
+    ]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.sessions[0].sessionKey).toBeNull();
+  });
+
+  it('get_session returns the key', async () => {
+    const result = await handleGetSession(
+      { email: 'test@test.com', sessionId: SESSION_UUID },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.session.sessionKey).toBe('wren:inkwell:main');
+  });
+});
+
 describe('session authorization boundary', () => {
   let mockDataComposer: ReturnType<typeof createMockDataComposer>;
 
@@ -2223,6 +2423,103 @@ describe('handleStartSession - threadKey matching', () => {
     vi.clearAllMocks();
   });
 
+  // One backend conversation is one Inkwell session. A launcher that resumes
+  // a Claude transcript names it here; a live row already carrying that id is
+  // the session, whatever else the caller asked for (forceNew included — the
+  // `ink claude` picker used to send forceNew for a transcript whose row it had
+  // hidden, and one conversation grew four live rows).
+  it('reuses the live session already linked to the backend conversation, even with forceNew', async () => {
+    const linked = { ...mockSession, id: 'session-linked', backendSessionId: 'claude-abc' };
+    mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId.mockResolvedValue(
+      linked
+    );
+
+    const result = await handleStartSession(
+      {
+        email: 'test@test.com',
+        sbSlug: 'lumen',
+        backendSessionId: 'claude-abc',
+        forceNew: true,
+        sessionId: '11111111-2222-4333-8444-555555555555',
+      },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-linked');
+    expect(parsed.session.isExisting).toBe(true);
+    expect(parsed.session.reusedBy).toBe('backendSessionId');
+    expect(
+      mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId
+    ).toHaveBeenCalledWith('user-123', 'claude-abc', 'lumen', undefined);
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+  });
+
+  it('creates the session when no live row carries the backend conversation', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen', backendSessionId: 'claude-new', forceNew: true },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-new');
+    expect(parsed.session.isExisting).toBeUndefined();
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledTimes(1);
+    // The link is written with the row, not by a later best-effort update:
+    // a second start for the same transcript must find this row (Lumen, #716).
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ backendSessionId: 'claude-new' })
+    );
+  });
+
+  // The hooks' start_session carries no backend id (Claude's transient ids
+  // are deliberately not read from stdin), so after a crash the only thing
+  // that can find the crashed row is the (sb, studio) reuse lookup. It used
+  // to exclude lifecycle 'failed', and every relaunch after a crash minted a
+  // second row for the same transcript (finished-session audit, row 10).
+  it('reuses a crashed session on a plain relaunch, with no backend id to go on', async () => {
+    const crashed = { ...mockSession, id: 'session-crashed', lifecycle: 'failed' };
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(crashed);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.session.id).toBe('session-crashed');
+    expect(parsed.session.isExisting).toBe(true);
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+      'user-123',
+      'lumen',
+      undefined,
+      undefined,
+      undefined,
+      { includeFailed: true }
+    );
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+  });
+
+  it('does not consult the backend link when the caller names no conversation', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen' },
+      mockDataComposer as never
+    );
+
+    expect(
+      mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId
+    ).not.toHaveBeenCalled();
+  });
+
   it('should match existing session by threadKey', async () => {
     mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(mockSession);
 
@@ -2244,7 +2541,8 @@ describe('handleStartSession - threadKey matching', () => {
       'pr:32',
       undefined,
       undefined, // contactId
-      undefined // sbId — canonical owner when the caller has one
+      undefined, // sbId — canonical owner when the caller has one
+      { includeFailed: true }
     );
     // Should NOT have fallen through to studioId lookup
     expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
@@ -2312,7 +2610,8 @@ describe('handleStartSession - threadKey matching', () => {
       'pr:32',
       studioId,
       undefined, // contactId
-      undefined // sbId
+      undefined, // sbId
+      { includeFailed: true }
     );
   });
 
@@ -2463,7 +2762,8 @@ describe('handleStartSession - identity and contact scope', () => {
       'pr:501',
       undefined,
       undefined,
-      'sb-myra'
+      'sb-myra',
+      { includeFailed: true }
     );
   });
 
@@ -2475,7 +2775,8 @@ describe('handleStartSession - identity and contact scope', () => {
       'myra',
       undefined,
       undefined,
-      'sb-myra'
+      'sb-myra',
+      { includeFailed: true }
     );
   });
 
@@ -2613,7 +2914,8 @@ describe('handleStartSession - studioId="main" scope resolution', () => {
       'wren',
       null,
       undefined, // contactId
-      undefined // sbId
+      undefined, // sbId
+      { includeFailed: true }
     );
   });
 

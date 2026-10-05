@@ -57,7 +57,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
-import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { isSafeStudioComponent, studioPermissionProfile, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
 import { completeStudioViaCli } from './studio-complete';
@@ -532,6 +532,8 @@ export class StudioOverflowService {
             sbSlug,
             studioId: revived.id,
             purpose: revived.purpose ?? undefined,
+            // The revived row describes this detached checkout: a reviewer.
+            permissionProfile: studioPermissionProfile(revived),
           });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
@@ -583,6 +585,8 @@ export class StudioOverflowService {
           sbSlug,
           studioId: studio.id,
           purpose: studio.purpose ?? undefined,
+          // From the row, never the checkout (it may be the PR under review).
+          permissionProfile: studioPermissionProfile(studio),
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
@@ -787,6 +791,7 @@ export class StudioOverflowService {
         sbSlug,
         studioId: studio.id,
         purpose: studio.purpose ?? undefined,
+        permissionProfile: studioPermissionProfile(studio),
       });
       logger.info('[StudioOverflow] Created parent studio', {
         studioId: studio.id,
@@ -835,6 +840,7 @@ export class StudioOverflowService {
         sbSlug: ctx.sbSlug,
         studioId: studio.id,
         purpose: studio.purpose ?? undefined,
+        permissionProfile: studioPermissionProfile(studio),
       });
       logger.info('[StudioOverflow] Revived closed parent studio', {
         studioId: studio.id,

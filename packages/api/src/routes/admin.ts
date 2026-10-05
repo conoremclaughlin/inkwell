@@ -25,7 +25,12 @@ import {
   participantSlugs,
   reopenThreadRow,
 } from '../mcp/tools/thread-handlers';
-import { resolveSbsByIds, userPrincipal } from '../services/principals';
+import {
+  resolveSbsByIds,
+  resolveSbsInWorkspace,
+  userPrincipal,
+  type SbPrincipal,
+} from '../services/principals';
 import { describePeople, resolvePersonNames } from '../services/person-display';
 import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
@@ -85,6 +90,37 @@ import {
 } from '../services/thread-key/thread-conversation';
 import { openVerifiedMedia } from '../utils/media-path';
 import { describeCurrentWorkFromRow } from '../services/sessions/current-work';
+import {
+  InklingError,
+  InklingService,
+  isUuid,
+  validateDisplayName,
+  type InklingScope,
+} from '../services/inklings/inkling-service';
+import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
+import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import { inklingTurnActivity } from '../services/inklings/inkling-turns';
+import {
+  ReactionRefusedError,
+  loadReactions,
+  reactToMessage,
+  type ReactionSummary,
+} from '../services/threads/thread-reactions';
+import {
+  CLIENT_MESSAGE_CONFLICT,
+  OWN_CREATE_SETTLE_ATTEMPTS,
+  OWN_CREATE_SETTLE_INTERVAL_MS,
+  THREAD_KEY_TAKEN_ERROR,
+  createIntentOf,
+  createRequestOf,
+  deliveryFromSendResult,
+  isClientMessageConflict,
+  lookUpClientMessage,
+  matchesCreateIntent,
+  parseClientMessageId,
+  recordDelivery,
+} from '../services/send-receipt';
+import { ThreadKeyTakenError } from '../mcp/tools/thread-key-taken';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -3803,6 +3839,169 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to get user identity history:', error);
     res.status(500).json(errorJson('Failed to get user identity history', error));
+  }
+});
+
+// =============================================================================
+// Inklings (the Inkling app's awakening and naming)
+// =============================================================================
+//
+// Contract v3 (inkling:thread:app-build 242d45bf, amended 58202c0a). The
+// logic lives in services/inklings/inkling-service.ts; these handlers check
+// the role, validate the body, and map refusals to their status. Every one
+// is scoped to the person and the workspace the middleware resolved, so an
+// x-ink-workspace-id header moves all three together. None runs a model,
+// opens a thread or wakes anyone.
+
+function inklingScope(authReq: AdminAuthRequest): InklingScope {
+  return {
+    userId: authReq.inkUserId,
+    workspaceId: authReq.inkWorkspaceId,
+    role: authReq.inkWorkspaceRole,
+  };
+}
+
+async function inklingService(): Promise<InklingService> {
+  return new InklingService((await getDataComposer()).getClient(), {
+    awakenCap: inklingAwakenCap(),
+    ownerTestUserIds: inklingOwnerTestUserIds(),
+  });
+}
+
+/**
+ * A send refused because it would put an inkling in a conversation outside
+ * the owner test: 403 with the refusal's code. Nothing was written. Answers
+ * and returns true for that refusal only.
+ */
+function answerInklingThreadRefusal(res: Response, error: unknown): boolean {
+  if (!(error instanceof InklingThreadRefusedError)) return false;
+  res.status(403).json({ error: error.message, code: error.code });
+  return true;
+}
+
+function answerInklingError(res: Response, label: string, error: unknown): void {
+  if (error instanceof InklingError) {
+    res
+      .status(error.status)
+      .json(error.code ? { error: error.message, code: error.code } : { error: error.message });
+    return;
+  }
+  logger.error(`${label}:`, error);
+  res.status(500).json(errorJson(label, error));
+}
+
+/**
+ * GET /api/admin/inklings → { inklings: [...Inkling, activity], now }, oldest first.
+ *
+ * Only inklings born through this flow: never the account's other SBs, and
+ * no fallback to /individuals. Reading is every role's, like threads; the
+ * list holds only the person's own inklings.
+ *
+ * `activity` ({ state: 'idle' | 'working' | 'stopping', since }) is each
+ * listed inkling's turn state in this server process (inkling-turns.ts),
+ * read for those inklings only. `now` is this server's clock as it
+ * answers, so the app measures elapsed time as now minus since and never
+ * mixes in the phone's own clock.
+ */
+router.get('/inklings', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const inklings = await (await inklingService()).list(inklingScope(authReq));
+    const now = new Date().toISOString();
+    res.json({
+      inklings: inklings.map((inkling) => ({
+        ...inkling,
+        activity: inklingTurnActivity(inkling.id),
+      })),
+      now,
+    });
+  } catch (error) {
+    answerInklingError(res, 'Failed to list inklings', error);
+  }
+});
+
+/**
+ * POST /api/admin/inklings/awaken
+ * Body: { clientRequestId: uuid }
+ *   201 { inkling, replayed: false }  a new inkling
+ *   200 { inkling, replayed: true }   this request id already awakened one
+ *   409                               the id was used in another workspace
+ *
+ * The client keeps clientRequestId across retries of one awakening; a new
+ * id is a new inkling. Two racing retries create one identity (a unique
+ * index), and the loser answers with the winner.
+ */
+router.post('/inklings/awaken', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'awaken an inkling');
+      return;
+    }
+    const clientRequestId = req.body?.clientRequestId;
+    if (!isUuid(clientRequestId)) {
+      res.status(400).json({ error: 'clientRequestId must be a UUID' });
+      return;
+    }
+
+    const result = await (await inklingService()).awaken(inklingScope(authReq), clientRequestId);
+    res.status(result.replayed ? 200 : 201).json(result);
+  } catch (error) {
+    answerInklingError(res, 'Failed to awaken an inkling', error);
+  }
+});
+
+/**
+ * POST /api/admin/inklings/:id/name
+ * Body: { displayName } → 200 { inkling }
+ *
+ * Trimmed, 1–32 Unicode code points, no control characters (400). The same
+ * name again, or a new one later, answers the same way: naming is optional
+ * and renamable forever. The slug never changes. 409 for an identity not
+ * born through this flow (the app can never rename Myra); 404 for an id
+ * that is unknown or belongs to another person or workspace.
+ */
+router.post('/inklings/:id/name', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'name an inkling');
+      return;
+    }
+    const displayName = validateDisplayName(req.body?.displayName);
+    if (!displayName.ok) {
+      res.status(400).json({ error: displayName.reason });
+      return;
+    }
+
+    const inkling = await (
+      await inklingService()
+    ).name(inklingScope(authReq), req.params.id, displayName.value);
+    res.json({ inkling });
+  } catch (error) {
+    answerInklingError(res, 'Failed to name the inkling', error);
+  }
+});
+
+/**
+ * POST /api/admin/inklings/:id/cancel → 200 { cancelled }
+ *
+ * Stops the inkling's running turn, with everything it started, if it has
+ * one in this server. `cancelled: false` means none was running. Owner test
+ * only (403 inklings_disabled otherwise), and only the caller's own inkling
+ * (404).
+ */
+router.post('/inklings/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, "cancel an inkling's turn");
+      return;
+    }
+    const result = await (await inklingService()).cancel(inklingScope(authReq), req.params.id);
+    res.json(result);
+  } catch (error) {
+    answerInklingError(res, "Failed to cancel the inkling's turn", error);
   }
 });
 
@@ -7777,6 +7976,21 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       return 'system';
     };
 
+    // Reactions (spec inkling-reactions), `mine` for this viewer. Shown in
+    // a background thread too: reading is open, reacting is for members.
+    // When they cannot be read the messages carry no `reactions` and meta
+    // says so, rather than [] on each, which would claim nobody reacted.
+    let reactionsByMessage: Map<string, ReactionSummary[]> | null = null;
+    try {
+      reactionsByMessage = await loadReactions(
+        supabase,
+        (messageRows || []).map((m) => m.id),
+        { kind: 'user', id: viewerUserId }
+      );
+    } catch (error) {
+      logger.error('Thread message reactions unavailable:', error);
+    }
+
     res.json({
       studioHistory,
       viewerUserId,
@@ -7816,9 +8030,15 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           priority: m.priority,
           metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
+          ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))
         .reverse(),
-      meta: { fetched, total, truncated: total > fetched },
+      meta: {
+        fetched,
+        total,
+        truncated: total > fetched,
+        ...(reactionsByMessage === null ? { reactionsUnavailable: true } : {}),
+      },
     });
   } catch (error) {
     logger.error('Failed to load thread messages:', error);
@@ -7828,8 +8048,29 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads
- * Body: { key, recipients: string[], content, title?, priority?, studioSlug? }
- *   → { success, created, messageId, threadId, threadKey }
+ * Body: { key, recipients: string[], content, title?, priority?, studioSlug?,
+ *         clientMessageId?: uuid }
+ *   → { success, created, messageId, threadId, threadKey, warning,
+ *       threadKeyWarning, delivery, replayed }
+ *
+ * Retries (services/send-receipt.ts): the client sends the same
+ * clientMessageId on every retry of one message. The thread key is the
+ * client's too, and stays the same across retries, so a retried create
+ * lands on the same thread, where a unique index on (thread, clientMessageId)
+ * refuses a second copy. If a server ever generated the key instead, a
+ * retry would open a second thread and this guarantee would not hold.
+ *
+ * A create carrying clientMessageId never joins a thread that exists, so
+ * a retry can never add anyone to a conversation. It replays (the original
+ * messageId, replayed: true, nobody woken) only when the sender, the words,
+ * the recipients as a set and the title all match what that id stored.
+ * Anything else is a 409 before any write, and so is a new clientMessageId
+ * aimed at a key already in use: a new conversation takes a new key. A
+ * concurrent request that takes the key first is caught inside the send
+ * handler (createOnly), before it writes a participant. Without
+ * clientMessageId the route keeps its old behaviour and continues a thread
+ * that already holds the key. `delivery` comes from positive evidence only
+ * (routed, partial, unrouted, or unknown).
  *
  * Start a thread from the dashboard or phone — or continue one that already
  * exists under that key. This is the only admin route that CREATES threads;
@@ -7889,7 +8130,15 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'studioSlug applies to a single recipient' });
       return;
     }
+    const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
+    if (!clientMessageId.ok) {
+      res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
 
+    // The workspace role before any lookup. What keeps a replay to the
+    // person who sent the original is the sender check inside
+    // lookUpClientMessage; this role check does not, and need not.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'start a thread');
       return;
@@ -7897,63 +8146,242 @@ router.post('/threads', async (req: Request, res: Response) => {
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
-    const { data: existing } = await supabase
-      .from('inbox_threads')
-      .select('id')
-      .eq('workspace_id', authReq.inkWorkspaceId)
-      .eq('thread_key', key)
-      .maybeSingle();
-
-    const result = await handleSendToInbox(
-      {
-        userId: authReq.inkUserId,
-        threadKey: key,
-        content,
-        // A studio-pinned send is the handler's single-recipient form; the
-        // group form (recipients[]) cannot carry a studio.
-        ...(studioSlug
-          ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
-          : { recipients: uniqueRecipients, triggerAll: true }),
-        ...(title ? { subject: title } : {}),
-        ...(priority ? { priority } : {}),
-        metadata: { sentBy: 'user', channel: 'admin-api' },
-      },
-      dataComposer,
-      // The person is the sender, in the workspace the middleware resolved —
-      // server-side context the public tool schema never carries (§3, §6).
-      {
-        sender: {
-          principal: userPrincipal(authReq.inkUserId),
-          workspaceId: authReq.inkWorkspaceId,
-        },
+    type KeyedThread = {
+      id: string;
+      created_by_user_id: string | null;
+      title: string | null;
+      metadata: unknown;
+    };
+    const findThread = async (): Promise<KeyedThread | null> => {
+      const { data } = await supabase
+        .from('inbox_threads')
+        .select('id, created_by_user_id, title, metadata')
+        .eq('workspace_id', authReq.inkWorkspaceId)
+        .eq('thread_key', key)
+        .maybeSingle();
+      return (data as KeyedThread | null) ?? null;
+    };
+    // What a client-identified create is held to on a retry: the same
+    // people (as a set) and the same title, beside the same sender and words.
+    const createRequest = clientMessageId.value
+      ? createRequestOf(uniqueRecipients, title)
+      : undefined;
+    // A client-identified create never joins a thread that exists. Either it
+    // is a retry of the submission that created the thread, which answers
+    // with the original message and wakes nobody, or it is a 409: different
+    // people, title or words, or a new message id aimed at a key already in
+    // use. Nothing is written either way.
+    const answerForExistingThread = async (thread: KeyedThread): Promise<void> => {
+      const lookUp = () =>
+        lookUpClientMessage(supabase, {
+          threadId: thread.id,
+          clientMessageId: clientMessageId.value as string,
+          userId: authReq.inkUserId,
+          content,
+          createRequest,
+        });
+      let lookup = await lookUp();
+      // This person created the thread, and the request that did may still be
+      // between creating it and storing its first message (a retry racing its
+      // own original). Let that request land before calling the key taken.
+      for (
+        let attempt = 0;
+        lookup.kind === 'none' &&
+        thread.created_by_user_id === authReq.inkUserId &&
+        attempt < OWN_CREATE_SETTLE_ATTEMPTS;
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, OWN_CREATE_SETTLE_INTERVAL_MS));
+        lookup = await lookUp();
       }
-    );
-
-    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
-    const parsed = JSON.parse(text) as {
-      success?: boolean;
-      error?: string;
-      messageId?: string;
-      threadId?: string;
-      warning?: string;
+      // Still nothing stored: the request that made this conversation died
+      // before its first message, or is slower than the wait. A correct
+      // retry completes it rather than being stranded on a 409.
+      if (lookup.kind === 'none') {
+        if (await adoptable(thread)) {
+          await sendCreate({ createOnly: false, created: false });
+          return;
+        }
+        // Adoption read the conversation after that lookup, and may have
+        // refused because the original's message has just landed. Look again,
+        // so the answer covers at least what adoption saw: that message
+        // replays, rather than a 409 that sends the person to a new
+        // conversation (review eb07e3df).
+        lookup = await lookUp();
+      }
+      if (lookup.kind === 'replay') {
+        res.json({
+          success: true,
+          created: false,
+          messageId: lookup.messageId,
+          threadId: lookup.threadId,
+          threadKey: key,
+          warning: null,
+          threadKeyWarning: null,
+          delivery: lookup.delivery,
+          replayed: true,
+        });
+        return;
+      }
+      res.status(409).json({
+        error: lookup.kind === 'conflict' ? CLIENT_MESSAGE_CONFLICT : THREAD_KEY_TAKEN_ERROR,
+      });
     };
 
-    if (parsed.messageId == null && parsed.success === false) {
-      // Nothing was stored: an unknown recipient, a refused key. That is the
-      // caller's mistake to fix, not a server fault.
-      res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+    // A conversation this very create made and then died in before its first
+    // message landed (the thread, its participants and the message are
+    // separate writes). Proven by the intent recorded on the thread row when
+    // it was created, before any participant: the same client message id,
+    // recipients and title (review 09b80921: creator, title and a member
+    // subset could not prove it, and a mismatching retry added people before
+    // being refused). Adopting it can only add people the original meant to
+    // reach, so even an original whose message lands mid-adoption is seen by
+    // exactly its addressees. Two adopting retries are settled by the
+    // client-message index.
+    const adoptable = async (thread: KeyedThread): Promise<boolean> => {
+      if (thread.created_by_user_id !== authReq.inkUserId) return false;
+      if (
+        !createRequest ||
+        !matchesCreateIntent(
+          thread.metadata,
+          clientMessageId.value as string,
+          createRequest,
+          content
+        )
+      ) {
+        return false;
+      }
+      const { data: anyMessage, error: messageError } = await supabase
+        .from('inbox_thread_messages')
+        .select('id')
+        .eq('thread_id', thread.id)
+        .limit(1);
+      if (messageError) throw new Error(`Failed to read the conversation: ${messageError.message}`);
+      if ((anyMessage ?? []).length > 0) return false;
+      const { data: members, error: membersError } = await supabase
+        .from('inbox_thread_participants')
+        .select('sb_id, user_id')
+        .eq('thread_id', thread.id);
+      if (membersError) {
+        throw new Error(`Failed to read the conversation's members: ${membersError.message}`);
+      }
+      const rows = (members ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
+      if (rows.some((r) => r.user_id && r.user_id !== authReq.inkUserId)) return false;
+      const present = new Set(rows.map((r) => r.sb_id).filter((id): id is string => !!id));
+      let requested: SbPrincipal[];
+      try {
+        requested = await resolveSbsInWorkspace(supabase, authReq.inkWorkspaceId, uniqueRecipients);
+      } catch {
+        return false;
+      }
+      // Every SB already on it was asked for by this create. One that died
+      // between its participant writes may have added only some; with no
+      // message there is no history to expose, so adding the rest is what
+      // that create meant to do. An SB this create did not ask for refuses.
+      const requestedIds = new Set(requested.map((sb) => sb.sbId));
+      return [...present].every((id) => requestedIds.has(id));
+    };
+
+    const sendCreate = async (send: { createOnly: boolean; created: boolean }): Promise<void> => {
+      let result: Awaited<ReturnType<typeof handleSendToInbox>>;
+      try {
+        result = await handleSendToInbox(
+          {
+            userId: authReq.inkUserId,
+            threadKey: key,
+            content,
+            // A studio-pinned send is the handler's single-recipient form; the
+            // group form (recipients[]) cannot carry a studio.
+            ...(studioSlug
+              ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+              : { recipients: uniqueRecipients, triggerAll: true }),
+            ...(title ? { subject: title } : {}),
+            ...(priority ? { priority } : {}),
+            metadata: {
+              sentBy: 'user',
+              channel: 'admin-api',
+              ...(clientMessageId.value
+                ? { clientMessageId: clientMessageId.value, pcp: { createRequest } }
+                : {}),
+            },
+          },
+          dataComposer,
+          // The person is the sender, in the workspace the middleware resolved —
+          // server-side context the public tool schema never carries (§3, §6).
+          // A client-identified create must create: if a concurrent request
+          // takes the key first, the handler refuses before writing anything.
+          {
+            sender: {
+              principal: userPrincipal(authReq.inkUserId),
+              workspaceId: authReq.inkWorkspaceId,
+            },
+            ...(send.createOnly ? { createOnly: true } : {}),
+            // Recorded on the thread row if this send creates it.
+            ...(clientMessageId.value && createRequest
+              ? { createIntent: createIntentOf(clientMessageId.value, createRequest, content) }
+              : {}),
+          }
+        );
+      } catch (error) {
+        // A concurrent request took the key first, or stored this client
+        // message id first (two adopting retries). The thread decides the
+        // answer: a replay of the same submission, or a 409.
+        if (
+          clientMessageId.value &&
+          (error instanceof ThreadKeyTakenError || isClientMessageConflict(error))
+        ) {
+          const taken = await findThread();
+          if (taken) {
+            await answerForExistingThread(taken);
+            return;
+          }
+        }
+        throw error;
+      }
+
+      const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
+      const parsed = JSON.parse(text) as Record<string, unknown> & {
+        success?: boolean;
+        error?: string;
+        messageId?: string;
+        threadId?: string;
+        warning?: string;
+        threadKeyWarning?: string;
+      };
+
+      if (parsed.messageId == null && parsed.success === false) {
+        // Nothing was stored: an unknown recipient, a refused key. That is the
+        // caller's mistake to fix, not a server fault.
+        res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+        return;
+      }
+
+      const delivery = deliveryFromSendResult(parsed);
+      if (clientMessageId.value && parsed.messageId) {
+        await recordDelivery(supabase, parsed.messageId, delivery);
+      }
+
+      res.json({
+        success: true,
+        created: send.created,
+        messageId: parsed.messageId ?? null,
+        threadId: parsed.threadId ?? existing?.id ?? null,
+        threadKey: key,
+        warning: parsed.warning ?? null,
+        threadKeyWarning: parsed.threadKeyWarning ?? null,
+        delivery,
+        replayed: false,
+      });
+    };
+
+    const existing = await findThread();
+    if (clientMessageId.value && existing) {
+      await answerForExistingThread(existing);
       return;
     }
-
-    res.json({
-      success: true,
-      created: !existing,
-      messageId: parsed.messageId ?? null,
-      threadId: parsed.threadId ?? existing?.id ?? null,
-      threadKey: key,
-      warning: parsed.warning ?? null,
-    });
+    await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });
   } catch (error) {
+    if (answerInklingThreadRefusal(res, error)) return;
     logger.error('Failed to start thread:', error);
     res.status(500).json(errorJson('Failed to start thread', error));
   }
@@ -7961,7 +8389,14 @@ router.post('/threads', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads/reply
- * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
+ * Body: { key, content, priority?, clientMessageId?: uuid }
+ *   → { success, messageId, threadId, triggered, warning, threadKeyWarning,
+ *       delivery, replayed }
+ *
+ * A retry carrying the same clientMessageId answers with the original
+ * messageId and replayed: true, and wakes nobody; the same id with other
+ * words is a 409. `delivery` comes from positive evidence only (see
+ * services/send-receipt.ts and POST /threads above).
  *
  * A human reply into an existing thread — the dashboard and mobile analogue of
  * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
@@ -7995,11 +8430,18 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'content exceeds 64KB' });
       return;
     }
+    const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
+    if (!clientMessageId.ok) {
+      res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
+    // The workspace role before any lookup; the sender check inside
+    // lookUpClientMessage keeps a replay to the person who sent the original.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reply');
       return;
@@ -8021,6 +8463,35 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    // A retry of a reply this thread already stored: the original answers,
+    // and nobody is woken again.
+    const answeredAsReplay = async (): Promise<boolean> => {
+      if (!clientMessageId.value) return false;
+      const lookup = await lookUpClientMessage(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        userId: authReq.inkUserId,
+        content,
+      });
+      if (lookup.kind === 'conflict') {
+        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
+        return true;
+      }
+      if (lookup.kind !== 'replay') return false;
+      res.json({
+        success: true,
+        messageId: lookup.messageId,
+        threadId: lookup.threadId,
+        triggered: [],
+        warning: null,
+        threadKeyWarning: null,
+        delivery: lookup.delivery,
+        replayed: true,
+      });
+      return true;
+    };
+    if (await answeredAsReplay()) return;
+
     const dataComposer = await getDataComposer();
     // Dispatch operates on the SB participants (§7): a person's reply wakes
     // every SB in the thread; the people reading it are never spawned.
@@ -8034,25 +8505,39 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await handleSendToInbox(
-      {
-        userId: authReq.inkUserId,
-        threadKey: key,
-        content,
-        recipients: participants,
-        // Human reply: wake everyone who is part of the conversation.
-        triggerAll: true,
-        ...(priority ? { priority } : {}),
-        metadata: { sentBy: 'user', channel: 'admin-api' },
-      },
-      dataComposer,
-      {
-        sender: {
-          principal: userPrincipal(authReq.inkUserId),
-          workspaceId: authReq.inkWorkspaceId,
+    let result: Awaited<ReturnType<typeof handleSendToInbox>>;
+    try {
+      result = await handleSendToInbox(
+        {
+          userId: authReq.inkUserId,
+          threadKey: key,
+          content,
+          recipients: participants,
+          // Human reply: wake everyone who is part of the conversation.
+          triggerAll: true,
+          ...(priority ? { priority } : {}),
+          metadata: {
+            sentBy: 'user',
+            channel: 'admin-api',
+            ...(clientMessageId.value ? { clientMessageId: clientMessageId.value } : {}),
+          },
         },
+        dataComposer,
+        {
+          sender: {
+            principal: userPrincipal(authReq.inkUserId),
+            workspaceId: authReq.inkWorkspaceId,
+          },
+        }
+      );
+    } catch (error) {
+      // A concurrent retry of this reply won the store: the unique index
+      // refused this copy before anything was dispatched.
+      if (clientMessageId.value && isClientMessageConflict(error) && (await answeredAsReplay())) {
+        return;
       }
-    );
+      throw error;
+    }
 
     const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
       string,
@@ -8067,21 +8552,85 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    const delivery = deliveryFromSendResult(parsed);
+    if (clientMessageId.value) {
+      await recordDelivery(supabase, String(parsed.messageId), delivery);
+    }
+
     res.json({
       // The handler folds trigger-routing outcomes into its own `success`,
       // and it can come back false when the message stored but a wake
       // bounced (observed: fresh user, both participants' triggers failed);
       // this route's success means what the person asked: "is my reply in
-      // the thread" — the messageId is the proof.
+      // the thread" — the messageId is the proof. Whether anyone was woken
+      // is `delivery`'s to say.
       success: true,
       messageId: parsed.messageId,
       threadId: parsed.threadId ?? thread.id,
       triggered: parsed.triggered ?? null,
       warning: parsed.warning ?? null,
+      threadKeyWarning: parsed.threadKeyWarning ?? null,
+      delivery,
+      replayed: false,
     });
   } catch (error) {
+    if (answerInklingThreadRefusal(res, error)) return;
     logger.error('Failed to send thread reply:', error);
     res.status(500).json(errorJson('Failed to send reply', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reactions
+ * Body: { threadKey, messageId, emoji, remove?: boolean }
+ *   → 200 { messageId, reactions }
+ *
+ * The person's own reaction on one message (spec inkling-reactions, "Wire").
+ * `reactions` is the message's summary, `mine` for this person. Adding one
+ * that is already there, or removing one that is not, is 200 and changes
+ * nothing. 400 a malformed emoji or id; 403 a role that cannot write, not a
+ * member (a background thread), or the inkling gate; 404 the message is not
+ * in that thread in this workspace; 409 over the per-person limit. Each
+ * refusal carries a stable `code`.
+ *
+ * A reaction is not a message. It wakes nobody, and moves no unread count
+ * and no thread recency. It is never approval of anything.
+ */
+router.post('/threads/reactions', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const threadKey = typeof req.body?.threadKey === 'string' ? req.body.threadKey.trim() : '';
+    const messageId = typeof req.body?.messageId === 'string' ? req.body.messageId : '';
+    const emoji = typeof req.body?.emoji === 'string' ? req.body.emoji : '';
+    const remove: unknown = req.body?.remove;
+    if (remove !== undefined && typeof remove !== 'boolean') {
+      res.status(400).json({ error: 'remove must be true or false', code: 'invalid_remove' });
+      return;
+    }
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'react to a message');
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await reactToMessage(supabase, {
+      workspaceId: authReq.inkWorkspaceId,
+      threadKey,
+      messageId,
+      emoji,
+      remove: remove === true,
+      reactor: userPrincipal(authReq.inkUserId),
+    });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof ReactionRefusedError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    logger.error('Failed to react to a thread message:', error);
+    res.status(500).json(errorJson('Failed to react to the message', error));
   }
 });
 

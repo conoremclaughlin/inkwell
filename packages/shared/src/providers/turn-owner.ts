@@ -51,3 +51,21 @@ export function promptAttachmentWrite(headless: boolean, env: NodeJS.ProcessEnv)
   if (!headless) return true;
   return parentOwnsTurn(env) ? null : false;
 }
+
+/**
+ * Whether the INK_CONTEXT token in `env` declares a headless spawn
+ * (`cliAttached:false`), as a server spawn's does. No token, or one that does
+ * not decode, is an interactive process.
+ */
+export function contextDeclaresHeadless(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.INK_CONTEXT?.trim();
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString()) as {
+      cliAttached?: unknown;
+    };
+    return parsed.cliAttached === false;
+  } catch {
+    return false;
+  }
+}

@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -42,8 +43,10 @@ class LifecycleTests(unittest.TestCase):
         self.calls = []
         self.fail_command = None
         self.suite_code = 0
+        self.running_private = set()
         for target, replacement in (
             ("capture", self.capture), ("containers", lambda _: dict(self.current)),
+            ("private_stacks", lambda: set(self.running_private)),
             ("port_preflight", lambda _: self.calls.append(["preflight"])),
             ("say", lambda _: None),
             ("capture_baseline", lambda *args: self.calls.append(["capture-baseline"]) or "fixture-baseline-hash"),
@@ -316,6 +319,104 @@ class LifecycleTests(unittest.TestCase):
         # fire on every --stop with nothing to do.
         with mock.patch.object(stack, "containers", lambda _name: {}):
             self.assertEqual(self.run_stack("--stop"), 0)
+
+    def use_project(self, project):
+        self.env["INTEGRATION_SUPABASE_PROJECT_ID"] = project
+        self.project = project
+        self.db = "supabase_db_" + project
+
+    def lock_dir(self):
+        return self.root / ".cache/inkwell/integration-db-locks"
+
+    def test_private_project_without_the_flag_refuses_before_any_lock_or_command(self):
+        # 2026-10-02: a caller refused by the shared lock picked a new suffix
+        # and brought up a whole second stack. A suffix alone is not enough.
+        self.use_project("ink-integration-t6")
+        for args in ((), ("--reuse",), ("--reset",), ("--fresh",)):
+            with self.assertRaisesRegex(stack.Refusal, "One shared stack is deliberate.*--private-stack"):
+                self.run_stack(*args)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.lock_dir().exists())
+
+    def test_private_stack_with_the_flag_is_disposable_by_default(self):
+        # Control for the refusal above: the flag is the only difference.
+        self.use_project("ink-integration-t6")
+        self.assertEqual(self.run_stack("--private-stack"), 0)
+        self.assertEqual(self.count("supabase", "start"), 1)
+        self.assertEqual(self.count("bash"), 1)
+        self.assertEqual(self.count("supabase", "stop"), 1)
+        self.assertFalse(self.current)
+        self.assertFalse(Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]).exists())
+        self.assertFalse((self.root / "cache" / self.project).exists())
+
+    def test_private_stack_is_retained_only_when_reuse_asks(self):
+        self.use_project("ink-integration-t6")
+        self.run_stack("--private-stack", "--reuse")
+        self.run_stack("--private-stack", "--reuse")
+        self.assertEqual(self.count("supabase", "start"), 1)
+        self.assertEqual(self.count("supabase", "stop"), 0)
+        self.assertEqual(self.state()["project"], "ink-integration-t6")
+
+    def test_the_legacy_keep_flag_does_not_retain_a_private_stack(self):
+        # Lumen, #729: fresh was implied, but an inherited keep flag still
+        # won, leaving an unmanaged private stack that --stop cannot release
+        # and that held the private slot after its run.
+        self.env["INTEGRATION_KEEP_SUPABASE"] = "1"
+        self.use_project("ink-integration-t6")
+        for args in (("--private-stack",), ("--private-stack", "--fresh")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_stack(*args), 0)
+                self.assertFalse(self.current)
+        self.assertEqual(self.count("supabase", "stop"), 2)
+        # Control: --reuse is how a private stack is kept, as a managed one.
+        self.run_stack("--private-stack", "--reuse")
+        self.assertTrue(self.current)
+        self.assertEqual(self.state()["project"], "ink-integration-t6")
+
+    def test_stopping_a_private_stack_needs_no_flag_and_is_not_capped(self):
+        self.use_project("ink-integration-t6")
+        self.run_stack("--private-stack", "--reuse")
+        self.running_private = {"ink-integration-t6", "ink-integration-other"}
+        self.assertEqual(self.run_stack("--stop"), 0)
+        self.assertEqual(self.count("supabase", "stop"), 1)
+        self.assertFalse(self.current)
+
+    def test_a_second_running_private_stack_is_refused(self):
+        self.use_project("ink-integration-t6")
+        self.running_private = {"ink-integration-other"}
+        with self.assertRaisesRegex(stack.Refusal, r"already running \(ink-integration-other\).*cap is one"):
+            self.run_stack("--private-stack")
+        self.assertEqual(self.count("supabase"), 0)
+        self.assertEqual(self.count("bash"), 0)
+        # Control: its own stack is not a second one.
+        self.running_private = {"ink-integration-t6"}
+        self.assertEqual(self.run_stack("--private-stack"), 0)
+        self.assertEqual(self.count("bash"), 1)
+
+    def test_running_private_stacks_do_not_hold_up_the_shared_stack(self):
+        self.running_private = {"ink-integration-other"}
+        self.assertEqual(self.run_stack(), 0)
+        self.assertEqual(self.count("bash"), 1)
+
+    def test_private_runs_take_the_machine_wide_private_slot(self):
+        self.env["INTEGRATION_LOCK_WAIT_SECONDS"] = "0"
+        with stack.locks(self.lock_dir(), "ink-integration-holder", [55100], private=True):
+            # Control first: the shared stack does not need the slot.
+            self.assertEqual(self.run_stack(), 0)
+            self.use_project("ink-integration-t6")
+            with self.assertRaisesRegex(stack.Refusal, "holds private-stack"):
+                self.run_stack("--private-stack")
+        self.assertEqual(self.count("supabase", "start"), 1)
+        self.assertEqual(self.count("bash"), 1)
+
+    def test_a_held_shared_lock_is_waited_on_for_the_configured_time(self):
+        self.env["INTEGRATION_LOCK_WAIT_SECONDS"] = "1"
+        with stack.locks(self.lock_dir(), self.project, [55100]):
+            started = time.monotonic()
+            with self.assertRaisesRegex(stack.Refusal, "holds project-ink-integration .*still held it after 1s"):
+                self.run_stack()
+            self.assertGreaterEqual(time.monotonic() - started, 1)
+        self.assertEqual(self.calls, [])
 
     def test_same_project_new_container_identity_is_not_adopted(self):
         self.run_stack()
@@ -774,6 +875,77 @@ class PrimitiveTests(unittest.TestCase):
                     pass
             with stack.locks(path, "ink-integration-a", [55000]):
                 pass
+
+    def test_held_lock_is_waited_on_and_taken_when_its_holder_exits(self):
+        # The holder is a harmless child that only reads its stdin; closing
+        # that pipe is how it releases the lock.
+        holder = ("import fcntl, sys\n"
+                  "handle = open(sys.argv[1], 'a+')\n"
+                  "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+                  "handle.write('fixture holder')\n"
+                  "handle.flush()\n"
+                  "print('HELD', flush=True)\n"
+                  "sys.stdin.read()\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            child = subprocess.Popen([sys.executable, "-c", holder, str(path / "port-55000.lock")],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            release = threading.Timer(0.5, child.stdin.close)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "HELD")
+                said = []
+                started = time.monotonic()
+                release.start()
+                with mock.patch.object(stack, "say", said.append):
+                    with stack.locks(path, "ink-integration", [55000], wait=10, poll=0.05):
+                        waited = time.monotonic() - started
+                        self.assertEqual(child.wait(timeout=5), 0)
+                self.assertGreaterEqual(waited, 0.4)
+                self.assertEqual(said, ["Waiting up to 10s for port-55000; held by fixture holder"])
+            finally:
+                release.cancel()
+                child.stdin.close()
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
+                child.stdout.close()
+
+    def test_lock_still_held_at_the_deadline_refuses_and_says_it_waited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with stack.locks(path, "ink-integration", [55000]):
+                started = time.monotonic()
+                with mock.patch.object(stack, "say"), \
+                     self.assertRaisesRegex(stack.Refusal, r"still held it after 1s\. Wait.*sparingly.*private stack"):
+                    with stack.locks(path, "ink-integration", [55000], wait=1, poll=0.1):
+                        self.fail("contending lock acquired")
+                self.assertGreaterEqual(time.monotonic() - started, 1)
+
+    def test_private_stacks_share_one_machine_wide_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with stack.locks(path, "ink-integration-a", [55000], private=True):
+                with self.assertRaisesRegex(stack.Refusal, "holds private-stack"):
+                    with stack.locks(path, "ink-integration-b", [55010], private=True):
+                        self.fail("a second private stack took the slot")
+                # Control: the same project and ports without the slot.
+                with stack.locks(path, "ink-integration-b", [55010]):
+                    pass
+
+    def test_private_stacks_are_the_running_suffixed_integration_projects(self):
+        listing = "\n".join(["ink-integration", "ink-integration-t6", "pcp-integration-old", "inkread",
+                             "ink-integration-t6", "ink-integrationx", ""])
+        with mock.patch.object(stack, "capture", return_value=listing) as capture:
+            self.assertEqual(stack.private_stacks(), {"ink-integration-t6", "pcp-integration-old"})
+        # Running only: an exited stack holds no memory.
+        self.assertNotIn("-a", capture.call_args[0][0])
+
+    def test_lock_wait_defaults_to_twenty_minutes_and_takes_whole_seconds(self):
+        self.assertEqual(stack.lock_wait({}), 1200)
+        self.assertEqual(stack.lock_wait({"INTEGRATION_LOCK_WAIT_SECONDS": "0"}), 0)
+        for value in ("-1", "1.5", "twenty", ""):
+            with self.assertRaises(stack.Refusal):
+                stack.lock_wait({"INTEGRATION_LOCK_WAIT_SECONDS": value})
 
     def test_busy_port_names_owner_and_wait_guidance(self):
         # Harmless localhost listener; no real executor or Docker call.

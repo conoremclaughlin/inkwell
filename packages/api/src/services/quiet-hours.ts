@@ -193,6 +193,26 @@ export function effectiveDeliveryTime(instant: Date, window: QuietHoursWindow): 
 }
 
 /**
+ * Whether `instant` is inside quiet hours and, if so, when they end and in
+ * which zone that was worked out.
+ *
+ * The scheduler (a reminder allowed to run overnight is told the end) and the
+ * notice gate (a held alert waits for it) both ask this, so the two read one
+ * window the same way.
+ */
+export function quietHoursAt(
+  instant: Date,
+  window: QuietHoursWindow
+): { quiet: false } | { quiet: true; until: Date; timezone: string } {
+  if (!isWithinQuietHours(instant, window)) return { quiet: false };
+  return {
+    quiet: true,
+    until: effectiveDeliveryTime(instant, window),
+    timezone: effectiveTimezone(window.timezone),
+  };
+}
+
+/**
  * A human-readable warning when a scheduled time will not be honoured, or null
  * when it will.
  *

@@ -5,15 +5,6 @@ import { PARENT_OWNED_TURN_ENV } from './turn-owner.js';
 import type { BackendTurnEvent } from './stream.js';
 import type { BackendHost, TurnMedia } from './types.js';
 
-/**
- * Default absolute backstop for a single backend turn. Deliberately generous:
- * the idle/token-flow timeout is the primary reaper (it resets on every output
- * chunk, so an actively-working streamed turn never trips it). This ceiling
- * exists only to reap a truly runaway process, mirroring the outer InkRunner
- * 4-hour PROCESS_TIMEOUT_MS — a working turn should never die on wall-clock.
- */
-export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
-
 /** Env names that say which session a child serves; only the request's ids set them. */
 const ROUTING_ENV_NAMES = ['INK_SESSION_ID', 'INK_STUDIO_ID', 'INK_CONTEXT'] as const;
 
@@ -48,8 +39,8 @@ export interface BackendRunRequest {
    */
   systemPromptOverride?: string;
   /**
-   * Hard ceiling (ms). Runaway backstop only — the idle timeout is the primary
-   * reaper. Defaults to DEFAULT_TURN_HARD_TIMEOUT_MS (4 h).
+   * Explicit hard ceiling only. No default wall-clock kill for a working turn.
+   * A host-admitted explicit deadline still bounds its run and credentials.
    */
   timeoutMs?: number;
   /**
@@ -172,7 +163,8 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const streaming = Boolean(request.stream && adapter.createStreamParser);
   const parser = streaming ? adapter.createStreamParser!() : null;
-  const requestedCeilingMs = request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS;
+  const requestedCeilingMs =
+    request.timeoutMs && request.timeoutMs > 0 ? request.timeoutMs : Number.POSITIVE_INFINITY;
   // A spawn ends by the run's deadline, whatever ceiling it asked for: a
   // continuation late in a run gets what is left, never a fresh budget.
   const ceilingMs = (): number =>
@@ -282,7 +274,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       }
       const mintedAt = Date.now();
       const credentials: Record<string, string> = {
-        ...(await host.sessionEnv({ hardTimeoutMs: mintedCeilingMs })),
+        ...(await host.sessionEnv({
+          hardTimeoutMs: Number.isFinite(mintedCeilingMs) ? mintedCeilingMs : undefined,
+        })),
       };
       for (const name of ROUTING_ENV_NAMES) delete credentials[name];
       const parentEnv = await host.baseEnv();
@@ -371,7 +365,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         // What the child inherits comes from the host, never from this process.
         parentEnv,
         stdinData: prepared.stdinData,
-        timeoutMs: hardTimeoutMs,
+        ...(Number.isFinite(hardTimeoutMs) ? { timeoutMs: hardTimeoutMs } : {}),
         idleTimeoutMs: request.idleTimeoutMs,
         onStdout:
           streaming || request.verbose

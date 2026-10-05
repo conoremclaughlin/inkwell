@@ -207,7 +207,7 @@ describe('sessionEnv', () => {
     admit();
     const given = input();
     const host = createServerBackendHost(given);
-    for (const hardTimeoutMs of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const hardTimeoutMs of [undefined, 0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(host.sessionEnv({ hardTimeoutMs }), String(hardTimeoutMs)).rejects.toThrow(
         SERVER_HOST_REFUSALS.invalidCeiling
       );

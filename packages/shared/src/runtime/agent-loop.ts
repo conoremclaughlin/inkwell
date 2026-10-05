@@ -24,6 +24,7 @@ import {
   isImitationResultLine,
   type OpenFence,
 } from './imitation-grammar.js';
+import { LOCAL_TOOL_CALL_PLACEHOLDER } from './local-tool-placeholder.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -1380,9 +1381,7 @@ export async function runAgentLoop(
     ? ''
     : input.toolRouting === 'local'
       ? stripLocalToolBlocks(responseText) ||
-        (calls.length > 0 || allToolResults.length > 0
-          ? '(local tool call emitted; see tool results above)'
-          : responseText)
+        (calls.length > 0 || allToolResults.length > 0 ? LOCAL_TOOL_CALL_PLACEHOLDER : responseText)
       : responseText;
 
   return {

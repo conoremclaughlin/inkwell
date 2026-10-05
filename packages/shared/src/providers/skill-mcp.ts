@@ -10,6 +10,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { applySessionHeaders } from '../runner/mcp-config.js';
+import { pinIsolatedPlaywright } from '../runner/playwright-mcp.js';
 
 export interface SkillMcpServer {
   name: string;
@@ -251,6 +252,10 @@ export async function buildMergedMcpConfig(
       modified = true;
     }
   }
+
+  const playwright = pinIsolatedPlaywright(config.mcpServers);
+  config.mcpServers = playwright.servers;
+  modified ||= playwright.pinned.length > 0;
 
   if (!modified) {
     return {

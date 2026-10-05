@@ -17,7 +17,7 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { isSafeStudioComponent, studioPermissionProfile, studioSiblingPath } from '@inklabs/shared';
 import { completeStudioViaCli, ensureStudioComplete } from '../../services/studio-complete';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
@@ -28,6 +28,7 @@ import {
 } from './caller-identity';
 import { resolveCallerSb } from './caller-principal';
 import { findOrCreateThread } from './inbox-handlers';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate';
 import { assignThreadParticipant } from '../../services/sessions/thread-assignment';
 import type { Session } from '../../data/models/memory';
 import {
@@ -414,6 +415,9 @@ function studioOwnershipMismatch(
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const participantTable = (supabase: ReturnType<DataComposer['getClient']>) =>
   (supabase as unknown as { from: (t: string) => any }).from('inbox_thread_participants');
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const threadsTable = (supabase: ReturnType<DataComposer['getClient']>) =>
+  (supabase as unknown as { from: (t: string) => any }).from('inbox_threads');
 
 /**
  * Give the thread a home: this agent's participant row on the thread points at
@@ -432,6 +436,24 @@ async function bindThreadHome(
   const supabase = dataComposer.getClient();
   // The agent is a principal in exactly one workspace; the thread lives there.
   const sb = await resolveCallerSb(supabase, opts.userId, opts.sbSlug);
+  // A key no thread carries yet would create one holding only this SB, and an
+  // inkling never starts a conversation: that creation is judged before any
+  // thread or member row exists (Lumen, #740 round 4). An existing thread is
+  // judged as what it is, below, so an inkling already in its conversation
+  // can still bind a home to it. For an ordinary SB this is a pass.
+  const { data: existing, error: lookupError } = await threadsTable(supabase)
+    .select('id')
+    .eq('workspace_id', sb.workspaceId)
+    .eq('thread_key', opts.threadKey)
+    .maybeSingle();
+  if (lookupError) throw new Error(`Failed to look up the thread: ${lookupError.message}`);
+  if (!existing) {
+    await assertInklingThreadAllowed(supabase, {
+      sender: sb,
+      participantSbs: [sb],
+      existingThreadId: null,
+    });
+  }
   const thread = await findOrCreateThread(supabase, {
     workspaceId: sb.workspaceId,
     threadKey: opts.threadKey,
@@ -447,6 +469,16 @@ async function bindThreadHome(
       .eq('sb_id', sb.sbId)
       .maybeSingle();
     if (!row) {
+      // Joining is adding a member, and a conversation with an inkling has
+      // its members fixed when it is made (inkling-thread-gate.ts). Asked
+      // against the conversation as it now exists, so a thread another send
+      // created first is judged as what it is. A refusal throws, before the
+      // row is written; the caller reports it as the home error.
+      await assertInklingThreadAllowed(supabase, {
+        sender: sb,
+        participantSbs: [sb],
+        existingThreadId: thread.id,
+      });
       await participantTable(supabase).insert({
         thread_id: thread.id,
         workspace_id: sb.workspaceId,
@@ -802,6 +834,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
         studio: {
           id: studio.id,
           studioId: studio.id,
+          slug: studio.slug ?? null,
           sbSlug: studio.sbSlug,
           branch: studio.branch,
           worktreeFolder: path.basename(studio.worktreePath),
@@ -901,6 +934,8 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       sbSlug: actor.sbSlug,
       studioId: studio.id,
       ...(purpose ? { purpose } : {}),
+      // From the row just written, never the checkout (design v3, item 5).
+      permissionProfile: studioPermissionProfile(studio),
     });
   }
 
@@ -942,6 +977,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -989,6 +1025,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
     studios: studios.map((w) => ({
       id: w.id,
       studioId: w.id,
+      slug: w.slug ?? null,
       sbSlug: w.sbSlug,
       branch: w.branch,
       worktreePath: w.worktreePath,
@@ -1038,6 +1075,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -1137,6 +1175,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),
@@ -1439,6 +1478,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   await ensureStudioComplete(studio.worktreePath, {
     sbSlug: studio.sbSlug ?? actor.sbSlug,
     studioId: studio.id,
+    permissionProfile: studioPermissionProfile(studio),
   });
 
   // Link session and set to active
@@ -1479,6 +1519,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),

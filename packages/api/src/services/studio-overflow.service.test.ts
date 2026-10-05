@@ -51,6 +51,7 @@ const completion = vi.hoisted(() => ({
     studioId?: string;
     sbSlug: string;
     present: string[];
+    permissionProfile?: string;
   }>,
 }));
 vi.mock('./studio-complete', async () => {
@@ -58,7 +59,10 @@ vi.mock('./studio-complete', async () => {
   const pathMod = await import('path');
   return {
     completeStudioViaCli: vi.fn(
-      async (worktreePath: string, opts: { sbSlug: string; studioId?: string }) => {
+      async (
+        worktreePath: string,
+        opts: { sbSlug: string; studioId?: string; permissionProfile?: string }
+      ) => {
         const present: string[] = [];
         for (const rel of ['.mcp.json', '.env.local', '.env', '.claude', '.codex', '.gemini']) {
           if (
@@ -75,6 +79,7 @@ vi.mock('./studio-complete', async () => {
           studioId: opts.studioId,
           sbSlug: opts.sbSlug,
           present,
+          permissionProfile: opts.permissionProfile,
         });
         return { ok: true, complete: true, missing: [] };
       }
@@ -886,6 +891,63 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
     }
   });
 
+  it('an ordinary overflow (a non-PR thread, detached at the base) is completed as a builder', async () => {
+    // Every overflow worktree is detached; only a PR review is a reviewer.
+    // An ordinary overflow does write work, and the reviewer profile would
+    // leave it unable to edit (review 4177f7fe, P2 4).
+    const holder = await mkdtemp(path.join(tmpdir(), 'overflow-builder-'));
+    const repoRoot = path.join(holder, 'inkwell-fixture');
+    await mkdir(repoRoot);
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
+    await execFileAsync(
+      'git',
+      [
+        '-c',
+        'user.email=test@test',
+        '-c',
+        'user.name=test',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'init',
+      ],
+      { cwd: repoRoot }
+    );
+    let worktree = '';
+    try {
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          worktree = input.worktreePath as string;
+          return Promise.resolve(
+            makeStudio({ id: 'plain-overflow', ...(input as Partial<Studio>) })
+          );
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const service = new StudioOverflowService(studios, {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      completion.calls.length = 0;
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'thread:perf-audit',
+      });
+      expect(result?.id).toBe('plain-overflow');
+      expect(completion.calls.at(-1)).toMatchObject({ permissionProfile: 'builder' });
+    } finally {
+      if (worktree) {
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+          cwd: repoRoot,
+        }).catch(() => undefined);
+      }
+      await rm(holder, { recursive: true, force: true });
+    }
+  });
+
   // Scope boundary: durable homes are checkouts a human also lives in. Only
   // the EPHEMERAL mints move; the D1 parent stays a sibling of the repo.
   it('the durable D1 parent studio stays a sibling of the repo, not under the root', async () => {
@@ -1016,8 +1078,13 @@ describe('StudioOverflowService.ensureParentStudio — a closed home is revived'
       });
       expect(stdout.trim()).toBe('lumen/studio/lumen');
       // Completed as a new home is, against the revived row's id.
+      // A home on its own branch is a builder.
       expect(completion.calls).toEqual([
-        expect.objectContaining({ worktreePath: home.worktreePath, studioId: 'home-1' }),
+        expect.objectContaining({
+          worktreePath: home.worktreePath,
+          studioId: 'home-1',
+          permissionProfile: 'builder',
+        }),
       ]);
     } finally {
       await removeWorktree(repoRoot, home.worktreePath);
@@ -1475,6 +1542,11 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         overflow: true,
         checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
       });
+      // A review checkout is completed with the reviewer profile, from the row.
+      expect(completion.calls.at(-1)).toMatchObject({
+        worktreePath: worktree,
+        permissionProfile: 'reviewer',
+      });
 
       // The worktree really sits on the PR's commit, detached.
       const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
@@ -1537,6 +1609,11 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(createdInputs[0].metadata).toEqual({
         overflow: true,
         checkout: { mode: 'detached', ref: 'main', commit: mainHead },
+      });
+      // Detached at the base after a failed fetch is still a detached checkout.
+      expect(completion.calls.at(-1)).toMatchObject({
+        worktreePath: worktree,
+        permissionProfile: 'reviewer',
       });
       const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
       expect(head.trim()).toBe(mainHead);
@@ -1613,8 +1690,15 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       // The revived row sits on a FRESH worktree, so it is completed exactly
       // as a created one is: with the row's id, after the row was updated.
       // Every review round after the first takes this path (task 2841c7a9).
+      // Detached on the PR head, so the revived row is a reviewer (design v3,
+      // item 5): the profile is read from the row, never the checkout.
       expect(completion.calls).toEqual([
-        expect.objectContaining({ worktreePath: worktree, studioId: 'stale-row', sbSlug: 'lumen' }),
+        expect.objectContaining({
+          worktreePath: worktree,
+          studioId: 'stale-row',
+          sbSlug: 'lumen',
+          permissionProfile: 'reviewer',
+        }),
       ]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {

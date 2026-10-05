@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { isConversation, matchesThreadSearch } from '@inklabs/shared/stories/thread-browsing';
+import {
+  byLatestMessage,
+  isConversation,
+  lastSpokeAt,
+  matchesThreadSearch,
+} from '@inklabs/shared/stories/thread-browsing';
 import { formatShortAgo } from '@inklabs/shared/stories/thread-viewing';
 import { ThreadRow } from '../components/ThreadRow';
 import { useThreads } from '../hooks/useInkwell';
@@ -15,12 +20,13 @@ import { colors, spacing, type } from '../ui/theme';
 const nameFor = (sbSlug: string) => sbSlug;
 
 /**
- * The thread list — the app's front door. Conversations with recent activity
- * first (the server already orders spines by lastActivityAt). A key that only
- * a session references has nothing to read, so it stays out of the list; the
- * shared browsing story decides that, and what the filter box matches: key,
- * title, summary, the newest message, or a participant. It doubles as "jump
- * to pr:545" for someone who knows exactly where they're going.
+ * The thread list — the app's front door. Conversations with the newest
+ * message first, as on the dashboard: the server's own order counts session
+ * activity, so the shared browsing story sorts the list itself. A key that
+ * only a session references has nothing to read, so it stays out of the list;
+ * the shared browsing story decides that, and what the filter box matches:
+ * key, title, summary, the newest message, or a participant. It doubles as
+ * "jump to pr:545" for someone who knows exactly where they're going.
  */
 
 /**
@@ -64,9 +70,9 @@ export function ThreadsScreen() {
 
   const spines = useMemo(() => {
     const needle = filter.trim().toLowerCase();
-    return (data?.spines ?? []).filter(
-      (spine) => isConversation(spine) && matchesThreadSearch(spine, needle, nameFor)
-    );
+    return (data?.spines ?? [])
+      .filter((spine) => isConversation(spine) && matchesThreadSearch(spine, needle, nameFor))
+      .sort(byLatestMessage);
   }, [data, filter]);
 
   // One callback for the whole list instead of one closure per row — a new
@@ -86,7 +92,7 @@ export function ThreadsScreen() {
     ({ item }: { item: ThreadSpine }) => (
       <ThreadRow
         spine={item}
-        timeLabel={formatShortAgo(item.lastActivityAt, new Date(nowMs))}
+        timeLabel={formatShortAgo(lastSpokeAt(item), new Date(nowMs))}
         onPress={openThread}
       />
     ),

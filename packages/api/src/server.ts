@@ -26,6 +26,7 @@ import {
   SessionService,
   RoutingRefusedError,
   type SessionServiceConfig,
+  type StudiolessPresencePlacement,
 } from './services/sessions';
 import type {
   SessionRequest,
@@ -45,10 +46,13 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryContext,
   type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
+import { recordWakeSourceCompletion } from './services/wake-source-breaker';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
@@ -65,7 +69,9 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
+import { handleHangup } from './utils/hangup';
 import { resolveThreadTriggerScope } from './services/trigger-scope';
 import {
   handleTriggerFailure,
@@ -75,6 +81,7 @@ import {
   decideChannelForward,
   applyChannelForward,
   attributeResponses,
+  createTurnReplyForwarder,
 } from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
@@ -306,6 +313,41 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
+    // External channels get their replies back on the channel: through
+    // send_response, or the runtime forwards the text.
+    const isExternalChannel =
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
+    // A run with several outer turns reports each turn's reply as the turn
+    // ends, and each is forwarded then (createTurnReplyForwarder). A runner
+    // that reports no turns leaves this unused, and the run's final text is
+    // decided below as before.
+    const gatewayForTurns = isExternalChannel ? channelGateway : null;
+    const turnReplies = gatewayForTurns
+      ? createTurnReplyForwarder(
+          { channel, conversationId },
+          {
+            consumeExplicitResponse: () => consumeExplicitResponse(channel, conversationId),
+            send: async (payload) => {
+              await gatewayForTurns.sendResponse({
+                channel: channel as ChannelType,
+                conversationId,
+                content: payload.content,
+                format: payload.format,
+                ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+              });
+            },
+            info: (m, meta) => logger.info(m, meta),
+            warn: (m, meta) => logger.warn(m, meta),
+            error: (m, meta) => logger.error(m, meta),
+            release: () =>
+              gatewayForTurns.releaseConversation(channel as GatewayChannel, conversationId),
+          }
+        )
+      : null;
+
     // Build SessionRequest
     const request: SessionRequest = {
       userId,
@@ -332,6 +374,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         // for a message that was never a reply, so its presence means one was.
         ...(replyRouting ? { replyRouting } : {}),
       },
+      ...(turnReplies ? { onTurnReply: turnReplies.onTurnReply } : {}),
     };
 
     // Process through SessionService
@@ -375,13 +418,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
-    // and auto-route the text response if no explicit send_response was called
-    const isExternalChannel =
-      channel === 'telegram' ||
-      channel === 'whatsapp' ||
-      channel === 'discord' ||
-      channel === 'slack';
-    if (isExternalChannel && channelGateway) {
+    // and auto-route the text response if no explicit send_response was called.
+    // A run that reported its turns was decided turn by turn; only the release
+    // and the run-level verdict are left.
+    if (turnReplies && turnReplies.turnsSeen > 0) {
+      await turnReplies.finish({ success: result.success });
+    } else if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       // Reads AND clears. releaseConversation below drains a pending next turn
       // synchronously, and a marker still standing then is read by that nested
@@ -410,7 +452,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         {
           info: (m, meta) => logger.info(m, meta),
           warn: (m, meta) => logger.warn(m, meta),
-          debug: (m, meta) => logger.debug(m, meta),
           release: (payload) =>
             gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
         }
@@ -536,6 +577,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     ...heartbeatServiceFlags,
   });
 
+  // The owner test's accounts are counted here, never named. An entry that
+  // isn't a UUID was left out of the test, and this is where that shows.
+  const inklingOwnerTest = inklingOwnerTestAllowlist();
+  logger.info('Inkling owner test evaluated', {
+    accounts: inklingOwnerTest.userIds.size,
+  });
+  if (inklingOwnerTest.malformed.length > 0) {
+    logger.warn('Inkling owner test: entries left out because they are not UUIDs', {
+      entries: inklingOwnerTest.malformed,
+    });
+  }
+
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
    *
@@ -545,7 +598,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    * exactly when a monitor is most likely to be broken.
    */
   const deliverReminderViaSession = async (
-    reminder: DueReminder
+    reminder: DueReminder,
+    deliveryContext?: HeartbeatDeliveryContext
   ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
@@ -686,19 +740,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // cascade (agent's own studio → main studio) instead of searching
     // for a studio literally named 'home' which doesn't exist.
 
-    const reminderContent = `[HEARTBEAT REMINDER]
-Title: ${reminder.title}
-Description: ${reminder.description || 'No description'}
-Delivery: ${reminder.delivery_channel} → ${reminder.delivery_target || 'default'}
-
----
-IMPORTANT: This reminder was triggered by the heartbeat service.
-Refer to your HEARTBEAT identity document for how to handle scheduled tasks.
-If you need to message a user on Telegram, use send_response with:
-- channel: "${reminder.delivery_channel}"
-- conversationId: "${reminder.delivery_target}"
-
-Do NOT just respond here — you MUST explicitly call send_response to reach external channels.`;
+    // A quiet-hours firing (the reminder's switch is on) is told not to contact
+    // the user until the window ends, in place of the send_response lines.
+    const reminderContent = buildHeartbeatReminderPrompt(reminder, deliveryContext);
 
     const request: SessionRequest = {
       userId,
@@ -801,7 +845,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         const stats = await processHeartbeat(
           deliverReminderViaSession,
           heartbeatEscalation?.onFailure,
-          heartbeatEscalation?.onRecovery
+          heartbeatEscalation?.onRecovery,
+          heartbeatEscalation?.drainHeldNotices
         );
         logger.info('Heartbeat complete', stats);
 
@@ -1148,7 +1193,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
-        sessionAlias: payload.sessionAlias,
+        recipientSessionNamed: !!payload.explicitRecipientSession,
+        sessionKey: payload.sessionKey,
+        // The payload's own field, which only the send path sets; never the
+        // caller-supplied payload.metadata. The inkling gate reads this
+        // message to learn who sent it (Lumen's review of 8b9d7f50).
+        triggerThreadMessageId: payload.threadMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1227,6 +1277,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
         ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
+        ...(refusal.detail.explicit ? { explicit: refusal.detail.explicit } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
@@ -1234,7 +1285,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
               : refusal.detail.reason === 'project-without-repo'
                 ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
-                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+                : refusal.detail.reason === 'explicit-address'
+                  ? 'the sender named a session that cannot take this message; re-send to one the recipient owns, or without the address'
+                  : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1259,6 +1312,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             // The pinned project a project-without-repo refusal names; this
             // hand-built copy is where it went missing (Lumen, #681 round 1).
             project: refusal.detail.project ?? null,
+            explicit: refusal.detail.explicit ?? null,
           },
         });
       }
@@ -1274,10 +1328,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Only a delivery that actually admits a spawn provisions, inside
     // handleMessage's own full resolution below.
     try {
+      // The plan's studioless-presence decision. The stamp's winner, and a
+      // newer stamp met during repair, are tested against it, so neither is
+      // judged by a different decision than the routed candidate (task
+      // bd4657a0). Stays null if the plan never reached routing.
+      let studiolessPresence: StudiolessPresencePlacement | null = null;
       const routedSession = await sessionService!.getOrCreateSession(userId, targetSlug, {
         planOnly: true,
+        onStudiolessPresence: (placement) => {
+          studiolessPresence = placement;
+        },
         threadKey: payload.threadKey,
-        alias: payload.sessionAlias,
+        alias: payload.sessionKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
@@ -1285,6 +1347,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // from thread history / the participant stamp is a continuity hint
         // that routing tests against the thread's project repo (#681 r2).
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // The caller named this session itself (T4): refused if it cannot
+        // take the message, reopened if it ended. A named studio alone never
+        // sets it.
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         repoRoot:
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
@@ -1333,6 +1399,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           } else {
             stampedSessionId = assignment.sessionId;
           }
+          // A named session is an address (T4; Lumen, #725). If its stamp could
+          // not be written and another session holds the binding, the message
+          // is held and reported, never delivered to that other session.
+          if (assignment.rerouted && payload.explicitRecipientSession) {
+            throw new RoutingRefusedError(payload.threadKey || '(unthreaded)', targetSlug, {
+              triedCallerRepo: false,
+              reason: 'explicit-address',
+              anchor: 'session',
+              explicit: { sessionId: payload.recipientSessionId, cause: 'binding-held' },
+            });
+          }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
             // to the winner, and archive our freshly-created loser candidate so
@@ -1351,7 +1428,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                   userId,
                   resolvedIdentityId,
                   payload.threadKey,
-                  winner
+                  winner,
+                  studiolessPresence
                 )
               : false;
             if (winner && winnerAllowed) {
@@ -1401,7 +1479,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                       userId,
                       resolvedIdentityId,
                       payload.threadKey,
-                      newer
+                      newer,
+                      studiolessPresence
                     )
                   : false;
                 if (newer && newerAllowed) {
@@ -1429,6 +1508,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
         } catch (err) {
+          // A refused address is a routing decision, not a failed write: it
+          // holds the message instead of degrading to the routed candidate.
+          if (err instanceof RoutingRefusedError) throw err;
           assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
@@ -1606,6 +1688,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // candidate is promoted as the continuity hint it is, and admission
         // re-checks it against the thread's project repo.
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // Named only while the delivery session IS the one the caller named:
+        // a reroute to a concurrent winner is routing's choice, not theirs.
+        recipientSessionNamed:
+          !!payload.explicitRecipientSession && deliverySession.id === payload.recipientSessionId,
       };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
@@ -1738,6 +1824,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // routingRecovery untouched by this dispatch, so the stamp's generation
     // guard passed.)
     await clearHoldAtTerminal();
+
+    // A completed, admitted wake: count it against its source's no-progress
+    // breaker (spec session-lifecycle-model §5). Only a message a wake source
+    // tagged is counted; never throws.
+    await recordWakeSourceCompletion(dataComposer!, userId, payload.metadata);
 
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =
@@ -1947,12 +2038,14 @@ function printStatus(): void {
  * Graceful shutdown with force-kill timeout.
  * If graceful teardown hangs (open connections, polling loops, etc.),
  * force-exit after 10 seconds so tsx --watch can restart cleanly.
+ *
+ * `reason` is logged so a stop always says what caused it.
  */
-async function shutdown(): Promise<void> {
+async function shutdown(reason: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  logger.info('\nShutting down Inkwell Server...');
+  logger.info(`\nShutting down Inkwell Server (${reason})...`);
 
   // Force-kill safety net: if graceful shutdown hangs, exit anyway.
   const forceKillTimer = setTimeout(() => {
@@ -2017,14 +2110,16 @@ async function shutdown(): Promise<void> {
   }
 }
 
-// Handle shutdown signals
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+// Handle shutdown signals. SIGHUP is what the terminal the server runs in sends
+// when it closes; see handleHangup for why it needs more than a plain shutdown.
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGHUP', () => handleHangup(shutdown));
 
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception:', error);
-  shutdown();
+  void shutdown('uncaught exception');
 });
 
 process.on('unhandledRejection', (reason) => {

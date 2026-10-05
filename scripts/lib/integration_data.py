@@ -60,11 +60,13 @@ WINDOWED_FIXTURE_TABLES = (
     ("20260925080025", "",
      ("observation_conflicts", "publication_operation_events", "publication_operations",
       "task_authority_holds")),
-    # The admission mode row is migration-seeded; the baseline keeps it at
-    # 'legacy' and cleanup restores it after a suite flips it.
+    ("20261002225412", "", ("wake_source_breakers",)),
+    ("20261004085434", "", ("thread_links",)),
+    # The admission mode row is migration-seeded; baseline/cleanup restore legacy.
     ("20261004094856", "",
      ("runtime_admission_mode", "session_command_events", "session_command_receipts",
       "session_commands")),
+    ("20261004095944", "", ("thread_message_reactions",)),
     ("20261004104039", "",
      ("session_admission_origins", "session_owner_tenures", "session_turn_generations",
       "session_turn_invocations")),

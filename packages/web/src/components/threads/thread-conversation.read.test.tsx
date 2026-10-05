@@ -25,6 +25,9 @@ vi.mock('@/lib/api', () => ({
     isLoading: fake.page === undefined,
   }),
   apiGet: (path: string) => fake.apiGet(path) as Promise<unknown>,
+  // Reactions post through these; nothing here reacts.
+  useApiPost: () => ({ mutate: () => {}, isError: false, error: null }),
+  useQueryClient: () => ({ invalidateQueries: () => Promise.resolve() }),
 }));
 vi.mock('./reply-composer', () => ({ ReplyComposer: () => null }));
 vi.mock('./reopen-button', () => ({ ReopenThreadButton: () => null }));

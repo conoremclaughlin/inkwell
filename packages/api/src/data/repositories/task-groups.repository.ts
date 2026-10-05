@@ -547,7 +547,11 @@ export class TaskGroupsRepository {
 
   /**
    * Release (holder, voluntary) or reclaim (sweep, after the app's
-   * fail-closed liveness check) a claim. Both CAS on the token.
+   * fail-closed liveness check) a claim. Both CAS on the token. With
+   * `fenceTurnEpoch`, the release also requires, in the same transaction,
+   * that the holder session's turn_epoch is still `expectedTurnEpoch`
+   * (reason 'turn-moved' otherwise): a turn that took the session after the
+   * caller decided keeps its claim.
    */
   async releaseGraphClaim(params: {
     userId: string;
@@ -556,6 +560,8 @@ export class TaskGroupsRepository {
     sessionId?: string;
     reclaim?: boolean;
     reason?: string;
+    fenceTurnEpoch?: boolean;
+    expectedTurnEpoch?: string | null;
   }): Promise<Record<string, unknown>> {
     const { data, error } = await this.client.rpc('release_graph_claim', {
       p_user_id: params.userId,
@@ -564,6 +570,8 @@ export class TaskGroupsRepository {
       p_session_id: params.sessionId ?? null,
       p_reclaim: params.reclaim ?? false,
       p_reason: params.reason ?? null,
+      p_fence_turn_epoch: params.fenceTurnEpoch ?? false,
+      p_expected_turn_epoch: params.expectedTurnEpoch ?? null,
     });
     if (error) throw new Error(`release_graph_claim failed: ${error.message}`);
     return data as Record<string, unknown>;

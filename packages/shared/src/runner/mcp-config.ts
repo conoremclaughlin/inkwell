@@ -13,6 +13,8 @@
  * synchronous, file-based injectSessionHeaders is in mcp-config-file.ts.
  */
 
+import { pinIsolatedPlaywright, type PlaywrightServerShape } from './playwright-mcp.js';
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface InjectSessionHeadersOptions {
@@ -38,7 +40,9 @@ export interface InjectSessionHeadersOptions {
  * asynchronous config builder both use it, so the two cannot drift.
  */
 export function applySessionHeaders(
-  config: { mcpServers: Record<string, { headers?: Record<string, string> }> },
+  config: {
+    mcpServers: Record<string, PlaywrightServerShape & { headers?: Record<string, string> }>;
+  },
   options: Pick<InjectSessionHeadersOptions, 'inkSessionId' | 'studioId' | 'accessToken'>
 ): boolean {
   const { inkSessionId, studioId, accessToken } = options;
@@ -46,9 +50,10 @@ export function applySessionHeaders(
   // Session headers are injected only into the canonical 'inkwell' server. The
   // legacy 'pcp' server name is retired — no code should create or feed it.
   const serverKey = 'inkwell';
-  if (!config.mcpServers[serverKey]) return false;
-
-  let modified = false;
+  const playwright = pinIsolatedPlaywright(config.mcpServers);
+  config.mcpServers = playwright.servers;
+  let modified = playwright.pinned.length > 0;
+  if (!config.mcpServers[serverKey]) return modified;
 
   // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
   // Only when we actually have a session — otherwise the rendered header
