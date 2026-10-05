@@ -9,7 +9,6 @@ import {
   type JournalStore,
 } from '@inklabs/shared/runtime';
 import { ADMISSION_PROTOCOL } from './command-admission';
-import { tenureCapabilityHash } from './tenure-admission';
 
 export class SessionJournalStoreError extends Error {
   constructor(readonly code: 'invalid_request' | 'transport_failed' | 'invalid_reply') {
@@ -36,7 +35,9 @@ const HOLD_REASONS = [
  * service client and the holder capability, never an agent/tool-supplied one.
  * That client must use persistSession:false and autoRefreshToken:false and must
  * not be shared with auth.* callers. Its credential is not frozen by this port.
- * The submitted hash is bearer-equivalent in A2, not safe diagnostic data.
+ * The capability is the raw holder secret: the database hashes it and compares
+ * the digest it stored, so it is sent only as p_capability and appears in no
+ * error, reply or diagnostic.
  *
  * Before live wiring the host must bound/abort RPC transport; this adapter has
  * no intrinsic timeout. A hung call remains unknown, not not-spawned. Expiry
@@ -51,7 +52,7 @@ const HOLD_REASONS = [
 export class SessionJournalStore implements JournalStore {
   readonly #client: SupabaseClient;
   readonly #identity: Readonly<JournalIdentity>;
-  readonly #capabilityHash: string;
+  readonly #capability: string;
   readonly #maxEntryBytes: number;
 
   constructor(options: {
@@ -92,7 +93,7 @@ export class SessionJournalStore implements JournalStore {
         4096
       );
       this.#identity = Object.freeze(identity);
-      this.#capabilityHash = tenureCapabilityHash(options.capability);
+      this.#capability = options.capability;
       this.#client = options.client;
       this.#maxEntryBytes = options.maxEntryBytes;
     } catch {
@@ -161,7 +162,7 @@ export class SessionJournalStore implements JournalStore {
       p_tenure_id: this.#identity.writerTenureId,
       p_host_instance_id: this.#identity.hostInstanceId,
       p_journal_id: this.#identity.journalId,
-      p_capability_hash: this.#capabilityHash,
+      p_capability: this.#capability,
       p_protocol: ADMISSION_PROTOCOL,
     };
   }

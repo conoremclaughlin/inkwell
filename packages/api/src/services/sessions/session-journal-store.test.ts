@@ -8,7 +8,6 @@ import {
   type JournalIdentity,
 } from '@inklabs/shared/runtime';
 import { ADMISSION_PROTOCOL } from './command-admission';
-import { tenureCapabilityHash } from './tenure-admission';
 import { SessionJournalStore, SessionJournalStoreError } from './session-journal-store';
 
 const identity: JournalIdentity = {
@@ -107,7 +106,7 @@ describe('D1 session journal store (mock transport, no live caller)', () => {
     expect(rpc).not.toHaveBeenCalled();
   });
 
-  it('binds the full authority, hashes the secret, and makes exactly one atomic append call', async () => {
+  it('binds the full authority, sends the secret only as p_capability, and makes exactly one atomic append call', async () => {
     const { store, rpc } = fixture();
     await store.append(request());
     expect(rpc).toHaveBeenCalledExactlyOnceWith('append_session_journal', {
@@ -115,12 +114,16 @@ describe('D1 session journal store (mock transport, no live caller)', () => {
       p_tenure_id: identity.writerTenureId,
       p_host_instance_id: identity.hostInstanceId,
       p_journal_id: identity.journalId,
-      p_capability_hash: tenureCapabilityHash(capability),
+      p_capability: capability,
       p_protocol: ADMISSION_PROTOCOL,
       p_expected_committed_eid: 0,
       p_entry: entry(),
     });
-    expect(JSON.stringify(rpc.mock.calls)).not.toContain(capability);
+    // The database hashes the secret, so it travels in exactly one argument.
+    const carrying = Object.entries(rpc.mock.calls[0][1] as Record<string, unknown>)
+      .filter(([, value]) => JSON.stringify(value).includes(capability))
+      .map(([key]) => key);
+    expect(carrying).toEqual(['p_capability']);
     // Private fields prevent a diagnostic JSON.stringify from exposing client credentials.
     expect(JSON.stringify(store)).toBe('{}');
   });
@@ -195,7 +198,7 @@ describe('D1 session journal store (mock transport, no live caller)', () => {
       p_tenure_id: identity.writerTenureId,
       p_host_instance_id: identity.hostInstanceId,
       p_journal_id: identity.journalId,
-      p_capability_hash: tenureCapabilityHash(capability),
+      p_capability: capability,
       p_protocol: ADMISSION_PROTOCOL,
       p_reason_code: 'append_failed',
     });
