@@ -250,6 +250,11 @@ export class InvocationGate {
     return this.invocations.filter((state) => !state.settled || state.reopened).length;
   }
 
+  /** Any OTHER obligation of the turn not proved settled, rechecked after every await. */
+  private othersUnresolved(except: InvocationState): boolean {
+    return this.invocations.some((state) => state !== except && (!state.settled || state.reopened));
+  }
+
   /**
    * Everything a spawn needs before its process may start: the run-level
    * conditions, no unsettled obligation earlier in the turn, a committed
@@ -310,6 +315,8 @@ export class InvocationGate {
     }
     const afterIntent = standingRefusal(this.ports, this.turn.sessionId, this.signal);
     if (afterIntent) return afterIntent;
+    // An earlier spawn may have been reopened while this intent was appended.
+    if (this.othersUnresolved(state)) return refusal('prior_invocation_unresolved');
 
     let decision: DispatchDecision;
     try {
@@ -318,6 +325,7 @@ export class InvocationGate {
       return refusal('dispatch_refused');
     }
     if (decision.outcome !== 'dispatch') return refusal('dispatch_refused', decision.reason);
+    if (this.othersUnresolved(state)) return refusal('prior_invocation_unresolved');
 
     state.permit = Object.freeze({ invocationId });
     state.phase = 'permitted';
@@ -327,7 +335,9 @@ export class InvocationGate {
   /**
    * The last check, synchronous, immediately before `spawn()`: a runner calls
    * it after its last await and spawns only on `undefined`. One permit, one
-   * spawn. Returns the refusal reason otherwise.
+   * spawn. It also refuses, and spends the permit, when any other obligation
+   * of the turn is unresolved now, such as an earlier spawn reopened after
+   * this permit was issued. Returns the refusal reason otherwise.
    */
   admitSpawn(permit: InvocationPermit): RunRefusalReason | undefined {
     const state = this.find(permit);
@@ -337,6 +347,10 @@ export class InvocationGate {
     if (standing) {
       state.phase = 'undispatched';
       return standing.reason;
+    }
+    if (this.othersUnresolved(state)) {
+      state.phase = 'undispatched';
+      return 'prior_invocation_unresolved';
     }
     state.phase = 'spawned';
     return undefined;
@@ -379,7 +393,9 @@ export class InvocationGate {
    * Records what was observed about the spawn. Local state follows only the
    * frozen record submitted here, confirmed by the committed echo; never the
    * caller's object after the await. A failed or held write, or any negative
-   * observation, leaves the spawn unresolved for good.
+   * observation, leaves the spawn unresolved for good. A negative is known
+   * the moment it is observed, so it reopens the spawn before the append is
+   * even awaited: the conservative local hold, not a claim that it is durable.
    */
   async observe(permit: InvocationPermit, observation: SpawnObservation): Promise<void> {
     const state = this.find(permit);
@@ -389,6 +405,7 @@ export class InvocationGate {
         ? { kind: 'unknown', reasonCode: observation.reasonCode }
         : { kind: observation.kind, evidenceRef: observation.evidenceRef }
     );
+    if (NEGATIVE_OBSERVATIONS.has(submitted.kind)) state.reopened = true;
     let receipt: JournalCommitReceipt;
     try {
       receipt = await this.ports.journal.append({
@@ -409,8 +426,8 @@ export class InvocationGate {
       state.reopened = true;
       return;
     }
-    if (NEGATIVE_OBSERVATIONS.has(submitted.kind)) state.reopened = true;
-    else if (SETTLED_OBSERVATIONS.has(submitted.kind)) state.settled = true;
+    // A negative already reopened the spawn before the await.
+    if (SETTLED_OBSERVATIONS.has(submitted.kind)) state.settled = true;
   }
 }
 
@@ -427,12 +444,24 @@ export type AdmittedRunOutcome<T> =
        */
       unresolvedInvocations: number;
     }
+  | {
+      /**
+       * `execute` threw after the turn was admitted. It may already have
+       * spawned or produced effects, so this is never a pre-dispatch refusal:
+       * the host takes `admittedTurn` through its canonical hold or finish path.
+       */
+      outcome: 'failed';
+      error: unknown;
+      admittedTurn: AdmittedTurn;
+      unresolvedInvocations: number;
+    }
   | RunRefusal;
 
 /**
  * One command's run under D1. Both runner seams use it (S1, a turn;
  * S2, a compaction). `execute` receives the gate and must take every physical
- * spawn through it; it is not called at all when the run is refused.
+ * spawn through it; it is not called at all when the run is refused. Every
+ * outcome after admission carries the admitted turn.
  */
 export async function admittedRun<T>(
   ports: RunAdmissionPorts | undefined,
@@ -443,20 +472,26 @@ export async function admittedRun<T>(
   if (!ports?.journal || !ports.turns || !ports.dispatch || !ports.recovery) {
     return refusal('ports_missing');
   }
-  const before = standingRefusal(ports, request.sessionId, options.signal);
+  // Read the caller's request once; nothing below looks at the original again.
+  const asked: RunRequest = Object.freeze({
+    sessionId: request.sessionId,
+    commandUuid: request.commandUuid,
+    kind: request.kind,
+  });
+  const before = standingRefusal(ports, asked.sessionId, options.signal);
   if (before) return before;
 
   let admission: TurnAdmission;
   try {
-    admission = await ports.turns.admit({ ...request });
+    admission = await ports.turns.admit({ ...asked });
   } catch {
     return refusal('turn_refused', 'admission_failed');
   }
   if (admission.outcome !== 'admitted') return refusal('turn_refused', admission.reason);
   if (
-    admission.sessionId !== request.sessionId ||
-    admission.commandUuid !== request.commandUuid ||
-    admission.kind !== request.kind ||
+    admission.sessionId !== asked.sessionId ||
+    admission.commandUuid !== asked.commandUuid ||
+    admission.kind !== asked.kind ||
     typeof admission.tenureId !== 'string' ||
     !admission.tenureId ||
     typeof admission.epoch !== 'string' ||
@@ -472,10 +507,21 @@ export async function admittedRun<T>(
     commandUuid: admission.commandUuid,
     kind: admission.kind,
   });
-  const after = standingRefusal(ports, request.sessionId, options.signal);
+  const after = standingRefusal(ports, asked.sessionId, options.signal);
   if (after) return { ...after, admittedTurn: turn };
 
   const gate = new InvocationGate(ports, turn, options.signal);
-  const result = await execute(gate);
+  let result: T;
+  try {
+    // Inside the try, so a synchronous throw is caught as well as a rejection.
+    result = await execute(gate);
+  } catch (error) {
+    return {
+      outcome: 'failed',
+      error,
+      admittedTurn: turn,
+      unresolvedInvocations: gate.unresolvedInvocations,
+    };
+  }
   return { outcome: 'ran', result, turn, unresolvedInvocations: gate.unresolvedInvocations };
 }

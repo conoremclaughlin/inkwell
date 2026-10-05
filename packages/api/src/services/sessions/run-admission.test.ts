@@ -7,7 +7,8 @@ import type {
   JournalWriter,
 } from '@inklabs/shared/runtime';
 import {
-  admittedRun,
+  admittedRun as admittedRunUnchecked,
+  type AdmittedRunOutcome,
   type AdmittedTurn,
   type InvocationGate,
   type InvocationPermit,
@@ -15,6 +16,23 @@ import {
   type RunRequest,
   type SpawnAttempt,
 } from './run-admission';
+
+/**
+ * admittedRun reports a throw from `execute` as `failed`, and that includes an
+ * assertion failing inside `execute`. Tests that assert there go through this
+ * wrapper, which rethrows it; only the tests about `failed` itself call the
+ * unchecked function.
+ */
+async function admittedRun<T>(
+  ports: RunAdmissionPorts | undefined,
+  request: RunRequest,
+  execute: (gate: InvocationGate) => Promise<T>,
+  options?: { signal?: AbortSignal }
+): Promise<AdmittedRunOutcome<T>> {
+  const outcome = await admittedRunUnchecked(ports, request, execute, options);
+  if (outcome.outcome === 'failed') throw outcome.error;
+  return outcome;
+}
 
 const SESSION = '11111111-1111-4111-8111-111111111111';
 const COMMAND = '22222222-2222-4222-8222-222222222222';
@@ -725,6 +743,200 @@ describe('the committed echo decides settlement, not what was submitted alone', 
     expect(outcome).toMatchObject({
       result: ['spawned:inv-1', 'refused:prior_invocation_unresolved'],
       unresolvedInvocations: 1,
+    });
+  });
+});
+
+// Lumen's re-review of 750a2b74 (pr:701 3c7d9c71): R5-R8 failed there.
+describe('review regressions: execution failure, request snapshot, negatives in flight', () => {
+  it('composes with the real JournalWriter: intent, binding and observation', async () => {
+    const { JournalWriter } = await import('@inklabs/shared/runtime');
+    const { ports } = fakePorts();
+    const entries: JournalEntry[] = [];
+    ports.journal = new JournalWriter({
+      identity: {
+        journalId: JOURNAL,
+        sessionId: SESSION,
+        writerTenureId: TENURE,
+        hostInstanceId: 'host-a',
+      },
+      committedEid: 0,
+      now: () => '2026-10-04T12:00:00.000Z',
+      maxEntryBytes: 4096,
+      maxPendingEntries: 8,
+      maxPendingBytes: 32768,
+      store: {
+        append: async ({ entry }) => {
+          entries.push(entry);
+          return { outcome: 'committed', projection: 'recorded', entry, committedEid: entry.eid };
+        },
+        hold: async () => {
+          throw new Error('unexpected hold');
+        },
+      },
+    });
+    const result = await admittedRun(ports, turnRequest, async (gate) => {
+      const permit = await gate.prepare(attempt);
+      if ('outcome' in permit) throw new Error(permit.reason);
+      expect(gate.admitSpawn(permit)).toBeUndefined();
+      expect(
+        await gate.bind(permit, {
+          pid: 42,
+          startIdentity: 'proc-a',
+          containment: { kind: 'unknown' },
+        })
+      ).toBe('bound');
+      await gate.observe(permit, { kind: 'tree_quiescent', evidenceRef: 'executor-proof' });
+      return 'done';
+    });
+    expect(result).toMatchObject({ outcome: 'ran', unresolvedInvocations: 0 });
+    expect(entries.map((entry) => [entry.eid, entry.type])).toEqual([
+      [1, 'provider_spawn_intent'],
+      [2, 'provider_spawn_binding'],
+      [3, 'provider_spawn_observation'],
+    ]);
+    expect(entries.every((entry) => Object.isFrozen(entry))).toBe(true);
+  });
+
+  it('R5: an execute that rejects returns failed with the admitted turn, not a refusal', async () => {
+    const { ports } = fakePorts();
+    const error = new Error('runner failed');
+    const result = await admittedRunUnchecked(ports, turnRequest, async () => {
+      throw error;
+    });
+    expect(result).toEqual({
+      outcome: 'failed',
+      error,
+      admittedTurn: {
+        sessionId: SESSION,
+        tenureId: TENURE,
+        epoch: 'epoch-7',
+        commandUuid: COMMAND,
+        kind: 'turn',
+      },
+      unresolvedInvocations: 0,
+    });
+  });
+
+  it('R5: a synchronous throw is caught the same way', async () => {
+    const { ports } = fakePorts();
+    const result = await admittedRunUnchecked(ports, turnRequest, (() => {
+      throw new Error('sync');
+    }) as unknown as (gate: InvocationGate) => Promise<never>);
+    expect(result).toMatchObject({ outcome: 'failed', admittedTurn: { epoch: 'epoch-7' } });
+  });
+
+  it('R5: a throw after a spawn reports that spawn as unresolved', async () => {
+    const { ports, calls } = fakePorts();
+    const result = await admittedRunUnchecked(ports, turnRequest, async (gate) => {
+      await spawnThroughGate(gate, calls);
+      throw new Error('runner crashed after spawning');
+    });
+    expect(result).toMatchObject({ outcome: 'failed', unresolvedInvocations: 1 });
+  });
+
+  it('R6: mutating the caller request during admission changes nothing', async () => {
+    const request: RunRequest = { ...turnRequest };
+    const { ports } = fakePorts({
+      admit: async (captured) => {
+        request.kind = 'compaction';
+        return { outcome: 'admitted', ...captured, tenureId: TENURE, epoch: 'epoch-7' };
+      },
+    });
+    expect(await admittedRun(ports, request, async () => 'done')).toMatchObject({
+      outcome: 'ran',
+      turn: { kind: 'turn' },
+    });
+  });
+
+  it('R7: a negative observation still being written blocks preparing another spawn', async () => {
+    const { ports, journal } = fakePorts();
+    await admittedRun(ports, turnRequest, async (gate) => {
+      const permit = (await gate.prepare(attempt)) as InvocationPermit;
+      gate.admitSpawn(permit);
+      await gate.observe(permit, { kind: 'tree_quiescent', evidenceRef: 'proof' });
+      const original = journal.append.getMockImplementation()!;
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => (release = resolve));
+      journal.append.mockImplementation(async (record) => {
+        if (record.body.kind === 'child_alive') await wait;
+        return original(record);
+      });
+      const negative = gate.observe(permit, { kind: 'child_alive', evidenceRef: 'late-child' });
+      const second = await gate.prepare(attempt);
+      release();
+      await negative;
+      expect(second).toMatchObject({ outcome: 'refused', reason: 'prior_invocation_unresolved' });
+    });
+  });
+
+  it('R8: a negative committed after the fallback permit was issued revokes that permit', async () => {
+    const { ports } = fakePorts();
+    await admittedRun(ports, turnRequest, async (gate) => {
+      const first = (await gate.prepare(attempt)) as InvocationPermit;
+      gate.admitSpawn(first);
+      await gate.observe(first, { kind: 'tree_quiescent', evidenceRef: 'proof' });
+      const second = await gate.prepare(attempt);
+      if ('outcome' in second) throw new Error(second.reason);
+      await gate.observe(first, { kind: 'child_alive', evidenceRef: 'late-child' });
+      expect(gate.admitSpawn(second)).toBe('prior_invocation_unresolved');
+      expect(gate.admitSpawn(second)).toBe('permit_used');
+    });
+  });
+
+  it('R8: a negative still being written also revokes the outstanding permit', async () => {
+    const { ports, journal } = fakePorts();
+    await admittedRun(ports, turnRequest, async (gate) => {
+      const first = (await gate.prepare(attempt)) as InvocationPermit;
+      gate.admitSpawn(first);
+      await gate.observe(first, { kind: 'tree_quiescent', evidenceRef: 'proof' });
+      const second = (await gate.prepare(attempt)) as InvocationPermit;
+      const original = journal.append.getMockImplementation()!;
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => (release = resolve));
+      journal.append.mockImplementation(async (record) => {
+        if (record.body.kind === 'unknown') await wait;
+        return original(record);
+      });
+      const negative = gate.observe(first, { kind: 'unknown', reasonCode: 'lost_track' });
+      expect(gate.admitSpawn(second)).toBe('prior_invocation_unresolved');
+      release();
+      await negative;
+    });
+  });
+
+  it('refuses before issuing a permit when an earlier spawn is reopened during authorization', async () => {
+    const { ports } = fakePorts();
+    await admittedRun(ports, turnRequest, async (gate) => {
+      const first = (await gate.prepare(attempt)) as InvocationPermit;
+      gate.admitSpawn(first);
+      await gate.observe(first, { kind: 'tree_quiescent', evidenceRef: 'proof' });
+      ports.dispatch.authorize = async () => {
+        await gate.observe(first, { kind: 'contradiction', evidenceRef: 'scan' });
+        return { outcome: 'dispatch' };
+      };
+      expect(await gate.prepare(attempt)).toMatchObject({ reason: 'prior_invocation_unresolved' });
+    });
+  });
+});
+
+describe('an earlier spawn reopened mid-preparation', () => {
+  it('refuses before dispatch is asked when the reopening lands during the intent append', async () => {
+    const { ports, journal, calls } = fakePorts();
+    await admittedRun(ports, turnRequest, async (gate) => {
+      const first = (await gate.prepare(attempt)) as InvocationPermit;
+      gate.admitSpawn(first);
+      await gate.observe(first, { kind: 'tree_quiescent', evidenceRef: 'proof' });
+      const original = journal.append.getMockImplementation()!;
+      journal.append.mockImplementation(async (record) => {
+        const receipt = await original(record);
+        if (record.type === 'provider_spawn_intent' && record.target?.invocationId === 'inv-2') {
+          await gate.observe(first, { kind: 'child_alive', evidenceRef: 'late-child' });
+        }
+        return receipt;
+      });
+      expect(await gate.prepare(attempt)).toMatchObject({ reason: 'prior_invocation_unresolved' });
+      expect(calls).not.toContain('authorize:inv-2');
     });
   });
 });
