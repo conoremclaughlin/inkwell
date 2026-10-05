@@ -14,6 +14,11 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createHash, randomUUID } from 'crypto';
 import { Client } from 'pg';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import {
+  canonicalJournalJson,
+  freezeJournalEntry,
+  type JournalTarget,
+} from '@inklabs/shared/runtime';
 import { getDataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 import {
@@ -2920,6 +2925,1334 @@ describe('durable command admission', () => {
             await holderTx.client.query('ROLLBACK').catch(() => undefined);
           }
         });
+      });
+    });
+
+    // Session journal, slice D1 (20261005021135): the append, its projection
+    // into the invocation index, the hold, the lineage gates and the seal.
+    describe('session journal (D1)', () => {
+      const ENTRY_LIMIT = 262_144;
+      let adminConnection: Client | undefined;
+
+      afterAll(async () => {
+        await adminConnection?.end().catch(() => undefined);
+      });
+
+      // The isolated stack's postgres connection: what a restore or an
+      // administrator can do, and the census's view of the catalog.
+      async function admin<T = Record<string, unknown>>(text: string, params: unknown[] = []) {
+        if (!adminConnection) {
+          const url = process.env.INTEGRATION_DB_URL;
+          if (!url) throw new Error('INTEGRATION_DB_URL is required (managed harness)');
+          adminConnection = new Client({ connectionString: url, statement_timeout: 15_000 });
+          await adminConnection.connect();
+        }
+        return (await adminConnection.query(text, params)).rows as T[];
+      }
+
+      interface JournalWriterState {
+        sessionId: string;
+        journalId: string;
+        holder: TenureHolder;
+        eid: number;
+      }
+      type Turn = { epoch: string; command: string };
+      type EntryRecord = {
+        type: string;
+        target: JournalTarget | null;
+        body: Record<string, unknown>;
+      };
+
+      async function journaledSession(): Promise<{ sessionId: string; journalId: string }> {
+        const { data, error } = await supabase
+          .from('sessions')
+          .insert({
+            user_id: userId,
+            agent_id: SUITE_SB,
+            sb_id: suiteSbId,
+            status: 'active',
+            journal_kind: 'db_v1',
+          })
+          .select('id')
+          .single();
+        if (error || !data) throw new Error(`journaled session insert failed: ${error?.message}`);
+        sessionIds.push(data.id as string);
+        const { data: journal } = await supabase
+          .from('session_journals')
+          .select('id')
+          .eq('session_id', data.id)
+          .single();
+        if (!journal) throw new Error('journal header was not opened');
+        return { sessionId: data.id as string, journalId: journal.id as string };
+      }
+
+      // A journaled session with a registered holder in its first turn.
+      async function started(): Promise<{ w: JournalWriterState; t: Turn }> {
+        const { sessionId, journalId } = await journaledSession();
+        const holder = await register(sessionId, 'server_hosted');
+        const t = await turn(sessionId, holder, null);
+        return { w: { sessionId, journalId, holder, eid: 0 }, t };
+      }
+
+      function targetOf(holder: TenureHolder, t: Turn, invocationId: string | null): JournalTarget {
+        return { tenureId: holder.tenureId, epoch: t.epoch, commandUuid: t.command, invocationId };
+      }
+      const ordinary = (target: JournalTarget | null, text = 'invented event'): EntryRecord => ({
+        type: 'assistant_text',
+        target,
+        body: { text },
+      });
+      const intent = (target: JournalTarget): EntryRecord => ({
+        type: 'provider_spawn_intent',
+        target,
+        body: {
+          adapter: 'claude-code',
+          hostMode: 'server_hosted',
+          attemptId: null,
+          deadlineAt: null,
+          execution: { kind: 'known', hostId: HOST.hostId, bootId: HOST.bootId },
+        },
+      });
+      const bound = (target: JournalTarget, pid = 4242): EntryRecord => ({
+        type: 'provider_spawn_binding',
+        target,
+        body: {
+          kind: 'process_binding',
+          pid,
+          startIdentity: `start-${pid}`,
+          containment: { kind: 'unknown' },
+        },
+      });
+      const observed = (
+        target: JournalTarget,
+        kind: string,
+        ref = `evidence-${kind}`
+      ): EntryRecord => ({
+        type: 'provider_spawn_observation',
+        target,
+        body: kind === 'unknown' ? { kind, reasonCode: 'lost_track' } : { kind, evidenceRef: ref },
+      });
+
+      // The entry a host would send: built and frozen by the shared contract.
+      function entryOf(w: JournalWriterState, eid: number, record: EntryRecord, holder = w.holder) {
+        return freezeJournalEntry(
+          {
+            version: 1,
+            journalId: w.journalId,
+            sessionId: w.sessionId,
+            writerTenureId: holder.tenureId,
+            hostInstanceId: holder.hostInstanceId,
+            eid,
+            ts: new Date(Date.UTC(2026, 9, 5, 3, 0, 0, eid)).toISOString(),
+            type: record.type,
+            target: record.target,
+            body: record.body,
+          },
+          ENTRY_LIMIT
+        ).entry;
+      }
+
+      async function appendRaw(
+        w: JournalWriterState,
+        expected: number,
+        entry: unknown,
+        overrides: {
+          holder?: TenureHolder;
+          journalId?: string;
+          sessionId?: string;
+          protocol?: number;
+        } = {}
+      ): Promise<Record<string, unknown>> {
+        const holder = overrides.holder ?? w.holder;
+        const { data, error } = await supabase.rpc('append_session_journal', {
+          p_session_id: overrides.sessionId ?? w.sessionId,
+          p_tenure_id: holder.tenureId,
+          p_capability_hash: tenureCapabilityHash(holder.capability),
+          p_host_instance_id: holder.hostInstanceId,
+          p_journal_id: overrides.journalId ?? w.journalId,
+          p_expected_committed_eid: expected,
+          p_entry: entry,
+          p_protocol: overrides.protocol ?? ADMISSION_PROTOCOL,
+        });
+        if (error) throw new Error(`append_session_journal failed: ${error.message}`);
+        return data as Record<string, unknown>;
+      }
+
+      // The next record under this writer; the cursor moves only on a commit.
+      async function append(w: JournalWriterState, record: EntryRecord, holder = w.holder) {
+        const entry = entryOf(w, w.eid + 1, record, holder);
+        const reply = await appendRaw(w, w.eid, entry, { holder });
+        if (reply.outcome === 'committed') w.eid += 1;
+        return { reply, entry };
+      }
+
+      async function hold(
+        w: JournalWriterState,
+        reasonCode: string,
+        holder = w.holder,
+        journalId = w.journalId
+      ) {
+        const { data, error } = await supabase.rpc('hold_session_journal', {
+          p_session_id: w.sessionId,
+          p_tenure_id: holder.tenureId,
+          p_capability_hash: tenureCapabilityHash(holder.capability),
+          p_host_instance_id: holder.hostInstanceId,
+          p_journal_id: journalId,
+          p_reason_code: reasonCode,
+          p_protocol: ADMISSION_PROTOCOL,
+        });
+        if (error) throw new Error(`hold_session_journal failed: ${error.message}`);
+        return data as Record<string, unknown>;
+      }
+
+      async function header(journalId: string) {
+        const { data, error } = await supabase
+          .from('session_journals')
+          .select(
+            'committed_eid, committed_bytes, hold_reason, held_by_tenure_id, held_by_host_instance_id'
+          )
+          .eq('id', journalId)
+          .single();
+        if (error || !data) throw new Error(`header read failed: ${error?.message}`);
+        return data;
+      }
+
+      async function storedEntries(journalId: string) {
+        const { data, error } = await supabase
+          .from('session_journal_entries')
+          .select('eid, entry, entry_bytes, projection')
+          .eq('journal_id', journalId)
+          .order('eid');
+        if (error) throw new Error(`entries read failed: ${error.message}`);
+        return data ?? [];
+      }
+
+      async function invocationRow(sessionId: string, epoch: string, invocationId: string) {
+        const { data, error } = await supabase
+          .from('session_turn_invocations')
+          .select('process_pid, resolution, unknown_reason, contradiction')
+          .eq('session_id', sessionId)
+          .eq('epoch', epoch)
+          .eq('invocation_id', invocationId)
+          .maybeSingle();
+        if (error) throw new Error(`invocation read failed: ${error.message}`);
+        return data;
+      }
+
+      // Everything a refused write must leave as it was.
+      async function journalState(w: JournalWriterState) {
+        return { header: await header(w.journalId), entries: await storedEntries(w.journalId) };
+      }
+
+      // A resolved spawn under the writer's turn.
+      async function settled(w: JournalWriterState, t: Turn, invocationId: string) {
+        const target = targetOf(w.holder, t, invocationId);
+        for (const record of [intent(target), bound(target), observed(target, 'tree_quiescent')]) {
+          const { reply } = await append(w, record);
+          expect(reply).toMatchObject({ outcome: 'committed', projection: 'recorded' });
+        }
+      }
+
+      async function nextTurn(w: JournalWriterState, prior: Turn): Promise<Turn> {
+        await finish(w.sessionId, w.holder, prior.epoch);
+        await complete(prior.command);
+        return turn(w.sessionId, w.holder, prior.epoch);
+      }
+
+      async function registerAfter(sessionId: string, prior: string) {
+        const { capability, capabilityHash } = mintTenureCapability();
+        const r = await registerTenure(supabase, {
+          sessionId,
+          expected: { kind: 'released', tenureId: prior },
+          mode: 'server_hosted',
+          capabilityHash,
+          host: HOST,
+        });
+        if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
+        return { tenureId: r.tenureId, capability, hostInstanceId: HOST.instanceId };
+      }
+
+      // T1 settled a spawn and released; T2 holds the session in its first turn.
+      async function twoTenures() {
+        const { w, t } = await started();
+        const inv = `inv-${randomUUID()}`;
+        await settled(w, t, inv);
+        await finish(w.sessionId, w.holder, t.epoch);
+        await complete(t.command);
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            evidence: 'controller_retired',
+          })
+        ).toEqual({ outcome: 'released', tenureId: w.holder.tenureId });
+        const holder2 = await registerAfter(w.sessionId, w.holder.tenureId);
+        const t2 = await turn(w.sessionId, holder2, t.epoch);
+        const w2: JournalWriterState = { ...w, holder: holder2 };
+        return { w1: w, t1: t, inv, w2, t2 };
+      }
+
+      it('opens a journal only in the creating INSERT, on a fresh conditional session, and fixes its kind', async () => {
+        const { sessionId, journalId } = await journaledSession();
+        expect(await header(journalId)).toMatchObject({
+          committed_eid: 0,
+          committed_bytes: 0,
+          hold_reason: null,
+        });
+
+        const insert = (fields: Record<string, unknown>) =>
+          supabase
+            .from('sessions')
+            .insert({
+              user_id: userId,
+              agent_id: SUITE_SB,
+              sb_id: suiteSbId,
+              status: 'active',
+              ...fields,
+            })
+            .select('id');
+        await setMode('legacy');
+        try {
+          const { error } = await insert({ journal_kind: 'db_v1' });
+          expect(error?.message).toMatch(/fresh session created in conditional mode/);
+        } finally {
+          await setMode('conditional');
+        }
+        const used = await insert({
+          journal_kind: 'db_v1',
+          backend_session_id: `backend-${randomUUID()}`,
+        });
+        expect(used.error?.message).toMatch(/fresh session created in conditional mode/);
+        const unknownKind = await insert({ journal_kind: 'db_v2' });
+        expect(unknownKind.error?.message).toMatch(/sessions_journal_kind_known/);
+
+        const cleared = await supabase
+          .from('sessions')
+          .update({ journal_kind: null })
+          .eq('id', sessionId);
+        expect(cleared.error?.message).toMatch(/journal_kind is fixed/);
+        const legacy = await newSession(suiteSbId);
+        const claimed = await supabase
+          .from('sessions')
+          .update({ journal_kind: 'db_v1' })
+          .eq('id', legacy);
+        expect(claimed.error?.message).toMatch(/journal_kind is fixed/);
+        const { count } = await supabase
+          .from('session_journals')
+          .select('id', { count: 'exact', head: true })
+          .eq('session_id', legacy);
+        expect(count).toBe(0);
+        // Other writes to a journaled session are untouched.
+        expect(
+          (await supabase.from('sessions').update({ status: 'active' }).eq('id', sessionId)).error
+        ).toBeNull();
+      });
+
+      it('commits each entry with its projection and the head in one step, echoing the exact entry', async () => {
+        const { w, t } = await started();
+        const inv = 'inv-happy';
+        const target = targetOf(w.holder, t, inv);
+        const records = [
+          [ordinary(null), 'none'],
+          [intent(target), 'recorded'],
+          [bound(target), 'recorded'],
+          [observed(target, 'tree_quiescent'), 'recorded'],
+          [ordinary(targetOf(w.holder, t, null)), 'none'],
+          [ordinary(targetOf(w.holder, t, inv)), 'none'],
+        ] as const;
+        for (const [record, projection] of records) {
+          const eid = w.eid + 1;
+          const { reply, entry } = await append(w, record);
+          expect(reply).toEqual({ outcome: 'committed', entry, committedEid: eid, projection });
+        }
+        expect(await invocationRow(w.sessionId, t.epoch, inv)).toEqual({
+          process_pid: 4242,
+          resolution: 'tree_quiescent',
+          unknown_reason: null,
+          contradiction: false,
+        });
+        const rows = await storedEntries(w.journalId);
+        expect(rows.map((r) => r.projection)).toEqual(records.map(([, p]) => p));
+        const bytes = rows.reduce((sum, r) => sum + (r.entry_bytes as number), 0);
+        expect(await header(w.journalId)).toMatchObject({
+          committed_eid: 6,
+          committed_bytes: bytes,
+        });
+        for (const row of rows) {
+          // Never below the host's compact size, so a host bound is conservative.
+          const compact = Buffer.byteLength(canonicalJournalJson(row.entry, 1_048_576));
+          expect(row.entry_bytes as number).toBeGreaterThanOrEqual(compact);
+        }
+        const [check] = await admin<{ ok: boolean }>(
+          'SELECT bool_and(entry_bytes = octet_length(entry::text)) AS ok FROM public.session_journal_entries WHERE journal_id = $1',
+          [w.journalId]
+        );
+        expect(check.ok).toBe(true);
+      });
+
+      it('answers an exact retry from the stored entry, and refuses a different one at the same eid', async () => {
+        const { w, t } = await started();
+        await append(w, ordinary(null));
+        const { entry: second } = await append(w, intent(targetOf(w.holder, t, 'inv-retry')));
+        await append(w, ordinary(null, 'later'));
+        const before = await journalState(w);
+
+        expect(await appendRaw(w, 1, second)).toEqual({
+          outcome: 'already_committed',
+          entry: second,
+          committedEid: 3,
+          projection: 'recorded',
+        });
+        // Key order is immaterial to the comparison.
+        const reordered = Object.fromEntries(Object.entries(second).reverse());
+        expect(await appendRaw(w, 1, reordered)).toMatchObject({
+          outcome: 'already_committed',
+          committedEid: 3,
+        });
+        for (const changed of [
+          { ...second, ts: '2026-10-05T03:00:01.000Z' },
+          { ...second, body: { ...second.body, attemptId: 'attempt-1' } },
+        ]) {
+          expect(await appendRaw(w, 1, changed)).toEqual({
+            outcome: 'refused',
+            reasonCode: 'conflict',
+          });
+        }
+        expect(await journalState(w)).toEqual(before);
+      });
+
+      it('refuses the same host under a new tenure retrying an earlier tenure entry', async () => {
+        const { w, t } = await started();
+        const { entry: first } = await append(w, ordinary(null));
+        await finish(w.sessionId, w.holder, t.epoch);
+        await complete(t.command);
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            evidence: 'controller_retired',
+          })
+        ).toMatchObject({ outcome: 'released' });
+        const holder2 = await registerAfter(w.sessionId, w.holder.tenureId);
+        expect(holder2.hostInstanceId).toBe(w.holder.hostInstanceId);
+
+        expect(await appendRaw(w, 0, first, { holder: holder2 })).toEqual({
+          outcome: 'refused',
+          reasonCode: 'stale_writer',
+        });
+        expect(await appendRaw(w, 0, first)).toEqual({
+          outcome: 'refused',
+          reasonCode: 'not_holder',
+        });
+        const w2 = { ...w, holder: holder2 };
+        const { reply } = await append(w2, ordinary(null, 'second tenure'));
+        expect(reply).toMatchObject({ outcome: 'committed', committedEid: 2 });
+      });
+
+      it('refuses malformed, oversized, misaddressed and out-of-order entries, writing nothing', async () => {
+        const { w, t } = await started();
+        await append(w, ordinary(null));
+        await append(w, intent(targetOf(w.holder, t, 'inv-known')));
+        const before = await journalState(w);
+        const next = entryOf(w, 3, ordinary(null)) as unknown as Record<string, unknown>;
+        const refused = (reasonCode: string) => ({ outcome: 'refused', reasonCode });
+
+        expect(await appendRaw(w, 2, next, { protocol: ADMISSION_PROTOCOL + 1 })).toEqual(
+          refused('mode_mismatch')
+        );
+        const invalid: Array<[string, Record<string, unknown>]> = [
+          ['uppercase journal id', { ...next, journalId: w.journalId.toUpperCase() }],
+          ['another session id', { ...next, sessionId: randomUUID() }],
+          ['another host instance', { ...next, hostInstanceId: 'host-other' }],
+          ['an extra envelope key', { ...next, extra: true }],
+          [
+            'a missing envelope key',
+            Object.fromEntries(Object.entries(next).filter(([k]) => k !== 'ts')),
+          ],
+          ['version 2', { ...next, version: 2 }],
+          ['an eid past the expected head', { ...next, eid: 4 }],
+          ['a fractional eid', { ...next, eid: 3.5 }],
+          ['an impossible date', { ...next, ts: '2026-02-30T00:00:00.000Z' }],
+          ['a timestamp without milliseconds', { ...next, ts: '2026-10-05T03:00:00Z' }],
+          ['a reserved key in the body', { ...next, body: { eid: 1 } }],
+          ['a body that is not an object', { ...next, body: [] }],
+          ['an unknown spawn type', { ...next, type: 'provider_spawn_other' }],
+          [
+            'a spawn record with no invocation',
+            {
+              ...entryOf(w, 3, intent(targetOf(w.holder, t, 'inv-x'))),
+              target: targetOf(w.holder, t, null),
+            },
+          ],
+          [
+            'a positive observation naming another tenure',
+            {
+              ...entryOf(w, 3, observed(targetOf(w.holder, t, 'inv-known'), 'tree_quiescent')),
+              target: { ...targetOf(w.holder, t, 'inv-known'), tenureId: randomUUID() },
+            },
+          ],
+          [
+            'a pid outside the integer range',
+            {
+              ...entryOf(w, 3, bound(targetOf(w.holder, t, 'inv-known'))),
+              body: {
+                kind: 'process_binding',
+                pid: 2_147_483_648,
+                startIdentity: 's',
+                containment: { kind: 'unknown' },
+              },
+            },
+          ],
+          [
+            'an observation kind the contract does not name',
+            {
+              ...entryOf(w, 3, observed(targetOf(w.holder, t, 'inv-known'), 'tree_quiescent')),
+              body: { kind: 'gone', evidenceRef: 'e' },
+            },
+          ],
+        ];
+        for (const [label, entry] of invalid) {
+          expect(await appendRaw(w, 2, entry), label).toEqual(refused('invalid_entry'));
+        }
+        expect(await appendRaw(w, 2, { ...next, body: { text: 'x'.repeat(530_000) } })).toEqual(
+          refused('entry_too_large')
+        );
+
+        const missingSession = randomUUID();
+        expect(
+          await appendRaw(
+            w,
+            2,
+            { ...next, sessionId: missingSession },
+            { sessionId: missingSession }
+          )
+        ).toEqual(refused('session_missing'));
+        const { capability: wrong } = mintTenureCapability();
+        expect(await appendRaw(w, 2, next, { holder: { ...w.holder, capability: wrong } })).toEqual(
+          refused('not_holder')
+        );
+        const other = await journaledSession();
+        expect(
+          await appendRaw(
+            w,
+            2,
+            { ...next, journalId: other.journalId },
+            { journalId: other.journalId }
+          )
+        ).toEqual(refused('journal_missing'));
+        expect(await appendRaw(w, 3, { ...next, eid: 4 })).toEqual(refused('head_mismatch'));
+
+        expect(await journalState(w)).toEqual(before);
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-x')).toBeNull();
+      });
+
+      it('refuses a record its turn or the index cannot take, writing nothing', async () => {
+        const { w, t } = await started();
+        // Bound, so the same holder may continue past it.
+        await append(w, intent(targetOf(w.holder, t, 'inv-open')));
+        await append(w, bound(targetOf(w.holder, t, 'inv-open')));
+        const t2 = await nextTurn(w, t);
+        const before = await journalState(w);
+        const stale = { outcome: 'refused', reasonCode: 'stale_target' };
+        const cases: Array<[string, EntryRecord, object]> = [
+          ['an ordinary event on a finished turn', ordinary(targetOf(w.holder, t, null)), stale],
+          [
+            'a turn named with another command',
+            ordinary({ ...targetOf(w.holder, t2, null), commandUuid: t.command }),
+            stale,
+          ],
+          [
+            'an invocation the turn never opened',
+            ordinary(targetOf(w.holder, t2, 'inv-none')),
+            stale,
+          ],
+          [
+            'a turn that does not exist',
+            intent({ ...targetOf(w.holder, t2, 'inv-y'), epoch: randomUUID() }),
+            stale,
+          ],
+          ['an intent on a finished turn', intent(targetOf(w.holder, t, 'inv-late')), stale],
+          [
+            'a binding before its intent',
+            bound(targetOf(w.holder, t2, 'inv-unopened')),
+            { outcome: 'refused', reasonCode: 'no_intent' },
+          ],
+        ];
+        for (const [label, record, expected] of cases) {
+          expect((await append(w, record)).reply, label).toEqual(expected);
+        }
+        expect(await journalState(w)).toEqual(before);
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-late')).toBeNull();
+        expect(await invocationRow(w.sessionId, t2.epoch, 'inv-unopened')).toBeNull();
+      });
+
+      it('commits a capacity hold in place of an entry that does not fit, and the hold stops admission and release', async () => {
+        const { w, t } = await started();
+        const inv = 'inv-full';
+        await settled(w, t, inv);
+        const before = await header(w.journalId);
+        await admin(
+          'UPDATE public.session_journals SET byte_budget = committed_bytes + 8 WHERE id = $1',
+          [w.journalId]
+        );
+        // Full budget: even a contradiction of a resolved spawn has no room.
+        const late = await append(w, observed(targetOf(w.holder, t, inv), 'child_alive'));
+        expect(late.reply).toEqual({ outcome: 'refused', reasonCode: 'capacity_held' });
+        expect(await header(w.journalId)).toEqual({
+          ...before,
+          hold_reason: 'store_capacity',
+          held_by_tenure_id: w.holder.tenureId,
+          held_by_host_instance_id: w.holder.hostInstanceId,
+        });
+        expect(await invocationRow(w.sessionId, t.epoch, inv)).toMatchObject({
+          resolution: 'tree_quiescent',
+        });
+        expect((await append(w, ordinary(null))).reply).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_held',
+        });
+        // An exact retry still answers.
+        const [first] = await storedEntries(w.journalId);
+        expect(await appendRaw(w, 0, first.entry)).toMatchObject({
+          outcome: 'already_committed',
+          committedEid: 3,
+        });
+
+        await finish(w.sessionId, w.holder, t.epoch);
+        await complete(t.command);
+        const command = await queued(w.sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            expectedPriorEpoch: t.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'journal_held', reasonCode: 'store_capacity' });
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            evidence: 'controller_retired',
+          })
+        ).toEqual({ outcome: 'journal_held', reasonCode: 'store_capacity' });
+      });
+
+      it('holds set-only under the same authority, echoing the reason asked for', async () => {
+        const { w } = await started();
+        const echo = (reasonCode: string) => ({
+          outcome: 'held',
+          journalId: w.journalId,
+          sessionId: w.sessionId,
+          writerTenureId: w.holder.tenureId,
+          hostInstanceId: w.holder.hostInstanceId,
+          reasonCode,
+        });
+        const { capability: wrong } = mintTenureCapability();
+        expect(await hold(w, 'append_failed', { ...w.holder, capability: wrong })).toEqual({
+          outcome: 'refused',
+          reasonCode: 'not_holder',
+        });
+        expect(await hold(w, 'append_failed', w.holder, randomUUID())).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_missing',
+        });
+        for (const reason of ['store_capacity', 'not_a_reason']) {
+          expect(await hold(w, reason)).toEqual({
+            outcome: 'refused',
+            reasonCode: 'invalid_reason',
+          });
+        }
+        expect((await header(w.journalId)).hold_reason).toBeNull();
+
+        expect(await hold(w, 'append_failed')).toEqual(echo('append_failed'));
+        expect(await hold(w, 'store_refused')).toEqual(echo('store_refused'));
+        expect(await header(w.journalId)).toMatchObject({
+          hold_reason: 'append_failed',
+          held_by_tenure_id: w.holder.tenureId,
+        });
+        expect((await append(w, ordinary(null))).reply).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_held',
+        });
+      });
+
+      it('lets negative evidence from the current holder reopen a finished turn of its own tenure', async () => {
+        const { w, t } = await started();
+        const inv = 'inv-own';
+        await settled(w, t, inv);
+        const t2 = await nextTurn(w, t);
+        const { reply } = await append(w, observed(targetOf(w.holder, t, inv), 'child_alive'));
+        expect(reply).toMatchObject({ outcome: 'committed', projection: 'contradiction' });
+        expect(await invocationRow(w.sessionId, t.epoch, inv)).toMatchObject({
+          resolution: null,
+          contradiction: true,
+        });
+        await finish(w.sessionId, w.holder, t2.epoch);
+        await complete(t2.command);
+        const command = await queued(w.sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            expectedPriorEpoch: t2.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'unresolved', epoch: t2.epoch });
+      });
+
+      it('lets a later holder contradict an earlier tenure resolved spawn, and holds every way out', async () => {
+        const { w1, t1, inv, w2, t2 } = await twoTenures();
+        const { reply } = await append(w2, observed(targetOf(w1.holder, t1, inv), 'child_alive'));
+        expect(reply).toMatchObject({ outcome: 'committed', projection: 'contradiction' });
+        expect(await invocationRow(w2.sessionId, t1.epoch, inv)).toMatchObject({
+          resolution: null,
+          contradiction: true,
+        });
+
+        await finish(w2.sessionId, w2.holder, t2.epoch);
+        await complete(t2.command);
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: w2.sessionId,
+            holder: w2.holder,
+            evidence: 'controller_retired',
+          })
+        ).toEqual({ outcome: 'unresolved', invocations: 1 });
+        const command = await queued(w2.sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: w2.sessionId,
+            holder: w2.holder,
+            expectedPriorEpoch: t2.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'unresolved', epoch: t2.epoch });
+        expect(
+          await markTenureLost(supabase, {
+            sessionId: w2.sessionId,
+            tenureId: w2.holder.tenureId,
+            authority: 'operator-fixture',
+            reasonCode: 'owner_gone',
+          })
+        ).toEqual({ outcome: 'recovery_required', tenureId: w2.holder.tenureId });
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: w2.sessionId,
+            expectedTenureId: w2.holder.tenureId,
+            evidence: 'owner_tree_gone',
+            evidenceRef: 'owner-tree-fixture',
+            currentHostId: HOST.hostId,
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'journal_lineage_needs_journal_reconciler' });
+        const { capabilityHash } = mintTenureCapability();
+        expect(
+          await registerTenure(supabase, {
+            sessionId: w2.sessionId,
+            expected: { kind: 'released', tenureId: w2.holder.tenureId },
+            mode: 'server_hosted',
+            capabilityHash,
+            host: HOST,
+          })
+        ).toMatchObject({ outcome: 'occupied', state: 'recovery_required' });
+        expect(await invocationRow(w2.sessionId, t1.epoch, inv)).toMatchObject({
+          resolution: null,
+        });
+      });
+
+      it('lets a later holder mark an earlier spawn unknown, and never resolve or bind one', async () => {
+        const { w1, t1, inv, w2, t2 } = await twoTenures();
+        const earlier = targetOf(w1.holder, t1, inv);
+        const before = await journalState(w2);
+
+        // Positive records stay on the writer's own turns, however they name the target.
+        const positive = {
+          ...entryOf(
+            w2,
+            w2.eid + 1,
+            observed({ ...earlier, tenureId: w2.holder.tenureId }, 'tree_quiescent')
+          ),
+          target: earlier,
+        };
+        expect(await appendRaw(w2, w2.eid, positive)).toEqual({
+          outcome: 'refused',
+          reasonCode: 'invalid_entry',
+        });
+        for (const record of [
+          observed({ ...earlier, tenureId: w2.holder.tenureId }, 'tree_quiescent'),
+          bound({ ...earlier, tenureId: w2.holder.tenureId }),
+        ]) {
+          expect((await append(w2, record)).reply).toEqual({
+            outcome: 'refused',
+            reasonCode: 'stale_target',
+          });
+        }
+        expect(await journalState(w2)).toEqual(before);
+        expect(await invocationRow(w2.sessionId, t1.epoch, inv)).toMatchObject({
+          resolution: 'tree_quiescent',
+        });
+
+        const { reply } = await append(w2, observed(earlier, 'unknown'));
+        expect(reply).toMatchObject({ outcome: 'committed', projection: 'recorded' });
+        expect(await invocationRow(w2.sessionId, t1.epoch, inv)).toMatchObject({
+          resolution: null,
+          unknown_reason: 'lost_track',
+        });
+        await finish(w2.sessionId, w2.holder, t2.epoch);
+        await complete(t2.command);
+        const command = await queued(w2.sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: w2.sessionId,
+            holder: w2.holder,
+            expectedPriorEpoch: t2.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'unresolved', epoch: t2.epoch });
+      });
+
+      it('keeps a live child of an open spawn open until quiescence, and an explicit contradiction for good', async () => {
+        const { w, t } = await started();
+        const a = targetOf(w.holder, t, 'inv-alive');
+        await append(w, intent(a));
+        await append(w, bound(a));
+        expect((await append(w, observed(a, 'child_alive'))).reply).toMatchObject({
+          projection: 'recorded',
+        });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-alive')).toMatchObject({
+          resolution: null,
+          contradiction: false,
+        });
+        expect((await append(w, observed(a, 'tree_quiescent'))).reply).toMatchObject({
+          projection: 'recorded',
+        });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-alive')).toMatchObject({
+          resolution: 'tree_quiescent',
+        });
+
+        const b = targetOf(w.holder, t, 'inv-contradicted');
+        await append(w, intent(b));
+        expect((await append(w, observed(b, 'contradiction'))).reply).toMatchObject({
+          projection: 'contradiction',
+        });
+        expect((await append(w, observed(b, 'tree_quiescent'))).reply).toMatchObject({
+          projection: 'contradiction',
+        });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-contradicted')).toMatchObject({
+          resolution: null,
+          contradiction: true,
+        });
+      });
+
+      it('refuses the legacy record and reconcile paths on a DB lineage; losing the tenure only removes authority', async () => {
+        const { w, t } = await started();
+        await append(w, intent(targetOf(w.holder, t, 'inv-legacy')));
+        expect(
+          await recordInvocation(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            epoch: t.epoch,
+            invocationId: 'inv-legacy',
+            record: { kind: 'tree_quiescent', evidenceRef: 'legacy-path' },
+          })
+        ).toEqual({ outcome: 'journal_lineage' });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-legacy')).toMatchObject({
+          resolution: null,
+        });
+        expect(
+          await markTenureLost(supabase, {
+            sessionId: w.sessionId,
+            tenureId: w.holder.tenureId,
+            authority: 'operator-fixture',
+            reasonCode: 'owner_gone',
+          })
+        ).toEqual({ outcome: 'recovery_required', tenureId: w.holder.tenureId });
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: w.sessionId,
+            expectedTenureId: w.holder.tenureId,
+            evidence: 'owner_tree_gone',
+            evidenceRef: 'owner-tree-fixture',
+            currentHostId: HOST.hostId,
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'journal_lineage_needs_journal_reconciler' });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-legacy')).toMatchObject({
+          resolution: null,
+        });
+        expect((await append(w, ordinary(null))).reply).toEqual({
+          outcome: 'refused',
+          reasonCode: 'not_holder',
+        });
+      });
+
+      it('fails closed when an administrator removes the header under a db_v1 kind', async () => {
+        const { w, t } = await started();
+        await append(w, intent(targetOf(w.holder, t, 'inv-damaged')));
+        await admin('DELETE FROM public.session_journals WHERE id = $1', [w.journalId]);
+
+        expect((await append(w, ordinary(null))).reply).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_missing',
+        });
+        expect(await hold(w, 'append_failed')).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_missing',
+        });
+        expect(
+          await recordInvocation(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            epoch: t.epoch,
+            invocationId: 'inv-damaged',
+            record: { kind: 'tree_quiescent', evidenceRef: 'legacy-path' },
+          })
+        ).toEqual({ outcome: 'journal_lineage' });
+        await finish(w.sessionId, w.holder, t.epoch);
+        await complete(t.command);
+        const command = await queued(w.sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            expectedPriorEpoch: t.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'journal_missing' });
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: w.sessionId,
+            holder: w.holder,
+            evidence: 'controller_retired',
+          })
+        ).toEqual({ outcome: 'journal_missing' });
+        await markTenureLost(supabase, {
+          sessionId: w.sessionId,
+          tenureId: w.holder.tenureId,
+          authority: 'operator-fixture',
+          reasonCode: 'owner_gone',
+        });
+        expect(
+          await reconcileTenure(supabase, {
+            sessionId: w.sessionId,
+            expectedTenureId: w.holder.tenureId,
+            evidence: 'owner_tree_gone',
+            evidenceRef: 'owner-tree-fixture',
+            currentHostId: HOST.hostId,
+            authority: 'reconciler-fixture',
+            hostInstanceId: HOST.instanceId,
+          })
+        ).toEqual({ outcome: 'refused', reason: 'journal_lineage_needs_journal_reconciler' });
+        const { capabilityHash } = mintTenureCapability();
+        expect(
+          await registerTenure(supabase, {
+            sessionId: w.sessionId,
+            expected: { kind: 'released', tenureId: w.holder.tenureId },
+            mode: 'server_hosted',
+            capabilityHash,
+            host: HOST,
+          })
+        ).toEqual({ outcome: 'journal_missing' });
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-damaged')).toMatchObject({
+          resolution: null,
+        });
+      });
+
+      it('fails closed when an administrator adds a header to a session of no kind', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId, 'server_hosted');
+        const t = await turn(sessionId, holder, null);
+        await settledSpawn(sessionId, holder, t.epoch, 'inv-plain', [
+          { kind: 'process_binding', pid: 77, startIdentity: 'start-77' },
+        ]);
+        const [planted] = await admin<{ id: string }>(
+          "INSERT INTO public.session_journals (session_id, kind) VALUES ($1, 'db_v1') RETURNING id",
+          [sessionId]
+        );
+        expect(
+          await recordInvocation(supabase, {
+            sessionId,
+            holder,
+            epoch: t.epoch,
+            invocationId: 'inv-plain',
+            record: { kind: 'tree_quiescent', evidenceRef: 'legacy-path' },
+          })
+        ).toEqual({ outcome: 'journal_lineage' });
+        const w: JournalWriterState = { sessionId, journalId: planted.id, holder, eid: 0 };
+        expect((await append(w, ordinary(null))).reply).toEqual({
+          outcome: 'refused',
+          reasonCode: 'journal_missing',
+        });
+        await finish(sessionId, holder, t.epoch);
+        await complete(t.command);
+        const command = await queued(sessionId);
+        expect(
+          await admitTurn(supabase, {
+            sessionId,
+            holder,
+            expectedPriorEpoch: t.epoch,
+            epoch: randomUUID(),
+            commandUuid: command,
+          })
+        ).toEqual({ outcome: 'journal_missing' });
+        expect(await invocationRow(sessionId, t.epoch, 'inv-plain')).toMatchObject({
+          resolution: null,
+        });
+      });
+
+      it('derives entry_bytes from the row, so no write can make it disagree', async () => {
+        const { w } = await started();
+        await append(w, ordinary(null));
+        const drift = (sql: string) =>
+          admin(sql, [w.journalId]).then(
+            () => 'stored',
+            (error: { code?: string }) => error.code
+          );
+        // 428C9: a generated column cannot be written.
+        expect(
+          await drift(
+            'UPDATE public.session_journal_entries SET entry_bytes = 3 WHERE journal_id = $1'
+          )
+        ).toBe('428C9');
+        expect(
+          await drift(
+            `INSERT INTO public.session_journal_entries (journal_id, eid, entry, entry_bytes, projection)
+             SELECT journal_id, 2, jsonb_set(entry, '{eid}', '2'), 3, 'none'
+               FROM public.session_journal_entries WHERE journal_id = $1 AND eid = 1`
+          )
+        ).toBe('428C9');
+        await admin(
+          `UPDATE public.session_journal_entries SET entry = jsonb_set(entry, '{body,text}', to_jsonb(repeat('y', 4000)))
+            WHERE journal_id = $1`,
+          [w.journalId]
+        );
+        const [row] = await admin<{ ok: boolean }>(
+          'SELECT entry_bytes = octet_length(entry::text) AND entry_bytes > 4000 AS ok FROM public.session_journal_entries WHERE journal_id = $1',
+          [w.journalId]
+        );
+        expect(row.ok).toBe(true);
+      });
+
+      it('serializes concurrent appends at one eid: one commits, a copy is a retry, a rival conflicts', async () => {
+        const { w } = await started();
+        const one = entryOf(w, 1, ordinary(null, 'one'));
+        const rival = entryOf(w, 1, ordinary(null, 'rival'));
+        const replies = await Promise.all([
+          appendRaw(w, 0, one),
+          appendRaw(w, 0, one),
+          appendRaw(w, 0, rival),
+        ]);
+        const outcomes = replies
+          .map((r) => (r.outcome === 'refused' ? r.reasonCode : r.outcome))
+          .sort();
+        // Whichever commits first, the other two are a retry and a conflict.
+        expect(outcomes.filter((o) => o === 'committed')).toHaveLength(1);
+        expect(outcomes).toEqual(
+          outcomes.includes('already_committed')
+            ? ['already_committed', 'committed', 'conflict']
+            : ['committed', 'conflict', 'conflict']
+        );
+        expect(await header(w.journalId)).toMatchObject({ committed_eid: 1 });
+        expect(await storedEntries(w.journalId)).toHaveLength(1);
+      });
+
+      it('counts every tenure spawns when a DB lineage registers or releases', async () => {
+        // Release: T2 holds no turn of its own, but T1's spawn is open again.
+        const a = await twoTenures();
+        await finish(a.w2.sessionId, a.w2.holder, a.t2.epoch);
+        await complete(a.t2.command);
+        await admin(
+          `UPDATE public.session_turn_invocations SET resolution = NULL, resolution_evidence_ref = NULL, contradiction = true
+            WHERE session_id = $1 AND epoch = $2`,
+          [a.w2.sessionId, a.t1.epoch]
+        );
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: a.w2.sessionId,
+            holder: a.w2.holder,
+            evidence: 'controller_retired',
+          })
+        ).toEqual({ outcome: 'unresolved', invocations: 1 });
+
+        // Registration: T3 follows a clean T2, and T1's spawn reopened after T2 left.
+        const b = await twoTenures();
+        await finish(b.w2.sessionId, b.w2.holder, b.t2.epoch);
+        await complete(b.t2.command);
+        expect(
+          await releaseTenure(supabase, {
+            sessionId: b.w2.sessionId,
+            holder: b.w2.holder,
+            evidence: 'controller_retired',
+          })
+        ).toMatchObject({ outcome: 'released' });
+        await admin(
+          `UPDATE public.session_turn_invocations SET resolution = NULL, resolution_evidence_ref = NULL, contradiction = true
+            WHERE session_id = $1 AND epoch = $2`,
+          [b.w2.sessionId, b.t1.epoch]
+        );
+        const { capabilityHash } = mintTenureCapability();
+        expect(
+          await registerTenure(supabase, {
+            sessionId: b.w2.sessionId,
+            expected: { kind: 'released', tenureId: b.w2.holder.tenureId },
+            mode: 'server_hosted',
+            capabilityHash,
+            host: HOST,
+          })
+        ).toEqual({ outcome: 'unresolved', tenureId: b.w2.holder.tenureId });
+      });
+
+      it('lets the reducer project a DB lineage only from the canonical entry at the head', async () => {
+        const { w, t } = await started();
+        await append(w, intent(targetOf(w.holder, t, 'inv-guard')));
+        const client = new Client({
+          connectionString: process.env.INTEGRATION_DB_URL,
+          statement_timeout: 15_000,
+        });
+        await client.connect();
+        try {
+          const attempt = async (journalId: string | null, eid: number | null) => {
+            await client.query('BEGIN');
+            try {
+              await client.query('SET LOCAL ROLE ink_admission_writer');
+              await client.query(
+                `SELECT ink_admission.reduce_invocation($1, $2, $3, 'inv-guard', 'tree_quiescent',
+                   '{"evidenceRef":"forged"}'::jsonb, $4, $5)`,
+                [w.sessionId, w.holder.tenureId, t.epoch, journalId, eid]
+              );
+              return 'projected';
+            } catch (error) {
+              return (error as { code?: string }).code;
+            } finally {
+              await client.query('ROLLBACK');
+            }
+          };
+          expect(await attempt(null, null)).toBe('IJ002');
+          // The committed intent is not the head+1 entry, and says something else.
+          expect(await attempt(w.journalId, 1)).toBe('IJ002');
+          expect(await attempt(w.journalId, 2)).toBe('IJ002');
+        } finally {
+          await client.end();
+        }
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-guard')).toMatchObject({
+          resolution: null,
+        });
+      });
+
+      it('seals the invocation index and the journal: only the allowlisted definers write them', async () => {
+        const sealed = ['session_turn_invocations', 'session_journals', 'session_journal_entries'];
+        const owners = await admin<{ relname: string; owner: string }>(
+          `SELECT c.relname, pg_get_userbyid(c.relowner) AS owner FROM pg_class c
+            WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($1) ORDER BY c.relname COLLATE "C"`,
+          [sealed]
+        );
+        expect(owners).toEqual(
+          [...sealed].sort().map((relname) => ({ relname, owner: 'ink_admission_writer' }))
+        );
+        for (const role of ['service_role', 'anon', 'authenticated']) {
+          const [privileges] = await admin<Record<string, boolean>>(
+            `SELECT bool_or(has_table_privilege($1, 'public.' || t, 'INSERT')) AS insert,
+                    bool_or(has_table_privilege($1, 'public.' || t, 'UPDATE')) AS update,
+                    bool_or(has_table_privilege($1, 'public.' || t, 'DELETE')) AS delete,
+                    bool_or(has_table_privilege($1, 'public.' || t, 'TRUNCATE')) AS truncate,
+                    bool_or(has_table_privilege($1, 'public.' || t, 'REFERENCES')) AS references,
+                    bool_or(has_table_privilege($1, 'public.' || t, 'TRIGGER')) AS trigger,
+                    bool_and(has_table_privilege($1, 'public.' || t, 'SELECT')) AS select
+               FROM unnest($2::text[]) AS t`,
+            [role, sealed]
+          );
+          expect(privileges, role).toEqual({
+            insert: false,
+            update: false,
+            delete: false,
+            truncate: false,
+            references: false,
+            trigger: false,
+            select: role === 'service_role',
+          });
+        }
+        const [writer] = await admin(
+          `SELECT rolcanlogin, rolsuper, rolinherit, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
+             FROM pg_roles WHERE rolname = 'ink_admission_writer'`
+        );
+        expect(writer).toEqual({
+          rolcanlogin: false,
+          rolsuper: false,
+          rolinherit: false,
+          rolbypassrls: true,
+          rolcreaterole: false,
+          rolcreatedb: false,
+          rolreplication: false,
+        });
+        const members = await admin<{ rolname: string }>(
+          `SELECT m.rolname FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid
+             JOIN pg_roles m ON m.oid = am.member WHERE r.rolname = 'ink_admission_writer'`
+        );
+        expect(members).toEqual([{ rolname: 'postgres' }]);
+        const [schema] = await admin(
+          `SELECT has_schema_privilege('service_role', 'ink_admission', 'USAGE') AS service,
+                  has_schema_privilege('anon', 'ink_admission', 'USAGE') AS anon,
+                  has_schema_privilege('authenticated', 'ink_admission', 'USAGE') AS authenticated,
+                  has_schema_privilege('ink_admission_writer', 'public', 'CREATE') AS writer_creates_public,
+                  has_schema_privilege('ink_admission_writer', 'ink_admission', 'CREATE') AS writer_creates_private`
+        );
+        expect(schema).toEqual({
+          service: false,
+          anon: false,
+          authenticated: false,
+          writer_creates_public: false,
+          writer_creates_private: false,
+        });
+        // Every function the writer owns, and so every function that runs as it.
+        const owned = await admin<{ fn: string; definer: boolean; config: string[] | null }>(
+          `SELECT n.nspname || '.' || p.proname AS fn, p.prosecdef AS definer, p.proconfig AS config
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE pg_get_userbyid(p.proowner) = 'ink_admission_writer'
+            ORDER BY (n.nspname || '.' || p.proname) COLLATE "C"`
+        );
+        const definers = [
+          'public.append_session_journal',
+          'public.hold_session_journal',
+          'public.reconcile_tenure',
+          'public.record_invocation',
+          'public.session_journal_open',
+        ];
+        const helpers = [
+          'ink_admission.invocation_record',
+          'ink_admission.journal_eid',
+          'ink_admission.journal_entry_refusal',
+          'ink_admission.journal_keys_are',
+          'ink_admission.journal_pid_valid',
+          'ink_admission.journal_string_matches',
+          'ink_admission.journal_target_refusal',
+          'ink_admission.journal_ts_valid',
+          'ink_admission.reconcile_tenure_legacy',
+          'ink_admission.reduce_invocation',
+        ];
+        expect(owned).toEqual(
+          [...definers, ...helpers].sort().map((fn) => ({
+            fn,
+            definer: definers.includes(fn),
+            config: ['search_path=""'],
+          }))
+        );
+        const [calls] = await admin(
+          `SELECT has_function_privilege('service_role', 'public.append_session_journal(uuid, uuid, text, text, uuid, bigint, jsonb, integer)', 'EXECUTE') AS service_appends,
+                  has_function_privilege('anon', 'public.append_session_journal(uuid, uuid, text, text, uuid, bigint, jsonb, integer)', 'EXECUTE') AS anon_appends,
+                  has_function_privilege('authenticated', 'public.hold_session_journal(uuid, uuid, text, text, uuid, text, integer)', 'EXECUTE') AS authenticated_holds,
+                  has_function_privilege('service_role', 'ink_admission.reduce_invocation(uuid, uuid, text, text, text, jsonb, uuid, bigint)', 'EXECUTE') AS service_reduces,
+                  has_function_privilege('service_role', 'ink_admission.reconcile_tenure_legacy(uuid, uuid, text, text, text, text, jsonb, text, text, integer)', 'EXECUTE') AS service_reconciles_directly`
+        );
+        expect(calls).toEqual({
+          service_appends: true,
+          anon_appends: false,
+          authenticated_holds: false,
+          service_reduces: false,
+          service_reconciles_directly: false,
+        });
+        const secrets = await admin(
+          `SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name IN ('session_journals', 'session_journal_entries')
+              AND (column_name ILIKE '%capab%' OR column_name ILIKE '%secret%' OR column_name ILIKE '%hash%')`
+        );
+        expect(secrets).toEqual([]);
+      });
+
+      it('denies service_role every direct write to the sealed tables, through SQL and through PostgREST', async () => {
+        const { w, t } = await started();
+        await append(w, intent(targetOf(w.holder, t, 'inv-sealed')));
+        const client = new Client({
+          connectionString: process.env.INTEGRATION_DB_URL,
+          statement_timeout: 15_000,
+        });
+        await client.connect();
+        const attempts: Array<[string, string, unknown[]]> = [
+          [
+            'insert a header',
+            "INSERT INTO public.session_journals (session_id, kind) VALUES ($1, 'db_v1')",
+            [randomUUID()],
+          ],
+          [
+            'advance a head',
+            'UPDATE public.session_journals SET committed_eid = committed_eid + 1 WHERE id = $1',
+            [w.journalId],
+          ],
+          [
+            'clear a hold',
+            'UPDATE public.session_journals SET hold_reason = NULL WHERE id = $1',
+            [w.journalId],
+          ],
+          ['delete a header', 'DELETE FROM public.session_journals WHERE id = $1', [w.journalId]],
+          [
+            'delete entries',
+            'DELETE FROM public.session_journal_entries WHERE journal_id = $1',
+            [w.journalId],
+          ],
+          ['truncate entries', 'TRUNCATE public.session_journal_entries', []],
+          [
+            'resolve a spawn',
+            "UPDATE public.session_turn_invocations SET resolution = 'tree_quiescent', resolution_evidence_ref = 'forged' WHERE session_id = $1",
+            [w.sessionId],
+          ],
+          [
+            'open a spawn',
+            "INSERT INTO public.session_turn_invocations (session_id, epoch, invocation_id) VALUES ($1, $2, 'inv-forged')",
+            [w.sessionId, t.epoch],
+          ],
+          [
+            'forget a spawn',
+            'DELETE FROM public.session_turn_invocations WHERE session_id = $1',
+            [w.sessionId],
+          ],
+          ['truncate the index', 'TRUNCATE public.session_turn_invocations', []],
+          [
+            'call the reducer',
+            `SELECT ink_admission.reduce_invocation($1, $2, $3, 'inv-sealed', 'tree_quiescent', '{"evidenceRef":"x"}'::jsonb, NULL, NULL)`,
+            [w.sessionId, w.holder.tenureId, t.epoch],
+          ],
+        ];
+        try {
+          for (const [label, sql, params] of attempts) {
+            await client.query('BEGIN');
+            try {
+              await client.query('SET LOCAL ROLE service_role');
+              const outcome = await client.query(sql, params).then(
+                () => 'written',
+                (error: { code?: string }) => error.code
+              );
+              expect(outcome, label).toBe('42501');
+            } finally {
+              await client.query('ROLLBACK');
+            }
+          }
+        } finally {
+          await client.end();
+        }
+        const forged = await supabase
+          .from('session_turn_invocations')
+          .update({ resolution: 'tree_quiescent', resolution_evidence_ref: 'forged' })
+          .eq('session_id', w.sessionId)
+          .select('invocation_id');
+        expect(forged.error?.code).toBe('42501');
+        const planted = await supabase.from('session_journal_entries').insert({
+          journal_id: w.journalId,
+          eid: 2,
+          entry: {},
+          projection: 'none',
+        });
+        expect(planted.error?.code).toBe('42501');
+        expect(await invocationRow(w.sessionId, t.epoch, 'inv-sealed')).toMatchObject({
+          resolution: null,
+        });
+        expect(await header(w.journalId)).toMatchObject({ committed_eid: 1, hold_reason: null });
       });
     });
   });

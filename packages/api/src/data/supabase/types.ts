@@ -3605,6 +3605,91 @@ export type Database = {
           },
         ];
       };
+      session_journal_entries: {
+        Row: {
+          committed_at: string;
+          eid: number;
+          entry: Json;
+          entry_bytes: number | null;
+          journal_id: string;
+          projection: string;
+        };
+        Insert: {
+          committed_at?: string;
+          eid: number;
+          entry: Json;
+          entry_bytes?: number | null;
+          journal_id: string;
+          projection: string;
+        };
+        Update: {
+          committed_at?: string;
+          eid?: number;
+          entry?: Json;
+          entry_bytes?: number | null;
+          journal_id?: string;
+          projection?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_journal_entries_journal_id_fkey';
+            columns: ['journal_id'];
+            isOneToOne: false;
+            referencedRelation: 'session_journals';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      session_journals: {
+        Row: {
+          byte_budget: number;
+          committed_bytes: number;
+          committed_eid: number;
+          created_at: string;
+          held_at: string | null;
+          held_by_host_instance_id: string | null;
+          held_by_tenure_id: string | null;
+          hold_reason: string | null;
+          id: string;
+          kind: string;
+          session_id: string;
+        };
+        Insert: {
+          byte_budget?: number;
+          committed_bytes?: number;
+          committed_eid?: number;
+          created_at?: string;
+          held_at?: string | null;
+          held_by_host_instance_id?: string | null;
+          held_by_tenure_id?: string | null;
+          hold_reason?: string | null;
+          id?: string;
+          kind: string;
+          session_id: string;
+        };
+        Update: {
+          byte_budget?: number;
+          committed_bytes?: number;
+          committed_eid?: number;
+          created_at?: string;
+          held_at?: string | null;
+          held_by_host_instance_id?: string | null;
+          held_by_tenure_id?: string | null;
+          hold_reason?: string | null;
+          id?: string;
+          kind?: string;
+          session_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_journals_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: true;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_logs: {
         Row: {
           compacted_at: string | null;
@@ -3968,6 +4053,7 @@ export type Database = {
           current_phase: string | null;
           ended_at: string | null;
           id: string;
+          journal_kind: string | null;
           lifecycle: string | null;
           message_count: number | null;
           metadata: Json | null;
@@ -4012,6 +4098,7 @@ export type Database = {
           current_phase?: string | null;
           ended_at?: string | null;
           id?: string;
+          journal_kind?: string | null;
           lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
@@ -4056,6 +4143,7 @@ export type Database = {
           current_phase?: string | null;
           ended_at?: string | null;
           id?: string;
+          journal_kind?: string | null;
           lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
@@ -5993,6 +6081,19 @@ export type Database = {
         };
         Returns: number;
       };
+      append_session_journal: {
+        Args: {
+          p_capability_hash: string;
+          p_entry: Json;
+          p_expected_committed_eid: number;
+          p_host_instance_id: string;
+          p_journal_id: string;
+          p_protocol: number;
+          p_session_id: string;
+          p_tenure_id: string;
+        };
+        Returns: Json;
+      };
       apply_task_graph: {
         Args: {
           p_user_id: string;
@@ -6136,6 +6237,18 @@ export type Database = {
           p_owner: Json;
           p_protocol: number;
           p_session_id: string;
+        };
+        Returns: Json;
+      };
+      hold_session_journal: {
+        Args: {
+          p_capability_hash: string;
+          p_host_instance_id: string;
+          p_journal_id: string;
+          p_protocol: number;
+          p_reason_code: string;
+          p_session_id: string;
+          p_tenure_id: string;
         };
         Returns: Json;
       };
@@ -6441,6 +6554,7 @@ export type Database = {
         Returns: undefined;
       };
       session_dispatch_head: { Args: { p_session_id: string }; Returns: Json };
+      session_journal_gate: { Args: { p_session_id: string }; Returns: Json };
       session_legacy_state: {
         Args: { p_session: Database['public']['Tables']['sessions']['Row'] };
         Returns: Json;

@@ -68,6 +68,10 @@ const held = z.object({
   holdingCommand: z.string().uuid(),
 });
 const tenureState = z.enum(['held', 'released', 'recovery_required', 'reconciled']);
+/** A DB-journal lineage (D1) whose header is missing or disagrees with its kind. */
+const journalMissing = z.object({ outcome: z.literal('journal_missing') });
+/** A DB-journal lineage whose journal is held: no admission, continuation or release. */
+const journalHeld = z.object({ outcome: z.literal('journal_held'), reasonCode: z.string() });
 
 const registerSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('registered'), tenureId: z.string().uuid() }),
@@ -79,6 +83,8 @@ const registerSchema = z.discriminatedUnion('outcome', [
     state: z.union([tenureState, z.literal('never_owned')]),
   }),
   z.object({ outcome: z.literal('unresolved'), tenureId: z.string().uuid() }),
+  journalMissing,
+  journalHeld,
   held,
   sessionMissing,
   invalid,
@@ -125,6 +131,8 @@ const admitSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('busy'), epoch: z.string() }),
   z.object({ outcome: z.literal('unresolved'), epoch: z.string().nullable() }),
   z.object({ outcome: z.literal('not_fifo_head'), head: z.string().uuid().nullable() }),
+  journalMissing,
+  journalHeld,
   held,
   notHolder,
   sessionMissing,
@@ -176,6 +184,8 @@ const leasedAdmitSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('lease_lost') }),
   /** The studio belongs to another tenant than the session. */
   z.object({ outcome: z.literal('forbidden') }),
+  journalMissing,
+  journalHeld,
   held,
   notHolder,
   sessionMissing,
@@ -249,6 +259,8 @@ const releaseSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('released'), tenureId: z.string().uuid() }),
   z.object({ outcome: z.literal('busy') }),
   z.object({ outcome: z.literal('unresolved'), invocations: z.number().int().positive() }),
+  journalMissing,
+  journalHeld,
   held,
   notHolder,
   sessionMissing,
@@ -296,6 +308,8 @@ const recordSchema = z.discriminatedUnion('outcome', [
   z.object({ outcome: z.literal('needs_reconciler'), kind: z.string() }),
   z.object({ outcome: z.literal('no_intent') }),
   z.object({ outcome: z.literal('stale') }),
+  /** A DB-journal lineage records spawns only through its journal (D1). */
+  z.object({ outcome: z.literal('journal_lineage') }),
   notHolder,
   sessionMissing,
   invalid,

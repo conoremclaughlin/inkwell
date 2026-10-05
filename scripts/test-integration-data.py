@@ -152,11 +152,12 @@ class DataTests(unittest.TestCase):
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539); the
         # revocation amendment's four tables (#678), the browser companion's
         # two (#671), command admission's four (#701 R4), and owner tenure's
-        # four (#701 R3), breaker/links/reactions (one each) join through windows,
-        # so a rehearsal cut before them is exact.
+        # four (#701 R3), breaker/links/reactions (one each) and the D1
+        # journal's two (#701) join through windows, so a rehearsal cut before
+        # them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 90)
+        self.assertEqual(len(names), 92)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -235,7 +236,8 @@ class DataTests(unittest.TestCase):
         breaker = ("wake_source_breakers",)
         links = ("thread_links",)
         reactions = ("thread_message_reactions",)
-        created = companion + revocation + breaker + links + admission + reactions + tenure
+        journal = ("session_journal_entries", "session_journals")
+        created = companion + revocation + breaker + links + admission + reactions + tenure + journal
         self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES + created)
         self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
         self.assertEqual(data.fixture_tables("20260913081634"), data.FIXTURE_TABLES)
@@ -251,6 +253,7 @@ class DataTests(unittest.TestCase):
             ("20261004094856", "20261004094857", admission),
             ("20261004095944", "20261004095945", reactions),
             ("20261004104039", "20261004104040", tenure),
+            ("20261005021135", "20261005021136", journal),
         ):
             with self.subTest(stamp=stamp):
                 self.assertEqual(data.fixture_tables(stamp), cumulative)
@@ -285,7 +288,7 @@ class DataTests(unittest.TestCase):
 
     def test_created_window_tables_are_missing_only_before_their_migration(self):
         created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
-        self.assertEqual(len(created), 17)
+        self.assertEqual(len(created), 19)
         # A full-schema stack carries them and cleanup truncates them ...
         self.clean()
         truncate = self.mutations()[0]
