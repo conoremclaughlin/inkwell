@@ -1008,6 +1008,11 @@ describe('SessionService', () => {
            * delivery makes.
            */
           metadataFaults?: { mode: 'error' | 'missing'; times: number };
+          /**
+           * The first `times` reads that find the identity by slug (the
+           * routing scope read, `select('id')`) fail, then reads recover.
+           */
+          scopeReadFaults?: number;
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -1075,6 +1080,27 @@ describe('SessionService', () => {
                 q.maybeSingle = async () => answer as never;
                 (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
                   Promise.resolve(answer).then(resolve);
+              }
+              return q;
+            }) as never;
+            return query;
+          };
+        }
+        if (extra.scopeReadFaults) {
+          let left = extra.scopeReadFaults;
+          const failed = { data: null, error: { message: 'fixture read failed' } };
+          const from = supabase.from.bind(supabase);
+          (supabase as { from: unknown }).from = (table: string) => {
+            const query = from(table);
+            if (table !== 'agent_identities') return query;
+            const select = query.select.bind(query);
+            query.select = ((cols?: string) => {
+              const q = select(cols);
+              if (left > 0 && cols === 'id') {
+                left -= 1;
+                q.maybeSingle = async () => failed as never;
+                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(failed).then(resolve);
               }
               return q;
             }) as never;
@@ -1363,6 +1389,58 @@ describe('SessionService', () => {
             .mock.calls.map(([data]) => (data as { backend?: string }).backend);
           expect(created).toEqual(['claude-code']);
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('a failed read of the identity by slug, with no id to classify, creates nothing: unthreaded it is retried, threaded it is held as before; the healthy delivery creates the inkling as ink (Lumen, #750 r3)', async () => {
+          const threaded = {
+            ...fromOwner,
+            metadata: {
+              ...fromOwner.metadata,
+              threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+            },
+          };
+          for (const [label, request, refusal] of [
+            [
+              'unthreaded',
+              fromOwner,
+              {
+                errorCode: 'INKLING_TURN_REFUSED',
+                classification: { retryable: true },
+              },
+            ],
+            // The ambiguous-identity hold threaded routing already had (#514).
+            ['threaded', threaded, { errorCode: 'ROUTING_REFUSED' }],
+          ] as const) {
+            vi.mocked(mockRepository.create).mockClear();
+            vi.mocked(mockInkRunner.run).mockClear();
+            const faulted = await turn(INKLING, request, OWNER, {
+              create: true,
+              scopeReadFaults: 1,
+            });
+            expect(faulted, label).toMatchObject({ success: false, admitted: false, ...refusal });
+            expect(mockRepository.create, label).not.toHaveBeenCalled();
+            expectNothingRan();
+
+            const healthy = await turn(INKLING, request, OWNER, { create: true });
+            expect(healthy.errorCode, label).toBeUndefined();
+            const created = vi
+              .mocked(mockRepository.create)
+              .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+            expect(created, label).toEqual(['ink']);
+            expect(mockInkRunner.run, label).toHaveBeenCalledTimes(1);
+          }
+        });
+
+        it('an ordinary SB whose identity read by slug fails is refused retryably too, and nothing is created', async () => {
+          const heartbeat = { sender: { id: 'system', name: 'heartbeat' } };
+          const faulted = await turn({}, heartbeat, OWNER, { create: true, scopeReadFaults: 1 });
+          expect(faulted).toMatchObject({
+            success: false,
+            classification: { retryable: true },
+            admitted: false,
+          });
+          expect(mockRepository.create).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
         it('the refusal carries a retryable verdict the trigger retry scheduler reads, and is not a routing hold', () => {

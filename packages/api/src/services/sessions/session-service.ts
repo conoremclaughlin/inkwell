@@ -598,7 +598,8 @@ export class IdentityUnclassifiedError extends Error {
 
   constructor(
     readonly sbSlug: string,
-    readonly sbId: string
+    /** Absent when no id was found to classify: the read by slug failed. */
+    readonly sbId?: string
   ) {
     const summary =
       "Inkling turn refused: the SB's identity could not be read, so no session was created";
@@ -3808,6 +3809,7 @@ export class SessionService implements ISessionService {
       id: options?.sbId ?? discovered.id,
       absent: discovered.absent === true,
       ambiguous: discovered.ambiguous === true,
+      unreadable: discovered.unreadable === true,
     };
     const identitySbId = identity.id ?? null;
 
@@ -3999,6 +4001,7 @@ export class SessionService implements ISessionService {
       sbId: identitySbId,
       identityAmbiguous: identity.ambiguous === true,
       identityAbsent: identity.absent === true,
+      identityUnreadable: identity.unreadable,
       backend,
       planOnly: options?.planOnly === true,
     });
@@ -4640,6 +4643,8 @@ export class SessionService implements ISessionService {
       identityAmbiguous?: boolean;
       /** No identity row exists at all — only then is a slug match a proof. */
       identityAbsent?: boolean;
+      /** The read that would find the identity by slug failed: there is nothing to classify. */
+      identityUnreadable?: boolean;
       /** v18 S3: decision-only resolution — the gate never mints overflow. */
       planOnly?: boolean;
       /**
@@ -4723,6 +4728,14 @@ export class SessionService implements ISessionService {
       if (identity.kind === 'inkling') {
         return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
       }
+    } else if (this.supabase && options.identityUnreadable && !options.threadKey) {
+      // No id to classify, because the read that would have found one by
+      // slug failed (Lumen, #750 r3). An unthreaded delivery used to fall
+      // through every tier to a new row on the identity's default runtime;
+      // it is retried instead, like the classification failure above. A
+      // threaded one is already held below as an ambiguous identity (#514),
+      // which creates nothing.
+      throw new IdentityUnclassifiedError(sbSlug);
     }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
