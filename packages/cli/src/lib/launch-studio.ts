@@ -29,6 +29,7 @@
  */
 
 import chalk from 'chalk';
+import { createInterface } from 'readline/promises';
 import { auditStudio, type StudioCheckId } from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
 import type { CompleteStudioReport, StepResult } from './studio-complete.js';
@@ -183,4 +184,96 @@ export async function completeStudioAtLaunch(
   const [first, ...rest] = lines;
   if (first) console.error(chalk.dim(first));
   for (const line of rest) console.error(chalk.yellow(`⚠ ${line}`));
+}
+
+// ============================================================================
+// A main worktree ink was never set up in (task 5cabaeeb)
+// ============================================================================
+
+export interface RootInitDeps {
+  placement?: (cwd: string) => WorktreePlacement;
+  confirm?: (question: string) => Promise<boolean>;
+  runInit?: typeof runInit;
+}
+
+export interface RootInitResult {
+  /** The person was asked. */
+  offered: boolean;
+  /** ink init ran. */
+  ran: boolean;
+  missingBefore?: StudioCheckId[];
+  report?: CompleteStudioReport;
+}
+
+/** Ask on stderr, Enter meaning yes; stdout stays the launch's own. */
+async function confirmOnStderr(question: string): Promise<boolean> {
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = (await prompt.question(question)).trim().toLowerCase();
+    return answer === '' || answer === 'y' || answer === 'yes';
+  } finally {
+    prompt.close();
+  }
+}
+
+/**
+ * `ink -a` in a main worktree whose checklist is incomplete, typically a
+ * repo `ink init` never ran in: no `.mcp.json`, so no inkwell tools and no
+ * inkmail. The studio path above never rewrites a main worktree on its own;
+ * this asks first, and runs `ink init` only on a yes. Without a person to
+ * ask (`interactive` false) it prints the repair and changes nothing. A
+ * main-worktree `ink init` writes no permissions, so no lane rule is
+ * touched either way. Never throws: a launch is not refused because setup
+ * failed.
+ */
+export async function offerRootInitAtLaunch(
+  cwd: string,
+  launchSlug: string,
+  options: { interactive: boolean },
+  deps: RootInitDeps = {}
+): Promise<RootInitResult> {
+  try {
+    const placement = (deps.placement ?? detectWorktree)(cwd);
+    if (placement.linked || !placement.toplevel) return { offered: false, ran: false };
+    const root = placement.toplevel;
+    const audit = auditStudio(root, { linked: false });
+    if (audit.complete) return { offered: false, ran: false };
+    const missing = audit.checks
+      .filter((check) => check.required && !check.ok)
+      .map((check) => check.label)
+      .join(', ');
+    if (!options.interactive) {
+      console.error(
+        chalk.yellow(
+          `⚠ Inkwell is not fully set up in ${root} (missing: ${missing}). Run: ink init`
+        )
+      );
+      return { offered: false, ran: false, missingBefore: audit.missing };
+    }
+    const yes = await (deps.confirm ?? confirmOnStderr)(
+      chalk.cyan(
+        `Inkwell is not fully set up in ${root} (missing: ${missing}). Run ink init now? [Y/n] `
+      )
+    );
+    if (!yes) {
+      console.error(chalk.dim(`  Skipped. Run ink init in ${root} when you're ready.`));
+      return { offered: true, ran: false, missingBefore: audit.missing };
+    }
+    const report = await (deps.runInit ?? runInit)(root, { agent: launchSlug });
+    const changed = describeStepsWritten(report.steps);
+    console.error(chalk.dim(`ink init ran${changed ? `: ${changed}` : ''}`));
+    if (!report.audit.complete) {
+      console.error(
+        chalk.yellow(`⚠ Still incomplete (${report.audit.missing.join(', ')}). Run: ink init`)
+      );
+    }
+    return { offered: true, ran: true, missingBefore: audit.missing, report };
+  } catch (error) {
+    sbDebugLog('sb', 'launch_root_init_failed', {
+      cwd,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    console.error(chalk.yellow('⚠ Could not set up Inkwell in this repo. Run: ink init'));
+    return { offered: false, ran: false };
+  }
 }

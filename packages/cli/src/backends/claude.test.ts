@@ -13,6 +13,10 @@ import {
 } from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
+// The CLI's own Inkwell checkout is the last inkmail plugin candidate (task
+// 5cabaeeb); none here, so a tmp repo resolves only what a test put on disk.
+vi.mock('../lib/ink-checkout.js', () => ({ inkCliMainWorktree: () => null }));
+
 vi.mock('../repl/skills.js', () => ({
   discoverSkills: () => [],
 }));
