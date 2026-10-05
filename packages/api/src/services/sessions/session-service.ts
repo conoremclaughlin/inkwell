@@ -2771,14 +2771,14 @@ export class SessionService implements ISessionService {
     // admission check has awaited, and a fence can land in between (Lumen's
     // review of #747). A refusal here is a run that never began, and is
     // recorded as one (refusedBeforeAcceptance, below).
+    // A survivor's hold (launched-processes.ts) is asked at both points as
+    // well: an earlier launch's failed record can install one in between.
     const fencedSbId = inklingTurn ? inklingSbId : undefined;
-    const admitSpawn = fencedSbId
-      ? () =>
-          inklingFenceHolds(fencedSbId)
-            ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
-            : undefined
-      : undefined;
-    const refusedAtEntry = admitSpawn?.() ?? launchHoldFor(session.id);
+    const admitSpawn = (): string | undefined =>
+      (fencedSbId && inklingFenceHolds(fencedSbId)
+        ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
+        : undefined) ?? launchHoldFor(session.id);
+    const refusedAtEntry = admitSpawn();
     // A live inkling turn its owner can cancel (inkling-turns.ts), released
     // however the run ends.
     const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
@@ -2817,7 +2817,7 @@ export class SessionService implements ISessionService {
             ...runnerConfig,
             turnEpoch,
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
-            ...(admitSpawn ? { admitSpawn } : {}),
+            admitSpawn,
             onSpawned: (spawned) => {
               launches.push(recordLaunch(session.id, resolvedBackend, spawned));
             },
@@ -5733,12 +5733,22 @@ This session will continue with a fresh context after compaction. Your identity,
         session.sbSlug
       );
 
+      // Asked again past the awaits since the first check, and by the runner
+      // at its spawn seam, as a turn's admission is.
+      const compactionHold = (): string | undefined => launchHoldFor(sessionId);
+      const heldAtRun = compactionHold();
+      if (heldAtRun) {
+        logger.warn('Not compacting a held session', { sessionId, reason: heldAtRun });
+        return;
+      }
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const compactionLaunches: Array<{ exited(): void }> = [];
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
         config: {
           ...runnerConfig,
+          admitSpawn: compactionHold,
           onSpawned: (spawned) => {
             compactionLaunches.push(recordLaunch(sessionId, runtimeBackend, spawned));
           },

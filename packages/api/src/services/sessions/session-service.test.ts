@@ -1337,6 +1337,38 @@ describe('SessionService', () => {
             expect(store.markExited).not.toHaveBeenCalled();
           });
 
+          it('carries a hold installed while the turn was prepared to the runner’s spawn seam', async () => {
+            const asked: Array<string | undefined> = [];
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: { config: { admitSpawn?: () => string | undefined } }
+            ) => {
+              asked.push(options.config.admitSpawn?.());
+              // An earlier launch's failed record lands during the runner's preparation.
+              holdSurvivors({
+                stopped: [],
+                gone: [],
+                unstoppable: [],
+                uncertain: [
+                  {
+                    id: '',
+                    sessionId: 'launch-session',
+                    backend: 'ink',
+                    pid: process.pid,
+                    pgid: null,
+                    startIdentity: null,
+                    bootId: 'boot',
+                  },
+                ],
+              });
+              asked.push(options.config.admitSpawn?.());
+              return { success: false, responses: [], error: asked[1], refusedBeforeSpawn: true };
+            }) as never);
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(asked[0]).toBeUndefined();
+            expect(asked[1]).toMatch(/may still be running this session/);
+          });
+
           it('starts nothing for a session held by a survivor that may still be alive', async () => {
             holdSurvivors({
               stopped: [],
@@ -3170,6 +3202,77 @@ describe('SessionService', () => {
         );
       } finally {
         configureLaunchRecording(undefined);
+      }
+    });
+
+    it('does not compact when a hold lands while the compaction lock is taken', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockImplementationOnce(async () => {
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          return true;
+        });
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('carries the hold to the compaction runner’s spawn seam', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        const asked: Array<string | undefined> = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { admitSpawn?: () => string | undefined } }
+        ) => {
+          asked.push(options.config.admitSpawn?.());
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          asked.push(options.config.admitSpawn?.());
+          return createMockClaudeResult({ success: false, error: asked[1] });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        expect(asked[0]).toBeUndefined();
+        expect(asked[1]).toMatch(/may still be running this session/);
+      } finally {
+        resetLaunchHolds();
       }
     });
 

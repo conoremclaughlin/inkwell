@@ -314,6 +314,31 @@ describe('launchHoldFor', () => {
     expect(reads).toBe(2);
   });
 
+  it('never starts a second attempt while one is still in flight', async () => {
+    // The second attempt reads the boot, then stalls on the inventory: a third
+    // started meanwhile could sweep a launch admitted after the second ends.
+    let releaseInventory: (value: { data: never[]; error: null }) => void = () => undefined;
+    const inventory = new Promise<{ data: never[]; error: null }>((resolve) => {
+      releaseInventory = resolve;
+    });
+    const client = { from: () => ({ select: () => ({ eq: () => ({ is: () => inventory }) }) }) };
+    let reads = 0;
+    const readBoot = async () => {
+      reads += 1;
+      if (reads === 1) throw new Error('sysctl failed');
+      return BOOT;
+    };
+    await startLaunchTracking(client as never, 3001, 10, readBoot);
+    await vi.waitFor(() => expect(reads).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(reads).toBe(2);
+    expect(launchHoldFor('any-session')).toMatch(/startup check/);
+    releaseInventory({ data: [], error: null });
+    await vi.waitFor(() => expect(launchHoldFor('any-session')).toBeUndefined());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reads).toBe(2);
+  });
+
   it('holds every session when the startup sweep could not run', async () => {
     const failing = {
       from: () => ({

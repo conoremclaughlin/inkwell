@@ -412,15 +412,17 @@ export async function startLaunchTracking(
         error: error instanceof Error ? error.message : String(error),
       }
     );
-    const retry = setInterval(() => {
-      void attempt()
-        .then(() => {
-          clearInterval(retry);
-          logger.info('The startup check of launched processes ran; agent turns resume');
-        })
-        .catch(() => undefined);
-    }, retryMs);
-    retry.unref();
+    // One attempt at a time: the next is scheduled only once this one has
+    // failed, so none is still sweeping after another has opened admission.
+    const retry = (): void => {
+      setTimeout(() => {
+        attempt().then(
+          () => logger.info('The startup check of launched processes ran; agent turns resume'),
+          retry
+        );
+      }, retryMs).unref();
+    };
+    retry();
     return undefined;
   }
 }
