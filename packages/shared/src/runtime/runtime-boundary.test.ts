@@ -657,8 +657,6 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'paragraph-stream.ts',
         'preview-guard.ts',
         'frame-fanout.ts',
-        'journal-record.ts',
-        'journal-writer.ts',
       ])
     );
   });
