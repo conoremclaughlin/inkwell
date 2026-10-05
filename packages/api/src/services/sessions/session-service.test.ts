@@ -16,6 +16,7 @@ import { resetPendingFinalizations, hasPendingFinalization } from './finalize-tu
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
+  IdentityUnclassifiedError,
   SessionService,
   resolveRuntimeModel,
   parseRuntimeConfig,
@@ -43,6 +44,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { STOP_GRACE_MS } from './stop-process.js';
 import { clearInklingFences, fenceInkling } from '../inklings/inkling-stop-fence.js';
+import { carriedClassification, isRoutingRefusal } from '../../channels/trigger-retry.js';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -999,6 +1001,13 @@ describe('SessionService', () => {
           failReads?: Array<{ table: string; columns: string }>;
           /** No session exists yet: routing creates one. */
           create?: boolean;
+          /**
+           * The first `times` reads of an identity's metadata fail (`error`)
+           * or find no row (`missing`), then reads recover. Routing's
+           * classification of the identity is the first such read a
+           * delivery makes.
+           */
+          metadataFaults?: { mode: 'error' | 'missing'; times: number };
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -1041,6 +1050,31 @@ describe('SessionService', () => {
                 q.maybeSingle = async () => failed as never;
                 (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
                   Promise.resolve(failed).then(resolve);
+              }
+              return q;
+            }) as never;
+            return query;
+          };
+        }
+        if (extra.metadataFaults) {
+          let left = extra.metadataFaults.times;
+          const answer =
+            extra.metadataFaults.mode === 'error'
+              ? { data: null, error: { message: 'fixture read failed' } }
+              : { data: null, error: null };
+          const from = supabase.from.bind(supabase);
+          (supabase as { from: unknown }).from = (table: string) => {
+            const query = from(table);
+            if (table !== 'agent_identities') return query;
+            const select = query.select.bind(query);
+            query.select = ((cols?: string) => {
+              const q = select(cols);
+              const columns = (cols ?? '').split(',').map((col) => col.trim());
+              if (left > 0 && columns.includes('metadata')) {
+                left -= 1;
+                q.maybeSingle = async () => answer as never;
+                (q as { then: unknown }).then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(answer).then(resolve);
               }
               return q;
             }) as never;
@@ -1279,6 +1313,64 @@ describe('SessionService', () => {
             inkProvider: 'claude',
             model: 'claude-test-model',
           });
+        });
+
+        it('an identity read that fails or finds no row at creation creates nothing and is retryable; the healthy retry creates the inkling as ink (Lumen, #750 r2)', async () => {
+          for (const mode of ['error', 'missing'] as const) {
+            vi.mocked(mockRepository.create).mockClear();
+            vi.mocked(mockInkRunner.run).mockClear();
+            const faulted = await turn(INKLING, fromOwner, OWNER, {
+              create: true,
+              metadataFaults: { mode, times: 1 },
+            });
+            expect(faulted, mode).toMatchObject({
+              success: false,
+              errorCode: 'INKLING_TURN_REFUSED',
+              classification: { retryable: true },
+              admitted: false,
+            });
+            // No row on a guessed runtime: nothing to be refused for good later.
+            expect(mockRepository.create, mode).not.toHaveBeenCalled();
+            expectNothingRan();
+
+            const retried = await turn(INKLING, fromOwner, OWNER, { create: true });
+            expect(retried.errorCode, mode).not.toBe('INKLING_TURN_REFUSED');
+            const created = vi
+              .mocked(mockRepository.create)
+              .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+            expect(created, mode).toEqual(['ink']);
+            expect(mockInkRunner.run, mode).toHaveBeenCalledTimes(1);
+          }
+        });
+
+        it('an ordinary SB whose identity read fails at routing is refused retryably too, and nothing is created; its retry runs as before', async () => {
+          const heartbeat = { sender: { id: 'system', name: 'heartbeat' } };
+          const faulted = await turn({}, heartbeat, OWNER, {
+            create: true,
+            metadataFaults: { mode: 'error', times: 1 },
+          });
+          expect(faulted).toMatchObject({
+            success: false,
+            classification: { retryable: true },
+            admitted: false,
+          });
+          expect(mockRepository.create).not.toHaveBeenCalled();
+          expectNothingRan();
+
+          await turn({}, heartbeat, OWNER, { create: true });
+          const created = vi
+            .mocked(mockRepository.create)
+            .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+          expect(created).toEqual(['claude-code']);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('the refusal carries a retryable verdict the trigger retry scheduler reads, and is not a routing hold', () => {
+          // A queued turn's re-resolution rethrows this error raw; the
+          // scheduler reads the verdict off the error object itself.
+          const error = new IdentityUnclassifiedError('myra', SB);
+          expect(carriedClassification(error)).toMatchObject({ retryable: true });
+          expect(isRoutingRefusal(error)).toBe(false);
         });
 
         it('an inkling runs on ink whatever runtime its identity stored, a direct Claude one included, with Claude as its provider and model', async () => {
@@ -7556,8 +7648,16 @@ describe('SessionService', () => {
       (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
 
+      // The caller's own identity row exists, as it does for any sbId routing
+      // is handed: routing classifies it before any tier, and an id that names
+      // no row is an unknown identity, refused before anything is created.
+      const mine = { id: 'sb-MINE', user_id: 'user-456', metadata: {} };
       const mockSupabase = {
-        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+        from: vi
+          .fn()
+          .mockImplementation((table: string) =>
+            createRecordingChain({ data: table === 'agent_identities' ? mine : null }, [])
+          ),
       };
       const service = serviceWith(mockSupabase);
 

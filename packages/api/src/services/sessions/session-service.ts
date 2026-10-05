@@ -98,7 +98,6 @@ import {
   fenceInkling,
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
-import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
@@ -582,6 +581,31 @@ export interface ExplicitAddressHold {
     | 'session-key-miss'
     | 'session-key-held'
     | 'binding-held';
+}
+
+/**
+ * The identity a delivery is for could not be classified: its read failed, or
+ * the id named no row at that moment. Routing creates and provisions nothing
+ * on a guess (Lumen, #750 r2). An inkling's session created on an ordinary
+ * runtime would be refused for good once the read recovered, so the delivery
+ * is retried instead. The verdict travels with the error, so the trigger retry
+ * scheduler reads it (carriedClassification) whichever path it surfaces on:
+ * the plan call, handleMessage, or a queued turn's re-resolution.
+ */
+export class IdentityUnclassifiedError extends Error {
+  readonly code = 'IDENTITY_UNCLASSIFIED';
+  readonly classification: ErrorClassification;
+
+  constructor(
+    readonly sbSlug: string,
+    readonly sbId: string
+  ) {
+    const summary =
+      "Inkling turn refused: the SB's identity could not be read, so no session was created";
+    super(summary);
+    this.name = 'IdentityUnclassifiedError';
+    this.classification = { category: 'network', summary, retryable: true };
+  }
 }
 
 export class RoutingRefusedError extends Error {
@@ -1969,6 +1993,24 @@ export class SessionService implements ISessionService {
           refusal: { threadKey: error.threadKey, detail: error.detail },
           // Refusals are pre-admission by construction — withStudioLease
           // throws before getOrCreateSession returns.
+          admitted: false,
+        };
+      }
+
+      // Thrown by routing before anything is created or provisioned, so it
+      // is pre-admission too, and retryable: the read may recover.
+      if (error instanceof IdentityUnclassifiedError) {
+        return {
+          success: false,
+          sessionId: '',
+          backendSessionId: null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: error.message,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: error.classification,
           admitted: false,
         };
       }
@@ -4569,16 +4611,6 @@ export class SessionService implements ISessionService {
     return this.withStudioLease(session, routing, leaseCtx);
   }
 
-  /** Whether this identity is an inkling. An unreadable row is not one: its turn is still checked at the seam. */
-  private async isInklingIdentity(sbId: string): Promise<boolean> {
-    const { data } = await this.supabase!.from('agent_identities')
-      .select('metadata')
-      .eq('id', sbId)
-      .maybeSingle();
-    const metadata = (data as { metadata?: Record<string, unknown> | null } | null)?.metadata;
-    return metadata?.client === INKLING_CLIENT;
-  }
-
   private async resolveStudioId(
     userId: string,
     sbSlug: string,
@@ -4678,8 +4710,19 @@ export class SessionService implements ISessionService {
     // before every tier, explicit ones included, so no studio hint, route
     // pattern or continuity row can put it in a worktree, and its threaded
     // message is placed rather than held for want of a studio.
-    if (this.supabase && options.sbId && (await this.isInklingIdentity(options.sbId))) {
-      return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+    // Classified, never guessed: an identity whose kind cannot be read stops
+    // here, before any tier, lease or session row (Lumen, #750 r2). The turn
+    // gate refuses the same identity retryably anyway; refusing it here also
+    // keeps a new session from being created on a runtime the identity may
+    // not have.
+    if (this.supabase && options.sbId) {
+      const identity = await classifyIdentityById(this.supabase, options.sbId);
+      if (identity.kind === 'unknown') {
+        throw new IdentityUnclassifiedError(sbSlug, options.sbId);
+      }
+      if (identity.kind === 'inkling') {
+        return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+      }
     }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
