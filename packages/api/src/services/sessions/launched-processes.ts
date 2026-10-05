@@ -98,7 +98,7 @@ export async function findTaggedProcesses(ids: Set<string>): Promise<ProcessInve
   const inventory: ProcessInventory = { tagged: new Map(), unreadable: [] };
   const groupOf = (pid: number, pgid: number) => (pgid === pid ? pid : null);
   const prefix = `${LAUNCH_TAG}=`;
-  const tag = (id: string, pid: number, pgid: number, command: string) => {
+  const tag = (id: string, pid: number, pgid: number, command: string | null) => {
     if (!ids.has(id)) return;
     const found = inventory.tagged.get(id) ?? [];
     inventory.tagged.set(id, [...found, { pid, pgid: groupOf(pid, pgid), command }]);
@@ -133,7 +133,8 @@ export async function findTaggedProcesses(ids: Set<string>): Promise<ProcessInve
         pgrp = Number(fields[2]);
         const environ = await readFile(`/proc/${entry}/environ`, 'utf8');
         const pair = environ.split('\0').find((p) => p.startsWith(prefix));
-        if (pair) tag(pair.slice(prefix.length), pid, pgrp, command ?? '');
+        // An exact tag is that launch's; an unread command stays unknown.
+        if (pair) tag(pair.slice(prefix.length), pid, pgrp, command);
       } catch (error) {
         if (vanished(error)) continue;
         unresolved(pid, pgrp, command);
@@ -198,12 +199,19 @@ export async function findTaggedProcesses(ids: Set<string>): Promise<ProcessInve
         continue;
       }
       if (args.command === '<defunct>') continue;
-      const environment = line.slice(args.line.length).trim();
-      if (environment === '') {
+      const environment = line.slice(args.line.length);
+      if (environment.trim() === '') {
         unresolved(pid, pgid, args.command);
         continue;
       }
-      const first = environment.split(' ')[0];
+      // The environment starts with a NAME= right after the arguments.
+      // Anything else is an argument the plain listing did not have: the two
+      // listings disagree, and the process gets another look.
+      const first = /^\s+([A-Za-z_][A-Za-z0-9_]*=\S*)/.exec(environment)?.[1];
+      if (first === undefined) {
+        inconsistent.set(pid, { pgid, command: args.command });
+        continue;
+      }
       if (first.startsWith(prefix)) tag(first.slice(prefix.length), pid, pgid, args.command);
     }
     for (const [pid, args] of argsOf) {
