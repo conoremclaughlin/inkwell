@@ -4843,6 +4843,17 @@ describe('durable command admission', () => {
         }
         expect(await pointers(lineage)).toMatchObject({ status: 'active' });
 
+        // Each edge separately: a lineage with several kinds of evidence would
+        // be refused by whichever edge fires first.
+        const edges = await admin<{ conname: string; on_delete: string }>(
+          `SELECT conname, confdeltype::text AS on_delete FROM pg_constraint
+            WHERE contype = 'f' AND conname = ANY($1) ORDER BY conname COLLATE "C"`,
+          [RESTRICTED]
+        );
+        expect(edges).toEqual(
+          [...RESTRICTED].sort().map((conname) => ({ conname, on_delete: 'r' }))
+        );
+
         // A session with no evidence is deleted as before.
         const plain = await legacySession();
         expect((await supabase.from('sessions').delete().eq('id', plain)).error).toBeNull();
