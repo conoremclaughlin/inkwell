@@ -34,6 +34,14 @@ import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 
+const RUNNER_FILES = [
+  'claude-runner.ts',
+  'ink-runner.ts',
+  'codex-runner.ts',
+  'gemini-runner.ts',
+  'antigravity-runner.ts',
+];
+
 const runners = {
   codex: () => new CodexRunner(),
   gemini: () => new GeminiRunner(),
@@ -73,14 +81,36 @@ describe('admitSpawn at the spawn seam', () => {
     });
   }
 
+  for (const [name, make] of Object.entries(runners)) {
+    it(`${name}: the launch's tag reaches the process's environment`, async () => {
+      const workingDirectory = mkdtempSync(join(tmpdir(), `tag-${name}-`));
+      try {
+        // spawn is mocked to throw, so the run fails; what it was handed is the point.
+        await make().run('hello', {
+          config: {
+            workingDirectory,
+            inkMcpUrl: 'http://127.0.0.1:9/mcp',
+            launchEnv: { INK_LAUNCH_ID: 'row-tag' },
+          } as never,
+        });
+        expect(spawn).toHaveBeenCalledTimes(1);
+        const options = vi.mocked(spawn).mock.calls[0][2] as { env?: Record<string, string> };
+        expect(options.env?.INK_LAUNCH_ID).toBe('row-tag');
+      } finally {
+        rmSync(workingDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('every runner sets the launch tag in its process environment', () => {
+    for (const file of RUNNER_FILES) {
+      const source = readFileSync(join(__dirname, file), 'utf-8').replace(/\/\/.*$/gm, '');
+      expect(source, file).toContain('...config.launchEnv,');
+    }
+  });
+
   it('every physical spawn in every runner is preceded, past its last await, by the admission', () => {
-    const files = [
-      'claude-runner.ts',
-      'ink-runner.ts',
-      'codex-runner.ts',
-      'gemini-runner.ts',
-      'antigravity-runner.ts',
-    ];
+    const files = RUNNER_FILES;
     let seams = 0;
     for (const file of files) {
       // Line comments blanked, offsets kept: a comment's "await" or "spawn(" is not code.

@@ -3,15 +3,18 @@
 -- (task 2562f0f8; packages/api/src/services/sessions/launched-processes.ts).
 --
 -- A restart signals only the server; the agent CLIs it started keep running.
--- The server writes a row when it spawns a process and stamps exited_at when
--- the run settles. At startup it reads the rows of its own instance with no
--- exit, stops each one still alive with the same start time on this boot, and
--- stamps it. A plain table: no function or trigger decides anything here.
+-- The server writes a row before it spawns a process, sets the row's id in
+-- the process's environment (INK_LAUNCH_ID), adds the pid once the process is
+-- up, and stamps exited_at when the run settles. At startup it reads the rows
+-- of its own instance with no exit and stops each process still running on
+-- this boot: by pid and start time, or by its INK_LAUNCH_ID when the pid never
+-- landed. A plain table: no function or trigger decides anything here.
 CREATE TABLE public.launched_processes (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id uuid NOT NULL REFERENCES public.sessions(id) ON DELETE CASCADE,
   backend text NOT NULL,
-  pid integer NOT NULL CHECK (pid > 0),
+  -- NULL from the reservation until the process is up.
+  pid integer CHECK (pid IS NULL OR pid > 0),
   -- Set when the process leads its own group, which is stopped as a whole.
   pgid integer CHECK (pgid IS NULL OR pgid > 0),
   -- `ps -o lstart=` at launch; NULL when it could not be read, and then the

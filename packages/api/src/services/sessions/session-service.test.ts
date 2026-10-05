@@ -1293,15 +1293,23 @@ describe('SessionService', () => {
           const fromSystem = { sender: { id: 'system', name: 'x' } };
           const launchSession = { backend: 'ink', id: 'launch-session' };
           const fakeStore = () => ({
-            record: vi.fn(async () => 'row-1'),
+            reserve: vi.fn(async () => 'row-1'),
+            attach: vi.fn(async () => undefined),
             markExited: vi.fn(async () => undefined),
             listOpen: vi.fn(async () => []),
           });
+          const envs: Array<Record<string, string> | undefined> = [];
           const reportingSpawn = (result: Record<string, unknown>) =>
             vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
               _message: string,
-              options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+              options: {
+                config: {
+                  onSpawned?: (spawned: { pid: number }) => void;
+                  launchEnv?: Record<string, string>;
+                };
+              }
             ) => {
+              envs.push(options.config.launchEnv);
               options.config.onSpawned?.({ pid: 4242 });
               return result;
             }) as never);
@@ -1310,15 +1318,40 @@ describe('SessionService', () => {
             resetLaunchHolds();
           });
 
-          it('records each process the runner reports, and stamps it once the run confirmed its exit', async () => {
+          it('writes the launch before the runner starts, tags its process, and stamps it once the run confirmed its exit', async () => {
             const store = fakeStore();
             configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            envs.length = 0;
             reportingSpawn({ success: true, responses: [], backendSessionId: 'ink-1' });
             await turn({}, fromSystem, OWNER, { session: launchSession });
-            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
-            expect(store.record).toHaveBeenCalledWith(
-              expect.objectContaining({ sessionId: 'launch-session', pid: 4242 })
+            expect(store.reserve).toHaveBeenCalledWith(
+              expect.objectContaining({ sessionId: 'launch-session' })
             );
+            expect(vi.mocked(store.reserve).mock.invocationCallOrder[0]).toBeLessThan(
+              vi.mocked(mockInkRunner.run).mock.invocationCallOrder[0]
+            );
+            expect(envs).toEqual([{ INK_LAUNCH_ID: 'row-1' }]);
+            await vi.waitFor(() =>
+              expect(store.attach).toHaveBeenCalledWith(
+                'row-1',
+                expect.objectContaining({ pid: 4242 })
+              )
+            );
+            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
+          });
+
+          it('starts nothing, and refuses the turn retryably, when its launch cannot be written', async () => {
+            const store = fakeStore();
+            store.reserve.mockRejectedValue(new Error('db down'));
+            configureLaunchRecording({
+              store,
+              serverInstance: 'host:3001',
+              bootId: 'boot',
+              reserveDelaysMs: [0],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/could not be recorded before starting it/);
           });
 
           it('leaves the row open when the runner could not confirm its processes stopped', async () => {
@@ -1332,7 +1365,7 @@ describe('SessionService', () => {
               stopUnconfirmed: { leaderExited: false },
             });
             await turn({}, fromSystem, OWNER, { session: launchSession });
-            await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
+            await vi.waitFor(() => expect(store.attach).toHaveBeenCalled());
             await new Promise((resolve) => setTimeout(resolve, 50));
             expect(store.markExited).not.toHaveBeenCalled();
           });
@@ -3179,7 +3212,8 @@ describe('SessionService', () => {
 
     it('records the compaction run’s launch, so a restart can stop it too', async () => {
       const store = {
-        record: vi.fn(async () => 'row-compaction'),
+        reserve: vi.fn(async () => 'row-compaction'),
+        attach: vi.fn(async () => undefined),
         markExited: vi.fn(async () => undefined),
         listOpen: vi.fn(async () => []),
       };
@@ -3197,8 +3231,14 @@ describe('SessionService', () => {
         }) as never);
         await sessionService.triggerCompaction('session-123');
         await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
-        expect(store.record).toHaveBeenCalledWith(
-          expect.objectContaining({ sessionId: 'session-123', pid: 4343 })
+        expect(store.reserve).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-123' })
+        );
+        await vi.waitFor(() =>
+          expect(store.attach).toHaveBeenCalledWith(
+            'row-compaction',
+            expect.objectContaining({ pid: 4343 })
+          )
         );
       } finally {
         configureLaunchRecording(undefined);

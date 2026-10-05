@@ -4,12 +4,13 @@ import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   configureLaunchRecording,
+  findTaggedProcesses,
   holdSurvivors,
   launchHoldFor,
   processStartIdentity,
   resetLaunchHolds,
+  reserveLaunch,
   startLaunchTracking,
-  recordLaunch,
   stopSurvivingLaunches,
   type LaunchRow,
   type LaunchStore,
@@ -57,14 +58,25 @@ async function exited(child: ChildProcess): Promise<void> {
 function fakeStore(rows: LaunchRow[]) {
   const exitedIds: string[] = [];
   const store: LaunchStore = {
-    record: vi.fn(async () => 'row-new'),
+    reserve: vi.fn(async () => 'row-new'),
+    attach: vi.fn(async () => undefined),
     markExited: vi.fn(async (ids: string[]) => void exitedIds.push(...ids)),
     listOpen: vi.fn(async () => rows),
   };
   return { store, exitedIds };
 }
 
-function row(over: Partial<LaunchRow> & { pid: number }): LaunchRow {
+/** A node child, whose environment its own user can read on macOS too (`sh` and `sleep` hide theirs). */
+function startTagged(env: Record<string, string>, args: string[] = []): ChildProcess {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', ...args], {
+    stdio: 'ignore',
+    env: { ...process.env, ...env },
+  });
+  children.push(child);
+  return child;
+}
+
+function row(over: Partial<LaunchRow> & { pid: number | null }): LaunchRow {
   return {
     id: `row-${over.pid}`,
     sessionId: 'session-fixture',
@@ -193,64 +205,152 @@ describe('stopSurvivingLaunches', () => {
   });
 });
 
-describe('recordLaunch', () => {
-  it('does nothing until recording is configured', () => {
-    expect(() =>
-      recordLaunch('session-fixture', 'codex-cli', { pid: process.pid }).exited()
-    ).not.toThrow();
+describe('reserveLaunch', () => {
+  it('does nothing until recording is configured', async () => {
+    const launch = await reserveLaunch('session-fixture', 'codex-cli');
+    expect(launch.refused).toBeUndefined();
+    expect(launch.env).toEqual({});
+    expect(() => {
+      launch.spawned({ pid: process.pid });
+      launch.exited();
+    }).not.toThrow();
   });
 
-  it('records the launch with its start time, and stamps it once the run settles', async () => {
-    const child = start('sleep 30');
+  it('writes the launch before its process, tags the process, adds its pid, and stamps it once gone', async () => {
     const { store } = fakeStore([]);
     configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
-    const launch = recordLaunch('session-fixture', 'claude-code', { pid: child.pid! });
-    await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
-    // Stamped only once the process is seen gone.
+    const launch = await reserveLaunch('session-fixture', 'claude-code');
+    expect(store.reserve).toHaveBeenCalledWith({
+      sessionId: 'session-fixture',
+      backend: 'claude-code',
+      bootId: BOOT,
+      serverInstance: INSTANCE,
+    });
+    expect(launch.env).toEqual({ INK_LAUNCH_ID: 'row-new' });
+    const child = start('sleep 30');
+    launch.spawned({ pid: child.pid! });
+    await vi.waitFor(() =>
+      expect(store.attach).toHaveBeenCalledWith('row-new', {
+        pid: child.pid,
+        pgid: null,
+        startIdentity: expect.any(String),
+      })
+    );
     child.kill('SIGKILL');
     await exited(child);
     launch.exited();
     await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-new']));
-    expect(store.record).toHaveBeenCalledWith({
-      sessionId: 'session-fixture',
-      backend: 'claude-code',
-      pid: child.pid,
-      pgid: null,
-      startIdentity: expect.any(String),
-      bootId: BOOT,
-      serverInstance: INSTANCE,
-    });
   });
 
   it('never stamps a launch whose process is still alive, whatever the runner said', async () => {
     const child = start('sleep 30');
     const { store } = fakeStore([]);
     configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
-    const launch = recordLaunch('session-fixture', 'codex-cli', { pid: child.pid! });
-    await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
+    const launch = await reserveLaunch('session-fixture', 'codex-cli');
+    launch.spawned({ pid: child.pid! });
     launch.exited();
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(store.markExited).not.toHaveBeenCalled();
   });
 
-  it('never throws into the turn when the store fails, and holds the session while that process lives', async () => {
-    const store: LaunchStore = {
-      record: vi.fn(async () => {
-        throw new Error('db down');
-      }),
-      markExited: vi.fn(async () => undefined),
-      listOpen: vi.fn(async () => []),
-    };
+  it('retries the write, and refuses the launch when it cannot be written', async () => {
+    const { store } = fakeStore([]);
+    vi.mocked(store.reserve).mockRejectedValue(new Error('db down'));
+    configureLaunchRecording({
+      store,
+      serverInstance: INSTANCE,
+      bootId: BOOT,
+      reserveDelaysMs: [0, 1, 1],
+    });
+    const launch = await reserveLaunch('session-fixture', 'claude-code');
+    expect(store.reserve).toHaveBeenCalledTimes(3);
+    expect(launch.refused).toMatch(/could not be recorded before starting it/);
+    expect(launch.env).toEqual({});
+  });
+
+  it('starts a launch whose write succeeded on a retry', async () => {
+    const { store } = fakeStore([]);
+    vi.mocked(store.reserve)
+      .mockRejectedValueOnce(new Error('blip'))
+      .mockResolvedValueOnce('row-2');
+    configureLaunchRecording({
+      store,
+      serverInstance: INSTANCE,
+      bootId: BOOT,
+      reserveDelaysMs: [0, 1, 1],
+    });
+    const launch = await reserveLaunch('session-fixture', 'claude-code');
+    expect(launch.refused).toBeUndefined();
+    expect(launch.env).toEqual({ INK_LAUNCH_ID: 'row-2' });
+  });
+
+  it('never throws into the turn when the pid cannot be added: the row and the tag remain', async () => {
+    const { store } = fakeStore([]);
+    vi.mocked(store.attach).mockRejectedValue(new Error('db down'));
     configureLaunchRecording({ store, serverInstance: INSTANCE, bootId: BOOT });
-    const launch = recordLaunch('session-fixture', 'claude-code', { pid: process.pid });
+    const launch = await reserveLaunch('session-fixture', 'claude-code');
+    const child = start('sleep 30');
+    launch.spawned({ pid: child.pid! });
+    await vi.waitFor(() => expect(store.attach).toHaveBeenCalled());
+    expect(launchHoldFor('session-fixture')).toBeUndefined();
+    child.kill('SIGKILL');
+    await exited(child);
     launch.exited();
-    await vi.waitFor(() => expect(store.record).toHaveBeenCalled());
-    expect(store.markExited).not.toHaveBeenCalled();
-    // This test process is the "launch": alive, so its session is held.
-    await vi.waitFor(() =>
-      expect(launchHoldFor('session-fixture')).toMatch(/may still be running/)
+    await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-new']));
+  });
+});
+
+describe('launches whose pid never reached the row', () => {
+  it('finds a process by the launch id in its environment, and stops it', async () => {
+    const child = startTagged({ INK_LAUNCH_ID: 'row-tagged' });
+    await vi.waitFor(async () =>
+      expect((await findTaggedProcesses(new Set(['row-tagged']))).get('row-tagged')).toEqual([
+        { pid: child.pid, pgid: null },
+      ])
     );
-    resetLaunchHolds();
+    const { store, exitedIds } = fakeStore([row({ id: 'row-tagged', pid: null })]);
+    const outcome = await sweep(store);
+    expect(outcome.stopped.map((r) => r.pid)).toEqual([child.pid]);
+    await exited(child);
+    expect(exitedIds).toEqual(['row-tagged']);
+  });
+
+  it('records a launch no process carries as gone, without signalling anything', async () => {
+    const kill = vi.spyOn(process, 'kill');
+    try {
+      const { store, exitedIds } = fakeStore([row({ id: 'row-untagged', pid: null })]);
+      const outcome = await stopSurvivingLaunches(store, {
+        serverInstance: INSTANCE,
+        bootId: BOOT,
+        findTagged: async () => new Map(),
+      });
+      expect(outcome.gone.map((r) => r.id)).toEqual(['row-untagged']);
+      expect(exitedIds).toEqual(['row-untagged']);
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it('fails the sweep, holding every turn, when the process table cannot be read', async () => {
+    const { store } = fakeStore([row({ id: 'row-unread', pid: null })]);
+    await expect(
+      stopSurvivingLaunches(store, {
+        serverInstance: INSTANCE,
+        bootId: BOOT,
+        findTagged: async () => {
+          throw new Error('ps failed');
+        },
+      })
+    ).rejects.toThrow('ps failed');
+    expect(store.markExited).not.toHaveBeenCalled();
+  });
+
+  it('never reads an argument that mentions a launch id as its tag', async () => {
+    const child = startTagged({}, ['INK_LAUNCH_ID=row-arg']);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(alive(child.pid!)).toBe(true);
+    expect((await findTaggedProcesses(new Set(['row-arg']))).get('row-arg')).toBeUndefined();
   });
 });
 

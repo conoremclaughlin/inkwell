@@ -488,6 +488,8 @@ export class InkRunner implements IRunner {
     // else it needs is set here, explicitly.
     const env = buildCleanEnv({
       ...sessionEnv,
+      // The launch's tag, by which a restarted server finds this process.
+      ...config.launchEnv,
       PATH: spawnPath,
       SB_SLUG: config.sbSlug || '',
       AGENT_ID: config.sbSlug || '',

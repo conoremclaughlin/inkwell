@@ -47,7 +47,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
-import { launchHoldFor, recordLaunch } from './launched-processes.js';
+import { launchHoldFor, reserveLaunch } from './launched-processes.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -2778,7 +2778,12 @@ export class SessionService implements ISessionService {
       (fencedSbId && inklingFenceHolds(fencedSbId)
         ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
         : undefined) ?? launchHoldFor(session.id);
-    const refusedAtEntry = admitSpawn();
+    // The launch is written before its process exists, so a restarted server
+    // can find the process whatever happens next (launched-processes.ts). A
+    // launch that cannot be written is refused, and starts nothing.
+    const launch =
+      admitSpawn() === undefined ? await reserveLaunch(session.id, resolvedBackend) : undefined;
+    const refusedAtEntry = admitSpawn() ?? launch?.refused;
     // A live inkling turn its owner can cancel (inkling-turns.ts), released
     // however the run ends.
     const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
@@ -2796,9 +2801,6 @@ export class SessionService implements ISessionService {
             }),
           };
 
-    // Each process the runner starts, recorded so a restarted server can stop
-    // it (launched-processes.ts), and stamped exited when the run settles.
-    const launches: Array<{ exited(): void }> = [];
     try {
       result = await turnRunner
         .run(formattedMessage, {
@@ -2818,16 +2820,15 @@ export class SessionService implements ISessionService {
             turnEpoch,
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
             admitSpawn,
-            onSpawned: (spawned) => {
-              launches.push(recordLaunch(session.id, resolvedBackend, spawned));
-            },
+            ...(launch ? { launchEnv: launch.env } : {}),
+            onSpawned: (spawned) => launch?.spawned(spawned),
           },
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
         })
         .then((ran) => {
-          // A stop the runner could not confirm leaves its rows open, for the
+          // A stop the runner could not confirm leaves its row open, for the
           // next start's sweep to look at.
-          if (!ran.stopUnconfirmed) for (const launch of launches) launch.exited();
+          if (!ran.stopUnconfirmed) launch?.exited();
           // Fenced before the turn is released below, so no admission can
           // fall between the two.
           if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
@@ -5735,26 +5736,28 @@ This session will continue with a fresh context after compaction. Your identity,
 
       // Asked again past the awaits since the first check, and by the runner
       // at its spawn seam, as a turn's admission is.
+      // The launch is written first, as a turn's is.
       const compactionHold = (): string | undefined => launchHoldFor(sessionId);
-      const heldAtRun = compactionHold();
-      if (heldAtRun) {
-        logger.warn('Not compacting a held session', { sessionId, reason: heldAtRun });
+      const launch =
+        compactionHold() === undefined ? await reserveLaunch(sessionId, runtimeBackend) : undefined;
+      const refusedAtRun = compactionHold() ?? launch?.refused;
+      if (refusedAtRun) {
+        logger.warn('Not compacting a held session', { sessionId, reason: refusedAtRun });
+        launch?.exited();
         return;
       }
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
-      const compactionLaunches: Array<{ exited(): void }> = [];
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
         config: {
           ...runnerConfig,
           admitSpawn: compactionHold,
-          onSpawned: (spawned) => {
-            compactionLaunches.push(recordLaunch(sessionId, runtimeBackend, spawned));
-          },
+          ...(launch ? { launchEnv: launch.env } : {}),
+          onSpawned: (spawned) => launch?.spawned(spawned),
         },
       });
-      if (!result.stopUnconfirmed) for (const launch of compactionLaunches) launch.exited();
+      if (!result.stopUnconfirmed) launch?.exited();
 
       // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
       if (result.responses.length > 0 && this.config.responseHandler) {

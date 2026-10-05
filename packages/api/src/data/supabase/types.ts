@@ -2082,7 +2082,7 @@ export type Database = {
           id: string;
           launched_at: string;
           pgid: number | null;
-          pid: number;
+          pid: number | null;
           server_instance: string;
           session_id: string;
           start_identity: string | null;
@@ -2094,7 +2094,7 @@ export type Database = {
           id?: string;
           launched_at?: string;
           pgid?: number | null;
-          pid: number;
+          pid?: number | null;
           server_instance: string;
           session_id: string;
           start_identity?: string | null;
@@ -2106,7 +2106,7 @@ export type Database = {
           id?: string;
           launched_at?: string;
           pgid?: number | null;
-          pid?: number;
+          pid?: number | null;
           server_instance?: string;
           session_id?: string;
           start_identity?: string | null;

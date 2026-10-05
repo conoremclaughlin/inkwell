@@ -291,6 +291,8 @@ export class CodexRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
         ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),

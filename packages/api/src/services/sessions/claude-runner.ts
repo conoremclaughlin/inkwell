@@ -559,6 +559,8 @@ export class ClaudeRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),

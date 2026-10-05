@@ -806,6 +806,12 @@ export interface ClaudeRunnerConfig {
    */
   admitSpawn?: () => string | undefined;
   /**
+   * Set in the environment of every process the runner starts, past the
+   * explicit allowlist: the launch's tag, by which a restarted server finds a
+   * process whose pid it never recorded (launched-processes.ts).
+   */
+  launchEnv?: Record<string, string>;
+  /**
    * Told each process the runner starts, as soon as it has a pid, so the
    * server can record it (launched-processes.ts) and a restarted server can
    * stop it. A run that leads its own process group passes the group too.

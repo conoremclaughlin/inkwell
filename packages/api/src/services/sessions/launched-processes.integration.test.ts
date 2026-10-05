@@ -53,15 +53,13 @@ describe('launched_processes', () => {
     const child = spawn('sh', ['-c', 'sleep 30'], { stdio: 'ignore' });
     children.push(child);
     const startIdentity = await processStartIdentity(child.pid!);
-    const id = await store.record({
+    const id = await store.reserve({
       sessionId,
       backend: 'claude-code',
-      pid: child.pid!,
-      pgid: null,
-      startIdentity,
       bootId: BOOT,
       serverInstance: MAIN,
     });
+    await store.attach(id, { pid: child.pid!, pgid: null, startIdentity });
 
     // Another server on another port sees nothing of it.
     expect(await stopSurvivingLaunches(store, { serverInstance: OTHER, bootId: BOOT })).toEqual({
@@ -90,6 +88,37 @@ describe('launched_processes', () => {
       .eq('id', id)
       .single();
     expect(data?.exited_at).not.toBeNull();
+    expect(await store.listOpen(MAIN)).toEqual([]);
+  });
+
+  it('stops a launch whose pid never reached its row, found by the id in its environment', async () => {
+    const store = supabaseLaunchStore(supabase);
+    const sessionId = await newSession();
+    // Reserved, then the server "went down" before the pid was written.
+    const id = await store.reserve({
+      sessionId,
+      backend: 'codex-cli',
+      bootId: BOOT,
+      serverInstance: MAIN,
+    });
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+      env: { ...process.env, INK_LAUNCH_ID: id },
+    });
+    children.push(child);
+    expect((await store.listOpen(MAIN)).find((row) => row.id === id)?.pid).toBeNull();
+
+    const outcome = await stopSurvivingLaunches(store, {
+      serverInstance: MAIN,
+      bootId: BOOT,
+      graceMs: 500,
+    });
+    expect(outcome.stopped.map((r) => [r.id, r.pid])).toEqual([[id, child.pid]]);
+    await new Promise((resolve) =>
+      child.exitCode !== null || child.signalCode !== null
+        ? resolve(null)
+        : child.once('exit', resolve)
+    );
     expect(await store.listOpen(MAIN)).toEqual([]);
   });
 });
