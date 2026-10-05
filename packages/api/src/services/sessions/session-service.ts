@@ -99,6 +99,7 @@ import {
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
+import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
@@ -2255,17 +2256,21 @@ export class SessionService implements ISessionService {
       session
     );
 
-    // 4. Select runtime backend and model
-    const resolvedBackend = this.resolveRuntimeBackend(
+    // 4. Select runtime backend and model. An inkling's turn replaces both
+    // below, once its identity is read (inkling-runtime.ts).
+    let resolvedBackend = this.resolveRuntimeBackend(
       session.backend,
       injectedContext.agent.backend
     );
     // For ink, model selection is based on the provider (the LLM underneath),
     // not the backend itself. For direct backends, backend === provider.
-    const modelKey =
+    let modelKey =
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
+    // The provider `ink chat` is told to run. Only an inkling's turn names
+    // one; every other ink spawn keeps the chat's own default.
+    let inkProvider: InklingProvider | undefined;
     let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
@@ -2342,15 +2347,23 @@ export class SessionService implements ISessionService {
       }
 
       if (inklingIdentity.kind === 'inkling') {
-        // Only the Claude runner and InkRunner enforce an inkling's ceiling,
-        // group stop, cancellation and spawn-seam admission (InkRunner since
-        // task 7d9aa453); on any other backend the turn would run unbounded.
-        // This admits ink alongside Claude; it doesn't choose either.
-        if (resolvedBackend !== 'claude-code' && resolvedBackend !== 'ink') {
-          return refuseInklingTurn(
-            `inkling turns run only on the Claude or ink runners, which bound them (not ${resolvedBackend})`
-          );
+        // Every inkling runs on ink, whatever runtime its session or identity
+        // stored, under a provider chosen on its own (inkling-runtime.ts).
+        // InkRunner enforces an inkling's ceiling, group stop, cancellation and
+        // spawn-seam admission (task 7d9aa453). A setting it cannot honour, or
+        // a conversation it cannot carry, is refused, never translated.
+        const runtime = inklingRuntime({
+          sessionBackend: session.backend,
+          backendSessionId: session.backendSessionId,
+          identityBackend: injectedContext.agent.backend,
+          identityProvider: injectedContext.agent.provider,
+        });
+        if (!runtime.ok) {
+          return refuseInklingTurn(runtime.reason);
         }
+        resolvedBackend = 'ink';
+        inkProvider = runtime.provider;
+        modelKey = 'claude-code';
         // A stopped turn whose processes were not confirmed gone fences the
         // inkling until its group is (inkling-stop-fence.ts): no new turn
         // runs beside them. Retryable, because the fence lifts once the group
@@ -2484,6 +2497,7 @@ export class SessionService implements ISessionService {
       // tools are always ink-owned: a dashboard setting must not hand its
       // provider's native tools to the turn.
       toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
+      ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       ...(launchPermissions ? { launchPermissions } : {}),
       // Propagate repo root so spawned backend's context token carries it

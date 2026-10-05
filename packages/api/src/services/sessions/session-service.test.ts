@@ -37,7 +37,6 @@ import type {
   ClaudeRunnerResult,
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
-import { ClaudeRunner } from './claude-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { resolveInkCli } from '../ink-cli.js';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
@@ -70,18 +69,6 @@ vi.mock('./claude-runner.js', async (importOriginal) => {
   return {
     ...actual,
     buildIdentityPrompt: vi.fn(() => 'mocked-identity-prompt'),
-  };
-});
-
-// The real ClaudeRunner, for the stopped-turn suite only: it resolves a fake
-// `claude` binary there, and the real path everywhere else.
-const stopFake = vi.hoisted(() => ({ binary: '' }));
-vi.mock('./resolve-binary.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./resolve-binary.js')>();
-  return {
-    ...actual,
-    resolveBinaryPath: (name: string) =>
-      stopFake.binary ? Promise.resolve(stopFake.binary) : actual.resolveBinaryPath(name),
   };
 });
 
@@ -974,17 +961,23 @@ describe('SessionService', () => {
         await rm(inklingsRoot, { recursive: true, force: true });
       });
 
-      const configPassedToRunner = () =>
+      /**
+       * The config `runner` was handed on its first call: the ink runner, where
+       * every inkling turn runs, unless a test names another.
+       */
+      const configPassedToRunner = (runner: IClaudeRunner = mockInkRunner) =>
         (
-          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+          vi.mocked(runner.run).mock.calls[0] as unknown as [
             string,
-            { config: { timeoutMs?: number; killProcessGroup?: boolean } },
+            {
+              config: { timeoutMs?: number; killProcessGroup?: boolean } & Record<string, unknown>;
+            },
           ]
         )[1].config;
 
       const cwdPassedToRunner = () =>
         (
-          vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+          vi.mocked(mockInkRunner.run).mock.calls[0] as unknown as [
             string,
             { config: { workingDirectory?: string } },
           ]
@@ -1057,14 +1050,27 @@ describe('SessionService', () => {
           mockContextBuilder,
           mockClaudeRunner,
           mockActivityStream,
-          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
+          {
+            defaultWorkingDirectory: '/test',
+            mcpConfigPath: '/test/.mcp.json',
+            inklingsRoot,
+            defaultModel: 'claude-test-model',
+            defaultCodexModel: 'codex-test-model',
+          },
           mockCodexRunner,
           supabase,
           undefined,
           mockInkRunner
         );
+        // A session as routing creates one: the runtime its identity names
+        // (none, so claude-code) and no native conversation yet.
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ sbId: SB, userId: OWNER, ...extra.session } as never)
+          createMockSession({
+            sbId: SB,
+            userId: OWNER,
+            backendSessionId: null,
+            ...extra.session,
+          } as never)
         );
         lastService = service;
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
@@ -1079,10 +1085,18 @@ describe('SessionService', () => {
       const turnsCounted = () =>
         (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
           ?.ownerTestTurns;
+      /**
+       * No runner was asked to run a turn. An inkling's turn would reach the
+       * ink runner, any other SB's the Claude one, so a refusal checks both.
+       */
+      const expectNothingRan = () => {
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      };
 
       it("the owner's own message wakes an inkling born under the test", async () => {
         const result = await turn(INKLING);
-        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(mockInkRunner.run).toHaveBeenCalled();
         expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
       });
 
@@ -1099,21 +1113,21 @@ describe('SessionService', () => {
 
         const woken = await turn(INKLING, asSecond('msg-second'), OWNER, theirs);
         expect(woken.errorCode).not.toBe('INKLING_TURN_REFUSED');
-        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
 
         // The first account is in the test too, but it is not this inkling's owner.
         const notTheirs = await turn(INKLING, asSecond('msg-owner'), OWNER, theirs);
         expect(notTheirs.errorCode).toBe('INKLING_TURN_REFUSED');
-        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
       });
 
       it("the inkling's own reply starts no turn", async () => {
         // Control: the owner's message does start one. Nothing is counted
         // either way: there is no turn cap (Conor, Oct 4 2026, 5:00 PM).
         await turn(INKLING);
-        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
         expect(turnsCounted()).toBeUndefined();
-        vi.mocked(mockClaudeRunner.run).mockClear();
+        vi.mocked(mockInkRunner.run).mockClear();
 
         const result = await turn(INKLING, {
           sender: { id: 'user', name: 'Owner' },
@@ -1121,7 +1135,7 @@ describe('SessionService', () => {
         });
         expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
         expect(result.classification?.retryable).toBe(false);
-        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
         expect(turnsCounted()).toBeUndefined();
       });
 
@@ -1143,7 +1157,7 @@ describe('SessionService', () => {
             });
             expect(result.errorCode, String(messageId)).toBe('INKLING_TURN_REFUSED');
           }
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
         it('an identity that cannot be established is refused, whatever its slug (Lumen 5bd4de42)', async () => {
@@ -1167,7 +1181,7 @@ describe('SessionService', () => {
             rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
           });
           expect(ambiguous.errorCode).toBe('INKLING_TURN_REFUSED');
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
         it("a failed read while proving the owner's message refuses without running, as retryable (Lumen 7d40b0aa)", async () => {
@@ -1185,7 +1199,7 @@ describe('SessionService', () => {
             metadata: { triggerThreadMessageId: 'msg-sb' },
           });
           expect(definite.classification?.retryable).toBe(false);
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
         it('with no sbId, a failed identity lookup refuses as retryable; a shared slug does not (Lumen 7d40b0aa)', async () => {
@@ -1202,7 +1216,7 @@ describe('SessionService', () => {
             rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
           });
           expect(shared.classification?.retryable).toBe(false);
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
         it('positively no identity row, or a readable ordinary one, runs as today', async () => {
@@ -1218,9 +1232,9 @@ describe('SessionService', () => {
         it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
           const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
           expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
           await turn(INKLING, fromOwner, OWNER, { session: { sbId: null } });
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
           expect(configPassedToRunner()).toMatchObject({ killProcessGroup: true });
           expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
         });
@@ -1230,17 +1244,101 @@ describe('SessionService', () => {
             row: { user_id: '33333333-3333-4333-8333-333333333333' },
           });
           expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
         });
 
-        it('an inkling session on a runner that cannot bound it (Codex, Gemini) is refused, never run unbounded', async () => {
-          for (const backend of ['codex-cli', 'gemini']) {
+        /** The context a turn is built from, with the identity's stored runtime and provider. */
+        const contextWith = (agent: Record<string, unknown>) => {
+          const context = createMockInjectedContext();
+          return { ...context, agent: { ...context.agent, ...agent } } as never;
+        };
+        /** The updates that rewrote a session's runtime or its native session id. */
+        const runtimeRewrites = () =>
+          vi
+            .mocked(mockRepository.update)
+            .mock.calls.map(([, updates]) => updates as Record<string, unknown>)
+            .filter((updates) => 'backend' in updates || 'backendSessionId' in updates);
+
+        it('every inkling runs on ink, whatever runtime its session stored, when no native conversation is there to carry (Conor, 5:08 PM)', async () => {
+          const stored = ['claude-code', 'codex-cli', 'gemini', 'antigravity', 'ink', null];
+          for (const backend of stored) {
             const result = await turn(INKLING, fromOwner, OWNER, { session: { backend } });
-            expect(result.errorCode, backend).toBe('INKLING_TURN_REFUSED');
+            expect(result.errorCode, String(backend)).not.toBe('INKLING_TURN_REFUSED');
           }
-          expect(mockCodexRunner.run).not.toHaveBeenCalled();
-          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(stored.length);
           expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          // Each runs Claude, with Claude's model: a stored Codex runtime never
+          // picks the model ink is handed.
+          for (const [, options] of vi.mocked(mockInkRunner.run).mock.calls) {
+            expect(options.config).toMatchObject({
+              inkProvider: 'claude',
+              model: 'claude-test-model',
+            });
+          }
+          // Each session is recorded as the ink session it now is.
+          expect(runtimeRewrites().filter((updates) => updates.backend === 'ink')).toHaveLength(
+            stored.length
+          );
+          expect(runtimeRewrites().some((updates) => updates.backend !== 'ink')).toBe(false);
+        });
+
+        it('a conversation that began natively on another runtime is refused, not moved: its history would not come with it (Lumen aec2aae7)', async () => {
+          for (const backend of ['claude-code', 'codex-cli', null]) {
+            const result = await turn(INKLING, fromOwner, OWNER, {
+              session: { backend, backendSessionId: 'native-conversation-1' },
+            });
+            expect(result.errorCode, String(backend)).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, String(backend)).toBe(false);
+            expect(result.error, String(backend)).toMatch(/would not carry its history/);
+          }
+          expectNothingRan();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          // The row keeps the runtime and the native id it had: nothing is relabelled.
+          expect(runtimeRewrites()).toEqual([]);
+
+          // Control: a native id on an ink session is ink's own, and the turn runs.
+          await turn(INKLING, fromOwner, OWNER, {
+            session: { backend: 'ink', backendSessionId: 'session-123' },
+          });
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('its provider is Claude Code when none is set or Claude is named, and ink is told so with the Claude model (Conor, 5:32 PM)', async () => {
+          const providers = [null, 'claude-code', 'claude', ' Claude-Code '];
+          for (const provider of providers) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ provider }));
+            const result = await turn(INKLING);
+            expect(result.errorCode, String(provider)).not.toBe('INKLING_TURN_REFUSED');
+          }
+          const configs = vi
+            .mocked(mockInkRunner.run)
+            .mock.calls.map(([, options]) => options.config);
+          expect(configs).toHaveLength(providers.length);
+          for (const config of configs) {
+            expect(config).toMatchObject({ inkProvider: 'claude', model: 'claude-test-model' });
+          }
+        });
+
+        it('a Codex provider, or a runtime or provider ink does not run for inklings, is refused by name: never run as Claude, never given a Codex model', async () => {
+          const cases = [
+            { agent: { provider: 'codex-cli' }, reason: /provider is Codex/ },
+            { agent: { provider: 'codex' }, reason: /provider is Codex/ },
+            { agent: { provider: 'gemini' }, reason: /provider "gemini"/ },
+            { agent: { backend: 'codex-cli' }, reason: /"codex-cli" runtime/ },
+            { agent: { backend: 'gemini' }, reason: /"gemini" runtime/ },
+            { agent: { backend: 'something-else' }, reason: /"something-else" runtime/ },
+          ];
+          for (const { agent, reason } of cases) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith(agent));
+            const result = await turn(INKLING);
+            const label = JSON.stringify(agent);
+            expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, label).toBe(false);
+            expect(result.error, label).toMatch(reason);
+          }
+          expectNothingRan();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
         });
 
         /** The config the ink runner was handed on its first call. */
@@ -1270,6 +1368,7 @@ describe('SessionService', () => {
             maxTurns: 1,
             toolRouting: 'local',
             workingDirectory: join(inklingsRoot, SB),
+            inkProvider: 'claude',
           });
           expect(config.signal).toBeInstanceOf(AbortSignal);
           expect(typeof config.admitSpawn).toBe('function');
@@ -1286,6 +1385,15 @@ describe('SessionService', () => {
           const config = configPassedToInkRunner();
           expect(config).toMatchObject({ maxTurns: 7, toolRouting: 'backend' });
           expect(config.killProcessGroup).toBeUndefined();
+          // Its provider is still the chat's own default: only an inkling names one.
+          expect(config.inkProvider).toBeUndefined();
+        });
+
+        it("another SB keeps its stored runtime: a direct Claude session isn't moved to ink", async () => {
+          await turn({}, { sender: { id: 'system', name: 'x' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(runtimeRewrites().some((updates) => updates.backend === 'ink')).toBe(false);
         });
 
         it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
@@ -1351,7 +1459,7 @@ describe('SessionService', () => {
         // first test's five minutes is gone unless the env sets a ceiling.
         expect('timeoutMs' in unset).toBe(false);
 
-        vi.mocked(mockClaudeRunner.run).mockClear();
+        vi.mocked(mockInkRunner.run).mockClear();
         vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '90000');
         await turn(INKLING);
         expect(configPassedToRunner()).toMatchObject({ timeoutMs: 90000, killProcessGroup: true });
@@ -1359,7 +1467,9 @@ describe('SessionService', () => {
 
       it('another SB keeps the runner defaults: no inkling ceiling, no group stop', async () => {
         await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
-        const config = configPassedToRunner() as { signal?: AbortSignal } & Record<string, unknown>;
+        const config = configPassedToRunner(mockClaudeRunner) as {
+          signal?: AbortSignal;
+        } & Record<string, unknown>;
         expect(config.timeoutMs).toBeUndefined();
         expect(config.killProcessGroup).toBeUndefined();
         expect(config.signal).toBeUndefined();
@@ -1368,7 +1478,7 @@ describe('SessionService', () => {
       it('its owner can cancel it while it runs; it is released when the run ends', async () => {
         let during = -1;
         let aborted = false;
-        vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (_m, options) => {
+        vi.mocked(mockInkRunner.run).mockImplementationOnce(async (_m, options) => {
           during = liveInklingTurns(SB);
           cancelInklingTurns(SB);
           aborted = (options.config as { signal?: AbortSignal }).signal?.aborted === true;
@@ -1385,7 +1495,7 @@ describe('SessionService', () => {
         expect(liveInklingTurns(SB)).toBe(0);
       });
 
-      describe('a stopped turn holds its session until its process has exited (two processes on one Claude session)', () => {
+      describe('a stopped turn holds its session until its process has exited (two processes on one session)', () => {
         let leaderPid = 0;
         let toolPid = 0;
 
@@ -1400,64 +1510,54 @@ describe('SessionService', () => {
           }
           leaderPid = 0;
           toolPid = 0;
-          stopFake.binary = '';
           clearInklingFences();
         });
 
         /**
-         * A fake `claude` that exits as soon as it gets SIGTERM, having started
-         * a tool that ignores it. Each reports its pid once its handler is set.
+         * Make `lines` the fake `ink` (INK_CLI_PATH) in a new directory, and
+         * return that directory. Refuses to go on unless InkRunner will run
+         * this fake: the checkout's real CLI would start a real `ink chat`.
+         * Paths come from the fake's own location (the runner hands it a
+         * clean env): no path is spliced into code.
          */
-        const writeFakeWithStubbornTool = async (): Promise<{ leader: string; tool: string }> => {
-          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-tool-'));
-          const leader = join(dir, 'leader.pid');
-          const tool = join(dir, 'tool.pid');
-          const script = join(dir, 'claude.mjs');
-          // Paths come from the fake's own location (the runner hands it a
-          // clean env), and the tool is handed its pid file as an argument:
-          // no path is spliced into code.
+        const installFakeInk = async (prefix: string, lines: string[]): Promise<string> => {
+          const dir = await mkdtemp(join(tmpdir(), prefix));
+          const script = join(dir, 'ink.mjs');
           writeFileSync(
             script,
             [
-              '#!/usr/bin/env node',
-              "import { spawn } from 'child_process';",
               "import { writeFileSync } from 'fs';",
               "import { dirname, join } from 'path';",
               "import { fileURLToPath } from 'url';",
               'const here = dirname(fileURLToPath(import.meta.url));',
-              "process.on('SIGTERM', () => process.exit(0));",
-              `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
-              "spawn(process.execPath, ['-e', tool, join(here, 'tool.pid')], { stdio: 'ignore' });",
-              "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
-              'setInterval(() => {}, 1000);',
-            ].join('\n'),
-            { mode: 0o755 }
+              ...lines,
+            ].join('\n')
           );
-          stopFake.binary = script;
-          return { leader, tool };
+          vi.stubEnv('INK_CLI_PATH', script);
+          if (resolveInkCli()?.path !== script) {
+            throw new Error('InkRunner would not run the fake ink; refusing to spawn anything');
+          }
+          return dir;
         };
 
         /**
-         * A fake `claude` that exits 400 ms after SIGTERM, the way a CLI
-         * winding down does, and reports its pid once that handler is set.
+         * A fake `ink` that exits as soon as it gets SIGTERM, having started a
+         * tool that ignores it. Each reports its pid once its handler is set;
+         * the tool is handed its pid file as an argument.
          */
-        const writeFake = async (): Promise<string> => {
-          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-'));
-          const pidFile = join(dir, 'leader.pid');
-          const script = join(dir, 'claude.mjs');
-          writeFileSync(
-            script,
-            [
-              '#!/usr/bin/env node',
-              "import { writeFileSync } from 'fs';",
-              "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
-              `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
-              'setInterval(() => {}, 1000);',
-            ].join('\n'),
-            { mode: 0o755 }
-          );
-          stopFake.binary = script;
-          return pidFile;
+        const writeFakeInkWithStubbornTool = async (): Promise<{
+          leader: string;
+          tool: string;
+        }> => {
+          const dir = await installFakeInk('stop-then-send-tool-', [
+            "import { spawn } from 'child_process';",
+            "process.on('SIGTERM', () => process.exit(0));",
+            `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
+            "spawn(process.execPath, ['-e', tool, join(here, 'tool.pid')], { stdio: 'ignore' });",
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+            'setInterval(() => {}, 1000);',
+          ]);
+          return { leader: join(dir, 'leader.pid'), tool: join(dir, 'tool.pid') };
         };
 
         const pidOf = async (pidFile: string): Promise<number> => {
@@ -1479,27 +1579,36 @@ describe('SessionService', () => {
           }
         };
 
-        /** Turn 1 runs the real ClaudeRunner on the fake; turn 2 records when it began. */
+        /** Turn 1 runs the real InkRunner on the fake; turn 2 records when it began. */
         const wire = (stoppedAt: () => number) => {
-          const real = new ClaudeRunner();
+          const real = new InkRunner();
           const second: { leaderAlive?: boolean; toolAlive?: boolean; afterStopMs?: number } = {};
-          vi.mocked(mockClaudeRunner.run)
+          vi.mocked(mockInkRunner.run)
             .mockImplementationOnce((message, options) => real.run(message, options))
             .mockImplementationOnce(async () => {
               second.leaderAlive = alive(leaderPid);
               second.toolAlive = toolPid ? alive(toolPid) : undefined;
               second.afterStopMs = Date.now() - stoppedAt();
-              return {
-                success: true,
-                responses: [],
-                backendSessionId: 'claude-abc',
-              } as never;
+              return { success: true, responses: [], backendSessionId: 'ink-session-1' } as never;
             });
           return second;
         };
 
+        /**
+         * A fake `ink` that exits 400 ms after SIGTERM, the way a CLI winding
+         * down does, and reports its pid beside itself once that handler is set.
+         */
+        const writeFakeInk = async (): Promise<string> => {
+          const dir = await installFakeInk('stop-then-send-ink-', [
+            "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+            'setInterval(() => {}, 1000);',
+          ]);
+          return join(dir, 'leader.pid');
+        };
+
         it('Stop, then the owner sends at once: the next turn starts only once the stopped one has exited', async () => {
-          const pidFile = await writeFake();
+          const pidFile = await writeFakeInk();
           let stoppedAt = 0;
           const second = wire(() => stoppedAt);
           const first = turn(INKLING);
@@ -1511,79 +1620,17 @@ describe('SessionService', () => {
             createMockRequest({ userId: OWNER, ...fromOwner })
           );
           expect(next.success).toBe(true);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
-          // Never a second `--resume` of the session beside the first.
-          expect(second.leaderAlive).toBe(false);
-          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
-        }, 20_000);
-
-        /**
-         * A fake `ink` (INK_CLI_PATH) that exits 400 ms after SIGTERM, the
-         * way a CLI winding down does, and reports its pid beside itself once
-         * that handler is set. Refuses to go on unless InkRunner will run this
-         * fake: the checkout's real CLI would start a real `ink chat`.
-         */
-        const writeFakeInk = async (): Promise<string> => {
-          const dir = await mkdtemp(join(tmpdir(), 'stop-then-send-ink-'));
-          const script = join(dir, 'ink.mjs');
-          writeFileSync(
-            script,
-            [
-              "import { writeFileSync } from 'fs';",
-              "import { dirname, join } from 'path';",
-              "import { fileURLToPath } from 'url';",
-              'const here = dirname(fileURLToPath(import.meta.url));',
-              "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
-              "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
-              'setInterval(() => {}, 1000);',
-            ].join('\n')
-          );
-          vi.stubEnv('INK_CLI_PATH', script);
-          if (resolveInkCli()?.path !== script) {
-            throw new Error('InkRunner would not run the fake ink; refusing to spawn anything');
-          }
-          return join(dir, 'leader.pid');
-        };
-
-        /** Turn 1 runs the real InkRunner on the fake; turn 2 records when it began. */
-        const wireInk = (stoppedAt: () => number) => {
-          const real = new InkRunner();
-          const second: { leaderAlive?: boolean; afterStopMs?: number } = {};
-          vi.mocked(mockInkRunner.run)
-            .mockImplementationOnce((message, options) => real.run(message, options))
-            .mockImplementationOnce(async () => {
-              second.leaderAlive = alive(leaderPid);
-              second.afterStopMs = Date.now() - stoppedAt();
-              return { success: true, responses: [], backendSessionId: 'ink-session-1' } as never;
-            });
-          return second;
-        };
-
-        const onInk = { session: { backend: 'ink' } };
-
-        it('on ink, Stop then the owner sends at once: the next turn starts only once the stopped one has exited', async () => {
-          const pidFile = await writeFakeInk();
-          let stoppedAt = 0;
-          const second = wireInk(() => stoppedAt);
-          const first = turn(INKLING, fromOwner, OWNER, onInk);
-          leaderPid = await pidOf(pidFile);
-          stoppedAt = Date.now();
-          expect(cancelInklingTurns(SB)).toBe(1);
-          await first;
-          const next = await lastService.handleMessage(
-            createMockRequest({ userId: OWNER, ...fromOwner })
-          );
-          expect(next.success).toBe(true);
           expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+          // Never a second `ink chat` on the session beside the first.
           expect(second.leaderAlive).toBe(false);
           expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
         }, 20_000);
 
-        it('on ink, the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
+        it('the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
           const pidFile = await writeFakeInk();
           let stoppedAt = 0;
-          const second = wireInk(() => stoppedAt);
-          const first = turn(INKLING, fromOwner, OWNER, onInk);
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
           leaderPid = await pidOf(pidFile);
           const queued = lastService.handleMessage(
             createMockRequest({ userId: OWNER, ...fromOwner })
@@ -1600,29 +1647,8 @@ describe('SessionService', () => {
           expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
         }, 20_000);
 
-        it('the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
-          const pidFile = await writeFake();
-          let stoppedAt = 0;
-          const second = wire(() => stoppedAt);
-          const first = turn(INKLING);
-          leaderPid = await pidOf(pidFile);
-          const queued = lastService.handleMessage(
-            createMockRequest({ userId: OWNER, ...fromOwner })
-          );
-          // Long enough to reach the session lock and queue behind it.
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
-          stoppedAt = Date.now();
-          expect(cancelInklingTurns(SB)).toBe(1);
-          const [, next] = await Promise.all([first, queued]);
-          expect(next.success).toBe(true);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
-          expect(second.leaderAlive).toBe(false);
-          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
-        }, 20_000);
-
         it('Stop, then the owner sends at once: a TERM-ignoring tool the stopped turn left holds the next turn until it is gone (Lumen 42298771)', async () => {
-          const files = await writeFakeWithStubbornTool();
+          const files = await writeFakeInkWithStubbornTool();
           let stoppedAt = 0;
           const second = wire(() => stoppedAt);
           const first = turn(INKLING);
@@ -1635,7 +1661,7 @@ describe('SessionService', () => {
             createMockRequest({ userId: OWNER, ...fromOwner })
           );
           expect(next.success).toBe(true);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
           // The leader went at once; the tool only at the group's SIGKILL,
           // and the next turn waited for it.
           expect(second.leaderAlive).toBe(false);
@@ -1649,28 +1675,28 @@ describe('SessionService', () => {
             stdio: 'ignore',
           });
           toolPid = survivor.pid as number;
-          vi.mocked(mockClaudeRunner.run).mockResolvedValueOnce({
+          vi.mocked(mockInkRunner.run).mockResolvedValueOnce({
             success: false,
             responses: [],
-            backendSessionId: 'claude-abc',
-            error: 'Claude Code turn cancelled; its processes did not confirm they had stopped',
+            backendSessionId: 'ink-session-1',
+            error: 'ink chat turn cancelled; its processes did not confirm they had stopped',
             stopUnconfirmed: { leaderExited: true, pgid: toolPid, group: 'unknown' },
           } as never);
           await turn(INKLING);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
 
           const refused = await turn(INKLING);
           expect(refused).toMatchObject({
             errorCode: 'INKLING_TURN_REFUSED',
             classification: { retryable: true },
           });
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
 
           const gone = new Promise((resolve) => survivor.once('exit', resolve));
           process.kill(toolPid, 'SIGKILL');
           await gone;
           await turn(INKLING);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
         }, 20_000);
 
         it('a fenced inkling is refused, retryably, spawning and counting nothing, until its group is observed gone', async () => {
@@ -1690,7 +1716,7 @@ describe('SessionService', () => {
             classification: { retryable: true },
           });
           expect(refused.error).toMatch(/not yet confirmed stopped/);
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
           expect(turnsCounted()).toBeUndefined();
 
           const gone = new Promise((resolve) => survivor.once('exit', resolve));
@@ -1698,7 +1724,7 @@ describe('SessionService', () => {
           await gone;
           const admitted = await turn(INKLING);
           expect(admitted.errorCode).not.toBe('INKLING_TURN_REFUSED');
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
         }, 20_000);
 
         /** A disposable group of our own, standing in for a stopped turn's survivors. */
@@ -1741,38 +1767,31 @@ describe('SessionService', () => {
             classification: { retryable: true },
           });
           expect(refused.error).toMatch(/not yet confirmed stopped/);
-          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expectNothingRan();
           // Nothing ran, so the turn records no outcome and leaves no run registered.
-          expect(update.mock.calls.at(-1)?.[1]).toEqual({ backend: 'claude-code' });
+          expect(update.mock.calls.at(-1)?.[1]).toEqual({ backend: 'ink' });
           expect(activeRunCount()).toBe(0);
           // No turn-count slot is claimed at admission any more (the cap is
           // gone), so a late refusal spends nothing.
           expect(turnsCounted()).toBeUndefined();
         }, 20_000);
 
-        it("a fence that lands during the runner's own preparation stops it at the spawn seam: nothing starts", async () => {
+        it('a fence that lands once the runner is entered stops it at the spawn seam: nothing starts', async () => {
           const pgid = startSurvivor();
-          // A fake claude that records its pid and exits at once, so a spawn
-          // by mistake ends cleanly and leaves its mark.
-          const dir = await mkdtemp(join(tmpdir(), 'fenced-at-spawn-'));
+          // A fake ink that records its pid and exits at once, so a spawn by
+          // mistake ends cleanly and leaves its mark.
+          const dir = await installFakeInk('fenced-at-spawn-', [
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+          ]);
           const pidFile = join(dir, 'leader.pid');
-          const script = join(dir, 'claude.mjs');
-          writeFileSync(
-            script,
-            [
-              '#!/usr/bin/env node',
-              "import { writeFileSync } from 'fs';",
-              `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
-            ].join('\n'),
-            { mode: 0o755 }
-          );
-          stopFake.binary = script;
-          const real = new ClaudeRunner();
-          vi.mocked(mockClaudeRunner.run).mockImplementationOnce((message, options) => {
-            const ran = real.run(message, options);
-            // The real runner is suspended in its preparation; the fence lands now.
+          const real = new InkRunner();
+          vi.mocked(mockInkRunner.run).mockImplementationOnce((message, options) => {
+            // Past every check SessionService makes: only the runner's own
+            // spawn seam is left to see this fence. InkRunner does not await
+            // between entering its spawn and asking that seam, so the fence
+            // has to be in place before it is entered.
             fenceInkling(SB, { leaderExited: true, pgid, group: 'alive' });
-            return ran;
+            return real.run(message, options);
           });
 
           const refused = await turn(INKLING);
@@ -1782,7 +1801,7 @@ describe('SessionService', () => {
             classification: { retryable: true },
           });
           expect(refused.error).toMatch(/not yet confirmed stopped/);
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
           expect(existsSync(pidFile)).toBe(false);
           expect(activeRunCount()).toBe(0);
           expect(liveInklingTurns(SB)).toBe(0);
@@ -1798,7 +1817,7 @@ describe('SessionService', () => {
           },
         });
         expect(result.errorCode).not.toBe('ROUTING_REFUSED');
-        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(mockInkRunner.run).toHaveBeenCalled();
         expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
       });
 
@@ -1807,7 +1826,7 @@ describe('SessionService', () => {
           { studioId: '77777777-7777-4777-8777-777777777777' },
           { studioHint: 'some-studio' },
         ]) {
-          vi.mocked(mockClaudeRunner.run).mockClear();
+          vi.mocked(mockInkRunner.run).mockClear();
           const result = await turn(INKLING, {
             ...fromOwner,
             metadata: { ...fromOwner.metadata, threadKey: 'chat:conversation-named', ...named },
@@ -1844,7 +1863,7 @@ describe('SessionService', () => {
           mockInkRunner
         );
         vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ sbId: SB, userId: OWNER } as never)
+          createMockSession({ sbId: SB, userId: OWNER, backendSessionId: null } as never)
         );
         const results = [];
         for (let i = 0; i < 3; i++) {
@@ -1852,7 +1871,7 @@ describe('SessionService', () => {
             await service.handleMessage(createMockRequest({ userId: OWNER, ...fromOwner }))
           );
         }
-        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(3);
         for (const result of results) {
           expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
         }
@@ -1861,7 +1880,7 @@ describe('SessionService', () => {
 
       it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
         const result = await turn(INKLING, fromOwner, '');
-        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expectNothingRan();
         expect(result).toMatchObject({
           success: false,
           errorCode: 'INKLING_TURN_REFUSED',
@@ -1874,7 +1893,7 @@ describe('SessionService', () => {
           const result = await turn(INKLING, { sender: { id, name: 'not a person here' } });
           expect(result.errorCode, id).toBe('INKLING_TURN_REFUSED');
         }
-        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expectNothingRan();
       });
 
       it('an inkling not born under the test, or on another account, never wakes', async () => {
@@ -1884,7 +1903,7 @@ describe('SessionService', () => {
           'INKLING_TURN_REFUSED',
           'INKLING_TURN_REFUSED',
         ]);
-        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expectNothingRan();
       });
 
       it('any other SB is untouched, gate on or off', async () => {
