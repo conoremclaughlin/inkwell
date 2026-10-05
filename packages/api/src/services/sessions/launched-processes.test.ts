@@ -1,9 +1,11 @@
 import { spawn, type ChildProcess } from 'child_process';
-import { readFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   configureLaunchRecording,
+  couldBeBackend,
   findTaggedProcesses,
   holdSurvivors,
   launchHoldFor,
@@ -67,14 +69,33 @@ function fakeStore(rows: LaunchRow[]) {
 }
 
 /** A node child, whose environment its own user can read on macOS too (`sh` and `sleep` hide theirs). */
-function startTagged(env: Record<string, string>, args: string[] = []): ChildProcess {
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', ...args], {
+function startTagged(
+  env: Record<string, string>,
+  args: string[] = [],
+  executable: string = process.execPath
+): ChildProcess {
+  const child = spawn(executable, ['-e', 'setTimeout(() => {}, 30000)', ...args], {
     stdio: 'ignore',
     env: { ...process.env, ...env },
   });
   children.push(child);
   return child;
 }
+
+/** Node, started as `claude`: what a Claude Code launch looks like in the process table. */
+const fakeBackendDirs: string[] = [];
+function asClaude(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'launch-backend-'));
+  fakeBackendDirs.push(dir);
+  const link = join(dir, 'claude');
+  symlinkSync(process.execPath, link);
+  return link;
+}
+afterEach(() => {
+  for (const dir of fakeBackendDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+const emptyInventory = async () => ({ tagged: new Map(), unreadable: [] });
 
 function row(over: Partial<LaunchRow> & { pid: number | null }): LaunchRow {
   return {
@@ -300,19 +321,48 @@ describe('reserveLaunch', () => {
   });
 });
 
-describe('launches whose pid never reached the row', () => {
-  it('finds a process by the launch id in its environment, and stops it', async () => {
-    const child = startTagged({ INK_LAUNCH_ID: 'row-tagged' });
+describe('launches found by their tag', () => {
+  it('finds a launch by the id in its environment, and stops it, when its pid never reached the row', async () => {
+    const child = startTagged({ INK_LAUNCH_ID: 'row-tagged' }, [], asClaude());
     await vi.waitFor(async () =>
-      expect((await findTaggedProcesses(new Set(['row-tagged']))).get('row-tagged')).toEqual([
-        { pid: child.pid, pgid: null },
-      ])
+      expect(
+        (await findTaggedProcesses(new Set(['row-tagged']))).tagged
+          .get('row-tagged')
+          ?.map((p) => p.pid)
+      ).toEqual([child.pid])
     );
     const { store, exitedIds } = fakeStore([row({ id: 'row-tagged', pid: null })]);
     const outcome = await sweep(store);
     expect(outcome.stopped.map((r) => r.pid)).toEqual([child.pid]);
     await exited(child);
     expect(exitedIds).toEqual(['row-tagged']);
+  });
+
+  it('finds a later attempt by its tag while the row still names an earlier one that has exited', async () => {
+    const earlier = start('true');
+    await exited(earlier);
+    const later = startTagged({ INK_LAUNCH_ID: 'row-retried' }, [], asClaude());
+    await vi.waitFor(async () =>
+      expect(
+        (await findTaggedProcesses(new Set(['row-retried']))).tagged.get('row-retried')
+      ).toHaveLength(1)
+    );
+    const { store, exitedIds } = fakeStore([row({ id: 'row-retried', pid: earlier.pid! })]);
+    const outcome = await sweep(store);
+    expect(outcome.stopped.map((r) => r.pid)).toEqual([later.pid]);
+    await exited(later);
+    expect(exitedIds).toEqual(['row-retried']);
+  });
+
+  it('never signals a process that is not the backend, whatever its environment says', async () => {
+    // Another variable's value holding the tag's text: space-joined `ps -E`
+    // cannot tell it from the tag, so the process's own name decides.
+    const bystander = startTagged({ FIXTURE_NOTE: 'prefix INK_LAUNCH_ID=row-bystander suffix' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const { store } = fakeStore([row({ id: 'row-bystander', pid: null })]);
+    const outcome = await sweep(store);
+    expect(outcome.stopped).toEqual([]);
+    expect(alive(bystander.pid!)).toBe(true);
   });
 
   it('records a launch no process carries as gone, without signalling anything', async () => {
@@ -322,7 +372,7 @@ describe('launches whose pid never reached the row', () => {
       const outcome = await stopSurvivingLaunches(store, {
         serverInstance: INSTANCE,
         bootId: BOOT,
-        findTagged: async () => new Map(),
+        findTagged: emptyInventory,
       });
       expect(outcome.gone.map((r) => r.id)).toEqual(['row-untagged']);
       expect(exitedIds).toEqual(['row-untagged']);
@@ -330,6 +380,44 @@ describe('launches whose pid never reached the row', () => {
     } finally {
       kill.mockRestore();
     }
+  });
+
+  it('holds a launch, and its session, while a process that could be its backend cannot be read', async () => {
+    const suspect = start('sleep 30');
+    const { store, exitedIds } = fakeStore([row({ id: 'row-unread', pid: null })]);
+    const outcome = await stopSurvivingLaunches(store, {
+      serverInstance: INSTANCE,
+      bootId: BOOT,
+      findTagged: async () => ({
+        tagged: new Map(),
+        unreadable: [{ pid: suspect.pid!, pgid: null, command: '/opt/bin/claude --print' }],
+      }),
+    });
+    expect(outcome.uncertain.map((r) => [r.id, r.pid])).toEqual([['row-unread', suspect.pid]]);
+    expect(exitedIds).toEqual([]);
+    holdSurvivors(outcome);
+    try {
+      expect(launchHoldFor('session-fixture')).toMatch(/may still be running/);
+      suspect.kill('SIGKILL');
+      await exited(suspect);
+      expect(launchHoldFor('session-fixture')).toBeUndefined();
+    } finally {
+      resetLaunchHolds();
+    }
+  });
+
+  it('does not hold a launch for an unreadable process that cannot be its backend', async () => {
+    const { store, exitedIds } = fakeStore([row({ id: 'row-other', pid: null })]);
+    const outcome = await stopSurvivingLaunches(store, {
+      serverInstance: INSTANCE,
+      bootId: BOOT,
+      findTagged: async () => ({
+        tagged: new Map(),
+        unreadable: [{ pid: process.pid, pgid: null, command: '/bin/sleep 30' }],
+      }),
+    });
+    expect(outcome.gone.map((r) => r.id)).toEqual(['row-other']);
+    expect(exitedIds).toEqual(['row-other']);
   });
 
   it('fails the sweep, holding every turn, when the process table cannot be read', async () => {
@@ -347,10 +435,33 @@ describe('launches whose pid never reached the row', () => {
   });
 
   it('never reads an argument that mentions a launch id as its tag', async () => {
-    const child = startTagged({}, ['INK_LAUNCH_ID=row-arg']);
+    const child = startTagged({}, ['INK_LAUNCH_ID=row-arg'], asClaude());
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(alive(child.pid!)).toBe(true);
-    expect((await findTaggedProcesses(new Set(['row-arg']))).get('row-arg')).toBeUndefined();
+    expect((await findTaggedProcesses(new Set(['row-arg']))).tagged.get('row-arg')).toBeUndefined();
+  });
+
+  it.skipIf(process.platform !== 'darwin')(
+    'reports a process whose environment macOS hides as unreadable',
+    async () => {
+      const child = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+      children.push(child);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const { unreadable } = await findTaggedProcesses(new Set(['row-none']));
+      expect(unreadable.find((p) => p.pid === child.pid)?.command).toMatch(/sleep 30/);
+    }
+  );
+
+  it('knows each backend by its executable or the script its interpreter runs', () => {
+    expect(couldBeBackend('claude-code', '/Users/x/.local/bin/claude --print')).toBe(true);
+    expect(couldBeBackend('codex-cli', 'node /opt/homebrew/bin/codex exec')).toBe(true);
+    expect(couldBeBackend('codex-cli', '/x/codex resume abc')).toBe(true);
+    expect(couldBeBackend('gemini', 'node /x/lib/gemini.js -p')).toBe(true);
+    expect(couldBeBackend('ink', 'node /x/packages/cli/dist/cli.js chat')).toBe(true);
+    expect(couldBeBackend('antigravity', '/x/agy chat')).toBe(true);
+    expect(couldBeBackend('claude-code', 'node -e setTimeout()')).toBe(false);
+    expect(couldBeBackend('claude-code', '/bin/zsh -c claude')).toBe(false);
+    expect(couldBeBackend('some-new-backend', 'anything')).toBe(true);
   });
 });
 

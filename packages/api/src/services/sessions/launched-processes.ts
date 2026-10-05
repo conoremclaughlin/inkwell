@@ -20,7 +20,7 @@
  * database function decides anything.
  */
 import { execFile } from 'child_process';
-import { readdir, readFile } from 'fs/promises';
+import { readdir, readFile, stat as stat_ } from 'fs/promises';
 import { hostname } from 'os';
 import { promisify } from 'util';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -70,55 +70,85 @@ export interface TaggedProcess {
   pid: number;
   /** Set only when the process leads its own group. */
   pgid: number | null;
+  /** Its command line, which says whether it could be a backend's launch. */
+  command: string;
+}
+
+export interface ProcessInventory {
+  /** Processes carrying one of the asked-for launch ids, by id. */
+  tagged: Map<string, TaggedProcess[]>;
+  /**
+   * This user's processes whose environment could not be read, with their
+   * command line: any one of them could be carrying a tag, so no match is not
+   * proof of exit while one of them could be the launch (`couldBeBackend`).
+   */
+  unreadable: TaggedProcess[];
 }
 
 /**
- * The processes on this host carrying one of these launch ids in their
- * environment, by id. Read from /proc on Linux and `ps -E` on macOS, both of
- * which show a process's environment to its own user. Throws when the table
- * cannot be read, and on any other platform: an unread table is not an empty
- * one.
+ * This user's processes, read for launch tags: from /proc on Linux, and from
+ * `ps -E` on macOS, which shows a process's environment to its own user unless
+ * the process is a system binary or has rewritten its argument area. Throws
+ * when the table cannot be read, and on any other platform: an unread table is
+ * not an empty one.
  */
-export async function findTaggedProcesses(ids: Set<string>): Promise<Map<string, TaggedProcess[]>> {
-  const found = new Map<string, TaggedProcess[]>();
-  const add = (id: string, pid: number, pgid: number) => {
-    if (!ids.has(id) || pid === process.pid) return;
-    found.set(id, [...(found.get(id) ?? []), { pid, pgid: pgid === pid ? pid : null }]);
-  };
+export async function findTaggedProcesses(ids: Set<string>): Promise<ProcessInventory> {
+  const inventory: ProcessInventory = { tagged: new Map(), unreadable: [] };
+  const groupOf = (pid: number, pgid: number) => (pgid === pid ? pid : null);
   const prefix = `${LAUNCH_TAG}=`;
+  const add = (id: string, pid: number, pgid: number, command: string) => {
+    if (!ids.has(id)) return;
+    const found = inventory.tagged.get(id) ?? [];
+    inventory.tagged.set(id, [...found, { pid, pgid: groupOf(pid, pgid), command }]);
+  };
+  const uid = process.getuid?.();
   if (process.platform === 'linux') {
     for (const entry of await readdir('/proc')) {
       if (!/^\d+$/.test(entry)) continue;
-      let environ: string;
+      const pid = Number(entry);
+      if (pid === process.pid) continue;
       let stat: string;
       try {
-        [environ, stat] = await Promise.all([
-          readFile(`/proc/${entry}/environ`, 'utf8'),
+        const [info, text] = await Promise.all([
+          stat_(`/proc/${entry}`),
           readFile(`/proc/${entry}/stat`, 'utf8'),
         ]);
+        if (info.uid !== uid) continue;
+        stat = text;
       } catch {
-        continue; // Exited meanwhile, or not ours to read.
+        continue; // Exited meanwhile.
       }
-      const tag = environ.split('\0').find((pair) => pair.startsWith(prefix));
-      if (!tag) continue;
       // Fields after the parenthesised name: state, ppid, pgrp.
-      const pgrp = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[2]);
-      add(tag.slice(prefix.length), Number(entry), pgrp);
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (fields[0] === 'Z') continue;
+      const pgrp = Number(fields[2]);
+      const commandOf = async () =>
+        (await readFile(`/proc/${entry}/cmdline`, 'utf8').catch(() => '')).split('\0').join(' ');
+      try {
+        const environ = await readFile(`/proc/${entry}/environ`, 'utf8');
+        const tag = environ.split('\0').find((pair) => pair.startsWith(prefix));
+        if (tag) add(tag.slice(prefix.length), pid, pgrp, await commandOf());
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ESRCH') continue;
+        inventory.unreadable.push({ pid, pgid: groupOf(pid, pgrp), command: await commandOf() });
+      }
     }
-    return found;
+    return inventory;
   }
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' || uid === undefined) {
     throw new Error(`launch tags cannot be read on ${process.platform}`);
   }
   // `ps -E` prints the environment after the arguments; the same listing
   // without it says where the arguments end, so an argument that merely
-  // mentions a tag is never read as one.
+  // mentions a tag is never read as one, and a line with nothing after its
+  // arguments is a process whose environment could not be read.
   const opts = {
     timeout: 15_000,
     maxBuffer: 256 * 1024 * 1024,
     env: { ...process.env, LC_ALL: 'C' },
   };
-  const columns = ['-ww', '-ax', '-o', 'pid=,pgid=,command='];
+  const columns = ['-ww', '-U', String(uid), '-o', 'pid=,pgid=,stat=,command='];
   const [plain, withEnv] = await Promise.all([
     exec('ps', columns, opts),
     exec('ps', ['-E', ...columns], opts),
@@ -129,15 +159,47 @@ export async function findTaggedProcesses(ids: Set<string>): Promise<Map<string,
     if (pid) argsOf.set(pid, line);
   }
   for (const line of withEnv.stdout.split('\n')) {
-    const match = /^\s*(\d+)\s+(\d+)/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
     const args = match ? argsOf.get(match[1]) : undefined;
     if (!match || args === undefined || !line.startsWith(args)) continue;
-    for (const pair of line.slice(args.length).split(' ')) {
-      if (pair.startsWith(prefix))
-        add(pair.slice(prefix.length), Number(match[1]), Number(match[2]));
+    const pid = Number(match[1]);
+    const pgid = Number(match[2]);
+    if (pid === process.pid || match[3].startsWith('Z')) continue;
+    const command = /^\s*\d+\s+\d+\s+\S+\s+(.*)$/.exec(args)?.[1] ?? '';
+    const environment = line.slice(args.length).trim();
+    if (environment === '') {
+      inventory.unreadable.push({ pid, pgid: groupOf(pid, pgid), command });
+      continue;
+    }
+    // Space-joined, so another variable's value can contain this text too;
+    // the sweep signals a match only when the process is the backend itself.
+    for (const pair of environment.split(' ')) {
+      if (pair.startsWith(prefix)) add(pair.slice(prefix.length), pid, pgid, command);
     }
   }
-  return found;
+  return inventory;
+}
+
+/** The executables each backend is started as: a process named otherwise is not its launch. */
+const BACKEND_EXECUTABLES: Record<string, string[]> = {
+  'claude-code': ['claude'],
+  'codex-cli': ['codex', 'codex.js'],
+  gemini: ['gemini', 'gemini.js'],
+  antigravity: ['agy'],
+  ink: ['ink', 'cli.js'],
+};
+
+/**
+ * Whether a process could be this backend's launch, from its command line: its
+ * executable, or the script a node or shell interpreter runs, is one the
+ * backend is started as. An unknown backend could be anything.
+ */
+export function couldBeBackend(backend: string, command: string): boolean {
+  const names = BACKEND_EXECUTABLES[backend];
+  if (!names) return true;
+  const [first = '', second = ''] = command.trim().split(/\s+/);
+  const base = (word: string) => word.slice(word.lastIndexOf('/') + 1);
+  return names.includes(base(first)) || names.includes(base(second));
 }
 
 /** What names this host's current boot: a different value is a different boot. */
@@ -396,7 +458,7 @@ export interface SweepOptions {
   /** How long each signal gets before the next, harder one. */
   graceMs?: number;
   identityOf?: (pid: number) => Promise<string | null>;
-  findTagged?: (ids: Set<string>) => Promise<Map<string, TaggedProcess[]>>;
+  findTagged?: (ids: Set<string>) => Promise<ProcessInventory>;
 }
 
 function pidAlive(pid: number): boolean {
@@ -462,64 +524,59 @@ export async function stopSurvivingLaunches(
   const findTagged = options.findTagged ?? findTaggedProcesses;
   const outcome: SweepOutcome = { stopped: [], gone: [], uncertain: [], unstoppable: [] };
   const rows = await store.listOpen(options.serverInstance);
+  // Nothing of an earlier boot survives it.
+  const current = rows.filter((row) => row.bootId === options.bootId);
+  outcome.gone.push(...rows.filter((row) => row.bootId !== options.bootId));
 
-  // A row of this boot whose pid never landed is resolved by the processes
-  // carrying its id: each one found is that launch, whatever its pid, so it is
-  // stopped without a start time to compare. None found means it has gone.
-  const thisBoot = (row: LaunchRow) => row.bootId === options.bootId;
-  const unattached = rows.filter((row) => row.pid === null && thisBoot(row));
-  const tagged =
-    unattached.length > 0 ? await findTagged(new Set(unattached.map((row) => row.id))) : new Map();
-  const confirmed = new Set<LaunchRow>();
-  const candidates = rows.flatMap((row) => {
-    if (row.pid !== null || !thisBoot(row)) return [row];
-    const found: TaggedProcess[] = tagged.get(row.id) ?? [];
-    if (found.length === 0) outcome.gone.push(row);
-    return found.map((proc) => {
-      const resolved = { ...row, pid: proc.pid, pgid: proc.pgid };
-      confirmed.add(resolved);
-      return resolved;
-    });
-  });
+  // Every launch of this boot is looked for by its tag, whatever pid its row
+  // names: one launch can start several processes (a fallback attempt), and
+  // the row names only the last pid written, or none.
+  const inventory =
+    current.length > 0
+      ? await findTagged(new Set(current.map((row) => row.id)))
+      : { tagged: new Map<string, TaggedProcess[]>(), unreadable: [] };
 
   await Promise.all(
-    candidates.map(async (row) => {
-      // Nothing of an earlier boot survives it.
-      if (!thisBoot(row) || row.pid === null) {
-        outcome.gone.push(row);
-        return;
-      }
-      if (confirmed.has(row)) {
-        if (await stop(row, graceMs)) outcome.stopped.push(row);
-        else outcome.unstoppable.push(row);
-        return;
-      }
-      const leaderAlive = pidAlive(row.pid);
-      if (!leaderAlive) {
-        // With the leader gone there is no start time to compare, and a group
-        // number can be reused once the old group has emptied. A group seen
-        // empty is gone; one still populated, or one that cannot be probed,
-        // is never signalled or cleared on a guess.
-        const group = row.pgid !== null ? probeGroup(row.pgid) : 'empty';
-        if (group === 'empty') {
-          outcome.gone.push(row);
-          return;
-        }
-        outcome.uncertain.push(row);
-        return;
-      } else {
-        const now = await identityOf(row.pid);
-        if (now === null || row.startIdentity === null) {
+    current.map(async (row) => {
+      // A process carrying the tag that is the backend itself is that launch,
+      // and is stopped without a start time to compare. One that is not (a
+      // tool the backend started, or another variable's value that happens to
+      // hold the text) is never signalled on the tag alone.
+      const found = (inventory.tagged.get(row.id) ?? []).filter((proc) =>
+        couldBeBackend(row.backend, proc.command)
+      );
+      const targets: LaunchRow[] = found.map((proc) => ({
+        ...row,
+        pid: proc.pid,
+        pgid: proc.pgid,
+      }));
+      let unresolved = false;
+      if (row.pid !== null && !found.some((proc) => proc.pid === row.pid)) {
+        const verdict = await judgeRecordedPid(row as LaunchRow & { pid: number }, identityOf);
+        if (verdict === 'running') targets.push(row);
+        if (verdict === 'uncertain') {
           outcome.uncertain.push(row);
-          return;
-        }
-        if (now !== row.startIdentity) {
-          outcome.gone.push(row);
-          return;
+          unresolved = true;
         }
       }
-      if (await stop(row, graceMs)) outcome.stopped.push(row);
-      else outcome.unstoppable.push(row);
+      for (const target of targets) {
+        if (await stop(target, graceMs)) outcome.stopped.push(target);
+        else outcome.unstoppable.push(target);
+      }
+      if (targets.length > 0 || unresolved) return;
+      // Nothing carries the tag. That is proof of exit only if no process
+      // whose environment could not be read could be this launch; each one
+      // that could holds the row open, and its session, until it exits.
+      const suspects = inventory.unreadable.filter((proc) =>
+        couldBeBackend(row.backend, proc.command)
+      );
+      if (suspects.length > 0) {
+        outcome.uncertain.push(
+          ...suspects.map((proc) => ({ ...row, pid: proc.pid, pgid: proc.pgid }))
+        );
+        return;
+      }
+      outcome.gone.push(row);
     })
   );
 
@@ -528,6 +585,26 @@ export async function stopSurvivingLaunches(
   const done = new Set([...outcome.stopped, ...outcome.gone].map((row) => row.id));
   await store.markExited([...done].filter((id) => !open.has(id)));
   return outcome;
+}
+
+/**
+ * What the row's recorded pid says: still the launch (`running`), gone, or
+ * alive with nothing to confirm it by (`uncertain`). With the leader gone
+ * there is no start time to compare, and a group number can be reused once
+ * the old group has emptied: a group seen empty is gone, one still populated
+ * or one that cannot be probed is never signalled or cleared on a guess.
+ */
+async function judgeRecordedPid(
+  row: LaunchRow & { pid: number },
+  identityOf: (pid: number) => Promise<string | null>
+): Promise<'running' | 'gone' | 'uncertain'> {
+  if (!pidAlive(row.pid)) {
+    const group = row.pgid !== null ? probeGroup(row.pgid) : 'empty';
+    return group === 'empty' ? 'gone' : 'uncertain';
+  }
+  const now = await identityOf(row.pid);
+  if (now === null || row.startIdentity === null) return 'uncertain';
+  return now === row.startIdentity ? 'running' : 'gone';
 }
 
 /**

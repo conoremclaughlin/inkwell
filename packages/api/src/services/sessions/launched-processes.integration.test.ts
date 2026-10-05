@@ -4,6 +4,9 @@
  * on another port never seeing it (task 2562f0f8).
  */
 import { spawn, type ChildProcess } from 'child_process';
+import { mkdtempSync, rmSync, symlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getDataComposer } from '../../data/composer';
@@ -101,7 +104,11 @@ describe('launched_processes', () => {
       bootId: BOOT,
       serverInstance: MAIN,
     });
-    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+    // Node, started as `codex`: the sweep signals only a process that is the backend.
+    const dir = mkdtempSync(join(tmpdir(), 'launch-backend-'));
+    const codex = join(dir, 'codex');
+    symlinkSync(process.execPath, codex);
+    const child = spawn(codex, ['-e', 'setTimeout(() => {}, 30000)'], {
       stdio: 'ignore',
       env: { ...process.env, INK_LAUNCH_ID: id },
     });
@@ -120,5 +127,6 @@ describe('launched_processes', () => {
         : child.once('exit', resolve)
     );
     expect(await store.listOpen(MAIN)).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
   });
 });
