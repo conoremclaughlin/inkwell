@@ -19,85 +19,54 @@
  * A journal receipt is evidence that a record committed, never permission to
  * spawn; permission comes from `DispatchAuthority`, per spawn.
  *
- * Unknown means refused. A missing port, a stopped journal, a projection other
- * than `recorded`, a barrier that is not `clear`, or a previous spawn in the
- * same turn without proof that nothing of it still runs: each refuses before
- * a process starts. A spawn that did start and could not be bound stays
- * unresolved; it is never reported as `not_spawned`.
+ * Unknown means refused, and an obligation once made is never forgotten. A
+ * missing port, a stopped journal, a projection other than `recorded`, a
+ * barrier that is not `clear`, or any earlier obligation of the turn not
+ * proved settled: each refuses before a process starts. An intent whose append
+ * threw may have committed, so it stays an obligation; a spawn that started and
+ * could not be bound stays unresolved; neither is ever reported `not_spawned`.
  *
- * DARK. No production caller yet. The journal types below are structural
- * copies of the contract in packages/shared/src/runtime/journal-record.ts and
- * journal-writer.ts on #701, to be replaced by imports once that lands.
+ * DARK. No production caller yet.
  */
 
 import { randomUUID } from 'crypto';
-
-// --- Journal contract (structural, type-only) -------------------------------
-
-export interface RunJournalTarget {
-  tenureId: string;
-  epoch: string;
-  commandUuid: string;
-  invocationId: string | null;
-}
-
-export interface RunJournalRecord {
-  type: string;
-  target: RunJournalTarget | null;
-  body: Record<string, unknown>;
-}
-
-export type RunJournalProjection =
-  | 'none'
-  | 'recorded'
-  | 'already_recorded'
-  | 'contradiction'
-  | 'needs_reconciler';
-
-export interface RunJournalReceipt {
-  outcome: 'committed' | 'already_committed';
-  projection: RunJournalProjection;
-  entry: { eid: number; type: string };
-  committedEid: number;
-}
+import type {
+  JournalCommitReceipt,
+  JournalRecord,
+  JournalTarget,
+  JournalWriter,
+  SpawnBindingBody,
+  SpawnIntentBody,
+  SpawnObservationBody,
+} from '@inklabs/shared/runtime';
 
 /** The part of `JournalWriter` the runner path uses. */
 export interface RunJournal {
-  append(record: RunJournalRecord): Promise<RunJournalReceipt>;
+  append(record: JournalRecord): Promise<JournalCommitReceipt>;
   /** Set once the writer has stopped; it never writes again after that. */
-  readonly failure: { code: string } | undefined;
+  readonly failure: JournalWriter['failure'];
 }
 
-export type SpawnAdapter = 'claude-code' | 'codex-cli' | 'ink' | 'gemini' | 'antigravity';
-export type SpawnHostMode = 'server_hosted' | 'interactive_wrapper' | 'native_external';
-export type SpawnExecution =
-  | { kind: 'known'; hostId: string; bootId: string }
-  | { kind: 'unverified'; reasonCode: string };
-
-export type SpawnContainment =
-  | { kind: 'unknown' }
-  | { kind: 'process_group'; pgid: number; evidenceRef: string }
-  | { kind: 'attested_tree'; identity: string; evidenceRef: string };
-
-export type SpawnObservation =
-  | {
-      kind:
-        | 'parent_exited'
-        | 'group_empty'
-        | 'tree_quiescent'
-        | 'not_spawned'
-        | 'child_alive'
-        | 'contradiction';
-      evidenceRef: string;
-    }
-  | { kind: 'unknown'; reasonCode: string };
+/** A physical spawn's intent: exactly the journal's intent body. */
+export type SpawnAttempt = SpawnIntentBody;
+export type SpawnProcessBinding = Omit<
+  Extract<SpawnBindingBody, { kind: 'process_binding' }>,
+  'kind'
+>;
+export type SpawnObservation = SpawnObservationBody;
 
 /**
  * The observations that prove nothing of a spawn still runs. `parent_exited`
  * and `group_empty` are recorded as what they are and never count: an escaped
  * descendant survives both.
  */
-const SETTLED_OBSERVATIONS = new Set(['tree_quiescent', 'not_spawned']);
+const SETTLED_OBSERVATIONS: ReadonlySet<string> = new Set(['tree_quiescent', 'not_spawned']);
+/** Observations that reopen any earlier settlement, permanently. */
+const NEGATIVE_OBSERVATIONS: ReadonlySet<string> = new Set([
+  'child_alive',
+  'contradiction',
+  'unknown',
+]);
 
 // --- Authority ports ---------------------------------------------------------
 
@@ -111,11 +80,11 @@ export interface RunRequest {
 }
 
 export interface AdmittedTurn {
-  sessionId: string;
-  tenureId: string;
-  epoch: string;
-  commandUuid: string;
-  kind: RunKind;
+  readonly sessionId: string;
+  readonly tenureId: string;
+  readonly epoch: string;
+  readonly commandUuid: string;
+  readonly kind: RunKind;
 }
 
 export type TurnAdmission =
@@ -135,7 +104,13 @@ export type DispatchDecision = { outcome: 'dispatch' } | { outcome: 'refused'; r
  * unresolved committed intent; and it has not been dispatched before. Only an
  * explicit `dispatch` permits; a refusal, an error or anything unknown never
  * does, and nothing here reads authority from a journal commit receipt.
- * No production implementation yet (Lumen, pr:701 1c87651b).
+ *
+ * The gate's own same-turn retry check covers only the spawn obligations it
+ * holds. Tree quiescence alone does not clear unresolved external effects, so
+ * the authority must refuse a retry while any of the command's effects are
+ * unresolved. The runner's existing final synchronous owner and cancel checks
+ * (main's `admitSpawn` fence) stay composed with this one-shot gate, never
+ * replaced by it. No production implementation yet (Lumen, pr:701 1c87651b).
  */
 export interface DispatchAuthority {
   authorize(turn: AdmittedTurn, invocationId: string): Promise<DispatchDecision>;
@@ -180,6 +155,11 @@ export interface RunRefusal {
   reason: RunRefusalReason;
   /** The authority's own reason, when it refused. */
   detail?: string;
+  /**
+   * Set when the refusal came after the turn was admitted: the host owns that
+   * turn and must take it through its canonical finish or hold path.
+   */
+  admittedTurn?: AdmittedTurn;
 }
 
 function refusal(reason: RunRefusalReason, detail?: string): RunRefusal {
@@ -188,37 +168,52 @@ function refusal(reason: RunRefusalReason, detail?: string): RunRefusal {
     : { outcome: 'refused', reason, detail };
 }
 
-function barrierRefusal(recovery: RecoveryBarrier, sessionId: string): RunRefusal | null {
-  const state = recovery.state(sessionId);
-  if (state === 'clear') return null;
-  return refusal(state === 'held' ? 'recovery_held' : 'recovery_unverified');
+/** The run-level conditions, checked again after every await. */
+function standingRefusal(
+  ports: RunAdmissionPorts,
+  sessionId: string,
+  signal: AbortSignal | undefined
+): RunRefusal | null {
+  if (signal?.aborted) return refusal('aborted');
+  const state = ports.recovery.state(sessionId);
+  if (state !== 'clear') return refusal(state === 'held' ? 'recovery_held' : 'recovery_unverified');
+  const failure = ports.journal.failure;
+  if (failure) return refusal('journal_failed', failure.code);
+  return null;
 }
 
 // --- The per-spawn gate ------------------------------------------------------
-
-export interface SpawnAttempt {
-  adapter: SpawnAdapter;
-  hostMode: SpawnHostMode;
-  /** The command's attempt identity, inherited by every spawn of the attempt; null when there is none. */
-  attemptId: string | null;
-  deadlineAt: string | null;
-  execution: SpawnExecution;
-}
 
 /** Permission for exactly one physical spawn, valid until used or invalidated. */
 export interface InvocationPermit {
   readonly invocationId: string;
 }
 
+type InvocationPhase =
+  /** Preparation holds the slot; nothing else may prepare until it ends. */
+  | 'reserved'
+  /** The intent append threw: it may have committed. */
+  | 'intent_ambiguous'
+  /** The intent committed, and no spawn followed: dispatch refused or failed, or the run stopped. */
+  | 'undispatched'
+  | 'permitted'
+  | 'spawned';
+
 interface InvocationState {
-  permit: InvocationPermit;
-  spawned: boolean;
-  used: boolean;
-  /** The latest observation recorded for this spawn, if any. */
-  observed: SpawnObservation['kind'] | null;
+  readonly invocationId: string;
+  permit: InvocationPermit | null;
+  phase: InvocationPhase;
+  /** A committed `tree_quiescent` or `not_spawned`, from the frozen submitted record. */
+  settled: boolean;
+  /** A committed negative observation, a held projection or a failed observation write. Sticky. */
+  reopened: boolean;
 }
 
 export type BindOutcome = 'bound' | 'unresolved';
+
+function echoes(receipt: JournalCommitReceipt, type: string, invocationId: string): boolean {
+  return receipt.entry.type === type && receipt.entry.target?.invocationId === invocationId;
+}
 
 export class InvocationGate {
   private readonly invocations: InvocationState[] = [];
@@ -232,7 +227,7 @@ export class InvocationGate {
     this.mint = ports.mintInvocationId ?? randomUUID;
   }
 
-  private target(invocationId: string): RunJournalTarget {
+  private target(invocationId: string): JournalTarget {
     return {
       tenureId: this.turn.tenureId,
       epoch: this.turn.epoch,
@@ -245,83 +240,87 @@ export class InvocationGate {
     return this.invocations.find((state) => state.permit === permit);
   }
 
-  /** Spawns that started without a settled observation: an obligation the next turn sees. */
+  /**
+   * Obligations of this turn not proved settled: reserved, ambiguous,
+   * undispatched, permitted, or spawned without a settled observation, plus
+   * any reopened since. A REPORT for the host, never release or finish
+   * authority: zero does not end the turn; the canonical finish path does.
+   */
   get unresolvedInvocations(): number {
-    return this.invocations.filter(
-      (state) => state.spawned && !(state.observed && SETTLED_OBSERVATIONS.has(state.observed))
-    ).length;
+    return this.invocations.filter((state) => !state.settled || state.reopened).length;
   }
 
   /**
-   * Everything a spawn needs before its process may start: the barrier, the
-   * journal, proof that no earlier spawn of this turn still runs, a committed
+   * Everything a spawn needs before its process may start: the run-level
+   * conditions, no unsettled obligation earlier in the turn, a committed
    * intent, and the dispatch authority's yes. Resolves to a permit, or to a
    * refusal with nothing spawned.
    */
   async prepare(attempt: SpawnAttempt): Promise<InvocationPermit | RunRefusal> {
-    if (this.signal?.aborted) return refusal('aborted');
-    const held = barrierRefusal(this.ports.recovery, this.turn.sessionId);
-    if (held) return held;
-    if (this.ports.journal.failure)
-      return refusal('journal_failed', this.ports.journal.failure.code);
-
+    const standing = standingRefusal(this.ports, this.turn.sessionId, this.signal);
+    if (standing) return standing;
     // A runner's own retry (Claude's fresh-session fallback, an Ink attempt
     // loop iteration) is another physical spawn of the same turn. It runs only
-    // once the earlier spawn is proved quiescent or never started; a failure
-    // string from the first attempt is not that proof.
-    // The same holds for an intent that committed without a spawn (dispatch
-    // refused, or the run stopped at the last check) and for a permit still
-    // outstanding: one spawn at a time, and none after an unproved one.
+    // once every earlier obligation is proved settled; a failure string from
+    // the first attempt is not that proof. A preparation in progress counts.
     if (this.unresolvedInvocations > 0) return refusal('prior_invocation_unresolved');
-    if (this.invocations.some((state) => !state.spawned)) {
-      return refusal('prior_invocation_unresolved');
-    }
 
+    // Reserve synchronously, before the first await, so a concurrent prepare
+    // sees this one and refuses.
     const invocationId = this.mint();
-    let receipt: RunJournalReceipt;
+    const state: InvocationState = {
+      invocationId,
+      permit: null,
+      phase: 'reserved',
+      settled: false,
+      reopened: false,
+    };
+    this.invocations.push(state);
+
+    const intent: SpawnIntentBody = {
+      adapter: attempt.adapter,
+      hostMode: attempt.hostMode,
+      attemptId: attempt.attemptId,
+      deadlineAt: attempt.deadlineAt,
+      execution:
+        attempt.execution.kind === 'known'
+          ? { kind: 'known', hostId: attempt.execution.hostId, bootId: attempt.execution.bootId }
+          : { kind: 'unverified', reasonCode: attempt.execution.reasonCode },
+    };
+    let receipt: JournalCommitReceipt;
     try {
       receipt = await this.ports.journal.append({
         type: 'provider_spawn_intent',
         target: this.target(invocationId),
-        body: {
-          adapter: attempt.adapter,
-          hostMode: attempt.hostMode,
-          attemptId: attempt.attemptId,
-          deadlineAt: attempt.deadlineAt,
-          execution: attempt.execution,
-        },
+        body: intent,
       });
     } catch {
+      state.phase = 'intent_ambiguous';
       return refusal('journal_refused');
     }
+    state.phase = 'undispatched';
     // A fresh invocation id must project as a new obligation. `already_recorded`
     // for an id minted a moment ago means the store and this process disagree.
-    if (receipt.outcome !== 'committed' || receipt.projection !== 'recorded') {
+    if (
+      receipt.outcome !== 'committed' ||
+      receipt.projection !== 'recorded' ||
+      !echoes(receipt, 'provider_spawn_intent', invocationId)
+    ) {
       return refusal('projection_not_recorded', receipt.projection);
     }
-
-    // The intent is committed whatever happens next, so the obligation is
-    // tracked from here, before dispatch is asked: a refused or failed
-    // authorization leaves a committed intent that no later spawn may pass.
-    const state: InvocationState = {
-      permit: Object.freeze({ invocationId }),
-      spawned: false,
-      used: false,
-      observed: null,
-    };
-    this.invocations.push(state);
+    const afterIntent = standingRefusal(this.ports, this.turn.sessionId, this.signal);
+    if (afterIntent) return afterIntent;
 
     let decision: DispatchDecision;
     try {
       decision = await this.ports.dispatch.authorize(this.turn, invocationId);
     } catch {
-      state.used = true;
       return refusal('dispatch_refused');
     }
-    if (decision.outcome !== 'dispatch') {
-      state.used = true;
-      return refusal('dispatch_refused', decision.reason);
-    }
+    if (decision.outcome !== 'dispatch') return refusal('dispatch_refused', decision.reason);
+
+    state.permit = Object.freeze({ invocationId });
+    state.phase = 'permitted';
     return state.permit;
   }
 
@@ -333,13 +332,13 @@ export class InvocationGate {
   admitSpawn(permit: InvocationPermit): RunRefusalReason | undefined {
     const state = this.find(permit);
     if (!state) return 'permit_stale';
-    if (state.used) return 'permit_used';
-    state.used = true;
-    if (this.signal?.aborted) return 'aborted';
-    const held = barrierRefusal(this.ports.recovery, this.turn.sessionId);
-    if (held) return held.reason;
-    if (this.ports.journal.failure) return 'journal_failed';
-    state.spawned = true;
+    if (state.phase !== 'permitted') return 'permit_used';
+    const standing = standingRefusal(this.ports, this.turn.sessionId, this.signal);
+    if (standing) {
+      state.phase = 'undispatched';
+      return standing.reason;
+    }
+    state.phase = 'spawned';
     return undefined;
   }
 
@@ -348,23 +347,26 @@ export class InvocationGate {
    * unresolved: the child may be alive, so it is never reported as not
    * spawned and never retried.
    */
-  async bind(
-    permit: InvocationPermit,
-    binding: { pid: number; startIdentity: string; containment: SpawnContainment }
-  ): Promise<BindOutcome> {
+  async bind(permit: InvocationPermit, binding: SpawnProcessBinding): Promise<BindOutcome> {
     const state = this.find(permit);
-    if (!state?.spawned) return 'unresolved';
+    if (state?.phase !== 'spawned') return 'unresolved';
+    const body: SpawnBindingBody = {
+      kind: 'process_binding',
+      pid: binding.pid,
+      startIdentity: binding.startIdentity,
+      containment: { ...binding.containment },
+    };
     try {
       const receipt = await this.ports.journal.append({
         type: 'provider_spawn_binding',
-        target: this.target(permit.invocationId),
-        body: {
-          kind: 'process_binding',
-          pid: binding.pid,
-          startIdentity: binding.startIdentity,
-          containment: binding.containment,
-        },
+        target: this.target(state.invocationId),
+        body,
       });
+      if (!echoes(receipt, 'provider_spawn_binding', state.invocationId)) return 'unresolved';
+      if (receipt.projection === 'contradiction' || receipt.projection === 'needs_reconciler') {
+        state.reopened = true;
+        return 'unresolved';
+      }
       return receipt.projection === 'recorded' || receipt.projection === 'already_recorded'
         ? 'bound'
         : 'unresolved';
@@ -374,25 +376,41 @@ export class InvocationGate {
   }
 
   /**
-   * Records what was observed about the spawn. Only an observation that
-   * committed and projected cleanly is remembered; anything else leaves the
-   * spawn unresolved.
+   * Records what was observed about the spawn. Local state follows only the
+   * frozen record submitted here, confirmed by the committed echo; never the
+   * caller's object after the await. A failed or held write, or any negative
+   * observation, leaves the spawn unresolved for good.
    */
   async observe(permit: InvocationPermit, observation: SpawnObservation): Promise<void> {
     const state = this.find(permit);
-    if (!state) return;
+    if (state?.phase !== 'spawned') return;
+    const submitted: SpawnObservationBody = Object.freeze(
+      observation.kind === 'unknown'
+        ? { kind: 'unknown', reasonCode: observation.reasonCode }
+        : { kind: observation.kind, evidenceRef: observation.evidenceRef }
+    );
+    let receipt: JournalCommitReceipt;
     try {
-      const receipt = await this.ports.journal.append({
+      receipt = await this.ports.journal.append({
         type: 'provider_spawn_observation',
-        target: this.target(permit.invocationId),
-        body: { ...observation },
+        target: this.target(state.invocationId),
+        body: { ...submitted },
       });
-      if (receipt.projection === 'recorded' || receipt.projection === 'already_recorded') {
-        state.observed = observation.kind;
-      }
     } catch {
-      // Unrecorded: the spawn stays unresolved.
+      state.reopened = true;
+      return;
     }
+    const committedKind = receipt.entry.body.kind;
+    if (
+      !echoes(receipt, 'provider_spawn_observation', state.invocationId) ||
+      committedKind !== submitted.kind ||
+      (receipt.projection !== 'recorded' && receipt.projection !== 'already_recorded')
+    ) {
+      state.reopened = true;
+      return;
+    }
+    if (NEGATIVE_OBSERVATIONS.has(submitted.kind)) state.reopened = true;
+    else if (SETTLED_OBSERVATIONS.has(submitted.kind)) state.settled = true;
   }
 }
 
@@ -402,7 +420,11 @@ export type AdmittedRunOutcome<T> =
   | {
       outcome: 'ran';
       result: T;
-      /** Started spawns without a settled observation. Non-zero holds the session's next command. */
+      turn: AdmittedTurn;
+      /**
+       * Obligations not proved settled. A report: non-zero holds the session's
+       * next command, and zero is not release or finish authority.
+       */
       unresolvedInvocations: number;
     }
   | RunRefusal;
@@ -421,30 +443,39 @@ export async function admittedRun<T>(
   if (!ports?.journal || !ports.turns || !ports.dispatch || !ports.recovery) {
     return refusal('ports_missing');
   }
-  if (options.signal?.aborted) return refusal('aborted');
-  const held = barrierRefusal(ports.recovery, request.sessionId);
-  if (held) return held;
-  if (ports.journal.failure) return refusal('journal_failed', ports.journal.failure.code);
+  const before = standingRefusal(ports, request.sessionId, options.signal);
+  if (before) return before;
 
   let admission: TurnAdmission;
   try {
-    admission = await ports.turns.admit(request);
+    admission = await ports.turns.admit({ ...request });
   } catch {
     return refusal('turn_refused', 'admission_failed');
   }
   if (admission.outcome !== 'admitted') return refusal('turn_refused', admission.reason);
-  if (admission.sessionId !== request.sessionId || admission.commandUuid !== request.commandUuid) {
+  if (
+    admission.sessionId !== request.sessionId ||
+    admission.commandUuid !== request.commandUuid ||
+    admission.kind !== request.kind ||
+    typeof admission.tenureId !== 'string' ||
+    !admission.tenureId ||
+    typeof admission.epoch !== 'string' ||
+    !admission.epoch
+  ) {
     return refusal('turn_refused', 'admission_mismatch');
   }
 
-  const turn: AdmittedTurn = {
+  const turn: AdmittedTurn = Object.freeze({
     sessionId: admission.sessionId,
     tenureId: admission.tenureId,
     epoch: admission.epoch,
     commandUuid: admission.commandUuid,
-    kind: request.kind,
-  };
+    kind: admission.kind,
+  });
+  const after = standingRefusal(ports, request.sessionId, options.signal);
+  if (after) return { ...after, admittedTurn: turn };
+
   const gate = new InvocationGate(ports, turn, options.signal);
   const result = await execute(gate);
-  return { outcome: 'ran', result, unresolvedInvocations: gate.unresolvedInvocations };
+  return { outcome: 'ran', result, turn, unresolvedInvocations: gate.unresolvedInvocations };
 }
