@@ -149,8 +149,16 @@ receiving raw JSON must reject duplicate keys **before** parsing it; this module
 cannot recover duplicates already discarded by a parser. Host objects/Proxies
 are not an untrusted transport format or an isolation boundary.
 
-This slice has fake-store evidence only. It does not implement the database
-adapter/migration, host-wide memory budget, raw transport parser, asynchronous
+The API's `session-journal-store.ts` binds the shared writer to one host-held
+identity/capability and the append/hold RPC contract. Its
+`session-journal-reader.ts` loads a bounded, authorized participant prefix by
+metadata-first keyset queries; it is not an observer endpoint or resume permit.
+Compact entries are bounded separately from SQL's uncompressed JSON text.
+Neither a page bound nor these adapters make whole-history hydration bounded;
+the host must also bound active sessions, aggregate memory and RPC transport.
+
+These adapters currently have mock-transport/query evidence only. They do not
+implement the database migration, host-wide memory budget, raw transport parser, asynchronous
 context/compaction wiring, startup recovery, process containment or live runner
 adoption. No application database or provider is used by these tests. Proposed
 production limits and full existing-event parity still need validation before

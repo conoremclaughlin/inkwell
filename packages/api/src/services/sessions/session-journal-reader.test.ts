@@ -215,6 +215,29 @@ describe('D1 bounded participant replay (mock queries, no live endpoint)', () =>
     }
   );
 
+  it('reads a byte-bounded page whose independently valid entries exceed the per-entry node cap in aggregate', async () => {
+    const es = Array.from({ length: 128 }, (_, i) => ({
+      ...entry(i + 1),
+      body: { values: Array(900).fill(0) },
+    }));
+    const f = fixture([header(128), meta(es), rows(es)]);
+    const page = await readSessionJournalPage(f.client, f.options);
+    expect(page.entries).toHaveLength(128);
+    expect(page.cursor.afterEid).toBe(128);
+    expect(new TextEncoder().encode(JSON.stringify(page)).byteLength).toBeLessThan(1024 * 1024);
+  });
+
+  it('does not count transport/page wrappers against the entry depth cap', async () => {
+    let nested: { [key: string]: import('@inklabs/shared/runtime').JournalJson } = {
+      leaf: 'fixture',
+    };
+    for (let depth = 0; depth < 61; depth++) nested = { child: nested };
+    const e = { ...entry(1), body: nested };
+    expect(() => freezeJournalEntry(e, 256 * 1024)).not.toThrow();
+    const f = fixture([header(1), meta([e]), rows([e])]);
+    expect((await readSessionJournalPage(f.client, f.options)).entries).toEqual([e]);
+  });
+
   it('keeps a prior snapshot ceiling when the head grows between pages', async () => {
     const es = [entry(3), entry(4)];
     const f = fixture([header(9), meta(es), rows(es)]);
@@ -402,6 +425,37 @@ describe('D1 bounded participant replay (mock queries, no live endpoint)', () =>
     await expect(readSessionJournalPage(f.client, f.options)).rejects.toMatchObject({
       code: 'invalid_page',
     });
+  });
+
+  it.each([
+    'element-getter',
+    'row-getter',
+    'inner-getter',
+    'hole',
+    'array-extra',
+    'row-extra',
+    'array-prototype',
+    'row-prototype',
+  ])('rejects non-data body transport shape %s without invoking accessors', async (kind) => {
+    const e = entry(1);
+    const bad = rows([e]);
+    const getter = vi.fn(() => e);
+    if (kind === 'element-getter')
+      Object.defineProperty(bad, '0', { get: getter, enumerable: true });
+    if (kind === 'row-getter')
+      Object.defineProperty(bad[0], 'entry', { get: getter, enumerable: true });
+    if (kind === 'inner-getter')
+      Object.defineProperty(e.body, 'text', { get: getter, enumerable: true });
+    if (kind === 'hole') delete bad[0];
+    if (kind === 'array-extra') Object.defineProperty(bad, 'extra', { value: true });
+    if (kind === 'row-extra') Object.defineProperty(bad[0], Symbol('extra'), { value: true });
+    if (kind === 'array-prototype') Object.setPrototypeOf(bad, Object.create(Array.prototype));
+    if (kind === 'row-prototype') Object.setPrototypeOf(bad[0], { marker: true });
+    const f = fixture([header(1), meta([entry(1)]), bad]);
+    await expect(readSessionJournalPage(f.client, f.options)).rejects.toMatchObject({
+      code: 'invalid_page',
+    });
+    expect(getter).not.toHaveBeenCalled();
   });
 
   it.each([0, 1, 2])('does not retry or expose errors from query%s', async (index) => {

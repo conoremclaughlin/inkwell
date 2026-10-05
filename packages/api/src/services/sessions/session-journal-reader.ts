@@ -69,7 +69,8 @@ export async function readSessionJournalPage(
     throughEid?: number;
     maxEntries?: number;
     maxPageBytes?: number;
-    authorize(scope: Readonly<JournalReadScope>): Promise<boolean>;
+    /** Pass a closure or explicitly bound method; no receiver is supplied. */
+    authorize(this: void, scope: Readonly<JournalReadScope>): Promise<boolean>;
   }
 ): Promise<SessionJournalPage> {
   let scope: Readonly<JournalReadScope>;
@@ -147,6 +148,7 @@ export async function readSessionJournalPage(
   throughEid ??= committedEid;
   const entries: Readonly<JournalEntry>[] = [];
   let scanned = afterEid;
+  let entryBytes = 0;
 
   if (afterEid < throughEid) {
     const expectedCount = Math.min(maxEntries, throughEid - afterEid);
@@ -186,7 +188,7 @@ export async function readSessionJournalPage(
     if (chosen.length === 0) throw new SessionJournalReadError('page_too_small');
     await requireAccess();
     const last = chosen[chosen.length - 1].eid;
-    const rows = array(
+    const rows = bodyRows(
       await query(() =>
         client
           .from('session_journal_entries')
@@ -197,11 +199,10 @@ export async function readSessionJournalPage(
           .order('eid', { ascending: true })
           .limit(chosen.length)
       ),
-      maxPageBytes
+      chosen.length
     );
-    if (rows.length !== chosen.length) invalidPage();
     for (let i = 0; i < rows.length; i++) {
-      const row = plain(rows[i], chosen[i].bytes + 128);
+      const row = rows[i];
       let snapshot: ReturnType<typeof freezeJournalEntry>;
       try {
         snapshot = freezeJournalEntry(row.entry, MAX_ENTRY_BYTES);
@@ -216,6 +217,7 @@ export async function readSessionJournalPage(
         snapshot.bytes > chosen[i].bytes
       )
         invalidPage();
+      entryBytes += snapshot.bytes;
       entries.push(snapshot.entry);
     }
     scanned = last;
@@ -230,7 +232,13 @@ export async function readSessionJournalPage(
     more: scanned < throughEid,
   });
   try {
-    canonicalJournalJson(page, maxPageBytes);
+    // Count already-validated entry snapshots independently. Revalidating the
+    // whole page as ONE entry would sum its per-entry node caps and add wrapper
+    // depth, incorrectly refusing valid pages and deepest valid entries.
+    const envelope = canonicalJournalJson({ ...page, entries: [] }, maxPageBytes);
+    const bytes =
+      new TextEncoder().encode(envelope).byteLength + entryBytes + Math.max(0, entries.length - 1);
+    if (bytes > maxPageBytes) invalidPage();
   } catch {
     invalidPage();
   }
@@ -264,6 +272,36 @@ function array(value: unknown, maxBytes: number): unknown[] {
     return invalidPage();
   }
 }
+/** Shallow transport shape only; each entry gets its own full shared validation. */
+function bodyRows(value: unknown, count: number): Array<{ eid: unknown; entry: unknown }> {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    value.length !== count ||
+    Reflect.ownKeys(value).length !== count + 1
+  )
+    invalidPage();
+  const rows: Array<{ eid: unknown; entry: unknown }> = [];
+  for (let i = 0; i < count; i++) {
+    const item = Object.getOwnPropertyDescriptor(value, String(i));
+    if (!item || !item.enumerable || !('value' in item)) invalidPage();
+    const row: unknown = item.value;
+    if (
+      !row ||
+      typeof row !== 'object' ||
+      (Object.getPrototypeOf(row) !== Object.prototype && Object.getPrototypeOf(row) !== null) ||
+      Reflect.ownKeys(row).length !== 2
+    )
+      invalidPage();
+    const eid = Object.getOwnPropertyDescriptor(row, 'eid');
+    const entry = Object.getOwnPropertyDescriptor(row, 'entry');
+    if (!eid?.enumerable || !entry?.enumerable || !('value' in eid) || !('value' in entry))
+      invalidPage();
+    rows.push({ eid: eid.value, entry: entry.value });
+  }
+  return rows;
+}
+
 async function query(run: () => PromiseLike<{ data: unknown; error: unknown }>): Promise<unknown> {
   try {
     const result = await run();
