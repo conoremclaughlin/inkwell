@@ -1071,7 +1071,11 @@ describe('SessionService', () => {
       };
       let lastService: SessionService;
       let lastTables: Record<string, Row[]>;
-      /** The turns counted against the inkling's cap in the last turn's tables. */
+      /**
+       * The old turn counter (metadata.ownerTestTurns) in the last turn's
+       * tables. Nothing writes it since the cap was dropped, so it stays as
+       * the test set it: undefined unless seeded.
+       */
       const turnsCounted = () =>
         (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
           ?.ownerTestTurns;

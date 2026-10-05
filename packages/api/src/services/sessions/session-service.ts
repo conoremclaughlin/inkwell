@@ -2277,7 +2277,7 @@ export class SessionService implements ISessionService {
     // scope. Missing/invalid identity fails CLOSED: toolRouting stays
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
-    // Set once an inkling's turn has passed the gate and claimed a slot.
+    // Set once an inkling's turn has passed the gate.
     let inklingTurn = false;
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
