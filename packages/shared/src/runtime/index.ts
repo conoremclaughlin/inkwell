@@ -35,3 +35,5 @@ export * from './serial-input-drain.js';
 export * from './paragraph-stream.js';
 export * from './preview-guard.js';
 export * from './frame-fanout.js';
+export * from './journal-record.js';
+export * from './journal-writer.js';

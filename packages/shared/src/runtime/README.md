@@ -108,6 +108,54 @@ An append's returned ID is reserved, not a commit acknowledgment. Await
 there is no added fsync/power-loss guarantee, replay engine, write-buffer bound
 or safe automatic replay of an unresolved external effect.
 
+## Hosted journal contract (D1, dark)
+
+`JournalWriter` is a separate strict, bounded async adapter; it does not change
+legacy `SessionLog` callers. The host supplies an authenticated journal identity,
+verified committed cursor, clock, explicit byte/count limits and `JournalStore`.
+Only a complete commit receipt exposes an eid. Input data is snapshotted before
+enqueue, metadata is writer-owned, and the queue includes in-flight writes.
+Records use the existing replay envelope through `journalReplayEvent`.
+
+The store must atomically insert the entry, apply its invocation projection and
+advance the journal head under the existing admission authority. There is no
+separate projection call. Its capability is held in the host port, never in
+record content. An exact retry must authenticate the current writer tenure and
+compare the full entry; an old receipt or open obligation is not a dispatch
+permit. The current store head and the acknowledged entry's eid are separate.
+
+Failure stops this writer permanently and prevents queued writes/retries. A
+client limit or ambiguous store failure requests a bounded, set-only hold under
+the same authority. The host must stop dispatch immediately, and a failed or
+mismatched hold acknowledgment remains unconfirmed. An already in-flight append
+can still commit after a local failure; its receipt is preserved, not relabeled
+as not written. Neither a successful hold nor `close()` releases ownership or
+proves a child/effect quiescent. A stored negative observation can be acknowledged
+as a fact while its held projection stops further writes.
+
+Spawn records are closed, bounded variants, with writer authority separate from
+the observed target. Cross-tenure records are negative-only; the DB must also
+validate that the target exists in this lineage and enforce its transition
+scope. Parent exit, an empty process group and whole-tree attestation remain
+different observations. A named evidence reference is a correlation key, not
+proof that this module checked a process. Do not put raw prompts, arguments,
+credentials or exceptions into spawn metadata.
+
+Serialization accepts plain JSON data only, with bounded depth/node count and
+UTF-8 size. It refuses accessors, lossy values, sparse arrays, metadata override,
+NUL and unpaired surrogates rather than letting transport/jsonb change identity.
+Object-key order is normalized, array order and missing/null are not. A host
+receiving raw JSON must reject duplicate keys **before** parsing it; this module
+cannot recover duplicates already discarded by a parser. Host objects/Proxies
+are not an untrusted transport format or an isolation boundary.
+
+This slice has fake-store evidence only. It does not implement the database
+adapter/migration, host-wide memory budget, raw transport parser, asynchronous
+context/compaction wiring, startup recovery, process containment or live runner
+adoption. No application database or provider is used by these tests. Proposed
+production limits and full existing-event parity still need validation before
+activation; the new writer is not yet used by a live session.
+
 ## Guarded paragraph streaming
 
 `ParagraphStreamBuffer` and `StreamedTurnRenderer` are the existing CLI text
