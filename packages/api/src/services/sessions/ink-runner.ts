@@ -546,6 +546,8 @@ export class InkRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
+      if (child.pid !== undefined)
+        config.onSpawned?.({ pid: child.pid, ...(killGroup ? { pgid: child.pid } : {}) });
 
       let stdout = '';
       let stderr = '';

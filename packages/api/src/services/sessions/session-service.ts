@@ -47,6 +47,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
+import { recordLaunch } from './launched-processes.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -2795,6 +2796,9 @@ export class SessionService implements ISessionService {
             }),
           };
 
+    // Each process the runner starts, recorded so a restarted server can stop
+    // it (launched-processes.ts), and stamped exited when the run settles.
+    const launches: Array<{ exited(): void }> = [];
     try {
       result = await turnRunner
         .run(formattedMessage, {
@@ -2814,6 +2818,9 @@ export class SessionService implements ISessionService {
             turnEpoch,
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
             ...(admitSpawn ? { admitSpawn } : {}),
+            onSpawned: (spawned) => {
+              launches.push(recordLaunch(session.id, resolvedBackend, spawned));
+            },
           },
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
         })
@@ -2825,7 +2832,10 @@ export class SessionService implements ISessionService {
           }
           return ran;
         })
-        .finally(() => inklingTracking?.done());
+        .finally(() => {
+          for (const launch of launches) launch.exited();
+          inklingTracking?.done();
+        });
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most

@@ -284,6 +284,7 @@ export class GeminiRunner implements IRunner {
         env: target.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      if (proc.pid !== undefined) config.onSpawned?.({ pid: proc.pid });
 
       let stderr = '';
       let stdoutRemainder = '';

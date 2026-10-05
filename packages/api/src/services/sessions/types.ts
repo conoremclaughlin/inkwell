@@ -805,6 +805,13 @@ export interface ClaudeRunnerConfig {
    * #747). The Claude runner honours it.
    */
   admitSpawn?: () => string | undefined;
+  /**
+   * Told each process the runner starts, as soon as it has a pid, so the
+   * server can record it (launched-processes.ts) and a restarted server can
+   * stop it. A run that leads its own process group passes the group too.
+   * Every runner calls it for every spawn, fallback spawns included.
+   */
+  onSpawned?: (spawned: { pid: number; pgid?: number }) => void;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |

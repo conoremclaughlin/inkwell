@@ -604,6 +604,8 @@ export class ClaudeRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
+      if (proc.pid !== undefined)
+        config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
       // No ceiling unless one is configured, for the module or for this run;
       // the lower one wins when both are.
       const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);

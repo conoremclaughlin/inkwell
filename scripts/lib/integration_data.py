@@ -63,6 +63,7 @@ WINDOWED_FIXTURE_TABLES = (
     ("20261002225412", "", ("wake_source_breakers",)),
     ("20261004085434", "", ("thread_links",)),
     ("20261004095944", "", ("thread_message_reactions",)),
+    ("20261005042648", "", ("launched_processes",)),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
