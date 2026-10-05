@@ -26,14 +26,21 @@ import { ADMISSION_PROTOCOL } from './command-admission';
 
 export type TenureMode = 'server_hosted' | 'interactive_wrapper' | 'native_external';
 
-/** What a holder presents. The secret is hashed here and never sent. */
+/**
+ * What a holder presents. The database hashes the secret and compares the
+ * digest it stored at registration, so the stored hash alone authorizes
+ * nothing. Keep the secret out of logs, errors and replies.
+ */
 export interface TenureHolder {
   tenureId: string;
   capability: string;
   hostInstanceId: string;
 }
 
-/** A fresh holder capability and the hash the database stores for it. */
+/**
+ * A fresh holder capability, 256 random bits, and the digest the database
+ * stores for it. The digest is for comparison in tests; RPCs take the secret.
+ */
 export function mintTenureCapability(): { capability: string; capabilityHash: string } {
   const capability = randomBytes(32).toString('base64url');
   return { capability, capabilityHash: tenureCapabilityHash(capability) };
@@ -43,14 +50,46 @@ export function tenureCapabilityHash(capability: string): string {
   return `sha256:${createHash('sha256').update(capability).digest('hex')}`;
 }
 
-function parseReply<T>(schema: z.ZodType<T>, what: string, data: unknown, error: unknown): T {
-  if (error) {
-    const message =
-      error instanceof Error ? error.message : (error as { message?: string }).message;
-    throw new Error(`${what} failed: ${message ?? 'unknown error'}`);
+/**
+ * A failed admission RPC, classified and value-free. Its message names the RPC
+ * and the class only: never the transport's message, code, details or hint,
+ * any of which may echo an argument, and the capability is an argument.
+ */
+export class TenureAdmissionError extends Error {
+  constructor(
+    readonly rpc: string,
+    readonly kind: 'transport_failed' | 'reply_outside_contract'
+  ) {
+    super(
+      `${rpc} ${kind === 'transport_failed' ? 'failed' : 'returned a reply outside its contract'}`
+    );
+    this.name = 'TenureAdmissionError';
   }
-  const parsed = schema.safeParse(data);
-  if (!parsed.success) throw new Error(`${what} returned a reply outside its contract`);
+}
+
+// A rejected call and an error reply are the same outcome to the caller:
+// the request may or may not have run, and nothing of the transport survives.
+async function callRpc(
+  client: SupabaseClient,
+  rpc: string,
+  args: Record<string, unknown>
+): Promise<{ data: unknown; failed: boolean }> {
+  try {
+    const result = await client.rpc(rpc, args);
+    return { data: result.data, failed: Boolean(result.error) };
+  } catch {
+    return { data: undefined, failed: true };
+  }
+}
+
+function parseReply<T>(
+  schema: z.ZodType<T>,
+  rpc: string,
+  reply: { data: unknown; failed: boolean }
+): T {
+  if (reply.failed) throw new TenureAdmissionError(rpc, 'transport_failed');
+  const parsed = schema.safeParse(reply.data);
+  if (!parsed.success) throw new TenureAdmissionError(rpc, 'reply_outside_contract');
   return parsed.data;
 }
 
@@ -100,7 +139,8 @@ export interface RegisterTenureInput {
   sessionId: string;
   expected: ExpectedTenurePrior;
   mode: TenureMode;
-  capabilityHash: string;
+  /** The holder's secret, from mintTenureCapability. The database stores its digest. */
+  capability: string;
   host: { instanceId: string; bootId?: string; hostId?: string };
   /** The verified identity of the process that owns the backend, when known. */
   owner?: { pid: number; startIdentity: string };
@@ -111,17 +151,17 @@ export async function registerTenure(
   client: SupabaseClient,
   input: RegisterTenureInput
 ): Promise<RegisterTenureOutcome> {
-  const { data, error } = await client.rpc('register_tenure', {
+  const reply = await callRpc(client, 'register_tenure', {
     p_session_id: input.sessionId,
     p_expected: input.expected,
     p_mode: input.mode,
-    p_capability_hash: input.capabilityHash,
+    p_capability: input.capability,
     p_host: input.host,
     p_owner: input.owner ?? null,
     p_endpoint: input.endpoint ?? null,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(registerSchema, 'register_tenure', data, error);
+  return parseReply(registerSchema, 'register_tenure', reply);
 }
 
 const admitSchema = z.discriminatedUnion('outcome', [
@@ -154,17 +194,17 @@ export async function admitTurn(
   client: SupabaseClient,
   input: AdmitTurnInput
 ): Promise<AdmitTurnOutcome> {
-  const { data, error } = await client.rpc('admit_turn', {
+  const reply = await callRpc(client, 'admit_turn', {
     p_session_id: input.sessionId,
     p_tenure_id: input.holder.tenureId,
-    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_capability: input.holder.capability,
     p_host_instance_id: input.holder.hostInstanceId,
     p_expected_prior_epoch: input.expectedPriorEpoch,
     p_epoch: input.epoch,
     p_command_uuid: input.commandUuid,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(admitSchema, 'admit_turn', data, error);
+  return parseReply(admitSchema, 'admit_turn', reply);
 }
 
 const leasedAdmitSchema = z.discriminatedUnion('outcome', [
@@ -205,10 +245,10 @@ export async function admitLeasedTurn(
   client: SupabaseClient,
   input: AdmitTurnInput & { studioId: string }
 ): Promise<AdmitLeasedTurnOutcome> {
-  const { data, error } = await client.rpc('admit_leased_turn', {
+  const reply = await callRpc(client, 'admit_leased_turn', {
     p_session_id: input.sessionId,
     p_tenure_id: input.holder.tenureId,
-    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_capability: input.holder.capability,
     p_host_instance_id: input.holder.hostInstanceId,
     p_expected_prior_epoch: input.expectedPriorEpoch,
     p_epoch: input.epoch,
@@ -216,7 +256,7 @@ export async function admitLeasedTurn(
     p_studio_id: input.studioId,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(leasedAdmitSchema, 'admit_leased_turn', data, error);
+  return parseReply(leasedAdmitSchema, 'admit_leased_turn', reply);
 }
 
 const finishSchema = z.discriminatedUnion('outcome', [
@@ -237,16 +277,16 @@ export async function finishTurn(
   client: SupabaseClient,
   input: { sessionId: string; holder: TenureHolder; epoch: string; evidence: string }
 ): Promise<FinishTurnOutcome> {
-  const { data, error } = await client.rpc('finish_turn', {
+  const reply = await callRpc(client, 'finish_turn', {
     p_session_id: input.sessionId,
     p_tenure_id: input.holder.tenureId,
-    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_capability: input.holder.capability,
     p_host_instance_id: input.holder.hostInstanceId,
     p_epoch: input.epoch,
     p_evidence: input.evidence,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(finishSchema, 'finish_turn', data, error);
+  return parseReply(finishSchema, 'finish_turn', reply);
 }
 
 /** What ended the tenure. None of them stands in for spawn evidence. */
@@ -273,15 +313,15 @@ export async function releaseTenure(
   client: SupabaseClient,
   input: { sessionId: string; holder: TenureHolder; evidence: TenureReleaseEvidence }
 ): Promise<ReleaseTenureOutcome> {
-  const { data, error } = await client.rpc('release_tenure', {
+  const reply = await callRpc(client, 'release_tenure', {
     p_session_id: input.sessionId,
     p_tenure_id: input.holder.tenureId,
-    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_capability: input.holder.capability,
     p_host_instance_id: input.holder.hostInstanceId,
     p_evidence: input.evidence,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(releaseSchema, 'release_tenure', data, error);
+  return parseReply(releaseSchema, 'release_tenure', reply);
 }
 
 /**
@@ -328,10 +368,10 @@ export async function recordInvocation(
   }
 ): Promise<RecordInvocationOutcome> {
   const { kind, ...detail } = input.record;
-  const { data, error } = await client.rpc('record_invocation', {
+  const reply = await callRpc(client, 'record_invocation', {
     p_session_id: input.sessionId,
     p_tenure_id: input.holder.tenureId,
-    p_capability_hash: tenureCapabilityHash(input.holder.capability),
+    p_capability: input.holder.capability,
     p_host_instance_id: input.holder.hostInstanceId,
     p_epoch: input.epoch,
     p_invocation_id: input.invocationId,
@@ -339,7 +379,7 @@ export async function recordInvocation(
     p_detail: detail,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(recordSchema, 'record_invocation', data, error);
+  return parseReply(recordSchema, 'record_invocation', reply);
 }
 
 const lostSchema = z.discriminatedUnion('outcome', [
@@ -355,14 +395,14 @@ export async function markTenureLost(
   client: SupabaseClient,
   input: { sessionId: string; tenureId: string; authority: string; reasonCode: string }
 ): Promise<MarkTenureLostOutcome> {
-  const { data, error } = await client.rpc('mark_tenure_lost', {
+  const reply = await callRpc(client, 'mark_tenure_lost', {
     p_session_id: input.sessionId,
     p_tenure_id: input.tenureId,
     p_authority: input.authority,
     p_reason: input.reasonCode,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(lostSchema, 'mark_tenure_lost', data, error);
+  return parseReply(lostSchema, 'mark_tenure_lost', reply);
 }
 
 /**
@@ -440,7 +480,7 @@ export async function reconcileTenure(
     hostInstanceId: string;
   }
 ): Promise<ReconcileTenureOutcome> {
-  const { data, error } = await client.rpc('reconcile_tenure', {
+  const reply = await callRpc(client, 'reconcile_tenure', {
     p_session_id: input.sessionId,
     p_expected_tenure_id: input.expectedTenureId,
     p_evidence: input.evidence,
@@ -452,5 +492,5 @@ export async function reconcileTenure(
     p_host_instance_id: input.hostInstanceId,
     p_protocol: ADMISSION_PROTOCOL,
   });
-  return parseReply(reconcileSchema, 'reconcile_tenure', data, error);
+  return parseReply(reconcileSchema, 'reconcile_tenure', reply);
 }

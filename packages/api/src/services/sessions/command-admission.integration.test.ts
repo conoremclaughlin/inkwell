@@ -111,12 +111,55 @@ describe('durable command admission', () => {
     return message.id as string;
   }
 
+  // The isolated stack's postgres connection: the operator's mode switch,
+  // fixtures that seed admission state, damage a restore could leave, and the
+  // census's view of the catalog. Since the authority seal (20261005032034)
+  // service_role can do none of these.
+  let adminConnection: Client | undefined;
+  async function admin<T = Record<string, unknown>>(text: string, params: unknown[] = []) {
+    if (!adminConnection) {
+      const url = process.env.INTEGRATION_DB_URL;
+      if (!url) throw new Error('INTEGRATION_DB_URL is required (managed harness)');
+      adminConnection = new Client({ connectionString: url, statement_timeout: 15_000 });
+      await adminConnection.connect();
+    }
+    return (await adminConnection.query(text, params)).rows as T[];
+  }
+  // The failure a statement produces, or null when it succeeds.
+  function adminError(text: string, params: unknown[] = []) {
+    return admin(text, params).then(
+      () => null,
+      (error: { code?: string; message?: string }) => ({ code: error.code, message: error.message })
+    );
+  }
+  async function adminInsert(table: string, row: Record<string, unknown>) {
+    const keys = Object.keys(row);
+    return adminError(
+      `INSERT INTO public.${table} (${keys.join(', ')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(', ')})`,
+      keys.map((key) => row[key])
+    );
+  }
+  // An administrator repairing authority columns acts as the writer, the only
+  // role the sessions guard admits.
+  async function asWriter(text: string, params: unknown[] = []) {
+    await admin('BEGIN');
+    try {
+      await admin('SET LOCAL ROLE ink_admission_writer');
+      const rows = await admin(text, params);
+      await admin('COMMIT');
+      return rows;
+    } catch (error) {
+      await admin('ROLLBACK');
+      throw error;
+    }
+  }
+
+  // The activation switch is the operator's (the seal leaves service_role SELECT).
   async function setMode(mode: 'legacy' | 'conditional'): Promise<void> {
-    const { error } = await supabase
-      .from('runtime_admission_mode')
-      .update({ mode, changed_reason: `command-admission suite ${RUN}` })
-      .eq('singleton', true);
-    if (error) throw new Error(`mode update failed: ${error.message}`);
+    await admin(
+      'UPDATE public.runtime_admission_mode SET mode = $1, changed_reason = $2 WHERE singleton',
+      [mode, `command-admission suite ${RUN}`]
+    );
   }
 
   function input(sessionId: string, overrides: Partial<AdmitCommandInput> = {}): AdmitCommandInput {
@@ -161,6 +204,8 @@ describe('durable command admission', () => {
   afterAll(async () => {
     if (!supabase) return;
     await setMode('legacy');
+    // Admission lineages are no longer deletable by service_role (ON DELETE
+    // RESTRICT); the harness's fixture cleanup truncates what remains.
     if (sessionIds.length) await supabase.from('sessions').delete().in('id', sessionIds);
     for (const threadId of threadIds) {
       await supabase.from('inbox_thread_messages').delete().eq('thread_id', threadId);
@@ -172,6 +217,7 @@ describe('durable command admission', () => {
       await supabase.from('agent_identities').delete().eq('user_id', otherUserId);
       await supabase.from('users').delete().eq('id', otherUserId);
     }
+    await adminConnection?.end().catch(() => undefined);
   }, 30_000);
 
   describe('mode binding', () => {
@@ -793,16 +839,15 @@ describe('durable command admission', () => {
 
       // A decision lifts the hold only for the exact revision it addresses;
       // the uncertain command stays unknown either way.
+      // An operator's decision has no RPC; since the seal only the
+      // administrator connection writes it.
       const decide = async (revision: number) => {
-        const { error } = await supabase
-          .from('session_commands')
-          .update({
-            recovery_decided_at: new Date().toISOString(),
-            recovery_decided_revision: revision,
-            recovery_decision: { authority: 'operator-fixture', obligations: ['fixture'] },
-          })
-          .eq('id', ids[0]);
-        if (error) throw new Error(`decision update failed: ${error.message}`);
+        await admin(
+          `UPDATE public.session_commands
+              SET recovery_decided_at = now(), recovery_decided_revision = $1, recovery_decision = $2
+            WHERE id = $3`,
+          [revision, { authority: 'operator-fixture', obligations: ['fixture'] }, ids[0]]
+        );
       };
       await decide(1);
       expect(await readDispatchHead(supabase, sessionId)).toMatchObject({
@@ -944,12 +989,12 @@ describe('durable command admission', () => {
     const HOST = { instanceId: `host-${RUN}`, bootId: 'boot-fixture-1', hostId: 'host-fixture' };
 
     async function register(sessionId: string, mode: TenureMode = 'interactive_wrapper') {
-      const { capability, capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       const r = await registerTenure(supabase, {
         sessionId,
         expected: { kind: 'never_owned' },
         mode,
-        capabilityHash,
+        capability,
         host: HOST,
       });
       if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -1082,13 +1127,13 @@ describe('durable command admission', () => {
       const sessionId = await newSession(suiteSbId);
       await setMode('legacy');
       try {
-        const { capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         expect(
           await registerTenure(supabase, {
             sessionId,
             expected: { kind: 'never_owned' },
             mode: 'server_hosted',
-            capabilityHash,
+            capability,
             host: HOST,
           })
         ).toEqual({ outcome: 'mode_mismatch', mode: 'legacy', protocol: ADMISSION_PROTOCOL });
@@ -1106,26 +1151,30 @@ describe('durable command admission', () => {
       } finally {
         await setMode('conditional');
       }
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId: legacy,
           expected: { kind: 'never_owned' },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toEqual({ outcome: 'unverified' });
 
-      // A legacy turn epoch with no record of its turn reads the same way.
+      // A turn epoch with no record of its turn reads the same way. The seal
+      // refuses that write to service_role, so it is seeded as damage would be.
       const fresh = await newSession(suiteSbId);
-      await supabase.from('sessions').update({ turn_epoch: randomUUID() }).eq('id', fresh);
+      await asWriter('UPDATE public.sessions SET turn_epoch = $1 WHERE id = $2', [
+        randomUUID(),
+        fresh,
+      ]);
       expect(
         await registerTenure(supabase, {
           sessionId: fresh,
           expected: { kind: 'never_owned' },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toEqual({ outcome: 'unverified' });
@@ -1175,13 +1224,13 @@ describe('durable command admission', () => {
       ).toEqual({ outcome: 'busy', epoch: first.epoch });
       await finish(sessionId, holder, first.epoch);
       // Finishing kept the tenure: another owner cannot register.
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId,
           expected: { kind: 'never_owned' },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toEqual({ outcome: 'occupied', tenureId: holder.tenureId, state: 'held' });
@@ -1342,8 +1391,8 @@ describe('durable command admission', () => {
         })
       ).toEqual({ outcome: 'not_holder' });
 
-      const { capability, capabilityHash } = mintTenureCapability();
-      const base = { sessionId, mode: 'interactive_wrapper' as const, capabilityHash, host: HOST };
+      const { capability } = mintTenureCapability();
+      const base = { sessionId, mode: 'interactive_wrapper' as const, capability, host: HOST };
       expect(
         await registerTenure(supabase, { ...base, expected: { kind: 'never_owned' } })
       ).toMatchObject({
@@ -1433,13 +1482,13 @@ describe('durable command admission', () => {
           hostInstanceId: HOST.instanceId,
         })
       ).toEqual({ outcome: 'reconciled', tenureId: holder.tenureId });
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId,
           expected: { kind: 'reconciled', tenureId: holder.tenureId },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toMatchObject({ outcome: 'registered' });
@@ -1457,13 +1506,13 @@ describe('durable command admission', () => {
           reasonCode: 'owner_unreachable',
         })
       ).toEqual({ outcome: 'recovery_required', tenureId: holder.tenureId });
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId,
           expected: { kind: 'never_owned' },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toEqual({ outcome: 'occupied', tenureId: holder.tenureId, state: 'recovery_required' });
@@ -1491,7 +1540,7 @@ describe('durable command admission', () => {
         sessionId,
         expected: { kind: 'reconciled', tenureId: holder.tenureId },
         mode: 'server_hosted',
-        capabilityHash,
+        capability,
         host: HOST,
       });
       expect(r).toMatchObject({
@@ -1504,12 +1553,12 @@ describe('durable command admission', () => {
 
     it('refuses boot evidence when the tenure never recorded its machine or boot', async () => {
       const sessionId = await newSession(suiteSbId);
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       const r = await registerTenure(supabase, {
         sessionId,
         expected: { kind: 'never_owned' },
         mode: 'interactive_wrapper',
-        capabilityHash,
+        capability,
         host: { instanceId: HOST.instanceId },
       });
       if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -1547,13 +1596,13 @@ describe('durable command admission', () => {
       }
       const attested = await attestLegacy(legacy, await inspectLegacy(legacy));
       if (attested.outcome !== 'reconciled') throw new Error(`unexpected ${attested.outcome}`);
-      const { capabilityHash } = mintTenureCapability();
+      const { capability } = mintTenureCapability();
       expect(
         await registerTenure(supabase, {
           sessionId: legacy,
           expected: { kind: 'reconciled', tenureId: attested.tenureId },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         })
       ).toMatchObject({ outcome: 'registered' });
@@ -1708,12 +1757,12 @@ describe('durable command admission', () => {
         // Cleared by the process proof, bound to the state the reconciler read.
         const decided = await attestLegacy(legacy, await inspectLegacy(legacy));
         if (decided.outcome !== 'reconciled') throw new Error(`unexpected ${decided.outcome}`);
-        const { capability, capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         const r = await registerTenure(supabase, {
           sessionId: legacy,
           expected: { kind: 'reconciled', tenureId: decided.tenureId },
           mode: 'interactive_wrapper',
-          capabilityHash,
+          capability,
           host: HOST,
         });
         if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -1747,7 +1796,7 @@ describe('durable command admission', () => {
             sessionId,
             expected: { kind: 'never_owned' },
             mode: 'interactive_wrapper',
-            capabilityHash: mintTenureCapability().capabilityHash,
+            capability: mintTenureCapability().capability,
             host,
           });
           if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -1815,13 +1864,13 @@ describe('durable command admission', () => {
       it('C1: accepting effect risk cannot make a running legacy session executable', async () => {
         const epoch = randomUUID();
         const legacy = await legacySession({ ...RUNNING, turn_epoch: epoch });
-        const { capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         const registerNever = () =>
           registerTenure(supabase, {
             sessionId: legacy,
             expected: { kind: 'never_owned' },
             mode: 'interactive_wrapper',
-            capabilityHash,
+            capability,
             host: HOST,
           });
         expect(await registerNever()).toEqual({ outcome: 'unverified' });
@@ -1941,12 +1990,12 @@ describe('durable command admission', () => {
         // the next owner's first turn names the legacy epoch.
         const attested = await attestLegacy(legacy, current);
         if (attested.outcome !== 'reconciled') throw new Error(`unexpected ${attested.outcome}`);
-        const { capability, capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         const r = await registerTenure(supabase, {
           sessionId: legacy,
           expected: { kind: 'reconciled', tenureId: attested.tenureId },
           mode: 'interactive_wrapper',
-          capabilityHash,
+          capability,
           host: HOST,
         });
         if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -2068,26 +2117,26 @@ describe('durable command admission', () => {
           { end_evidence_ref: 'owner-tree-attestation-fixture' },
           { end_evidence_scope: { hostId: HOST.hostId } },
         ]) {
-          const { error } = await supabase
-            .from('session_owner_tenures')
-            .insert({ ...row, ...proof });
+          // The constraint, below the seal: only an administrator can try.
+          const error = await adminInsert('session_owner_tenures', { ...row, ...proof });
           expect(error?.code).toBe('23514');
           expect(error?.message).toContain('session_owner_tenures_reconciled_keeps_proof');
         }
         // Control: the same row with both is accepted.
-        const { error } = await supabase.from('session_owner_tenures').insert({
-          ...row,
-          end_evidence_ref: 'owner-tree-attestation-fixture',
-          end_evidence_scope: { hostId: HOST.hostId },
-        });
-        expect(error).toBeNull();
+        expect(
+          await adminInsert('session_owner_tenures', {
+            ...row,
+            end_evidence_ref: 'owner-tree-attestation-fixture',
+            end_evidence_scope: { hostId: HOST.hostId },
+          })
+        ).toBeNull();
       });
 
       it('C3: a commandless generation needs legacy coverage evidence, null included', async () => {
         const sessionId = await newSession(suiteSbId);
         const holder = await register(sessionId);
         const commandless = (finishEvidence: string | null) =>
-          supabase.from('session_turn_generations').insert({
+          adminInsert('session_turn_generations', {
             session_id: sessionId,
             epoch: randomUUID(),
             tenure_id: holder.tenureId,
@@ -2097,12 +2146,12 @@ describe('durable command admission', () => {
             finish_evidence: finishEvidence,
           });
         for (const finishEvidence of [null, 'cli_stop']) {
-          const { error } = await commandless(finishEvidence);
+          const error = await commandless(finishEvidence);
           expect(error?.code).toBe('23514');
           expect(error?.message).toContain('session_turn_generations_command_or_legacy_coverage');
         }
         // Control: the coverage row itself is accepted.
-        expect((await commandless('reconciled_legacy_epoch')).error).toBeNull();
+        expect(await commandless('reconciled_legacy_epoch')).toBeNull();
       });
     });
 
@@ -2127,12 +2176,12 @@ describe('durable command admission', () => {
         };
         const currentBootId = 'b'.repeat(200);
         const sessionId = await newSession(suiteSbId);
-        const { capability, capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         const r = await registerTenure(supabase, {
           sessionId,
           expected: { kind: 'never_owned' },
           mode: 'interactive_wrapper',
-          capabilityHash,
+          capability,
           host,
         });
         if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -2186,7 +2235,7 @@ describe('durable command admission', () => {
               sessionId,
               expected: { kind: 'never_owned' },
               mode: 'interactive_wrapper',
-              capabilityHash: mintTenureCapability().capabilityHash,
+              capability: mintTenureCapability().capability,
               host,
               owner:
                 owner === undefined ? undefined : { pid: owner, startIdentity: 'start-fixture' },
@@ -2512,7 +2561,7 @@ describe('durable command admission', () => {
             .query('SELECT public.admit_leased_turn($1, $2, $3, $4, $5, $6, $7, $8, $9) AS r', [
               a.sessionId,
               a.holder.tenureId,
-              tenureCapabilityHash(a.holder.capability),
+              a.holder.capability,
               a.holder.hostInstanceId,
               a.prior,
               a.epoch,
@@ -2938,23 +2987,6 @@ describe('durable command admission', () => {
     // into the invocation index, the hold, the lineage gates and the seal.
     describe('session journal (D1)', () => {
       const ENTRY_LIMIT = 262_144;
-      let adminConnection: Client | undefined;
-
-      afterAll(async () => {
-        await adminConnection?.end().catch(() => undefined);
-      });
-
-      // The isolated stack's postgres connection: what a restore or an
-      // administrator can do, and the census's view of the catalog.
-      async function admin<T = Record<string, unknown>>(text: string, params: unknown[] = []) {
-        if (!adminConnection) {
-          const url = process.env.INTEGRATION_DB_URL;
-          if (!url) throw new Error('INTEGRATION_DB_URL is required (managed harness)');
-          adminConnection = new Client({ connectionString: url, statement_timeout: 15_000 });
-          await adminConnection.connect();
-        }
-        return (await adminConnection.query(text, params)).rows as T[];
-      }
 
       interface JournalWriterState {
         sessionId: string;
@@ -3073,7 +3105,7 @@ describe('durable command admission', () => {
         const { data, error } = await supabase.rpc('append_session_journal', {
           p_session_id: overrides.sessionId ?? w.sessionId,
           p_tenure_id: holder.tenureId,
-          p_capability_hash: tenureCapabilityHash(holder.capability),
+          p_capability: holder.capability,
           p_host_instance_id: holder.hostInstanceId,
           p_journal_id: overrides.journalId ?? w.journalId,
           p_expected_committed_eid: expected,
@@ -3101,7 +3133,7 @@ describe('durable command admission', () => {
         const { data, error } = await supabase.rpc('hold_session_journal', {
           p_session_id: w.sessionId,
           p_tenure_id: holder.tenureId,
-          p_capability_hash: tenureCapabilityHash(holder.capability),
+          p_capability: holder.capability,
           p_host_instance_id: holder.hostInstanceId,
           p_journal_id: journalId,
           p_reason_code: reasonCode,
@@ -3166,12 +3198,12 @@ describe('durable command admission', () => {
       }
 
       async function registerAfter(sessionId: string, prior: string) {
-        const { capability, capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         const r = await registerTenure(supabase, {
           sessionId,
           expected: { kind: 'released', tenureId: prior },
           mode: 'server_hosted',
-          capabilityHash,
+          capability,
           host: HOST,
         });
         if (r.outcome !== 'registered') throw new Error(`unexpected ${r.outcome}`);
@@ -3674,13 +3706,13 @@ describe('durable command admission', () => {
             hostInstanceId: HOST.instanceId,
           })
         ).toEqual({ outcome: 'refused', reason: 'journal_lineage_needs_journal_reconciler' });
-        const { capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         expect(
           await registerTenure(supabase, {
             sessionId: w2.sessionId,
             expected: { kind: 'released', tenureId: w2.holder.tenureId },
             mode: 'server_hosted',
-            capabilityHash,
+            capability,
             host: HOST,
           })
         ).toMatchObject({ outcome: 'occupied', state: 'recovery_required' });
@@ -3875,13 +3907,13 @@ describe('durable command admission', () => {
             hostInstanceId: HOST.instanceId,
           })
         ).toEqual({ outcome: 'refused', reason: 'journal_lineage_needs_journal_reconciler' });
-        const { capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         expect(
           await registerTenure(supabase, {
             sessionId: w.sessionId,
             expected: { kind: 'released', tenureId: w.holder.tenureId },
             mode: 'server_hosted',
-            capabilityHash,
+            capability,
             host: HOST,
           })
         ).toEqual({ outcome: 'journal_missing' });
@@ -4022,13 +4054,13 @@ describe('durable command admission', () => {
             WHERE session_id = $1 AND epoch = $2`,
           [b.w2.sessionId, b.t1.epoch]
         );
-        const { capabilityHash } = mintTenureCapability();
+        const { capability } = mintTenureCapability();
         expect(
           await registerTenure(supabase, {
             sessionId: b.w2.sessionId,
             expected: { kind: 'released', tenureId: b.w2.holder.tenureId },
             mode: 'server_hosted',
-            capabilityHash,
+            capability,
             host: HOST,
           })
         ).toEqual({ outcome: 'unresolved', tenureId: b.w2.holder.tenureId });
@@ -4136,8 +4168,19 @@ describe('durable command admission', () => {
         });
       });
 
-      it('seals the invocation index and the journal: only the allowlisted definers write them', async () => {
-        const sealed = ['session_turn_invocations', 'session_journals', 'session_journal_entries'];
+      it('seals every admission table: only the allowlisted definers write them', async () => {
+        // D1 sealed the index and the journal; the authority seal the rest.
+        const sealed = [
+          'session_turn_invocations',
+          'session_journals',
+          'session_journal_entries',
+          'session_admission_origins',
+          'session_owner_tenures',
+          'session_turn_generations',
+          'session_commands',
+          'session_command_events',
+          'session_command_receipts',
+        ];
         const owners = await admin<{ relname: string; owner: string }>(
           `SELECT c.relname, pg_get_userbyid(c.relowner) AS owner FROM pg_class c
             WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($1) ORDER BY c.relname COLLATE "C"`,
@@ -4208,13 +4251,23 @@ describe('durable command admission', () => {
             ORDER BY (n.nspname || '.' || p.proname) COLLATE "C"`
         );
         const definers = [
+          'public.admit_command',
+          'public.admit_leased_turn',
+          'public.admit_turn',
           'public.append_session_journal',
+          'public.finish_turn',
           'public.hold_session_journal',
+          'public.mark_tenure_lost',
           'public.reconcile_tenure',
           'public.record_invocation',
+          'public.record_session_admission_origin',
+          'public.register_tenure',
+          'public.release_tenure',
           'public.session_journal_open',
+          'public.transition_command',
         ];
         const helpers = [
+          'ink_admission.capability_hash',
           'ink_admission.invocation_record',
           'ink_admission.journal_eid',
           'ink_admission.journal_entry_refusal',
@@ -4225,6 +4278,7 @@ describe('durable command admission', () => {
           'ink_admission.journal_ts_valid',
           'ink_admission.reconcile_tenure_legacy',
           'ink_admission.reduce_invocation',
+          'ink_admission.session_command_record_receipts',
         ];
         expect(owned).toEqual(
           [...definers, ...helpers].sort().map((fn) => ({
@@ -4255,7 +4309,7 @@ describe('durable command admission', () => {
         expect(secrets).toEqual([]);
       });
 
-      it('denies service_role every direct write to the sealed tables, through SQL and through PostgREST', async () => {
+      it('denies service_role every direct write to admission state, through SQL and through PostgREST', async () => {
         const { w, t } = await started();
         await append(w, intent(targetOf(w.holder, t, 'inv-sealed')));
         const client = new Client({
@@ -4307,6 +4361,69 @@ describe('durable command admission', () => {
             `SELECT ink_admission.reduce_invocation($1, $2, $3, 'inv-sealed', 'tree_quiescent', '{"evidenceRef":"x"}'::jsonb, NULL, NULL)`,
             [w.sessionId, w.holder.tenureId, t.epoch],
           ],
+          // The authority seal (20261005032034): what the reducer trusts.
+          [
+            'release a tenure',
+            "UPDATE public.session_owner_tenures SET state = 'released', ended_at = now(), capability_hash = NULL WHERE session_id = $1",
+            [w.sessionId],
+          ],
+          [
+            'forge a held tenure',
+            "INSERT INTO public.session_owner_tenures (session_id, mode, state, capability_hash, host_instance_id) VALUES ($1, 'server_hosted', 'held', 'sha256:' || repeat('0', 64), 'host-forged')",
+            [w.sessionId],
+          ],
+          ['truncate tenures', 'TRUNCATE public.session_owner_tenures', []],
+          [
+            'finish a turn',
+            "UPDATE public.session_turn_generations SET state = 'finished', finished_at = now() WHERE session_id = $1",
+            [w.sessionId],
+          ],
+          [
+            'forge an origin',
+            "INSERT INTO public.session_admission_origins (session_id, origin) VALUES ($1, 'created_conditional')",
+            [randomUUID()],
+          ],
+          [
+            'erase an origin',
+            'DELETE FROM public.session_admission_origins WHERE session_id = $1',
+            [w.sessionId],
+          ],
+          [
+            'complete a command',
+            "UPDATE public.session_commands SET state = 'completed' WHERE session_id = $1",
+            [w.sessionId],
+          ],
+          ['forget command events', 'DELETE FROM public.session_command_events', []],
+          ['forget receipts', 'DELETE FROM public.session_command_receipts', []],
+          ['truncate commands', 'TRUNCATE public.session_command_receipts', []],
+          [
+            'flip the mode',
+            "UPDATE public.runtime_admission_mode SET mode = 'legacy' WHERE singleton",
+            [],
+          ],
+          [
+            'record receipts directly',
+            "SELECT ink_admission.session_command_record_receipts($1, 1, 'user', 'x', '[]'::jsonb)",
+            [randomUUID()],
+          ],
+          [
+            'test a hash as a holder',
+            "SELECT public.session_tenure_holder_refusal($1, $2, 'sha256:x', 'host')",
+            [w.sessionId, w.holder.tenureId],
+          ],
+          ['hash a secret', "SELECT ink_admission.capability_hash('secret')", []],
+          // The sessions guard: the same refusal, from the trigger.
+          [
+            'move the owner pointer',
+            'UPDATE public.sessions SET owner_tenure_id = NULL WHERE id = $1',
+            [w.sessionId],
+          ],
+          [
+            'move the turn pointer',
+            "UPDATE public.sessions SET turn_epoch = 'forged' WHERE id = $1",
+            [w.sessionId],
+          ],
+          ['claim a turn', 'SELECT public.claim_turn_epoch($1, false)', [w.sessionId]],
         ];
         try {
           for (const [label, sql, params] of attempts) {
@@ -4338,6 +4455,24 @@ describe('durable command admission', () => {
           projection: 'none',
         });
         expect(planted.error?.code).toBe('42501');
+        const released = await supabase
+          .from('session_owner_tenures')
+          .update({ state: 'released' })
+          .eq('session_id', w.sessionId)
+          .select('id');
+        expect(released.error?.code).toBe('42501');
+        const flipped = await supabase
+          .from('runtime_admission_mode')
+          .update({ mode: 'legacy' })
+          .eq('singleton', true)
+          .select('mode');
+        expect(flipped.error?.code).toBe('42501');
+        const moved = await supabase
+          .from('sessions')
+          .update({ turn_epoch: 'forged' })
+          .eq('id', w.sessionId)
+          .select('id');
+        expect(moved.error?.code).toBe('42501');
         expect(await invocationRow(w.sessionId, t.epoch, 'inv-sealed')).toMatchObject({
           resolution: null,
         });
@@ -4512,6 +4647,233 @@ describe('durable command admission', () => {
           expect(page.entries[2].body.kind).toBe('not_spawned');
           expect(page.holdReason).toBe('projection_held');
         });
+      });
+    });
+
+    // The authority seal (20261005032034): the pointers, the capability and the
+    // evidence's parents. The privilege census and direct-write denials are in
+    // the D1 block above.
+    describe('authority seal', () => {
+      const RESTRICTED = [
+        'session_commands_session_id_fkey',
+        'session_commands_workspace_id_fkey',
+        'session_admission_origins_session_id_fkey',
+        'session_owner_tenures_session_id_fkey',
+        'session_turn_generations_session_id_fkey',
+        'session_journals_session_id_fkey',
+      ];
+
+      async function pointers(sessionId: string) {
+        const { data, error } = await supabase
+          .from('sessions')
+          .select('turn_epoch, owner_tenure_id, lifecycle, status')
+          .eq('id', sessionId)
+          .single();
+        if (error || !data) throw new Error(`session read failed: ${error?.message}`);
+        return data;
+      }
+
+      // One statement as service_role, always rolled back: what it would do.
+      async function asServiceRole(sql: string, params: unknown[] = []) {
+        await admin('BEGIN');
+        try {
+          await admin('SET LOCAL ROLE service_role');
+          return await admin(sql, params).then(
+            () => ({ code: undefined, constraint: undefined }),
+            (error: { code?: string; constraint?: string }) => ({
+              code: error.code,
+              constraint: error.constraint,
+            })
+          );
+        } finally {
+          await admin('ROLLBACK');
+        }
+      }
+
+      it('guards the owner and turn pointers of an admission lineage, and nothing else', async () => {
+        const lineage = await newSession(suiteSbId);
+        const before = await pointers(lineage);
+        for (const fields of [
+          { turn_epoch: randomUUID() },
+          { owner_tenure_id: randomUUID() },
+          // session_running_write fills a turn on entering running: the guard
+          // judges the final row, and the whole statement rolls back.
+          { lifecycle: 'running' },
+        ]) {
+          const { error } = await supabase.from('sessions').update(fields).eq('id', lineage);
+          expect(error?.code, JSON.stringify(fields)).toBe('42501');
+        }
+        const claimed = await supabase.rpc('claim_turn_epoch', { p_session_id: lineage });
+        expect(claimed.error?.code).toBe('42501');
+        expect(await pointers(lineage)).toEqual(before);
+        // Other columns are the API's as before.
+        const noted = await supabase
+          .from('sessions')
+          .update({ context: 'invented note' })
+          .eq('id', lineage);
+        expect(noted.error).toBeNull();
+
+        // The evidence decides, not the mode it was created in.
+        await setMode('legacy');
+        try {
+          const { error } = await supabase
+            .from('sessions')
+            .update({ turn_epoch: randomUUID() })
+            .eq('id', lineage);
+          expect(error?.code).toBe('42501');
+        } finally {
+          await setMode('conditional');
+        }
+
+        // A legacy session keeps its turns, and still cannot be given an owner.
+        const legacy = await legacySession();
+        expect(
+          (await supabase.from('sessions').update({ turn_epoch: randomUUID() }).eq('id', legacy))
+            .error
+        ).toBeNull();
+        expect((await supabase.rpc('claim_turn_epoch', { p_session_id: legacy })).error).toBeNull();
+        const owned = await supabase
+          .from('sessions')
+          .update({ owner_tenure_id: randomUUID() })
+          .eq('id', legacy);
+        expect(owned.error?.code).toBe('42501');
+
+        // Nor can a new row arrive with one.
+        const seeded = await supabase
+          .from('sessions')
+          .insert({
+            user_id: userId,
+            agent_id: SUITE_SB,
+            sb_id: suiteSbId,
+            status: 'active',
+            owner_tenure_id: randomUUID(),
+          })
+          .select('id');
+        expect(seeded.error?.code).toBe('42501');
+      });
+
+      it('proves the holder by its secret, so the stored hash authorizes nothing', async () => {
+        const sessionId = await newSession(suiteSbId);
+        const holder = await register(sessionId, 'server_hosted');
+        const { data: tenure } = await supabase
+          .from('session_owner_tenures')
+          .select('capability_hash')
+          .eq('id', holder.tenureId)
+          .single();
+        // Still readable, and now only a digest.
+        expect(tenure?.capability_hash).toBe(tenureCapabilityHash(holder.capability));
+        const command = await queued(sessionId);
+        const admit = (capability: string) =>
+          admitTurn(supabase, {
+            sessionId,
+            holder: { ...holder, capability },
+            expectedPriorEpoch: null,
+            epoch: randomUUID(),
+            commandUuid: command,
+          });
+        expect(await admit(tenure!.capability_hash as string)).toEqual({ outcome: 'not_holder' });
+        expect(await admit(holder.capability)).toMatchObject({ outcome: 'admitted' });
+
+        // Registration takes a secret of at least 256 bits' worth of text.
+        const other = await newSession(suiteSbId);
+        for (const capability of ['short-secret', tenureCapabilityHash('x'), 'a'.repeat(201)]) {
+          expect(
+            await registerTenure(supabase, {
+              sessionId: other,
+              expected: { kind: 'never_owned' },
+              mode: 'server_hosted',
+              capability,
+              host: HOST,
+            }),
+            capability
+          ).toEqual({ outcome: 'invalid', field: 'capability' });
+        }
+        // The hash-taking signatures are gone.
+        const old = await supabase.rpc('admit_turn', {
+          p_session_id: sessionId,
+          p_tenure_id: holder.tenureId,
+          p_capability_hash: tenureCapabilityHash(holder.capability),
+          p_host_instance_id: holder.hostInstanceId,
+          p_expected_prior_epoch: null,
+          p_epoch: randomUUID(),
+          p_command_uuid: command,
+          p_protocol: ADMISSION_PROTOCOL,
+        });
+        expect(old.error).not.toBeNull();
+      });
+
+      it('keeps evidence while its parent stands: a lineage, its workspace or its user cannot be deleted', async () => {
+        const lineage = await newSession(suiteSbId);
+        await register(lineage, 'server_hosted');
+        await queued(lineage);
+        // A user whose only dependent is one lineage session, so no unrelated
+        // key can be the one that refuses its deletion.
+        const loner = randomUUID();
+        const { error: lonerErr } = await supabase
+          .from('users')
+          .insert({ id: loner, email: `seal-${RUN}@integration.test` });
+        if (lonerErr) throw new Error(`user insert failed: ${lonerErr.message}`);
+        const { data: lonerSession, error: lonerSessionErr } = await supabase
+          .from('sessions')
+          .insert({ user_id: loner, agent_id: SUITE_SB, status: 'active' })
+          .select('id')
+          .single();
+        if (lonerSessionErr || !lonerSession)
+          throw new Error(`session insert failed: ${lonerSessionErr?.message}`);
+        sessionIds.push(lonerSession.id as string);
+        // Without the session, the same delete succeeds: the control.
+        const spare = randomUUID();
+        await supabase
+          .from('users')
+          .insert({ id: spare, email: `seal-spare-${RUN}@integration.test` });
+        expect(await asServiceRole('DELETE FROM public.users WHERE id = $1', [spare])).toEqual({
+          code: undefined,
+          constraint: undefined,
+        });
+        await supabase.from('users').delete().eq('id', spare);
+        for (const [label, sql, params] of [
+          ['the session', 'DELETE FROM public.sessions WHERE id = $1', [lineage]],
+          ['its workspace', 'DELETE FROM public.workspaces WHERE id = $1', [workspaceId]],
+          ['its user', 'DELETE FROM public.users WHERE id = $1', [loner]],
+        ] as const) {
+          const refused = await asServiceRole(sql, [...params]);
+          // Refused by one of the six restricted edges, not by some other key.
+          expect(refused.code, label).toBe('23503');
+          expect(RESTRICTED, label).toContain(refused.constraint);
+        }
+        expect(await pointers(lineage)).toMatchObject({ status: 'active' });
+
+        // A session with no evidence is deleted as before.
+        const plain = await legacySession();
+        expect((await supabase.from('sessions').delete().eq('id', plain)).error).toBeNull();
+
+        // A referential action that writes a lineage row passes the guard: it
+        // never touches the owner or turn pointer.
+        const path = `/tmp/ink-seal-${RUN}`;
+        const { data: studio, error: studioErr } = await supabase
+          .from('studios')
+          .insert({
+            user_id: userId,
+            agent_id: SUITE_SB,
+            repo_root: path,
+            worktree_path: path,
+            branch: 'seal-fixture',
+            status: 'active',
+          })
+          .select('id')
+          .single();
+        if (studioErr || !studio) throw new Error(`studio insert failed: ${studioErr?.message}`);
+        expect(
+          (await supabase.from('sessions').update({ studio_id: studio.id }).eq('id', lineage)).error
+        ).toBeNull();
+        expect((await supabase.from('studios').delete().eq('id', studio.id)).error).toBeNull();
+        const { data: after } = await supabase
+          .from('sessions')
+          .select('studio_id, owner_tenure_id')
+          .eq('id', lineage)
+          .single();
+        expect(after?.studio_id).toBeNull();
+        expect(after?.owner_tenure_id).not.toBeNull();
       });
     });
   });

@@ -10,6 +10,7 @@ import {
   registerTenure,
   releaseTenure,
   tenureCapabilityHash,
+  TenureAdmissionError,
   type LegacySessionState,
   type TenureHolder,
 } from './tenure-admission';
@@ -39,7 +40,9 @@ describe('tenure capability', () => {
     expect(a.capabilityHash).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
-  it('sends only the hash of the holder secret, never the secret', async () => {
+  // The database hashes the secret itself, so the digest it stores is not a
+  // credential: presenting it proves nothing.
+  it('sends the holder secret for the database to hash, never the stored digest', async () => {
     const { client, rpc } = clientReturning({ outcome: 'not_holder' });
     await admitTurn(client, {
       sessionId: SESSION,
@@ -49,20 +52,63 @@ describe('tenure capability', () => {
       commandUuid: COMMAND,
     });
     const args = rpc.mock.calls[0][1] as Record<string, unknown>;
-    expect(args.p_capability_hash).toBe(tenureCapabilityHash(holder.capability));
-    expect(JSON.stringify(args)).not.toContain(holder.capability);
+    expect(args.p_capability).toBe(holder.capability);
+    expect(args).not.toHaveProperty('p_capability_hash');
+    expect(JSON.stringify(args)).not.toContain(tenureCapabilityHash(holder.capability));
+  });
+});
+
+describe('admission RPC failures', () => {
+  const call = (client: SupabaseClient) =>
+    admitTurn(client, {
+      sessionId: SESSION,
+      holder,
+      expectedPriorEpoch: null,
+      epoch: 'epoch-1',
+      commandUuid: COMMAND,
+    });
+  // Everything a transport might say, each echoing the secret.
+  const echo = `invalid input near "${holder.capability}"`;
+
+  it('reports an error reply by its class alone, with nothing of the transport', async () => {
+    const error = { message: echo, details: echo, hint: echo, code: echo };
+    const rejection = await call(clientReturning(null, error).client).catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(TenureAdmissionError);
+    expect(rejection).toMatchObject({ rpc: 'admit_turn', kind: 'transport_failed' });
+    expect((rejection as Error).message).toBe('admit_turn failed');
+    expect(JSON.stringify(rejection)).not.toContain(holder.capability);
+    expect(String((rejection as Error).stack)).not.toContain(holder.capability);
+    expect((rejection as Error & { cause?: unknown }).cause).toBeUndefined();
+  });
+
+  it('reports a rejected call the same way', async () => {
+    const rpc = vi.fn().mockRejectedValue(new Error(echo));
+    const rejection = await call({ rpc } as unknown as SupabaseClient).catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(TenureAdmissionError);
+    expect(rejection).toMatchObject({ rpc: 'admit_turn', kind: 'transport_failed' });
+    expect((rejection as Error).message).toBe('admit_turn failed');
+    expect(String((rejection as Error).stack)).not.toContain(holder.capability);
+    expect((rejection as Error & { cause?: unknown }).cause).toBeUndefined();
+  });
+
+  it('reports a reply outside the contract without quoting it', async () => {
+    const rejection = await call(clientReturning({ outcome: echo }).client).catch(
+      (e: unknown) => e
+    );
+    expect(rejection).toMatchObject({ rpc: 'admit_turn', kind: 'reply_outside_contract' });
+    expect((rejection as Error).message).not.toContain(holder.capability);
   });
 });
 
 describe('registerTenure', () => {
   it('passes the exact expected prior, the host and the protocol', async () => {
     const { client, rpc } = clientReturning({ outcome: 'registered', tenureId: TENURE });
-    const { capabilityHash } = mintTenureCapability();
+    const { capability } = mintTenureCapability();
     const result = await registerTenure(client, {
       sessionId: SESSION,
       expected: { kind: 'released', tenureId: TENURE },
       mode: 'interactive_wrapper',
-      capabilityHash,
+      capability,
       host: { instanceId: 'host-fixture', bootId: 'boot-fixture' },
     });
     expect(result).toEqual({ outcome: 'registered', tenureId: TENURE });
@@ -70,7 +116,7 @@ describe('registerTenure', () => {
       p_session_id: SESSION,
       p_expected: { kind: 'released', tenureId: TENURE },
       p_mode: 'interactive_wrapper',
-      p_capability_hash: capabilityHash,
+      p_capability: capability,
       p_host: { instanceId: 'host-fixture', bootId: 'boot-fixture' },
       p_owner: null,
       p_endpoint: null,
@@ -91,7 +137,7 @@ describe('registerTenure', () => {
           sessionId: SESSION,
           expected: { kind: 'never_owned' },
           mode: 'server_hosted',
-          capabilityHash: mintTenureCapability().capabilityHash,
+          capability: mintTenureCapability().capability,
           host: { instanceId: 'host-fixture' },
         })
       ).rejects.toThrow(/outside its contract/);
@@ -197,7 +243,7 @@ describe('admitLeasedTurn', () => {
     studioId: TENURE,
   };
 
-  it('sends the named studio with the admission and only the capability hash', async () => {
+  it('sends the named studio with the admission and the holder secret', async () => {
     const { client, rpc } = clientReturning({
       outcome: 'admitted',
       epoch: 'epoch-1',
@@ -211,7 +257,7 @@ describe('admitLeasedTurn', () => {
     expect(rpc).toHaveBeenCalledWith('admit_leased_turn', {
       p_session_id: SESSION,
       p_tenure_id: TENURE,
-      p_capability_hash: tenureCapabilityHash(holder.capability),
+      p_capability: holder.capability,
       p_host_instance_id: 'host-fixture',
       p_expected_prior_epoch: null,
       p_epoch: 'epoch-1',

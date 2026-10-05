@@ -5997,7 +5997,7 @@ export type Database = {
       };
       admit_leased_turn: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_command_uuid: string;
           p_epoch: string;
           p_expected_prior_epoch: string;
@@ -6011,7 +6011,7 @@ export type Database = {
       };
       admit_turn: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_command_uuid: string;
           p_epoch: string;
           p_expected_prior_epoch: string;
@@ -6064,7 +6064,7 @@ export type Database = {
       };
       finish_turn: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_epoch: string;
           p_evidence: string;
           p_host_instance_id: string;
@@ -6083,7 +6083,7 @@ export type Database = {
       };
       append_session_journal: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_entry: Json;
           p_expected_committed_eid: number;
           p_host_instance_id: string;
@@ -6229,7 +6229,7 @@ export type Database = {
       };
       register_tenure: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_endpoint: Json;
           p_expected: Json;
           p_host: Json;
@@ -6242,7 +6242,7 @@ export type Database = {
       };
       hold_session_journal: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_host_instance_id: string;
           p_journal_id: string;
           p_protocol: number;
@@ -6464,7 +6464,7 @@ export type Database = {
       };
       record_invocation: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_detail: Json;
           p_epoch: string;
           p_host_instance_id: string;
@@ -6491,7 +6491,7 @@ export type Database = {
       };
       release_tenure: {
         Args: {
-          p_capability_hash: string;
+          p_capability: string;
           p_evidence: string;
           p_host_instance_id: string;
           p_protocol: number;
