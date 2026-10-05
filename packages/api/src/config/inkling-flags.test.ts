@@ -1,11 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AWAKEN_CAP,
-  DEFAULT_TURN_CAP,
   inklingAwakenCap,
   inklingOwnerTestAllowlist,
   inklingOwnerTestUserIds,
-  inklingTurnCap,
   inklingTurnTimeoutMs,
   isInklingOwnerTestUser,
 } from './inkling-flags';
@@ -18,17 +16,6 @@ describe('inklingTurnTimeoutMs', () => {
     expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '0' })).toBeUndefined();
     expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '-5' })).toBeUndefined();
     expect(inklingTurnTimeoutMs({ INKLING_TURN_TIMEOUT_MS: '90000' })).toBe(90_000);
-  });
-});
-
-describe('inklingTurnCap', () => {
-  it('is 20 unless INKLING_TURN_CAP is a positive whole number', () => {
-    expect(DEFAULT_TURN_CAP).toBe(20);
-    expect(inklingTurnCap({})).toBe(20);
-    expect(inklingTurnCap({ INKLING_TURN_CAP: '3' })).toBe(3);
-    for (const raw of ['0', '-1', 'lots', '1.5']) {
-      expect(inklingTurnCap({ INKLING_TURN_CAP: raw })).toBe(20);
-    }
   });
 });
 

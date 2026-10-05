@@ -86,7 +86,6 @@ import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import {
-  claimInklingTurn,
   classifyIdentityById,
   type InklingIdentity,
   inklingTurnRefusal,
@@ -100,11 +99,7 @@ import {
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
-import {
-  inklingOwnerTestUserIds,
-  inklingTurnCap,
-  inklingTurnTimeoutMs,
-} from '../../config/inkling-flags.js';
+import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -2358,20 +2353,17 @@ export class SessionService implements ISessionService {
         }
         // A stopped turn whose processes were not confirmed gone fences the
         // inkling until its group is (inkling-stop-fence.ts): no new turn
-        // runs beside them. Asked before the cap, so a refused turn counts
-        // nothing, and retryable, because the fence lifts once the group is
-        // observed gone. Asked again at the spawn seam (below), because this
-        // answer can go stale while the turn is prepared.
+        // runs beside them. Retryable, because the fence lifts once the group
+        // is observed gone. Asked again at the spawn seam (below), because
+        // this answer can go stale while the turn is prepared.
         if (inklingFenceHolds(inklingIdentity.id)) {
           return refuseInklingTurn(INKLING_FENCE_REASON, true);
         }
-        // A bounded first test: each turn is counted against the inkling's
-        // cap before anything is spawned.
-        const cap = inklingTurnCap();
-        const claim = await claimInklingTurn(this.supabase, inklingIdentity.id, userId, cap);
-        if (!claim.allowed) {
-          return refuseInklingTurn(`turn cap reached (${claim.used} of ${cap})`);
-        }
+        // There is no count of turns: Conor dropped the turn cap on Oct 4
+        // 2026 (5:00 PM). Usage limits will be monthly token allowances
+        // (ink://specs/inkling-model-access, task 2a00148f); until then a turn
+        // is bounded by the owner test above, Stop, the fence and its one
+        // outer cycle.
         inklingTurn = true;
         inklingSbId = inklingIdentity.id;
         // Its turn runs in its own folder, never the Inkwell checkout or the
