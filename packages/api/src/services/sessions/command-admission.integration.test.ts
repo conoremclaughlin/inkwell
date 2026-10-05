@@ -17,8 +17,14 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   canonicalJournalJson,
   freezeJournalEntry,
+  JournalWriter,
+  type JournalJson,
+  type JournalRecord,
+  type JournalStore,
   type JournalTarget,
 } from '@inklabs/shared/runtime';
+import { SessionJournalStore } from './session-journal-store';
+import { readSessionJournalPage } from './session-journal-reader';
 import { getDataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 import {
@@ -4253,6 +4259,170 @@ describe('durable command admission', () => {
           resolution: null,
         });
         expect(await header(w.journalId)).toMatchObject({ committed_eid: 1, hold_reason: null });
+      });
+
+      // The real host ports composed with PostgREST/SQL, not a parallel mock of
+      // their contract. These share this suite's admission-mode owner and use
+      // synthetic sessions only. No backend is launched or session recovered.
+      describe('host writer/store/reader composition', () => {
+        function host(w: JournalWriterState) {
+          const identity = {
+            sessionId: w.sessionId,
+            journalId: w.journalId,
+            writerTenureId: w.holder.tenureId,
+            hostInstanceId: w.holder.hostInstanceId,
+          };
+          const store = new SessionJournalStore({
+            client: supabase,
+            identity,
+            capability: w.holder.capability,
+            maxEntryBytes: ENTRY_LIMIT,
+          });
+          const options = {
+            identity,
+            store,
+            committedEid: w.eid,
+            now: () => '2026-10-05T03:00:00.000Z',
+            maxEntryBytes: ENTRY_LIMIT,
+            maxPendingEntries: 8,
+            maxPendingBytes: ENTRY_LIMIT * 8,
+          };
+          const scope = { sessionId: w.sessionId, journalId: w.journalId };
+          const read = {
+            scope,
+            cursor: { journalId: w.journalId, afterEid: 0 },
+            // Synthetic fixture authorization, not a production auth adapter.
+            authorize: async () => true,
+          };
+          return { store, options, writer: new JournalWriter(options), read };
+        }
+
+        it('round-trips depth/node boundary entries through SQL and a multi-entry read page', async () => {
+          const { w } = await started();
+          const h = host(w);
+          let nested: JournalJson = 'leaf';
+          for (let i = 0; i < 62; i++) nested = { child: nested };
+          const bodies: JournalRecord['body'][] = [
+            { nested },
+            { values: Array(99_988).fill(0) },
+            { values: Array(99_988).fill(1) },
+          ];
+          for (const body of bodies) {
+            const receipt = await h.writer.append({ type: 'assistant', target: null, body });
+            expect(receipt.outcome).toBe('committed');
+            expect(receipt.projection).toBe('none');
+            expect(receipt.entry.body).toEqual(body);
+          }
+          await h.writer.close();
+          expect(h.writer.failure).toBeUndefined();
+          expect(h.writer.committedEid).toBe(3);
+          const page = await readSessionJournalPage(supabase, h.read);
+          expect(page.entries.map((entry) => entry.body)).toEqual(bodies);
+          expect(page).toMatchObject({
+            committedEid: 3,
+            throughEid: 3,
+            more: false,
+            holdReason: null,
+          });
+          expect(page.cursor.afterEid).toBe(3);
+          expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
+        });
+
+        it('pins replay independently of later appends and resumes with the last committed cursor', async () => {
+          const { w } = await started();
+          const h = host(w);
+          const record = (text: string): JournalRecord => ({
+            type: 'assistant',
+            target: null,
+            body: { text },
+          });
+          await h.writer.append(record('one'));
+          await h.writer.append(record('two'));
+          const first = await readSessionJournalPage(supabase, { ...h.read, maxEntries: 1 });
+          expect(first).toMatchObject({ throughEid: 2, committedEid: 2, more: true });
+          await h.writer.append(record('three'));
+          const second = await readSessionJournalPage(supabase, {
+            ...h.read,
+            cursor: first.cursor,
+            throughEid: first.throughEid,
+          });
+          expect(second.entries.map((entry) => entry.body.text)).toEqual(['two']);
+          expect(second).toMatchObject({ throughEid: 2, committedEid: 3, more: false });
+          const third = await readSessionJournalPage(supabase, {
+            ...h.read,
+            cursor: second.cursor,
+          });
+          expect(third.entries.map((entry) => entry.body.text)).toEqual(['three']);
+          expect(third.cursor.afterEid).toBe(3);
+          await h.writer.close();
+        });
+
+        it('preserves an unacknowledged SQL commit, stops queued writes and confirms a durable hold', async () => {
+          const { w } = await started();
+          const h = host(w);
+          let calls = 0;
+          let committedRequest: Parameters<JournalStore['append']>[0] | undefined;
+          const lossy: JournalStore = {
+            append: async (request) => {
+              calls++;
+              await h.store.append(request);
+              committedRequest = request;
+              // Fault at the store/consumer boundary, AFTER the real DB ACK.
+              // This is not a claim to have crashed Postgres or the transport.
+              throw new Error('synthetic acknowledgment loss');
+            },
+            hold: (request) => h.store.hold(request),
+          };
+          const writer = new JournalWriter({ ...h.options, store: lossy });
+          const results = await Promise.allSettled([
+            writer.append({ type: 'assistant', target: null, body: { text: 'committed' } }),
+            writer.append({ type: 'assistant', target: null, body: { text: 'never sent' } }),
+          ]);
+          expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected']);
+          await expect(writer.flush()).rejects.toMatchObject({ code: 'append_failed' });
+          expect(calls).toBe(1);
+          expect(writer.committedEid).toBe(0);
+          expect(writer.failure).toEqual({ code: 'append_failed', hold: 'confirmed' });
+          const page = await readSessionJournalPage(supabase, h.read);
+          expect(page.entries.map((entry) => entry.body.text)).toEqual(['committed']);
+          expect(page).toMatchObject({ committedEid: 1, holdReason: 'append_failed' });
+          expect(committedRequest).toBeDefined();
+          const receipt = await h.store.append(committedRequest!);
+          expect(receipt).toMatchObject({
+            outcome: 'already_committed',
+            committedEid: 1,
+            projection: 'none',
+            entry: committedRequest!.entry,
+          });
+          // An explicit diagnostic retry proves history, never reopens writer intake.
+          await expect(
+            writer.append({ type: 'assistant', target: null, body: {} })
+          ).rejects.toMatchObject({ code: 'append_failed' });
+          expect((await storedEntries(w.journalId)).length).toBe(1);
+          expect((await header(w.journalId)).hold_reason).toBe('append_failed');
+        });
+
+        it('turns a committed contradiction into a confirmed host hold and leaves the evidence readable', async () => {
+          const { w, t } = await started();
+          const h = host(w);
+          const target = targetOf(w.holder, t, 'inv-host-composition');
+          // entryOf shares the full record grammar; use only the resulting record fields.
+          for (const source of [intent(target), bound(target), observed(target, 'not_spawned')]) {
+            const { type, target: checkedTarget, body } = entryOf(w, 1, source);
+            await h.writer.append({ type, target: checkedTarget, body });
+          }
+          await expect(h.writer.flush()).rejects.toMatchObject({ code: 'projection_held' });
+          expect(h.writer.failure).toEqual({ code: 'projection_held', hold: 'confirmed' });
+          expect(h.writer.committedEid).toBe(3);
+          expect(await invocationRow(w.sessionId, t.epoch, target.invocationId!)).toMatchObject({
+            resolution: null,
+            contradiction: true,
+          });
+          const page = await readSessionJournalPage(supabase, h.read);
+          expect(page.entries).toHaveLength(3);
+          expect(page.entries[2].body.kind).toBe('not_spawned');
+          expect(page.holdReason).toBe('projection_held');
+        });
       });
     });
   });
