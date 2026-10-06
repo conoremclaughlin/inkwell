@@ -97,6 +97,10 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import {
+  HostedInkSessionRunner,
+  parseHostedInkSbIds,
+} from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
@@ -180,6 +184,17 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   // 2. Create SessionService (stateless, queries DB per-request)
   logger.info('Creating SessionService...');
+  // Opt-in only. No composition is bound yet (pr:701), so a listed agent's
+  // ink turns are refused, never sent to ink chat in its place.
+  const hostedInkSbIds = parseHostedInkSbIds(env.INK_RUNTIME_IN_PROCESS_SB_IDS);
+  if (hostedInkSbIds.size > 0) {
+    logger.warn(
+      "In-process ink runtime selected, with no composition bound: these agents' ink turns are refused",
+      {
+        sbIds: [...hostedInkSbIds],
+      }
+    );
+  }
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
@@ -196,6 +211,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
+    ...(hostedInkSbIds.size > 0
+      ? { hostedInk: { runner: new HostedInkSessionRunner({}), sbIds: hostedInkSbIds } }
+      : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
