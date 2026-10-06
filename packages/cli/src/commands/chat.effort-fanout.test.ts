@@ -6,12 +6,18 @@ import { dirname, join } from 'path';
 /**
  * Every backend spawn the REPL makes must carry the runtime's effort — the
  * delivery spawn, the reseed after a vanished session, tool-loop
- * continuations, the compaction summarizer, and shadow clones. Those calls
- * live inside runChat's closure with no harness that reaches them, so the
- * invariant is pinned where it can be observed: the source. Deleting the
+ * continuations, the compaction summarizer, and shadow clones. This scan follows the CLI and shared provider request sites;
+ * behavioural tests of the extracted composer live beside it. Deleting the
  * `effort:` line at any spawn site turns this red (Lumen, PR #579).
  */
-const chatSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'chat.ts'), 'utf-8');
+const here = dirname(fileURLToPath(import.meta.url));
+const cliSource = readFileSync(join(here, 'chat.ts'), 'utf8');
+const providerSource = readFileSync(
+  join(here, '../../../shared/src/providers/session-provider.ts'),
+  'utf8'
+);
+// Scan the remaining CLI spawns AND the extracted delivery/reseed/continuation sites.
+const chatSource = cliSource + '\n' + providerSource;
 
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
@@ -19,7 +25,8 @@ function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
   // A spawn's request may be built by a named builder (continuationRequest,
   // cloneRequest) that the budget measurer shares — those literals are spawn
   // sites too.
-  const re = /\b(?:startBackendTurn|runBackendTurn)\(\{|: BackendRunRequest => \(\{/g;
+  const re =
+    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn)\(\{|: BackendRunRequest => \(\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     const open = m.index + m[0].length - 1;
@@ -41,6 +48,12 @@ function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
 
 describe('effort reaches every backend spawn in chat.ts', () => {
   const calls = spawnCallArgs(chatSource);
+
+  it('wires the shared provider composition to the same runtime and attachment', () => {
+    expect(cliSource).toMatch(/createSessionProviderTurn\(\s*\{\s*runtime,/);
+    expect(cliSource).toMatch(/sbSlug,\s*cliAttached,\s*passthroughArgs,/);
+    expect(cliSource).toContain('startTurn: startBackendTurn');
+  });
 
   it('finds the spawn sites (delivery, reseed, continuation, compaction, clone)', () => {
     expect(calls.length).toBeGreaterThanOrEqual(5);

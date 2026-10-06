@@ -37,3 +37,4 @@ export * from './session-prompt.js';
 export * from './paragraph-stream.js';
 export * from './preview-guard.js';
 export * from './frame-fanout.js';
+export * from './session-budget.js';

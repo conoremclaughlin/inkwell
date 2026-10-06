@@ -85,3 +85,13 @@ export function findLastDetectedModelInEvents(
   }
   return found;
 }
+
+/**
+ * Detect claude's "resume failed because the session no longer exists locally"
+ * signal from stderr. Mirrors the same check in the server runners
+ * (ink-runner.ts / claude-runner.ts) so the CLI recovers the same way.
+ */
+export function isResumeFailedNoSession(stderr: string): boolean {
+  const lower = (stderr || '').toLowerCase();
+  return lower.includes('session not found') || lower.includes('no such session');
+}

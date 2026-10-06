@@ -14,12 +14,20 @@ import { dirname, join } from 'path';
  * The behavioural check through runChat is in chat.integration.test.ts, which
  * CI does not run. This one it does.
  */
-const chatSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'chat.ts'), 'utf-8');
+const here = dirname(fileURLToPath(import.meta.url));
+const cliSource = readFileSync(join(here, 'chat.ts'), 'utf8');
+const providerSource = readFileSync(
+  join(here, '../../../shared/src/providers/session-provider.ts'),
+  'utf8'
+);
+// Scan the remaining CLI spawns AND the extracted delivery/reseed/continuation sites.
+const chatSource = cliSource + '\n' + providerSource;
 
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
   const out: Array<{ at: number; literal: string }> = [];
-  const re = /\b(?:startBackendTurn|runBackendTurn)\(\{|: BackendRunRequest => \(\{/g;
+  const re =
+    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn)\(\{|: BackendRunRequest => \(\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     const open = m.index + m[0].length - 1;
@@ -41,6 +49,12 @@ function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
 
 describe('attachment reaches every backend spawn in chat.ts', () => {
   const calls = spawnCallArgs(chatSource);
+
+  it('wires the shared provider composition to the same runtime and attachment', () => {
+    expect(cliSource).toMatch(/createSessionProviderTurn\(\s*\{\s*runtime,/);
+    expect(cliSource).toMatch(/sbSlug,\s*cliAttached,\s*passthroughArgs,/);
+    expect(cliSource).toContain('startTurn: startBackendTurn');
+  });
 
   it('derives attachment once, from the run mode', () => {
     const derivations = chatSource.match(/\bconst cliAttached = [^;]+;/g) ?? [];

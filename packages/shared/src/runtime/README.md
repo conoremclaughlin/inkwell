@@ -236,3 +236,19 @@ provider orchestration, tool policy, media, live controls, cancellation
 and rendering still have host composition in `runChat`. Both hosts must bind
 that same extracted composition before claiming API parity; a bare call to
 `runAgentLoop` with fresh context is not an equivalent implementation.
+
+### Session provider composition
+
+`../providers/session-provider.ts` now holds the existing parent turn's native
+provider continuity and relay-occupancy policy. `runChat` uses it for initial
+launch, missing-session recovery, and tool-loop continuations. Its explicit
+ports carry the live envelope, session-specific launch host, log, stream events,
+usage sampling, mutation generation, cancellation handle, and presentation
+callbacks. It imports provider request **types** but never launches on its own;
+it belongs to the Node provider layer rather than widening this pure runtime
+entry point's import boundary. Stateless budget arithmetic lives here in
+`session-budget.ts`.
+
+This extraction is not the complete hosted session binding: bootstrap/state
+hydration, tool-policy composition, controls, and per-host cleanup must still
+join the coordinator and provider composition before a server turn is enabled.

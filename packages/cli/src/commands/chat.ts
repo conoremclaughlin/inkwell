@@ -1,16 +1,23 @@
+import { createSessionProviderTurn } from '@inklabs/shared/providers';
+export { isResumeFailedNoSession } from '@inklabs/shared/runtime';
+import { occupancyTokens, promptTokensOf, relayBudgetBytes } from '@inklabs/shared/runtime';
+export {
+  occupancyTokens,
+  promptTokensOf,
+  ledgerEntryPromptBytes,
+  relayBudgetBytes,
+  RELAY_HEADROOM_SHARE,
+  RELAY_BYTES_PER_TOKEN,
+  MIN_RELAY_BUDGET_BYTES,
+  LEDGER_ENTRY_FRAME_BYTES,
+} from '@inklabs/shared/runtime';
 import {
-  buildDeltaPrompt,
-  buildContinuationPrompt,
-  buildMidTurnReseedBody,
-  continuationSpawnArgs,
-  decideContinuationSession,
   envelopeShapeKey,
   spawnDialogueText,
   turnContextOccupancy,
   buildSessionPrompt,
   formatBootstrapContext,
   renderActiveSkills,
-  type ContinuationSpawnArgs,
   type ReseedDialogueEntry,
 } from '@inklabs/shared/runtime';
 export {
@@ -1978,16 +1985,6 @@ export function failIfBootstrapRequired(
   process.exit(78); // EX_CONFIG — the environment is wrong, not the request
 }
 
-/**
- * Detect claude's "resume failed because the session no longer exists locally"
- * signal from stderr. Mirrors the same check in the server runners
- * (ink-runner.ts / claude-runner.ts) so the CLI recovers the same way.
- */
-export function isResumeFailedNoSession(stderr: string): boolean {
-  const lower = (stderr || '').toLowerCase();
-  return lower.includes('session not found') || lower.includes('no such session');
-}
-
 /** Recovered provider-native session marker (see findLastBackendSession). */
 /** CLI storage adapters for the host-independent provider-continuity policy. */
 export function findLastBackendSession(
@@ -2080,113 +2077,7 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
   }
 }
 
-/** Share of the remaining window one relay may spend; the rest is the model's reply and the next turn. */
-export const RELAY_HEADROOM_SHARE = 0.5;
-/**
- * Bytes per token to assume when converting headroom into a relay budget —
- * and the reason budgets are in UTF-8 BYTES at all. No text tokenizes to
- * more tokens than its UTF-8 bytes (byte-level BPE bottoms out at one token
- * per byte), so 1 byte/token is a bound for any script; a chars-per-token
- * heuristic is not — the incident's JSON measured ~1.9 chars/token, and the
- * half-headroom promise failed below 0.75 UTF-16 chars/token (Lumen, PR #576
- * rounds 3–4). For ASCII JSON this is about twice as conservative as needed;
- * the payloads are in the transcript, and safety is the point.
- */
-export const RELAY_BYTES_PER_TOKEN = 1;
-/**
- * The floor a relay gets when the window has no headroom left: enough for a
- * stub per result that still names the tool and status, so the model is never
- * blind to what ran — at most 4K tokens, at the byte bound.
- */
-export const MIN_RELAY_BUDGET_BYTES = 4_000;
-
 const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
-
-/**
- * What the provider's session holds after a reply, by its own accounting:
- * the prompt it was handed (input + cache parts for Anthropic, whose cache
- * fields are disjoint from input; input alone for OpenAI/Gemini, whose input
- * already includes the cache) plus the reply it produced — including hidden
- * thinking, which no byte count of the visible text could see (Lumen, PR
- * #576 round 5). Undefined when the backend reported nothing usable.
- */
-export function occupancyTokens(
-  backend: string,
-  usage:
-    | Pick<
-        BackendTokenUsage,
-        | 'inputTokens'
-        | 'cacheReadTokens'
-        | 'cacheWriteTokens'
-        | 'outputTokens'
-        | 'totalTokens'
-        | 'reasoningTokens'
-      >
-    | undefined
-): number | undefined {
-  if (!usage) return undefined;
-  const name = backend.toLowerCase();
-  if (name === 'claude' || name === 'anthropic') {
-    // Anthropic's cache fields are disjoint from input; its total is input +
-    // output only, so the parts are summed here.
-    const prompt = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
-      (n): n is number => n !== undefined
-    );
-    if (prompt.length === 0) return undefined;
-    return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
-  }
-  // OpenAI and Gemini: the reported total already includes the cached prompt
-  // and hidden reasoning (Gemini's thoughtsTokenCount is part of
-  // totalTokenCount); without a total, prompt + output + reasoning (Lumen,
-  // PR #576 round 6).
-  if (usage.totalTokens !== undefined) return usage.totalTokens;
-  if (usage.inputTokens === undefined) return undefined;
-  return usage.inputTokens + (usage.outputTokens ?? 0) + (usage.reasoningTokens ?? 0);
-}
-
-/**
- * The PROMPT part of a report — what the provider counted as handed to the
- * model, discovered instruction files, tool schemas and media included — per
- * backend accounting: input + cache parts for Anthropic, input alone for
- * OpenAI/Gemini (whose input already includes the cache). A stateless
- * parent's next envelope is this plus what the ledger grew since; the reply
- * is not re-sent and is not counted (Lumen, PR #576 rounds 5–10).
- */
-export function promptTokensOf(
-  backend: string,
-  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'> | undefined
-): number | undefined {
-  if (!usage) return undefined;
-  const name = backend.toLowerCase();
-  if (name === 'claude' || name === 'anthropic') {
-    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
-      (n): n is number => n !== undefined
-    );
-    return parts.length ? parts.reduce((a, b) => a + b, 0) : undefined;
-  }
-  return usage.inputTokens;
-}
-
-/**
- * The bytes a ledger entry costs once rendered into a stateless envelope —
- * its content, role and source in UTF-8, plus a per-entry allowance for the
- * framing the envelope adds around them. An over-approximation on purpose:
- * a tokens × 4 estimate charged 500 for a 1,483-byte Han entry and omitted
- * the framing entirely (Lumen, PR #576 round 11).
- */
-export const LEDGER_ENTRY_FRAME_BYTES = 64;
-export function ledgerEntryPromptBytes(entry: {
-  role: string;
-  content: string;
-  source?: string;
-}): number {
-  return (
-    utf8Bytes(entry.content) +
-    utf8Bytes(entry.role) +
-    utf8Bytes(entry.source ?? '') +
-    LEDGER_ENTRY_FRAME_BYTES
-  );
-}
 
 /** What a stateless clone joins its history with; two ride along every new turn. */
 export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
@@ -2205,53 +2096,6 @@ export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'apply_patch',
   'bash',
 ]);
-
-/**
- * How many UTF-8 bytes the next relay message may be, from the window's live
- * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
- * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
- * MAX_RELAY_BYTES.
- *
- * What it holds is `occupancyTokens`, which the host supplies: for a native
- * session the provider's own count after the last reply — and NOTHING once a
- * later spawn reported no usage, because hidden thinking that was never
- * reported cannot be recovered from visible text (Lumen, PR #576 round 7);
- * for a stateless parent the previous request's PROMPT tokens as the provider
- * counted them (system prompt, discovered instruction files, tool schemas and
- * media included — nothing ink could measure from outside bounds those; Lumen,
- * PR #576 rounds 7–10) plus the exact rendered bytes of every ledger entry
- * added after that report and still present (by entry id — an eviction of
- * older entries can never net an addition away); the previous body is inside
- * the count and is not re-sent, which is slack in the safe direction. With no
- * occupancy the relay gets the floor.
- *
- * The one named assumption for a stateless parent: what the provider
- * discovers on its own (instruction files, tool schemas) is the same on the
- * next spawn as on the reported one. Ink drops the count to unknown whenever
- * the session-wide context generation moved since the report — any parent or
- * clone call of CONTEXT_MUTATING_TOOLS bumps it before running and again when
- * it settles, and no count is trusted while one is in flight, so an error after
- * a side effect and a spawn overlapping the mutation both count; drift caused
- * OUTSIDE this process — another
- * process editing AGENTS.md between spawns — is not detected and is accepted
- * as the limit of what the runtime can know (Lumen, PR #576 rounds 12–13).
- *
- * The bound is exact for the relay string. The floor is the one deliberate
- * exception: at exhausted headroom the model still receives a
- * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
- * than a small overrun; the pre-turn compaction threshold is what keeps
- * headroom from reaching zero (Lumen, PR #576 rounds 2–7).
- */
-export function relayBudgetBytes(
-  runtime: Pick<ChatRuntime, 'maxContextTokens'>,
-  occupancyTokens?: number
-): number {
-  const occupied =
-    occupancyTokens !== undefined ? Math.max(0, occupancyTokens) : runtime.maxContextTokens;
-  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied);
-  const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
-  return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
-}
 
 /** CLI compatibility: instruction discovery stays at the host boundary. */
 export function buildPromptEnvelope(
@@ -3596,12 +3440,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // resumed native session would be stale, so runUserTurn invalidates and
   // reseeds. Subsumes the backend check (backend is part of the shape).
   let activeBackendSessionShape: string | undefined;
-  // The stateless parent budget state, per turn (reset at turn start): the
-  // last report's prompt count and the ledger high-water id it was taken
-  // against. Held here, not in the turn, because the local-tool executor
-  // that invalidates it is declared before the turn (PR #576 round 12).
-  let statelessPromptTokens: number | undefined;
-  let ledgerMaxIdAtReport = -1;
   /**
    * The session-wide CONTEXT GENERATION: bumped before any local tool that can
    * change what a stateless provider discovers on its next fresh spawn runs —
@@ -3610,7 +3448,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * generation it was reported in is the current one (Lumen, PR #576 round 13).
    */
   let contextGeneration = 0;
-  let statelessGenerationAtReport = 0;
   /**
    * Mutations still running. A stateless spawn that starts and returns while
    * one is in flight would record the post-start generation and trust it after
@@ -5931,10 +5768,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const executeUserTurn = async (
     raw: string,
     turnMedia: TurnMedia[],
-    { occupancy: turnOccupancy, promptHooks: promptHookResult }: PreparedSessionTurn
+    prepared: PreparedSessionTurn
   ) => {
-    const contextStamp = formatContextStamp(turnOccupancy);
-
+    const { occupancy: turnOccupancy, promptHooks: promptHookResult } = prepared;
     // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
       // Check if any were passive recall vs budget warnings
@@ -5992,72 +5828,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
           )
         );
       }
-    }
-
-    // Provider session seed/resume decision (claude only). The first backend
-    // spawn of the session SEEDS a fresh provider session (--session-id) with
-    // the FULL envelope; every later turn RESUMES it (--resume) sending only
-    // this turn's delta — the new user message plus any passive-recall surfaced
-    // this turn — because the provider already holds the system prompt, tools,
-    // bootstrap, and prior turns. The tool-loop continuations below always
-    // resume the same session. This collapses the whole conversation into ONE
-    // coherent Claude jsonl and stops re-piping the transcript window on every
-    // round-trip. Stateless backends (codex/gemini) always get the full
-    // envelope.
-    //
-    // `canReuseBackendSession` is computed PER-TURN against the current backend
-    // so a mid-session /backend switch is honored (not captured once at
-    // startup). And a live session is invalidated when the envelope's static
-    // SHAPE has drifted since it was seeded — /backend, /model, /tool-routing,
-    // /skill-use, /skill-clear, /refresh, profile changes. Otherwise the resumed
-    // native session would be stale (e.g. seeded with backend tool-routing, then
-    // /tool-routing local leaves it without ink-tool instructions while native
-    // tools are disabled). On drift we reseed fresh with the new envelope.
-    const canReuseBackendSession = runtime.backend === 'claude';
-    const currentEnvelopeShape = envelopeShapeKey(runtime);
-    if (activeBackendSessionId !== undefined) {
-      if (activeBackendSessionShape === undefined) {
-        // Recovered from a prior process — adopt this turn's shape as the
-        // baseline (no invalidation). Cross-process bootstrap drift is
-        // tolerated; only in-process drift from here triggers a reseed.
-        activeBackendSessionShape = currentEnvelopeShape;
-      } else if (activeBackendSessionShape !== currentEnvelopeShape) {
-        // In-process envelope drift — the resumed native session would be
-        // stale, so invalidate and reseed fresh with the new envelope.
-        activeBackendSessionId = undefined;
-        activeBackendSessionShape = undefined;
-      }
-    }
-    const resumeProviderSession = canReuseBackendSession && activeBackendSessionId !== undefined;
-    let seedProviderSessionId: string | undefined;
-    if (canReuseBackendSession && !resumeProviderSession) {
-      seedProviderSessionId = randomUUID();
-      activeBackendSessionId = seedProviderSessionId;
-      activeBackendSessionShape = currentEnvelopeShape;
-      // Persist the seed so a later process (next heartbeat / reattach) recovers
-      // and RESUMES this native session instead of fragmenting into a new jsonl.
-      // routing rides along so cross-process recovery can refuse a session
-      // seeded under the other instruction envelope.
-      runtime.log.append({
-        type: 'backend_session',
-        id: seedProviderSessionId,
-        routing: runtime.toolRouting,
-      });
-    }
-
-    let prompt: string;
-    if (resumeProviderSession) {
-      const recallDelta = promptHookResult.injectedEntries
-        .filter((e) => e.source === 'passive-recall')
-        .map((e) => e.content)
-        .join('\n\n');
-      // The stamp rides the DELTA, not just the envelope. A resumed native
-      // session never re-reads the envelope, so anything that lives only there
-      // is sent once at seed time and is stale for every turn after — and the
-      // long-running resumed session is exactly the seat whose window fills.
-      prompt = buildDeltaPrompt(contextStamp, recallDelta, raw);
-    } else {
-      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw, contextStamp);
     }
 
     const turnStartedAt = Date.now();
@@ -6164,384 +5934,148 @@ export async function runChat(options: ChatOptions): Promise<void> {
      * fire it. `currentTurnAbort` still moves per child, so a Ctrl+C during a
      * backend turn kills the right process.
      */
-    process.on('SIGINT', onSigintDuringTurn);
-    inkRepl?.setAbortHandler(abortCurrentTurn);
     const disarmTurnCancellation = () => {
       process.off('SIGINT', onSigintDuringTurn);
       inkRepl?.setAbortHandler(null);
     };
 
-    // ── Backend port for this turn ──
-    // The loop (@inklabs/shared/runtime) decides WHAT to send and whether to send
-    // again. Everything below is this host's business: provider-session seeding
-    // and reuse, recovery when a resumed session has vanished, media delivery
-    // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone
-    // supplies a far simpler runTurn and shares the loop unchanged.
-    let lastRunResult!: BackendRunResult;
-    // What this turn's loop has already put in the provider's context that the
-    // ledger cannot see yet: every continuation body sent and every reply
-    // received. The relay budget shrinks by it, or each iteration re-grants
-    // the same allowance while the window fills (Lumen, PR #576 round 3).
-    let loopOccupancyTokens: number | undefined;
-    // A stateless parent: the last report's prompt tokens and the highest
-    // ledger entry id at that moment, so every entry added since is charged at
-    // its rendered bytes — by id, never as a net total an eviction could hide.
-    statelessPromptTokens = undefined;
-    ledgerMaxIdAtReport = -1;
-    const maxLedgerId = (): number => ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
-    const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
-    /**
-     * After each spawn. NATIVE session: the provider's own occupancy when it
-     * reported one — everything sent and received so far, hidden thinking
-     * included — else UNKNOWN until the next report (what an unreported spawn
-     * added cannot be recovered from visible text). STATELESS parent: the
-     * report's prompt tokens — the provider's own count of the envelope, with
-     * discovered files, tool schemas and media inside it — and the ledger
-     * size at that moment; the reply is not re-sent and is not counted
-     * (Lumen, PR #576 rounds 5–10).
-     */
-    const noteSpawn = (
-      result: BackendRunResult,
-      ledgerIdBeforeSpawn: number,
-      generationBeforeSpawn: number
-    ): void => {
-      if (nativeSession()) {
-        loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
-        return;
-      }
-      statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
-      // The high-water id from BEFORE the spawn: an entry polled in while the
-      // backend ran (inbox, activity) is absent from the reported prompt and
-      // must be charged, not marked covered (Lumen, PR #576 round 12).
-      ledgerMaxIdAtReport = ledgerIdBeforeSpawn;
-      statelessGenerationAtReport = generationBeforeSpawn;
-    };
-    /** The continuation spawn's request; the budget measures the same shape. */
-    const continuationRequest = (
-      prompt: string,
-      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
-    ): BackendRunRequest => ({
-      backend: runtime.backend,
-      sbSlug,
-      model: runtime.model,
-      effort: runtime.effort,
-      prompt,
-      verbose: runtime.verbose,
-      passthroughArgs,
-      systemPromptOverride: runtime.systemPromptOverride,
-      timeoutMs: runtime.backendTurnTimeoutMs,
-      idleTimeoutMs: runtime.backendIdleTimeoutMs,
-      stream: true,
-      onEvent: handleBackendEvent,
-      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-      toolRouting: runtime.toolRouting,
-      // Same logical turn — media rides along so the adapter's boundary
-      // disposition (--tools gate) cannot flap between the delivery spawn and
-      // tool-loop continuations. A RESUME never re-delivers it (the session
-      // holds it); a mid-turn SEED must (the fresh session has never seen it);
-      // stateless adapters re-attach from `media` regardless.
-      media: turnMedia.length > 0 ? turnMedia : undefined,
-      ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
-      cliAttached,
-      ...providerSpawnContext(),
-      // The session argument is the DECISION's, never derived from the live id:
-      // a seed assigns the minted id before spawning, and deriving from it sent
-      // a resume of a session that did not exist yet (Lumen, PR #577).
-      ...spawn.sessionArgs,
-    });
-    /**
-     * What the window holds for the next relay — see relayBudgetBytes. A
-     * stateless parent's next envelope is the last report's prompt plus the
-     * rendered bytes of every entry added to the ledger since (by id).
-     */
-    const relayOccupancy = (): number | undefined => {
-      if (nativeSession()) return loopOccupancyTokens;
-      if (statelessPromptTokens === undefined) return undefined;
-      // A mutator ran since the report, or is still running (parent or
-      // clone): the next fresh spawn may discover a different context —
-      // unknown, the floor.
-      if (mutationsInFlight > 0 || statelessGenerationAtReport !== contextGeneration) {
-        return undefined;
-      }
-      const addedBytes = ledger
-        .listEntries()
-        .filter((e) => e.id > ledgerMaxIdAtReport)
-        .reduce((n, e) => n + ledgerEntryPromptBytes(e), 0);
-      return statelessPromptTokens + addedBytes;
-    };
-
-    const runTurnForLoop = async (
-      body: string,
-      ctx: { isContinuation: boolean }
-    ): Promise<BackendTurnOutcome> => {
-      if (!ctx.isContinuation) {
-        const ledgerIdBeforeSpawn = maxLedgerId();
-        const generationBeforeSpawn = contextGeneration;
-        beginSpawn();
-        const turn = startBackendTurn({
-          backend: runtime.backend,
-          sbSlug,
-          model: runtime.model,
-          effort: runtime.effort,
-          prompt: body,
-          verbose: runtime.verbose,
-          passthroughArgs,
-          systemPromptOverride: runtime.systemPromptOverride,
-          timeoutMs: runtime.backendTurnTimeoutMs,
-          idleTimeoutMs: runtime.backendIdleTimeoutMs,
-          stream: true,
-          onEvent: handleBackendEvent,
-          attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-          toolRouting: runtime.toolRouting,
-          // Delivery spawn: embed this turn's media even when resuming a
-          // recovered provider session — new media on an existing conversation
-          // must reach the provider (heartbeat/reattach path).
-          media: turnMedia.length > 0 ? turnMedia : undefined,
-          ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-          // Seed a fresh provider session (first spawn) OR resume the live one
-          // (subsequent turns). Tool-loop continuations always resume it.
-          ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
-          ...(resumeProviderSession && activeBackendSessionId
-            ? { backendSessionId: activeBackendSessionId }
-            : {}),
-          cliAttached,
-          ...providerSpawnContext(),
-        });
-        currentTurnAbort = turn.abort;
-
-        let runResult = await turn.result.finally(() => {
-          currentTurnAbort = null;
+    const providerTurn = createSessionProviderTurn(
+      {
+        runtime,
+        state: {
+          get id() {
+            return activeBackendSessionId;
+          },
+          set id(value) {
+            activeBackendSessionId = value;
+          },
+          get shape() {
+            return activeBackendSessionShape;
+          },
+          set shape(value) {
+            activeBackendSessionShape = value;
+          },
+        },
+        ledger,
+        sbSlug,
+        cliAttached,
+        passthroughArgs,
+        dialogue: turnDialogue,
+        mintId: randomUUID,
+        append: (entry) => runtime.log.append(entry),
+        buildEnvelope: (body, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, body, stamp),
+        measurement: providerContextMeasurement,
+        spawnContext: providerSpawnContext,
+        attachmentDirs: () =>
+          sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        startTurn: startBackendTurn,
+        onEvent: handleBackendEvent,
+        beginSpawn,
+        endSpawn,
+        onAbortHandle: (abort) => {
+          currentTurnAbort = abort;
+        },
+        onInitialSettled: () => {
           turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
           stopWaiting();
-        });
-        endSpawn();
-        // Recorded here, not after the reseed branch: a failed resume that
-        // reported usage still spent those tokens, and the retry below
-        // REASSIGNS runResult — recording once at the end would silently drop
-        // the first attempt (Lumen, PR #494 round 3).
-        recordRunUsage(runResult.usage);
-        sampleProviderContext(runResult.usage);
-
-        // If a resumed turn failed because the provider session vanished (jsonl
-        // cleaned up / different machine), drop the live id so the NEXT turn seeds
-        // a fresh one. Within a single interactive process this is near-impossible
-        // (we seeded the id ourselves); the full mid-turn re-seed lands with the
-        // server/cross-process path.
-        if (
-          resumeProviderSession &&
-          !runResult.success &&
-          (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
-        ) {
-          // Mint a fresh native session, re-send the FULL envelope (the ledger
-          // already holds the history), and retry once so a server heartbeat still
-          // produces output instead of dying on a stale id. Mirrors
-          // ClaudeRunner/InkRunner's resume-not-found recovery.
-          const reseedId = randomUUID();
-          activeBackendSessionId = reseedId;
-          activeBackendSessionShape = currentEnvelopeShape;
-          runtime.log.append({
-            type: 'backend_session',
-            id: reseedId,
-            routing: runtime.toolRouting,
-          });
-          printEvent(
-            chalk.yellow(
-              '  ⛁ provider session not found on resume — re-seeding a fresh native session'
-            )
+        },
+        onInitialResult: (runResult) => {
+          sbDebugLog(
+            'chat',
+            'backend_turn_result',
+            {
+              backend: runtime.backend,
+              sessionId: runtime.sessionId || null,
+              success: runResult.success,
+              exitCode: runResult.exitCode,
+              durationMs: runResult.durationMs,
+              command: runResult.command,
+              stderrPreview: runResult.stderr.slice(0, 500),
+            },
+            debugFile ? { force: true, file: debugFile } : undefined
           );
-          // Regenerated HERE, after the new id is assigned, and never the
-          // opening's contextStamp reused. The stamped resume died before a
-          // model read it; THIS seed is the first request of the turn anything
-          // answers. The reassignment above is what makes the reading honest:
-          // providerScope() keys on activeBackendSessionId, so the failed
-          // session's measurement no longer matches and the stamp falls back to
-          // the estimate instead of describing a window that no longer exists.
-          const reseedStamp = formatContextStamp(
-            turnContextOccupancy(ledger, runtime, providerContextMeasurement())
-          );
-          beginSpawn();
-          const reseedTurn = startBackendTurn({
-            backend: runtime.backend,
-            sbSlug,
-            model: runtime.model,
-            effort: runtime.effort,
-            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw, reseedStamp),
-            verbose: runtime.verbose,
-            passthroughArgs,
-            systemPromptOverride: runtime.systemPromptOverride,
-            timeoutMs: runtime.backendTurnTimeoutMs,
-            idleTimeoutMs: runtime.backendIdleTimeoutMs,
-            stream: true,
-            onEvent: handleBackendEvent,
-            attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-            toolRouting: runtime.toolRouting,
-            // The reseeded provider session is fresh — re-inject this turn's
-            // media so the full envelope carries the images too.
-            media: turnMedia.length > 0 ? turnMedia : undefined,
-            ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-            backendSessionSeedId: reseedId,
-            cliAttached,
-            ...providerSpawnContext(),
-          });
-          currentTurnAbort = reseedTurn.abort;
-          runResult = await reseedTurn.result.finally(() => {
-            currentTurnAbort = null;
-          });
-          endSpawn();
-          recordRunUsage(runResult.usage);
-          sampleProviderContext(runResult.usage);
-        }
 
-        sbDebugLog(
-          'chat',
-          'backend_turn_result',
-          {
-            backend: runtime.backend,
-            sessionId: runtime.sessionId || null,
-            success: runResult.success,
-            exitCode: runResult.exitCode,
-            durationMs: runResult.durationMs,
-            command: runResult.command,
-            stderrPreview: runResult.stderr.slice(0, 500),
-          },
-          debugFile ? { force: true, file: debugFile } : undefined
-        );
+          if (runResult.success) {
+            consecutiveBackendFailures = 0;
+          } else {
+            consecutiveBackendFailures += 1;
+          }
 
-        if (runResult.success) {
-          consecutiveBackendFailures = 0;
-        } else {
-          consecutiveBackendFailures += 1;
-        }
+          // Log backend CLI turn completion to activity stream. Use 'ink' as the
+          // runner label (not the LLM backend like 'claude') so the mission feed
+          // shows the correct execution layer. Continuations are the same logical
+          // turn and deliberately do NOT log again.
+          if (runtime.sessionId) {
+            const turnStatus = runResult.success ? 'completed' : 'failed';
+            const cliErrorClassification = !runResult.success
+              ? classifyError({
+                  errorText: runResult.stderr || runResult.stdout,
+                  backend: runtime.backend,
+                  exitCode: runResult.exitCode,
+                })
+              : null;
 
-        // Log backend CLI turn completion to activity stream. Use 'ink' as the
-        // runner label (not the LLM backend like 'claude') so the mission feed
-        // shows the correct execution layer. Continuations are the same logical
-        // turn and deliberately do NOT log again.
-        if (runtime.sessionId) {
-          const turnStatus = runResult.success ? 'completed' : 'failed';
-          const cliErrorClassification = !runResult.success
-            ? classifyError({
-                errorText: runResult.stderr || runResult.stdout,
-                backend: runtime.backend,
-                exitCode: runResult.exitCode,
+            const runnerLabel = 'ink';
+            inkClient
+              .callTool('log_activity', {
+                sbSlug,
+                type: runResult.success ? 'agent_complete' : 'error',
+                subtype: `backend_cli:${runnerLabel}`,
+                content: runResult.success
+                  ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+                  : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
+                sessionId: runtime.sessionId,
+                status: turnStatus,
+                payload: {
+                  backend: runnerLabel,
+                  exitCode: runResult.exitCode,
+                  durationMs: turnDurationSeconds * 1000,
+                  studioId: runtime.studioId,
+                  ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
+                  ...(cliErrorClassification
+                    ? {
+                        errorCategory: cliErrorClassification.category,
+                        errorSummary: cliErrorClassification.summary,
+                        retryable: cliErrorClassification.retryable,
+                      }
+                    : {}),
+                  ...(runResult.usage ? { usage: runResult.usage } : {}),
+                },
               })
-            : null;
+              .catch(() => undefined);
+          }
+        },
+        recordUsage: recordRunUsage,
+        sampleContext: sampleProviderContext,
+        contextGeneration: () => contextGeneration,
+        mutationsInFlight: () => mutationsInFlight,
+        notice: (reason) =>
+          printEvent(
+            reason === 'resume-missing'
+              ? chalk.yellow(
+                  '  ⛁ provider session not found on resume — re-seeding a fresh native session'
+                )
+              : chalk.dim(
+                  '  ⛁ provider session rolled mid-turn — re-seeding a fresh native session'
+                )
+          ),
+      },
+      raw,
+      turnMedia,
+      prepared
+    );
 
-          const runnerLabel = 'ink';
-          inkClient
-            .callTool('log_activity', {
-              sbSlug,
-              type: runResult.success ? 'agent_complete' : 'error',
-              subtype: `backend_cli:${runnerLabel}`,
-              content: runResult.success
-                ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
-                : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
-              sessionId: runtime.sessionId,
-              status: turnStatus,
-              payload: {
-                backend: runnerLabel,
-                exitCode: runResult.exitCode,
-                durationMs: turnDurationSeconds * 1000,
-                studioId: runtime.studioId,
-                ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
-                ...(cliErrorClassification
-                  ? {
-                      errorCategory: cliErrorClassification.category,
-                      errorSummary: cliErrorClassification.summary,
-                      retryable: cliErrorClassification.retryable,
-                    }
-                  : {}),
-                ...(runResult.usage ? { usage: runResult.usage } : {}),
-              },
-            })
-            .catch(() => undefined);
-        }
-
-        lastRunResult = runResult;
-        noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
-        return runResult;
-      }
-
-      // ── Continuation ──
-      // When resuming the same Claude session the model already holds the full
-      // transcript + tool instructions from the seeded turn, so send ONLY the
-      // delta. When the session was rolled mid-turn, SEED a fresh one now —
-      // full envelope, the model's own output so far, and a persisted id so
-      // the rest of this turn and the next resume it (#572). Stateless
-      // backends re-pack the full envelope every time.
-      const decision = decideContinuationSession(
-        canReuseBackendSession,
-        activeBackendSessionId,
-        randomUUID
-      );
-      if (decision.mode === 'seed') {
-        activeBackendSessionId = decision.id;
-        // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
-        // model init may have changed the budget (applyDetectedModel), and
-        // the envelope built below uses the new one. Recording the stale
-        // shape made the NEXT turn roll this session again — the very
-        // fragmentation this fix exists to stop (Lumen, PR #577).
-        activeBackendSessionShape = envelopeShapeKey(runtime);
-        runtime.log.append({
-          type: 'backend_session',
-          id: decision.id,
-          routing: runtime.toolRouting,
-          reason: 'mid-turn-roll',
-        });
-        printEvent(
-          chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
-        );
-      }
-      // Regenerated per continuation, never the opening's stamp reused: the
-      // preceding spawn's usage has since been sampled, so THIS is the first
-      // reading of the turn backed by a provider measurement. A run whose whole
-      // job happens inside the tool loop would otherwise never see one.
-      const continuationStamp = formatContextStamp(
-        turnContextOccupancy(ledger, runtime, providerContextMeasurement())
-      );
-      const continuationPrompt = buildContinuationPrompt(
-        decision.mode,
-        continuationStamp,
-        body,
-        (promptBody, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, promptBody, stamp),
-        () => buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
-      );
-
-      // Recorded for a later reseed in this same turn; the seed above already
-      // rendered this body itself.
-      turnDialogue.push({ role: 'runtime', text: body });
-
-      beginSpawn();
-      const ledgerIdBeforeSpawn = maxLedgerId();
-      const generationBeforeSpawn = contextGeneration;
-      const contTurn = startBackendTurn(
-        continuationRequest(
-          continuationPrompt,
-          continuationSpawnArgs(decision, turnMedia.length > 0)
-        )
-      );
-      currentTurnAbort = contTurn.abort;
-
-      const contResult = await contTurn.result.finally(() => {
-        currentTurnAbort = null;
-      });
-      endSpawn();
-
-      lastRunResult = contResult;
-      recordRunUsage(contResult.usage);
-      sampleProviderContext(contResult.usage);
-      noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
-      return contResult;
-    };
+    process.on('SIGINT', onSigintDuringTurn);
+    inkRepl?.setAbortHandler(abortCurrentTurn);
 
     let loopResult: AgentLoopResult;
     try {
       loopResult = await runAgentLoop(
         {
-          prompt,
+          prompt: providerTurn.prompt,
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
-          relayBudgetBytes: () => relayBudgetBytes(runtime, relayOccupancy()),
+          relayBudgetBytes: () => relayBudgetBytes(runtime, providerTurn.relayOccupancy()),
         },
         {
           ui: {
@@ -6569,7 +6103,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               return verdict.ok ? { calls: verdict.calls } : { rejected: verdict.reason };
             },
           },
-          backend: { runTurn: runTurnForLoop },
+          backend: { runTurn: providerTurn.runTurn },
           observe: {
             recordToolCall: (r) => {
               const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
@@ -6639,7 +6173,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
 
-    return { loop: loopResult, backend: lastRunResult, value: { turnDurationSeconds } };
+    return {
+      loop: loopResult,
+      backend: providerTurn.lastRunResult,
+      value: { turnDurationSeconds },
+    };
   };
 
   const presentUserTurn = (

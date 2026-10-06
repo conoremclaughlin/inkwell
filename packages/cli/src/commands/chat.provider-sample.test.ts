@@ -12,6 +12,11 @@ import { dirname, join } from 'path';
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, 'chat.ts'), 'utf8');
 
+const provider = readFileSync(
+  join(here, '../../../shared/src/providers/session-provider.ts'),
+  'utf8'
+);
+
 describe('chat.ts provider-sample wiring', () => {
   const cloneStart = source.indexOf('const cloneRunTurn = async (');
   const cloneEnd = source.indexOf('\n    };\n', cloneStart);
@@ -19,10 +24,12 @@ describe('chat.ts provider-sample wiring', () => {
   const parent = source.slice(0, cloneStart) + source.slice(cloneEnd);
 
   it("samples usage where each of the parent's spawn results lands — right after it is recorded, before the loop goes on", () => {
-    const sites = [...parent.matchAll(/recordRunUsage\((\w+)\.usage\);\n\s*(\S[^\n]*)/g)];
+    const sites = [...provider.matchAll(/ports\.recordUsage\((\w+)\.usage\);\n\s*(\S[^\n]*)/g)];
     expect(sites.length).toBeGreaterThanOrEqual(3);
+    expect(parent).toContain('recordUsage: recordRunUsage');
+    expect(parent).toContain('sampleContext: sampleProviderContext');
     for (const [, result, nextLine] of sites) {
-      expect(nextLine).toBe(`sampleProviderContext(${result}.usage);`);
+      expect(nextLine).toBe(`ports.sampleContext(${result}.usage);`);
     }
   });
 

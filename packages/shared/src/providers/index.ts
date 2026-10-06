@@ -23,3 +23,4 @@ export * from './turn-owner.js';
 export * from './skill-mcp.js';
 export * from './skill-servers.js';
 export * from './skill-discovery.js';
+export * from './session-provider.js';

@@ -100,10 +100,16 @@ describe('envelopeShapeKey', () => {
  * from chat.ts forwards the override.
  */
 describe('every backend turn forwards the override', () => {
-  const chatSource = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), 'chat.ts'),
-    'utf-8'
-  );
+  const chatSource =
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'chat.ts'), 'utf-8') +
+    '\n' +
+    readFileSync(
+      join(
+        dirname(fileURLToPath(import.meta.url)),
+        '../../../shared/src/providers/session-provider.ts'
+      ),
+      'utf8'
+    );
 
   /** The balanced-brace object literal passed to a `<fn>({ ... })` call. */
   const callArguments = (source: string, index: number): string => {
@@ -128,6 +134,7 @@ describe('every backend turn forwards the override', () => {
   const sites = [
     ...callSites('startBackendTurn'),
     ...callSites('runBackendTurn'),
+    ...callSites('ports.startTurn'),
     // Request builders shared by a spawn and the relay-budget measurer.
     ...callSites('BackendRunRequest => '),
   ];
