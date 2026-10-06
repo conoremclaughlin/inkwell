@@ -362,6 +362,108 @@ describe('SessionTurnCoordinator', () => {
     }
   );
 
+  it.each([0, -1, Infinity, NaN, 0.5, 60_001])(
+    'refuses an unbounded/invalid prompt-hook budget %s',
+    (ms) => {
+      expect(
+        () => new SessionTurnCoordinator({ ...harness().ports, promptHookTimeoutMs: ms })
+      ).toThrow(RangeError);
+    }
+  );
+
+  it('bounds prompt hooks before dispatch and drops their late results', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const coordinator = new SessionTurnCoordinator({ ...h.ports, promptHookTimeoutMs: 30 });
+    const release = deferred();
+    const started = deferred();
+    h.hooks.register({
+      name: 'slow-prompt',
+      event: 'prompt_build',
+      handler: async () => {
+        started.resolve();
+        await release.promise;
+        return { inject: [{ role: 'system', content: 'late prompt', source: 'fixture' }] };
+      },
+    });
+    const execute = vi.fn(async () => outcome());
+    try {
+      const run = coordinator.run({ raw: 'hi', source: 'user' }, execute);
+      await started.promise;
+      expect(execute).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(30);
+      await run;
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(h.events).toContainEqual(
+        expect.objectContaining({ type: 'hook_timeout', event: 'prompt_build', timeoutMs: 30 })
+      );
+      const before = h.events.length;
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.events).toHaveLength(before);
+      expect(h.ledger.listEntries().map((e) => e.content)).not.toContain('late prompt');
+    } finally {
+      release.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it('parent cancellation ends a prompt hook wait without dispatch or a synthetic timeout', async () => {
+    const h = harness();
+    const stop = new AbortController();
+    const release = deferred();
+    const started = deferred();
+    const abortError = new Error('stopped by host');
+    h.hooks.register({
+      name: 'gated-prompt',
+      event: 'prompt_build',
+      handler: async () => {
+        started.resolve();
+        await release.promise;
+      },
+    });
+    const execute = vi.fn(async () => outcome());
+    const run = h.coordinator.run({ raw: 'hi', source: 'user' }, execute, undefined, stop.signal);
+    const assertion = expect(run).rejects.toBe(abortError);
+    await started.promise;
+    stop.abort(abortError);
+    await assertion;
+    expect(execute).not.toHaveBeenCalled();
+    expect(h.events.some((e) => e.type === 'hook_timeout')).toBe(false);
+    release.resolve();
+  });
+
+  it('an already cancelled submission does not persist input', async () => {
+    const h = harness();
+    const stop = new AbortController();
+    stop.abort(new Error('cancelled'));
+    await expect(
+      h.coordinator.run(
+        { raw: 'hi', source: 'user' },
+        async () => outcome(),
+        undefined,
+        stop.signal
+      )
+    ).rejects.toThrow('cancelled');
+    expect(h.events).toHaveLength(0);
+  });
+
+  it('a throwing outcome observer rejects after the assistant is persisted, without retrying it', async () => {
+    const h = harness();
+    const execute = vi.fn(async () => outcome());
+    const tail = vi.fn(async () => {});
+    h.hooks.register({ name: 'tail', event: 'turn_end', handler: tail });
+    await expect(
+      h.coordinator.run({ raw: 'hi', source: 'user' }, execute, () => {
+        throw new Error('view failed');
+      })
+    ).rejects.toThrow('view failed');
+    expect(h.events.at(-1)).toMatchObject({ type: 'assistant', content: 'reply' });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(tail).not.toHaveBeenCalled();
+    expect(h.coordinator.turnCount).toBe(1);
+  });
+
   it('preserves failed-backend transcript metadata without turning it into success', async () => {
     const h = harness();
     const failure = outcome({ success: false, stopReason: 'backend-failure' });

@@ -64,6 +64,8 @@ export interface SessionTurnResult<T> {
 export interface SessionTurnPorts {
   /** Finite whole-event budget. Default 5 seconds; the host may choose a smaller deadline. */
   endHookTimeoutMs?: number;
+  /** Same bounded hook contract before dispatch; default 5 seconds. */
+  promptHookTimeoutMs?: number;
   ledger: ContextLedger;
   hooks: SbHookRegistry;
   /** Append reserves an eid; flush confirms queued writes. Not a DB transaction. */
@@ -101,9 +103,15 @@ export class SessionTurnCoordinator {
       throw new RangeError('End-hook timeout must be an integer from 1 to 60000 ms');
     }
     this.endHookTimeoutMs = ms;
+    const promptMs = ports.promptHookTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(promptMs) || promptMs < 1 || promptMs > 60_000) {
+      throw new RangeError('Prompt-hook timeout must be an integer from 1 to 60000 ms');
+    }
+    this.promptHookTimeoutMs = promptMs;
   }
 
   private readonly endHookTimeoutMs: number;
+  private readonly promptHookTimeoutMs: number;
 
   get turnCount(): number {
     return this.completedTurns;
@@ -112,21 +120,38 @@ export class SessionTurnCoordinator {
   async run<T>(
     submitted: SessionTurnInput,
     execute: (turn: PreparedSessionTurn) => Promise<SessionTurnExecution<T>>,
-    /** Committed assistant outcome, before the bounded recall tail. Not the turn's completion. */
-    onOutcome?: (execution: SessionTurnExecution<T>) => void
+    /**
+     * Committed assistant outcome, before the bounded recall tail. Not completion.
+     * Hosts must not throw here: a throw propagates AFTER persistence, skipping
+     * the tail; callers must not retry the already committed outcome.
+     */
+    onOutcome?: (execution: SessionTurnExecution<T>) => void,
+    /** Cancels hook waits and fences dispatch; host I/O must also honor it. */
+    signal?: AbortSignal
   ): Promise<SessionTurnResult<T> | undefined> {
     if (this.running) throw new Error('Session turn already running');
+    signal?.throwIfAborted();
     if (!submitted.raw.trim()) return undefined;
     this.running = true;
     const input = { ...submitted };
     try {
       this.recordInput(input);
       await this.ports.inputRecorded?.();
+      signal?.throwIfAborted();
       await this.ports.compact('pre-turn budget check');
+      signal?.throwIfAborted();
       const occupancy = this.ports.occupancy();
-      const promptHooks = await this.fireHooks('prompt_build', input.raw, '', occupancy);
+      const promptHooks = await this.fireBoundedHooks(
+        'prompt_build',
+        input.raw,
+        '',
+        occupancy,
+        signal
+      );
+      signal?.throwIfAborted();
       // No provider dispatch after an unobserved asynchronous input/hook write failure.
       await this.ports.log.flush();
+      signal?.throwIfAborted();
       const execution = await execute({ input, occupancy, promptHooks });
       const { loop, backend } = execution;
       const state = this.ports.state();
@@ -166,27 +191,14 @@ export class SessionTurnCoordinator {
         evicted: 0,
         blocked: false,
       };
-      if (!aborted) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.endHookTimeoutMs);
-        try {
-          endHooks = await this.fireHooks(
-            'turn_end',
-            input.raw,
-            loop.assistantDisplayText,
-            this.ports.occupancy(),
-            controller.signal
-          );
-        } finally {
-          clearTimeout(timer);
-        }
-        if (endHooks.interrupted) {
-          this.ports.log.append({
-            type: 'hook_timeout',
-            event: 'turn_end',
-            timeoutMs: this.endHookTimeoutMs,
-          });
-        }
+      if (!aborted && !signal?.aborted) {
+        endHooks = await this.fireBoundedHooks(
+          'turn_end',
+          input.raw,
+          loop.assistantDisplayText,
+          this.ports.occupancy(),
+          signal
+        );
       }
       await this.ports.log.flush();
       return { execution, endHooks, autoEviction };
@@ -207,6 +219,37 @@ export class SessionTurnCoordinator {
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${input.raw}`, 500), 'auto-run');
       log.append({ type: 'auto_turn', content: input.raw });
+    }
+  }
+
+  private async fireBoundedHooks(
+    event: 'prompt_build' | 'turn_end',
+    userInput: string,
+    assistantResponse: string,
+    occupancy: ContextOccupancy,
+    signal?: AbortSignal
+  ): Promise<SessionHookResult> {
+    const timeoutMs = event === 'prompt_build' ? this.promptHookTimeoutMs : this.endHookTimeoutMs;
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const result = await this.fireHooks(
+        event,
+        userInput,
+        assistantResponse,
+        occupancy,
+        controller.signal
+      );
+      if (result.interrupted && !signal?.aborted) {
+        this.ports.log.append({ type: 'hook_timeout', event, timeoutMs });
+      }
+      return result;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
     }
   }
 

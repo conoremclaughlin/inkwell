@@ -252,3 +252,13 @@ entry point's import boundary. Stateless budget arithmetic lives here in
 This extraction is not the complete hosted session binding: bootstrap/state
 hydration, tool-policy composition, controls, and per-host cleanup must still
 join the coordinator and provider composition before a server turn is enabled.
+
+Prompt-build hooks also have a whole-event 5-second default budget (validated
+1–60000 ms); their late returned mutations are discarded. A timed-out optional
+hook is recorded and dispatch proceeds with the context already available.
+The coordinator accepts the host's per-turn AbortSignal: cancellation interrupts
+hook waits and is checked before dispatch, rather than being treated as an
+optional-hook timeout. Hosts must separately cancel/fence their own I/O;
+awaiting compaction is not proof that its external effects are cancellable.
+The outcome callback must not throw: it runs after persistence, so its failure
+cannot authorize retrying that committed reply.
