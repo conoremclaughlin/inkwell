@@ -51,6 +51,24 @@ export type Database = {
   };
   public: {
     Tables: {
+      account_deletion_requests: {
+        Row: {
+          completed_at: string | null;
+          requested_at: string;
+          user_id: string;
+        };
+        Insert: {
+          completed_at?: string | null;
+          requested_at?: string;
+          user_id: string;
+        };
+        Update: {
+          completed_at?: string | null;
+          requested_at?: string;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
       activity_stream: {
         Row: {
           agent_id: string;
