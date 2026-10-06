@@ -274,3 +274,20 @@ session log and waits for its writes before dispatch. Credential expansion
 still belongs inside the dispatcher, after the unresolved model arguments are
 recorded. Policy storage, coding-tool/catalog setup and approval transports
 remain host composition; this extraction alone does not enable the API host.
+
+### Tool policy and host persistence
+
+`ToolPolicyState` and `tool-profiles` are the existing Ink policy, not a second
+hosted permission model. The runtime takes a host-loaded v1/v2 snapshot and an
+optional synchronous `onChange(snapshot)` staging callback. It does not read the
+home directory or touch a file. The CLI adapter retains its existing path,
+malformed-file fallback, write permissions, and synchronous persistence points.
+
+An API host must load its policy asynchronously before constructing the state.
+If it stages writes in `onChange`, it must await that queue (and surface errors)
+before admitting the corresponding effect, alongside the tool-intent barrier.
+Do not pass an async callback and discard its promise. A policy instance is not
+a lock or a cross-session grant authority: the host must coordinate instances
+that share persisted grants. Session-only grants remain session-only and are
+never serialized. Async persistence coordination is a binding requirement, not
+an implementation provided by this extraction.
