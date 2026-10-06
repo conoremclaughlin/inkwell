@@ -2092,6 +2092,53 @@ export type Database = {
           },
         ];
       };
+      launched_processes: {
+        Row: {
+          backend: string;
+          boot_id: string;
+          exited_at: string | null;
+          id: string;
+          launched_at: string;
+          pgid: number | null;
+          pid: number | null;
+          server_instance: string;
+          session_id: string;
+          start_identity: string | null;
+        };
+        Insert: {
+          backend: string;
+          boot_id: string;
+          exited_at?: string | null;
+          id?: string;
+          launched_at?: string;
+          pgid?: number | null;
+          pid?: number | null;
+          server_instance: string;
+          session_id: string;
+          start_identity?: string | null;
+        };
+        Update: {
+          backend?: string;
+          boot_id?: string;
+          exited_at?: string | null;
+          id?: string;
+          launched_at?: string;
+          pgid?: number | null;
+          pid?: number | null;
+          server_instance?: string;
+          session_id?: string;
+          start_identity?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'launched_processes_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       links: {
         Row: {
           created_at: string | null;

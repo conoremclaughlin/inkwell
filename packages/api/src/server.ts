@@ -103,6 +103,7 @@ import {
 } from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
+import { startLaunchTracking } from './services/sessions/launched-processes';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -180,6 +181,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 1. Initialize data layer
   logger.info('Initializing data layer...');
   dataComposer = await getDataComposer();
+
+  // Before any input is handled: stop the backend processes this server
+  // launched before a restart and left running, then record every launch from
+  // here on (launched-processes.ts). A restart signals only the server, and the
+  // next message to such a session would start a second backend beside it.
+  await startLaunchTracking(dataComposer.getClient(), env.MCP_HTTP_PORT);
   logger.info('Data layer ready');
 
   // 2. Create SessionService (stateless, queries DB per-request)

@@ -559,6 +559,8 @@ export class ClaudeRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
@@ -604,6 +606,8 @@ export class ClaudeRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
+      if (proc.pid !== undefined)
+        config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
       // No ceiling unless one is configured, for the module or for this run;
       // the lower one wins when both are.
       const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);

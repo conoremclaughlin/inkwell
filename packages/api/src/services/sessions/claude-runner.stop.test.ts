@@ -211,15 +211,21 @@ describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
     async (_label, killProcessGroup) => {
       hoisted.binary = writeSlowToExitFake(400);
       const controller = new AbortController();
+      const spawned: Array<{ pid: number; pgid?: number }> = [];
       const run = new ClaudeRunner().run('hello', {
         config: {
           workingDirectory: fixtures,
           mcpConfigPath: join(fixtures, '.mcp.json'),
           killProcessGroup,
           signal: controller.signal,
+          onSpawned: (process) => spawned.push(process),
         },
       });
       const [fakeClaude] = await whenReported();
+      // The launch is reported with the process a restart would have to stop.
+      expect(spawned).toEqual([
+        killProcessGroup ? { pid: fakeClaude, pgid: fakeClaude } : { pid: fakeClaude },
+      ]);
       const abortedAt = Date.now();
       controller.abort();
       const result = await run;

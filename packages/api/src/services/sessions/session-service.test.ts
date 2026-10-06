@@ -12,6 +12,7 @@ import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { configureLaunchRecording, holdSurvivors, resetLaunchHolds } from './launched-processes.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
@@ -1578,6 +1579,143 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
           expect(mockInkRunner.run).not.toHaveBeenCalled();
           expect(runtimeRewrites().some((updates) => updates.backend === 'ink')).toBe(false);
+        });
+
+        describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const fromSystem = { sender: { id: 'system', name: 'x' } };
+          const launchSession = { backend: 'ink', id: 'launch-session' };
+          const fakeStore = () => ({
+            reserve: vi.fn(async () => 'row-1'),
+            attach: vi.fn(async () => undefined),
+            markExited: vi.fn(async () => undefined),
+            listOpen: vi.fn(async () => []),
+          });
+          const envs: Array<Record<string, string> | undefined> = [];
+          const reportingSpawn = (result: Record<string, unknown>) =>
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: {
+                config: {
+                  onSpawned?: (spawned: { pid: number }) => void;
+                  launchEnv?: Record<string, string>;
+                };
+              }
+            ) => {
+              envs.push(options.config.launchEnv);
+              options.config.onSpawned?.({ pid: 4242 });
+              return result;
+            }) as never);
+          afterEach(() => {
+            configureLaunchRecording(undefined);
+            resetLaunchHolds();
+          });
+
+          it('writes the launch before the runner starts, tags its process, and stamps it once the run confirmed its exit', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            envs.length = 0;
+            reportingSpawn({ success: true, responses: [], backendSessionId: 'ink-1' });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(store.reserve).toHaveBeenCalledWith(
+              expect.objectContaining({ sessionId: 'launch-session' })
+            );
+            expect(vi.mocked(store.reserve).mock.invocationCallOrder[0]).toBeLessThan(
+              vi.mocked(mockInkRunner.run).mock.invocationCallOrder[0]
+            );
+            expect(envs).toEqual([{ INK_LAUNCH_ID: 'row-1' }]);
+            await vi.waitFor(() =>
+              expect(store.attach).toHaveBeenCalledWith(
+                'row-1',
+                expect.objectContaining({ pid: 4242 })
+              )
+            );
+            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
+          });
+
+          it('starts nothing, and refuses the turn retryably, when its launch cannot be written', async () => {
+            const store = fakeStore();
+            store.reserve.mockRejectedValue(new Error('db down'));
+            configureLaunchRecording({
+              store,
+              serverInstance: 'host:3001',
+              bootId: 'boot',
+              reserveDelaysMs: [0],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/could not be recorded before starting it/);
+          });
+
+          it('leaves the row open when the runner could not confirm its processes stopped', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            reportingSpawn({
+              success: false,
+              responses: [],
+              backendSessionId: 'ink-1',
+              error: 'stopped, unconfirmed',
+              stopUnconfirmed: { leaderExited: false },
+            });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            await vi.waitFor(() => expect(store.attach).toHaveBeenCalled());
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(store.markExited).not.toHaveBeenCalled();
+          });
+
+          it('carries a hold installed while the turn was prepared to the runner’s spawn seam', async () => {
+            const asked: Array<string | undefined> = [];
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: { config: { admitSpawn?: () => string | undefined } }
+            ) => {
+              asked.push(options.config.admitSpawn?.());
+              // An earlier launch's failed record lands during the runner's preparation.
+              holdSurvivors({
+                stopped: [],
+                gone: [],
+                unstoppable: [],
+                uncertain: [
+                  {
+                    id: '',
+                    sessionId: 'launch-session',
+                    backend: 'ink',
+                    pid: process.pid,
+                    pgid: null,
+                    startIdentity: null,
+                    bootId: 'boot',
+                  },
+                ],
+              });
+              asked.push(options.config.admitSpawn?.());
+              return { success: false, responses: [], error: asked[1], refusedBeforeSpawn: true };
+            }) as never);
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(asked[0]).toBeUndefined();
+            expect(asked[1]).toMatch(/may still be running this session/);
+          });
+
+          it('starts nothing for a session held by a survivor that may still be alive', async () => {
+            holdSurvivors({
+              stopped: [],
+              gone: [],
+              unstoppable: [],
+              // This test process: certainly alive.
+              uncertain: [
+                {
+                  id: 'row-held',
+                  sessionId: 'launch-session',
+                  backend: 'ink',
+                  pid: process.pid,
+                  pgid: null,
+                  startIdentity: null,
+                  bootId: 'boot',
+                },
+              ],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/may still be running this session/);
+          });
         });
 
         it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
@@ -3348,6 +3486,142 @@ describe('SessionService', () => {
       // longer a usable proxy, since the post-finalize boundary ownership
       // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+    });
+
+    it('records the compaction run’s launch, so a restart can stop it too', async () => {
+      const store = {
+        reserve: vi.fn(async () => 'row-compaction'),
+        attach: vi.fn(async () => undefined),
+        markExited: vi.fn(async () => undefined),
+        listOpen: vi.fn(async () => []),
+      };
+      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+      try {
+        const session = createMockSession({ backendSessionId: 'claude-abc' });
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+        ) => {
+          options.config.onSpawned?.({ pid: 4343 });
+          return createMockClaudeResult({ success: true });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
+        expect(store.reserve).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-123' })
+        );
+        await vi.waitFor(() =>
+          expect(store.attach).toHaveBeenCalledWith(
+            'row-compaction',
+            expect.objectContaining({ pid: 4343 })
+          )
+        );
+      } finally {
+        configureLaunchRecording(undefined);
+      }
+    });
+
+    it('does not compact when a hold lands while the compaction lock is taken', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockImplementationOnce(async () => {
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          return true;
+        });
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('carries the hold to the compaction runner’s spawn seam', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        const asked: Array<string | undefined> = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { admitSpawn?: () => string | undefined } }
+        ) => {
+          asked.push(options.config.admitSpawn?.());
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          asked.push(options.config.admitSpawn?.());
+          return createMockClaudeResult({ success: false, error: asked[1] });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        expect(asked[0]).toBeUndefined();
+        expect(asked[1]).toMatch(/may still be running this session/);
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('does not compact a session held by a survivor that may still be alive', async () => {
+      holdSurvivors({
+        stopped: [],
+        gone: [],
+        unstoppable: [],
+        uncertain: [
+          {
+            id: 'row-held',
+            sessionId: 'session-123',
+            backend: 'claude-code',
+            pid: process.pid,
+            pgid: null,
+            startIdentity: null,
+            bootId: 'boot',
+          },
+        ],
+      });
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+      } finally {
+        resetLaunchHolds();
+      }
     });
 
     it('should skip compaction when lock is already held (re-entry guard)', async () => {

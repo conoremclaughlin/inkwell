@@ -803,9 +803,22 @@ export interface ClaudeRunnerConfig {
    * it and the spawn. A reason refuses the run, which starts nothing and
    * returns `refusedBeforeSpawn` with the reason as its error. An admission
    * made earlier can go stale while the run is prepared (Lumen's review of
-   * #747). The Claude runner honours it.
+   * #747). Every runner honours it.
    */
   admitSpawn?: () => string | undefined;
+  /**
+   * Set in the environment of every process the runner starts, past the
+   * explicit allowlist: the launch's tag, by which a restarted server finds a
+   * process whose pid it never recorded (launched-processes.ts).
+   */
+  launchEnv?: Record<string, string>;
+  /**
+   * Told each process the runner starts, as soon as it has a pid, so the
+   * server can record it (launched-processes.ts) and a restarted server can
+   * stop it. A run that leads its own process group passes the group too.
+   * Every runner calls it for every spawn, fallback spawns included.
+   */
+  onSpawned?: (spawned: { pid: number; pgid?: number }) => void;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
