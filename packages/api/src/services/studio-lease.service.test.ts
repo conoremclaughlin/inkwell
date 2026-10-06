@@ -4288,6 +4288,29 @@ describe('a merged wake turn runs under the epoch its lease will release for', (
     );
   });
 
+  it('fails, rather than reading as unstamped, when the read returns an error', async () => {
+    // PostgREST resolves a failed read as { data: null, error }; an empty set
+    // here would merge the wakes under the lead's epoch (Lumen, #759 r1).
+    const query: Record<string, unknown> = {};
+    query.select = () => query;
+    query.eq = () => query;
+    query.then = (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+      Promise.resolve({
+        data: null,
+        error: { code: '57014', message: 'synthetic lease lookup timeout' },
+      }).then(resolve, reject);
+    const service = new StudioLeaseService({ from: () => query } as never);
+    await expect(service.turnEpochsHeldBy('sess-merge', 'u')).rejects.toThrow(
+      /synthetic lease lookup timeout/
+    );
+  });
+
+  it('a read that succeeds with no rows is an empty set', async () => {
+    const tables = heldBy('another-session', 'epoch-x');
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    expect((await service.turnEpochsHeldBy('sess-merge', 'u')).size).toBe(0);
+  });
+
   it('reads only this session’s leases, for this user', async () => {
     const tables = heldBy('sess-merge', 'epoch-a');
     tables.studios.push(

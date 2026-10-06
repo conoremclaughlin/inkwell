@@ -9,6 +9,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { SessionService } from './session-service.js';
+import { StudioLeaseService } from '../studio-lease.service.js';
 import type {
   Session,
   ISessionRepository,
@@ -484,4 +485,32 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     expect(turns[1]).toContain('wake for m11');
     expect(turns[1]).toContain('wake for m12');
   });
+
+  // Lumen's review of 1e2920d7: PostgREST reports a failed read as a resolved
+  // { data: null, error }, not a throw. Read as "no stamps", that merged the
+  // wakes under the lead's epoch even when the lease carried a later
+  // member's, and the boundary would then refuse the release. Both kinds of
+  // failure must leave the merge in doubt, and so run the wakes one by one.
+  it.each(['returned', 'thrown'])(
+    'runs the wakes one by one when the lease read fails (%s error)',
+    async (failureMode) => {
+      const query: Record<string, unknown> = {};
+      query.select = () => query;
+      query.eq = () => query;
+      query.then = (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) => {
+        const error = { code: '57014', message: 'synthetic lease lookup timeout' };
+        return failureMode === 'returned'
+          ? Promise.resolve({ data: null, error }).then(resolve, reject)
+          : Promise.reject(error).then(resolve, reject);
+      };
+      const leases = new StudioLeaseService({ from: () => query } as never);
+      vi.spyOn(
+        service as unknown as { getLeaseService: () => StudioLeaseService },
+        'getLeaseService'
+      ).mockReturnValue(leases);
+      await behindABusyTurn([wake('m1'), wake('m2'), wake('m3')]);
+      expect(turnsAfterTheFirst()).toHaveLength(3);
+      expect(turnsAfterTheFirst().every((turn) => !turn.includes('messages arrived'))).toBe(true);
+    }
+  );
 });
