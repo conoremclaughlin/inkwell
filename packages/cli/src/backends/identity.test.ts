@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -13,6 +13,7 @@ describe('resolveSlug', () => {
   let workDir: string;
 
   beforeEach(() => {
+    vi.stubEnv('SB_SLUG', '');
     originalHome = process.env.HOME;
     originalAgentEnv = process.env.AGENT_ID;
     originalBackendEnv = process.env.SB_BACKEND;
@@ -29,6 +30,7 @@ describe('resolveSlug', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     process.chdir(originalCwd);
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
