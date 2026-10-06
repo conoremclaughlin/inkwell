@@ -308,6 +308,21 @@ export interface SessionRequest {
      * gate reads the message to learn who really sent it.
      */
     triggerThreadMessageId?: string;
+    /**
+     * The stored inbox message that prompted this trigger, copied by the
+     * trigger handler from the payload's own inboxMessageId.
+     */
+    triggerInboxMessageId?: string;
+    /**
+     * Set by the trigger handler, and only there, on a wake that may run in
+     * one turn with the wakes queued beside it (spec trigger-pipe-in v7, 1.1):
+     * it points at a stored message and is neither a force-spawn nor a
+     * strategy trigger. SessionService still keeps out a wake whose metadata
+     * changes the launch (media, a task group, a sandbox container).
+     */
+    wakeCoalescible?: boolean;
+    /** On a merged turn's request: the source message id of every wake it carries. */
+    coalescedSources?: string[];
   };
 
   /**
@@ -432,6 +447,13 @@ export interface SessionResult {
       };
     };
   };
+  /**
+   * Present on a wake that ran inside another wake's turn (spec
+   * trigger-pipe-in v7, 1.5). The turn's outcome is this wake's too, but its
+   * replies were routed once, by the wake named here, so `responses` is empty
+   * and `finalTextResponse` is absent.
+   */
+  wake?: { coalescedInto: string };
 }
 
 // ─── Tool Call Tracking ───

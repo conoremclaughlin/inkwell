@@ -121,6 +121,8 @@ interface RigOptions {
   resultRefusal?: { threadKey: string; detail: Record<string, unknown> };
   /** What the thread says about itself, as the descriptor loader would answer. */
   descriptor?: { lines: string[] };
+  /** A successful SessionResult from handleMessage, verbatim (default `{ success: true }`). */
+  resultSuccess?: Record<string, unknown>;
 }
 
 function rig(options: RigOptions = {}) {
@@ -133,6 +135,8 @@ function rig(options: RigOptions = {}) {
   const requests: Array<Record<string, unknown>> = [];
   const wakeCompletions: unknown[][] = [];
   const chainEndings: Array<Record<string, unknown>> = [];
+  const inkmail: unknown[][] = [];
+  const routed: unknown[][] = [];
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -276,7 +280,7 @@ function rig(options: RigOptions = {}) {
         }
         sessionTurns += 1;
         if (options.resultFailure) return options.resultFailure;
-        return { success: true };
+        return options.resultSuccess ?? { success: true };
       },
       async getSession() {
         return null;
@@ -306,7 +310,9 @@ function rig(options: RigOptions = {}) {
       userId: 'user-synthetic',
       recipientSbId: 'identity-synthetic',
     }),
-    logInkmail: async () => {},
+    logInkmail: async (...args: unknown[]) => {
+      inkmail.push(args);
+    },
     // The no-progress breaker's completion hook (T1), recorded, not run.
     recordWakeSourceCompletion: async (...args: unknown[]) => {
       wakeCompletions.push(args);
@@ -320,7 +326,9 @@ function rig(options: RigOptions = {}) {
     stampRoutingHold: async () => true,
     decideDelivery: () => ({ mode: 'spawn' }),
     storedTriggerMedia: async () => [],
-    routeResponses: async () => {},
+    routeResponses: async (...args: unknown[]) => {
+      routed.push(args);
+    },
     RoutingRefusedError,
     sendTriggerFailureNotice: loadModule(resolve(API_SRC, 'services/trigger-failure-notice.ts'), {
       '../utils/logger': { logger: silentLogger },
@@ -379,6 +387,8 @@ function rig(options: RigOptions = {}) {
     requests,
     wakeCompletions,
     chainEndings,
+    inkmail,
+    routed,
     chain,
     row,
     threadPayload,
@@ -951,5 +961,83 @@ describe('a group answering in turn: what the handler tells a later member', () 
     const [later, ordinary] = r.requests.map((request) => JSON.stringify(request));
     expect(later).toMatch(/answered this message before you/);
     expect(ordinary).not.toMatch(/answered this message before you/);
+  });
+});
+
+describe('a wake says whether it may share a turn (spec trigger-pipe-in v7, 1.1)', () => {
+  const metadataOf = (r: ReturnType<typeof rig>) =>
+    (r.requests.at(-1) as { metadata: Record<string, unknown> }).metadata;
+
+  it('marks a wake for a stored thread message', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    expect(metadataOf(r)).toMatchObject({
+      wakeCoalescible: true,
+      triggerThreadMessageId: 'message-synthetic',
+    });
+  });
+
+  it('marks a wake for a stored inbox message, and forwards its id', async () => {
+    const r = rig();
+    await r.gateway.handler!({
+      ...r.threadPayload,
+      threadId: undefined,
+      threadMessageId: undefined,
+      threadKey: undefined,
+      inboxMessageId: 'inbox-synthetic',
+    });
+    expect(metadataOf(r)).toMatchObject({
+      wakeCoalescible: true,
+      triggerInboxMessageId: 'inbox-synthetic',
+    });
+  });
+
+  it('leaves a wake with no stored message, a force-spawn and a strategy wake unmarked', async () => {
+    for (const payload of [
+      { fromSlug: 'sender-test', toSlug: 'recipient-test', triggerType: 'message' },
+      { ...rig().threadPayload, forceSpawn: true },
+      { ...rig().threadPayload, metadata: { strategyTrigger: true, groupId: 'group-synthetic' } },
+    ]) {
+      const r = rig();
+      await r.gateway.handler!(payload);
+      expect(metadataOf(r).wakeCoalescible, JSON.stringify(payload)).toBe(false);
+    }
+  });
+});
+
+describe('a wake carried by another wake’s turn (spec trigger-pipe-in v7, 1.5)', () => {
+  it('cancels its own retry and counts its own completion, routes nothing, and says it was coalesced', async () => {
+    const r = rig({
+      resultSuccess: {
+        success: true,
+        admitted: true,
+        sessionId: 'session-synthetic',
+        responses: [],
+        wake: { coalescedInto: 'message-lead' },
+      },
+    });
+    const wakeSource = {
+      source: 'strategy_watchdog',
+      workKind: 'task_group',
+      workId: 'group-synthetic',
+      revision: '',
+      fingerprint: 'fp-synthetic',
+      dispatchedAt: '2026-10-02T10:00:00.000Z',
+      taskGroupId: 'group-synthetic',
+      ownerSbId: null,
+    };
+    await r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } });
+
+    expect(r.routed).toHaveLength(0);
+    expect(r.wakeCompletions).toHaveLength(1);
+    const delivered = r.inkmail.find(([event]) => event === 'inkmail_deliver');
+    expect(delivered?.[3]).toEqual({ deliveryMethod: 'coalesced' });
+  });
+
+  it('a wake that ran its own turn still says spawn', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    const delivered = r.inkmail.find(([event]) => event === 'inkmail_deliver');
+    expect(delivered?.[3]).toEqual({ deliveryMethod: 'spawn' });
   });
 });

@@ -1429,6 +1429,19 @@ export class StudioLeaseService {
   }
 
   /**
+   * The turn epochs stamped on the leases this session holds. A turn that
+   * carries several queued wakes runs under the one its members' routing
+   * actually left on the lease (spec trigger-pipe-in v7, 1.4).
+   */
+  async turnEpochsHeldBy(sessionId: string, userId: string): Promise<Set<string>> {
+    const epochs = new Set<string>();
+    for (const row of await this.studiosHeldBy(sessionId, userId)) {
+      if (row.lease.turnEpoch !== undefined) epochs.add(row.lease.turnEpoch);
+    }
+    return epochs;
+  }
+
+  /**
    * Every studio this session currently holds a non-quarantine lease on.
    *
    * "One session holds at most one studio" is an invariant the service
