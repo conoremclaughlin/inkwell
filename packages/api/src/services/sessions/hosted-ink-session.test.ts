@@ -550,6 +550,52 @@ describe('HostedInkSessionRunner: the turn’s lifetime (Lumen’s #757 review)'
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('runs nothing for a turn stopped as its preparation resolves (R5)', async () => {
+    const stop = new AbortController();
+    const deps = dependencies();
+    const execute = vi.fn(succeed);
+    const result = await new HostedInkSessionRunner({
+      execute,
+      forTurn: async () => {
+        stop.abort();
+        return deps;
+      },
+    }).run('hi', { config: config({ signal: stop.signal }) });
+    expect(result).toMatchObject({
+      success: false,
+      refusedBeforeSpawn: true,
+      error: HOSTED_INK_REFUSALS.stopped,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(deps.inkwell.callTool).not.toHaveBeenCalled();
+    expect(deps.startProviderTurn).not.toHaveBeenCalled();
+  });
+
+  it('runs nothing for a turn stopped after preparation but before the start (R5)', async () => {
+    const stop = new AbortController();
+    const deps = dependencies();
+    const deadlineAt = deps.deadlineAt;
+    // The deadline is first read after preparation and before the start, so
+    // this Stop lands in that window, as any late close might.
+    Object.defineProperty(deps, 'deadlineAt', {
+      get: () => {
+        stop.abort();
+        return deadlineAt;
+      },
+    });
+    const execute = vi.fn(succeed);
+    const result = await runner(execute, deps).run('hi', {
+      config: config({ signal: stop.signal }),
+    });
+    expect(stop.signal.aborted).toBe(true);
+    expect(result).toMatchObject({
+      success: false,
+      refusedBeforeSpawn: true,
+      error: HOSTED_INK_REFUSALS.stopped,
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('refuses a run whose deadline has already passed, or is not finite', async () => {
     const execute = vi.fn(succeed);
     for (const deadlineAt of [Date.now() - 1, Number.NaN, Number.POSITIVE_INFINITY]) {

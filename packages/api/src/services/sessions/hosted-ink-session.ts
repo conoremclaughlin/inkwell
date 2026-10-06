@@ -556,9 +556,19 @@ export class HostedInkSessionRunner implements IRunner {
         deadlineAt: deps.deadlineAt,
       });
 
-      const executed = await settleWithin(() => execute(input, ports), lifetime, {
-        afterCloseMs: this.settleMs,
-      });
+      // A turn that closed before the composition starts never runs it. A
+      // Stop that lands as preparation resolves reads as prepared, because
+      // the abandon timer has not fired, and settleWithin starts the work a
+      // microtask later still; so the check is made at the start itself.
+      const notStarted = Symbol('not started');
+      const executed = await settleWithin(
+        () => (lifetime.closed ? Promise.reject(notStarted) : execute(input, ports)),
+        lifetime,
+        { afterCloseMs: this.settleMs }
+      );
+      if (executed.kind === 'failed' && executed.error === notStarted) {
+        return refused(lifetime.reason ?? HOSTED_INK_REFUSALS.stopped);
+      }
       // Why the turn stopped before it ended, if it did.
       const stoppedBy = lifetime.reason;
       // The turn ends here, whatever the composition still holds: admission
