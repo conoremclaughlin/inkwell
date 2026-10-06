@@ -17,10 +17,16 @@
  *   exit was confirmed (`result.childExited`).
  * - A turn reports refusedBeforeSpawn only when no launch was ever accepted.
  *   A refusal after an accepted launch never erases that dispatch.
- * - Stop (`config.signal`) aborts every open launch, and the runner waits,
- *   bounded, for each one's actual result. A launch whose result did not
- *   arrive, rejected with anything but a refusal, or reported no child exit,
- *   leaves the turn stopUnconfirmed.
+ * - The turn has one lifetime, which Stop (`config.signal`), the run's
+ *   deadline and the turn's end each close. Closing shuts launch admission
+ *   first, then stops every open launch, and the runner waits, bounded, for
+ *   each one's actual result. A launch whose result did not arrive, rejected
+ *   with anything but a refusal, or reported no child exit, leaves the turn
+ *   stopUnconfirmed, and never a success.
+ * - Preparation and execution each settle within a finite bound. A
+ *   composition still running when a stopped turn's bound runs out is
+ *   abandoned, reported unconfirmed, and fenced: when the turn ends, every
+ *   port it was handed (launches, Inkwell calls, the log, replies) refuses.
  * - Replies leave by send_response, as they do from `ink chat`.
  *   `ports.output.onReply` only observes them; it is not a second sender.
  *
@@ -51,19 +57,23 @@ export interface ProviderTurnHandle {
 }
 
 /**
- * The session's own log: the JSONL SessionLog the CLI keeps, history and
- * backend_session events included, as the composition reads and extends it.
- * It is the one continuity source; there is no second state schema.
- * - `read`: every entry, oldest first, as of the call.
- * - `append`: adds one entry after every earlier one. Appends are applied in
- *   call order and never reordered.
- * - `flush`: resolves once every entry appended before it is durable. The
- *   composition flushes before it reports; the runner never writes the log.
+ * The session's own log: the JSONL SessionLog the CLI keeps (shared runtime
+ * session-log.ts), history and backend_session events included. It is the one
+ * continuity source; there is no second state schema.
+ * - `append`: SessionLog.append. Assigns the entry's eid and returns it
+ *   synchronously, before the entry is durable, so a caller can reference it.
+ *   Writes are queued in call order; once one fails, every later append
+ *   throws.
+ * - `flush`: SessionLog.flush. Resolves once every queued write has landed,
+ *   which is not fsync; rejects if any failed.
+ * - `read`: this session's entries, oldest first, as the history readers
+ *   return them, for continuity (findLastBackendSession and hydration).
+ * The composition writes the log; the runner never does.
  */
-export interface HostedSessionLog<Entry = unknown> {
-  read(): Promise<ReadonlyArray<Entry>>;
-  append(entry: Entry): Promise<void>;
+export interface HostedSessionLog {
+  append(event: Record<string, unknown>): number;
   flush(): Promise<void>;
+  read(): Promise<ReadonlyArray<Record<string, unknown>>>;
 }
 
 /** What the composition is told about the turn it runs. */
@@ -104,9 +114,9 @@ export interface HostedInkSessionPorts {
   readonly sessionLog: HostedSessionLog;
   /** Observes each outer turn's reply; it does not send it. */
   readonly output: { onReply?(reply: RunnerTurnReply): Promise<void> };
-  /** Aborts on Stop or drain. */
+  /** Aborts on Stop, at the run's deadline, and when the turn ends. */
   readonly signal: AbortSignal;
-  /** The run's one deadline, in this process's clock. Nothing the composition does may outlast it. */
+  /** The run's one deadline, in this process's clock; `signal` aborts at it. */
   readonly deadlineAt: number;
 }
 
@@ -137,6 +147,7 @@ export interface HostedInkTurnDependencies {
   /** Whether a launch's rejection is the host withholding credentials, so no child started. */
   isHostedRefusal(error: unknown): boolean;
   readonly sessionLog: HostedSessionLog;
+  /** The run's deadline, in this process's clock: finite, and still ahead. */
   readonly deadlineAt: number;
 }
 
@@ -150,10 +161,13 @@ export interface HostedInkRunnerOptions {
     config: Readonly<ClaudeRunnerConfig>;
   }) => HostedInkTurnDependencies | Promise<HostedInkTurnDependencies>;
   /**
-   * How long, once the turn has returned, an open launch's result is waited
-   * for. A stopped child gets its grace and the give-up wait; later is unproven.
+   * How long a stopped turn's composition, and then each open launch, gets to
+   * settle. A stopped child gets its grace and the give-up wait; later is
+   * unproven. Finite and positive.
    */
   settleMs?: number;
+  /** How long preparing the turn (`forTurn`) may take. Finite and positive. */
+  prepareMs?: number;
 }
 
 export const HOSTED_INK_REFUSALS = {
@@ -163,20 +177,132 @@ export const HOSTED_INK_REFUSALS = {
     'a hosted ink turn needs its session and its admitted generation; nothing was started',
   dependencies: 'the hosted ink turn could not be prepared; nothing was started',
   stopped: 'the turn was stopped',
+  deadline: "the run's deadline passed",
+  retired: 'the turn has ended; nothing it was handed can act for it now',
+  unsettled:
+    'the composition had not returned when the stopped turn ran out of time; what it may still be doing is unconfirmed',
+  exitUnconfirmed: "a provider launch's exit was not confirmed",
 } as const;
 
 const DEFAULT_SETTLE_MS = STOP_GRACE_MS + STOP_GIVE_UP_MS;
+const DEFAULT_PREPARE_MS = 30_000;
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** A launch the caller's admission refused, before anything started. */
+function finitePositive(value: number, what: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${what} must be a finite, positive number of milliseconds`);
+  }
+  return value;
+}
+
+/** A launch the caller's admission, or the turn's closed lifetime, refused before anything started. */
 export class HostedLaunchRefused extends Error {
   constructor(reason: string) {
     super(reason);
     this.name = 'HostedLaunchRefused';
   }
+}
+
+/** A port used after its turn ended. */
+export class HostedTurnRetired extends Error {
+  constructor() {
+    super(HOSTED_INK_REFUSALS.retired);
+    this.name = 'HostedTurnRetired';
+  }
+}
+
+/**
+ * One turn's lifetime, open from admission until the turn ends. Stop, the
+ * run's deadline and the turn's end each close it. Closing shuts launch
+ * admission (`reason` is set) before anything registered to run on close,
+ * which stops the open launches, so nothing can start once a stop has begun.
+ * Retiring also fences every port.
+ */
+class TurnLifetime {
+  private readonly controller = new AbortController();
+  private readonly onClose: Array<() => void> = [];
+  private closeReason: string | undefined;
+  private isRetired = false;
+  readonly signal = this.controller.signal;
+
+  get closed(): boolean {
+    return this.closeReason !== undefined;
+  }
+
+  get retired(): boolean {
+    return this.isRetired;
+  }
+
+  get reason(): string | undefined {
+    return this.closeReason;
+  }
+
+  whenClosed(fn: () => void): void {
+    if (this.closed) fn();
+    else this.onClose.push(fn);
+  }
+
+  close(reason: string): void {
+    if (this.closed) return;
+    this.closeReason = reason;
+    this.controller.abort(reason);
+    for (const fn of this.onClose.splice(0)) {
+      try {
+        fn();
+      } catch {
+        // Each one still runs.
+      }
+    }
+  }
+
+  retire(): void {
+    this.isRetired = true;
+    this.close(HOSTED_INK_REFUSALS.retired);
+  }
+}
+
+type Settlement<T> =
+  | { kind: 'done'; value: T }
+  | { kind: 'failed'; error: unknown }
+  | { kind: 'abandoned' };
+
+/**
+ * Wait for `work` until it settles, or until `maxMs` has passed, or until
+ * `afterCloseMs` after the lifetime closes. Abandoning is not settlement: the
+ * work may still be running, so the caller treats it as unconfirmed.
+ */
+function settleWithin<T>(
+  work: () => T | Promise<T>,
+  lifetime: TurnLifetime,
+  bounds: { maxMs?: number; afterCloseMs: number }
+): Promise<Settlement<T>> {
+  return new Promise((resolve) => {
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    let finished = false;
+    const finish = (settlement: Settlement<T>) => {
+      if (finished) return;
+      finished = true;
+      for (const timer of timers) clearTimeout(timer);
+      resolve(settlement);
+    };
+    Promise.resolve()
+      .then(work)
+      .then(
+        (value) => finish({ kind: 'done', value }),
+        (error: unknown) => finish({ kind: 'failed', error })
+      );
+    if (bounds.maxMs !== undefined) {
+      timers.push(setTimeout(() => finish({ kind: 'abandoned' }), bounds.maxMs));
+    }
+    lifetime.whenClosed(() => {
+      if (!finished) {
+        timers.push(setTimeout(() => finish({ kind: 'abandoned' }), bounds.afterCloseMs));
+      }
+    });
+  });
 }
 
 /**
@@ -194,11 +320,13 @@ class ProviderLaunches {
   constructor(
     private readonly startFn: (request: ProviderTurnRequest) => ProviderTurnHandle,
     private readonly isRefusal: (error: unknown) => boolean,
-    private readonly admit: () => string | undefined
+    private readonly admit: () => string | undefined,
+    private readonly lifetime: TurnLifetime
   ) {}
 
   start(request: ProviderTurnRequest): ProviderTurnHandle {
-    const refusedNow = this.admit();
+    // A closed turn starts nothing: stopped, past its deadline, or ended.
+    const refusedNow = this.lifetime.reason ?? this.admit();
     if (refusedNow !== undefined) {
       this.refusal ??= refusedNow;
       throw new HostedLaunchRefused(refusedNow);
@@ -299,7 +427,13 @@ export function parseHostedInkSbIds(value: string | undefined): ReadonlySet<stri
 }
 
 export class HostedInkSessionRunner implements IRunner {
-  constructor(private readonly options: HostedInkRunnerOptions) {}
+  private readonly settleMs: number;
+  private readonly prepareMs: number;
+
+  constructor(private readonly options: HostedInkRunnerOptions) {
+    this.settleMs = finitePositive(options.settleMs ?? DEFAULT_SETTLE_MS, 'settleMs');
+    this.prepareMs = finitePositive(options.prepareMs ?? DEFAULT_PREPARE_MS, 'prepareMs');
+  }
 
   async run(
     message: string,
@@ -325,116 +459,182 @@ export class HostedInkSessionRunner implements IRunner {
     if (!sessionId || !turnEpoch) return refused(HOSTED_INK_REFUSALS.unadmitted);
     const atEntry = config.admitSpawn?.();
     if (atEntry !== undefined) return refused(atEntry);
+    if (config.signal?.aborted) return refused(HOSTED_INK_REFUSALS.stopped);
 
-    let deps: HostedInkTurnDependencies;
+    const lifetime = new TurnLifetime();
+    const onStop = () => lifetime.close(HOSTED_INK_REFUSALS.stopped);
+    config.signal?.addEventListener('abort', onStop, { once: true });
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      deps = Object.freeze(
-        await forTurn({ sessionId, turnEpoch, config: Object.freeze({ ...config }) })
+      // Preparation starts nothing, so a Stop abandons it at once.
+      const prepared = await settleWithin(
+        () => forTurn({ sessionId, turnEpoch, config: Object.freeze({ ...config }) }),
+        lifetime,
+        { maxMs: this.prepareMs, afterCloseMs: 0 }
       );
-    } catch (error) {
-      return refused(`${HOSTED_INK_REFUSALS.dependencies}: ${messageOf(error)}`);
-    }
+      if (prepared.kind === 'failed') {
+        return refused(`${HOSTED_INK_REFUSALS.dependencies}: ${messageOf(prepared.error)}`);
+      }
+      if (prepared.kind === 'abandoned') {
+        return refused(
+          lifetime.reason ??
+            `${HOSTED_INK_REFUSALS.dependencies}: not prepared within ${this.prepareMs} ms`
+        );
+      }
+      const deps = Object.freeze(prepared.value);
+      if (!Number.isFinite(deps.deadlineAt)) {
+        return refused(`${HOSTED_INK_REFUSALS.dependencies}: the run has no finite deadline`);
+      }
+      const remainingMs = deps.deadlineAt - Date.now();
+      if (remainingMs <= 0) return refused(HOSTED_INK_REFUSALS.deadline);
+      deadlineTimer = setTimeout(() => lifetime.close(HOSTED_INK_REFUSALS.deadline), remainingMs);
 
-    const launches = new ProviderLaunches(
-      (request) => deps.startProviderTurn(request),
-      (error) => deps.isHostedRefusal(error),
-      () => config.admitSpawn?.()
-    );
-    const stop = new AbortController();
-    const onStop = () => stop.abort(config.signal?.reason);
-    if (config.signal?.aborted) onStop();
-    else config.signal?.addEventListener('abort', onStop, { once: true });
-    stop.signal.addEventListener('abort', () => launches.abortOpen(), { once: true });
+      const launches = new ProviderLaunches(
+        (request) => deps.startProviderTurn(request),
+        (error) => deps.isHostedRefusal(error),
+        () => config.admitSpawn?.(),
+        lifetime
+      );
+      lifetime.whenClosed(() => launches.abortOpen());
 
-    const input: HostedInkSessionInput = Object.freeze({
-      sessionId,
-      turnEpoch,
-      ...(config.sbSlug ? { sbSlug: config.sbSlug } : {}),
-      ...(config.studioId ? { studioId: config.studioId } : {}),
-      workingDirectory: config.workingDirectory,
-      message,
-      attachments: Object.freeze(
-        (options.mediaAttachments ?? [])
-          .filter((attachment) => typeof attachment.path === 'string')
-          .map((attachment) =>
-            Object.freeze({
-              path: attachment.path as string,
-              ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
-            })
-          )
-      ),
-      options: Object.freeze({
-        ...(config.model ? { model: config.model } : {}),
-        ...(config.effort ? { effort: config.effort } : {}),
-        ...(config.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
-        toolRouting: config.toolRouting ?? 'local',
-        profile: 'safe' as const,
-        away: true as const,
-        messageLabel: config.channel || 'server',
-      }),
-    });
-    const ports: HostedInkSessionPorts = Object.freeze({
-      inkwell: deps.inkwell,
-      provider: Object.freeze({
-        startTurn: (request: ProviderTurnRequest) => launches.start(request),
-      }),
-      sessionLog: deps.sessionLog,
-      output: Object.freeze(config.onTurnReply ? { onReply: config.onTurnReply } : {}),
-      signal: stop.signal,
-      deadlineAt: deps.deadlineAt,
-    });
+      const input: HostedInkSessionInput = Object.freeze({
+        sessionId,
+        turnEpoch,
+        ...(config.sbSlug ? { sbSlug: config.sbSlug } : {}),
+        ...(config.studioId ? { studioId: config.studioId } : {}),
+        workingDirectory: config.workingDirectory,
+        message,
+        attachments: Object.freeze(
+          (options.mediaAttachments ?? [])
+            .filter((attachment) => typeof attachment.path === 'string')
+            .map((attachment) =>
+              Object.freeze({
+                path: attachment.path as string,
+                ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+              })
+            )
+        ),
+        options: Object.freeze({
+          ...(config.model ? { model: config.model } : {}),
+          ...(config.effort ? { effort: config.effort } : {}),
+          ...(config.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
+          toolRouting: config.toolRouting ?? 'local',
+          profile: 'safe' as const,
+          away: true as const,
+          messageLabel: config.channel || 'server',
+        }),
+      });
+      // Every port refuses once the turn has ended, so nothing the composition
+      // still holds can act for a finished turn.
+      const onTurnReply = config.onTurnReply;
+      const retiredRejection = () => Promise.reject(new HostedTurnRetired());
+      const ports: HostedInkSessionPorts = Object.freeze({
+        inkwell: Object.freeze({
+          callTool: (name: string, args: Record<string, unknown>, opts: { signal: AbortSignal }) =>
+            lifetime.retired ? retiredRejection() : deps.inkwell.callTool(name, args, opts),
+        }),
+        provider: Object.freeze({
+          startTurn: (request: ProviderTurnRequest) => launches.start(request),
+        }),
+        sessionLog: Object.freeze({
+          append: (event: Record<string, unknown>) => {
+            if (lifetime.retired) throw new HostedTurnRetired();
+            return deps.sessionLog.append(event);
+          },
+          flush: () => (lifetime.retired ? retiredRejection() : deps.sessionLog.flush()),
+          read: () => (lifetime.retired ? retiredRejection() : deps.sessionLog.read()),
+        }),
+        output: Object.freeze(
+          onTurnReply
+            ? {
+                onReply: (reply: RunnerTurnReply) =>
+                  lifetime.retired ? retiredRejection() : onTurnReply(reply),
+              }
+            : {}
+        ),
+        signal: lifetime.signal,
+        deadlineAt: deps.deadlineAt,
+      });
 
-    let outcome: HostedInkSessionResult | undefined;
-    let failure: unknown;
-    try {
-      outcome = await execute(input, ports);
-    } catch (error) {
-      failure = error;
-    } finally {
-      config.signal?.removeEventListener('abort', onStop);
-    }
-    // Nothing the composition left open outlives its turn.
-    launches.abortOpen();
-    const settled = await launches.settle(this.options.settleMs ?? DEFAULT_SETTLE_MS);
+      const executed = await settleWithin(() => execute(input, ports), lifetime, {
+        afterCloseMs: this.settleMs,
+      });
+      // Why the turn stopped before it ended, if it did.
+      const stoppedBy = lifetime.reason;
+      // The turn ends here, whatever the composition still holds: admission
+      // shuts, open launches are stopped, and every port refuses from now on.
+      lifetime.retire();
+      const settled = await launches.settle(this.settleMs);
 
-    if (settled.accepted === 0 && settled.refusal !== undefined) return refused(settled.refusal);
-    const unconfirmed = settled.unconfirmed > 0 ? { stopUnconfirmed: { leaderExited: false } } : {};
-    const stopped = stop.signal.aborted;
+      if (
+        settled.accepted === 0 &&
+        settled.refusal !== undefined &&
+        executed.kind !== 'abandoned'
+      ) {
+        return refused(settled.refusal);
+      }
+      const exitUnconfirmed = settled.unconfirmed > 0;
+      const unconfirmed =
+        exitUnconfirmed || executed.kind === 'abandoned'
+          ? { stopUnconfirmed: { leaderExited: false } }
+          : {};
 
-    if (failure !== undefined || !outcome) {
+      if (executed.kind === 'abandoned') {
+        return {
+          success: false,
+          backendSessionId: sessionId,
+          responses: [],
+          error: `${stoppedBy ?? HOSTED_INK_REFUSALS.stopped}; ${HOSTED_INK_REFUSALS.unsettled}`,
+          ...unconfirmed,
+        };
+      }
+      if (executed.kind === 'failed') {
+        return {
+          success: false,
+          backendSessionId: sessionId,
+          responses: [],
+          error: messageOf(executed.error),
+          ...unconfirmed,
+        };
+      }
+      const outcome = executed.value;
+      // As InkRunner: a stopped turn keeps what it reported and is never a
+      // success; nor is one whose provider exit is unproven. Any other failure
+      // reports nothing but its error.
+      if (stoppedBy !== undefined || outcome.success) {
+        const error =
+          stoppedBy !== undefined
+            ? (outcome.error ?? stoppedBy)
+            : exitUnconfirmed
+              ? (outcome.error ?? HOSTED_INK_REFUSALS.exitUnconfirmed)
+              : undefined;
+        return {
+          success: outcome.success && stoppedBy === undefined && !exitUnconfirmed,
+          backendSessionId: sessionId,
+          responses: outcome.responses,
+          ...(outcome.usage ? { usage: outcome.usage } : {}),
+          ...(outcome.servedModel ? { servedModel: outcome.servedModel } : {}),
+          ...(outcome.finalTextResponse !== undefined
+            ? { finalTextResponse: outcome.finalTextResponse }
+            : {}),
+          ...(outcome.toolCalls ? { toolCalls: outcome.toolCalls } : {}),
+          ...(error !== undefined ? { error } : {}),
+          ...(outcome.classification ? { classification: outcome.classification } : {}),
+          ...unconfirmed,
+        };
+      }
       return {
         success: false,
         backendSessionId: sessionId,
         responses: [],
-        error: failure !== undefined ? messageOf(failure) : HOSTED_INK_REFUSALS.stopped,
-        ...unconfirmed,
-      };
-    }
-    // As InkRunner: a stopped turn keeps what it reported and is never a
-    // success; any other failure reports nothing but its error.
-    if (stopped || outcome.success) {
-      return {
-        success: outcome.success && !stopped,
-        backendSessionId: sessionId,
-        responses: outcome.responses,
-        ...(outcome.usage ? { usage: outcome.usage } : {}),
-        ...(outcome.servedModel ? { servedModel: outcome.servedModel } : {}),
-        ...(outcome.finalTextResponse !== undefined
-          ? { finalTextResponse: outcome.finalTextResponse }
-          : {}),
-        ...(outcome.toolCalls ? { toolCalls: outcome.toolCalls } : {}),
-        ...(stopped ? { error: outcome.error ?? HOSTED_INK_REFUSALS.stopped } : {}),
+        error: outcome.error ?? 'the hosted ink turn failed',
         ...(outcome.classification ? { classification: outcome.classification } : {}),
         ...unconfirmed,
       };
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      config.signal?.removeEventListener('abort', onStop);
+      lifetime.retire();
     }
-    return {
-      success: false,
-      backendSessionId: sessionId,
-      responses: [],
-      error: outcome.error ?? 'the hosted ink turn failed',
-      ...(outcome.classification ? { classification: outcome.classification } : {}),
-      ...unconfirmed,
-    };
   }
 }

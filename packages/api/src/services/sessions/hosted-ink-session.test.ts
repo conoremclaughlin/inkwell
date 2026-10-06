@@ -4,11 +4,12 @@
  * fake composition and fake provider launches. This is contract evidence, not
  * parity or a live run: the real composition is bound separately (pr:701).
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   HOSTED_INK_REFUSALS,
   HostedInkSessionRunner,
   HostedLaunchRefused,
+  HostedTurnRetired,
   parseHostedInkSbIds,
   selectInkRunner,
   type ExecuteHostedInkSession,
@@ -59,10 +60,11 @@ function dependencies(over: Partial<HostedInkTurnDependencies> = {}): HostedInkT
       return l.handle;
     }),
     isHostedRefusal: (error) => error instanceof RefusedByHost,
+    // SessionLog's shape: append returns the entry's eid synchronously.
     sessionLog: {
-      read: vi.fn(async () => []),
-      append: vi.fn(async () => {}),
+      append: vi.fn(() => 7),
       flush: vi.fn(async () => {}),
+      read: vi.fn(async () => []),
     },
     deadlineAt: Date.now() + 60_000,
     ...over,
@@ -215,8 +217,8 @@ describe('HostedInkSessionRunner', () => {
     expect(Object.isFrozen(seen!.input)).toBe(true);
     expect(Object.isFrozen(seen!.input.options)).toBe(true);
     expect(Object.isFrozen(seen!.ports)).toBe(true);
-    // The reply handler is handed over to observe; the runner itself sends nothing.
-    expect(seen!.ports.output.onReply).toBe(onTurnReply);
+    // The reply port observes; the runner itself sends nothing.
+    expect(typeof seen!.ports.output.onReply).toBe('function');
     expect(onTurnReply).not.toHaveBeenCalled();
     expect(JSON.stringify(process.env)).toBe(before);
     expect(process.cwd()).toBe(cwd);
@@ -374,6 +376,213 @@ describe('HostedInkSessionRunner', () => {
       backendSessionId: 'ink-session-1',
       responses: [],
       error: 'bad',
+    });
+  });
+});
+
+describe('HostedInkSessionRunner: the turn’s lifetime (Lumen’s #757 review)', () => {
+  const request = { inkSessionId: 'ink-session-1' };
+  const ok = { success: true, responses: [] };
+  /** A composition that never returns until released. */
+  function hanging() {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { pending, release };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('starts nothing for a turn already stopped when it arrives (R1)', async () => {
+    const stop = new AbortController();
+    stop.abort();
+    const deps = dependencies();
+    const forTurn = vi.fn(() => deps);
+    const result = await new HostedInkSessionRunner({ forTurn, execute: succeed }).run('hi', {
+      config: config({ signal: stop.signal }),
+    });
+    expect(result).toMatchObject({ success: false, refusedBeforeSpawn: true });
+    expect(forTurn).not.toHaveBeenCalled();
+    expect(deps.startProviderTurn).not.toHaveBeenCalled();
+  });
+
+  it('shuts launch admission on Stop, before stopping what is open (R1)', async () => {
+    const stop = new AbortController();
+    const deps = dependencies();
+    let refusal: unknown;
+    const result = await runner(async (_input, ports) => {
+      stop.abort();
+      try {
+        ports.provider.startTurn(request);
+      } catch (error) {
+        refusal = error;
+      }
+      return ok;
+    }, deps).run('hi', { config: config({ signal: stop.signal }) });
+    expect(refusal).toBeInstanceOf(HostedLaunchRefused);
+    expect(deps.startProviderTurn).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+  });
+
+  it('retires every port when the turn returns (R2)', async () => {
+    const deps = dependencies();
+    const onTurnReply = vi.fn(async () => {});
+    let kept!: HostedInkSessionPorts;
+    await runner(async (_input, ports) => {
+      kept = ports;
+      return ok;
+    }, deps).run('hi', { config: config({ onTurnReply }) });
+
+    expect(() => kept.provider.startTurn(request)).toThrow(HostedLaunchRefused);
+    await expect(kept.inkwell.callTool('recall', {}, { signal: kept.signal })).rejects.toThrow(
+      HostedTurnRetired
+    );
+    expect(() => kept.sessionLog.append({ type: 'late' })).toThrow(HostedTurnRetired);
+    await expect(kept.sessionLog.flush()).rejects.toThrow(HostedTurnRetired);
+    await expect(kept.output.onReply!({ content: 'late' } as never)).rejects.toThrow(
+      HostedTurnRetired
+    );
+    expect(kept.signal.aborted).toBe(true);
+    expect(deps.startProviderTurn).not.toHaveBeenCalled();
+    expect(deps.inkwell.callTool).not.toHaveBeenCalled();
+    expect(deps.sessionLog.append).not.toHaveBeenCalled();
+    expect(onTurnReply).not.toHaveBeenCalled();
+  });
+
+  it('forwards to the ports while the turn is open', async () => {
+    const deps = dependencies();
+    const onTurnReply = vi.fn(async () => {});
+    await runner(async (_input, ports) => {
+      await ports.inkwell.callTool('bootstrap', {}, { signal: ports.signal });
+      expect(ports.sessionLog.append({ type: 'user' })).toBe(7);
+      await ports.sessionLog.flush();
+      await ports.output.onReply!({ content: 'hi' } as never);
+      return ok;
+    }, deps).run('hi', { config: config({ onTurnReply }) });
+    expect(deps.inkwell.callTool).toHaveBeenCalledWith('bootstrap', {}, expect.anything());
+    expect(deps.sessionLog.append).toHaveBeenCalledWith({ type: 'user' });
+    expect(onTurnReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts the turn at its deadline (R3)', async () => {
+    vi.useFakeTimers();
+    const { pending, release } = hanging();
+    let kept!: HostedInkSessionPorts;
+    const deps = dependencies({ deadlineAt: Date.now() + 100 });
+    const run = runner(
+      async (_input, ports) => {
+        kept = ports;
+        await pending;
+        return ok;
+      },
+      deps,
+      10
+    ).run('hi', { config: config() });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(kept.signal.aborted).toBe(true);
+    expect(() => kept.provider.startTurn(request)).toThrow(HostedLaunchRefused);
+    await vi.advanceTimersByTimeAsync(50);
+    const result = await run;
+    release();
+    expect(result).toMatchObject({ success: false, stopUnconfirmed: { leaderExited: false } });
+    expect(result.error).toContain(HOSTED_INK_REFUSALS.deadline);
+  });
+
+  it('settles a stopped turn within its bound though the composition never returns (R3)', async () => {
+    vi.useFakeTimers();
+    const stop = new AbortController();
+    const { pending, release } = hanging();
+    let kept!: HostedInkSessionPorts;
+    let completed = false;
+    const run = runner(
+      async (_input, ports) => {
+        kept = ports;
+        await pending;
+        return ok;
+      },
+      dependencies(),
+      10
+    )
+      .run('hi', { config: config({ signal: stop.signal }) })
+      .then((result) => {
+        completed = true;
+        return result;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+    stop.abort();
+    await vi.advanceTimersByTimeAsync(30);
+    expect(completed).toBe(true);
+    const result = await run;
+    // Abandoned, not settled: unconfirmed, and every port already refuses.
+    expect(result).toMatchObject({ success: false, stopUnconfirmed: { leaderExited: false } });
+    expect(result.error).toContain(HOSTED_INK_REFUSALS.unsettled);
+    expect(() => kept.provider.startTurn(request)).toThrow(HostedLaunchRefused);
+    release();
+  });
+
+  it('abandons a preparation that a Stop or its own budget overtakes, starting nothing (R3)', async () => {
+    vi.useFakeTimers();
+    const execute = vi.fn(succeed);
+    const neverPrepared = () => new Promise<HostedInkTurnDependencies>(() => undefined);
+
+    const stop = new AbortController();
+    const stopped = new HostedInkSessionRunner({ execute, forTurn: neverPrepared }).run('hi', {
+      config: config({ signal: stop.signal }),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    stop.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await stopped).toMatchObject({
+      refusedBeforeSpawn: true,
+      error: HOSTED_INK_REFUSALS.stopped,
+    });
+
+    const slow = new HostedInkSessionRunner({
+      execute,
+      forTurn: neverPrepared,
+      prepareMs: 20,
+    }).run('hi', { config: config() });
+    await vi.advanceTimersByTimeAsync(25);
+    expect(await slow).toMatchObject({ refusedBeforeSpawn: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('refuses a run whose deadline has already passed, or is not finite', async () => {
+    const execute = vi.fn(succeed);
+    for (const deadlineAt of [Date.now() - 1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const result = await runner(execute, dependencies({ deadlineAt })).run('hi', {
+        config: config(),
+      });
+      expect(result.refusedBeforeSpawn).toBe(true);
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('refuses budgets that are not finite and positive', () => {
+    for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new HostedInkSessionRunner({ settleMs: value })).toThrow(RangeError);
+      expect(() => new HostedInkSessionRunner({ prepareMs: value })).toThrow(RangeError);
+    }
+  });
+
+  it('never reports success while a provider exit is unproven (R4)', async () => {
+    const l = launch();
+    l.settle({ childExited: false });
+    const result = await runner(
+      async (_input, ports) => {
+        await ports.provider.startTurn(request).result;
+        return { success: true, responses: [], finalTextResponse: 'done' };
+      },
+      dependencies({ startProviderTurn: vi.fn(() => l.handle) })
+    ).run('hi', { config: config() });
+    expect(result).toMatchObject({
+      success: false,
+      finalTextResponse: 'done',
+      error: HOSTED_INK_REFUSALS.exitUnconfirmed,
+      stopUnconfirmed: { leaderExited: false },
     });
   });
 });
