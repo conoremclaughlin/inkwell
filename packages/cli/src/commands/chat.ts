@@ -37,6 +37,7 @@ import {
   compactForLedger,
   SerialInputDrain,
   SessionTurnCoordinator,
+  bootstrapSessionIdentity,
   type PreparedSessionTurn,
   type SessionTurnExecution,
   InputDrainRefusal,
@@ -3075,79 +3076,42 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let readyForAutoRun = false;
   let enqueueAutoRunFromInbox: ((message: InboxMessage) => Promise<void>) | null = null;
 
-  // A caller-supplied system prompt means this session's identity comes from
-  // the caller, not the database. `ink awaken` runs as the placeholder
-  // `nascent`, which has no identity row and no memories — bootstrapping it
-  // would attribute shared workspace documents to a being that does not exist
-  // yet, and "Bootstrapped as nascent" would be among the first things it ever
-  // read about itself. Both are false, which is the whole thing the override
-  // exists to prevent.
-  const identitySuppliedByCaller = Boolean(runtime.systemPromptOverride);
-
-  const bootstrapResult = identitySuppliedByCaller
-    ? ({} as Record<string, unknown>)
-    : ((await inkClient
-        .callTool('bootstrap', { sbSlug })
-        .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
-
-  if (identitySuppliedByCaller) {
-    // Keychain preload still has to happen — it is independent of identity,
-    // and an awakening session can use tools as soon as it has a name.
-    const keychainCreds = await loadKeychainCredentials();
-    if (Object.keys(keychainCreds).length > 0) {
-      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+  // Shared bootstrap sequence: identity override, context/timezone, host
+  // preparation, recall dedup and ledger marker. Only presentation and I/O
+  // stay here; a server host supplies these same ports without a CLI process.
+  await bootstrapSessionIdentity(
+    { sbSlug, systemPromptOverride: runtime.systemPromptOverride },
+    {
+      load: async (slug) =>
+        (await inkClient.callTool('bootstrap', { sbSlug: slug })) as Record<string, unknown>,
+      ledger,
+      setTimezone: (timezone) => {
+        runtime.userTimezone = timezone;
+        statusLane.setTimezone(timezone);
+      },
+      setContext: (context) => {
+        runtime.bootstrapContext = context;
+        console.log(
+          chalk.dim(
+            `Identity context loaded: ~${estimateTokens(context).toLocaleString()} tokens injected into prompt`
+          )
+        );
+      },
+      prepareHost: async () => {
+        const keychainCreds = await loadKeychainCredentials();
+        if (Object.keys(keychainCreds).length > 0) {
+          console.log(
+            chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`)
+          );
+        }
+      },
+      seedMemoryIds: (ids) => passiveRecallHandle.seedBootstrapIds(ids),
+      unavailable: (reason) => {
+        failIfBootstrapRequired(options, reason);
+        if (reason.startsWith('bootstrap unavailable:')) console.log(chalk.yellow(reason));
+      },
     }
-  } else if (bootstrapResult.error) {
-    failIfBootstrapRequired(options, `bootstrap unavailable: ${String(bootstrapResult.error)}`);
-    console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
-  } else {
-    const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
-      ?.suggestion;
-    const timezone = (bootstrapResult.user as Record<string, unknown> | undefined)?.timezone;
-    if (typeof timezone === 'string' && timezone.trim()) {
-      runtime.userTimezone = timezone;
-      statusLane.setTimezone(timezone);
-    }
-
-    // Format and inject the full bootstrap context into the prompt envelope.
-    // This is what gives the backend its identity, values, and memories.
-    const ctx = formatBootstrapContext(bootstrapResult);
-    if (!ctx) {
-      // Bootstrap answered, but with nothing to render. Same outcome as a
-      // failed call for our purposes: this session has no identity context.
-      failIfBootstrapRequired(options, 'bootstrap returned no identity context');
-    }
-    if (ctx) {
-      runtime.bootstrapContext = ctx;
-      const ctxTokens = estimateTokens(ctx);
-      console.log(
-        chalk.dim(
-          `Identity context loaded: ~${ctxTokens.toLocaleString()} tokens injected into prompt`
-        )
-      );
-    }
-
-    // Pre-load Keychain credentials for the credential resolver.
-    // Runs once at session start; the cache persists for the session lifetime.
-    const keychainCreds = await loadKeychainCredentials();
-    if (Object.keys(keychainCreds).length > 0) {
-      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
-    }
-
-    // Seed passive recall dedup with memory IDs already in bootstrap context
-    const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
-    if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
-      passiveRecallHandle.seedBootstrapIds(bootstrapMemoryIds);
-    }
-
-    ledger.addEntry(
-      'system',
-      `Bootstrapped as ${sbSlug}${timezone ? ` (${String(timezone)})` : ''}${
-        suggestion ? `. ${String(suggestion)}` : ''
-      }`,
-      'bootstrap'
-    );
-  }
+  );
 
   let attachedSessionSummary: SessionSummary | undefined;
 

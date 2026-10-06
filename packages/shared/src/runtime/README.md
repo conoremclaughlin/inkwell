@@ -201,6 +201,22 @@ not prescribe a datastore or database admission functions. Running two drains
 for the same session is NOT prevented by this class. Hosted recovery and
 multi-view streaming require their own integration and end-to-end tests.
 
+## Session identity bootstrap
+
+`bootstrapSessionIdentity` runs the existing CLI identity initialization through
+explicit host ports: load bootstrap, apply timezone and formatted context,
+prepare host credentials, seed passive-recall dedup, then add the bootstrap
+ledger marker. A caller-supplied system prompt skips database identity without
+skipping host preparation. Required-bootstrap hosts must throw from
+`unavailable`; the interactive CLI retains its warn-and-continue behavior.
+The context formatter and accepted result shape are unchanged.
+
+The optional signal prevents applying late results after cancellation; it does
+not stop an arbitrary host request or roll back context already applied before
+host preparation failed. Hosts own bounded I/O and admission. This helper does
+not create a session, grant authority, or replace history restoration, hook
+registration or the remaining tool/control composition.
+
 ## Session turn context coordinator
 
 `SessionTurnCoordinator` is the CLI's shared context lifecycle around the existing
@@ -231,7 +247,7 @@ a completed assistant response. Separate instances can run concurrently.
 
 Prompt/identity/skill rendering, measured occupancy and continuation/reseed
 policy now live in `session-prompt.ts`; the CLI supplies its instruction catalog.
-This extraction is not yet the complete hosted session entry. Bootstrap calls,
+This extraction is not yet the complete hosted session entry. Bootstrap I/O,
 provider orchestration, tool policy, media, live controls, cancellation
 and rendering still have host composition in `runChat`. Both hosts must bind
 that same extracted composition before claiming API parity; a bare call to
@@ -250,7 +266,7 @@ entry point's import boundary. Stateless budget arithmetic lives here in
 `session-budget.ts`.
 
 This extraction is not the complete hosted session binding: bootstrap/state
-hydration, tool-policy composition, controls, and per-host cleanup must still
+hydration binding, tool-policy composition, controls, and per-host cleanup must still
 join the coordinator and provider composition before a server turn is enabled.
 
 Prompt-build hooks also have a whole-event 5-second default budget (validated
