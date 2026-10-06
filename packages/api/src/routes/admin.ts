@@ -99,6 +99,7 @@ import {
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
 import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
   ReactionRefusedError,
@@ -119,6 +120,7 @@ import {
   matchesCreateIntent,
   parseClientMessageId,
   recordDelivery,
+  wakeRequestOf,
 } from '../services/send-receipt';
 import { ThreadKeyTakenError } from '../mcp/tools/thread-key-taken';
 import { activityBus } from '../services/events/activity-bus';
@@ -1974,6 +1976,53 @@ router.post('/browser-companion/pairing-code', async (req: Request, res: Respons
  * GET /api/admin/workspaces
  * List workspaces available to the authenticated user.
  */
+// =============================================================================
+// Account deletion (App Store Review Guideline 5.1.1(v))
+// =============================================================================
+
+/**
+ * POST /api/admin/account/deletion
+ *   → 202 { deletion: { status: 'pending' | 'completed', requestedAt } }
+ *
+ * Records that the signed-in person asked, from inside the app, for their
+ * account to be deleted. That is all it does. It ends no session, blocks no
+ * sign-in and deletes no data: fulfilling the request (what is deleted, by
+ * whom, how long it takes and how the person hears it is done) is a separate,
+ * reviewed step that sets completed_at. Until that exists, no client should
+ * present this as account deletion.
+ *
+ * Asking again changes nothing and answers with the first request's time.
+ */
+router.post('/account/deletion', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AdminAuthRequest).inkUserId;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { error: recordError } = await supabase
+      .from('account_deletion_requests')
+      .upsert({ user_id: userId }, { onConflict: 'user_id', ignoreDuplicates: true });
+    if (recordError) throw recordError;
+    const { data: recorded, error: readError } = await supabase
+      .from('account_deletion_requests')
+      .select('requested_at, completed_at')
+      .eq('user_id', userId)
+      .single();
+    if (readError || !recorded) throw readError ?? new Error('Deletion request was not recorded');
+
+    res.status(202).json({
+      deletion: {
+        status: recorded.completed_at ? 'completed' : 'pending',
+        requestedAt: recorded.requested_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Account deletion request error:', error);
+    res.status(500).json(errorJson('Could not record the deletion request', error));
+  }
+});
+
 router.get('/workspaces', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
@@ -3914,6 +3963,10 @@ router.get('/inklings', async (req: Request, res: Response) => {
         activity: inklingTurnActivity(inkling.id),
       })),
       now,
+      // How this server wakes a group of inklings, so the app promises only
+      // that: members answer in turn, and naming one wakes only it (`wake`
+      // on POST /threads and /threads/reply).
+      groupReplies: { inTurn: true, wake: true },
     });
   } catch (error) {
     answerInklingError(res, 'Failed to list inklings', error);
@@ -8049,7 +8102,11 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 /**
  * POST /api/admin/threads
  * Body: { key, recipients: string[], content, title?, priority?, studioSlug?,
- *         clientMessageId?: uuid }
+ *         clientMessageId?: uuid, wake?: string[] }
+ *
+ * In a conversation of the person's own inklings, `wake` names the members
+ * they addressed (slugs, each a recipient): only those are woken. Without
+ * it, the members answer in turn (services/inklings/inkling-reply-chain.ts).
  *   → { success, created, messageId, threadId, threadKey, warning,
  *       threadKeyWarning, delivery, replayed }
  *
@@ -8063,7 +8120,8 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
  * A create carrying clientMessageId never joins a thread that exists, so
  * a retry can never add anyone to a conversation. It replays (the original
  * messageId, replayed: true, nobody woken) only when the sender, the words,
- * the recipients as a set and the title all match what that id stored.
+ * the recipients as a set, the title and the members named in `wake` all
+ * match what that id stored.
  * Anything else is a 409 before any write, and so is a new clientMessageId
  * aimed at a key already in use: a new conversation takes a new key. A
  * concurrent request that takes the key first is caught inside the send
@@ -8088,8 +8146,38 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
  * A DM keyed chat:<agent> has no route pattern anywhere, so without this the
  * message is held rather than delivered.
  */
+/**
+ * `wake` on a person's message to a group of their inklings: the members
+ * they addressed, by slug, who alone are woken. Absent, members answer in
+ * turn (inkling-reply-chain.ts). Every name must be a member; a list that
+ * names anyone else is refused rather than quietly narrowed.
+ */
+function parseWake(
+  raw: unknown,
+  members: string[]
+): { ok: true; wake?: string[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true };
+  const names = Array.isArray(raw)
+    ? raw
+        .filter((name): name is string => typeof name === 'string')
+        .map((name) => name.trim().toLowerCase())
+    : [];
+  if (!Array.isArray(raw) || names.length !== raw.length || names.length === 0) {
+    return { ok: false, error: 'wake must list at least one member by slug' };
+  }
+  const memberSet = new Set(members);
+  if (!names.every((name) => memberSet.has(name))) {
+    return { ok: false, error: 'wake must name members of this conversation' };
+  }
+  return { ok: true, wake: [...new Set(names)] };
+}
+
 router.post('/threads', async (req: Request, res: Response) => {
   try {
+    // This send's place among what the person did, before any await, so a
+    // Stop or a newer send that lands while it is stored is seen when it
+    // decides who answers (inkling-reply-chain.ts).
+    const ticket = takeReplyTicket();
     const authReq = req as AdminAuthRequest;
     const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
@@ -8128,6 +8216,11 @@ router.post('/threads', async (req: Request, res: Response) => {
     }
     if (studioSlug && (uniqueRecipients.length !== 1 || studioSlug.length > 100)) {
       res.status(400).json({ error: 'studioSlug applies to a single recipient' });
+      return;
+    }
+    const createWake = parseWake(req.body?.wake, uniqueRecipients);
+    if (!createWake.ok) {
+      res.status(400).json({ error: createWake.error, code: 'wake_not_member' });
       return;
     }
     const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
@@ -8178,6 +8271,7 @@ router.post('/threads', async (req: Request, res: Response) => {
           clientMessageId: clientMessageId.value as string,
           userId: authReq.inkUserId,
           content,
+          wake: wakeRequestOf(createWake.wake),
           createRequest,
         });
       let lookup = await lookUp();
@@ -8246,7 +8340,8 @@ router.post('/threads', async (req: Request, res: Response) => {
           thread.metadata,
           clientMessageId.value as string,
           createRequest,
-          content
+          content,
+          wakeRequestOf(createWake.wake)
         )
       ) {
         return false;
@@ -8301,7 +8396,10 @@ router.post('/threads', async (req: Request, res: Response) => {
               sentBy: 'user',
               channel: 'admin-api',
               ...(clientMessageId.value
-                ? { clientMessageId: clientMessageId.value, pcp: { createRequest } }
+                ? {
+                    clientMessageId: clientMessageId.value,
+                    pcp: { createRequest, wake: wakeRequestOf(createWake.wake) },
+                  }
                 : {}),
             },
           },
@@ -8318,8 +8416,19 @@ router.post('/threads', async (req: Request, res: Response) => {
             ...(send.createOnly ? { createOnly: true } : {}),
             // Recorded on the thread row if this send creates it.
             ...(clientMessageId.value && createRequest
-              ? { createIntent: createIntentOf(clientMessageId.value, createRequest, content) }
+              ? {
+                  createIntent: createIntentOf(
+                    clientMessageId.value,
+                    createRequest,
+                    content,
+                    wakeRequestOf(createWake.wake)
+                  ),
+                }
               : {}),
+            // A group of inklings: the named members answer, else all in turn.
+            inklingGroup: createWake.wake
+              ? { wake: createWake.wake, ticket }
+              : { inTurn: true, ticket },
           }
         );
       } catch (error) {
@@ -8389,13 +8498,15 @@ router.post('/threads', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads/reply
- * Body: { key, content, priority?, clientMessageId?: uuid }
+ * Body: { key, content, priority?, clientMessageId?: uuid, wake?: string[] }
  *   → { success, messageId, threadId, triggered, warning, threadKeyWarning,
  *       delivery, replayed }
  *
+ * `wake` works as on POST /threads, against the thread's members.
+ *
  * A retry carrying the same clientMessageId answers with the original
  * messageId and replayed: true, and wakes nobody; the same id with other
- * words is a 409. `delivery` comes from positive evidence only (see
+ * words, or naming other members in `wake`, is a 409. `delivery` comes from positive evidence only (see
  * services/send-receipt.ts and POST /threads above).
  *
  * A human reply into an existing thread — the dashboard and mobile analogue of
@@ -8415,6 +8526,8 @@ router.post('/threads', async (req: Request, res: Response) => {
  */
 router.post('/threads/reply', async (req: Request, res: Response) => {
   try {
+    // Before any await, as on POST /threads.
+    const ticket = takeReplyTicket();
     const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
     const content = typeof req.body?.content === 'string' ? req.body.content : '';
     const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
@@ -8472,6 +8585,8 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
         clientMessageId: clientMessageId.value,
         userId: authReq.inkUserId,
         content,
+        // Checked before the members are read, so held to the request as sent.
+        wake: wakeRequestOf(req.body?.wake),
       });
       if (lookup.kind === 'conflict') {
         res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
@@ -8504,6 +8619,11 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       res.status(409).json({ error: 'Thread has no participants to notify' });
       return;
     }
+    const replyWake = parseWake(req.body?.wake, participants);
+    if (!replyWake.ok) {
+      res.status(400).json({ error: replyWake.error, code: 'wake_not_member' });
+      return;
+    }
 
     let result: Awaited<ReturnType<typeof handleSendToInbox>>;
     try {
@@ -8519,7 +8639,12 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
           metadata: {
             sentBy: 'user',
             channel: 'admin-api',
-            ...(clientMessageId.value ? { clientMessageId: clientMessageId.value } : {}),
+            ...(clientMessageId.value
+              ? {
+                  clientMessageId: clientMessageId.value,
+                  pcp: { wake: wakeRequestOf(replyWake.wake) },
+                }
+              : {}),
           },
         },
         dataComposer,
@@ -8528,6 +8653,10 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
             principal: userPrincipal(authReq.inkUserId),
             workspaceId: authReq.inkWorkspaceId,
           },
+          // A group of inklings: the named members answer, else all in turn.
+          inklingGroup: replyWake.wake
+            ? { wake: replyWake.wake, ticket }
+            : { inTurn: true, ticket },
         }
       );
     } catch (error) {

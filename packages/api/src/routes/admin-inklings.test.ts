@@ -53,6 +53,12 @@ vi.mock('../utils/request-context', () => ({
 
 import router from './admin';
 import { trackInklingTurn } from '../services/inklings/inkling-turns';
+import {
+  openReplyChain,
+  resetReplyChains,
+  routedInReplyChain,
+  wakeNextInReplyChain,
+} from '../services/inklings/inkling-reply-chain';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 
@@ -132,6 +138,9 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+/** How the list says a group of inklings is woken (inkling-reply-chain.ts). */
+const GROUP_REPLIES = { inTurn: true, wake: true };
+
 describe('POST /inklings/awaken', () => {
   it('201 with a new inkling, then 200 with the same one for the same request id', async () => {
     const first = await call(awaken, { clientRequestId: REQUEST });
@@ -206,13 +215,18 @@ describe('GET /inklings', () => {
         { ...(b._json.inkling as object), activity: idle },
       ],
       now: expect.any(String),
+      groupReplies: GROUP_REPLIES,
     });
   });
 
   it('is scoped to the resolved workspace', async () => {
     await call(awaken, { clientRequestId: REQUEST });
     const res = await call(list, undefined, { workspaceId: OTHER_WORKSPACE });
-    expect(res._json).toEqual({ inklings: [], now: expect.any(String) });
+    expect(res._json).toEqual({
+      inklings: [],
+      now: expect.any(String),
+      groupReplies: GROUP_REPLIES,
+    });
   });
 
   // Lumen's review of #736 at 11bff2c0: the app measures elapsed time as
@@ -247,7 +261,11 @@ describe('GET /inklings', () => {
     try {
       vi.setSystemTime(new Date('2026-10-04T09:05:00.000Z'));
       const res = await call(list, undefined);
-      expect(res._json).toEqual({ inklings: [], now: '2026-10-04T09:05:00.000Z' });
+      expect(res._json).toEqual({
+        inklings: [],
+        now: '2026-10-04T09:05:00.000Z',
+        groupReplies: GROUP_REPLIES,
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -307,7 +325,11 @@ describe('GET /inklings', () => {
     try {
       for (const workspaceId of [MY_WORKSPACE, OTHER_WORKSPACE]) {
         const res = await call(list, undefined, { workspaceId });
-        expect(res._json, workspaceId).toEqual({ inklings: [], now: expect.any(String) });
+        expect(res._json, workspaceId).toEqual({
+          inklings: [],
+          now: expect.any(String),
+          groupReplies: GROUP_REPLIES,
+        });
       }
     } finally {
       turn.done();
@@ -317,6 +339,37 @@ describe('GET /inklings', () => {
 
 describe('POST /inklings/:id/cancel', () => {
   const cancel = handler('post', '/inklings/:id/cancel');
+
+  it('drops the members of its group still waiting their turn, even with no turn running', async () => {
+    resetReplyChains();
+    const awakenedRes = await call(awaken, { clientRequestId: REQUEST });
+    const id = (awakenedRes._json.inkling as { id: string }).id;
+    const dispatch = vi.fn(() => ({ accepted: true }));
+    const chain = openReplyChain({
+      threadId: 'thread-group-fixture',
+      ownerMessageId: 'message-owner-fixture',
+      members: [
+        { sbId: id, sbSlug: 'awakened-fixture' },
+        { sbId: 'sb-sibling-fixture', sbSlug: 'sibling-fixture' },
+      ],
+    });
+    for (const sbId of [id, 'sb-sibling-fixture']) {
+      routedInReplyChain(
+        chain,
+        sbId,
+        { toSbId: sbId, threadMessageId: 'message-owner-fixture' } as never,
+        dispatch
+      );
+    }
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    const res = await call(cancel, {}, { params: { id } });
+    expect(res._status).toBe(200);
+    expect(res._json).toEqual({ cancelled: true });
+    // Its turn ending afterwards wakes nobody.
+    wakeNextInReplyChain({ threadMessageId: 'message-owner-fixture', toSbId: id }, dispatch);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
 
   it("stops its owner's live turn: 200 { cancelled }; a viewer gets 403; the test off is 403", async () => {
     const awakenedRes = await call(awaken, { clientRequestId: REQUEST });

@@ -151,9 +151,17 @@ function emptyConversation(metadata: Row = {}): Row {
   return thread;
 }
 
-const fernsIntent = {
-  createIntent: createIntentOf(ID, createRequestOf(['fern'], ''), 'private words'),
-};
+/**
+ * Fern's intent as a create recorded it before creates could name members:
+ * no `wake` at all. It named nobody, so only a retry naming nobody matches.
+ */
+const { wake: _unnamed, ...fernsLegacyIntent } = createIntentOf(
+  ID,
+  createRequestOf(['fern'], ''),
+  'private words',
+  null
+);
+const fernsIntent = { createIntent: fernsLegacyIntent };
 
 function members(): string[] {
   return db
@@ -306,6 +314,35 @@ describe('the recorded intent pins the words (Lumen 77379fb4, 345e579e)', () => 
   });
 });
 
+describe('the recorded intent pins the members it named (Lumen r3)', () => {
+  it('a retry naming other members, or none, cannot adopt; the same names can', async () => {
+    failNextInsert('inbox_thread_messages');
+    expect((await call(body({ wake: ['fern'] }))).status).toBe(500);
+    const [thread] = db.rows('inbox_threads');
+    expect((thread.metadata as Row).createIntent).toMatchObject({ wake: ['fern'] });
+    const sendsBefore = sends;
+
+    const unnamed = await call(body());
+    expect(unnamed.status).toBe(409);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+    expect(sends).toBe(sendsBefore);
+
+    const same = await call(body({ wake: ['FERN'] }));
+    expect(same.status).toBe(200);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('an intent recorded before creates could name members matches only a retry naming nobody', async () => {
+    emptyConversation(fernsIntent);
+    const named = await call(body({ wake: ['fern'] }));
+    expect(named.status).toBe(409);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+    expect(sends).toBe(0);
+    expect((await call(body())).status).toBe(200);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+});
+
 describe('the create that recorded its intent is the one that may adopt', () => {
   it('records its intent on the thread row, and its exact retry completes it', async () => {
     failNextInsert('inbox_thread_messages');
@@ -313,7 +350,7 @@ describe('the create that recorded its intent is the one that may adopt', () => 
     expect(died.status).toBe(500);
     const [thread] = db.rows('inbox_threads');
     expect((thread.metadata as Row).createIntent).toEqual(
-      createIntentOf(ID, createRequestOf(['fern'], ''), 'private words')
+      createIntentOf(ID, createRequestOf(['fern'], ''), 'private words', null)
     );
     expect(db.rows('inbox_thread_messages')).toHaveLength(0);
 

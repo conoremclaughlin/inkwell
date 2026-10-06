@@ -185,39 +185,56 @@ function contentDigestOf(content: string): string {
  * What a client-identified create records on the thread row it creates
  * (inbox_threads.metadata.createIntent), in the same insert, before any
  * participant is written: its client message id, its recipients as a set,
- * its full title (not the thread's bounded display title) and a digest of
- * its words. It is the only durable evidence of what an interrupted create
- * meant, so it is what a retry is held to.
+ * its full title (not the thread's bounded display title), a digest of its
+ * words, and the members it named to wake (wakeRequestOf). It is the only
+ * durable evidence of what an interrupted create meant, so it is what a
+ * retry is held to.
  */
-export function createIntentOf(clientMessageId: string, request: CreateRequest, content: string) {
+export function createIntentOf(
+  clientMessageId: string,
+  request: CreateRequest,
+  content: string,
+  wake: string[] | null
+) {
   return {
     clientMessageId,
     recipients: request.recipients,
     title: request.title,
     contentDigest: contentDigestOf(content),
+    wake,
   };
 }
 
 /**
  * Is this thread the one this exact create made? Its recorded intent must
  * name the same client message id, the same recipients (as a set), the
- * same title and the same words. A thread with no recorded intent never
- * matches, and the same id with edited words is not its retry.
+ * same title, the same words and the same members to wake. A thread with no
+ * recorded intent never matches, and the same id with edited words is not
+ * its retry. An intent recorded before creates could name members has no
+ * `wake`: it named nobody, so only a retry that names nobody matches it.
  */
 export function matchesCreateIntent(
   threadMetadata: unknown,
   clientMessageId: string,
   request: CreateRequest,
-  content: string
+  content: string,
+  wake: string[] | null
 ): boolean {
   const intent = (threadMetadata as { createIntent?: unknown } | null | undefined)?.createIntent as
-    | { clientMessageId?: unknown; recipients?: unknown; title?: unknown; contentDigest?: unknown }
+    | {
+        clientMessageId?: unknown;
+        recipients?: unknown;
+        title?: unknown;
+        contentDigest?: unknown;
+        wake?: unknown;
+      }
     | undefined;
   if (
     !intent ||
     intent.clientMessageId !== clientMessageId ||
     intent.contentDigest !== contentDigestOf(content) ||
-    !Array.isArray(intent.recipients)
+    !Array.isArray(intent.recipients) ||
+    !sameWakeRequest({ pcp: { wake: intent.wake } }, wake)
   ) {
     return false;
   }
@@ -230,6 +247,26 @@ export function matchesCreateIntent(
     recorded.recipients.length === request.recipients.length &&
     recorded.recipients.every((r, i) => r === request.recipients[i])
   );
+}
+
+/**
+ * The members a send named to wake, as a retry is held to them: their slugs
+ * as a sorted set, or null when it named nobody and every member answers.
+ * A client-identified send stores it on its message (metadata.pcp.wake).
+ * Anything that is not a list of names comes back empty, which no stored send
+ * has, so a retry carrying it is a conflict.
+ */
+export function wakeRequestOf(raw: unknown): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw) || !raw.every((name) => typeof name === 'string')) return [];
+  return [...new Set(raw.map((name: string) => name.trim().toLowerCase()))].sort();
+}
+
+function sameWakeRequest(metadata: Record<string, unknown> | null, wake: string[] | null) {
+  const stored = (metadata?.pcp as { wake?: unknown } | undefined)?.wake;
+  const recorded = Array.isArray(stored) ? wakeRequestOf(stored) : null;
+  if (recorded === null || wake === null) return recorded === wake;
+  return recorded.length === wake.length && recorded.every((slug, i) => slug === wake[i]);
 }
 
 function sameCreateRequest(metadata: Record<string, unknown> | null, request: CreateRequest) {
@@ -251,8 +288,9 @@ function sameCreateRequest(metadata: Record<string, unknown> | null, request: Cr
  * Has this client message id already stored a message in this thread? The
  * caller has checked the person's workspace role; the sender check here is
  * what keeps a replay to the person who sent the original. A replay must
- * come from the same person with the same words and, for a create, the same
- * recipients and title (`createRequest`); anything else is a conflict.
+ * come from the same person with the same words, naming the same members to
+ * wake (`wake`, from wakeRequestOf) and, for a create, the same recipients
+ * and title (`createRequest`); anything else is a conflict.
  */
 export async function lookUpClientMessage(
   supabase: SupabaseClient,
@@ -261,6 +299,7 @@ export async function lookUpClientMessage(
     clientMessageId: string;
     userId: string;
     content: string;
+    wake: string[] | null;
     createRequest?: CreateRequest;
   }
 ): Promise<ReplayLookup> {
@@ -277,6 +316,7 @@ export async function lookUpClientMessage(
     stored.sender_kind === 'user' &&
     stored.sender_user_id === input.userId &&
     stored.content === input.content &&
+    sameWakeRequest(stored.metadata, input.wake) &&
     (input.createRequest === undefined || sameCreateRequest(stored.metadata, input.createRequest));
   if (!sameSend) return { kind: 'conflict' };
   return {

@@ -29,6 +29,7 @@ import {
   type OwnerTestAllowlist,
 } from '../../config/inkling-flags';
 import { cancelInklingTurns } from './inkling-turns';
+import { dropReplyChainsFor } from './inkling-reply-chain';
 import { logger } from '../../utils/logger';
 
 /** The identity metadata tag for inklings born through this flow. */
@@ -369,7 +370,11 @@ export class InklingService {
     if (!identity || !isInklingRow(identity)) {
       throw new InklingError(404, 'No inkling with that id');
     }
-    return { cancelled: cancelInklingTurns(identity.id) > 0 };
+    // Waiting members first: aborting the running turn ends it, and an ended
+    // turn wakes the next member in turn (inkling-reply-chain.ts).
+    const dropped = dropReplyChainsFor(identity.id);
+    const aborted = cancelInklingTurns(identity.id);
+    return { cancelled: aborted > 0 || dropped > 0 };
   }
 
   /**

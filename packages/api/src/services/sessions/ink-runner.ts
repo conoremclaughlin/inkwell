@@ -369,6 +369,12 @@ export class InkRunner implements IRunner {
 
     args.push('--session-id', sessionId);
 
+    // Named only when the caller chose one (an inkling's turn always does);
+    // otherwise the chat's own default provider runs, as it always has.
+    if (config.inkProvider) {
+      args.push('--backend', config.inkProvider);
+    }
+
     if (config.model) {
       args.push('--model', config.model);
     }
