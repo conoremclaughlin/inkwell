@@ -17,52 +17,6 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { isInklingOwnerTestUser, type OwnerTestAllowlist } from '../../config/inkling-flags';
 import { INKLING_CLIENT } from './inkling-service';
 
-/** Attempts at the conditional counter update before a contended claim is refused. */
-const CLAIM_ATTEMPTS = 5;
-
-/**
- * Count one turn against an inkling's cap before it is spawned: a
- * conditional update of metadata.ownerTestTurns, guarded on updated_at as
- * naming is, so two turns starting together cannot both take the last one.
- * A failed or unfinished turn still counts: the cap bounds how often the
- * inkling runs, not how often it succeeds. An unreadable identity, or a
- * claim still contended after a few attempts, is refused rather than run.
- */
-export async function claimInklingTurn(
-  supabase: SupabaseClient,
-  sbId: string,
-  userId: string,
-  cap: number
-): Promise<{ allowed: boolean; used: number }> {
-  for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt++) {
-    const { data, error } = await supabase
-      .from('agent_identities')
-      .select('metadata, updated_at')
-      .eq('id', sbId)
-      .eq('user_id', userId)
-      .maybeSingle();
-    const row = data as { metadata: Record<string, unknown> | null; updated_at: string } | null;
-    if (error || !row) return { allowed: false, used: 0 };
-    const metadata = row.metadata ?? {};
-    const counted = metadata.ownerTestTurns;
-    const used = typeof counted === 'number' && Number.isInteger(counted) ? counted : 0;
-    if (used >= cap) return { allowed: false, used };
-    const { data: won } = await supabase
-      .from('agent_identities')
-      .update({
-        metadata: { ...metadata, ownerTestTurns: used + 1 },
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', sbId)
-      .eq('user_id', userId)
-      .eq('updated_at', row.updated_at)
-      .select('id')
-      .maybeSingle();
-    if (won) return { allowed: true, used: used + 1 };
-  }
-  return { allowed: false, used: cap };
-}
-
 /**
  * What the SB a turn is for is, as far as the database can say:
  * - 'inkling', with its row;

@@ -207,6 +207,12 @@ export const SPAWN_ENV_INHERITED_NAMES: readonly string[] = [
 ];
 
 /**
+ * The variable carrying a launch's record id into its process, by which a
+ * restarted server finds the process (packages/api launched-processes.ts).
+ */
+export const LAUNCH_TAG = 'INK_LAUNCH_ID';
+
+/**
  * Build the env a spawned backend starts from.
  *
  * Only the names in SPAWN_ENV_INHERITED_NAMES cross from the parent (the
@@ -226,7 +232,11 @@ export function buildCleanEnv(
     const value = parent[name];
     if (value !== undefined) inherited[name] = value;
   }
-  return { ...inherited, ...extraEnv };
+  // The launch tag goes first. macOS lists a process's environment joined by
+  // spaces, so only the first variable can be read exactly: any later
+  // variable's value could contain the tag's text.
+  const tag = extraEnv?.[LAUNCH_TAG];
+  return { ...(tag !== undefined ? { [LAUNCH_TAG]: tag } : {}), ...inherited, ...extraEnv };
 }
 
 /**

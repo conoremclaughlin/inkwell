@@ -25,6 +25,7 @@ import type {
   ISessionService,
   ClaudeRunnerConfig,
   IRunner,
+  RunnerResult,
   ISessionRepository,
   IContextBuilder,
   ToolCall,
@@ -46,6 +47,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
+import { launchHoldFor, reserveLaunch } from './launched-processes.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -55,6 +57,7 @@ import {
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
+import { selectInkRunner, type HostedInkSelection } from './hosted-ink-session.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import {
   classifyError,
@@ -85,7 +88,6 @@ import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 import {
-  claimInklingTurn,
   classifyIdentityById,
   type InklingIdentity,
   inklingTurnRefusal,
@@ -93,12 +95,13 @@ import {
 } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
-import { INKLING_CLIENT } from '../inklings/inkling-service.js';
 import {
-  inklingOwnerTestUserIds,
-  inklingTurnCap,
-  inklingTurnTimeoutMs,
-} from '../../config/inkling-flags.js';
+  INKLING_FENCE_REASON,
+  fenceInkling,
+  inklingFenceHolds,
+} from '../inklings/inkling-stop-fence.js';
+import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
+import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -130,6 +133,13 @@ export interface SessionServiceConfig {
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
   responseHandler?: (responses: ChannelResponse[], sessionId?: string) => Promise<void>;
+  /**
+   * The in-process ink runtime (hosted-ink-session.ts), for the agents named
+   * here only: an `ink` turn of any other agent still spawns `ink chat`.
+   * Absent by default. A listed agent's turn goes to this runner whether or
+   * not it can run: an unbound runner refuses, never falls back.
+   */
+  hostedInk?: HostedInkSelection;
 }
 
 const DEFAULT_CONFIG: SessionServiceConfig = {
@@ -582,6 +592,32 @@ export interface ExplicitAddressHold {
     | 'binding-held';
 }
 
+/**
+ * The identity a delivery is for could not be classified: its read failed, or
+ * the id named no row at that moment. Routing creates and provisions nothing
+ * on a guess (Lumen, #750 r2). An inkling's session created on an ordinary
+ * runtime would be refused for good once the read recovered, so the delivery
+ * is retried instead. The verdict travels with the error, so the trigger retry
+ * scheduler reads it (carriedClassification) whichever path it surfaces on:
+ * the plan call, handleMessage, or a queued turn's re-resolution.
+ */
+export class IdentityUnclassifiedError extends Error {
+  readonly code = 'IDENTITY_UNCLASSIFIED';
+  readonly classification: ErrorClassification;
+
+  constructor(
+    readonly sbSlug: string,
+    /** Absent when no id was found to classify: the read by slug failed. */
+    readonly sbId?: string
+  ) {
+    const summary =
+      "Inkling turn refused: the SB's identity could not be read, so no session was created";
+    super(summary);
+    this.name = 'IdentityUnclassifiedError';
+    this.classification = { category: 'network', summary, retryable: true };
+  }
+}
+
 export class RoutingRefusedError extends Error {
   readonly code = 'ROUTING_REFUSED';
 
@@ -802,6 +838,11 @@ export class SessionService implements ISessionService {
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+  }
+
+  /** The runner for an `ink` turn: in process for the agents opted in, else `ink chat`. */
+  private inkRunnerFor(sbId: string | null | undefined): IRunner {
+    return selectInkRunner(this.config.hostedInk, this.inkRunner, sbId);
   }
 
   private getLeaseService(): StudioLeaseService | null {
@@ -1971,6 +2012,24 @@ export class SessionService implements ISessionService {
         };
       }
 
+      // Thrown by routing before anything is created or provisioned, so it
+      // is pre-admission too, and retryable: the read may recover.
+      if (error instanceof IdentityUnclassifiedError) {
+        return {
+          success: false,
+          sessionId: '',
+          backendSessionId: null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: error.message,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: error.classification,
+          admitted: false,
+        };
+      }
+
       return {
         success: false,
         sessionId: '',
@@ -2254,7 +2313,8 @@ export class SessionService implements ISessionService {
       session
     );
 
-    // 4. Select runtime backend and model
+    // 4. Select runtime backend and model. An inkling's session is stored as
+    // ink, and its turn is refused below if it is not (inkling-runtime.ts).
     const resolvedBackend = this.resolveRuntimeBackend(
       session.backend,
       injectedContext.agent.backend
@@ -2265,6 +2325,9 @@ export class SessionService implements ISessionService {
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
+    // The provider `ink chat` is told to run. Only an inkling's turn names
+    // one; every other ink spawn keeps the chat's own default.
+    let inkProvider: InklingProvider | undefined;
     let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
@@ -2276,7 +2339,7 @@ export class SessionService implements ISessionService {
     // scope. Missing/invalid identity fails CLOSED: toolRouting stays
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
-    // Set once an inkling's turn has passed the gate and claimed a slot.
+    // Set once an inkling's turn has passed the gate.
     let inklingTurn = false;
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
@@ -2341,20 +2404,35 @@ export class SessionService implements ISessionService {
       }
 
       if (inklingIdentity.kind === 'inkling') {
-        // Only the Claude runner enforces an inkling's ceiling, group stop
-        // and cancellation; on any other backend the turn would run unbounded.
-        if (resolvedBackend !== 'claude-code') {
-          return refuseInklingTurn(
-            `inkling turns run only on the Claude runner, which bounds them (not ${resolvedBackend})`
-          );
+        // Every inkling runs on ink, under a provider chosen on its own
+        // (inkling-runtime.ts). Its session is created as ink, and one that
+        // stored another runtime is refused here, so an admitted turn always
+        // reaches InkRunner, which enforces its ceiling, group stop,
+        // cancellation and spawn-seam admission (task 7d9aa453). A setting ink
+        // cannot honour, or a conversation it cannot carry, is refused, never
+        // translated.
+        const runtime = inklingRuntime({
+          sessionBackend: session.backend,
+          identityBackend: injectedContext.agent.backend,
+          identityProvider: injectedContext.agent.provider,
+        });
+        if (!runtime.ok) {
+          return refuseInklingTurn(runtime.reason);
         }
-        // A bounded first test: each turn is counted against the inkling's
-        // cap before anything is spawned.
-        const cap = inklingTurnCap();
-        const claim = await claimInklingTurn(this.supabase, inklingIdentity.id, userId, cap);
-        if (!claim.allowed) {
-          return refuseInklingTurn(`turn cap reached (${claim.used} of ${cap})`);
+        inkProvider = runtime.provider;
+        // A stopped turn whose processes were not confirmed gone fences the
+        // inkling until its group is (inkling-stop-fence.ts): no new turn
+        // runs beside them. Retryable, because the fence lifts once the group
+        // is observed gone. Asked again at the spawn seam (below), because
+        // this answer can go stale while the turn is prepared.
+        if (inklingFenceHolds(inklingIdentity.id)) {
+          return refuseInklingTurn(INKLING_FENCE_REASON, true);
         }
+        // There is no count of turns: Conor dropped the turn cap on Oct 4
+        // 2026 (5:00 PM). Usage limits will be monthly token allowances
+        // (ink://specs/inkling-model-access, task 2a00148f); until then a turn
+        // is bounded by the owner test above, Stop, the fence and its one
+        // outer cycle.
         inklingTurn = true;
         inklingSbId = inklingIdentity.id;
         // Its turn runs in its own folder, never the Inkwell checkout or the
@@ -2460,11 +2538,22 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
-      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      // An inkling turn is one outer cycle per admitted message, whatever its
+      // dashboard says: an execution boundary, not a product quota, and not a
+      // claim of one provider call (a cycle's tool loop may make several).
+      // Further continuations would need their own admission.
+      ...(inklingTurn
+        ? { maxTurns: 1 }
+        : runtimeMaxTurns !== undefined
+          ? { maxTurns: runtimeMaxTurns }
+          : {}),
       ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
-      // .ink/identity.json preferences or Commander defaults.
-      toolRouting: runtimeToolRouting,
+      // .ink/identity.json preferences or Commander defaults. An inkling's
+      // tools are always ink-owned: a dashboard setting must not hand its
+      // provider's native tools to the turn.
+      toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
+      ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       ...(launchPermissions ? { launchPermissions } : {}),
       // Propagate repo root so spawned backend's context token carries it
@@ -2511,7 +2600,7 @@ export class SessionService implements ISessionService {
           : resolvedBackend === 'antigravity'
             ? this.antigravityRunner
             : resolvedBackend === 'ink'
-              ? this.inkRunner
+              ? this.inkRunnerFor(session.sbId)
               : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
@@ -2745,12 +2834,44 @@ export class SessionService implements ISessionService {
     await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     const turnStartMs = Date.now();
+    // The inkling's fence, asked again where the answer cannot go stale:
+    // here, with no await before the runner is entered, and by the runner at
+    // its spawn seam, past its own preparation. Everything since the
+    // admission check has awaited, and a fence can land in between (Lumen's
+    // review of #747). A refusal here is a run that never began, and is
+    // recorded as one (refusedBeforeAcceptance, below).
+    // A survivor's hold (launched-processes.ts) is asked at both points as
+    // well: an earlier launch's failed record can install one in between.
+    const fencedSbId = inklingTurn ? inklingSbId : undefined;
+    const admitSpawn = (): string | undefined =>
+      (fencedSbId && inklingFenceHolds(fencedSbId)
+        ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
+        : undefined) ?? launchHoldFor(session.id);
+    // The launch is written before its process exists, so a restarted server
+    // can find the process whatever happens next (launched-processes.ts). A
+    // launch that cannot be written is refused, and starts nothing.
+    const launch =
+      admitSpawn() === undefined ? await reserveLaunch(session.id, resolvedBackend) : undefined;
+    const refusedAtEntry = admitSpawn() ?? launch?.refused;
     // A live inkling turn its owner can cancel (inkling-turns.ts), released
     // however the run ends.
     const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
+    // Refused here, the turn goes to a stand-in that starts nothing.
+    const turnRunner: Pick<IRunner, 'run'> =
+      refusedAtEntry === undefined
+        ? runner
+        : {
+            run: async (): Promise<RunnerResult> => ({
+              success: false,
+              backendSessionId: session.backendSessionId ?? null,
+              responses: [],
+              error: refusedAtEntry,
+              refusedBeforeSpawn: true,
+            }),
+          };
 
     try {
-      result = await runner
+      result = await turnRunner
         .run(formattedMessage, {
           backendSessionId: session.backendSessionId || undefined,
           // Always handed over, including on resume. Every runner already gates
@@ -2767,8 +2888,22 @@ export class SessionService implements ISessionService {
             ...runnerConfig,
             turnEpoch,
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+            admitSpawn,
+            ...(launch ? { launchEnv: launch.env } : {}),
+            onSpawned: (spawned) => launch?.spawned(spawned),
           },
           mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+        })
+        .then((ran) => {
+          // A stop the runner could not confirm leaves its row open, for the
+          // next start's sweep to look at.
+          if (!ran.stopUnconfirmed) launch?.exited();
+          // Fenced before the turn is released below, so no admission can
+          // fall between the two.
+          if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
+            fenceInkling(inklingSbId, ran.stopUnconfirmed);
+          }
+          return ran;
         })
         .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
@@ -2796,16 +2931,22 @@ export class SessionService implements ISessionService {
       // PR #662). A runner that saw the whole output classified it there.
       // Runners without that seam carry nothing, and this falls back to
       // exactly what it did before.
-      errorClassification =
-        !result.success && result.error
+      //
+      // A run refused at the spawn seam started nothing. It is classified as
+      // the admission refusal is (refuseInklingTurn: retryable, because the
+      // fence lifts once its group is observed gone), and recorded as a run
+      // that never began.
+      errorClassification = result.refusedBeforeSpawn
+        ? { category: 'network', summary: result.error ?? 'Refused before spawn', retryable: true }
+        : !result.success && result.error
           ? (result.classification ??
             classifyError({ errorText: result.error, backend: resolvedBackend }))
           : null;
-      refusedBeforeAcceptance = errorClassification
-        ? isPreAcceptanceRefusal(errorClassification.category)
-        : false;
+      refusedBeforeAcceptance =
+        result.refusedBeforeSpawn === true ||
+        (errorClassification ? isPreAcceptanceRefusal(errorClassification.category) : false);
       if (refusedBeforeAcceptance) {
-        logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+        logger.warn('The run was refused before it was accepted; not recording an outcome', {
           sessionId: session.id,
           backend: resolvedBackend,
           category: errorClassification!.category,
@@ -3280,6 +3421,8 @@ export class SessionService implements ISessionService {
       compactionTriggered: false,
       finalTextResponse: result.finalTextResponse,
       error: result.error,
+      // A run refused at the spawn seam answers as the admission refusal does.
+      ...(result.refusedBeforeSpawn ? { errorCode: 'INKLING_TURN_REFUSED' as const } : {}),
       // The verdict this turn was judged by, not a fresh reading of `error`.
       // The heartbeat outage alert prints a category to a human; deriving it
       // again from the excerpt is how the alert could name one category while
@@ -3690,6 +3833,7 @@ export class SessionService implements ISessionService {
       id: options?.sbId ?? discovered.id,
       absent: discovered.absent === true,
       ambiguous: discovered.ambiguous === true,
+      unreadable: discovered.unreadable === true,
     };
     const identitySbId = identity.id ?? null;
 
@@ -3881,6 +4025,7 @@ export class SessionService implements ISessionService {
       sbId: identitySbId,
       identityAmbiguous: identity.ambiguous === true,
       identityAbsent: identity.absent === true,
+      identityUnreadable: identity.unreadable,
       backend,
       planOnly: options?.planOnly === true,
     });
@@ -4433,7 +4578,11 @@ export class SessionService implements ISessionService {
       totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
-      backend,
+      // An inkling's session is ink's from birth (Conor, Oct 4 2026, 5:08 PM):
+      // its turns run nowhere else, and a session that stored another runtime
+      // is refused rather than moved (inkling-runtime.ts). Routing read the
+      // identity and placed it in its folder.
+      backend: routing.tier === 'inkling-folder' ? 'ink' : backend,
       // Null until a turn runs — the model that actually served the turn is
       // recorded post-run, so this never claims a model that was only asked for.
       model: null,
@@ -4489,16 +4638,6 @@ export class SessionService implements ISessionService {
     return this.withStudioLease(session, routing, leaseCtx);
   }
 
-  /** Whether this identity is an inkling. An unreadable row is not one: its turn is still checked at the seam. */
-  private async isInklingIdentity(sbId: string): Promise<boolean> {
-    const { data } = await this.supabase!.from('agent_identities')
-      .select('metadata')
-      .eq('id', sbId)
-      .maybeSingle();
-    const metadata = (data as { metadata?: Record<string, unknown> | null } | null)?.metadata;
-    return metadata?.client === INKLING_CLIENT;
-  }
-
   private async resolveStudioId(
     userId: string,
     sbSlug: string,
@@ -4528,6 +4667,8 @@ export class SessionService implements ISessionService {
       identityAmbiguous?: boolean;
       /** No identity row exists at all — only then is a slug match a proof. */
       identityAbsent?: boolean;
+      /** The read that would find the identity by slug failed: there is nothing to classify. */
+      identityUnreadable?: boolean;
       /** v18 S3: decision-only resolution — the gate never mints overflow. */
       planOnly?: boolean;
       /**
@@ -4598,8 +4739,27 @@ export class SessionService implements ISessionService {
     // before every tier, explicit ones included, so no studio hint, route
     // pattern or continuity row can put it in a worktree, and its threaded
     // message is placed rather than held for want of a studio.
-    if (this.supabase && options.sbId && (await this.isInklingIdentity(options.sbId))) {
-      return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+    // Classified, never guessed: an identity whose kind cannot be read stops
+    // here, before any tier, lease or session row (Lumen, #750 r2). The turn
+    // gate refuses the same identity retryably anyway; refusing it here also
+    // keeps a new session from being created on a runtime the identity may
+    // not have.
+    if (this.supabase && options.sbId) {
+      const identity = await classifyIdentityById(this.supabase, options.sbId);
+      if (identity.kind === 'unknown') {
+        throw new IdentityUnclassifiedError(sbSlug, options.sbId);
+      }
+      if (identity.kind === 'inkling') {
+        return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+      }
+    } else if (this.supabase && options.identityUnreadable && !options.threadKey) {
+      // No id to classify, because the read that would have found one by
+      // slug failed (Lumen, #750 r3). An unthreaded delivery used to fall
+      // through every tier to a new row on the identity's default runtime;
+      // it is retried instead, like the classification failure above. A
+      // threaded one is already held below as an ambiguous identity (#514),
+      // which creates nothing.
+      throw new IdentityUnclassifiedError(sbSlug);
     }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
@@ -5546,6 +5706,14 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A compaction is a launch too: never beside a survivor that may still be
+    // running this session (launched-processes.ts).
+    const launchHold = launchHoldFor(sessionId);
+    if (launchHold) {
+      logger.warn('Not compacting a held session', { sessionId, reason: launchHold });
+      return;
+    }
+
     // Acquire database-backed compaction lock (atomic, multi-server safe)
     const lockAcquired = await this.repository.tryAcquireCompactionLock(sessionId);
     if (!lockAcquired) {
@@ -5643,7 +5811,7 @@ This session will continue with a fresh context after compaction. Your identity,
             : runtimeBackend === 'antigravity'
               ? this.antigravityRunner
               : runtimeBackend === 'ink'
-                ? this.inkRunner
+                ? this.inkRunnerFor(session.sbId)
                 : this.claudeRunner;
 
       await this.completeStudioBeforeSpawn(
@@ -5652,11 +5820,30 @@ This session will continue with a fresh context after compaction. Your identity,
         session.sbSlug
       );
 
+      // Asked again past the awaits since the first check, and by the runner
+      // at its spawn seam, as a turn's admission is.
+      // The launch is written first, as a turn's is.
+      const compactionHold = (): string | undefined => launchHoldFor(sessionId);
+      const launch =
+        compactionHold() === undefined ? await reserveLaunch(sessionId, runtimeBackend) : undefined;
+      const refusedAtRun = compactionHold() ?? launch?.refused;
+      if (refusedAtRun) {
+        logger.warn('Not compacting a held session', { sessionId, reason: refusedAtRun });
+        launch?.exited();
+        return;
+      }
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
-        config: runnerConfig,
+        config: {
+          ...runnerConfig,
+          admitSpawn: compactionHold,
+          ...(launch ? { launchEnv: launch.env } : {}),
+          onSpawned: (spawned) => launch?.spawned(spawned),
+        },
       });
+      if (!result.stopUnconfirmed) launch?.exited();
 
       // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
       if (result.responses.length > 0 && this.config.responseHandler) {

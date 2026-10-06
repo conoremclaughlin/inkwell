@@ -51,6 +51,24 @@ export type Database = {
   };
   public: {
     Tables: {
+      account_deletion_requests: {
+        Row: {
+          completed_at: string | null;
+          requested_at: string;
+          user_id: string;
+        };
+        Insert: {
+          completed_at?: string | null;
+          requested_at?: string;
+          user_id: string;
+        };
+        Update: {
+          completed_at?: string | null;
+          requested_at?: string;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
       activity_stream: {
         Row: {
           agent_id: string;
@@ -2070,6 +2088,53 @@ export type Database = {
             foreignKeyName: 'kindle_tokens_used_by_user_id_fkey';
             columns: ['used_by_user_id'];
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      launched_processes: {
+        Row: {
+          backend: string;
+          boot_id: string;
+          exited_at: string | null;
+          id: string;
+          launched_at: string;
+          pgid: number | null;
+          pid: number | null;
+          server_instance: string;
+          session_id: string;
+          start_identity: string | null;
+        };
+        Insert: {
+          backend: string;
+          boot_id: string;
+          exited_at?: string | null;
+          id?: string;
+          launched_at?: string;
+          pgid?: number | null;
+          pid?: number | null;
+          server_instance: string;
+          session_id: string;
+          start_identity?: string | null;
+        };
+        Update: {
+          backend?: string;
+          boot_id?: string;
+          exited_at?: string | null;
+          id?: string;
+          launched_at?: string;
+          pgid?: number | null;
+          pid?: number | null;
+          server_instance?: string;
+          session_id?: string;
+          start_identity?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'launched_processes_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
         ];

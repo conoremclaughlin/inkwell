@@ -31,7 +31,7 @@ import { homedir, tmpdir } from 'os';
 import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
-import { stopProcessAndWait } from './stop-process.js';
+import { isGroupId, stopProcessAndWait } from './stop-process.js';
 import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 
@@ -285,8 +285,18 @@ export class ClaudeRunner implements IRunner {
       messageLength: fullMessage.length,
     });
 
+    // Refused at the spawn seam: no process, so no session either.
+    const refusedRun = (reason: string): RunnerResult => ({
+      success: false,
+      backendSessionId: backendSessionId ?? null,
+      responses: [],
+      error: reason,
+      refusedBeforeSpawn: true,
+    });
+
     try {
       const result = await this.spawnProcess(args, fullMessage, runConfig);
+      if (result.refusedBeforeSpawn !== undefined) return refusedRun(result.refusedBeforeSpawn);
 
       // Check if resume failed because session doesn't exist
       if (result.resumeFailedNoSession && isResume) {
@@ -307,6 +317,9 @@ export class ClaudeRunner implements IRunner {
 
         logger.info('Retrying with fresh session', { sessionId });
         const retryResult = await this.spawnProcess(args, fullMessage, runConfig);
+        if (retryResult.refusedBeforeSpawn !== undefined) {
+          return refusedRun(retryResult.refusedBeforeSpawn);
+        }
 
         return {
           success: !retryResult.timedOut,
@@ -317,6 +330,7 @@ export class ClaudeRunner implements IRunner {
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
           ...(retryResult.timedOut ? { error: retryResult.timedOut.message } : {}),
+          ...(retryResult.stopUnconfirmed ? { stopUnconfirmed: retryResult.stopUnconfirmed } : {}),
         };
       }
 
@@ -335,6 +349,7 @@ export class ClaudeRunner implements IRunner {
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
         ...(result.timedOut ? { error: result.timedOut.message } : {}),
+        ...(result.stopUnconfirmed ? { stopUnconfirmed: result.stopUnconfirmed } : {}),
       };
     } catch (error) {
       logger.error('Claude Code process failed', {
@@ -413,6 +428,9 @@ export class ClaudeRunner implements IRunner {
      * it is reported as a completed turn. See the timers below.
      */
     timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
+    stopUnconfirmed?: RunnerResult['stopUnconfirmed'];
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -507,6 +525,21 @@ export class ClaudeRunner implements IRunner {
       }
     }
 
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    // A refusal undoes what was prepared and starts nothing.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      mcpInjection?.cleanup();
+      restoreOverlay?.().catch(() => {});
+      launchSettings?.cleanup().catch(() => {});
+      logger.warn('Claude Code spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
+
     // If headers were injected, patch the --mcp-config arg to point to the temp file.
     // When containerized, translate host path to the container-side mount point.
     if (mcpInjection?.modified) {
@@ -526,6 +559,8 @@ export class ClaudeRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
@@ -571,6 +606,8 @@ export class ClaudeRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
+      if (proc.pid !== undefined)
+        config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
       // No ceiling unless one is configured, for the module or for this run;
       // the lower one wins when both are.
       const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);
@@ -592,14 +629,17 @@ export class ClaudeRunner implements IRunner {
       let idleTimer: NodeJS.Timeout;
 
       /**
-       * Stop the process, and settle once it has exited, not when it was
+       * Stop the process, and settle once it has gone, not when it was
        * signalled. The caller releases the session when this settles, and a
        * process still winding down can still write to that session: settling
        * at the signal let a queued or new turn start a second `--resume` of
        * the same Claude session beside it (measured on the #740 thread,
-       * a0b00a78). Past the bound the turn settles anyway, and says the exit
-       * was not confirmed. The outcome is read at settle time, so it carries
-       * whatever the process emitted while it wound down.
+       * a0b00a78). For a group stop, "gone" is the whole group, so a tool
+       * child that outlives its leader holds the turn too. Past the bound the
+       * turn settles anyway, says the stop was not confirmed, and names the
+       * processes still seen, so the caller can keep new work off them. The
+       * outcome is read at settle time, so it carries the stream events
+       * parsed while the process wound down.
        */
       const stopThenSettle = (
         stopped: () => {
@@ -612,12 +652,25 @@ export class ClaudeRunner implements IRunner {
         settled = true;
         clearTimeout(timeout);
         clearTimeout(idleTimer);
-        void stopProcessAndWait(proc, { group: killGroup }).then((exited) => {
+        void stopProcessAndWait(proc, { group: killGroup }).then((stop) => {
           const outcome = stopped();
-          if (!exited) {
-            logger.error('Claude Code process did not confirm its exit after the stop', {
+          // A group stop is confirmed only by a group seen empty, never by an
+          // outcome that says nothing of the group.
+          const confirmed = stop.exited && (!killGroup || stop.group === 'empty');
+          let stopUnconfirmed: RunnerResult['stopUnconfirmed'];
+          if (!confirmed) {
+            const pgid = killGroup && isGroupId(proc.pid) ? proc.pid : undefined;
+            stopUnconfirmed = {
+              leaderExited: stop.exited,
+              ...(pgid !== undefined ? { pgid } : {}),
+              ...(stop.group !== undefined ? { group: stop.group } : {}),
+            };
+            // Process metadata only: never arguments, environment or content.
+            logger.error('Claude Code stop could not confirm its processes had gone', {
               pid: proc.pid,
               kind: outcome.kind,
+              leaderExited: stop.exited,
+              group: stop.group,
             });
           }
           resolve({
@@ -628,8 +681,9 @@ export class ClaudeRunner implements IRunner {
             finalTextResponse: outcome.finalTextResponse,
             timedOut: {
               kind: outcome.kind,
-              message: exited ? outcome.message : outcome.unconfirmedMessage,
+              message: confirmed ? outcome.message : outcome.unconfirmedMessage,
             },
+            ...(stopUnconfirmed ? { stopUnconfirmed } : {}),
           });
         });
       };
@@ -656,7 +710,7 @@ export class ClaudeRunner implements IRunner {
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
               kind: 'idle',
               message,
-              unconfirmedMessage: `${message}, but it did not confirm it had exited`,
+              unconfirmedMessage: `${message}, but its processes did not confirm they had stopped`,
             }));
           }
         }, IDLE_TIMEOUT_MS);
@@ -682,7 +736,7 @@ export class ClaudeRunner implements IRunner {
                   finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
                   kind: 'hard',
                   message,
-                  unconfirmedMessage: `${message}, but it did not confirm it had exited`,
+                  unconfirmedMessage: `${message}, but its processes did not confirm they had stopped`,
                 }));
               }
             }, ceilingMs);
@@ -700,7 +754,7 @@ export class ClaudeRunner implements IRunner {
           kind: 'cancelled',
           message: 'Claude Code turn cancelled, process stopped',
           unconfirmedMessage:
-            'Claude Code turn cancelled; its process did not confirm it had exited',
+            'Claude Code turn cancelled; its processes did not confirm they had stopped',
         }));
       };
       if (config.signal?.aborted) onAbort();

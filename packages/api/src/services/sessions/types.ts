@@ -6,6 +6,8 @@
 
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
+import type { GroupState } from './stop-process';
+import type { InklingProvider } from '../inklings/inkling-runtime';
 
 // ─── Channel Types ───
 
@@ -795,6 +797,28 @@ export interface ClaudeRunnerConfig {
    * inkling's turn). The Claude runner honours it.
    */
   signal?: AbortSignal;
+  /**
+   * The caller's admission, asked again at the spawn seam: synchronously,
+   * after the last await of the runner's own preparation, with none between
+   * it and the spawn. A reason refuses the run, which starts nothing and
+   * returns `refusedBeforeSpawn` with the reason as its error. An admission
+   * made earlier can go stale while the run is prepared (Lumen's review of
+   * #747). Every runner honours it.
+   */
+  admitSpawn?: () => string | undefined;
+  /**
+   * Set in the environment of every process the runner starts, past the
+   * explicit allowlist: the launch's tag, by which a restarted server finds a
+   * process whose pid it never recorded (launched-processes.ts).
+   */
+  launchEnv?: Record<string, string>;
+  /**
+   * Told each process the runner starts, as soon as it has a pid, so the
+   * server can record it (launched-processes.ts) and a restarted server can
+   * stop it. A run that leads its own process group passes the group too.
+   * Every runner calls it for every spawn, fallback spawns included.
+   */
+  onSpawned?: (spawned: { pid: number; pgid?: number }) => void;
   model?: string;
   /**
    * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
@@ -835,6 +859,13 @@ export interface ClaudeRunnerConfig {
    * Only ever true on a fresh spawn — a resume carries the original in history.
    */
   constitutionInjected?: boolean;
+  /**
+   * The provider InkRunner tells `ink chat` to run (`--backend`). Unset leaves
+   * the chat's own default, as every ordinary SB's spawn does. An inkling's
+   * turn always sets it (inklings/inkling-runtime.ts), so its provider never
+   * rests on that default.
+   */
+  inkProvider?: InklingProvider;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts
@@ -934,6 +965,20 @@ export interface RunnerResult {
   finalTextResponse?: string;
   /** Tool calls captured during this run (for activity stream logging) */
   toolCalls?: ToolCall[];
+  /**
+   * Set when the run was stopped and the stop could not confirm, by the
+   * bound, that the process (and, for a group stop, its whole group) had
+   * gone. The caller must not let replacement work overlap whatever is still
+   * running (stop-process.ts, inkling-stop-fence.ts).
+   */
+  stopUnconfirmed?: {
+    leaderExited: boolean;
+    /** The group's number, for a group stop: the only thing a fence may release on. */
+    pgid?: number;
+    group?: GroupState;
+  };
+  /** `admitSpawn` refused this run: nothing was started, and `error` is its reason. */
+  refusedBeforeSpawn?: true;
 }
 
 /** @deprecated Use RunnerResult */

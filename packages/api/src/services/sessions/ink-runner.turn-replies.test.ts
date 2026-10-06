@@ -442,3 +442,104 @@ describe('InkRunner turn replies', () => {
     ]);
   });
 });
+
+/**
+ * A stopped turn and its replies (task 7d9aa453; Lumen 0a811b37). The process
+ * stop and the reply hand-over are separate waits: a cancel must not drop a
+ * reply that is still being delivered, and nothing here claims that wait is
+ * bounded. The fake child is unexited (exitCode and signalCode null), so the
+ * stop really waits for its `exit`.
+ */
+describe('InkRunner turn replies across a stop', () => {
+  function unexited(child: FakeChild): FakeChild & {
+    exitCode: number | null;
+    signalCode: string | null;
+  } {
+    return Object.assign(child, { exitCode: null as number | null, signalCode: null });
+  }
+
+  it('a cancelled run waits for a reply still being delivered, then settles as cancelled, never a success', async () => {
+    let finishReply!: () => void;
+    const delivered: RunnerTurnReply[] = [];
+    const controller = new AbortController();
+    const { child, run, turnLine } = await start({
+      workingDirectory: '/tmp',
+      sbSlug: 'myra',
+      inkSessionId: 'sess-stop-reply',
+      signal: controller.signal,
+      onTurnReply: (reply: RunnerTurnReply) =>
+        new Promise<void>((resolve) => {
+          delivered.push(reply);
+          finishReply = resolve;
+        }),
+    });
+    const proc = unexited(child);
+    let settled = false;
+    void run.then(() => (settled = true));
+
+    proc.stdout.emit('data', turnLine(1, 'telegram', 'a reply on its way out'));
+    expect(delivered).toHaveLength(1);
+
+    controller.abort();
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    proc.exitCode = 143;
+    proc.emit('exit', 143, null);
+    proc.emit('close', 143);
+    await ticks(10);
+    // The process has gone; the reply has not finished being delivered.
+    expect(settled).toBe(false);
+
+    finishReply();
+    const result = await run;
+    expect(result).toMatchObject({
+      success: false,
+      error: 'ink chat turn cancelled, process stopped',
+    });
+  });
+
+  it('a stop that races an error and the close settles once, as the stop', async () => {
+    const controller = new AbortController();
+    const { child, run } = await start({
+      workingDirectory: '/tmp',
+      sbSlug: 'myra',
+      signal: controller.signal,
+    });
+    const proc = unexited(child);
+    const outcomes: unknown[] = [];
+    void run.then(
+      (value) => outcomes.push(value),
+      (error) => outcomes.push(error)
+    );
+
+    controller.abort();
+    proc.emit('error', new Error('synthetic late error'));
+    proc.exitCode = 143;
+    proc.emit('exit', 143, null);
+    proc.emit('close', 143);
+    await ticks(10);
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({
+      success: false,
+      error: 'ink chat turn cancelled, process stopped',
+    });
+  });
+
+  it('a run that ends on its own before any stop is reported as it ended; a later cancel changes nothing', async () => {
+    const controller = new AbortController();
+    const { child, run } = await start({
+      workingDirectory: '/tmp',
+      sbSlug: 'myra',
+      signal: controller.signal,
+    });
+    const proc = unexited(child);
+    proc.stdout.emit('data', line({ type: 'result', text: 'finished' }));
+    proc.exitCode = 0;
+    proc.emit('exit', 0, null);
+    proc.emit('close', 0);
+    controller.abort();
+    const result = await run;
+    expect(result).toMatchObject({ success: true, finalTextResponse: 'finished' });
+    expect(proc.kill).not.toHaveBeenCalled();
+  });
+});

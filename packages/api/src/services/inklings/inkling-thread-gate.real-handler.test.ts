@@ -71,6 +71,7 @@ import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
 import { handleAddThreadParticipant } from '../../mcp/tools/thread-handlers';
 import { getRequestContext } from '../../utils/request-context';
 import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
+import { resetReplyChains } from './inkling-reply-chain';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -136,6 +137,7 @@ const NOTHING = { threads: 0, participants: 0, messages: 0 };
 beforeEach(() => {
   gateway.dispatchTrigger.mockClear();
   gateway.processTrigger.mockClear();
+  resetReplyChains();
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
   sb('pip', OWNER_TEST_INKLING);
@@ -504,8 +506,9 @@ describe("owner-present groups of the owner's own inklings, up to three", () => 
 
   it('each member inkling may reply, and its reply wakes nobody', async () => {
     await call(create, { key: KEY, recipients: ['pip', 'tam'], content: 'hi' });
-    // Control: the owner's message woke every member.
-    expect(woken()).toEqual(['pip', 'tam']);
+    // Control: the owner's message woke the first member; the others answer
+    // in turn as each turn ends (inkling-reply-chain.ts).
+    expect(woken()).toEqual(['pip']);
     gateway.dispatchTrigger.mockClear();
     gateway.processTrigger.mockClear();
     for (const slug of ['pip', 'tam']) {

@@ -57,6 +57,11 @@ import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import {
+  attachReplyChain,
+  inTurnNote,
+  replyChainWakeDue,
+} from './services/inklings/inkling-reply-chain';
+import {
   TriggerRetryScheduler,
   getTriggerAttempt,
   BackendFailureError,
@@ -92,8 +97,13 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import {
+  HostedInkSessionRunner,
+  parseHostedInkSbIds,
+} from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
+import { startLaunchTracking } from './services/sessions/launched-processes';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -171,10 +181,27 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 1. Initialize data layer
   logger.info('Initializing data layer...');
   dataComposer = await getDataComposer();
+
+  // Before any input is handled: stop the backend processes this server
+  // launched before a restart and left running, then record every launch from
+  // here on (launched-processes.ts). A restart signals only the server, and the
+  // next message to such a session would start a second backend beside it.
+  await startLaunchTracking(dataComposer.getClient(), env.MCP_HTTP_PORT);
   logger.info('Data layer ready');
 
   // 2. Create SessionService (stateless, queries DB per-request)
   logger.info('Creating SessionService...');
+  // Opt-in only. No composition is bound yet (pr:701), so a listed agent's
+  // ink turns are refused, never sent to ink chat in its place.
+  const hostedInkSbIds = parseHostedInkSbIds(env.INK_RUNTIME_IN_PROCESS_SB_IDS);
+  if (hostedInkSbIds.size > 0) {
+    logger.warn(
+      "In-process ink runtime selected, with no composition bound: these agents' ink turns are refused",
+      {
+        sbIds: [...hostedInkSbIds],
+      }
+    );
+  }
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
@@ -191,6 +218,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
+    ...(hostedInkSbIds.size > 0
+      ? { hostedInk: { runner: new HostedInkSessionRunner({}), sbIds: hostedInkSbIds } }
+      : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -1143,6 +1173,10 @@ Type: ${payload.triggerType}`;
     }
     if (payload.threadKey) {
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
+      // A group of inklings answering their owner in turn: this one comes
+      // after others (inkling-reply-chain.ts).
+      const answeringInTurn = inTurnNote(payload.metadata);
+      if (answeringInTurn) triggerMessage += `\n${answeringInTurn}`;
 
       // The thread's own description, on the surface an SB reads BEFORE
       // deciding whether to act. A key alone ("inkwell:thread:legibility-commission")
@@ -1879,6 +1913,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   // inbox row is restored to unread before the retry decision, and a threaded
   // failure is announced on its first failure rather than held silently.
   const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
+    // A group member's wake whose chain Stop or a newer owner message has
+    // since ended is not sent again (inkling-reply-chain.ts).
+    if (!replyChainWakeDue(retryPayload)) {
+      logger.info('[TriggerRetry] Not re-dispatching: its group reply chain has ended', {
+        to: retryPayload.toSlug,
+        threadKey: retryPayload.threadKey || null,
+      });
+      return;
+    }
     logger.info('[TriggerRetry] Re-dispatching trigger', {
       to: retryPayload.toSlug,
       from: retryPayload.fromSlug,
@@ -1889,18 +1932,37 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     agentGateway.dispatchTrigger(retryPayload);
   });
 
-  // 7c. Listen for trigger failures — transient errors get a delayed retry;
+  // 7c. A group of inklings answering their owner in turn: as each member's
+  // wake ends, the next is woken (inkling-reply-chain.ts). A processed wake
+  // has ended. A failed one has ended only if no retry is coming, which the
+  // failure listener below decides, so it reports those itself.
+  const replyChainWakeFailed = attachReplyChain(agentGateway);
+
+  // 7d. Listen for trigger failures — transient errors get a delayed retry;
   // otherwise restore inbox message + notify sender. The decision lives in
   // services/trigger-failure-listener.ts so it can run over a table-backed
   // client (Lumen, #618); the scheduler and the activity stream are handed in.
-  agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
-    handleTriggerFailure(dataComposer?.getClient(), event, {
+  // A failure with no retry coming then ends that wake's part in its chain;
+  // one with a retry keeps its place, so the retry never runs beside the
+  // next member's turn.
+  agentGateway.on('trigger:error', (event: TriggerFailureEvent) => {
+    let retrying = false;
+    return handleTriggerFailure(dataComposer?.getClient(), event, {
       logInkmailFailure: (payload, userId, extra) =>
         logInkmail('inkmail_fail', payload, userId, extra),
-      retryScheduler: triggerRetryScheduler,
+      retryScheduler: {
+        scheduleRetry: (payload, classification, error) => {
+          const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
+          // A retry already pending for this wake is still to come.
+          retrying = retry.scheduled || retry.reason === 'already_pending';
+          return retry;
+        },
+      },
       logRetryActivity: (entry) => dataComposer!.repositories.activityStream.logActivity(entry),
-    })
-  );
+    }).finally(() => {
+      if (!retrying) replyChainWakeFailed(event.payload);
+    });
+  });
 
   // 8. Print status
   printStatus();

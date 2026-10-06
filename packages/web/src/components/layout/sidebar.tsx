@@ -80,7 +80,7 @@ const mainNav: NavGroup[] = [
     label: 'Platform',
     items: [
       { name: 'Automations', href: '/automations', icon: Workflow },
-      { name: 'Reminders', href: '/reminders', icon: Bell },
+      { name: 'Scheduled', href: '/scheduled', icon: Bell },
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
       { name: 'Mobile', href: '/mobile', icon: Smartphone },
       { name: 'Routing', href: '/routing', icon: Route },
