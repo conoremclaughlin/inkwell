@@ -32,6 +32,7 @@ export * from './clone-outcomes.js';
 export * from './session-history.js';
 export * from './provider-recovery.js';
 export * from './serial-input-drain.js';
+export * from './session-turn.js';
 export * from './paragraph-stream.js';
 export * from './preview-guard.js';
 export * from './frame-fanout.js';

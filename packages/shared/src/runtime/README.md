@@ -200,3 +200,30 @@ restart and prevent overlapping writers before dispatch; this primitive does
 not prescribe a datastore or database admission functions. Running two drains
 for the same session is NOT prevented by this class. Hosted recovery and
 multi-view streaming require their own integration and end-to-end tests.
+
+## Session turn context coordinator
+
+`SessionTurnCoordinator` is the CLI's shared context lifecycle around the existing
+execution callback: input provenance and transcript writes, pre-turn compaction,
+measured-occupancy hooks, persisted recall injections, assistant outcome,
+consumed-tool-result eviction, and turn-end hooks. It receives explicit ledger,
+hook, log, state, occupancy, compaction and eviction ports. Native-session
+invalidation still goes through the host's existing persistent eviction path.
+It has no process globals, filesystem defaults or network client.
+
+Turn-end hooks now finish before the next ordinary input or one-shot shutdown.
+Previously their unawaited recall could inject into the next prompt or append
+after the transcript closed. Hook handler failures remain isolated by the
+registry; log failures propagate. Log flush is awaited before execution and
+before reporting completion. This observes the existing SessionLog's write
+promise, not fsync, a transaction, cross-process exclusion or recovery.
+
+Each instance serves one session and refuses overlapping runs; the host still
+owns its FIFO and admission. Execution, errors and cancellation do not manufacture
+a completed assistant response. Separate instances can run concurrently.
+
+This extraction is not yet the complete hosted session entry. Bootstrap, prompt
+assembly, provider continuity, tool policy, media, live controls, cancellation
+and rendering still have host composition in `runChat`. Both hosts must bind
+that same extracted composition before claiming API parity; a bare call to
+`runAgentLoop` with fresh context is not an equivalent implementation.

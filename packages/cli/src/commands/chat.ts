@@ -1,6 +1,8 @@
 import {
   compactForLedger,
   SerialInputDrain,
+  SessionTurnCoordinator,
+  type PreparedSessionTurn,
   InputDrainRefusal,
   EVICTED_DISPLAY_MAX,
   extractSessionContextMessages,
@@ -98,14 +100,6 @@ import {
   runCompaction,
   type CompactionOutcome,
 } from '../repl/compaction.js';
-import {
-  autoEvictTombstone,
-  selectConsumedToolResults,
-  AUTO_EVICT_KEEP_RECENT_TURNS,
-  AUTO_EVICT_MIN_SHARE,
-  AUTO_EVICT_MIN_TOKENS,
-  AUTO_EVICT_TOMBSTONE_SOURCE,
-} from '../repl/auto-evict.js';
 import { localToolLedgerLine } from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
@@ -3474,7 +3468,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const ledger = new ContextLedger();
   const sessionSignal = createSignalSink();
   const hookRegistry = new SbHookRegistry();
-  let hookTurnCount = 0;
 
   // Session-level tool call log — surfaced in the Ctrl+O context inspector
   const recentToolCalls: Array<{
@@ -6275,98 +6268,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return iterationResults;
   };
 
-  const runUserTurn = async (
+  const executeUserTurn = async (
     raw: string,
-    source: 'user' | 'inbox-auto' | 'system' = 'user',
-    displayLabel?: string
+    turnMedia: TurnMedia[],
+    { occupancy: turnOccupancy, promptHooks: promptHookResult }: PreparedSessionTurn
   ) => {
-    if (!raw.trim()) return;
-    streamRenderer.reset();
-    turnDialogue = [];
-    turnDialogueMuted = false;
-    // Attach pending files to this turn — append the block so the backend
-    // sees the paths inline with the message that delivered them. The media
-    // list rides the same turn (injected as prompt content by adapters that
-    // support it) and is consumed here so continuations don't re-inject.
-    if (pendingAttachmentBlock) {
-      raw = `${raw}\n\n${pendingAttachmentBlock}`;
-      pendingAttachmentBlock = '';
-    }
-    const turnMedia = pendingTurnMedia;
-    pendingTurnMedia = [];
-    // NOTE: display echo happens at SUBMIT time in enqueueTurn — a message
-    // typed while another turn is in flight must appear immediately, not when
-    // the queue reaches it. Ledger/transcript appends stay here, sequenced
-    // with the turn.
-    if (source === 'user') {
-      ledger.addEntry('user', raw, 'repl');
-      runtime.log.append({ type: 'user', content: raw });
-    } else if (source === 'system') {
-      // Synthetic turn input: heartbeat triggers, server-delivered messages,
-      // continuation prompts. Recorded as system (not "you") so transcripts
-      // distinguish harness prompts from the human's words.
-      const label = displayLabel || 'system';
-      ledger.addEntry('system', raw, label);
-      runtime.log.append({ type: 'system_turn', content: raw, label });
-    } else {
-      ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
-      runtime.log.append({ type: 'auto_turn', content: raw });
-    }
-
-    if (runtime.sessionId && !options.nonInteractive) {
-      await inkClient
-        .callTool('update_session_state', {
-          sbSlug,
-          sessionId: runtime.sessionId,
-          phase: 'implementing',
-          status: 'active',
-        })
-        .catch(() => undefined);
-    }
-
-    // ── Token-budget enforcement: compact before building the prompt ──
-    // If the transcript has grown past the compaction threshold, summarize
-    // the oldest entries into a new start state before this turn spends them.
-    await maybeCompactContext('pre-turn budget check');
-
-    // ── Fire prompt_build hooks (budget monitor, etc.) ──
-    // Occupancy comes from turnContextOccupancy, which prefers the provider's
-    // own measurement over ink's estimate. The estimate cannot see the identity
-    // envelope or what a resumed native session accumulated, and every hook
-    // gating on this number — the budget monitor, the passive-recall ceiling —
-    // was calibrated against it.
-    const turnOccupancy = turnContextOccupancy(ledger, runtime, providerContextMeasurement());
     const contextStamp = formatContextStamp(turnOccupancy);
-
-    const promptHookResult = await hookRegistry.fire('prompt_build', {
-      ledger,
-      runtime: {
-        sessionId: runtime.sessionId,
-        sbSlug,
-        backend: runtime.backend,
-        budgetUtilization: turnOccupancy.utilization,
-        turnCount: hookTurnCount,
-      },
-      // Pass user input so passive recall can surface memories BEFORE the backend responds
-      lastTurn: {
-        userInput: raw,
-        assistantResponse: '',
-        turnIndex: hookTurnCount + 1,
-      },
-    });
-
-    // Persist hook-injected entries to transcript so they survive reattach
-    if (promptHookResult.injectedEntries.length > 0) {
-      for (const entry of promptHookResult.injectedEntries) {
-        runtime.log.append({
-          type: 'hook_injection',
-          role: entry.role,
-          content: entry.content,
-          source: entry.source,
-          memoryId: entry.memoryId,
-        });
-      }
-    }
 
     // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
@@ -7058,12 +6965,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       disarmTurnCancellation();
     }
 
-    const runResult = lastRunResult;
-    const responseText = loopResult.responseText;
-    const allToolResults = loopResult.toolResults;
-    const isAbortedTurn = loopResult.stopReason === 'aborted';
-    const assistantDisplayText = loopResult.assistantDisplayText;
-
     // The loop tells the model when it has written fake results; when it
     // could not (the correction itself came back imitated, or the backend
     // failed before one could be sent), the native session still holds the
@@ -7078,169 +6979,120 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
 
-    if (isAbortedTurn) {
-      runtime.log.append({
-        type: 'assistant',
-        backend: runtime.backend,
-        model: runtime.model || null,
-        success: false,
-        exitCode: runResult.exitCode,
-        durationMs: runResult.durationMs,
-        stderr: runResult.stderr || null,
-        content: null,
-        cancelled: true,
-        usage: runResult.usage || null,
-      });
-    } else {
-      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-      // A failed backend's text is whatever it printed before failing, not a
-      // reply: the same rule the server applies to a failed run.
+    return { loop: loopResult, backend: lastRunResult, value: { turnDurationSeconds } };
+  };
+
+  const turnCoordinator = new SessionTurnCoordinator({
+    ledger,
+    hooks: hookRegistry,
+    // Read the live log/state: /session and other live controls can replace them.
+    log: {
+      append: (entry) => runtime.log.append(entry),
+      flush: () => runtime.log.flush(),
+    },
+    state: () => ({
+      sessionId: runtime.sessionId,
+      sbSlug,
+      backend: runtime.backend,
+      model: runtime.model,
+      bootstrapContext: runtime.bootstrapContext,
+      maxContextTokens: runtime.maxContextTokens,
+      compactionInFlight,
+    }),
+    occupancy: () => turnContextOccupancy(ledger, runtime, providerContextMeasurement()),
+    inputRecorded: async () => {
+      if (runtime.sessionId && !options.nonInteractive) {
+        await inkClient
+          .callTool('update_session_state', {
+            sbSlug,
+            sessionId: runtime.sessionId,
+            phase: 'implementing',
+            status: 'active',
+          })
+          .catch(() => undefined);
+      }
+    },
+    compact: maybeCompactContext,
+    recordEviction,
+  });
+
+  const runUserTurn = async (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ) => {
+    if (!raw.trim()) return;
+    streamRenderer.reset();
+    turnDialogue = [];
+    turnDialogueMuted = false;
+    // Attach pending files to this turn — append the block so the backend
+    // sees the paths inline with the message that delivered them. The media
+    // list rides the same turn (injected as prompt content by adapters that
+    // support it) and is consumed here so continuations don't re-inject.
+    if (pendingAttachmentBlock) {
+      raw = `${raw}\n\n${pendingAttachmentBlock}`;
+      pendingAttachmentBlock = '';
+    }
+    const turnMedia = pendingTurnMedia;
+    pendingTurnMedia = [];
+    // Display echo stays at submit time. The shared coordinator sequences
+    // context/log writes, compaction and recall with the actual execution.
+    const coordinated = await turnCoordinator.run({ raw, source, displayLabel }, (prepared) =>
+      executeUserTurn(raw, turnMedia, prepared)
+    );
+    if (!coordinated) return;
+    const { execution, endHooks: hookResult, autoEviction } = coordinated;
+    const { loop: loopResult, backend: runResult } = execution;
+    const { turnDurationSeconds } = execution.value;
+    const isAbortedTurn = loopResult.stopReason === 'aborted';
+    const assistantDisplayText = loopResult.assistantDisplayText;
+    if (!isAbortedTurn) {
+      // A failed backend's partial output is not a reply.
       lastTurnAssistantText = loopResult.success ? assistantDisplayText : null;
-      runtime.log.append({
-        type: 'assistant',
-        backend: runtime.backend,
-        model: runtime.model || null,
-        success: runResult.success,
-        exitCode: runResult.exitCode,
-        durationMs: runResult.durationMs,
-        stderr: runResult.stderr || null,
-        content: assistantDisplayText,
-        rawContent: responseText,
-        approxTokens: estimateTokens(assistantDisplayText),
-        usage: runResult.usage || null,
-      });
+    }
+    if (autoEviction) {
+      printEvent(
+        chalk.dim(
+          `  🗑 auto-cleared ${autoEviction.entries} consumed tool results (${formatTokenCount(autoEviction.removedTokens)} tok) — ${autoEviction.tools.join(', ')}`
+        )
+      );
     }
 
-    // ── Fire turn_end hooks (passive recall, etc.) ──
-    hookTurnCount++;
-    const turnEndBootstrapReserve = runtime.bootstrapContext
-      ? estimateTokens(runtime.bootstrapContext)
-      : 0;
-    const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
+    // Notify the user about passive recall injections
+    if (hookResult.injected > 0) {
+      const recallEntries = ledger
+        .listEntries()
+        .filter((e) => e.source === 'passive-recall')
+        .slice(-hookResult.injected);
 
-    // ── Automatic clearing of consumed tool results (task 2cef5780) ──
-    // A tool result is read once, in the continuation that follows the call;
-    // afterwards it is a 500-char bookkeeping line that stays for the whole
-    // session. Results older than the protected recent turns are cleared at
-    // the turn boundary once they outgrow the threshold — the same persistent
-    // eviction every actor uses, so replay reproduces it, plus one tombstone.
-    // Thresholded because every eviction rolls the provider session; a small
-    // sweep is not worth a reseed. Never during a compaction, never on an
-    // aborted turn.
-    if (!isAbortedTurn && !compactionInFlight) {
-      const sweep = selectConsumedToolResults(ledger.listEntries(), {
-        keepRecentTurns: AUTO_EVICT_KEEP_RECENT_TURNS,
-        minTokens: Math.max(
-          AUTO_EVICT_MIN_TOKENS,
-          Math.floor(turnEndEffectiveBudget * AUTO_EVICT_MIN_SHARE)
-        ),
-      });
-      if (sweep) {
-        const removed = ledger.evictEntries(sweep.ids);
-        recordEviction(
-          'system',
-          `auto: ${sweep.ids.length} consumed tool results older than ${AUTO_EVICT_KEEP_RECENT_TURNS} turns`,
-          removed.removedTokens,
-          removed.removedEntries.map((e) => ({
-            ...(e.eid !== undefined ? { eid: e.eid } : {}),
-            hash: entryRefHash(e.role, e.content),
-            role: e.role,
-            source: e.source,
-            preview: e.content.slice(0, 100),
-          }))
-        );
-        // The tombstone is persisted as its own event so a reattached process
-        // gets the notice too — tool results are not reconstructed into the
-        // ledger on replay, and without this the gap had no explanation
-        // (Lumen, PR #584).
-        const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
-        const noteEid = runtime.log.append({
-          type: 'context_note',
-          source: AUTO_EVICT_TOMBSTONE_SOURCE,
-          content: tombstone,
-        });
-        ledger.addEntry(
-          'system',
-          tombstone,
-          AUTO_EVICT_TOMBSTONE_SOURCE,
-          typeof noteEid === 'number' ? noteEid : undefined
-        );
-        printEvent(
-          chalk.dim(
-            `  🗑 auto-cleared ${sweep.ids.length} consumed tool results (${formatTokenCount(removed.removedTokens)} tok) — ${sweep.tools.join(', ')}`
-          )
-        );
+      if (recallEntries.length > 0) {
+        const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+        if (inkRepl) {
+          const details = recallEntries.map((entry) => {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+          });
+          inkRepl.setSurfacedMemories(details);
+          printLine(
+            chalk.dim(
+              `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+            )
+          );
+        } else {
+          for (const entry of recallEntries) {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            printLine(
+              chalk.dim(
+                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+              )
+            );
+          }
+        }
       }
     }
-
-    hookRegistry
-      .fire('turn_end', {
-        ledger,
-        runtime: {
-          sessionId: runtime.sessionId,
-          sbSlug,
-          backend: runtime.backend,
-          budgetUtilization: turnContextOccupancy(ledger, runtime, providerContextMeasurement())
-            .utilization,
-          turnCount: hookTurnCount,
-        },
-        lastTurn: {
-          userInput: raw,
-          assistantResponse: assistantDisplayText,
-          turnIndex: hookTurnCount,
-        },
-      })
-      .then((hookResult) => {
-        // Persist hook-injected entries to transcript so they survive reattach
-        if (hookResult.injectedEntries.length > 0) {
-          for (const entry of hookResult.injectedEntries) {
-            runtime.log.append({
-              type: 'hook_injection',
-              role: entry.role,
-              content: entry.content,
-              source: entry.source,
-              memoryId: entry.memoryId,
-            });
-          }
-        }
-
-        // Notify the user about passive recall injections
-        if (hookResult.injected > 0) {
-          const recallEntries = ledger
-            .listEntries()
-            .filter((e) => e.source === 'passive-recall')
-            .slice(-hookResult.injected);
-
-          if (recallEntries.length > 0) {
-            const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
-            if (inkRepl) {
-              const details = recallEntries.map((entry) => {
-                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-                return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
-              });
-              inkRepl.setSurfacedMemories(details);
-              printLine(
-                chalk.dim(
-                  `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
-                )
-              );
-            } else {
-              for (const entry of recallEntries) {
-                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-                printLine(
-                  chalk.dim(
-                    `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
-                  )
-                );
-              }
-            }
-          }
-        }
-        if (hookResult.evicted > 0) {
-          printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
-        }
-      })
-      .catch(() => undefined); // never block the REPL
+    if (hookResult.evicted > 0) {
+      printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
+    }
 
     if (!runResult.success && !isAbortedTurn) {
       printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
