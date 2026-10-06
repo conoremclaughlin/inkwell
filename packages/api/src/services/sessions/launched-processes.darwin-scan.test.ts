@@ -89,7 +89,9 @@ describe('findTaggedProcesses on macOS', () => {
     expect(
       listings.selectors.filter((args) => args.includes('-p')).map((a) => a[a.indexOf('-p') + 1])
     ).toEqual(['201,203,207,202', '201,203,207,202']);
+    // 204's tag text sits later in its list: unresolved, never a match or an absence.
     expect(inventory.unreadable).toEqual([
+      { pid: 204, pgid: 204, command: '/x/claude --print' },
       { pid: 205, pgid: 205, command: '/x/agy chat' },
       { pid: 201, pgid: 201, command: '/x/codex resume abc' },
     ]);

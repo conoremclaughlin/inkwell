@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   configureLaunchRecording,
@@ -323,7 +323,10 @@ describe('reserveLaunch', () => {
   });
 });
 
-describe('launches found by their tag', () => {
+// Real process-table scans: two `ps -E` passes and a re-look on macOS, each
+// over every process of this user, which under a full parallel suite can
+// outlast vitest's 5 s per-test default.
+describe('launches found by their tag', { timeout: 30_000 }, () => {
   it('finds a launch by the id in its environment, and stops it, when its pid never reached the row', async () => {
     const child = startTagged({ INK_LAUNCH_ID: 'row-tagged' }, [], asClaude());
     await vi.waitFor(
@@ -371,7 +374,12 @@ describe('launches found by their tag', () => {
     const target = resolveSpawnTarget({
       binary: script,
       args: ['exec'],
-      env: { PATH: process.env.PATH ?? '', HOME: '/h', INK_LAUNCH_ID: 'row-wrapped' },
+      // The real node first: a PATH shim would put a shell in between (next test).
+      env: {
+        PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+        HOME: '/h',
+        INK_LAUNCH_ID: 'row-wrapped',
+      },
     });
     const child = spawn(target.binary, target.args, {
       stdio: 'ignore',
@@ -386,6 +394,39 @@ describe('launches found by their tag', () => {
       // A real process-table scan: two `ps -E` passes on macOS, slow under load.
       { timeout: 10_000 }
     );
+  });
+
+  it('stops or holds, never drops, a launch whose shell shim rebuilt its environment', async () => {
+    // As Yarn's PATH shims are: `#!/bin/sh` then exec node with the script. The
+    // shell rebuilds the environment in its own order, so on macOS the tag need
+    // not stay first; on Linux /proc reads it exactly either way.
+    const dir = mkdtempSync(join(tmpdir(), 'launch-shim-'));
+    fakeBackendDirs.push(dir);
+    writeFileSync(join(dir, 'codex.js'), 'setTimeout(() => {}, 30000);\n');
+    const shim = join(dir, 'codex');
+    writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, 'codex.js')}" "$@"\n`);
+    chmodSync(shim, 0o755);
+    const target = resolveSpawnTarget({
+      binary: shim,
+      args: ['exec'],
+      env: { PATH: '/usr/bin:/bin', HOME: '/h', INK_LAUNCH_ID: 'row-shimmed' },
+    });
+    const child = spawn(target.binary, target.args, {
+      stdio: 'ignore',
+      env: target.env as NodeJS.ProcessEnv,
+    });
+    children.push(child);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const { store, exitedIds } = fakeStore([
+      row({ id: 'row-shimmed', backend: 'codex-cli', pid: null }),
+    ]);
+    const outcome = await sweep(store);
+    expect([...outcome.stopped, ...outcome.uncertain].map((r) => r.pid)).toContain(child.pid);
+    expect(outcome.gone.map((r) => r.id)).not.toContain('row-shimmed');
+    // Held, its row stays open.
+    if (outcome.uncertain.some((r) => r.pid === child.pid)) {
+      expect(exitedIds).not.toContain('row-shimmed');
+    }
   });
 
   it('never matches the tag’s text inside another variable, even in a process named as the backend', async () => {

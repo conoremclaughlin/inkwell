@@ -212,7 +212,22 @@ export async function findTaggedProcesses(ids: Set<string>): Promise<ProcessInve
         inconsistent.set(pid, { pgid, command: args.command });
         continue;
       }
-      if (first.startsWith(prefix)) tag(first.slice(prefix.length), pid, pgid, args.command);
+      if (first.startsWith(prefix)) {
+        tag(first.slice(prefix.length), pid, pgid, args.command);
+        continue;
+      }
+      // A launch's text later in the list proves nothing either way. A shell
+      // or shim between the spawn and the process (`#!/bin/sh … exec node`,
+      // as Yarn's PATH shims are) rebuilds the environment in its own order,
+      // so the launch's own tag can land anywhere; another variable's value
+      // can also hold the text. Unresolved, then: held, never signalled on
+      // it, and never counted absent.
+      for (const id of ids) {
+        if (environment.includes(`${prefix}${id}`)) {
+          unresolved(pid, pgid, args.command);
+          break;
+        }
+      }
     }
     for (const [pid, args] of argsOf) {
       if (!seen.has(pid) && pid !== process.pid && args.command !== '<defunct>') {
