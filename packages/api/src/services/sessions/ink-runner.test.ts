@@ -74,6 +74,26 @@ describe('InkRunner', () => {
       expect(withoutRouting[defaultIdx + 1]).toBe('local');
     });
 
+    it('names the provider with --backend only when the caller chose one', () => {
+      const runner = new InkRunner();
+      const named = (runner as any).buildArgs('session-pv', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+        inkProvider: 'claude',
+      });
+      const idx = named.indexOf('--backend');
+      expect(idx).toBeGreaterThan(-1);
+      expect(named[idx + 1]).toBe('claude');
+      expect(named.filter((arg: string) => arg === '--backend')).toHaveLength(1);
+
+      // Every other spawn keeps the chat's own default, as before.
+      const unnamed = (runner as any).buildArgs('session-pv2', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+      });
+      expect(unnamed).not.toContain('--backend');
+    });
+
     it('includes --model when specified', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-789', {

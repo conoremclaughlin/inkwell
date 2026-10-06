@@ -174,6 +174,7 @@ export class ClaudeAdapter implements BackendAdapter {
       // only discovered when they can be used.
       skillServers: localRouting ? [] : await host.skillMcpServers(config.cwd),
       tempDir: host.paths.tempDir,
+      channelPluginCheckout: host.paths.channelPluginCheckout,
     });
     // The MCP config is the one file this adapter writes, so it is built
     // first and removed if anything after it fails: a prepare that rejects

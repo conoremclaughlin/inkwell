@@ -83,6 +83,7 @@ import { resetActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import type { Session, InjectedContext } from './types';
+import { inTurnNote } from '../inklings/inkling-reply-chain';
 
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -151,7 +152,8 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion
+       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion,
+       inTurnNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -453,6 +455,9 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = [], dFirst =
     triggerRetryScheduler: { cancelFor: vi.fn() },
     // The no-progress breaker's completion hook (T1): inert here.
     recordWakeSourceCompletion: vi.fn(async () => null),
+    // What a member of an inkling group answering in turn is told
+    // (inkling-reply-chain.ts): production, and silent for these wakes.
+    inTurnNote,
   });
 
   /** One delivery, through the handler production registers on the gateway. */

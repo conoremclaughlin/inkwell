@@ -49,6 +49,23 @@ describe('buildCleanEnv', () => {
 // from inside a runner). The child now starts from nothing and inherits exact
 // names only. Every value below is synthetic; the fixture is a shape, not a
 // copy of any deployment.
+describe('buildCleanEnv: the launch tag', () => {
+  it('puts the launch tag first, whatever else the env carries', () => {
+    const env = buildCleanEnv(
+      { HOME: '/h', INK_LAUNCH_ID: 'row-1', SB_SLUG: 'wren' },
+      { PATH: '/usr/bin', HOME: '/parent', LANG: 'C' }
+    );
+    expect(Object.keys(env)[0]).toBe('INK_LAUNCH_ID');
+    expect(env).toMatchObject({ INK_LAUNCH_ID: 'row-1', HOME: '/h', PATH: '/usr/bin' });
+  });
+
+  it('adds no tag when the spawner gave none', () => {
+    expect(Object.keys(buildCleanEnv({ HOME: '/h' }, { PATH: '/usr/bin' }))).not.toContain(
+      'INK_LAUNCH_ID'
+    );
+  });
+});
+
 describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
   const parent: Record<string, string> = {
     // Process basics a runtime needs.

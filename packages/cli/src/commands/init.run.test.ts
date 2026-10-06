@@ -28,6 +28,10 @@ import { detectWorktree, registerInitCommand, runInit, studioNameFromPath } from
 import type { StepResult } from '../lib/studio-complete.js';
 import type { StudioLookup } from '../lib/studio-lookup.js';
 
+// The CLI's own Inkwell checkout is the last inkmail plugin candidate (task
+// 5cabaeeb); none here, so a tmp repo resolves only what a test put on disk.
+vi.mock('../lib/ink-checkout.js', () => ({ inkCliMainWorktree: () => null }));
+
 let root: string;
 let main: string;
 let studio: string;

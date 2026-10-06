@@ -22,6 +22,8 @@ export interface BackendHost {
     readonly studiosRoot: string;
     /** Where per-spawn files (identity prompt, settings, MCP configs) are written. */
     readonly tempDir: string;
+    /** Trusted Inkwell main checkout for the channel plugin fallback; host-resolved. */
+    readonly channelPluginCheckout?: string;
   };
   /**
    * The run's absolute deadline (epoch ms), when the host admitted one.

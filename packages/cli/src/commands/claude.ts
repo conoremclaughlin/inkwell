@@ -34,7 +34,7 @@ import { sbDebugLog } from '../lib/sb-debug.js';
 import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import { formatCurrentWork } from '../lib/current-work.js';
-import { completeStudioAtLaunch } from '../lib/launch-studio.js';
+import { completeStudioAtLaunch, offerRootInitAtLaunch } from '../lib/launch-studio.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -2383,6 +2383,21 @@ function hasInkHookCommand(value: unknown): boolean {
   return false;
 }
 
+/**
+ * A person at the terminal to ask, and no script reading the output: every
+ * stream a TTY, and not listing session candidates for a picker.
+ */
+function canAskAtLaunch(options: {
+  sessionCandidates?: boolean;
+  sessionCandidatesJson?: boolean;
+}): boolean {
+  return (
+    Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY) &&
+    !options.sessionCandidates &&
+    !options.sessionCandidatesJson
+  );
+}
+
 function getHookHealthForBackend(
   backend: string,
   cwd = process.cwd()
@@ -3983,6 +3998,8 @@ export async function runClaude(
   // studio is completed with its row's owner, so the hooks that follow book
   // this session to the right studio (task 2841c7a9).
   await completeStudioAtLaunch(process.cwd(), sbSlug);
+  // A main worktree ink was never set up in: ask, then ink init (task 5cabaeeb).
+  await offerRootInitAtLaunch(process.cwd(), sbSlug, { interactive: canAskAtLaunch(options) });
   const sessionContext = options.session
     ? await ensureInkSessionContext(
         sbSlug,
@@ -4240,6 +4257,7 @@ export async function runClaudeInteractive(
   // As in runClaude: the checklist first, so the session lands in a studio
   // that knows its owner (task 2841c7a9).
   await completeStudioAtLaunch(process.cwd(), sbSlug);
+  await offerRootInitAtLaunch(process.cwd(), sbSlug, { interactive: canAskAtLaunch(options) });
   const sessionContext = options.session
     ? await ensureInkSessionContext(sbSlug, options.backend, passthroughArgs, options.verbose, [], {
         listCandidates: options.sessionCandidates || options.sessionCandidatesJson,

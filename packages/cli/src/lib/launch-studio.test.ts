@@ -14,8 +14,10 @@ import type { CompleteStudioReport } from './studio-complete.js';
 import {
   completeStudioForLaunch,
   describeLaunchStudioResult,
+  offerRootInitAtLaunch,
   type LaunchStudioDeps,
   type LaunchStudioLookup,
+  type RootInitDeps,
 } from './launch-studio.js';
 
 /** The server's get_studio, for the tests that use the default lookup. */
@@ -256,5 +258,84 @@ describe('completeStudioForLaunch', () => {
     expect(describeLaunchStudioResult(result)).toEqual([
       'Studio completed for lumen: created identity, hooks (gemini); updated hooks (claude-code)',
     ]);
+  });
+});
+
+describe('offerRootInitAtLaunch — a main worktree ink was never set up in (task 5cabaeeb)', () => {
+  let repo: string;
+  let stderr: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    repo = join(root, 'repo');
+    mkdirSync(repo);
+    stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    stderr.mockRestore();
+  });
+
+  const rootDeps = (overrides: Partial<RootInitDeps> = {}) => ({
+    placement: main,
+    confirm: vi.fn(async () => true),
+    runInit: vi.fn(async () => report(true)),
+    ...overrides,
+  });
+  const printed = () => stderr.mock.calls.map((call: unknown[]) => String(call[0])).join('\n');
+
+  it('an incomplete root asks, and on a yes runs ink init there for the launching SB', async () => {
+    const confirm = vi.fn(async (_question: string) => true);
+    const d = rootDeps({ confirm });
+    const result = await offerRootInitAtLaunch(repo, 'wren', { interactive: true }, d);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0][0]).toContain('Run ink init now? [Y/n]');
+    expect(confirm.mock.calls[0][0]).toContain('.mcp.json');
+    expect(d.runInit).toHaveBeenCalledWith(repo, { agent: 'wren' });
+    expect(result).toMatchObject({ offered: true, ran: true });
+    expect(result.missingBefore).toContain('mcp-json');
+  });
+
+  it('a no leaves every file alone and names the repair', async () => {
+    const d = rootDeps({ confirm: vi.fn(async () => false) });
+    const result = await offerRootInitAtLaunch(repo, 'wren', { interactive: true }, d);
+    expect(d.runInit).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ offered: true, ran: false });
+    expect(printed()).toContain('Run ink init in');
+  });
+
+  it('with no one to ask it warns and changes nothing', async () => {
+    const d = rootDeps();
+    const result = await offerRootInitAtLaunch(repo, 'wren', { interactive: false }, d);
+    expect(d.confirm).not.toHaveBeenCalled();
+    expect(d.runInit).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ offered: false, ran: false });
+    expect(printed()).toContain('Run: ink init');
+  });
+
+  it('a complete root is not asked about', async () => {
+    seedComplete(repo);
+    expect(auditStudio(repo, { linked: false }).complete).toBe(true);
+    const d = rootDeps();
+    const result = await offerRootInitAtLaunch(repo, 'wren', { interactive: true }, d);
+    expect(result).toEqual({ offered: false, ran: false });
+    expect(d.confirm).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('a linked worktree is left to the studio routine', async () => {
+    const d = rootDeps({ placement: linked });
+    const result = await offerRootInitAtLaunch(studio, 'wren', { interactive: true }, d);
+    expect(result).toEqual({ offered: false, ran: false });
+    expect(d.confirm).not.toHaveBeenCalled();
+  });
+
+  it('a failed ink init does not refuse the launch', async () => {
+    const d = rootDeps({
+      runInit: vi.fn(async () => {
+        throw new Error('disk full');
+      }),
+    });
+    await expect(
+      offerRootInitAtLaunch(repo, 'wren', { interactive: true }, d)
+    ).resolves.toMatchObject({ ran: false });
+    expect(printed()).toContain('Run: ink init');
   });
 });

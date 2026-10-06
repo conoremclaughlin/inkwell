@@ -125,8 +125,11 @@ export function discoverSkillMcpServers(cwd: string): SkillMcpServer[] {
  * the generator and the withholding boundary can never disagree about what
  * the plugin IS. Returns null when no candidate exists.
  */
-export function resolveChannelPluginPath(cwd: string): string | null {
-  for (const p of channelPluginCandidates(cwd)) {
+export function resolveChannelPluginPath(
+  cwd: string,
+  channelPluginCheckout?: string
+): string | null {
+  for (const p of channelPluginCandidates(cwd, channelPluginCheckout)) {
     if (existsSync(p)) return p;
   }
   return null;

@@ -38,16 +38,22 @@ interface McpJsonConfig {
  * Shared with the synchronous resolver `ink init` uses (skill-servers.ts), so
  * the generator and the withholding boundary agree on what the plugin IS.
  */
-export function channelPluginCandidates(cwd: string): string[] {
+export function channelPluginCandidates(cwd: string, channelPluginCheckout?: string): string[] {
   return [
     join(cwd, 'packages', 'channel-plugin', 'index.ts'),
     join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+    ...(channelPluginCheckout
+      ? [join(channelPluginCheckout, 'packages', 'channel-plugin', 'index.ts')]
+      : []),
   ];
 }
 
 /** The channel plugin's entrypoint on disk, found without blocking, or null. */
-async function findChannelPluginPath(cwd: string): Promise<string | null> {
-  for (const p of channelPluginCandidates(cwd)) {
+async function findChannelPluginPath(
+  cwd: string,
+  channelPluginCheckout?: string
+): Promise<string | null> {
+  for (const p of channelPluginCandidates(cwd, channelPluginCheckout)) {
     const found = await stat(p).then(
       () => true,
       () => false
@@ -136,6 +142,8 @@ export async function buildMergedMcpConfig(
     inkSessionId?: string;
     studioId?: string;
     omitToolServers?: boolean;
+    /** Optional trusted checkout supplied by the host, never a project entry. */
+    channelPluginCheckout?: string;
     /**
      * The caller named the session and studio, possibly as none: drop any
      * session, studio or context header the project config carries, so the
@@ -204,7 +212,7 @@ export async function buildMergedMcpConfig(
     // (Lumen, PR #462 review 4894572540). No resolvable plugin on disk → no
     // bridge; fail closed costs inbox push, never the boundary.
     if (parsed?.mcpServers?.['inkmail']) {
-      const pluginPath = await findChannelPluginPath(cwd);
+      const pluginPath = await findChannelPluginPath(cwd, options.channelPluginCheckout);
       if (pluginPath) {
         config.mcpServers['inkmail'] = { type: 'stdio', command: 'npx', args: ['tsx', pluginPath] };
       }

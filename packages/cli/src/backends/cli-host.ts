@@ -13,6 +13,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { sessionEnvHandoff } from '@inklabs/shared';
 import { discoverSkillMcpServers, type BackendHost } from '@inklabs/shared/providers';
+import { inkCliMainWorktree } from '../lib/ink-checkout.js';
 import { getInkServerUrl } from '../lib/ink-mcp.js';
 
 /**
@@ -37,6 +38,9 @@ export function createCliBackendHost(): BackendHost {
   return {
     // Read when asked, as the adapters read them, not when the host is made.
     paths: {
+      get channelPluginCheckout() {
+        return inkCliMainWorktree() ?? undefined;
+      },
       get inkFiles() {
         return join(homedir(), '.ink', 'files');
       },

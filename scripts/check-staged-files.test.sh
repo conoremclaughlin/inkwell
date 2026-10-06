@@ -471,6 +471,26 @@ stage "$r" .mailmap "CANARYPERSON <x@example.com>"
 out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 0 ] && ok ".mailmap is exempt from the marker arm" || bad ".mailmap is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
+# The emoji catalog's generated search data, and that one file only, is exempt
+# from the marker arm alone.
+cat_dir=packages/shared/src/stories/reaction-picking
+r=$(new_repo scan-marker-catalog "$nohooks")
+stage "$r" "$cat_dir/search.generated.ts" '["a name", "canaryperson|keyword"],'
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "the catalog's generated search data is exempt from the marker arm" || bad "the catalog's generated search data is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-marker-catalog-address "$nohooks")
+stage "$r" "$cat_dir/search.generated.ts" "// person@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "the address arm still reads the catalog's generated search data" || bad "the address arm still reads the catalog's generated search data" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+for near in "$cat_dir/search.ts" "$cat_dir/parity-manifest.generated.ts" packages/shared/src/stories/reacting/validation.generated.ts packages/shared/src/stories/other/search.generated.ts "$cat_dir/deeper/search.generated.ts" "vendor/$cat_dir/search.generated.ts" "$cat_dir/search.generated.tsx"; do
+  r=$(new_repo "scan-marker-catalog-near-$(printf '%s' "$near" | tr '/.' '--')" "$nohooks")
+  stage "$r" "$near" 'mentions canaryperson'
+  out=$(run_index "$r"); rc=$?
+  [ "$rc" -eq 1 ] && ok "a marker is still refused in $near" || bad "a marker is still refused in $near" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+done
+
 r=$(new_repo scan-marker-missing "$nohooks")
 stage "$r" src/x.ts 'clean'
 out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/does-not-exist" sh "$guard" 2>&1); rc=$?
