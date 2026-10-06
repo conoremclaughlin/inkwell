@@ -22,6 +22,37 @@ function session(callRecall = vi.fn(async () => [memory('shared-id')]), cooldown
 }
 
 describe('built-in hooks: actual implementation, fake recall only', () => {
+  it('does not spend recall dedup/cooldown state on an abandoned late result', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const recall = vi.fn(async () => [memory('shared-id')]);
+    recall.mockImplementationOnce(async () => {
+      entered();
+      await gate;
+      return [memory('shared-id')];
+    });
+    const h = session(recall);
+    const abort = new AbortController();
+    const running = h.hooks.fire('turn_end', { ...h.ctx, signal: abort.signal });
+    await started;
+    abort.abort();
+    expect((await running).interrupted).toBe(true);
+    release();
+    await gate;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.passiveRecall.getStats().uniqueMemories).toBe(0);
+    expect(h.passiveRecall.getStats().totalInjected).toBe(0);
+    const next = await h.hooks.fire('prompt_build', h.ctx);
+    expect(next.injectedEntries.map((e) => e.memoryId)).toEqual(['shared-id']);
+  });
+
   it('one pending recall does not block or inject into another session', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {

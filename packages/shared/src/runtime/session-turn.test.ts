@@ -290,6 +290,8 @@ describe('SessionTurnCoordinator', () => {
 
   it('records cancellation without adding partial output to assistant context', async () => {
     const h = harness();
+    const end = vi.fn(async () => {});
+    h.hooks.register({ name: 'recall', event: 'turn_end', handler: end });
     await h.coordinator.run({ raw: 'hi', source: 'user' }, async () =>
       outcome({ stopReason: 'aborted', success: false })
     );
@@ -301,7 +303,64 @@ describe('SessionTurnCoordinator', () => {
       content: null,
     });
     expect(h.coordinator.turnCount).toBe(1);
+    expect(end).not.toHaveBeenCalled();
   });
+
+  it('notifies a persisted reply before bounded end hooks; drops late injection and eviction', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const coordinator = new SessionTurnCoordinator({ ...h.ports, endHookTimeoutMs: 50 });
+    const release = deferred();
+    const started = deferred();
+    const target = h.ledger.addEntry('system', 'keep me', 'fixture');
+    h.hooks.register({
+      name: 'late',
+      event: 'turn_end',
+      handler: async () => {
+        started.resolve();
+        await release.promise;
+        return {
+          inject: [{ role: 'system', content: 'late', source: 'fixture' }],
+          evict: [target.id],
+        };
+      },
+    });
+    const notify = vi.fn(() => {
+      expect(h.events.at(-1)).toMatchObject({ type: 'assistant', content: 'reply' });
+    });
+    try {
+      const running = coordinator.run({ raw: 'hi', source: 'user' }, async () => outcome(), notify);
+      await started.promise;
+      expect(notify).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(50);
+      expect((await running)?.endHooks.interrupted).toBe(true);
+      expect(h.events.at(-1)).toMatchObject({
+        type: 'hook_timeout',
+        event: 'turn_end',
+        timeoutMs: 50,
+      });
+      const before = h.events.length;
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.events).toHaveLength(before);
+      expect(h.ledger.listEntries().map((e) => e.content)).toContain('keep me');
+      expect(h.ledger.listEntries().map((e) => e.content)).not.toContain('late');
+      h.hooks.unregister('late');
+      await coordinator.run({ raw: 'next', source: 'user' }, async () => outcome());
+    } finally {
+      release.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([0, -1, Infinity, NaN, 0.5, 60_001])(
+    'refuses an unbounded/invalid end-hook budget %s',
+    (ms) => {
+      expect(
+        () => new SessionTurnCoordinator({ ...harness().ports, endHookTimeoutMs: ms })
+      ).toThrow(RangeError);
+    }
+  );
 
   it('preserves failed-backend transcript metadata without turning it into success', async () => {
     const h = harness();

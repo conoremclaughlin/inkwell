@@ -29,6 +29,8 @@ export type SbHookEvent =
 
 export interface HookContext {
   event: SbHookEvent;
+  /** Cancel async work where possible. Return mutations; do not mutate the ledger after cancellation. */
+  signal?: AbortSignal;
   ledger: ContextLedger;
   runtime: HookRuntimeState;
   /** Last turn content — available on on-turn-end, on-prompt */
@@ -85,6 +87,34 @@ const BLOCKING_EVENTS: ReadonlySet<SbHookEvent> = new Set<SbHookEvent>(['tool_pr
 
 /** Supplied by the host; diagnostic failure must not change hook semantics. */
 export type HookErrorReporter = (hook: string, event: SbHookEvent, error: unknown) => void;
+
+/** A late handler result is observed, but cannot resume this fire's application path. */
+function awaitHook(
+  handler: () => Promise<HookResult | void>,
+  signal?: AbortSignal
+): Promise<HookResult | void> {
+  if (!signal) return handler();
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const stop = () => {
+      signal.removeEventListener('abort', stop);
+      resolve();
+    };
+    signal.addEventListener('abort', stop, { once: true });
+    Promise.resolve()
+      .then(() => (signal.aborted ? undefined : handler()))
+      .then(
+        (result) => {
+          signal.removeEventListener('abort', stop);
+          resolve(result);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', stop);
+          reject(error);
+        }
+      );
+  });
+}
 
 // ─── Registry ───────────────────────────────────────────────────
 
@@ -146,6 +176,7 @@ export class SbHookRegistry {
     evicted: number;
     blocked: boolean;
     blockReason?: string;
+    interrupted?: boolean;
   }> {
     const eventHooks = this.hooks.filter((h) => h.event === event);
     if (eventHooks.length === 0) {
@@ -158,8 +189,10 @@ export class SbHookRegistry {
     const allInjected: InjectedLedgerEntry[] = [];
 
     for (const hook of eventHooks) {
+      if (ctx.signal?.aborted) break;
       try {
-        const result = await hook.handler(fullCtx);
+        const result = await awaitHook(() => hook.handler(fullCtx), ctx.signal);
+        if (ctx.signal?.aborted) break;
         this._fireLog.push({
           event,
           hookName: hook.name,
@@ -209,6 +242,7 @@ export class SbHookRegistry {
       injectedEntries: allInjected,
       evicted: totalEvicted,
       blocked: false,
+      ...(ctx.signal?.aborted ? { interrupted: true } : {}),
     };
   }
 }

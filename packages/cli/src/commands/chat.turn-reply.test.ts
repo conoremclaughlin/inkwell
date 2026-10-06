@@ -301,7 +301,8 @@ describe('spawned ink chat: per-turn replies', () => {
       await atHook;
       await vi.advanceTimersByTimeAsync(100);
       expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
-      expect(turnReplies()).toEqual([]);
+      expect(turnReplies()).toHaveLength(1);
+      expect(turnReplies()[0]).toMatchObject({ text: SCRIPTED_TURNS[0], turn: 1 });
     } finally {
       release();
       await running;
@@ -352,6 +353,59 @@ describe('spawned ink chat: per-turn replies', () => {
     const result = lines.find((line) => line.type === 'result');
     expect(result?.turnsCompleted).toBe(3);
     expect(lines.indexOf(result!)).toBeGreaterThan(lines.indexOf(replies[2]!));
+  });
+
+  it('finishes after the hook budget without applying a late result after shutdown', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const atHook = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fire = SbHookRegistry.prototype.fire;
+    const spy = vi.spyOn(SbHookRegistry.prototype, 'fire').mockImplementation(function (
+      this: SbHookRegistry,
+      event,
+      context
+    ) {
+      if (event === 'turn_end') {
+        this.register({
+          name: 'hung recall fixture',
+          event: 'turn_end',
+          handler: async () => {
+            entered();
+            await gate;
+            return { inject: [{ role: 'system', content: 'too late', source: 'fixture' }] };
+          },
+        });
+      }
+      return fire.call(this, event, context);
+    });
+    const running = runThreeTurns({ maxTurns: '1' });
+    try {
+      await atHook;
+      expect(turnReplies()).toHaveLength(1);
+      expect(jsonLines().some((e) => e.type === 'result')).toBe(false);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await running;
+      expect(jsonLines().some((e) => e.type === 'result')).toBe(true);
+      const dir = join(testCwd, '.ink', 'runtime', 'repl');
+      const path = join(dir, readdirSync(dir)[0]!);
+      const before = readFileSync(path, 'utf8');
+      expect(before).toContain('"type":"hook_timeout"');
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+    } finally {
+      release();
+      try {
+        await running;
+      } finally {
+        spy.mockRestore();
+      }
+    }
   });
 
   it('prints nothing per turn when the server did not mint a token', async () => {

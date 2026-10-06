@@ -31,6 +31,7 @@ import {
   SerialInputDrain,
   SessionTurnCoordinator,
   type PreparedSessionTurn,
+  type SessionTurnExecution,
   InputDrainRefusal,
   EVICTED_DISPLAY_MAX,
   extractSessionContextMessages,
@@ -6641,6 +6642,58 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return { loop: loopResult, backend: lastRunResult, value: { turnDurationSeconds } };
   };
 
+  const presentUserTurn = (
+    execution: SessionTurnExecution<{ turnDurationSeconds: number }>,
+    onReplyReady?: () => void
+  ) => {
+    const { loop: loopResult, backend: runResult } = execution;
+    const { turnDurationSeconds } = execution.value;
+    const isAbortedTurn = loopResult.stopReason === 'aborted';
+    const assistantDisplayText = loopResult.assistantDisplayText;
+    if (!isAbortedTurn) {
+      // A failed backend's partial output is not a reply.
+      lastTurnAssistantText = loopResult.success ? assistantDisplayText : null;
+    }
+    if (!runResult.success && !isAbortedTurn) {
+      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+      if (runResult.stderr) {
+        printLine(chalk.dim(runResult.stderr));
+      }
+    }
+
+    if (inkRepl) {
+      if (!isAbortedTurn) {
+        const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
+        const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
+        // When the final text already streamed live (it equals the last
+        // completed assistant MESSAGE, modulo local-tool stripping), don't
+        // print the body twice — close the turn with a compact meta line.
+        if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
+          inkRepl.printEvent(`✔ ${sbSlug} · ${trailingParts}`);
+        } else {
+          inkRepl.addMessage('assistant', assistantDisplayText, {
+            label: sbSlug,
+            trailingMeta: trailingParts,
+          });
+        }
+      }
+    } else if (!isAbortedTurn) {
+      printLine('');
+      printLine(
+        renderMessageLine('assistant', assistantDisplayText, {
+          label: sbSlug,
+          timezone: runtime.userTimezone,
+          trailingMeta: `${turnDurationSeconds}s`,
+        })
+      );
+      if (runResult.usage) {
+        printLine(chalk.dim(`    ↳ ${formatBackendTokenUsage(runResult.usage)}`));
+      }
+      printLine('');
+    }
+    onReplyReady?.();
+  };
+
   const turnCoordinator = new SessionTurnCoordinator({
     ledger,
     hooks: hookRegistry,
@@ -6678,7 +6731,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runUserTurn = async (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
-    displayLabel?: string
+    displayLabel?: string,
+    onReplyReady?: () => void
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
@@ -6696,19 +6750,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     pendingTurnMedia = [];
     // Display echo stays at submit time. The shared coordinator sequences
     // context/log writes, compaction and recall with the actual execution.
-    const coordinated = await turnCoordinator.run({ raw, source, displayLabel }, (prepared) =>
-      executeUserTurn(raw, turnMedia, prepared)
+    const coordinated = await turnCoordinator.run(
+      { raw, source, displayLabel },
+      (prepared) => executeUserTurn(raw, turnMedia, prepared),
+      (execution) => presentUserTurn(execution, onReplyReady)
     );
     if (!coordinated) return;
-    const { execution, endHooks: hookResult, autoEviction } = coordinated;
-    const { loop: loopResult, backend: runResult } = execution;
-    const { turnDurationSeconds } = execution.value;
-    const isAbortedTurn = loopResult.stopReason === 'aborted';
-    const assistantDisplayText = loopResult.assistantDisplayText;
-    if (!isAbortedTurn) {
-      // A failed backend's partial output is not a reply.
-      lastTurnAssistantText = loopResult.success ? assistantDisplayText : null;
-    }
+    const { endHooks: hookResult, autoEviction } = coordinated;
     if (autoEviction) {
       printEvent(
         chalk.dim(
@@ -6751,44 +6799,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     if (hookResult.evicted > 0) {
       printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
-    }
-
-    if (!runResult.success && !isAbortedTurn) {
-      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
-      if (runResult.stderr) {
-        printLine(chalk.dim(runResult.stderr));
-      }
-    }
-
-    if (inkRepl) {
-      if (!isAbortedTurn) {
-        const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
-        const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-        // When the final text already streamed live (it equals the last
-        // completed assistant MESSAGE, modulo local-tool stripping), don't
-        // print the body twice — close the turn with a compact meta line.
-        if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
-          inkRepl.printEvent(`✔ ${sbSlug} · ${trailingParts}`);
-        } else {
-          inkRepl.addMessage('assistant', assistantDisplayText, {
-            label: sbSlug,
-            trailingMeta: trailingParts,
-          });
-        }
-      }
-    } else if (!isAbortedTurn) {
-      printLine('');
-      printLine(
-        renderMessageLine('assistant', assistantDisplayText, {
-          label: sbSlug,
-          timezone: runtime.userTimezone,
-          trailingMeta: `${turnDurationSeconds}s`,
-        })
-      );
-      if (runResult.usage) {
-        printLine(chalk.dim(`    ↳ ${formatBackendTokenUsage(runResult.usage)}`));
-      }
-      printLine('');
     }
   };
 
@@ -6847,6 +6857,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     raw: string;
     source: 'user' | 'inbox-auto' | 'system';
     displayLabel?: string;
+    onReplyReady?: () => void;
   }>({
     maxPendingInputs: 128,
     maxPendingBytes: 8 * 1024 * 1024,
@@ -6854,7 +6865,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       Buffer.byteLength(raw, 'utf8') +
       Buffer.byteLength(source, 'utf8') +
       Buffer.byteLength(displayLabel ?? '', 'utf8'),
-    run: async ({ raw, source, displayLabel }) => {
+    run: async ({ raw, source, displayLabel, onReplyReady }) => {
       if (inkRepl) {
         inkRepl.setWaiting(true, runtime.backend);
       } else {
@@ -6874,7 +6885,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           printLine(chalk.red(`Turn not started: ${gate.reason}`));
           return;
         }
-        await runUserTurn(raw, source, displayLabel);
+        await runUserTurn(raw, source, displayLabel, onReplyReady);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
@@ -6894,9 +6905,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const enqueueTurn = (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
-    displayLabel?: string
+    displayLabel?: string,
+    onReplyReady?: () => void
   ): Promise<void> =>
-    inputDrain.enqueue({ raw, source, displayLabel }, () => {
+    inputDrain.enqueue({ raw, source, displayLabel, onReplyReady }, () => {
       // Echo at SUBMIT time, not when the queue reaches the turn — a message
       // typed while another turn is in flight must not vanish until its turn
       // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
@@ -7072,19 +7084,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
       lastTurnAssistantText = null;
       turnSends = [];
       pendingBackendSends.clear();
-      await enqueueTurn(raw, source, label);
-      if (!turnReplyToken) return;
-      console.log(
-        JSON.stringify(
-          turnReplyEvent({
-            turn,
-            label: label || 'user',
-            assistantText: lastTurnAssistantText,
-            sends: turnSends,
-            token: turnReplyToken,
-          })
-        )
-      );
+      let reported = false;
+      const report = () => {
+        if (reported || !turnReplyToken) return;
+        reported = true;
+        console.log(
+          JSON.stringify(
+            turnReplyEvent({
+              turn,
+              label: label || 'user',
+              assistantText: lastTurnAssistantText,
+              sends: turnSends,
+              token: turnReplyToken,
+            })
+          )
+        );
+      };
+      await enqueueTurn(raw, source, label, report);
+      // Preserve the existing empty/error receipt when no assistant outcome
+      // reached the committed callback. Never duplicate a successfully sent one.
+      report();
     };
     const repliesForwarded = Boolean(turnReplyToken);
     sessionSignal.clear();

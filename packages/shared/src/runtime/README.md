@@ -211,19 +211,28 @@ hook, log, state, occupancy, compaction and eviction ports. Native-session
 invalidation still goes through the host's existing persistent eviction path.
 It has no process globals, filesystem defaults or network client.
 
-Turn-end hooks now finish before the next ordinary input or one-shot shutdown.
+Turn-end hooks now finish before the next ordinary input or one-shot shutdown,
+with a finite whole-event budget (5 seconds by default, at most 60 seconds).
 Previously their unawaited recall could inject into the next prompt or append
-after the transcript closed. Hook handler failures remain isolated by the
-registry; log failures propagate. Log flush is awaited before execution and
-before reporting completion. This observes the existing SessionLog's write
+after the transcript closed. Assistant entries flush and notify the host before
+this tail, so recall does not delay the reply. Aborted turns skip end hooks.
+The registry abandons late hook results on cancellation; built-in recall also
+leaves its dedup/cooldown state unchanged when its late read returns. Hooks
+must return mutations, not mutate the ledger or perform effects after cancellation.
+An ignored signal cannot stop arbitrary third-party work, only its result application.
+Timeout is recorded in the log; the next input can then proceed. Hook handler
+failures remain isolated by the registry; log failures propagate. Log flush is
+awaited before execution, reply notification and completion. This observes the existing SessionLog's write
 promise, not fsync, a transaction, cross-process exclusion or recovery.
 
 Each instance serves one session and refuses overlapping runs; the host still
 owns its FIFO and admission. Execution, errors and cancellation do not manufacture
 a completed assistant response. Separate instances can run concurrently.
 
-This extraction is not yet the complete hosted session entry. Bootstrap, prompt
-assembly, provider continuity, tool policy, media, live controls, cancellation
+Prompt/identity/skill rendering, measured occupancy and continuation/reseed
+policy now live in `session-prompt.ts`; the CLI supplies its instruction catalog.
+This extraction is not yet the complete hosted session entry. Bootstrap calls,
+provider orchestration, tool policy, media, live controls, cancellation
 and rendering still have host composition in `runChat`. Both hosts must bind
 that same extracted composition before claiming API parity; a bare call to
 `runAgentLoop` with fresh context is not an equivalent implementation.

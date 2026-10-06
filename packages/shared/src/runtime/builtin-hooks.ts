@@ -128,7 +128,7 @@ export function registerPassiveRecallHook(
 
   // Shared recall logic used by both prompt_build and turn_end hooks
   const doRecall = async (ctx: HookContext): Promise<HookResult | void> => {
-    if (!cfg.enabled) return;
+    if (!cfg.enabled || ctx.signal?.aborted) return;
 
     // Budget ceiling
     if ((ctx.runtime.budgetUtilization ?? 0) > cfg.budgetCeiling) {
@@ -157,6 +157,10 @@ export function registerPassiveRecallHook(
       // Fail silently — never block the REPL
       return;
     }
+
+    // A bounded hook may have been abandoned while recall was in flight.
+    // Its result must not consume cooldown/dedup state for the next turn.
+    if (ctx.signal?.aborted) return;
 
     // Reset cooldown after every recall attempt, not just successful injection.
     // Without this, once all memories are injected the cooldown stays expired

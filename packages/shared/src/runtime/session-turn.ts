@@ -62,6 +62,8 @@ export interface SessionTurnResult<T> {
 }
 
 export interface SessionTurnPorts {
+  /** Finite whole-event budget. Default 5 seconds; the host may choose a smaller deadline. */
+  endHookTimeoutMs?: number;
   ledger: ContextLedger;
   hooks: SbHookRegistry;
   /** Append reserves an eid; flush confirms queued writes. Not a DB transaction. */
@@ -93,7 +95,15 @@ export class SessionTurnCoordinator {
   private running = false;
   private completedTurns = 0;
 
-  constructor(private readonly ports: SessionTurnPorts) {}
+  constructor(private readonly ports: SessionTurnPorts) {
+    const ms = ports.endHookTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(ms) || ms < 1 || ms > 60_000) {
+      throw new RangeError('End-hook timeout must be an integer from 1 to 60000 ms');
+    }
+    this.endHookTimeoutMs = ms;
+  }
+
+  private readonly endHookTimeoutMs: number;
 
   get turnCount(): number {
     return this.completedTurns;
@@ -101,7 +111,9 @@ export class SessionTurnCoordinator {
 
   async run<T>(
     submitted: SessionTurnInput,
-    execute: (turn: PreparedSessionTurn) => Promise<SessionTurnExecution<T>>
+    execute: (turn: PreparedSessionTurn) => Promise<SessionTurnExecution<T>>,
+    /** Committed assistant outcome, before the bounded recall tail. Not the turn's completion. */
+    onOutcome?: (execution: SessionTurnExecution<T>) => void
   ): Promise<SessionTurnResult<T> | undefined> {
     if (this.running) throw new Error('Session turn already running');
     if (!submitted.raw.trim()) return undefined;
@@ -141,17 +153,41 @@ export class SessionTurnCoordinator {
         });
       }
       this.completedTurns++;
+      await this.ports.log.flush();
+      onOutcome?.(execution);
       const autoEviction =
         !aborted && !state.compactionInFlight ? this.evictConsumed(state) : undefined;
       // Previously fire-and-forget in runChat: a slow recall could inject into
       // the NEXT prompt, or append after one-shot shutdown closed the log.
       // Hook handlers isolate their own errors; persistence failures do not.
-      const endHooks = await this.fireHooks(
-        'turn_end',
-        input.raw,
-        loop.assistantDisplayText,
-        this.ports.occupancy()
-      );
+      let endHooks: SessionHookResult = {
+        injected: 0,
+        injectedEntries: [],
+        evicted: 0,
+        blocked: false,
+      };
+      if (!aborted) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.endHookTimeoutMs);
+        try {
+          endHooks = await this.fireHooks(
+            'turn_end',
+            input.raw,
+            loop.assistantDisplayText,
+            this.ports.occupancy(),
+            controller.signal
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        if (endHooks.interrupted) {
+          this.ports.log.append({
+            type: 'hook_timeout',
+            event: 'turn_end',
+            timeoutMs: this.endHookTimeoutMs,
+          });
+        }
+      }
       await this.ports.log.flush();
       return { execution, endHooks, autoEviction };
     } finally {
@@ -178,11 +214,13 @@ export class SessionTurnCoordinator {
     event: 'prompt_build' | 'turn_end',
     userInput: string,
     assistantResponse: string,
-    occupancy: ContextOccupancy
+    occupancy: ContextOccupancy,
+    signal?: AbortSignal
   ): Promise<SessionHookResult> {
     const state = this.ports.state();
     const result = await this.ports.hooks.fire(event, {
       ledger: this.ports.ledger,
+      signal,
       runtime: {
         sessionId: state.sessionId,
         sbSlug: state.sbSlug,
