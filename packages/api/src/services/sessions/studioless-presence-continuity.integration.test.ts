@@ -35,6 +35,7 @@ import { resetPendingFinalizations } from './finalize-turn.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import type { IContextBuilder, IRunner } from './types';
 import type { IActivityStream } from './session-service';
+import { inTurnNote } from '../inklings/inkling-reply-chain';
 
 vi.mock('./claude-runner.js', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
@@ -84,7 +85,8 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope
+       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
+       inTurnNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -268,6 +270,9 @@ describe('a pinned presence thread keeps one session (integration, task bd4657a0
       triggerRetryScheduler: { cancelFor: vi.fn() },
       // The no-progress breaker's completion hook (T1): inert here.
       recordWakeSourceCompletion: vi.fn(async () => null),
+      // What a member of an inkling group answering in turn is told
+      // (inkling-reply-chain.ts): production, and silent for these wakes.
+      inTurnNote,
     });
   });
 

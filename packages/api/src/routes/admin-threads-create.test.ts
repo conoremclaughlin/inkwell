@@ -57,6 +57,8 @@ vi.mock('../utils/request-context', () => ({
 }));
 
 import router from './admin';
+import { getDataComposer } from '../data/composer';
+import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 
@@ -155,6 +157,15 @@ describe('POST /threads', () => {
 
   it('starts a new thread: human sender, title as subject, every recipient woken', async () => {
     mockThreadLookup(null);
+    // The route's first await, to place its arrival ticket before it.
+    const composer = vi.mocked(getDataComposer);
+    const original = composer.getMockImplementation()!;
+    let atFirstAwait: number | undefined;
+    composer.mockImplementationOnce((...args) => {
+      atFirstAwait ??= takeReplyTicket();
+      return original(...args);
+    });
+    const before = takeReplyTicket();
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: true, messageId: 'msg-1', threadId: 'thread-new' })
     );
@@ -194,9 +205,16 @@ describe('POST /threads', () => {
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
     // The person and the workspace they act in are server-side context, not
     // tool args (spec inkmail-thread-scope §3, §6).
+    // With nobody named, a group of inklings answers in turn; the handler
+    // applies it only to an inkling conversation (inkling-reply-chain.ts).
+    // It carries the ticket the route took on arrival, before any await.
     expect(mockHandleSendToInbox.mock.calls[0][2]).toEqual({
       sender: { principal: { kind: 'user', userId: 'user-1' }, workspaceId: 'ws-1' },
+      inklingGroup: { inTurn: true, ticket: expect.any(Number) },
     });
+    const { ticket } = mockHandleSendToInbox.mock.calls[0][2].inklingGroup;
+    expect(ticket).toBeGreaterThan(before);
+    expect(ticket).toBeLessThan(atFirstAwait!);
   });
 
   it("pins a single-recipient send to a studio by slug, in the handler's single form", async () => {
