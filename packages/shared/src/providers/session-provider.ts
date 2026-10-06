@@ -259,46 +259,52 @@ export function createSessionProviderTurn(
 
   const runTurnForLoop = async (
     body: string,
-    ctx: { isContinuation: boolean }
+    ctx: { isContinuation: boolean; signal?: AbortSignal }
   ): Promise<BackendTurnOutcome> => {
     if (!ctx.isContinuation) {
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = ports.contextGeneration();
+      let runResult: BackendRunResult;
       ports.beginSpawn();
-      const turn = ports.startTurn({
-        backend: runtime.backend,
-        sbSlug,
-        model: runtime.model,
-        effort: runtime.effort,
-        prompt: body,
-        verbose: runtime.verbose,
-        passthroughArgs,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        onEvent: ports.onEvent,
-        attachmentDirs: ports.attachmentDirs(),
-        toolRouting: runtime.toolRouting,
-        // Delivery spawn: embed this turn's media even when resuming a
-        // recovered provider session — new media on an existing conversation
-        // must reach the provider (heartbeat/reattach path).
-        media: turnMedia.length > 0 ? turnMedia : undefined,
-        ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-        // Seed a fresh provider session (first spawn) OR resume the live one
-        // (subsequent turns). Tool-loop continuations always resume it.
-        ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
-        ...(resumeProviderSession && state.id ? { backendSessionId: state.id } : {}),
-        cliAttached,
-        ...ports.spawnContext(),
-      });
-      ports.onAbortHandle(turn.abort);
+      try {
+        const turn = ports.startTurn({
+          backend: runtime.backend,
+          sbSlug,
+          model: runtime.model,
+          effort: runtime.effort,
+          prompt: body,
+          verbose: runtime.verbose,
+          passthroughArgs,
+          systemPromptOverride: runtime.systemPromptOverride,
+          timeoutMs: runtime.backendTurnTimeoutMs,
+          idleTimeoutMs: runtime.backendIdleTimeoutMs,
+          stream: true,
+          onEvent: ports.onEvent,
+          attachmentDirs: ports.attachmentDirs(),
+          toolRouting: runtime.toolRouting,
+          // Delivery spawn: embed this turn's media even when resuming a
+          // recovered provider session — new media on an existing conversation
+          // must reach the provider (heartbeat/reattach path).
+          media: turnMedia.length > 0 ? turnMedia : undefined,
+          ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+          // Seed a fresh provider session (first spawn) OR resume the live one
+          // (subsequent turns). Tool-loop continuations always resume it.
+          ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
+          ...(resumeProviderSession && state.id ? { backendSessionId: state.id } : {}),
+          cliAttached,
+          ...ports.spawnContext(),
+        });
+        ports.onAbortHandle(turn.abort);
 
-      let runResult = await turn.result.finally(() => {
-        ports.onAbortHandle(null);
-        ports.onInitialSettled();
-      });
-      ports.endSpawn();
+        runResult = await turn.result;
+      } finally {
+        try {
+          ports.onAbortHandle(null);
+          ports.onInitialSettled();
+        } finally {
+          ports.endSpawn();
+        }
+      }
       // Recorded here, not after the reseed branch: a failed resume that
       // reported usage still spent those tokens, and the retry below
       // REASSIGNS runResult — recording once at the end would silently drop
@@ -310,6 +316,7 @@ export function createSessionProviderTurn(
       // reseed in this turn, preserving both attempts' usage and media delivery.
       if (
         resumeProviderSession &&
+        !ctx.signal?.aborted &&
         !runResult.success &&
         (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
       ) {
@@ -337,34 +344,39 @@ export function createSessionProviderTurn(
           turnContextOccupancy(ledger, runtime, ports.measurement())
         );
         ports.beginSpawn();
-        const reseedTurn = ports.startTurn({
-          backend: runtime.backend,
-          sbSlug,
-          model: runtime.model,
-          effort: runtime.effort,
-          prompt: ports.buildEnvelope(raw, reseedStamp),
-          verbose: runtime.verbose,
-          passthroughArgs,
-          systemPromptOverride: runtime.systemPromptOverride,
-          timeoutMs: runtime.backendTurnTimeoutMs,
-          idleTimeoutMs: runtime.backendIdleTimeoutMs,
-          stream: true,
-          onEvent: ports.onEvent,
-          attachmentDirs: ports.attachmentDirs(),
-          toolRouting: runtime.toolRouting,
-          // The reseeded provider session is fresh — re-inject this turn's
-          // media so the full envelope carries the images too.
-          media: turnMedia.length > 0 ? turnMedia : undefined,
-          ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-          backendSessionSeedId: reseedId,
-          cliAttached,
-          ...ports.spawnContext(),
-        });
-        ports.onAbortHandle(reseedTurn.abort);
-        runResult = await reseedTurn.result.finally(() => {
-          ports.onAbortHandle(null);
-        });
-        ports.endSpawn();
+        try {
+          const reseedTurn = ports.startTurn({
+            backend: runtime.backend,
+            sbSlug,
+            model: runtime.model,
+            effort: runtime.effort,
+            prompt: ports.buildEnvelope(raw, reseedStamp),
+            verbose: runtime.verbose,
+            passthroughArgs,
+            systemPromptOverride: runtime.systemPromptOverride,
+            timeoutMs: runtime.backendTurnTimeoutMs,
+            idleTimeoutMs: runtime.backendIdleTimeoutMs,
+            stream: true,
+            onEvent: ports.onEvent,
+            attachmentDirs: ports.attachmentDirs(),
+            toolRouting: runtime.toolRouting,
+            // The reseeded provider session is fresh — re-inject this turn's
+            // media so the full envelope carries the images too.
+            media: turnMedia.length > 0 ? turnMedia : undefined,
+            ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+            backendSessionSeedId: reseedId,
+            cliAttached,
+            ...ports.spawnContext(),
+          });
+          ports.onAbortHandle(reseedTurn.abort);
+          runResult = await reseedTurn.result;
+        } finally {
+          try {
+            ports.onAbortHandle(null);
+          } finally {
+            ports.endSpawn();
+          }
+        }
         ports.recordUsage(runResult.usage);
         ports.sampleContext(runResult.usage);
       }
@@ -419,18 +431,27 @@ export function createSessionProviderTurn(
     // rendered this body itself.
     turnDialogue.push({ role: 'runtime', text: body });
 
-    ports.beginSpawn();
+    let contResult: BackendRunResult;
     const ledgerIdBeforeSpawn = maxLedgerId();
     const generationBeforeSpawn = ports.contextGeneration();
-    const contTurn = ports.startTurn(
-      continuationRequest(continuationPrompt, continuationSpawnArgs(decision, turnMedia.length > 0))
-    );
-    ports.onAbortHandle(contTurn.abort);
+    ports.beginSpawn();
+    try {
+      const contTurn = ports.startTurn(
+        continuationRequest(
+          continuationPrompt,
+          continuationSpawnArgs(decision, turnMedia.length > 0)
+        )
+      );
+      ports.onAbortHandle(contTurn.abort);
 
-    const contResult = await contTurn.result.finally(() => {
-      ports.onAbortHandle(null);
-    });
-    ports.endSpawn();
+      contResult = await contTurn.result;
+    } finally {
+      try {
+        ports.onAbortHandle(null);
+      } finally {
+        ports.endSpawn();
+      }
+    }
 
     lastRunResult = contResult;
     ports.recordUsage(contResult.usage);

@@ -118,10 +118,10 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       ) ?? [];
     expect(wraps).toHaveLength(2);
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*(?:ports\.beginSpawn\(\);\s*)?const turn = ports\.startTurn\(\{/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
     );
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
     );
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/

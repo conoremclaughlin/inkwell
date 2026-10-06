@@ -168,6 +168,79 @@ describe('shared session provider composition', () => {
     expect(t.lastRunResult.usage).toEqual({ inputTokens: 8 });
   });
 
+  it.each([
+    ['initial', 'throw'],
+    ['initial', 'reject'],
+    ['reseed', 'throw'],
+    ['reseed', 'reject'],
+    ['continuation', 'throw'],
+    ['continuation', 'reject'],
+  ] as const)('closes the %s spawn bracket when the provider %s fails', async (phase, failure) => {
+    const h = harness();
+    const error = new Error('host refused or provider failed');
+    const fail = () => {
+      if (failure === 'throw') throw error;
+      return { result: Promise.reject(error), abort: vi.fn() };
+    };
+    if (phase === 'reseed') {
+      h.ports.state.id = 'missing';
+      vi.mocked(h.ports.startTurn).mockReturnValueOnce({
+        result: Promise.resolve(result({ success: false, resumeFailedNoSession: true })),
+        abort: vi.fn(),
+      });
+    }
+    const t = h.turn();
+    if (phase === 'continuation') {
+      await t.runTurn(t.prompt, { isContinuation: false });
+    }
+    vi.mocked(h.ports.startTurn).mockImplementationOnce(fail);
+    await expect(t.runTurn('body', { isContinuation: phase === 'continuation' })).rejects.toBe(
+      error
+    );
+    const count = phase === 'initial' ? 1 : 2;
+    expect(h.ports.startTurn).toHaveBeenCalledTimes(count);
+    expect(h.ports.beginSpawn).toHaveBeenCalledTimes(count);
+    expect(h.ports.endSpawn).toHaveBeenCalledTimes(count);
+    expect(h.ports.onAbortHandle).toHaveBeenLastCalledWith(null);
+    expect(h.ports.onInitialSettled).toHaveBeenCalledTimes(1);
+    // Only completed attempts can contribute a result/usage sample.
+    expect(h.ports.recordUsage).toHaveBeenCalledTimes(count - 1);
+  });
+
+  it('still closes the spawn bracket if the initial-settled observer throws', async () => {
+    const h = harness();
+    const error = new Error('observer failed');
+    vi.mocked(h.ports.onInitialSettled).mockImplementationOnce(() => {
+      throw error;
+    });
+    const t = h.turn();
+    await expect(t.runTurn(t.prompt, { isContinuation: false })).rejects.toBe(error);
+    expect(h.ports.endSpawn).toHaveBeenCalledTimes(1);
+    expect(h.ports.onAbortHandle).toHaveBeenLastCalledWith(null);
+  });
+
+  it('does not reseed a missing resume after Stop, while retaining the first attempt usage', async () => {
+    const h = harness();
+    h.ports.state.id = 'missing';
+    const stop = new AbortController();
+    vi.mocked(h.ports.startTurn).mockImplementationOnce(() => {
+      stop.abort();
+      return {
+        result: Promise.resolve(result({ success: false, resumeFailedNoSession: true })),
+        abort: vi.fn(),
+      };
+    });
+    const t = h.turn();
+    const outcome = await t.runTurn(t.prompt, { isContinuation: false, signal: stop.signal });
+    expect(outcome.success).toBe(false);
+    expect(h.ports.startTurn).toHaveBeenCalledTimes(1);
+    expect(h.ports.endSpawn).toHaveBeenCalledTimes(1);
+    expect(h.ports.recordUsage).toHaveBeenCalledWith({ inputTokens: 10, outputTokens: 2 });
+    expect(h.ports.state.id).toBe('missing');
+    expect(h.events).toEqual([]);
+    expect(h.ports.notice).not.toHaveBeenCalled();
+  });
+
   it('mid-turn eviction reseeds with the dialogue, then resumes without redelivering media', async () => {
     const h = harness();
     const t = h.turn();
