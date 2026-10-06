@@ -2287,6 +2287,76 @@ describe('SessionService', () => {
     });
   });
 
+  describe('the in-process ink runtime is opt-in, by agent (hosted-ink-session.ts)', () => {
+    const LISTED = '5f2a9c4e-0d6b-4c1a-9f3e-7a8b1c2d3e4f';
+    const OTHER = '0e1d2c3b-4a59-4687-9a8b-7c6d5e4f3a2b';
+    const hostedService = () => {
+      const hosted: IClaudeRunner = {
+        run: vi
+          .fn()
+          .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
+      };
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          hostedInk: { runner: hosted, sbIds: new Set([LISTED]) },
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+      return { service, hosted };
+    };
+
+    it("runs a listed agent's ink turn in process, matching its id in any case", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED.toUpperCase() })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
+    });
+
+    it("leaves an unlisted agent's ink turn on ink chat", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: OTHER })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it("never moves a listed agent's turn on another backend", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: LISTED })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it('compacts a listed agent in process too, never on ink chat beside it', async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED, backendSessionId: 'ink-session-1' })
+      );
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+      await service.triggerCompaction('session-123');
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Message Locking', () => {
     it('should process messages sequentially for the same session', async () => {
       const session = createMockSession();

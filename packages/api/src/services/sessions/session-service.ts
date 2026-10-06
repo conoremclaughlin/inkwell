@@ -56,6 +56,7 @@ import {
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
+import { selectInkRunner, type HostedInkSelection } from './hosted-ink-session.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import {
   classifyError,
@@ -131,6 +132,13 @@ export interface SessionServiceConfig {
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
   responseHandler?: (responses: ChannelResponse[], sessionId?: string) => Promise<void>;
+  /**
+   * The in-process ink runtime (hosted-ink-session.ts), for the agents named
+   * here only: an `ink` turn of any other agent still spawns `ink chat`.
+   * Absent by default. A listed agent's turn goes to this runner whether or
+   * not it can run: an unbound runner refuses, never falls back.
+   */
+  hostedInk?: HostedInkSelection;
 }
 
 const DEFAULT_CONFIG: SessionServiceConfig = {
@@ -829,6 +837,11 @@ export class SessionService implements ISessionService {
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+  }
+
+  /** The runner for an `ink` turn: in process for the agents opted in, else `ink chat`. */
+  private inkRunnerFor(sbId: string | null | undefined): IRunner {
+    return selectInkRunner(this.config.hostedInk, this.inkRunner, sbId);
   }
 
   private getLeaseService(): StudioLeaseService | null {
@@ -2586,7 +2599,7 @@ export class SessionService implements ISessionService {
           : resolvedBackend === 'antigravity'
             ? this.antigravityRunner
             : resolvedBackend === 'ink'
-              ? this.inkRunner
+              ? this.inkRunnerFor(session.sbId)
               : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
@@ -5779,7 +5792,7 @@ This session will continue with a fresh context after compaction. Your identity,
             : runtimeBackend === 'antigravity'
               ? this.antigravityRunner
               : runtimeBackend === 'ink'
-                ? this.inkRunner
+                ? this.inkRunnerFor(session.sbId)
                 : this.claudeRunner;
 
       await this.completeStudioBeforeSpawn(
