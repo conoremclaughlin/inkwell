@@ -262,3 +262,15 @@ optional-hook timeout. Hosts must separately cancel/fence their own I/O;
 awaiting compaction is not proof that its external effects are cancellable.
 The outcome callback must not throw: it runs after persistence, so its failure
 cannot authorize retrying that committed reply.
+
+### Tool execution boundary
+
+`tool-call-executor.ts` is the same sequential policy/approval/intent pipeline
+used by parent and clone CLI turns. Hosts supply the policy decision port,
+invocation-id mint, local-surface diagnostics, approvals, and dispatcher. The
+CLI adapter supplies its existing implementations; no host receives an
+implicit permissive policy. `createToolIntentCommitter` uses the existing
+session log and waits for its writes before dispatch. Credential expansion
+still belongs inside the dispatcher, after the unresolved model arguments are
+recorded. Policy storage, coding-tool/catalog setup and approval transports
+remain host composition; this extraction alone does not enable the API host.

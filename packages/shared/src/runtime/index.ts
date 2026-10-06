@@ -38,3 +38,5 @@ export * from './paragraph-stream.js';
 export * from './preview-guard.js';
 export * from './frame-fanout.js';
 export * from './session-budget.js';
+export * from './tool-call-executor.js';
+export * from './tool-intent.js';
