@@ -12,9 +12,9 @@ export const EMOJI_PARITY_FILES: ReadonlyArray<readonly [string, string]> = [
   ["reaction-picking/index.ts", "8e11db8fead6647235c86e25264cb668635199c0e1cd6ef974ff884209037da6"],
   ["reaction-picking/parity-vectors.ts", "512300d23d19e4d5cb25286f934e79800696445a8c824ff85c6fe1aced79f437"],
   ["reaction-picking/search-aliases.ts", "035aad62d163fe6e570392667ad63bfe8ffcce1e4dddfc50470545b39111cc1c"],
-  ["reaction-picking/search.generated.ts", "5f5381941a91b214b694ceb38acea3df20d1fcc7fb2c717f80c3ce455650b036"],
+  ["reaction-picking/search.generated.ts", "d0e0d58ec0885050f6cb03002248f48764cb1d5f071ba9deab9ee09c15318eee"],
   ["reaction-picking/search.ts", "47eaf592ee2f2277e1e417fd2ed9252620e617cebf27c410004152c0ec100b88"],
 ];
 
 /** SHA-256 over "<path>\t<sha256>\n" for each file above, sorted by path. */
-export const EMOJI_PARITY_DIGEST = "6cbdc68848e6006595724fe6660cb283c87794942f3ad05015c4976ebb94f7c5";
+export const EMOJI_PARITY_DIGEST = "3b3c290d42bca4d20501816a727b72e324a25173ecbd7506aece4837ac18f119";

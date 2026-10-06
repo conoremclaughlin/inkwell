@@ -9,19 +9,35 @@ interface Annotations {
   names: Map<string, string>;
   keywords: Map<string, string[]>;
 }
-const { parseEmojiTest, parseAnnotations, buildCatalog } = generator as {
+interface Catalog {
+  rows: Array<{ hex: string; name: string; keywords: string[]; toneOf: number }>;
+  minimallyQualified: Array<[string, number]>;
+  unqualified: Array<[string, number]>;
+}
+const { parseEmojiTest, parseAnnotations, buildCatalog, assertToneFamilies } = generator as {
   parseEmojiTest: (text: string) => unknown[];
   parseAnnotations: (xml: string) => Annotations;
-  buildCatalog: (
-    entries: unknown[],
-    annotations: Annotations,
-    derived: Annotations
-  ) => {
-    rows: Array<{ hex: string; name: string; keywords: string[]; toneOf: number }>;
-    minimallyQualified: Array<[string, number]>;
-    unqualified: Array<[string, number]>;
-  };
+  buildCatalog: (entries: unknown[], annotations: Annotations, derived: Annotations) => Catalog;
+  assertToneFamilies: (catalog: Catalog) => void;
 };
+
+/** One fully-qualified emoji-test entry, built directly for the mapping tests. */
+const entry = (hex: string, label: string, subgroup: string) => ({
+  hex,
+  seq: hex
+    .split(' ')
+    .map((h) => String.fromCodePoint(parseInt(h, 16)))
+    .join(''),
+  status: 'fully-qualified',
+  label,
+  group: 'People & Body',
+  subgroup,
+});
+const namesOf = (entries: Array<{ seq: string; label: string }>): Annotations => ({
+  names: new Map(entries.map((e) => [e.seq, e.label])),
+  keywords: new Map(),
+});
+const none: Annotations = { names: new Map(), keywords: new Map() };
 
 const COUNTS = (fq: number, mq: number, uq: number, c: number) => `
 # Status Counts
@@ -108,14 +124,76 @@ describe('generate-emoji-catalog', () => {
     expect(() => build(orphan)).toThrow(/no fully-qualified form for unqualified 2764/);
   });
 
-  it('fails on a skin-tone variant with no untoned base in its subgroup', () => {
+  it('fails on a skin-tone variant with no untoned base, whatever row precedes it', () => {
     const stray = EMOJI_TEST.replace(
       '1F44D                                                  ; fully-qualified     # 👍 E0.6 thumbs up\n',
       ''
     ).replace('# fully-qualified : 3', '# fully-qualified : 2');
-    expect(() => build(stray)).toThrow(
-      /skin-tone variant with no base in its subgroup: 1F44D 1F3FB/
+    expect(() => build(stray)).toThrow(/skin-tone variant with no base: 1F44D 1F3FB/);
+  });
+
+  it('maps a skin-tone variant by structure, then by name, never by position', () => {
+    // Unicode lists a family's mixed tones after its last member.
+    const people = entry('1F46F', 'people with bunny ears', 'family');
+    const women = entry('1F46F 200D 2640 FE0F', 'women with bunny ears', 'family');
+    const mixed = entry(
+      '1F9D1 1F3FB 200D 1F430 200D 1F9D1 1F3FC',
+      'people with bunny ears: light skin tone, medium-light skin tone',
+      'family'
     );
+    const single = entry(
+      '1F46F 1F3FB 200D 2640 FE0F',
+      'women with bunny ears: light skin tone',
+      'family'
+    );
+    const catalog = buildCatalog(
+      [people, women, mixed, single],
+      namesOf([people, women, mixed, single]),
+      none
+    );
+    expect(catalog.rows.map((r) => r.toneOf)).toEqual([-1, -1, 0, 1]);
+  });
+
+  it('prefers structure to the name, so a hair style keeps its own variants', () => {
+    const man = entry('1F468', 'man', 'person');
+    const red = entry('1F468 200D 1F9B0', 'man: red hair', 'person');
+    const toned = entry('1F468 1F3FB 200D 1F9B0', 'man: light skin tone, red hair', 'person');
+    const catalog = buildCatalog([man, red, toned], namesOf([man, red, toned]), none);
+    expect(catalog.rows[2].toneOf).toBe(1);
+  });
+
+  it('fails on a variant whose base is in another subgroup', () => {
+    const up = entry('1F44D', 'thumbs up', 'hand-fingers-closed');
+    const toned = entry('1F44D 1F3FB', 'thumbs up: light skin tone', 'hand-fingers-open');
+    expect(() => buildCatalog([up, toned], namesOf([up, toned]), none)).toThrow(
+      /skin-tone variant outside its base's subgroup: 1F44D 1F3FB -> 1F44D/
+    );
+  });
+
+  it('fails on two variants of one base with the same tones', () => {
+    const people = entry('1F46F', 'people with bunny ears', 'family');
+    const a = entry('1F46F 1F3FB', 'people with bunny ears: light skin tone', 'family');
+    const b = entry(
+      '1F9D1 1F3FB 200D 1F430 200D 1F9D1',
+      'people with bunny ears: light skin tone',
+      'family'
+    );
+    expect(() => buildCatalog([people, a, b], namesOf([people, a, b]), none)).toThrow(
+      /two skin-tone variants of 1F46F have the same tones/
+    );
+  });
+
+  it('refuses a generation whose bases do not have 5 or 25 variants each', () => {
+    const up = entry('1F44D', 'thumbs up', 'hand');
+    const tones = ['1F3FB', '1F3FC', '1F3FD', '1F3FE', '1F3FF'];
+    const five = tones.map((t) => entry(`1F44D ${t}`, `thumbs up: tone ${t}`, 'hand'));
+    expect(() =>
+      assertToneFamilies(buildCatalog([up, ...five], namesOf([up, ...five]), none))
+    ).not.toThrow();
+    const one = five.slice(0, 1);
+    expect(() =>
+      assertToneFamilies(buildCatalog([up, ...one], namesOf([up, ...one]), none))
+    ).toThrow(/not 5 or 25 variants: 1F44D has 1/);
   });
 
   it('decodes XML entities and refuses one it does not know', () => {

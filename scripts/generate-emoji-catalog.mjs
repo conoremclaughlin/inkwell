@@ -14,7 +14,9 @@
  *   - every fully-qualified sequence must have a CLDR name (a missing name
  *     fails: newer emoji are never dropped, and nothing else is passed off as
  *     a CLDR name);
- *   - every skin-tone variant must follow an untoned base in its subgroup.
+ *   - every skin-tone variant must resolve to exactly one untoned base in its
+ *     subgroup, by structure or by name, never by its position in the file;
+ *   - every base must end up with 5 or 25 variants, each with distinct tones.
  *
  * It writes two checked-in files, kept apart so a client can load search
  * lazily while validation stays small:
@@ -132,6 +134,7 @@ authorization of the copyright holder.`;
 
 const VS16 = '\u{FE0F}';
 const TONE = /[\u{1F3FB}-\u{1F3FF}]/u;
+const TONES = /[\u{1F3FB}-\u{1F3FF}]/gu;
 const STATUSES = ['fully-qualified', 'minimally-qualified', 'unqualified', 'component'];
 
 export function sha256(bytes) {
@@ -227,6 +230,74 @@ function lookup(map, seq) {
   return map.get(seq) ?? map.get(withoutVs16(seq));
 }
 
+const tonesOf = (seq) => (seq.match(TONES) ?? []).join('');
+
+/**
+ * The untoned emoji each skin-tone variant belongs to, by catalog index, or
+ * -1 for an emoji that is not a variant. Never by adjacency: Unicode lists a
+ * family's mixed tones after its last member, so "the untoned row above"
+ * gives people and men with bunny ears to the women.
+ *
+ * Structure first: without its tone modifiers the variant is a listed emoji
+ * (thumbs up: light skin tone is thumbs up; man: light skin tone, red hair is
+ * man: red hair). A mixed-tone variant spelled differently from its base, such
+ * as 🧑🏽‍🐰‍🧑🏿 for people with bunny ears, falls back to its label: the part
+ * before ": " must name exactly one untoned emoji. Anything else fails, as do
+ * a base outside the variant's subgroup and two variants of one base with the
+ * same tones.
+ */
+function toneBases(fullyQualified, indexByStripped) {
+  const untonedByLabel = new Map();
+  fullyQualified.forEach((e, i) => {
+    if (TONE.test(e.seq)) return;
+    untonedByLabel.set(e.label, untonedByLabel.has(e.label) ? -1 : i);
+  });
+  const bases = fullyQualified.map((e) => {
+    if (!TONE.test(e.seq)) return -1;
+    const structural = indexByStripped.get(withoutVs16(e.seq.replace(TONES, '')));
+    if (structural !== undefined) return structural;
+    const colon = e.label.indexOf(': ');
+    const named = colon > 0 ? untonedByLabel.get(e.label.slice(0, colon)) : undefined;
+    if (named !== undefined && named >= 0) return named;
+    throw new Error(`skin-tone variant with no base: ${e.hex} (${e.label})`);
+  });
+  const seen = new Map();
+  bases.forEach((base, i) => {
+    if (base < 0) return;
+    const e = fullyQualified[i];
+    const owner = fullyQualified[base];
+    if (owner.subgroup !== e.subgroup)
+      throw new Error(`skin-tone variant outside its base's subgroup: ${e.hex} -> ${owner.hex}`);
+    const tones = seen.get(base) ?? new Set();
+    if (tones.has(tonesOf(e.seq)))
+      throw new Error(`two skin-tone variants of ${owner.hex} have the same tones: ${e.hex}`);
+    tones.add(tonesOf(e.seq));
+    seen.set(base, tones);
+  });
+  return bases;
+}
+
+/**
+ * The pinned data's own shape, checked on every generation: each base has 5
+ * skin-tone variants (one tone) or 25 (two people, every pairing). A base with
+ * any other count means the mapping went wrong; at Unicode 18.0 the adjacency
+ * mapping gave three bases 5, 5 and 65.
+ */
+export function assertToneFamilies(catalog) {
+  const counts = new Map();
+  for (const row of catalog.rows) {
+    if (row.toneOf >= 0) counts.set(row.toneOf, (counts.get(row.toneOf) ?? 0) + 1);
+  }
+  const wrong = [...counts].filter(([, n]) => n !== 5 && n !== 25);
+  if (wrong.length > 0) {
+    const sample = wrong
+      .slice(0, 5)
+      .map(([base, n]) => `${catalog.rows[base].hex} has ${n}`)
+      .join(', ');
+    throw new Error(`skin-tone families are not 5 or 25 variants: ${sample}`);
+  }
+}
+
 /**
  * The catalog: fully-qualified sequences in file order with names, keywords,
  * group, subgroup and tone base; the qualification aliases; the counts.
@@ -266,19 +337,16 @@ export function buildCatalog(entries, annotations, derived) {
 
   const groups = [...new Set(fullyQualified.map((e) => e.group))];
   const subgroups = [...new Set(fullyQualified.map((e) => e.subgroup))];
-  let base = -1;
+  const bases = toneBases(fullyQualified, indexByStripped);
   const rows = fullyQualified.map((e, i) => {
-    const toned = TONE.test(e.seq);
-    if (!toned) base = i;
-    else if (base < 0 || fullyQualified[base].subgroup !== e.subgroup)
-      throw new Error(`skin-tone variant with no base in its subgroup: ${e.hex}`);
+    const toned = bases[i] >= 0;
     return {
       hex: e.hex,
       name: lookup(names, e.seq),
       keywords: toned ? [] : (lookup(keywords, e.seq) ?? []),
       group: groups.indexOf(e.group),
       subgroup: subgroups.indexOf(e.subgroup),
-      toneOf: toned ? base : -1,
+      toneOf: bases[i],
     };
   });
 
@@ -450,6 +518,7 @@ async function main(argv) {
   const annotations = parseAnnotations(await readPinned(dir, PINS.cldr.annotations));
   const derived = parseAnnotations(await readPinned(dir, PINS.cldr.derived));
   const catalog = buildCatalog(entries, annotations, derived);
+  assertToneFamilies(catalog);
   let drift = 0;
   drift += await writeOrCheck(OUTPUTS.validation, renderValidation(catalog), check);
   drift += await writeOrCheck(OUTPUTS.search, renderSearch(catalog), check);
