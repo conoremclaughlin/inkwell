@@ -471,20 +471,20 @@ stage "$r" .mailmap "CANARYPERSON <x@example.com>"
 out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 0 ] && ok ".mailmap is exempt from the marker arm" || bad ".mailmap is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
-# The generated emoji catalog is exempt from the marker arm alone, one story
-# directory deep and nowhere else.
+# The emoji catalog's generated search data, and that one file only, is exempt
+# from the marker arm alone.
 cat_dir=packages/shared/src/stories/reaction-picking
 r=$(new_repo scan-marker-catalog "$nohooks")
 stage "$r" "$cat_dir/search.generated.ts" '["a name", "canaryperson|keyword"],'
 out=$(run_index "$r"); rc=$?
-[ "$rc" -eq 0 ] && ok "a generated emoji catalog file is exempt from the marker arm" || bad "a generated emoji catalog file is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 0 ] && ok "the catalog's generated search data is exempt from the marker arm" || bad "the catalog's generated search data is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 r=$(new_repo scan-marker-catalog-address "$nohooks")
 stage "$r" "$cat_dir/search.generated.ts" "// person@$realdom"
 out=$(run_index "$r"); rc=$?
-[ "$rc" -eq 1 ] && ok "the address arm still reads a generated emoji catalog file" || bad "the address arm still reads a generated emoji catalog file" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 1 ] && ok "the address arm still reads the catalog's generated search data" || bad "the address arm still reads the catalog's generated search data" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
-for near in "$cat_dir/search.ts" "$cat_dir/deeper/search.generated.ts" packages/shared/src/stories/search.generated.ts packages/web/src/stories/x/search.generated.ts "$cat_dir/search.generated.tsx"; do
+for near in "$cat_dir/search.ts" "$cat_dir/parity-manifest.generated.ts" packages/shared/src/stories/reacting/validation.generated.ts packages/shared/src/stories/other/search.generated.ts "$cat_dir/deeper/search.generated.ts" "vendor/$cat_dir/search.generated.ts" "$cat_dir/search.generated.tsx"; do
   r=$(new_repo "scan-marker-catalog-near-$(printf '%s' "$near" | tr '/.' '--')" "$nohooks")
   stage "$r" "$near" 'mentions canaryperson'
   out=$(run_index "$r"); rc=$?

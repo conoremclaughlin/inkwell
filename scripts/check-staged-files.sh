@@ -37,10 +37,10 @@
 #
 # Two paths are exempt from the ADDRESSES and MARKERS arms and from nothing
 # else: .mailmap, whose purpose is real author addresses that every commit
-# object already carries, and .yarn/releases/, which is vendored. One family
-# is exempt from the MARKERS arm alone: the generated emoji catalog,
-# packages/shared/src/stories/<story>/*.generated.ts, which is the Unicode
-# standard's published text (see marker_exempt below).
+# object already carries, and .yarn/releases/, which is vendored. One file is
+# exempt from the MARKERS arm alone: the emoji catalog's generated search
+# data, packages/shared/src/stories/reaction-picking/search.generated.ts,
+# which is the Unicode standard's published text (see marker_exempt below).
 #
 # The commit-msg guard cannot see files and this guard cannot see the message;
 # they are two halves. This one exists because `git add .` and `git add -A`
@@ -305,24 +305,21 @@ personal_exempt() {
   return 1
 }
 
-# Paths the MARKERS arm alone does not read: the generated emoji catalog, one
-# story directory deep and nowhere else. Those files are the CLDR names and
-# keywords the Unicode standard publishes, written byte for byte from pinned
-# source files by scripts/generate-emoji-catalog.mjs and never edited by hand.
-# A generic English keyword in that data matched a machine's marker list, and
-# the machine's owner chose this exemption over narrowing the list (Conor,
-# 2026-10-06). The ADDRESSES arm still reads these files, and a hand edit
-# shows in review as a change to a file that only regeneration should touch.
+# The one path the MARKERS arm alone does not read: the emoji catalog's
+# generated search data. It holds the CLDR names and keywords the Unicode
+# standard publishes, written byte for byte from pinned source files by
+# scripts/generate-emoji-catalog.mjs and never edited by hand. A generic
+# English keyword in that data matched a machine's marker list, and the
+# machine's owner chose this exemption over narrowing the list (Conor,
+# 2026-10-06). It names that file exactly: the catalog's other generated
+# files carry no CLDR words and stay scanned, as does any future generated
+# file. The ADDRESSES arm still reads it, and a hand edit shows in review as
+# a change to a file that only regeneration should touch.
 marker_exempt() {
-  case "$1" in
-    packages/shared/src/stories/*/*.generated.ts) ;;
-    *) return 1 ;;
+  case "/$1" in
+    /packages/shared/src/stories/reaction-picking/search.generated.ts) return 0 ;;
   esac
-  # A case pattern's * also matches "/", so require exactly one directory.
-  case "${1#packages/shared/src/stories/}" in
-    */*/*) return 1 ;;
-  esac
-  return 0
+  return 1
 }
 
 # ADDRESSES. The shape is deliberately loose — a local part, an at sign, a
