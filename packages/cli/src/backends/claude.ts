@@ -15,7 +15,7 @@ import {
   readSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { homedir } from 'os';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
@@ -257,6 +257,19 @@ export class ClaudeAdapter implements BackendAdapter {
           })
           .join('\n');
     }
+    // Withheld (task 0321ccf1): a file that can't be shown inline has no
+    // native-read fallback, so the model is told on the delivery spawn that
+    // it was never opened, rather than left to look for a way in.
+    const withhold = config.withholdProviderTools === true;
+    if (withhold && config.prompt && config.deliverMedia && classified.nativeRead.length > 0) {
+      rejectionNote +=
+        '\n\n[media note] These attached file(s) could NOT be opened: only JPEG, PNG, GIF ' +
+        'and WebP images can be shown to you in this conversation, and there is no other ' +
+        'way to read a file here. Tell the user you could not open each one:\n' +
+        classified.nativeRead
+          .map((m) => `- ${basename(m.path)}${m.mimeType ? ` (${m.mimeType})` : ''}`)
+          .join('\n');
+    }
     const imageBlocks = [...(encoded?.blocks ?? []), ...(encodedContext?.blocks ?? [])];
     const injecting = imageBlocks.length > 0;
     const promptText = config.prompt ? config.prompt + rejectionNote : config.prompt;
@@ -321,6 +334,11 @@ export class ClaudeAdapter implements BackendAdapter {
     // its own, and the withheld servers leak straight back in. (Same pattern
     // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
     const localRouting = config.toolRouting === 'local';
+    if (withhold && !localRouting) {
+      // startBackendTurn never asks for this; refuse rather than spawn a
+      // provider that keeps its own tools and the project's MCP servers.
+      throw new Error('withholdProviderTools requires ink-owned (local) tool routing');
+    }
     const {
       mcpConfigPath,
       hasChannelBridge,
@@ -347,9 +365,13 @@ export class ClaudeAdapter implements BackendAdapter {
       // classification, so it is identical on every spawn of the logical
       // turn; injection FAILURES (oversize, unreadable, special files) fail
       // closed and never reopen Read.
+      //
+      // Withheld, there is no exception: the turn keeps no native tool,
+      // whatever it carries. Read's reach is Claude Code's read policy, not
+      // the attachment's directory (task 0321ccf1).
       const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
       const needsNativeRead =
-        hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
+        !withhold && hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
       args.push('--tools', needsNativeRead ? 'Read' : '');
     }
 
@@ -358,33 +380,39 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-skip-permissions');
     }
 
-    // Attachment directories: grant read access so files attached to the
-    // turn (--attach-file paths referenced in the prompt) are readable
-    // without permission prompts. Claude Code's Read renders images
-    // natively, so this is the full multimodal path for CLI spawns.
-    for (const dir of config.attachmentDirs ?? []) {
-      args.push('--add-dir', dir);
-    }
+    // Withheld, the spawn gets no directory grant at all. With no native
+    // tool one would be inert, and it stays out so nothing opened later
+    // inherits it. Injected images are read here, by this process, not by
+    // the provider, so they need none.
+    if (!withhold) {
+      // Attachment directories: grant read access so files attached to the
+      // turn (--attach-file paths referenced in the prompt) are readable
+      // without permission prompts. Claude Code's Read renders images
+      // natively, so this is the full multimodal path for CLI spawns.
+      for (const dir of config.attachmentDirs ?? []) {
+        args.push('--add-dir', dir);
+      }
 
-    // Inkwell media directory: always grant read access so agents can
-    // read downloaded attachments (email, Telegram, etc.) via the native
-    // Read tool. This is Inkwell's own directory, not arbitrary fs access.
-    const inkFilesDir = join(homedir(), '.ink', 'files');
-    if (existsSync(inkFilesDir)) {
-      args.push('--add-dir', inkFilesDir);
-    }
+      // Inkwell media directory: always grant read access so agents can
+      // read downloaded attachments (email, Telegram, etc.) via the native
+      // Read tool. This is Inkwell's own directory, not arbitrary fs access.
+      const inkFilesDir = join(homedir(), '.ink', 'files');
+      if (existsSync(inkFilesDir)) {
+        args.push('--add-dir', inkFilesDir);
+      }
 
-    // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
-    // so create_studio/overflow worktrees minted mid-session are accessible —
-    // a live session can never be granted a new directory. Created if
-    // missing: Claude Code ignores a nonexistent --add-dir.
-    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
-    try {
-      mkdirSync(inkStudiosDir, { recursive: true });
-    } catch {
-      // Non-fatal — worst case the grant is a no-op until the dir exists.
+      // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
+      // so create_studio/overflow worktrees minted mid-session are accessible —
+      // a live session can never be granted a new directory. Created if
+      // missing: Claude Code ignores a nonexistent --add-dir.
+      const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+      try {
+        mkdirSync(inkStudiosDir, { recursive: true });
+      } catch {
+        // Non-fatal — worst case the grant is a no-op until the dir exists.
+      }
+      args.push('--add-dir', inkStudiosDir);
     }
-    args.push('--add-dir', inkStudiosDir);
 
     // Inkwell channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges Inkwell's HTTP
@@ -396,8 +424,11 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-load-development-channels', 'server:inkmail');
     }
 
-    // Passthrough flags
-    args.push(...config.passthroughArgs);
+    // Passthrough flags. Appended last, so they could override any flag
+    // above; a withheld spawn takes none (Lumen).
+    if (!withhold) {
+      args.push(...config.passthroughArgs);
+    }
 
     // Consolidated context token for x-ink-context header. The `.mcp.json`
     // generated by buildMergedMcpConfig references ${INK_CONTEXT}; this env

@@ -788,3 +788,175 @@ describe('ClaudeAdapter prepare — images a tool put in context', () => {
     expect(roomy.totalBytes).toBe(1024);
   });
 });
+
+describe('ClaudeAdapter prepare — provider tools withheld (task 0321ccf1)', () => {
+  // A synthetic home holding what an inkling must not reach: the shared media
+  // directory, a studio checkout with its .env.local, and an upload of its own.
+  const PNG_BYTES = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+  let home: string;
+  let uploadDir: string;
+  let savedCwd: string;
+  let files: Record<'png' | 'pdf' | 'txt', string>;
+
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), 'claude-withheld-')));
+    mkdirSync(join(home, '.ink', 'files', 'telegram'), { recursive: true });
+    mkdirSync(join(home, '.ink', 'studios', 'some-studio'), { recursive: true });
+    writeFileSync(join(home, '.ink', 'studios', 'some-studio', '.env.local'), 'SYNTHETIC=1\n');
+    const folder = join(home, '.ink', 'inklings', 'kindle-0a1b2c3d');
+    mkdirSync(folder, { recursive: true });
+    uploadDir = join(home, '.ink', 'uploads', 'u', 'w', 'up1');
+    mkdirSync(uploadDir, { recursive: true });
+    files = {
+      png: join(uploadDir, 'up1.png'),
+      pdf: join(uploadDir, 'up1.pdf'),
+      txt: join(uploadDir, 'up1.txt'),
+    };
+    writeFileSync(files.png, PNG_BYTES);
+    writeFileSync(files.pdf, 'not really a pdf');
+    writeFileSync(files.txt, 'plain words');
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('INK_STUDIOS_ROOT', join(home, '.ink', 'studios'));
+    savedCwd = process.cwd();
+    process.chdir(folder);
+  });
+
+  afterEach(() => {
+    process.chdir(savedCwd);
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const MEDIA = {
+    png: () => ({ path: files.png, mimeType: 'image/png' }),
+    pdf: () => ({ path: files.pdf, mimeType: 'application/pdf' }),
+    txt: () => ({ path: files.txt, mimeType: 'text/plain' }),
+  };
+
+  function prepare(extra: Record<string, unknown>) {
+    return new ClaudeAdapter().prepare({
+      sbSlug: 'kindle-0a1b2c3d',
+      prompt: 'what did I send?',
+      promptParts: ['what did I send?'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [uploadDir],
+      ...extra,
+    });
+  }
+
+  const toolsOf = (args: string[]) => args.filter((_, i) => args[i - 1] === '--tools');
+  const grantsOf = (args: string[]) => args.filter((_, i) => args[i - 1] === '--add-dir');
+
+  it('opens Read and grants the shared directories without it (the control)', () => {
+    const prepared = prepare({ media: [MEDIA.pdf()], deliverMedia: true });
+    try {
+      expect(toolsOf(prepared.args)).toEqual(['Read']);
+      expect(grantsOf(prepared.args)).toEqual([
+        uploadDir,
+        join(home, '.ink', 'files'),
+        join(home, '.ink', 'studios'),
+      ]);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('keeps no native tool and grants nothing, for every attachment and every spawn of a turn', () => {
+    const mediaSets = [[], [MEDIA.pdf()], [MEDIA.txt()], [MEDIA.png()], [MEDIA.png(), MEDIA.pdf()]];
+    const spawns = [
+      { deliverMedia: true }, // a fresh delivery
+      { deliverMedia: true, backendSessionSeedId: 'seeded-provider-session' }, // a reseed
+      { deliverMedia: true, backendSessionId: 'resumed-provider-session' }, // a resumed delivery
+      { backendSessionId: 'resumed-provider-session' }, // a same-turn continuation
+    ];
+    let checked = 0;
+    for (const media of mediaSets) {
+      for (const spawn of spawns) {
+        const prepared = prepare({ withholdProviderTools: true, media, ...spawn });
+        const label = `${media.map((m) => m.mimeType).join('+') || 'no media'} ${JSON.stringify(spawn)}`;
+        try {
+          expect(toolsOf(prepared.args), label).toEqual(['']);
+          expect(grantsOf(prepared.args), label).toEqual([]);
+          expect(prepared.args, label).toContain('--strict-mcp-config');
+          expect(prepared.args, label).not.toContain('--dangerously-skip-permissions');
+          checked++;
+        } finally {
+          prepared.cleanup();
+        }
+      }
+    }
+    expect(checked).toBe(mediaSets.length * spawns.length);
+  });
+
+  it('appends no caller argument, so a trailing one cannot reopen tools or directories', () => {
+    const prepared = prepare({
+      withholdProviderTools: true,
+      media: [MEDIA.pdf()],
+      deliverMedia: true,
+      passthroughArgs: [
+        '--tools',
+        'Bash,Read',
+        '--add-dir',
+        '/',
+        '--mcp-config',
+        '/synthetic/other.json',
+        '--dangerously-skip-permissions',
+      ],
+    });
+    try {
+      expect(toolsOf(prepared.args)).toEqual(['']);
+      expect(grantsOf(prepared.args)).toEqual([]);
+      expect(prepared.args.filter((a) => a === '--mcp-config')).toHaveLength(1);
+      expect(prepared.args).not.toContain('/synthetic/other.json');
+      expect(prepared.args).not.toContain('--dangerously-skip-permissions');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('still shows a photo inline, and tells the model which files it could not open', () => {
+    const prepared = prepare({
+      withholdProviderTools: true,
+      media: [MEDIA.png(), MEDIA.pdf(), MEDIA.txt()],
+      deliverMedia: true,
+    });
+    try {
+      const line = JSON.parse(prepared.stdinData!.trim());
+      const [text, image] = line.message.content;
+      expect(image.type).toBe('image');
+      expect(Buffer.from(image.source.data, 'base64').equals(PNG_BYTES)).toBe(true);
+      expect(text.text).toContain('[media note] These attached file(s) could NOT be opened');
+      expect(text.text).toContain('- up1.pdf (application/pdf)');
+      expect(text.text).toContain('- up1.txt (text/plain)');
+      expect(text.text).not.toContain('up1.png (');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('says it once, on the delivery spawn, and not on a continuation', () => {
+    const prepared = prepare({
+      withholdProviderTools: true,
+      media: [MEDIA.pdf()],
+      backendSessionId: 'resumed-provider-session',
+    });
+    try {
+      expect(prepared.stdinData).not.toContain('[media note]');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('refuses withheld tools without ink-owned routing, rather than spawn the provider with its own', () => {
+    expect(() => prepare({ withholdProviderTools: true, toolRouting: 'backend' })).toThrow(
+      'withholdProviderTools requires ink-owned (local) tool routing'
+    );
+    expect(() => prepare({ withholdProviderTools: true, toolRouting: undefined })).toThrow(
+      'withholdProviderTools requires ink-owned (local) tool routing'
+    );
+  });
+});

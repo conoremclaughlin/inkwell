@@ -159,6 +159,7 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
       profile: flagged('--profile'),
       required: flagged('--require-profile'),
       away: args.includes('--away'),
+      noProviderTools: args.includes('--no-provider-tools'),
     };
   }
   const POLICY = '/home/synthetic/.ink/inklings/.tool-policy/0a1b2c3d.json';
@@ -176,12 +177,17 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
     expect(launched.profile).toBeNull();
     expect(launched.away).toBe(true);
     expect(launched.env.INK_TOOL_POLICY_PATH).toBe(POLICY);
+    // Named too, though the profile implies it: a CLI that takes the profile
+    // but predates the option refuses it, rather than opening the provider's
+    // native Read for a document.
+    expect(launched.noProviderTools).toBe(true);
   });
 
   it('leaves every other spawn on the safe profile and the policy it already had', async () => {
     const launched = await launch({ workingDirectory: '/tmp', sbSlug: 'myra' });
     expect(launched.profile).toBe('safe');
     expect(launched.required).toBeNull();
+    expect(launched.noProviderTools).toBe(false);
     expect('INK_TOOL_POLICY_PATH' in launched.env).toBe(false);
   });
 });

@@ -65,6 +65,13 @@ export interface BackendConfig {
    */
   toolRouting?: 'backend' | 'local';
   /**
+   * The provider gets no native tools and no directory grants, whatever the
+   * turn's attachments, and none of passthroughArgs (task 0321ccf1). Set
+   * only by startBackendTurn, from the process latch, together with 'local'
+   * routing. Only claude honours it; startBackendTurn refuses the others.
+   */
+  withholdProviderTools?: boolean;
+  /**
    * Media files for the LOGICAL turn (spec:provider-media-injection),
    * passed on every spawn of that turn — delivery, reseed, and tool-loop
    * continuations alike. Injecting adapters embed them in the prompt

@@ -68,6 +68,7 @@ import {
 import {
   startBackendTurn,
   runBackendTurn,
+  withholdProviderToolsForThisProcess,
   type BackendRunResult,
   type BackendRunRequest,
 } from '../repl/backend-runner.js';
@@ -264,6 +265,12 @@ type ChatOptions = {
   profile?: string;
   /** A profile the chat must run under; a CLI without this option refuses it as unknown. */
   requireProfile?: string;
+  /**
+   * False under `--no-provider-tools`: the provider gets no tools of its own
+   * on any spawn (backend-runner.ts). A CLI without the option refuses it as
+   * unknown.
+   */
+  providerTools?: boolean;
   message?: string;
   messageLabel?: string;
   attachFile?: string[];
@@ -3768,6 +3775,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     process.exit(78); // EX_CONFIG
   }
   const launchProfileName = options.requireProfile ?? options.profile;
+  let profileWithholdsProviderTools = false;
   if (launchProfileName) {
     const launchProfile = applyLaunchProfile(toolPolicy, launchProfileName);
     if (!launchProfile.ok) {
@@ -3775,7 +3783,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
       process.exit(78); // EX_CONFIG
     }
     runtime.toolMode = toolPolicy.getMode();
+    profileWithholdsProviderTools = launchProfile.withholdProviderTools;
     console.log(chalk.green(launchProfile.message));
+  }
+
+  // No provider tools (task 0321ccf1): --no-provider-tools, or a profile that
+  // implies it. Latched before any turn can spawn, for the life of this
+  // process; startBackendTurn applies it to every spawn. It needs ink-owned
+  // routing on Claude, the one backend that can withhold every native tool,
+  // and the chat refuses to start without both rather than run unbounded.
+  if (options.providerTools === false || profileWithholdsProviderTools) {
+    if (runtime.toolRouting !== 'local' || runtime.backend !== 'claude') {
+      console.error(
+        chalk.red(
+          `No provider tools needs --tool-routing local on the claude backend (got ${runtime.toolRouting} on ${runtime.backend})`
+        )
+      );
+      process.exit(78); // EX_CONFIG
+    }
+    withholdProviderToolsForThisProcess();
   }
 
   // --session-candidates / --session-candidates-json: list what the session
@@ -10260,6 +10286,10 @@ export function registerChatCommand(program: Command): void {
       .option(
         '--require-profile <name>',
         'Apply a security profile and refuse to start without it (server spawns)'
+      )
+      .option(
+        '--no-provider-tools',
+        "Give the backend no tools or directory access of its own, only ink's (Claude, local routing)"
       )
       .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
