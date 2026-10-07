@@ -288,3 +288,53 @@ describe('bareToolName', () => {
     expect(bareToolName('get_inbox')).toBe('get_inbox');
   });
 });
+
+describe('createLocalToolDispatcher — Inkwell parameter help', () => {
+  const parameters = (names: string[], strict: boolean) => ({
+    names,
+    required: [] as string[],
+    strict,
+  });
+
+  it("adds an Inkwell tool's parameters to its validation refusal", async () => {
+    const toolParameters = vi.fn(async () => parameters(['content', 'senderSlug'], true));
+    const { deps } = makeDeps({
+      toolParameters,
+      callInk: vi.fn(async () => {
+        throw new Error(
+          "Inkwell tool call failed: Input validation error: Invalid arguments for tool send_to_inbox: Unrecognized key(s) in object: 'sbSlug'"
+        );
+      }),
+    });
+
+    await expect(
+      createLocalToolDispatcher(deps)('mcp__inkwell__send_to_inbox', { sbSlug: 'kin' }, {})
+    ).rejects.toThrow(
+      /Parameters of send_to_inbox: content, senderSlug\.\s*Not parameters of send_to_inbox: sbSlug\./
+    );
+    expect(toolParameters).toHaveBeenCalledWith('send_to_inbox');
+  });
+
+  it("compares the model's own arguments, not the credential-resolved ones", async () => {
+    const { deps } = makeDeps({
+      toolParameters: async () => parameters(['query'], false),
+      callInk: vi.fn(async () => ({ success: true }) as InkToolCallResult),
+    });
+
+    const result = payloadOf(
+      await createLocalToolDispatcher(deps)('recall', { query: '$TOKEN', stray: 1 }, {})
+    );
+    // `resolved` is the fake resolver's addition, never the model's.
+    expect(result.ignoredParameters.names).toEqual(['stray']);
+  });
+
+  it('never looks parameters up for a runtime tool or for describe_tool itself', async () => {
+    const toolParameters = vi.fn(async () => parameters([], true));
+    const { deps } = makeDeps({ toolParameters });
+    const dispatch = createLocalToolDispatcher(deps);
+
+    await dispatch('read', { path: 'a.ts' }, {});
+    await dispatch('describe_tool', { name: 'send_to_inbox' }, {});
+    expect(toolParameters).not.toHaveBeenCalled();
+  });
+});
