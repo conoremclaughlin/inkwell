@@ -95,4 +95,22 @@ describe('approval requests paged on Postgres', () => {
       expect(Date.parse(seen[i].createdAt)).toBeLessThanOrEqual(Date.parse(seen[i - 1].createdAt));
     }
   });
+
+  it('refuses a cursor naming a time Postgres would reject, as a bad request', async () => {
+    const filter = { userId: fixture.userId, workspaceId: fixture.workspaceId, sbId };
+    // Each fits the old shape check, and Postgres refuses each with an error,
+    // which reached the person as a 500 (Lumen, #767).
+    for (const c of [
+      '2026-02-30T08:00:00+00:00',
+      '2026-13-01T08:00:00+00:00',
+      '2026-10-07T25:00:00+00:00',
+      '2026-10-07T08:00:00+16:00',
+      '0000-01-01T00:00:00+00:00',
+    ]) {
+      const before = Buffer.from(JSON.stringify({ c, i: created[0] })).toString('base64url');
+      await expect(
+        readApprovalsPage(dc.getClient(), filter, { limit: 1, before }, Date.now)
+      ).rejects.toMatchObject({ status: 400, message: 'That page cursor is not valid' });
+    }
+  });
 });
