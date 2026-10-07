@@ -1300,6 +1300,17 @@ describe('documents on a withheld turn (task 0321ccf1 follow-up)', () => {
       expect(out!.text.length).toBe(MAX_DOCUMENT_TEXT_CHARS + 1);
     });
 
+    it('brings a blank PDF back with no text, though pdf-parse marks its page (Lumen, #775)', () => {
+      const out = extractPdfTextSync(minimalPdf([]), MAX_PDF_PAGES);
+      expect(out).toEqual({ text: '', pages: 1, total: 1 });
+    });
+
+    it("keeps pdf-parse's page markers in a PDF that has text, for the model to cite a page", () => {
+      const out = extractPdfTextSync(minimalPdf(['Page one words']), MAX_PDF_PAGES);
+      expect(out!.text).toContain('Page one words');
+      expect(out!.text).toContain('-- 1 of 1 --');
+    });
+
     it('returns null for bytes that are not a PDF, never throwing', () => {
       expect(extractPdfTextSync(Buffer.from('%PDF-1.4 not really'), MAX_PDF_PAGES)).toBeNull();
       expect(extractPdfTextSync(Buffer.alloc(0), MAX_PDF_PAGES)).toBeNull();
@@ -1412,6 +1423,37 @@ describe('documents on a withheld turn (task 0321ccf1 follow-up)', () => {
       }
     });
 
+    it('refuses a real blank PDF as having no text, through the real child, and shows nothing of it', () => {
+      const blank = { path: '/synthetic/blank.pdf', mimeType: 'application/pdf' };
+      const encoded = encodeDocumentBlocks([blank], 0, () => minimalPdf([]));
+      expect(encoded.blocks).toEqual([]);
+      expect(encoded.rejected).toEqual([
+        { media: blank, reason: 'no text could be extracted (it may hold only scanned images)' },
+      ]);
+
+      const pdf = join(uploadDir, 'blank.pdf');
+      writeFileSync(pdf, minimalPdf([]));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const prepared = prepare({
+        withholdProviderTools: true,
+        media: [{ path: pdf, mimeType: 'application/pdf' }],
+        deliverMedia: true,
+      });
+      try {
+        expect(toolsOf(prepared.args)).toEqual(['']);
+        expect(grantsOf(prepared.args)).toEqual([]);
+        // Nothing but the prompt: no block for the blank PDF.
+        expect(prepared.args).not.toContain('--input-format');
+        expect(prepared.stdinData).toContain(
+          '- blank.pdf (application/pdf) — no text could be extracted (it may hold only scanned images)'
+        );
+        expect(prepared.stdinData).not.toContain('-- 1 of 1 --');
+      } finally {
+        prepared.cleanup();
+        warn.mockRestore();
+      }
+    });
+
     it('re-delivers on a reseed and a resumed delivery, and not on a continuation', () => {
       const txt = join(uploadDir, 'up2.txt');
       writeFileSync(txt, 'remember this');
@@ -1483,6 +1525,23 @@ describe('documents on a withheld turn (task 0321ccf1 follow-up)', () => {
         })
       ).toThrow('withholdProviderTools requires ink-owned (local) tool routing');
       expect(vi.mocked(execFileSyncForTest).mock.calls.length).toBe(calls);
+    });
+
+    it('refuses before an image is read, too: an unreadable one raises no media warning', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(() =>
+          prepare({
+            withholdProviderTools: true,
+            toolRouting: 'backend',
+            media: [{ path: join(uploadDir, 'missing.png'), mimeType: 'image/png' }],
+            deliverMedia: true,
+          })
+        ).toThrow('withholdProviderTools requires ink-owned (local) tool routing');
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it("counts documents in the request budget before a tool's context images", () => {

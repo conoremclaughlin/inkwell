@@ -214,7 +214,12 @@ process.stdin.on('end', async () => {
   const parser = new PDFParse({ data: new Uint8Array(Buffer.concat(chunks)), isEvalSupported: false });
   try {
     const result = await parser.getText({ first: Number(process.argv[2]) });
-    process.stdout.write(JSON.stringify({ text: result.text.slice(0, Number(process.argv[3])), total: result.total }));
+    // result.text carries the page markers pdf-parse appends ('-- 1 of 1 --'),
+    // which help the model cite a page but which a blank PDF has as well. So
+    // it counts as text only when one of the pages has some (Lumen, #775).
+    const hasText = result.pages.some((page) => page.text.trim() !== '');
+    const text = hasText ? result.text : '';
+    process.stdout.write(JSON.stringify({ text: text.slice(0, Number(process.argv[3])), total: result.total }));
   } finally {
     await parser.destroy();
   }
@@ -420,6 +425,15 @@ export class ClaudeAdapter implements BackendAdapter {
 
     const args: string[] = [];
 
+    // Withheld (task 0321ccf1): refused first, before any file is read, if
+    // the routing isn't ink-owned. startBackendTurn never asks for this;
+    // refuse rather than spawn a provider that keeps its own tools and the
+    // project's MCP servers.
+    const withhold = config.withholdProviderTools === true;
+    if (withhold && config.toolRouting !== 'local') {
+      throw new Error('withholdProviderTools requires ink-owned (local) tool routing');
+    }
+
     // Media injection (spec:provider-media-injection): embed images as
     // base64 content blocks in a stream-json user message instead of having
     // the provider pull them via native Read. Requires prompt mode (the
@@ -454,17 +468,10 @@ export class ClaudeAdapter implements BackendAdapter {
         '(fail-closed; no filesystem fallback). Tell the user, naming each file:\n' +
         encoded.rejected.map((r) => `- ${r.media.path} — ${r.reason}`).join('\n');
     }
-    // Withheld (task 0321ccf1): with no native tool there is no native read,
-    // so a document is read here and shown as text on the delivery spawn,
-    // and anything that can't be shown is named to the model as unopened
-    // rather than left for it to look for a way in. Refused first if the
-    // routing isn't ink-owned, before any file is read.
-    const withhold = config.withholdProviderTools === true;
-    if (withhold && config.toolRouting !== 'local') {
-      // startBackendTurn never asks for this; refuse rather than spawn a
-      // provider that keeps its own tools and the project's MCP servers.
-      throw new Error('withholdProviderTools requires ink-owned (local) tool routing');
-    }
+    // Withheld: with no native tool there is no native read, so a document
+    // is read here and shown as text on the delivery spawn, and anything
+    // that can't be shown is named to the model as unopened rather than left
+    // for it to look for a way in.
     const documents =
       withhold && config.prompt && config.deliverMedia && classified.nativeRead.length > 0
         ? encodeDocumentBlocks(classified.nativeRead, encoded?.totalBytes ?? 0)
