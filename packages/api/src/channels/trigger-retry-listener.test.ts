@@ -137,6 +137,9 @@ function rig(options: RigOptions = {}) {
   const chainEndings: Array<Record<string, unknown>> = [];
   const inkmail: unknown[][] = [];
   const routed: unknown[][] = [];
+  const closingHooks: unknown[][] = [];
+  /** What closingTextTurnHooks hands back, so a test can find it on the request. */
+  const closingHooksMade = { start: async () => {}, end: async () => {} };
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -329,6 +332,11 @@ function rig(options: RigOptions = {}) {
     routeResponses: async (...args: unknown[]) => {
       routed.push(args);
     },
+    // The inkling closing-text hooks (inkling-closing-text.ts), recorded, not run.
+    closingTextTurnHooks: (...args: unknown[]) => {
+      closingHooks.push(args);
+      return closingHooksMade;
+    },
     RoutingRefusedError,
     sendTriggerFailureNotice: loadModule(resolve(API_SRC, 'services/trigger-failure-notice.ts'), {
       '../utils/logger': { logger: silentLogger },
@@ -389,6 +397,8 @@ function rig(options: RigOptions = {}) {
     chainEndings,
     inkmail,
     routed,
+    closingHooks,
+    closingHooksMade,
     chain,
     row,
     threadPayload,
@@ -644,6 +654,37 @@ describe('server.ts wiring', () => {
     expect(
       parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
     ).toBe('startServer');
+  });
+});
+
+describe("an inkling turn that sent nothing (task 9edf62fe): the handler's part", () => {
+  // inkling-closing-text.test.ts decides what is posted, and session-service
+  // runs the hooks around each turn. This checks that the shipping handler
+  // builds them from the wake and hands them to the turn, before the turn runs.
+  it('hands the turn hooks built from its wake to the request it runs', async () => {
+    const r = rig();
+
+    await r.gateway.handler!(r.threadPayload);
+
+    expect(r.closingHooks).toHaveLength(1);
+    const [, wake] = r.closingHooks[0];
+    expect(wake).toEqual({
+      userId: 'user-synthetic',
+      identityId: 'identity-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: 'pr:42',
+      threadMessageId: 'message-synthetic',
+    });
+    expect(r.requests[0]?.turnHooks).toBe(r.closingHooksMade);
+  });
+
+  it('hands none to a trigger that names no thread message', async () => {
+    const r = rig();
+
+    await r.gateway.handler!({ ...r.threadPayload, threadMessageId: undefined });
+
+    expect(r.closingHooks).toHaveLength(0);
+    expect(r.requests[0]?.turnHooks).toBeUndefined();
   });
 });
 

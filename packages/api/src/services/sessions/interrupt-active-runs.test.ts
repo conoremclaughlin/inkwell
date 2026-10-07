@@ -1411,19 +1411,29 @@ describe('turn-epoch candidate threading (round 9)', () => {
       'sessionRoutingOptions(pending.request, pending.turnEpochCandidate)'
     );
     // A dequeued message runs in runQueuedTurn, whether it stayed on its lock
-    // or moved to the lock of the session it re-resolved to.
+    // or moved to the lock of the session it re-resolved to, through runTurn,
+    // which hands the same candidate to processMessage.
     const runner = source.indexOf('private async runQueuedTurn(');
     const dequeueRun =
       runner +
       source
         .slice(runner)
         .search(
-          /this\.processMessage\(\s*pending\.request,\s*session,\s*pending\.turnEpochCandidate\s*\)/
+          /this\.runTurn\(\s*pending\.request,\s*session,\s*pending\.turnEpochCandidate\s*\)/
         );
+    const turn = source.indexOf('private async runTurn(');
+    const forwarded =
+      turn +
+      source
+        .slice(turn)
+        .search(/this\.processMessage\(\s*request,\s*session,\s*turnEpochCandidate\s*\)/);
     expect(queued).toBeGreaterThan(-1);
     expect(dequeueRoute).toBeGreaterThan(-1);
     expect(runner).toBeGreaterThan(dequeueRoute);
     expect(dequeueRun).toBeGreaterThan(runner);
+    expect(turn).toBeGreaterThan(-1);
+    expect(forwarded).toBeGreaterThan(turn);
+    expect(forwarded).toBeLessThan(source.indexOf('private async callTurnHook('));
   });
 
   it('BOTH lease acquisitions in withStudioLease stamp the candidate', () => {

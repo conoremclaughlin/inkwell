@@ -332,6 +332,26 @@ export interface SessionRequest {
    * to the run's final text.
    */
   onTurnReply?: TurnReplyHandler;
+
+  /**
+   * Called around this request's own turn, whichever path runs it: directly,
+   * from the queue, or as the lead of wakes merged into one turn. See
+   * SessionTurnHooks.
+   */
+  turnHooks?: SessionTurnHooks;
+}
+
+/**
+ * A caller's view of one turn, in turn order. `start` runs before the turn
+ * begins and `end` runs with its result the moment it returns, before the next
+ * queued turn on the session starts. handleMessage's own promise can settle
+ * much later, once the queue behind it has drained, so a decision that must
+ * belong to this turn alone is made here (Lumen, #769). Neither can fail the
+ * turn: SessionService logs a throw and goes on.
+ */
+export interface SessionTurnHooks {
+  start(): Promise<void>;
+  end(result: SessionResult): Promise<void>;
 }
 
 export interface ChannelResponse {

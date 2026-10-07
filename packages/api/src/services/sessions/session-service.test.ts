@@ -245,6 +245,111 @@ describe('SessionService', () => {
     );
   });
 
+  describe('turn hooks: each turn, in turn order (Lumen, #769)', () => {
+    const deferred = <T>() => {
+      let resolve!: (v: T) => void;
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    };
+    const hooksLogging = (order: string[], name: string, ended?: unknown[]) => ({
+      start: async () => {
+        order.push(`start ${name}`);
+      },
+      end: async (result: unknown) => {
+        order.push(`end ${name}`);
+        ended?.push(result);
+      },
+    });
+
+    it('wraps a direct turn: start before it runs, end with its result as admitted', async () => {
+      const order: string[] = [];
+      const ended: unknown[] = [];
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      vi.spyOn(sessionService as any, 'processMessage').mockImplementation(async () => {
+        order.push('turn');
+        return createMockClaudeResult({ finalTextResponse: 'done' });
+      });
+
+      const result = await sessionService.handleMessage({
+        ...createMockRequest(),
+        turnHooks: hooksLogging(order, 'A', ended),
+      } as never);
+
+      expect(order).toEqual(['start A', 'turn', 'end A']);
+      expect(ended).toEqual([
+        expect.objectContaining({ success: true, admitted: true, finalTextResponse: 'done' }),
+      ]);
+      expect(result.success).toBe(true);
+    });
+
+    it('ends a turn before the next queued one starts, although the first caller settles only after it', async () => {
+      const order: string[] = [];
+      const enteredA = deferred<void>();
+      const enteredB = deferred<void>();
+      const endA = deferred<unknown>();
+      const endB = deferred<unknown>();
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      vi.spyOn(sessionService as any, 'processMessage')
+        .mockImplementationOnce(async () => {
+          order.push('turn A');
+          enteredA.resolve();
+          return endA.promise;
+        })
+        .mockImplementationOnce(async () => {
+          order.push('turn B');
+          enteredB.resolve();
+          return endB.promise;
+        });
+
+      const a = sessionService.handleMessage({
+        ...createMockRequest({ content: 'A' }),
+        turnHooks: hooksLogging(order, 'A'),
+      } as never);
+      await enteredA.promise;
+      const b = sessionService.handleMessage({
+        ...createMockRequest({ content: 'B' }),
+        turnHooks: hooksLogging(order, 'B'),
+      } as never);
+      for (let n = 0; n < 50 && !(sessionService as any).pendingQueues.size; n++) {
+        await Promise.resolve();
+      }
+      expect((sessionService as any).pendingQueues.size).toBe(1);
+
+      endA.resolve(createMockClaudeResult({ finalTextResponse: 'Closing A' }));
+      await enteredB.promise;
+      // A's decision is made while B is still running: before it, in fact.
+      expect(order).toEqual(['start A', 'turn A', 'end A', 'start B', 'turn B']);
+
+      endB.resolve(createMockClaudeResult({ finalTextResponse: 'Closing B' }));
+      await Promise.all([a, b]);
+      expect(order).toEqual(['start A', 'turn A', 'end A', 'start B', 'turn B', 'end B']);
+    });
+
+    it('a hook that throws never fails the turn', async () => {
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      const turn = vi
+        .spyOn(sessionService as any, 'processMessage')
+        .mockResolvedValue(createMockClaudeResult({ finalTextResponse: 'done' }));
+
+      const result = await sessionService.handleMessage({
+        ...createMockRequest(),
+        turnHooks: {
+          start: async () => {
+            throw new Error('start exploded');
+          },
+          end: async () => {
+            throw new Error('end exploded');
+          },
+        },
+      } as never);
+
+      expect(turn).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ success: true, finalTextResponse: 'done' });
+    });
+  });
+
   /**
    * pr:558 (2026-09-01): the post-run finalization write hit a transient DB
    * error and the throw rode up through the trigger handler — the sender was

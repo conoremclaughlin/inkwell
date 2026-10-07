@@ -140,6 +140,9 @@ beforeEach(() => {
   resetReplyChains();
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
+  // An SB writes with its owner's role, read from the membership table, on
+  // every send path the server takes for it (Lumen, #769).
+  db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
   sb('pip', OWNER_TEST_INKLING);
   sb('fern');
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
@@ -231,8 +234,6 @@ describe('a conversation with an inkling is only between it and its owner (Lumen
 
   it("the inkling's own reply in its owner's conversation is stored (MCP tool path)", async () => {
     await call(create, { key: KEY, recipients: ['pip'], content: 'hi' });
-    // An SB writes with its owner's role, read from the membership table.
-    db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
     // A turn's MCP token binds the inkling's own identity.
     vi.mocked(getRequestContext).mockImplementation(
       () => ({ userId: ME, sbId: 'sb-pip', sbSlug: 'pip' }) as never
@@ -406,6 +407,8 @@ describe('an inkling replies only in a conversation it already shares with its o
   it("an inkling not born under the owner test, or another account's, may not reply", async () => {
     sb('old', { client: 'inkling-mobile', named: false });
     sb('elsewhere', OWNER_TEST_INKLING, SOMEONE);
+    // A member, so the owner test is what refuses, not the owner's role.
+    db.seed('workspace_members', { workspace_id: WS, user_id: SOMEONE, role: 'owner' });
     for (const [slug, owner] of [
       ['old', ME],
       ['elsewhere', SOMEONE],
@@ -445,6 +448,7 @@ describe('with more than one account in the owner test, each reaches only its ow
     // The list alone, with the single-account variable unset.
     vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
     vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', `${ME},${SOMEONE}`);
+    db.seed('workspace_members', { workspace_id: WS, user_id: SOMEONE, role: 'owner' });
     sb('moss', OWNER_TEST_INKLING, SOMEONE);
   });
 
@@ -804,8 +808,6 @@ describe('membership is fixed for every writer: add_thread_participant (Lumen 0d
       slug: 'personal',
       archived_at: null,
     });
-    // An SB writes with its owner's role, read from the membership table.
-    db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
   });
 
   /** add_thread_participant as an MCP caller bound to `actor`, or as the person when null. */

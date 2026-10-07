@@ -61,6 +61,7 @@ import {
   inTurnNote,
   replyChainWakeDue,
 } from './services/inklings/inkling-reply-chain';
+import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
 import {
   TriggerRetryScheduler,
   getTriggerAttempt,
@@ -1785,6 +1786,21 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       Boolean(payload.threadMessageId || payload.inboxMessageId) &&
       payload.forceSpawn !== true &&
       payload.metadata?.strategyTrigger !== true;
+
+    // An inkling's turn that ends without a word to its owner posts its
+    // closing text as its message (task 9edf62fe). Decided in the turn's own
+    // hooks, as that turn ends and before the next queued one starts: this
+    // handler's handleMessage can settle only once the queue behind it has
+    // drained (Lumen, #769).
+    if (payload.threadId && payload.threadMessageId && resolvedIdentityId) {
+      request.turnHooks = closingTextTurnHooks(dataComposer!, {
+        userId,
+        identityId: resolvedIdentityId,
+        threadId: payload.threadId,
+        threadKey: payload.threadKey,
+        threadMessageId: payload.threadMessageId,
+      });
+    }
 
     let result: SessionResult;
     try {

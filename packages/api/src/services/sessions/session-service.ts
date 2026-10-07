@@ -1973,7 +1973,7 @@ export class SessionService implements ISessionService {
       logger.debug('Acquired processing lock', { lockKey });
 
       try {
-        const result = await this.processMessage(request, session, turnEpochCandidate);
+        const result = await this.runTurn(request, session, turnEpochCandidate);
         // If the initial lock-holder failed with a non-retryable error,
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
@@ -2182,11 +2182,7 @@ export class SessionService implements ISessionService {
     session: Session
   ): Promise<void> {
     try {
-      const result = await this.processMessage(
-        pending.request,
-        session,
-        pending.turnEpochCandidate
-      );
+      const result = await this.runTurn(pending.request, session, pending.turnEpochCandidate);
       // Same admission evidence as the direct path: resolution succeeded
       // before this turn ran, so whatever the turn did, routing admitted it.
       pending.resolve({ ...result, admitted: true });
@@ -2305,7 +2301,7 @@ export class SessionService implements ISessionService {
 
       let result: SessionResult;
       try {
-        result = await this.processMessage(request, members[members.length - 1].session, epoch);
+        result = await this.runTurn(request, members[members.length - 1].session, epoch);
       } catch (error) {
         for (const { pending } of members) reject(pending, error);
         this.flushQueueOnNonRetryableError(
@@ -2437,6 +2433,42 @@ export class SessionService implements ISessionService {
         }
         this.pendingQueues.delete(lockKey);
       }
+    }
+  }
+
+  /**
+   * One turn of `request`, with its caller's turn hooks around it
+   * (SessionTurnHooks). Every path that runs a turn comes through here, so a
+   * hook sees each of its request's turns, in turn order, before the next
+   * queued turn begins. A turn that throws has no end to report.
+   */
+  private async runTurn(
+    request: SessionRequest,
+    session: Session,
+    turnEpochCandidate?: string
+  ): Promise<SessionResult> {
+    const hooks = request.turnHooks;
+    if (hooks) await this.callTurnHook('start', request, () => hooks.start());
+    const result = await this.processMessage(request, session, turnEpochCandidate);
+    // Every caller of this reports the turn as admitted: it ran.
+    if (hooks)
+      await this.callTurnHook('end', request, () => hooks.end({ ...result, admitted: true }));
+    return result;
+  }
+
+  private async callTurnHook(
+    which: 'start' | 'end',
+    request: SessionRequest,
+    hook: () => Promise<void>
+  ): Promise<void> {
+    try {
+      await hook();
+    } catch (error) {
+      logger.warn(`A turn ${which} hook failed; the turn goes on`, {
+        sbSlug: request.sbSlug,
+        threadKey: request.metadata?.threadKey,
+        error: serializeError(error),
+      });
     }
   }
 
