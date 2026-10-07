@@ -1701,6 +1701,63 @@ describe('SessionService', () => {
           expect(config.inkProvider).toBeUndefined();
         });
 
+        it("another SB on ink runs the provider its identity names, with that provider's model; none named is left to the chat (task f5acf0f5)", async () => {
+          const cases = [
+            { provider: 'codex-cli', inkProvider: 'codex', model: 'codex-test-model' },
+            { provider: 'codex', inkProvider: 'codex', model: 'codex-test-model' },
+            { provider: 'claude-code', inkProvider: 'claude', model: 'claude-test-model' },
+            { provider: null, inkProvider: undefined, model: 'claude-test-model' },
+          ];
+          for (const { provider } of cases) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ provider }));
+            const result = await turn({}, { sender: { id: 'system', name: 'x' } }, OWNER, {
+              session: { backend: 'ink' },
+            });
+            expect(result.errorCode, String(provider)).toBeUndefined();
+          }
+          const configs = vi
+            .mocked(mockInkRunner.run)
+            .mock.calls.map(([, options]) => options.config);
+          expect(configs).toHaveLength(cases.length);
+          cases.forEach(({ provider, inkProvider, model }, i) => {
+            expect(configs[i].inkProvider, String(provider)).toBe(inkProvider);
+            expect(configs[i].model, String(provider)).toBe(model);
+          });
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        });
+
+        it('another SB on ink whose provider ink does not run is refused by name, never run as Claude', async () => {
+          for (const provider of ['gemini', 'antigravity', 'something-else']) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ provider }));
+            const result = await turn({}, { sender: { id: 'system', name: 'x' } }, OWNER, {
+              session: { backend: 'ink' },
+            });
+            expect(result, provider).toMatchObject({
+              success: false,
+              errorCode: 'INK_PROVIDER_UNSUPPORTED',
+              classification: { retryable: false },
+            });
+            expect(result.error, provider).toContain(`"${provider}"`);
+          }
+          expectNothingRan();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          // Nothing ran, so nothing about the session was rewritten.
+          expect(runtimeRewrites()).toEqual([]);
+        });
+
+        it('an SB on a direct runner is untouched: its own runner, and no ink provider', async () => {
+          vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(
+            contextWith({ provider: 'gemini' })
+          );
+          await turn({}, { sender: { id: 'system', name: 'x' } }, OWNER, {
+            session: { backend: 'codex-cli' },
+          });
+          expect(mockCodexRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(configPassedToRunner(mockCodexRunner).inkProvider).toBeUndefined();
+        });
+
         it("another SB keeps its stored runtime: a direct Claude session isn't moved to ink", async () => {
           await turn({}, { sender: { id: 'system', name: 'x' } });
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);

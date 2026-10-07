@@ -7,7 +7,7 @@
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 import type { GroupState } from './stop-process';
-import type { InklingProvider } from '../inklings/inkling-runtime';
+import type { InkProvider } from './ink-provider';
 
 // ─── Channel Types ───
 
@@ -905,11 +905,11 @@ export interface ClaudeRunnerConfig {
   constitutionInjected?: boolean;
   /**
    * The provider InkRunner tells `ink chat` to run (`--backend`). Unset leaves
-   * the chat's own default, as every ordinary SB's spawn does. An inkling's
-   * turn always sets it (inklings/inkling-runtime.ts), so its provider never
-   * rests on that default.
+   * the chat's own default, as an ordinary SB whose identity names no provider
+   * gets. An inkling's turn always sets it (inklings/inkling-runtime.ts), and
+   * an ordinary SB's does when its identity names one (ink-provider.ts).
    */
-  inkProvider?: InklingProvider;
+  inkProvider?: InkProvider;
   /**
    * An inkling's turn only: the tool-policy file `ink chat` reads instead of
    * the machine's (INK_TOOL_POLICY_PATH), with the `inkling` profile in place
