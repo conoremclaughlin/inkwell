@@ -88,6 +88,14 @@ vi.mock('./studio-complete', async () => {
   };
 });
 
+// What is running from a worktree is read from the host by default. This
+// suite pins the teardown's decisions, so the default here is "nothing", and
+// the in-use cases inject their own answer (worktree-in-use.test.ts runs the
+// real check).
+vi.mock('./worktree-in-use', () => ({
+  worktreeInUse: vi.fn(async () => ({ state: 'idle' })),
+}));
+
 // Every ephemeral mint in this file materializes under an isolated root —
 // never the real ~/.ink/studios. Restored so parallel-worker siblings that
 // share this process env are unaffected after the file completes.
@@ -1212,6 +1220,178 @@ describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
       expect(conflictCall?.[3]?.reason).toContain('teardown-aborted-rescue-failed');
     } finally {
       await rm(nonRepoDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+});
+
+describe('StudioOverflowService.teardownEphemeralStudio — a worktree in use (task 7ec05d10)', () => {
+  // On 2026-10-07 the sweep removed an expired ephemeral checkout 17 s into a
+  // Codex turn spawned there, under a running Metro: the turn held no lease.
+  const running = {
+    state: 'in-use' as const,
+    processes: [{ pid: 4242, command: 'node', cwd: '/ws/inkling--canonical' }],
+  };
+
+  function fixtures() {
+    const update = vi.fn().mockResolvedValue(makeStudio());
+    const studios = { markCleaned: vi.fn(), update } as unknown as StudiosRepository;
+    const claim = makeTeardownClaim();
+    const leases = {
+      logEvent: vi.fn(),
+      claimForTeardown: vi.fn().mockResolvedValue(claim),
+      verifyClaim: vi.fn().mockResolvedValue(true),
+      clearTeardownClaim: vi.fn().mockResolvedValue(true),
+      finalizeTeardown: vi.fn().mockResolvedValue(true),
+    } as unknown as StudioLeaseService & Record<string, ReturnType<typeof vi.fn>>;
+    return { studios, update, leases, claim };
+  }
+
+  for (const [label, use] of [
+    ['something is running from it', running],
+    ['the check could not run', { state: 'unknown' as const, error: 'spawn lsof ENOENT' }],
+  ] as const) {
+    it(`backs out before the rescue when ${label}`, async () => {
+      // A directory that is not a git repo: had the teardown gone on, the
+      // rescue would have failed and left the claim as a quarantine.
+      const dir = await mkdtemp(path.join(tmpdir(), 'overflow-inuse-'));
+      try {
+        const f = fixtures();
+        const inUse = vi.fn().mockResolvedValue(use);
+        const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+        await service.teardownEphemeralStudio(
+          makeStudio({ ephemeral: true, worktreePath: dir, repoRoot: dir }),
+          { reason: 'expired' }
+        );
+
+        expect(inUse).toHaveBeenCalledWith(dir);
+        // Its own claim is cleared, so the studio is not left quarantined.
+        expect(f.leases.clearTeardownClaim).toHaveBeenCalledWith('parent-1', 'user-1', f.claim);
+        expect(f.studios.markCleaned).not.toHaveBeenCalled();
+        expect(f.leases.finalizeTeardown).not.toHaveBeenCalled();
+        // The sweep looks again later.
+        const [, patch] = f.update.mock.calls[0] as [string, { expiresAt: string }];
+        expect(Date.parse(patch.expiresAt)).toBeGreaterThan(Date.now() + 10 * 60 * 1000);
+        const conflict = f.leases.logEvent.mock.calls.find((c) => c[2] === 'conflict');
+        expect(conflict?.[3]?.reason).toBe('teardown-skipped-in-use (expired)');
+        // Nothing on disk was touched.
+        await expect(access(dir)).resolves.toBeUndefined();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('goes on when nothing is running from it', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'overflow-idle-'));
+    try {
+      const f = fixtures();
+      const inUse = vi.fn().mockResolvedValue({ state: 'idle' });
+      const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: dir, repoRoot: dir }),
+        { reason: 'expired' }
+      );
+
+      // It reached the rescue, which fails on a non-repo and keeps the claim.
+      expect(f.leases.clearTeardownClaim).not.toHaveBeenCalled();
+      const conflict = f.leases.logEvent.mock.calls.find((c) => c[2] === 'conflict');
+      expect(conflict?.[3]?.reason).toContain('teardown-aborted-rescue-failed');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('backs out at the last moment when a process starts during the rescue', async () => {
+    const repoRoot = await makeGitRepo();
+    const worktree = `${repoRoot}--live`;
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', 'eph/live', worktree, 'main'], {
+        cwd: repoRoot,
+      });
+      const f = fixtures();
+      // Idle when the teardown starts; in use by the time it would remove.
+      const inUse = vi.fn().mockResolvedValueOnce({ state: 'idle' }).mockResolvedValue(running);
+      const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: worktree, repoRoot }),
+        { reason: 'expired' }
+      );
+
+      expect(inUse).toHaveBeenCalledTimes(2);
+      await expect(access(worktree)).resolves.toBeUndefined();
+      expect(f.leases.clearTeardownClaim).toHaveBeenCalledWith('parent-1', 'user-1', f.claim);
+      expect(f.leases.finalizeTeardown).not.toHaveBeenCalled();
+      expect(f.studios.markCleaned).not.toHaveBeenCalled();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not remove when the claim changes during the final process probe (Lumen, #766)', async () => {
+    const repoRoot = await makeGitRepo();
+    const worktree = `${repoRoot}--claim-moved`;
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', 'eph/claim-moved', worktree, 'main'], {
+        cwd: repoRoot,
+      });
+      const f = fixtures();
+      let claimStillOurs = true;
+      (f.leases.verifyClaim as ReturnType<typeof vi.fn>).mockImplementation(
+        async () => claimStillOurs
+      );
+      // The final probe is the long await: another worker takes the studio
+      // while it runs.
+      const inUse = vi
+        .fn()
+        .mockResolvedValueOnce({ state: 'idle' })
+        .mockImplementationOnce(async () => {
+          claimStillOurs = false;
+          return { state: 'idle' };
+        });
+      const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: worktree, repoRoot }),
+        { reason: 'expired' }
+      );
+
+      await expect(access(worktree)).resolves.toBeUndefined();
+      expect(f.leases.finalizeTeardown).not.toHaveBeenCalled();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('still removes an idle clean worktree', async () => {
+    const repoRoot = await makeGitRepo();
+    const worktree = `${repoRoot}--idle`;
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', 'eph/idle', worktree, 'main'], {
+        cwd: repoRoot,
+      });
+      const f = fixtures();
+      const inUse = vi.fn().mockResolvedValue({ state: 'idle' });
+      const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: worktree, repoRoot }),
+        { reason: 'expired' }
+      );
+
+      expect(inUse).toHaveBeenCalledTimes(2);
+      await expect(access(worktree)).rejects.toThrow();
+      expect(f.leases.finalizeTeardown).toHaveBeenCalled();
+    } finally {
+      await rm(repoRoot, { recursive: true, force: true });
     }
   });
 });
