@@ -153,8 +153,13 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
   async function launch(config: Record<string, unknown>) {
     const env = await launchOnce(config);
     const [, args] = spawnMock.mock.calls[0] as [string, string[]];
-    const profile = args[args.indexOf('--profile') + 1];
-    return { env, profile, away: args.includes('--away') };
+    const flagged = (flag: string) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : null);
+    return {
+      env,
+      profile: flagged('--profile'),
+      required: flagged('--require-profile'),
+      away: args.includes('--away'),
+    };
   }
   const POLICY = '/home/synthetic/.ink/inklings/.tool-policy/0a1b2c3d.json';
 
@@ -165,7 +170,10 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
       sbSlug: 'kindle-0a1b2c3d',
       inklingToolPolicyPath: POLICY,
     });
-    expect(launched.profile).toBe('inkling');
+    // Required, not merely named: a CLI without --require-profile refuses it
+    // as unknown, where it would take --profile inkling and carry on (Lumen, #773).
+    expect(launched.required).toBe('inkling');
+    expect(launched.profile).toBeNull();
     expect(launched.away).toBe(true);
     expect(launched.env.INK_TOOL_POLICY_PATH).toBe(POLICY);
   });
@@ -173,6 +181,7 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
   it('leaves every other spawn on the safe profile and the policy it already had', async () => {
     const launched = await launch({ workingDirectory: '/tmp', sbSlug: 'myra' });
     expect(launched.profile).toBe('safe');
+    expect(launched.required).toBeNull();
     expect('INK_TOOL_POLICY_PATH' in launched.env).toBe(false);
   });
 });

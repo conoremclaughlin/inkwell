@@ -309,13 +309,20 @@ describe('the inkling profile (task 0321ccf1)', () => {
     return { policy, dir };
   }
 
-  it('denies the shell, file edits and writes, waking an agent and send_response, whatever is granted', () => {
+  it('denies the shell, file edits and writes, shared-image reads, waking an agent and send_response, whatever is granted', () => {
     const { policy, dir } = withMachineGrants();
     try {
       // The control: before the profile, the machine's grant opens the shell.
       expect(policy.canCallInkTool('bash').allowed).toBe(true);
       expect(applyProfile(policy, 'inkling').success).toBe(true);
-      for (const tool of ['bash', 'edit', 'write', 'trigger_agent', 'send_response']) {
+      for (const tool of [
+        'bash',
+        'edit',
+        'write',
+        'view_image',
+        'trigger_agent',
+        'send_response',
+      ]) {
         const decision = policy.canCallInkTool(tool);
         expect(decision.allowed, tool).toBe(false);
         // Denied, not asked: nobody answers a prompt in an away turn.
@@ -364,9 +371,19 @@ describe('a launch profile (task 0321ccf1)', () => {
 
   it('stops the chat when it refuses: chat.ts exits rather than running unbounded', () => {
     const source = readFileSync(join(__dirname, '../commands/chat.ts'), 'utf8');
-    const call = source.indexOf('applyLaunchProfile(toolPolicy, options.profile)');
+    // --require-profile wins, else --profile: either one is applied, or the chat stops.
+    expect(source).toContain(
+      'const launchProfileName = options.requireProfile ?? options.profile;'
+    );
+    const call = source.indexOf('applyLaunchProfile(toolPolicy, launchProfileName)');
     expect(call).toBeGreaterThan(-1);
-    const refusal = source.slice(call, call + 400);
-    expect(refusal).toMatch(/if \(!launchProfile\.ok\) \{[^}]*process\.exit\(78\)/);
+    expect(source.slice(call, call + 400)).toMatch(
+      /if \(!launchProfile\.ok\) \{[^}]*process\.exit\(78\)/
+    );
+    // Two different profiles named at once is a refusal too, before either is applied.
+    const conflict = source.indexOf('Conflicting profiles');
+    expect(conflict).toBeGreaterThan(-1);
+    expect(conflict).toBeLessThan(call);
+    expect(source.slice(conflict, conflict + 300)).toMatch(/process\.exit\(78\)/);
   });
 });

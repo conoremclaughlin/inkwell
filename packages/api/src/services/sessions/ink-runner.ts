@@ -400,9 +400,16 @@ export class InkRunner implements IRunner {
     // write/comms tools. Away mode routes approval prompts to the user's
     // inbox (2FA) instead of auto-denying. An inkling's turn runs the
     // inkling profile instead, against its own policy file (task 0321ccf1):
-    // the shell, file writes, waking another agent and send_response are
-    // denied outright, and the machine's grants are never read.
-    args.push('--profile', config.inklingToolPolicyPath ? 'inkling' : 'safe', '--away');
+    // the shell, file writes, shared-image reads, waking another agent and
+    // send_response are denied outright, and the machine's grants are never
+    // read. It names the profile with --require-profile, which a CLI built
+    // before that option refuses as unknown before anything runs (Lumen,
+    // #773): an old CLI would take --profile inkling, warn and carry on.
+    if (config.inklingToolPolicyPath) {
+      args.push('--require-profile', 'inkling', '--away');
+    } else {
+      args.push('--profile', 'safe', '--away');
+    }
 
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").

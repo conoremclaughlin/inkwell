@@ -62,25 +62,29 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
   },
   /**
    * An inkling's own turn (task 0321ccf1). Denied outright, so no grant in
-   * the policy file can open them: the shell, which is the one local tool
-   * not confined to the working directory; file edits and writes; waking
-   * another agent; and send_response, which an inkling, answering in its
-   * conversation thread, never needs. Its reply, send_to_inbox, stays
-   * allowed, as do reads, which stay inside its own folder. The server
-   * also runs it against a policy file of its own, so the machine's grants
-   * are never read at all; these denials hold either way.
+   * the policy file can open them: the shell, which is not confined to the
+   * working directory; view_image, whose roots include the shared
+   * ~/.ink/files (Lumen, #773: another account's image was reachable);
+   * file edits and writes; waking another agent; and send_response, which
+   * an inkling, answering in its conversation thread, never needs. Its
+   * reply, send_to_inbox, stays allowed, as do the Pi reads (read, grep,
+   * find, ls), which validatePathArgs keeps inside its own folder. Media a
+   * person sends reaches the turn through ink chat's own attachment
+   * encoding, not through view_image. The server also runs it against a
+   * policy file of its own, so the machine's grants are never read at all;
+   * these denials hold either way.
    *
    * No allow list: one would narrow every tool to the names on it.
    */
   inkling: {
     label: 'Inkling',
     description:
-      "An inkling's turn: no shell, no file edits or writes, never wakes another agent; it replies in its own conversation.",
+      "An inkling's turn: no shell, no file edits or writes, no shared-image reads, never wakes another agent; it replies in its own conversation.",
     mode: 'backend',
     safeSpecs: ['group:ink-safe'],
     allowSpecs: [],
     promptSpecs: [],
-    denySpecs: ['group:write', 'trigger_agent', 'send_response'],
+    denySpecs: ['group:write', 'view_image', 'trigger_agent', 'send_response'],
   },
 };
 
