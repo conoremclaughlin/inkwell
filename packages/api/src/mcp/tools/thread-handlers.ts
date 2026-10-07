@@ -603,16 +603,18 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const parsed = getThreadMessagesSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  // Omitted, the caller reads as itself: the slug its token was minted for,
-  // else the one its own session context names. A wake tells an SB to read
-  // its thread, and a brand-new inkling that left the slug out failed its
-  // very first turn on the required field (debug:inkling-first-reply). The
-  // participant check below still decides what it may read.
+  // Omitted, the caller reads as itself: the slug its token was minted for
+  // (or, over stdio, bootstrap's pin), else the one its own session context
+  // names. A wake tells an SB to read its thread, and a brand-new inkling that
+  // left the slug out failed its very first turn on the required field
+  // (debug:inkling-first-reply). The two branches stay apart: an explicit
+  // slug keeps the existing pinning rule, and getEffectiveSlug(undefined)
+  // would return the context's routing hint ahead of the token (Lumen, #763
+  // r1). The participant check below still decides what it may read.
   const sbSlug =
-    getEffectiveSlug(parsed.sbSlug) ??
-    parsed.sbSlug ??
-    resolveCallerIdentity().sbSlug ??
-    getRequestContext()?.sbSlug;
+    parsed.sbSlug !== undefined
+      ? (getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug)
+      : (resolveCallerIdentity().sbSlug ?? getRequestContext()?.sbSlug);
   if (!sbSlug) {
     return {
       content: [
