@@ -195,6 +195,17 @@ export class FakeQuery implements PromiseLike<FakeResult> {
     return this;
   }
 
+  lt(column: string, value: unknown): this {
+    this.filters.push({
+      label: `${column}<${String(value)}`,
+      test: (row) => {
+        const own = read(row, column);
+        return own !== null && own !== undefined && String(own) < String(value);
+      },
+    });
+    return this;
+  }
+
   in(column: string, values: unknown[]): this {
     this.inListLengths.push(values.length);
     this.filters.push({

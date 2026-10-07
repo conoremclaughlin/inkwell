@@ -155,6 +155,12 @@ type AdminAuthRequest = Request & {
   inkUserId: string;
   inkWorkspaceId: string;
   inkWorkspaceRole: WorkspaceMemberRole | 'trusted';
+  /**
+   * The canonical identity an agent's access token was signed for, on the
+   * routes that accept one (CLI transcript sync and approval requests).
+   * Absent for a person's cookie or token. Never read from a header.
+   */
+  inkTokenSbId?: string;
 };
 
 type CommentAuthorUser = {
@@ -1087,6 +1093,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     let inkUserId: string | undefined;
     let userEmail: string | undefined;
+    let tokenSbId: string | undefined;
     let issueTokenCookies = false;
 
     // --- Tier 1: Inkwell admin access JWT (local, ~0ms) ---
@@ -1108,6 +1115,9 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       if (mcpPayload) {
         inkUserId = mcpPayload.sub;
         userEmail = mcpPayload.email;
+        // A runner's token is signed for one identity; keep that, so an
+        // approval request records who asked from a signed source.
+        tokenSbId = mcpPayload.sbId ?? mcpPayload.identityId;
       }
     }
 
@@ -1341,6 +1351,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     authReq.inkUserId = inkUserId!;
     authReq.inkWorkspaceId = activeWorkspaceId;
     authReq.inkWorkspaceRole = activeWorkspaceRole || 'trusted';
+    authReq.inkTokenSbId = tokenSbId;
 
     // Wrap the rest of the request in context
     runWithRequestContext(
@@ -4458,6 +4469,31 @@ router.get('/inklings/:id/profile', async (req: Request, res: Response) => {
     res.json({ profile });
   } catch (error) {
     answerInklingError(res, "Failed to read the inkling's profile", error);
+  }
+});
+
+/**
+ * GET /api/admin/inklings/:id/approvals?limit=&before= → 200 { approvals, nextBefore }
+ *
+ * The approval requests one of the person's own inklings made, newest first,
+ * read-only (ink://designs/inkling-approvals-extension §A). Each is its id,
+ * tool, purpose, status, createdAt, expiresAt and resolvedAt; never the
+ * tool's input, the grant, or who decided. The same 404 as the profile for
+ * anything that isn't one of the caller's inklings. Not cached by anything
+ * between, error answers included. Nothing here approves or denies.
+ */
+router.get('/inklings/:id/approvals', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const authReq = req as AdminAuthRequest;
+    const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+    const page = await (
+      await inklingService()
+    ).approvals(inklingScope(authReq), req.params.id, { limit, before });
+    res.json(page);
+  } catch (error) {
+    answerInklingError(res, "Failed to read the inkling's approvals", error);
   }
 });
 
@@ -10509,6 +10545,36 @@ function normalizeApprovalOrigin(
   };
 }
 
+/**
+ * The canonical requester of an approval request: the identity the caller's
+ * agent token was signed for, if it is one of this user's identities, with
+ * that identity's own workspace. Anything else, a person's cookie, a token
+ * for another user's identity or a failed read, records no requester, and the
+ * request itself goes ahead exactly as before.
+ */
+async function signedApprovalRequester(
+  supabase: SupabaseClient,
+  authReq: AdminAuthRequest
+): Promise<{ sbId: string | null; workspaceId: string | null }> {
+  const none = { sbId: null, workspaceId: null };
+  if (!isUuid(authReq.inkTokenSbId)) return none;
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('id, workspace_id')
+    .eq('id', authReq.inkTokenSbId)
+    .eq('user_id', authReq.inkUserId)
+    .maybeSingle();
+  const row = data as { id: string; workspace_id: string | null } | null;
+  if (error || !row) {
+    logger.warn('Approval request recorded without a signed requester', {
+      tokenSbId: authReq.inkTokenSbId,
+      reason: error ? error.message : 'no identity of this user',
+    });
+    return none;
+  }
+  return { sbId: row.id, workspaceId: row.workspace_id };
+}
+
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -10562,12 +10628,30 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     const studioIdForInsert = studioId && UUID_RE.test(studioId) ? studioId : null;
     const sessionIdForInsert = sessionId && UUID_RE.test(sessionId) ? sessionId : null;
 
+    // Who asked, from the signed token only: its identity, when that names an
+    // identity of this same user, and that identity's own workspace. The
+    // scoped Approvals read lists only these (ink://designs/inkling-approvals-
+    // extension §A). The header slug above stays as requesting_agent_id, which
+    // the approval interceptor scopes by; it is never promoted to this.
+    const requester = await signedApprovalRequester(supabase, authReq);
+    if (!requester.sbId && requestingSlug !== 'unknown') {
+      // A request an SB made with a person's token, for instance after its
+      // runner token expired and ink chat fell back to the stored login. It
+      // works as before, but its inkling's Approvals view won't list it.
+      logger.warn('Approval request from an SB without a signed requester', {
+        requestingSlug,
+        tool,
+      });
+    }
+
     const { data, error } = await supabase
       .from('approval_requests')
       .insert({
         user_id: authReq.inkUserId,
         studio_id: studioIdForInsert,
         session_id: sessionIdForInsert,
+        sb_id: requester.sbId,
+        workspace_id: requester.workspaceId,
         requesting_agent_id: requestingSlug,
         tool,
         args: args || null,

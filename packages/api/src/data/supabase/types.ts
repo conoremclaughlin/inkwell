@@ -762,6 +762,7 @@ export type Database = {
           metadata: Json | null;
           reason: string | null;
           requesting_agent_id: string;
+          sb_id: string | null;
           resolved_at: string | null;
           session_id: string | null;
           status: string;
@@ -770,6 +771,7 @@ export type Database = {
           tool: string;
           updated_at: string | null;
           user_id: string;
+          workspace_id: string | null;
         };
         Insert: {
           action?: string | null;
@@ -783,6 +785,7 @@ export type Database = {
           reason?: string | null;
           requesting_agent_id: string;
           resolved_at?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           status?: string;
           studio_id?: string | null;
@@ -790,6 +793,7 @@ export type Database = {
           tool: string;
           updated_at?: string | null;
           user_id: string;
+          workspace_id?: string | null;
         };
         Update: {
           action?: string | null;
@@ -802,6 +806,7 @@ export type Database = {
           metadata?: Json | null;
           reason?: string | null;
           requesting_agent_id?: string;
+          sb_id?: string | null;
           resolved_at?: string | null;
           session_id?: string | null;
           status?: string;
@@ -810,6 +815,7 @@ export type Database = {
           tool?: string;
           updated_at?: string | null;
           user_id?: string;
+          workspace_id?: string | null;
         };
         Relationships: [
           {
