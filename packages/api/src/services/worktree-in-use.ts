@@ -58,6 +58,17 @@ export function parseLsofCwd(output: string): WorktreeProcess[] {
   return processes;
 }
 
+/**
+ * Characters lsof does not print as themselves in a name: control
+ * characters (a newline becomes `\\n`, others `\\xNN` or `^X`) and the
+ * backslash it escapes with. A worktree path holding one would never equal
+ * its own listing, so no process inside it could be seen (Lumen, #766: a
+ * live child under a directory with a newline in its name read as idle).
+ * Paths beneath a clean root still match, because their escaped form keeps
+ * the root's own characters as its prefix.
+ */
+const ESCAPED_BY_LSOF = /[\u0000-\u001f\u007f\\]/;
+
 /** True when `cwd` is the root itself or anywhere beneath it. */
 export function isInside(cwd: string, root: string): boolean {
   return cwd === root || cwd.startsWith(root.endsWith('/') ? root : `${root}/`);
@@ -71,10 +82,16 @@ type Exec = (
 
 export async function worktreeInUse(
   worktreePath: string,
-  deps: { exec?: Exec; resolve?: (path: string) => Promise<string> } = {}
+  deps: {
+    exec?: Exec;
+    resolve?: (path: string) => Promise<string>;
+    /** This process, which always has a cwd and so must be in a complete listing. */
+    selfPid?: number;
+  } = {}
 ): Promise<WorktreeUse> {
   const exec = deps.exec ?? (execFileAsync as unknown as Exec);
   const resolve = deps.resolve ?? realpath;
+  const selfPid = deps.selfPid ?? process.pid;
 
   let root: string;
   try {
@@ -83,6 +100,9 @@ export async function worktreeInUse(
     // A worktree that is not on disk has nothing running from it.
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { state: 'idle' };
     return { state: 'unknown', error: error instanceof Error ? error.message : String(error) };
+  }
+  if (ESCAPED_BY_LSOF.test(root)) {
+    return { state: 'unknown', error: 'worktree path has characters lsof prints escaped' };
   }
 
   let stdout: string;
@@ -102,6 +122,13 @@ export async function worktreeInUse(
     return { state: 'unknown', error: error instanceof Error ? error.message : String(error) };
   }
 
-  const processes = parseLsofCwd(stdout).filter((p) => isInside(p.cwd, root));
+  const listed = parseLsofCwd(stdout);
+  // A listing that succeeded can still be empty or cut short. This process
+  // always has a cwd, so a listing that lacks it is not the whole picture,
+  // and "nothing found in it" proves nothing (Lumen, #766).
+  if (!listed.some((p) => p.pid === selfPid)) {
+    return { state: 'unknown', error: 'lsof listing does not include this process' };
+  }
+  const processes = listed.filter((p) => isInside(p.cwd, root));
   return processes.length > 0 ? { state: 'in-use', processes } : { state: 'idle' };
 }

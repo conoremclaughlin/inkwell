@@ -1226,8 +1226,15 @@ export class StudioOverflowService {
         return;
       }
 
+      // Again at the last moment: something may have started in the
+      // worktree while the rescue ran.
+      if (await this.backOutIfInUse(studio, claim, opts.reason)) return;
+
       // Token revalidation immediately before destruction: if our claim aged
       // out and another worker took over, the removal is theirs, not ours.
+      // After the process probe, never before it: that probe awaits lsof for
+      // up to 15 seconds, long enough for a stale claim to be replaced
+      // (Lumen, #766).
       if (!(await this.leases.verifyClaim(studio.id, studio.userId, claim))) {
         logger.warn('[StudioOverflow] Teardown aborted — claim no longer ours', {
           studioId: studio.id,
@@ -1235,10 +1242,6 @@ export class StudioOverflowService {
         });
         return;
       }
-
-      // Again at the last moment: something may have started in the
-      // worktree while the rescue ran.
-      if (await this.backOutIfInUse(studio, claim, opts.reason)) return;
 
       await execFileAsync('git', ['worktree', 'remove', studio.worktreePath], {
         cwd: studio.repoRoot,

@@ -1333,6 +1333,44 @@ describe('StudioOverflowService.teardownEphemeralStudio — a worktree in use (t
     }
   });
 
+  it('does not remove when the claim changes during the final process probe (Lumen, #766)', async () => {
+    const repoRoot = await makeGitRepo();
+    const worktree = `${repoRoot}--claim-moved`;
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', 'eph/claim-moved', worktree, 'main'], {
+        cwd: repoRoot,
+      });
+      const f = fixtures();
+      let claimStillOurs = true;
+      (f.leases.verifyClaim as ReturnType<typeof vi.fn>).mockImplementation(
+        async () => claimStillOurs
+      );
+      // The final probe is the long await: another worker takes the studio
+      // while it runs.
+      const inUse = vi
+        .fn()
+        .mockResolvedValueOnce({ state: 'idle' })
+        .mockImplementationOnce(async () => {
+          claimStillOurs = false;
+          return { state: 'idle' };
+        });
+      const service = new StudioOverflowService(f.studios, f.leases, inUse);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: worktree, repoRoot }),
+        { reason: 'expired' }
+      );
+
+      await expect(access(worktree)).resolves.toBeUndefined();
+      expect(f.leases.finalizeTeardown).not.toHaveBeenCalled();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it('still removes an idle clean worktree', async () => {
     const repoRoot = await makeGitRepo();
     const worktree = `${repoRoot}--idle`;

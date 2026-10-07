@@ -55,11 +55,46 @@ describe('isInside', () => {
 
 describe('worktreeInUse', () => {
   const resolve = async (p: string) => p;
+  /** The fixture's launchd line stands in for this process. */
+  const SELF = 404;
+
+  it('is unknown for a listing that succeeded but is empty, or lacks this process (Lumen, #766)', async () => {
+    for (const stdout of ['', 'p101\nczsh\nfcwd\nn/elsewhere\n']) {
+      const use = await worktreeInUse('/Users/me/ws/inkling--canonical', {
+        exec: async () => ({ stdout }),
+        resolve,
+        selfPid: SELF,
+      });
+      expect(use.state).toBe('unknown');
+    }
+  });
+
+  it('is unknown for a worktree path lsof would print escaped', async () => {
+    for (const root of ['/ws/new\nline', '/ws/tab\there', '/ws/back\\slash', '/ws/del\u007f']) {
+      const use = await worktreeInUse(root, {
+        exec: async () => ({ stdout: LSOF_OUTPUT }),
+        resolve,
+        selfPid: SELF,
+      });
+      expect(use.state).toBe('unknown');
+    }
+  });
+
+  it('still matches paths with spaces and non-ASCII letters', async () => {
+    const listing = 'p404\nclaunchd\nfcwd\nn/\np7\ncnode\nfcwd\nn/ws/my canonical é/app\n';
+    const use = await worktreeInUse('/ws/my canonical é', {
+      exec: async () => ({ stdout: listing }),
+      resolve,
+      selfPid: SELF,
+    });
+    expect(use.state).toBe('in-use');
+  });
 
   it('names the processes running from the worktree, and only those', async () => {
     const use = await worktreeInUse('/Users/me/ws/inkling--canonical', {
       exec: async () => ({ stdout: LSOF_OUTPUT }),
       resolve,
+      selfPid: SELF,
     });
     expect(use).toEqual({
       state: 'in-use',
@@ -74,6 +109,7 @@ describe('worktreeInUse', () => {
     const use = await worktreeInUse('/Users/me/ws/elsewhere', {
       exec: async () => ({ stdout: LSOF_OUTPUT }),
       resolve,
+      selfPid: SELF,
     });
     expect(use).toEqual({ state: 'idle' });
   });
@@ -101,6 +137,7 @@ describe('worktreeInUse', () => {
         throw partial;
       },
       resolve,
+      selfPid: SELF,
     });
     // Even for a path nothing in that listing uses: the listing is not
     // known to be complete.
@@ -171,5 +208,18 @@ describe.skipIf(!hasLsof)('worktreeInUse against the real lsof', () => {
     child.kill('SIGKILL');
     await exited;
     expect(await worktreeInUse(dir)).toEqual({ state: 'idle' });
+  });
+
+  it('never reads a live child under a directory with a newline in its name as idle', async () => {
+    dir = await realpath(await mkdtemp(path.join(tmpdir(), 'worktree-in-use-nl-')));
+    const odd = path.join(dir, 'new\nline');
+    await mkdir(odd);
+    child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000); console.log("ready")'], {
+      cwd: odd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    await new Promise<void>((resolve) => child!.stdout!.once('data', () => resolve()));
+
+    expect((await worktreeInUse(odd)).state).not.toBe('idle');
   });
 });
