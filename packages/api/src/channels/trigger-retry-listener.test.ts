@@ -672,6 +672,13 @@ describe('the thread describes itself in the prompt the SB actually reads', () =
     );
   });
 
+  it('names the recipient in the fetch it tells the SB to make (debug:inkling-first-reply)', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    const content = (r.requests.at(-1) as { content: string }).content;
+    expect(content).toContain('get_thread_messages(threadKey: "pr:42", sbSlug: "recipient-test")');
+  });
+
   it('asks for the description as the recipient, not as the sender', async () => {
     const r = rig();
 

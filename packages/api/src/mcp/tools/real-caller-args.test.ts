@@ -109,6 +109,15 @@ describe('real caller args survive validation', () => {
     });
   });
 
+  it('get_thread_messages as a fresh inkling made it: threadKey alone (debug:inkling-first-reply)', async () => {
+    // A new inkling's first turn failed here on 2026-10-06: the call carried
+    // no sbSlug, which was required, so validation refused it before the
+    // handler could read the caller's identity.
+    await expectArgsAccepted('get_thread_messages', {
+      threadKey: 'chat:conversation-00000000-0000-4000-8000-000000000001',
+    });
+  });
+
   it('start_session from the ink launcher resuming a transcript — claude.ts:3058, 3103', async () => {
     // `backendSessionId` is the key the drifted inline schema refused. Every
     // `ink -a` that resumed a transcript whose row had left the launcher's
