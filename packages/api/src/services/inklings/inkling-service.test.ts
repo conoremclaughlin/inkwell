@@ -424,6 +424,140 @@ describe('the awakening soul', () => {
   });
 });
 
+describe('profile (Lumen 2026-10-07 privacy contract)', () => {
+  /** Writes onto the stored identity row, as an identity update would. */
+  function write(id: string, changes: Row) {
+    Object.assign(rowsOf('agent_identities').find((r) => r.id === id)!, changes);
+  }
+
+  it('reads one of my inklings: its soul and its own values, and nothing else on the row', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    write(inkling.id, {
+      soul: '# Soul\nCurious, and kind about it.',
+      values: ['honesty', '', 7, 'care'],
+      heartbeat: 'operational instructions',
+      relationships: { conor: 'friend' },
+      capabilities: ['email'],
+      backend: 'claude-code',
+      description: 'An inkling',
+      metadata: { client: 'inkling-mobile', runtimeConfig: { model: 'x' } },
+    });
+    const profile = await service.profile(ME, inkling.id);
+    expect(Object.keys(profile).sort()).toEqual([
+      'createdAt',
+      'displayName',
+      'id',
+      'identityUpdatedAt',
+      'soul',
+      'values',
+    ]);
+    expect(profile).toMatchObject({
+      id: inkling.id,
+      displayName: null,
+      soul: '# Soul\nCurious, and kind about it.',
+      values: ['honesty', 'care'],
+    });
+    expect(profile.createdAt).toBe(inkling.createdAt);
+  });
+
+  it('reads as not written when the soul is blank and the values are missing or not a list', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    for (const [soul, values] of [
+      [null, null],
+      ['   ', { core: ['x'] }],
+      ['', 'honesty'],
+    ] as const) {
+      write(inkling.id, { soul, values });
+      expect(await service.profile(ME, inkling.id)).toMatchObject({ soul: null, values: [] });
+    }
+  });
+
+  it('shows the name once named', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    await service.name(ME, inkling.id, 'Pip');
+    expect((await service.profile(ME, inkling.id)).displayName).toBe('Pip');
+  });
+
+  it('is the same 404 for anything that is not one of my inklings here', async () => {
+    service = as(ME, { awakenCap: null });
+    const mine = await service.awaken(ME, REQUEST);
+    const elsewhere = await service.awaken(
+      { ...ME, workspaceId: OTHER_WORKSPACE },
+      '5e8a1b2c-3d4f-4e6a-8b9c-0d1e2f3a4b5c'
+    );
+    const theirs = await as(SOMEONE_ELSE).awaken(
+      SOMEONE_ELSE,
+      '7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d'
+    );
+    const housemates = await as(HOUSEMATE).awaken(
+      HOUSEMATE,
+      '9e8d7c6b-5a49-4382-8170-6f5e4d3c2b1a'
+    );
+    const agent = seedOwnSb(db, ME, 'myra');
+    const lookalike = db.seed('agent_identities', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      agent_id: 'lookalike',
+      name: 'Lookalike',
+      metadata: { client: 'inkling-mobile', named: true },
+    });
+    for (const id of [
+      'not-a-uuid',
+      'e5c4b3a2-1f0e-4d9c-8b7a-6f5e4d3c2b1a',
+      elsewhere.inkling.id,
+      theirs.inkling.id,
+      housemates.inkling.id,
+      agent.id as string,
+      lookalike.id as string,
+    ]) {
+      await expect(service.profile(ME, id)).rejects.toMatchObject({
+        status: 404,
+        message: 'No inkling with that id',
+      });
+    }
+    // The tag is required as well as the lineage: an inkling's row losing it isn't one.
+    write(mine.inkling.id, { metadata: { named: false } });
+    await expect(service.profile(ME, mine.inkling.id)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('refuses a malformed id before any read (Postgres would error on it as a uuid)', async () => {
+    const before = db.log.length;
+    await expect(service.profile(ME, 'not-a-uuid')).rejects.toMatchObject({ status: 404 });
+    expect(db.log.slice(before)).toEqual([]);
+  });
+
+  it('a failed read is an error, never an empty profile', async () => {
+    const failing = new Proxy(
+      {},
+      {
+        get: (_target, prop) =>
+          prop === 'maybeSingle'
+            ? async () => ({ data: null, error: { message: 'connection reset' } })
+            : () => failing,
+      }
+    );
+    const broken = new InklingService(failing as unknown as SupabaseClient);
+    await expect(broken.profile(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a')).rejects.toThrow(
+      "Failed to read the inkling's profile: connection reset"
+    );
+  });
+
+  it('reads with every scope filter: the id, the person, the workspace and the inkling tag', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    const before = db.log.length;
+    await service.profile(ME, inkling.id);
+    const read = db.log.slice(before).find((e) => e.table === 'agent_identities')!;
+    expect(read.filters).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(inkling.id),
+        expect.stringContaining(ME.userId),
+        expect.stringContaining(ME.workspaceId),
+        expect.stringContaining('inkling-mobile'),
+      ])
+    );
+  });
+});
+
 describe('list', () => {
   it("lists only the person's inklings in this workspace, oldest first, unnamed as null", async () => {
     // Three awakenings for ME across two workspaces: past the per-person cap,
