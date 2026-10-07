@@ -2678,8 +2678,12 @@ export class SessionService implements ISessionService {
     // An ordinary SB's ink turn runs the provider its identity names, named to
     // `ink chat` so the model chosen for that provider meets the provider that
     // runs it (ink-provider.ts). One ink does not run is refused here, before
-    // anything is written or spawned, never run as Claude in its place. An
-    // inkling's provider was decided with its runtime above.
+    // the provider is launched and before the session's runtime or native id
+    // is rewritten, never run as Claude in its place. (The message is already
+    // logged, and its session row may already exist or hold a lease.) An
+    // inkling's provider was decided with its runtime above. triggerCompaction
+    // builds its own runner and names no provider; it runs only for
+    // claude-code sessions today, so it is outside this decision.
     if (resolvedBackend === 'ink' && !inklingTurn) {
       const choice = inkProviderFor(injectedContext.agent.provider);
       if (!choice.ok) {
