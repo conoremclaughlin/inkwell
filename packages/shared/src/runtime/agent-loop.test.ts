@@ -513,6 +513,92 @@ describe('runAgentLoop — refused iterations', () => {
     expect(result.stopReason).toBe('all-refused');
   });
 
+  // The Oct 7 inkling reply: the model passed `sbSlug` to send_to_inbox, the
+  // strict schema refused it, and the turn ended on the FINAL relay with the
+  // reply unsent. An unwatched turn now gets to fix the argument and send.
+  const UNRECOGNIZED =
+    "Input validation error: Invalid arguments for tool send_to_inbox: Unrecognized key(s) in object: 'sbSlug'";
+  const rejectsSbSlug = (calls: LocalToolCall[]): ToolResultRecord[] =>
+    calls.map((c) =>
+      'sbSlug' in c.args
+        ? { tool: c.tool, result: UNRECOGNIZED, status: 'error' }
+        : { tool: c.tool, result: '{"success":true}', status: 'executed', args: c.args }
+    );
+  const replyTurns = () => [
+    outcome({
+      responseText: inkTool('send_to_inbox', {
+        threadKey: 'chat:c1',
+        sbSlug: 'kin',
+        content: 'Hi',
+      }),
+    }),
+    outcome({ responseText: inkTool('send_to_inbox', { threadKey: 'chat:c1', content: 'Hi' }) }),
+    outcome({ responseText: 'Sent.' }),
+  ];
+
+  it('lets an unwatched turn fix a call that failed and send it', async () => {
+    const harness = makePorts(replyTurns(), rejectsSbSlug);
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnFailure: true },
+      harness.ports
+    );
+
+    // The error reached the model on an ordinary continuation, not the FINAL
+    // relay, and the corrected call it made there was run.
+    expect(harness.prompts[1].isContinuation).toBe(true);
+    expect(harness.prompts[1].body).toContain('Unrecognized key');
+    expect(harness.prompts[1].body).not.toContain('FINAL');
+    expect(harness.executed).toHaveLength(2);
+    expect(harness.executed[1][0].args).toEqual({ threadKey: 'chat:c1', content: 'Hi' });
+    expect(result.stopReason).not.toBe('all-refused');
+  });
+
+  it('without it, the same failure still ends the turn on the FINAL relay', async () => {
+    const harness = makePorts(replyTurns(), rejectsSbSlug);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // The model is shown the error once more, but nothing it asks for runs.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('FINAL');
+    expect(harness.executed).toHaveLength(1);
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('still ends an unwatched turn on a deliberate refusal alone', async () => {
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('bash') }), outcome({ responseText: 'second turn' })],
+      () => [blocked('bash')]
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnFailure: true },
+      harness.ports
+    );
+
+    // A denial or block was somebody's decision; asking again would nag them.
+    expect(harness.prompts).toHaveLength(1);
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('stops an unwatched turn at the cap when the call keeps failing', async () => {
+    const harness = makePorts(
+      Array.from({ length: 5 }, () =>
+        outcome({ responseText: inkTool('send_to_inbox', { sbSlug: 'kin', content: 'Hi' }) })
+      ),
+      rejectsSbSlug
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnFailure: true, maxIterations: 3 },
+      harness.ports
+    );
+
+    expect(result.iterations).toBe(3);
+    expect(result.stopReason).toBe('all-refused');
+  });
+
   /**
    * A failure is not a refusal, and the advice for each is the opposite.
    *
