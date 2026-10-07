@@ -2311,3 +2311,68 @@ describe('send_to_inbox keeps the whole subject on the message row', () => {
     expect(messages.find((m) => m.id === 'without-subject')).not.toHaveProperty('subject');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// A caller that names no sbSlug reads as itself (debug:inkling-first-reply)
+//
+// On 2026-10-06 a brand-new inkling's first turn called
+// get_thread_messages(threadKey) as its wake told it to, without sbSlug. The
+// field was required, so the call failed validation and the turn ended
+// without ever reading the person's first message. Omitted now, the slug is
+// the caller's own: its agent token's, else its session context's.
+// ═══════════════════════════════════════════════════════════════════
+
+describe('handleGetThreadMessages — a caller that names no sbSlug reads as itself', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  async function readAs(context: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(context as never);
+    try {
+      const result = await handleGetThreadMessages(
+        { email: 'test@test.com', threadKey: 'pr:guard', ...extra },
+        guardComposer(createGuardMockSupabase([guardMsg('m-1', 1)], { joinedAt: null }))
+      );
+      return JSON.parse(result.content[0].text);
+    } finally {
+      vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    }
+  }
+  async function readAsSlug() {
+    const { resolveCallerSb } = await import('./caller-principal');
+    return vi.mocked(resolveCallerSb).mock.calls.at(-1)?.[2];
+  }
+
+  it('reads as the identity its agent token was minted for', async () => {
+    const parsed = await readAs({
+      agentTokenBound: true,
+      tokenSlug: 'kindle-a1',
+      sbSlug: 'an-enriched-hint',
+    });
+    expect(parsed.success).toBe(true);
+    expect(await readAsSlug()).toBe('kindle-a1');
+  });
+
+  it('reads as the identity its session context names, when no token is bound', async () => {
+    const parsed = await readAs({ sessionId: 'session-mock-123', sbSlug: 'kindle-b2' });
+    expect(parsed.success).toBe(true);
+    expect(await readAsSlug()).toBe('kindle-b2');
+  });
+
+  it('refuses, and says what to pass, when the request carries no identity at all', async () => {
+    const { resolveCallerSb } = await import('./caller-principal');
+    const parsed = await readAs({ sessionId: 'session-mock-123' });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/Pass sbSlug/);
+    expect(vi.mocked(resolveCallerSb)).not.toHaveBeenCalled();
+  });
+
+  it('an explicit sbSlug still decides, as before', async () => {
+    const parsed = await readAs(
+      { agentTokenBound: true, tokenSlug: 'kindle-a1' },
+      { sbSlug: 'wren' }
+    );
+    expect(parsed.success).toBe(true);
+    expect(await readAsSlug()).toBe('wren');
+  });
+});

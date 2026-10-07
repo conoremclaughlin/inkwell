@@ -13,6 +13,8 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { getRequestContext } from '../../utils/request-context';
+import { resolveCallerIdentity } from './caller-identity.js';
 import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -119,7 +121,12 @@ const sbSlugSchema = z.string().min(1).max(64);
 
 const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: z.string().describe('SB slug requesting access (must be a participant)'),
+  sbSlug: z
+    .string()
+    .optional()
+    .describe(
+      'SB slug requesting access (must be a participant). Omit to read as yourself: the identity your token or session names.'
+    ),
   limit: z.number().int().min(1).max(200).optional().default(50),
   beforeMessageId: z.string().guid().optional().describe('Cursor: get messages before this ID'),
   afterMessageId: z.string().guid().optional().describe('Cursor: get messages after this ID'),
@@ -596,7 +603,29 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const parsed = getThreadMessagesSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+  // Omitted, the caller reads as itself: the slug its token was minted for,
+  // else the one its own session context names. A wake tells an SB to read
+  // its thread, and a brand-new inkling that left the slug out failed its
+  // very first turn on the required field (debug:inkling-first-reply). The
+  // participant check below still decides what it may read.
+  const sbSlug =
+    getEffectiveSlug(parsed.sbSlug) ??
+    parsed.sbSlug ??
+    resolveCallerIdentity().sbSlug ??
+    getRequestContext()?.sbSlug;
+  if (!sbSlug) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            error: 'Pass sbSlug: this request carries no identity to read the thread as.',
+          }),
+        },
+      ],
+    };
+  }
   const {
     threadKey,
     limit,
