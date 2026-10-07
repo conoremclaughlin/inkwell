@@ -91,18 +91,20 @@ describe('worktreeInUse', () => {
     expect(use).toEqual({ state: 'idle' });
   });
 
-  it('uses the listing lsof printed when it exits non-zero over unreadable processes', async () => {
+  it('is unknown when lsof exits non-zero, even with a listing (Lumen, #766)', async () => {
     const partial = Object.assign(new Error('Command failed: lsof'), {
       code: 1,
       stdout: LSOF_OUTPUT,
     });
-    const use = await worktreeInUse('/Users/me/ws/inkling--canonical', {
+    const use = await worktreeInUse('/Users/me/ws/elsewhere', {
       exec: async () => {
         throw partial;
       },
       resolve,
     });
-    expect(use.state).toBe('in-use');
+    // Even for a path nothing in that listing uses: the listing is not
+    // known to be complete.
+    expect(use.state).toBe('unknown');
   });
 
   it('is unknown when lsof printed nothing, or was killed partway', async () => {

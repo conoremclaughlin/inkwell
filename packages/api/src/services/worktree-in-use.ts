@@ -11,6 +11,10 @@
  *
  * One `lsof` over every process's cwd, about a quarter of a second on a
  * busy Mac, run only when a teardown is about to happen.
+ *
+ * A best-effort backstop, not mutual exclusion: a process can start between
+ * the check and the removal. Closing that window needs every spawn and lease
+ * path to honour the teardown claim (task 7ec05d10).
  */
 
 import { execFile } from 'child_process';
@@ -88,19 +92,14 @@ export async function worktreeInUse(
       timeout: 15_000,
     }));
   } catch (error) {
-    // lsof exits non-zero when it could not read some processes, and still
-    // prints every process it could. The ones it cannot read belong to other
-    // OS users, and every turn, dev server and shell that uses a studio runs
-    // as this one, so that listing is the one that matters. No listing at
-    // all (lsof missing, a timeout) is a check that did not run.
-    // A run killed by the timeout printed only part of the list, so it
-    // stays unknown even when it has output.
-    const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown };
-    const partial = failed?.stdout;
-    if (failed?.killed || failed?.signal || typeof partial !== 'string' || partial.length === 0) {
-      return { state: 'unknown', error: error instanceof Error ? error.message : String(error) };
-    }
-    stdout = partial;
+    // Any failure is a check that did not prove the worktree idle: a
+    // missing lsof, a timeout, or a non-zero exit. lsof also exits non-zero
+    // when it could not read some processes, and the listing it still prints
+    // cannot be shown complete for this user's own processes (a permission
+    // or a process racing the read can drop one). Deferring a cleanup costs
+    // nothing; deleting a live checkout cost a night's canonical tree
+    // (Lumen, #766).
+    return { state: 'unknown', error: error instanceof Error ? error.message : String(error) };
   }
 
   const processes = parseLsofCwd(stdout).filter((p) => isInside(p.cwd, root));
