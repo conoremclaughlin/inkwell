@@ -6,11 +6,14 @@
  * fast, clearly-labelled error.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fetchWithTimeout, InkClient } from './ink-client';
+import { captureToolImages, takeCapturedImages } from '../repl/tool-images.js';
+import { isSemanticFailure, localToolLedgerLine } from '../repl/auto-evict.js';
+import { isErrorPayload } from '@inklabs/shared/runtime';
 
 const originalFetch = global.fetch;
 
@@ -264,6 +267,151 @@ describe('InkClient surfaces failed tool calls', () => {
     await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
       /failed without a text error message/
     );
+  });
+
+  describe('keeps image blocks that arrive beside text (PR #708)', () => {
+    // A real 1x1 PNG, so the capture step downstream can measure it.
+    const PNG_1X1 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const image = { type: 'image', data: PNG_1X1, mimeType: 'image/png' };
+    const respond = (content: unknown[]) => {
+      global.fetch = vi.fn(async () =>
+        okJson({ jsonrpc: '2.0', id: 1, result: { content } })
+      ) as unknown as typeof fetch;
+    };
+
+    it('beside a JSON payload: the payload unwrapped as before, the image on content', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true, name: 'chart' }) }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result.success).toBe(true);
+      expect(result.name).toBe('chart');
+      expect(result.content).toEqual([image]);
+    });
+
+    it('beside plain text', async () => {
+      respond([{ type: 'text', text: 'here is the chart' }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result).toEqual({ text: 'here is the chart', content: [image] });
+    });
+
+    it('beside a JSON value that is not an object', async () => {
+      respond([{ type: 'text', text: '[1,2]' }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result).toEqual({ result: [1, 2], content: [image] });
+    });
+
+    // Lumen, PR #708 round 2: a payload's own `content` is application data,
+    // and merging images into it erased a string or object and blended them
+    // into an array. Every shape is kept whole under `result`.
+    it.each([
+      ['a string', 'synthetic-caption-marker'],
+      ['an object', { caption: 'synthetic-caption-marker' }],
+      ['an array', ['synthetic-caption-marker']],
+      ['null', null],
+    ])(
+      'beside a payload whose own content is %s: the payload is kept whole',
+      async (_label, own) => {
+        const payload = { success: true, content: own };
+        respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+        const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+        // `success` is also copied up beside it (round 3, below).
+        expect(result).toEqual({ success: true, result: payload, content: [image] });
+      }
+    );
+
+    // Lumen, PR #708 round 3: nested under `result`, a failed call's flags were
+    // invisible to every failure predicate, and the ledger recorded a receipt.
+    // Checked with the production predicates, never a restatement of them.
+    describe("a wrapped payload's failure flags stay where the failure predicates read them", () => {
+      const call = async (payload: Record<string, unknown>) => {
+        respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+        const result = await makeClient().callTool('render_chart', {});
+        return { result, captured: await captureToolImages(result, captureOpts()) };
+      };
+      let cacheDir: string;
+      const captureOpts = () => ({
+        cacheDir: async () => cacheDir,
+        delivery: () => ({ deliverable: true }) as const,
+      });
+      beforeEach(() => {
+        cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-flags-'));
+      });
+      afterEach(() => rmSync(cacheDir, { recursive: true, force: true }));
+
+      // The predicates first: they are the contract. The shape is how it holds.
+      it('success: false reads as a failure, and the ledger says so', async () => {
+        const payload = { success: false, error: 'render failed', content: 'diagnostic' };
+        const { result, captured } = await call(payload);
+        expect(isSemanticFailure(captured)).toBe(true);
+        expect(localToolLedgerLine('render_chart', captured, JSON.stringify(captured))).toMatch(
+          /^Local tool failed \(render_chart\)/
+        );
+        expect(result).toEqual({ success: false, result: payload, content: [image] });
+      });
+
+      it('isError: true reads as a declared error', async () => {
+        const payload = { isError: true, content: { detail: 'diagnostic' } };
+        const { result, captured } = await call(payload);
+        expect(isErrorPayload(captured)).toBe(true);
+        expect(isSemanticFailure(captured)).toBe(true);
+        expect(result).toEqual({ isError: true, result: payload, content: [image] });
+      });
+
+      it('success: true is carried as it is, and is no failure', async () => {
+        const payload = { success: true, content: 'caption' };
+        const { result, captured } = await call(payload);
+        expect(result).toEqual({ success: true, result: payload, content: [image] });
+        expect(isSemanticFailure(captured)).toBe(false);
+        expect(isErrorPayload(captured)).toBe(false);
+      });
+
+      it('a payload with no flags gains none', async () => {
+        const payload = { content: 'caption', note: 'no flags here' };
+        const { result } = await call(payload);
+        expect(result).toEqual({ result: payload, content: [image] });
+      });
+    });
+
+    it('the kept payload survives capture: its data stays, only the image bytes go', async () => {
+      const payload = { success: true, content: 'synthetic-caption-marker' };
+      respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+      const parsed = await makeClient().callTool('render_chart', {});
+      const cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-capture-'));
+      try {
+        const captured = await captureToolImages(parsed, {
+          cacheDir: async () => cacheDir,
+          delivery: () => ({ deliverable: true }),
+        });
+        const serialized = JSON.stringify(captured);
+        expect(serialized).toContain('synthetic-caption-marker');
+        expect(serialized).not.toContain(PNG_1X1.slice(0, 32));
+        expect(takeCapturedImages(captured)).toHaveLength(1);
+      } finally {
+        rmSync(cacheDir, { recursive: true, force: true });
+      }
+    });
+
+    it('with no image, the payload is exactly what it always was', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true }) }]);
+      const result = await makeClient().callTool('render_chart', {});
+      expect(result).toEqual({ success: true });
+    });
+
+    it('and the chat runtime then captures it instead of relaying base64', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true }) }, image]);
+      const parsed = await makeClient().callTool('render_chart', {});
+      const cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-capture-'));
+      try {
+        const captured = await captureToolImages(parsed, {
+          cacheDir: async () => cacheDir,
+          delivery: () => ({ deliverable: true }),
+        });
+        expect(takeCapturedImages(captured)).toHaveLength(1);
+        expect(JSON.stringify(captured)).not.toContain(PNG_1X1.slice(0, 32));
+      } finally {
+        rmSync(cacheDir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('still returns plain non-JSON text when the call did not fail', async () => {

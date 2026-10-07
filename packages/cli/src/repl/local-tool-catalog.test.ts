@@ -13,6 +13,7 @@ import { ToolPolicyState } from './tool-policy.js';
 import { applyProfile } from './tool-profiles.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isPiTool } from './pi-tools.js';
+import { VIEW_IMAGE_TOOL } from './view-image.js';
 import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /**
@@ -46,7 +47,11 @@ describe('the local tool catalog', () => {
     for (const entry of LOCAL_TOOL_CATALOG) {
       expect(isLocalRuntimeTool(entry.name), entry.name).toBe(true);
       const dispatchable =
-        isPiTool(entry.name) || isClientLocalTool(entry.name) || entry.group === 'delegation';
+        isPiTool(entry.name) ||
+        isClientLocalTool(entry.name) ||
+        entry.group === 'delegation' ||
+        // The dispatcher's own branch for it (tool-dispatch.ts).
+        entry.name === VIEW_IMAGE_TOOL;
       expect(dispatchable, entry.name).toBe(true);
     }
   });
@@ -107,9 +112,11 @@ describe('the prompt and the catalog describe the same surface', () => {
         '- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).',
         '- find: Find files by name/pattern. Args: pattern (string), path (string, optional).',
         '- ls: List directory contents. Args: path (string, optional).',
+        '- view_image: Look at an image file (PNG, JPEG, GIF, WebP). The image is shown to you as an image, never as base64 text. Args: path (string). Works under the working directory and under ~/.ink/files (downloaded attachments, SB screenshots). Large images are downscaled to 2000px on the long side; the result says so. The image costs roughly width x height / 750 tokens, shows in list_context, and evict_context removes it.',
       ].join('\n')
     );
 
+    // No view_image: a clone's turns never carry an image (CLONE_DENIED_TOOLS).
     expect(renderLocalToolGroup('coding', 'clone')).toBe(
       [
         'Coding tools (in-process, scoped to working directory):',

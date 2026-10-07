@@ -13,6 +13,7 @@ import type {
 } from '../../data/repositories/workspaces.repository';
 import type { Json } from '../../data/supabase/types';
 import { slugifyWorkspaceName } from '../../utils/workspace-slug';
+import { isInviteOnly } from '../../services/workspace-invitations';
 
 const workspaceTypeSchema = z.enum(['personal', 'team']);
 const workspaceMemberRoleSchema = z.enum(['owner', 'admin', 'member', 'viewer']);
@@ -242,6 +243,13 @@ export async function handleAddWorkspaceMember(args: unknown, dataComposer: Data
   );
   if (!workspace) {
     return errorResponse('Workspace not found or not accessible');
+  }
+  // A group created invite-only takes people only by invitation, which they
+  // accept themselves; nobody is added, and no member's role is changed, here.
+  if (isInviteOnly(workspace.metadata)) {
+    return errorResponse(
+      'This group takes members only by invitation. Create an invitation instead.'
+    );
   }
 
   const canManage = await dataComposer.repositories.workspaces.canManageWorkspace(

@@ -12,6 +12,7 @@ import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier, type ResolvedUser } from '../../services/user-resolver';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { resolveMemoryOwner } from './memory-owner';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
@@ -577,24 +578,30 @@ export async function handleCompleteTask(
 
     const task = await dataComposer.repositories.tasks.completeTask(args.taskId);
 
-    // Auto-remember: persist task completion as a memory for session continuity
+    // Auto-remember: persist task completion as a memory for session continuity,
+    // owned by the SB completing it. With no SB behind the call there is no
+    // owner, and no memory: it used to be written as a shared one
+    // (remove-shared-memories §3.2).
     try {
-      const sbSlug = getEffectiveSlug(undefined);
+      const ownerResolution = await resolveMemoryOwner(dataComposer.getClient(), resolved.user.id);
       const salience = task.priority === 'high' || task.priority === 'critical' ? 'high' : 'medium';
       const topics = [`task:${task.id}`, ...(task.tags || [])];
       if (task.project_id) topics.push(`project:${task.project_id}`);
 
-      await dataComposer.repositories.memory.remember({
-        userId: resolved.user.id,
-        content: `Completed task: ${task.title}${task.description ? ` — ${task.description}` : ''}`,
-        summary: `Completed: ${task.title}`,
-        topicKey: task.project_id ? `project:${task.project_id}` : undefined,
-        source: 'session',
-        salience: salience as 'medium' | 'high',
-        topics,
-        sbSlug: sbSlug || undefined,
-        metadata: { taskId: task.id, autoCreated: true },
-      });
+      if (ownerResolution.ok) {
+        await dataComposer.repositories.memory.remember({
+          userId: resolved.user.id,
+          content: `Completed task: ${task.title}${task.description ? ` — ${task.description}` : ''}`,
+          summary: `Completed: ${task.title}`,
+          topicKey: task.project_id ? `project:${task.project_id}` : undefined,
+          source: 'session',
+          salience: salience as 'medium' | 'high',
+          topics,
+          sbSlug: ownerResolution.owner.sbSlug,
+          sbId: ownerResolution.owner.sbId,
+          metadata: { taskId: task.id, autoCreated: true },
+        });
+      }
     } catch (err) {
       // Non-fatal — task completion is the primary action, memory is best-effort
       logger.warn('Failed to auto-remember task completion:', err);

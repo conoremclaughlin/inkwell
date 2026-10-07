@@ -1207,7 +1207,11 @@ describe('handleUpdateSessionState', () => {
         salience: 'high',
         topics: ['session-phase', 'blocked'],
         metadata: { sessionId: 'session-123', phase: 'blocked:awaiting-approval' },
+        // The session's own canonical owner and contact scope, never the
+        // caller's parameter (remove-shared-memories §3.2).
         sbSlug: 'wren',
+        sbId: 'sb-wren',
+        contactId: undefined,
       });
     });
 
@@ -3202,7 +3206,9 @@ describe('handleUpdateMemory', () => {
         salience: undefined,
         topics: undefined,
         metadata: undefined,
-      })
+      }),
+      // A person's call: no owner filter beyond the user.
+      undefined
     );
 
     const parsed = JSON.parse(result.content[0].text);

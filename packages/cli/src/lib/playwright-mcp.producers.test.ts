@@ -25,6 +25,10 @@ import { completeStudio, type StepResult } from './studio-complete.js';
 import { injectMcpServers } from '../commands/skills.js';
 import { buildGeminiSettings } from '../backends/gemini.js';
 
+// The CLI's own Inkwell checkout is the last inkmail plugin candidate (task
+// 5cabaeeb); none here, so a tmp repo resolves only what a test put on disk.
+vi.mock('./ink-checkout.js', () => ({ inkCliMainWorktree: () => null }));
+
 const here = dirname(fileURLToPath(import.meta.url));
 const BUNDLED_SKILL = join(
   here,

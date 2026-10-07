@@ -186,6 +186,10 @@ const envSchema = z.object({
   // Default: this checkout's packages/cli/dist/cli.js. The server never uses
   // the global ~/.ink/bin/ink link (services/ink-cli.ts).
   INK_CLI_PATH: optionalString,
+  // Private root for photos and documents people send into threads. Default:
+  // ~/.ink/uploads. Uploads stay off unless it is clear of every directory
+  // another route serves or a runner is granted (services/uploads/layout.ts).
+  INK_UPLOADS_DIR: optionalString,
 
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z
@@ -248,6 +252,10 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   COMPACTION_THRESHOLD: optionalNumber,
+
+  // The in-process ink runtime, for these agents only (comma-separated
+  // agent identity UUIDs). Unset by default: every ink turn spawns ink chat.
+  INK_RUNTIME_IN_PROCESS_SB_IDS: optionalString,
 });
 
 // Parse and validate environment variables

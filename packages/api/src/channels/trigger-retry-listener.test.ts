@@ -121,6 +121,8 @@ interface RigOptions {
   resultRefusal?: { threadKey: string; detail: Record<string, unknown> };
   /** What the thread says about itself, as the descriptor loader would answer. */
   descriptor?: { lines: string[] };
+  /** A successful SessionResult from handleMessage, verbatim (default `{ success: true }`). */
+  resultSuccess?: Record<string, unknown>;
 }
 
 function rig(options: RigOptions = {}) {
@@ -132,6 +134,12 @@ function rig(options: RigOptions = {}) {
   const descriptorLoads: unknown[][] = [];
   const requests: Array<Record<string, unknown>> = [];
   const wakeCompletions: unknown[][] = [];
+  const chainEndings: Array<Record<string, unknown>> = [];
+  const inkmail: unknown[][] = [];
+  const routed: unknown[][] = [];
+  const closingHooks: unknown[][] = [];
+  /** What closingTextTurnHooks hands back, so a test can find it on the request. */
+  const closingHooksMade = { start: async () => {}, end: async () => {} };
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -234,7 +242,18 @@ function rig(options: RigOptions = {}) {
     },
   };
 
+  // The real reply chain module (inkling-reply-chain.ts): the handler asks it
+  // what a member of an inkling group answering in turn is told, and the
+  // retry scheduler asks it whether a group member's retry is still wanted.
+  const chain = loadModule(resolve(API_SRC, 'services/inklings/inkling-reply-chain.ts'), {
+    '../../utils/logger': { logger: silentLogger },
+  });
   const deps = {
+    inTurnNote: chain.inTurnNote,
+    replyChainWakeDue: chain.replyChainWakeDue,
+    // A group's chain (inkling-reply-chain.ts), told when a failed wake has
+    // ended for good: recorded, not run.
+    replyChainWakeFailed: (payload: Record<string, unknown>) => chainEndings.push(payload),
     logger: silentLogger,
     agentGateway: gateway,
     dataComposer: {
@@ -264,7 +283,7 @@ function rig(options: RigOptions = {}) {
         }
         sessionTurns += 1;
         if (options.resultFailure) return options.resultFailure;
-        return { success: true };
+        return options.resultSuccess ?? { success: true };
       },
       async getSession() {
         return null;
@@ -294,7 +313,9 @@ function rig(options: RigOptions = {}) {
       userId: 'user-synthetic',
       recipientSbId: 'identity-synthetic',
     }),
-    logInkmail: async () => {},
+    logInkmail: async (...args: unknown[]) => {
+      inkmail.push(args);
+    },
     // The no-progress breaker's completion hook (T1), recorded, not run.
     recordWakeSourceCompletion: async (...args: unknown[]) => {
       wakeCompletions.push(args);
@@ -308,7 +329,14 @@ function rig(options: RigOptions = {}) {
     stampRoutingHold: async () => true,
     decideDelivery: () => ({ mode: 'spawn' }),
     storedTriggerMedia: async () => [],
-    routeResponses: async () => {},
+    routeResponses: async (...args: unknown[]) => {
+      routed.push(args);
+    },
+    // The inkling closing-text hooks (inkling-closing-text.ts), recorded, not run.
+    closingTextTurnHooks: (...args: unknown[]) => {
+      closingHooks.push(args);
+      return closingHooksMade;
+    },
     RoutingRefusedError,
     sendTriggerFailureNotice: loadModule(resolve(API_SRC, 'services/trigger-failure-notice.ts'), {
       '../utils/logger': { logger: silentLogger },
@@ -366,6 +394,12 @@ function rig(options: RigOptions = {}) {
     descriptorLoads,
     requests,
     wakeCompletions,
+    chainEndings,
+    inkmail,
+    routed,
+    closingHooks,
+    closingHooksMade,
+    chain,
     row,
     threadPayload,
     get sessionTurns() {
@@ -419,6 +453,82 @@ describe('a routing refusal is never retried', () => {
     const r = rig();
     await r.fail(r.threadPayload, new Error('fetch failed'));
     expect(r.timers).toHaveLength(1);
+  });
+});
+
+describe("a failed wake moves a group's chain on only when no retry is coming", () => {
+  // A group of inklings answers in turn (inkling-reply-chain.ts). A member
+  // whose wake failed and will be retried keeps its place: moving on now would
+  // run its retry beside the next member's turn (Lumen's probe).
+  it('keeps the place of a wake that will be retried', async () => {
+    const r = rig();
+    await r.fail(r.threadPayload, new Error('fetch failed'));
+    expect(r.timers).toHaveLength(1);
+    expect(r.chainEndings).toHaveLength(0);
+    // A second failure of the same wake while its retry waits: still coming.
+    await r.fail(r.threadPayload, new Error('fetch failed'));
+    expect(r.chainEndings).toHaveLength(0);
+  });
+
+  it('ends it for a failure that will not be retried: a refusal, a fault, the last attempt', async () => {
+    const r = rig();
+    const refusal = new RoutingRefusedError('pr:42', 'recipient-test', {
+      triedCallerRepo: false,
+      reason: 'no-route',
+    });
+    await r.fail(r.threadPayload, refusal);
+    await r.fail(r.threadPayload, new Error('a fault nobody has classified'));
+    const last = { ...r.threadPayload, metadata: { triggerAttempt: 3 } };
+    await r.fail(last, new Error('fetch failed'));
+    expect(r.timers).toHaveLength(0);
+    expect(r.chainEndings).toEqual([r.threadPayload, r.threadPayload, last]);
+  });
+});
+
+describe("a group member's retry is sent only while its chain still wants it", () => {
+  // The scheduler that ships asks the chain at the moment it would re-send:
+  // Stop or a newer owner message may have ended the chain during the backoff.
+  it('sends the retry its chain waits on, and drops one whose chain Stop has ended', async () => {
+    const r = rig();
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const c = r.chain as any;
+    const sent: Array<Record<string, unknown>> = [];
+    const handle = c.openReplyChain({
+      threadId: 'thread-synthetic',
+      ownerMessageId: 'message-synthetic',
+      ticket: c.takeReplyTicket(),
+      members: [
+        { sbId: 'identity-synthetic', sbSlug: 'recipient-test' },
+        { sbId: 'identity-other', sbSlug: 'other-test' },
+      ],
+    });
+    c.routedInReplyChain(
+      handle,
+      'identity-synthetic',
+      { ...r.threadPayload, toSbId: 'identity-synthetic' },
+      (payload: Record<string, unknown>) => {
+        sent.push(payload);
+        return { accepted: true };
+      }
+    );
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const wake = sent[0]!;
+
+    await r.fail(wake);
+    r.timers[0]!.fn();
+    expect(r.redispatched).toHaveLength(1);
+
+    // Stop on another member ends the chain while a second retry waits.
+    c.dropReplyChainsFor('identity-other');
+    await r.fail(wake);
+    expect(r.timers).toHaveLength(2);
+    r.timers[1]!.fn();
+    expect(r.redispatched).toHaveLength(1);
+
+    // A wake outside any chain is re-sent as before.
+    await r.fail({ ...r.threadPayload, threadMessageId: 'message-other' });
+    r.timers[2]!.fn();
+    expect(r.redispatched).toHaveLength(2);
   });
 });
 
@@ -520,6 +630,62 @@ describe('server.ts wiring', () => {
       parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
     ).toBe('startServer');
   });
+
+  it('attaches the inkling reply chain to the gateway once, directly in startServer', () => {
+    // Nothing else moves a group of inklings answering in turn: without this
+    // call, the first member answers and the rest wait forever. Its result is
+    // what the failure listener calls, so it must be bound before that.
+    const source = readFileSync(SERVER, 'utf8');
+    const ast = ts.createSourceFile(SERVER, source, ts.ScriptTarget.Latest, true);
+    const calls: ts.CallExpression[] = [];
+    const walk = (n: ts.Node) => {
+      if (ts.isCallExpression(n) && n.expression.getText(ast) === 'attachReplyChain') calls.push(n);
+      ts.forEachChild(n, walk);
+    };
+    walk(ast);
+    expect(calls.map((c) => c.arguments.map((a) => a.getText(ast)))).toEqual([['agentGateway']]);
+    const binding = calls[0]!.parent;
+    expect(ts.isVariableDeclaration(binding) ? binding.name.getText(ast) : '(not bound)').toBe(
+      'replyChainWakeFailed'
+    );
+    expect(binding.getStart(ast)).toBeLessThan(source.indexOf("agentGateway.on('trigger:error'"));
+    let parent: ts.Node | undefined = calls[0]!.parent;
+    while (parent && !ts.isFunctionLike(parent)) parent = parent.parent;
+    expect(
+      parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
+    ).toBe('startServer');
+  });
+});
+
+describe("an inkling turn that sent nothing (task 9edf62fe): the handler's part", () => {
+  // inkling-closing-text.test.ts decides what is posted, and session-service
+  // runs the hooks around each turn. This checks that the shipping handler
+  // builds them from the wake and hands them to the turn, before the turn runs.
+  it('hands the turn hooks built from its wake to the request it runs', async () => {
+    const r = rig();
+
+    await r.gateway.handler!(r.threadPayload);
+
+    expect(r.closingHooks).toHaveLength(1);
+    const [, wake] = r.closingHooks[0];
+    expect(wake).toEqual({
+      userId: 'user-synthetic',
+      identityId: 'identity-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: 'pr:42',
+      threadMessageId: 'message-synthetic',
+    });
+    expect(r.requests[0]?.turnHooks).toBe(r.closingHooksMade);
+  });
+
+  it('hands none to a trigger that names no thread message', async () => {
+    const r = rig();
+
+    await r.gateway.handler!({ ...r.threadPayload, threadMessageId: undefined });
+
+    expect(r.closingHooks).toHaveLength(0);
+    expect(r.requests[0]?.turnHooks).toBeUndefined();
+  });
 });
 
 describe('the thread describes itself in the prompt the SB actually reads', () => {
@@ -545,6 +711,13 @@ describe('the thread describes itself in the prompt the SB actually reads', () =
     expect(content.indexOf('About: the legibility commission')).toBeLessThan(
       content.indexOf('IMPORTANT: This is a system trigger')
     );
+  });
+
+  it('names the recipient in the fetch it tells the SB to make (debug:inkling-first-reply)', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    const content = (r.requests.at(-1) as { content: string }).content;
+    expect(content).toContain('get_thread_messages(threadKey: "pr:42", sbSlug: "recipient-test")');
   });
 
   it('asks for the description as the recipient, not as the sender', async () => {
@@ -822,5 +995,97 @@ describe('a completed wake is counted against its source (T1)', () => {
       r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } })
     ).rejects.toBeTruthy();
     expect(r.wakeCompletions).toHaveLength(0);
+  });
+});
+
+describe('a group answering in turn: what the handler tells a later member', () => {
+  it('tells the later member that others answered first, and nobody else', async () => {
+    const r = rig();
+    await r.gateway.handler!({
+      ...r.threadPayload,
+      metadata: { inklingAnswersInTurn: true },
+    });
+    await r.gateway.handler!(r.threadPayload);
+    const [later, ordinary] = r.requests.map((request) => JSON.stringify(request));
+    expect(later).toMatch(/answered this message before you/);
+    expect(ordinary).not.toMatch(/answered this message before you/);
+  });
+});
+
+describe('a wake says whether it may share a turn (spec trigger-pipe-in v7, 1.1)', () => {
+  const metadataOf = (r: ReturnType<typeof rig>) =>
+    (r.requests.at(-1) as { metadata: Record<string, unknown> }).metadata;
+
+  it('marks a wake for a stored thread message', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    expect(metadataOf(r)).toMatchObject({
+      wakeCoalescible: true,
+      triggerThreadMessageId: 'message-synthetic',
+    });
+  });
+
+  it('marks a wake for a stored inbox message, and forwards its id', async () => {
+    const r = rig();
+    await r.gateway.handler!({
+      ...r.threadPayload,
+      threadId: undefined,
+      threadMessageId: undefined,
+      threadKey: undefined,
+      inboxMessageId: 'inbox-synthetic',
+    });
+    expect(metadataOf(r)).toMatchObject({
+      wakeCoalescible: true,
+      triggerInboxMessageId: 'inbox-synthetic',
+    });
+  });
+
+  it('leaves a wake with no stored message, a force-spawn and a strategy wake unmarked', async () => {
+    for (const payload of [
+      { fromSlug: 'sender-test', toSlug: 'recipient-test', triggerType: 'message' },
+      { ...rig().threadPayload, forceSpawn: true },
+      { ...rig().threadPayload, metadata: { strategyTrigger: true, groupId: 'group-synthetic' } },
+    ]) {
+      const r = rig();
+      await r.gateway.handler!(payload);
+      expect(metadataOf(r).wakeCoalescible, JSON.stringify(payload)).toBe(false);
+    }
+  });
+});
+
+describe('a wake carried by another wake’s turn (spec trigger-pipe-in v7, 1.5)', () => {
+  it('cancels its own retry and counts its own completion, routes nothing, and says it was coalesced', async () => {
+    const r = rig({
+      resultSuccess: {
+        success: true,
+        admitted: true,
+        sessionId: 'session-synthetic',
+        responses: [],
+        wake: { coalescedInto: 'message-lead' },
+      },
+    });
+    const wakeSource = {
+      source: 'strategy_watchdog',
+      workKind: 'task_group',
+      workId: 'group-synthetic',
+      revision: '',
+      fingerprint: 'fp-synthetic',
+      dispatchedAt: '2026-10-02T10:00:00.000Z',
+      taskGroupId: 'group-synthetic',
+      ownerSbId: null,
+    };
+    await r.gateway.handler!({ ...r.threadPayload, metadata: { wakeSource } });
+
+    expect(r.routed).toHaveLength(0);
+    expect(r.wakeCompletions).toHaveLength(1);
+    const delivered = r.inkmail.find(([event]) => event === 'inkmail_deliver');
+    expect(delivered?.[3]).toEqual({ deliveryMethod: 'coalesced' });
+  });
+
+  it('a wake that ran its own turn still says spawn', async () => {
+    const r = rig();
+    await r.gateway.handler!(r.threadPayload);
+    const delivered = r.inkmail.find(([event]) => event === 'inkmail_deliver');
+    expect(delivered?.[3]).toEqual({ deliveryMethod: 'spawn' });
   });
 });

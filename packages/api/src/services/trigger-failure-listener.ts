@@ -29,6 +29,30 @@ import { logger } from '../utils/logger';
 import { sendTriggerFailureNotice } from './trigger-failure-notice';
 import { resolveFailureNoticeAddress } from './trigger-scope';
 
+/**
+ * What the person sees when their inkling's turn fails, in its own
+ * conversation (task 935af241; Myra's wording). Plain words: never the
+ * inkling's slug, the backend, or the error. A retry still coming says so,
+ * so a resend doesn't start a second turn; a failure resending can't cure
+ * doesn't ask for one.
+ */
+export function inklingFailureNotice(
+  displayName: string | null,
+  outcome: 'retrying' | 'final-retryable' | 'final'
+): string {
+  const name = displayName ?? 'Your inkling';
+  /** The same, mid-sentence. */
+  const named = displayName ?? 'your inkling';
+  if (outcome === 'retrying') {
+    return `${name} couldn't answer yet and is trying again. No need to send your message again.`;
+  }
+  if (outcome === 'final-retryable') {
+    // A turn can act before it fails (Myra): only an action asked for can be repeated.
+    return `${name} couldn't answer that message. If you asked ${named} to do something, check whether it's done before sending it again.`;
+  }
+  return `${name} can't answer right now. Try again later.`;
+}
+
 export interface TriggerFailureEvent {
   triggerId: string;
   payload: AgentTriggerPayload;
@@ -117,6 +141,8 @@ export async function handleTriggerFailure(
   let resolvedThreadId: string | undefined;
   let resolvedThreadWorkspaceId: string | undefined;
   let senderOwnerUserId: string | undefined;
+  /** Set when the notice goes to a person in their inkling's own conversation. */
+  let inklingNoticeFor: { displayName: string | null } | undefined;
   if (payload.inboxMessageId) {
     const { data: origMsg } = await client
       .from('agent_inbox')
@@ -132,6 +158,15 @@ export async function handleTriggerFailure(
     resolvedThreadWorkspaceId = address.threadWorkspaceId;
     recipientUserId = address.targetOwnerUserId;
     senderOwnerUserId = address.senderOwnerUserId;
+    // For a person whenever it could be: an inkling's conversation, whatever
+    // its target reads as (an identity that can't be read, or has no row or
+    // metadata, is no proof of anything); a thread that can't be read; or an
+    // inkling target. Every thread holding an inkling is marked when it is
+    // created, so only a readable, unmarked thread with an SB target keeps
+    // the developer notice (Lumen, #771).
+    if (address.inklingConversation || address.threadUnreadable || address.targetInkling) {
+      inklingNoticeFor = address.targetInkling ?? { displayName: null };
+    }
   }
 
   // Bare trigger_agent (no source row, possibly just a threadKey): fall
@@ -250,7 +285,20 @@ export async function handleTriggerFailure(
   const retryLabel = pendingRetry
     ? ` — retrying (${pendingRetry.attempt}/${TRIGGER_MAX_ATTEMPTS}) in ${Math.round(pendingRetry.delayMs / 1000)}s`
     : '';
-  const notificationContent = `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}${retryLabel}: ${classification.summary}`;
+  const notificationContent = inklingNoticeFor
+    ? inklingFailureNotice(
+        inklingNoticeFor.displayName,
+        pendingRetry ? 'retrying' : classification.retryable ? 'final-retryable' : 'final'
+      )
+    : `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}${retryLabel}: ${classification.summary}`;
+  const failure = {
+    triggerFailure: true,
+    triggerId,
+    errorCategory: classification.category,
+    retryable: classification.retryable,
+    attempts: attempt,
+    retryPending: pendingRetry ? pendingRetry.attempt : null,
+  };
 
   // Thread-borne trigger → notice joins the thread (participants and
   // session stamps already exist; stamped-only delivery lands it in
@@ -267,17 +315,17 @@ export async function handleTriggerFailure(
     workspaceId: resolvedThreadWorkspaceId ?? null,
     subject: `Trigger failed: ${payload.toSlug}`,
     content: notificationContent,
-    metadata: {
-      triggerFailure: true,
-      triggerId,
-      errorCategory: classification.category,
-      errorSummary: classification.summary,
-      errorDetail: errorText.slice(0, 4000),
-      retryable: classification.retryable,
-      attempts: attempt,
-      retryPending: pendingRetry ? pendingRetry.attempt : null,
-      originalInboxMessageId: payload.inboxMessageId || null,
-    },
+    // In an inkling's conversation: no error text, and the message it is
+    // about by id, so the app can show it as a status line under that
+    // message (Myra).
+    metadata: inklingNoticeFor
+      ? { ...failure, inklingNotice: true, aboutMessageId: payload.threadMessageId ?? null }
+      : {
+          ...failure,
+          errorSummary: classification.summary,
+          errorDetail: errorText.slice(0, 4000),
+          originalInboxMessageId: payload.inboxMessageId || null,
+        },
   });
   if (noticeResult.ok) {
     logger.info('[TriggerFailure] Sent failure notification to sender', {

@@ -77,7 +77,6 @@ async function inkRecall(
         arguments: {
           query,
           sbSlug: options?.sbSlug || 'wren',
-          includeShared: true,
           limit: options?.limit || 5,
           recallMode: options?.recallMode || 'hybrid',
         },

@@ -312,7 +312,7 @@ function SBSection({
 
 // ─── Main Page ───
 
-export default function RemindersPage() {
+export default function ScheduledPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
 
   const { data, isLoading, error } = useApiQuery<RemindersResponse>(
@@ -371,10 +371,8 @@ export default function RemindersPage() {
     <div className="max-w-5xl">
       {/* Header */}
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">Reminders</h1>
-        <p className="mt-1 text-gray-500">
-          Scheduled reminders and recurring check-ins, grouped by SB.
-        </p>
+        <h1 className="text-3xl font-bold text-gray-900">Scheduled</h1>
+        <p className="mt-1 text-gray-500">Reminders and recurring check-ins, grouped by SB.</p>
       </div>
 
       {error && (

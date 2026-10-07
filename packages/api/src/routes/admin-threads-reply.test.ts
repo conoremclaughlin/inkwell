@@ -66,6 +66,7 @@ vi.mock('../utils/request-context', () => ({
 }));
 
 import router from './admin';
+import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 
@@ -179,6 +180,14 @@ describe('POST /threads/reply', () => {
 
   it('sends via handleSendToInbox with participants as recipients and triggerAll', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    // The route's first database call, to place its arrival ticket before it.
+    const lookUp = mockSupabaseFrom.getMockImplementation()!;
+    let atFirstQuery: number | undefined;
+    mockSupabaseFrom.mockImplementation((...args: unknown[]) => {
+      atFirstQuery ??= takeReplyTicket();
+      return lookUp(...args);
+    });
+    const before = takeReplyTicket();
     mockGetParticipants.mockResolvedValue([sb('wren'), sb('lumen')]);
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: true, messageId: 'msg-9', threadId: 'thread-1' })
@@ -206,9 +215,17 @@ describe('POST /threads/reply', () => {
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
     // The person and their workspace ride as server-side context — the
     // public tool schema never carries who a person is (spec §3, §6).
+    // With nobody named, a group of inklings answers in turn; the handler
+    // applies it only to an inkling conversation (inkling-reply-chain.ts).
+    // It carries the ticket the route took on arrival, before any await, so a
+    // Stop or newer send made meanwhile is seen when the handler decides.
     expect(mockHandleSendToInbox.mock.calls[0][2]).toEqual({
       sender: { principal: { kind: 'user', userId: 'user-1' }, workspaceId: 'ws-1' },
+      inklingGroup: { inTurn: true, ticket: expect.any(Number) },
     });
+    const { ticket } = mockHandleSendToInbox.mock.calls[0][2].inklingGroup;
+    expect(ticket).toBeGreaterThan(before);
+    expect(ticket).toBeLessThan(atFirstQuery!);
   });
 
   it('wakes the SB participants only — a person on the thread is never a recipient (§7)', async () => {

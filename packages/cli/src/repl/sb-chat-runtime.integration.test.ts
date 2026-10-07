@@ -51,7 +51,6 @@ describe('InkClient.callTool recall shape', () => {
       const result = await inkClient.callTool('recall', {
         query: 'session routing',
         sbSlug: 'wren',
-        includeShared: true,
         limit: 3,
         recallMode: 'hybrid',
       });
@@ -84,7 +83,6 @@ describe('InkClient.callTool recall shape', () => {
           const result = await inkClient.callTool('recall', {
             query,
             sbSlug: 'wren',
-            includeShared: true,
             limit,
             recallMode: 'hybrid',
           });
@@ -122,7 +120,6 @@ describe('InkClient.callTool recall shape', () => {
       const result = await inkClient.callTool('recall', {
         query,
         sbSlug: 'wren',
-        includeShared: true,
         limit,
         recallMode: 'hybrid',
       });
@@ -388,7 +385,6 @@ describe('Inbox polling + passive recall interaction', () => {
         const result = await inkClient.callTool('recall', {
           query,
           sbSlug: 'wren',
-          includeShared: true,
           limit,
           recallMode: 'hybrid',
         });

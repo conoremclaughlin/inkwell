@@ -23,7 +23,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 import { handleRemember } from './memory-handlers';
 import { runWithRequestContext } from '../../utils/request-context';
 
@@ -54,6 +54,9 @@ describe('Memory session attribution', () => {
     dataComposer = await getDataComposer();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     testUserId = fixture.userId;
+    // Every memory has a canonical owner, so the probe identity must exist
+    // (ink://specs/remove-shared-memories §3.2).
+    await ensureSuiteIdentity(dataComposer, fixture, AGENT);
 
     const supabase = dataComposer.getClient();
 
@@ -122,6 +125,11 @@ describe('Memory session attribution', () => {
     if (studioId) {
       await supabase.from('studios').delete().eq('id', studioId);
     }
+    await supabase
+      .from('agent_identities')
+      .delete()
+      .eq('user_id', testUserId)
+      .eq('agent_id', AGENT);
   });
 
   /** Read a memory's stored attribution straight from the table. */

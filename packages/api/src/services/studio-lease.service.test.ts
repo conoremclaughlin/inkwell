@@ -34,6 +34,7 @@ import {
   type StudioLease,
 } from './studio-lease.service';
 import { registerActiveRun, resetActiveRuns } from './sessions/active-runs';
+import { batchTurnEpoch } from './sessions/wake-batch';
 import { logger } from '../utils/logger';
 
 const execFileAsync = promisify(execFile);
@@ -4194,5 +4195,144 @@ describe("claimForTeardown checks the fresh lease's workspace (Lumen, #624)", ()
         })
       )?.quarantined
     ).toBe(true);
+  });
+});
+
+/**
+ * A turn that carries several queued wakes runs under the epoch its members'
+ * routing left on the lease (spec trigger-pipe-in v7, 1.4). Routing on a
+ * write-intent thread stamps the lease with that member's candidate; routing
+ * on a presence thread acquires nothing, so a write wake followed by a
+ * presence wake leaves the write wake's stamp. The boundary releases only
+ * for the stamp, so that is the epoch the turn must run under (Lumen's
+ * review of v6, point 1).
+ */
+describe('a merged wake turn runs under the epoch its lease will release for', () => {
+  afterEach(() => resetActiveRuns());
+
+  function heldBy(sessionId: string, turnEpoch?: string): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-merge',
+          user_id: 'u',
+          status: 'active',
+          lease: freshLease({
+            sessionId,
+            threadKey: 'pr:1',
+            ...(turnEpoch ? { turnEpoch } : {}),
+          }) as unknown as Row,
+          worktree_path: null,
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [{ id: sessionId, user_id: 'u', ended_at: new Date().toISOString() }],
+    };
+  }
+  const terminalRelease = (service: StudioLeaseService, expectedTurnEpoch: string) =>
+    service.releaseAtBoundary('sess-merge', {
+      userId: 'u',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch,
+    });
+
+  it('a write wake then a presence wake: the write wake’s epoch releases, the last member’s is refused', async () => {
+    resetActiveRuns();
+    // Member A (pr:1, write) stamped epoch-a; member B (thread:x, presence)
+    // stamped nothing.
+    const tables = heldBy('sess-merge', 'epoch-a');
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stamped = await service.turnEpochsHeldBy('sess-merge', 'u');
+    expect([...stamped]).toEqual(['epoch-a']);
+    const chosen = batchTurnEpoch(['epoch-a', 'epoch-b'], stamped);
+    expect(chosen).toBe('epoch-a');
+
+    // Running as the last-resolved member would leave the lease held at the
+    // terminal boundary...
+    expect(await terminalRelease(service, 'epoch-b')).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+    // ...and the chosen epoch releases it.
+    expect(await terminalRelease(service, chosen)).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('a member handed off to another session stamps that session’s lease, not this one', async () => {
+    resetActiveRuns();
+    const tables = heldBy('sess-merge', 'epoch-a');
+    // Member C re-resolved to sess-other and stamped its own studio there.
+    tables.studios.push({
+      id: 's-other',
+      user_id: 'u',
+      status: 'active',
+      lease: freshLease({ sessionId: 'sess-other', turnEpoch: 'epoch-c' }) as unknown as Row,
+      worktree_path: null,
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stamped = await service.turnEpochsHeldBy('sess-merge', 'u');
+    expect([...stamped]).toEqual(['epoch-a']);
+    // Only the members still resolving here take part: A and presence B.
+    expect(batchTurnEpoch(['epoch-a', 'epoch-b'], stamped)).toBe('epoch-a');
+    expect(await terminalRelease(service, 'epoch-a')).toBe(true);
+  });
+
+  it('with no member stamped, the lead’s epoch, as for a lone turn', () => {
+    expect(batchTurnEpoch(['epoch-a', 'epoch-b', 'epoch-c'], new Set(['earlier']))).toBe('epoch-a');
+    expect(batchTurnEpoch(['epoch-a', 'epoch-b', 'epoch-c'], new Set())).toBe('epoch-a');
+    expect(batchTurnEpoch(['epoch-a', 'epoch-b', 'epoch-c'], new Set(['epoch-a', 'epoch-c']))).toBe(
+      'epoch-c'
+    );
+  });
+
+  it('fails, rather than reading as unstamped, when the read returns an error', async () => {
+    // PostgREST resolves a failed read as { data: null, error }; an empty set
+    // here would merge the wakes under the lead's epoch (Lumen, #759 r1).
+    const query: Record<string, unknown> = {};
+    query.select = () => query;
+    query.eq = () => query;
+    query.then = (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+      Promise.resolve({
+        data: null,
+        error: { code: '57014', message: 'synthetic lease lookup timeout' },
+      }).then(resolve, reject);
+    const service = new StudioLeaseService({ from: () => query } as never);
+    await expect(service.turnEpochsHeldBy('sess-merge', 'u')).rejects.toThrow(
+      /synthetic lease lookup timeout/
+    );
+  });
+
+  it('a read that succeeds with no rows is an empty set', async () => {
+    const tables = heldBy('another-session', 'epoch-x');
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    expect((await service.turnEpochsHeldBy('sess-merge', 'u')).size).toBe(0);
+  });
+
+  it('reads only this session’s leases, for this user', async () => {
+    const tables = heldBy('sess-merge', 'epoch-a');
+    tables.studios.push(
+      {
+        id: 's-unstamped',
+        user_id: 'u',
+        status: 'active',
+        lease: freshLease({ sessionId: 'sess-merge' }) as unknown as Row,
+        worktree_path: null,
+      },
+      {
+        id: 's-foreign',
+        user_id: 'someone-else',
+        status: 'active',
+        lease: freshLease({
+          sessionId: 'sess-merge',
+          turnEpoch: 'epoch-foreign',
+        }) as unknown as Row,
+        worktree_path: null,
+      }
+    );
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    expect([...(await service.turnEpochsHeldBy('sess-merge', 'u'))]).toEqual(['epoch-a']);
   });
 });

@@ -30,7 +30,10 @@ import { basename, join, sep } from 'path';
 import { constants as fsConstants } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from 'fs/promises';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type { MediaAttachment } from '../services/sessions/types.js';
+import { resolveUploadMedia } from '../services/uploads/dispatch';
+import type { StoredThreadMessage } from '../services/uploads/claims';
 import { logger } from '../utils/logger';
 
 /** Defensive cap on attachments per message. */
@@ -363,7 +366,11 @@ export async function resolveTriggerMedia(
       type?: unknown;
       mimeType?: unknown;
       filename?: unknown;
+      upload?: unknown;
     } | null;
+    // A person's upload is resolved by services/uploads/dispatch.ts, from
+    // the stored message itself, not by path.
+    if (e !== null && typeof e === 'object' && 'upload' in e) continue;
     if (typeof e?.path !== 'string' || e.path.length === 0) {
       malformed += 1;
       continue;
@@ -474,7 +481,8 @@ interface StoredRowClient {
  * message row the trigger references and resolves/snapshots its media.
  * Payload-composed metadata is not an input by design: a trigger without a
  * stored message reference delivers no attachments, whatever its payload
- * claims.
+ * claims. A thread message's uploads are authorized against that same row
+ * (services/uploads/dispatch.ts); the real caller passes the service client.
  */
 export async function storedTriggerMedia(
   client: StoredRowClient,
@@ -492,10 +500,18 @@ export async function storedTriggerMedia(
   } else if (ref.threadMessageId) {
     const { data } = await client
       .from('inbox_thread_messages')
-      .select('metadata')
+      .select('id, thread_id, sender_kind, sender_user_id, content, metadata')
       .eq('id', ref.threadMessageId)
       .single();
     storedMetadata = data?.metadata;
+    const media = await resolveTriggerMedia(storedMetadata, options);
+    const uploads = data
+      ? await resolveUploadMedia(
+          client as unknown as SupabaseClient,
+          data as unknown as StoredThreadMessage
+        )
+      : [];
+    return [...media, ...uploads];
   } else {
     return [];
   }

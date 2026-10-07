@@ -61,6 +61,25 @@ function withFailingTargetRead(db: Db, targetSbId: string): Db {
   return db;
 }
 
+/** The thread row's own read fails; its insert still works. */
+function withFailingThreadRead(db: Db): Db {
+  const from = db.from.bind(db);
+  db.from = ((table: string) => {
+    const q = from(table);
+    if (table !== 'inbox_threads') return q;
+    return {
+      ...q,
+      select: () => {
+        const chain = q.select('*');
+        chain.single = (() =>
+          Promise.resolve({ data: null, error: { message: 'thread read failed' } })) as never;
+        return chain;
+      },
+    };
+  }) as never;
+  return db;
+}
+
 /** The thread lane's insert fails, as when the thread row is gone. */
 function withFailingThreadInsert(db: Db): Db {
   const from = db.from.bind(db);
@@ -256,5 +275,165 @@ describe('handleTriggerFailure', () => {
       deps
     );
     expect(await rows(db, 'inbox_thread_messages')).toHaveLength(0);
+  });
+});
+
+describe("in an inkling's own conversation, the notice is for its person (task 935af241)", () => {
+  const INKLING = { client: 'inkling-mobile', ownerTest: true };
+  const inklingWorld = (
+    named: boolean,
+    marked = true,
+    target: 'inkling' | 'missing' | 'no-metadata' = 'inkling'
+  ) =>
+    client({
+      agent_identities: [
+        ...identities.map((i) => ({ ...i })),
+        ...(target === 'missing'
+          ? []
+          : [
+              {
+                id: 'sb-ink',
+                agent_id: 'kindle-0a1b2c3d',
+                user_id: 'user-a',
+                workspace_id: 'ws-a',
+                name: named ? 'Pip' : 'unnamed inkling',
+                metadata: target === 'no-metadata' ? null : { ...INKLING, named },
+              },
+            ]),
+      ],
+      inbox_threads: [
+        {
+          id: 'thread-ink',
+          thread_key: 'chat:conversation-x',
+          workspace_id: 'ws-a',
+          status: 'open',
+          metadata: marked ? { inklingConversation: true } : {},
+        },
+      ],
+    });
+  const fromThePerson = (error: Error) => ({
+    triggerId: 'trig-ink',
+    error,
+    payload: {
+      fromSlug: 'user',
+      toSlug: 'kindle-0a1b2c3d',
+      toSbId: 'sb-ink',
+      threadId: 'thread-ink',
+      threadMessageId: 'msg-waking',
+      threadKey: 'chat:conversation-x',
+      triggerType: 'message',
+    },
+  });
+  const timeout = new Error('Claude Code timeout: no output for 300s, process killed');
+  const retrying = {
+    ...deps,
+    retryScheduler: {
+      scheduleRetry: vi.fn(() => ({ scheduled: true, attempt: 2, delayMs: 120_000 })),
+    },
+  };
+  const theNotice = async (db: Db) => {
+    const notices = await rows(db, 'inbox_thread_messages');
+    expect(notices).toHaveLength(1);
+    return notices[0] as Row & { content: string; metadata: Row };
+  };
+
+  it('says a retry is coming, by name, and asks for no resend', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, retrying as never);
+    const notice = await theNotice(db);
+    expect(notice.content).toBe(
+      "Pip couldn't answer yet and is trying again. No need to send your message again."
+    );
+    expect(notice).toMatchObject({ sender_kind: 'system', message_type: 'notification' });
+  });
+
+  it('asks for a resend once a retryable failure is final', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, deps);
+    expect((await theNotice(db)).content).toBe(
+      "Pip couldn't answer that message. If you asked Pip to do something, check whether it's done before sending it again."
+    );
+  });
+
+  it("doesn't ask for a resend a retry can't cure", async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(new Error('runner exited 1')) as never, deps);
+    expect((await theNotice(db)).content).toBe("Pip can't answer right now. Try again later.");
+  });
+
+  it('says "Your inkling" while it has no name', async () => {
+    const db = inklingWorld(false);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, deps);
+    expect((await theNotice(db)).content).toBe(
+      "Your inkling couldn't answer that message. If you asked your inkling to do something, check whether it's done before sending it again."
+    );
+  });
+
+  it('carries no slug, backend or error text, in the words or in what the app reads', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, retrying as never);
+    const notice = await theNotice(db);
+    expect(JSON.stringify(notice)).not.toMatch(/kindle-0a1b2c3d|Claude|timeout: no output|300s/);
+    expect(notice.metadata).toEqual({
+      triggerFailure: true,
+      inklingNotice: true,
+      aboutMessageId: 'msg-waking',
+      triggerId: 'trig-ink',
+      errorCategory: 'timeout',
+      retryable: true,
+      attempts: 1,
+      retryPending: 2,
+    });
+    // The full error still reaches the logs.
+    expect(logInkmailFailure).toHaveBeenCalledWith(expect.anything(), 'user-a', {
+      error: timeout.message,
+    });
+  });
+
+  it("is today's notice on a readable, unmarked thread whose target is an SB", async () => {
+    const db = client();
+    await handleTriggerFailure(db, threadBorne, deps);
+    const notice = await theNotice(db);
+    expect(notice.content).toContain('Trigger to lumen failed');
+    expect(notice.metadata).toMatchObject({ errorDetail: 'runner exited 1' });
+    // Its target unreadable changes nothing there: no inkling can be in an unmarked thread.
+    const unreadable = withFailingTargetRead(client(), 'sb-b');
+    await handleTriggerFailure(unreadable, threadBorne, deps);
+    expect((await theNotice(unreadable)).content).toContain('Trigger to lumen failed');
+  });
+
+  it('is for the person wherever an inkling could be reading (Lumen, #771)', async () => {
+    const plain =
+      "Your inkling couldn't answer that message. If you asked your inkling to do something, check whether it's done before sending it again.";
+    const pip =
+      "Pip couldn't answer that message. If you asked Pip to do something, check whether it's done before sending it again.";
+    const cases: Array<[string, Db, string]> = [
+      // A marked conversation, whatever its target reads as.
+      ['target unreadable', withFailingTargetRead(inklingWorld(true), 'sb-ink'), plain],
+      ['target missing', inklingWorld(true, true, 'missing'), plain],
+      ['target without metadata', inklingWorld(true, true, 'no-metadata'), plain],
+      // An inkling target, even where the mark is missing.
+      ['unmarked thread, inkling target', inklingWorld(true, false), pip],
+      // A thread that can't be read, whatever its target: it could be a conversation.
+      ['thread unreadable', withFailingThreadRead(inklingWorld(true)), pip],
+    ];
+    for (const [label, db, expected] of cases) {
+      await handleTriggerFailure(
+        db,
+        fromThePerson(new Error('private-diagnostic-marker timeout')) as never,
+        deps
+      );
+      const notice = await theNotice(db);
+      expect(notice.content, label).toBe(expected);
+      expect(JSON.stringify(notice), label).not.toContain('private-diagnostic-marker');
+    }
+  });
+
+  it('treats an unreadable thread as one a person may read, even with an SB target', async () => {
+    const db = withFailingThreadRead(client());
+    await handleTriggerFailure(db, threadBorne, deps);
+    const notice = await theNotice(db);
+    expect(notice.content).toBe("Your inkling can't answer right now. Try again later.");
+    expect(JSON.stringify(notice)).not.toContain('runner exited 1');
   });
 });

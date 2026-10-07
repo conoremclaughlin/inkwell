@@ -59,6 +59,10 @@ function harness() {
   let memory: any = {
     id: 'synthetic-memory',
     user_id: 'synthetic-user',
+    // Owned, as every memory is: restore refuses a row with no owner
+    // (remove-shared-memories §3.4). The history row below inherits it.
+    agent_id: 'synthetic-sb',
+    sb_id: 'synthetic-sb-id',
     content: 'Old fact',
     summary: null,
     source: 'observation',

@@ -128,7 +128,6 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
       const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
-        includeShared: true,
         limit,
         recallMode: 'hybrid',
       });
@@ -194,7 +193,6 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
       const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
-        includeShared: true,
         limit,
         recallMode: 'hybrid',
       });
@@ -363,7 +361,6 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
       const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
-        includeShared: true,
         limit,
         recallMode: 'hybrid',
       });

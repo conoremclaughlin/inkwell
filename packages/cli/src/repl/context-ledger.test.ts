@@ -320,3 +320,46 @@ describe('ContextLedger', () => {
     });
   });
 });
+
+describe('ContextLedger — images a tool put in context', () => {
+  const image = {
+    ref: 'img:0123456789abcdef',
+    path: '/tmp/ink-tool-images-x/0123456789abcdef.png',
+    mimeType: 'image/png',
+    width: 1536,
+    height: 1024,
+    approxTokens: 2098,
+  };
+
+  it('counts the image in its entry, lists it, and shows it in the summary', () => {
+    const ledger = new ContextLedger();
+    const line = 'local tool view_image -> {...} [img:0123456789abcdef 1536x1024 attached]';
+    const entry = ledger.addEntry('system', line, 'local-tool', undefined, undefined, [image]);
+
+    expect(entry.approxTokens).toBe(estimateTokens(line) + 2098);
+    expect(ledger.totalTokens()).toBe(entry.approxTokens);
+    expect(ledger.listImages()).toEqual([image]);
+    expect(ledger.summarizeEntries()[0]!.images).toEqual([
+      { image: 'img:0123456789abcdef', width: 1536, height: 1024, tokens: 2098 },
+    ]);
+  });
+
+  it('an entry without images carries no images field', () => {
+    const ledger = new ContextLedger();
+    const entry = ledger.addEntry('system', 'plain', 'local-tool', undefined, undefined, []);
+    expect(entry.images).toBeUndefined();
+    expect(ledger.summarizeEntries()[0]).not.toHaveProperty('images');
+  });
+
+  it('evicting the entry takes its image and its tokens with it', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'look at this');
+    const entry = ledger.addEntry('system', 'viewed', 'local-tool', undefined, undefined, [image]);
+    const before = ledger.totalTokens();
+
+    const result = ledger.evictBySource('local-tool');
+    expect(result.removedTokens).toBe(entry.approxTokens);
+    expect(ledger.totalTokens()).toBe(before - entry.approxTokens);
+    expect(ledger.listImages()).toEqual([]);
+  });
+});

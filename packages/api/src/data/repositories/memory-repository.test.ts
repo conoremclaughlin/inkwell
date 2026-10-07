@@ -11,6 +11,8 @@ import { MEMORY_EMBEDDING_CHUNKS_VERSION } from '../../services/embeddings/memor
 describe('MemoryRepository', () => {
   let mockSupabase: MockSupabaseClient;
   let repo: MemoryRepository;
+  // Every read is for one canonical owner (remove-shared-memories §3.3).
+  const LUMEN_OWNER = { sbSlug: 'lumen', sbId: 'sb-lumen' };
   const disableEmbeddings = () => {
     (repo as any).embeddingRouter = {
       isEnabled: vi.fn().mockReturnValue(false),
@@ -339,6 +341,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Test memory content',
       });
 
@@ -379,6 +383,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Important memory',
         source: 'user_stated',
         salience: 'high',
@@ -414,6 +420,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Reflection on recent experiences: I notice patterns in how I approach problems.',
         source: 'reflection',
         salience: 'high',
@@ -433,6 +441,8 @@ describe('MemoryRepository', () => {
       await expect(
         repo.remember({
           userId: 'user-456',
+          sbSlug: 'wren',
+          sbId: 'sb-wren',
           content: 'Test',
         })
       ).rejects.toThrow('Failed to create memory: Database error');
@@ -472,7 +482,7 @@ describe('MemoryRepository', () => {
 
       mockSupabase._setArrayData(mockMemories);
 
-      const results = await repo.recall('user-456');
+      const results = await repo.recall('user-456', undefined, { ...LUMEN_OWNER });
 
       expect(results).toHaveLength(2);
       expect(results[0].id).toBe('mem-1');
@@ -483,7 +493,7 @@ describe('MemoryRepository', () => {
     it('should apply text search filter', async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.recall('user-456', 'search term', { recallMode: 'text' });
+      await repo.recall('user-456', 'search term', { ...LUMEN_OWNER, recallMode: 'text' });
 
       expect(mockSupabase._queryBuilder.or).toHaveBeenCalledWith(
         'content.ilike.%search term%,summary.ilike.%search term%,topic_key.ilike.%search term%,content.ilike.%search%,summary.ilike.%search%,topic_key.ilike.%search%,content.ilike.%term%,summary.ilike.%term%,topic_key.ilike.%term%'
@@ -493,7 +503,7 @@ describe('MemoryRepository', () => {
     it('should apply salience filter', async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.recall('user-456', undefined, { salience: 'high' });
+      await repo.recall('user-456', undefined, { ...LUMEN_OWNER, salience: 'high' });
 
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('salience', 'high');
     });
@@ -501,7 +511,7 @@ describe('MemoryRepository', () => {
     it('should apply topics filter', async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.recall('user-456', undefined, { topics: ['work', 'ai'] });
+      await repo.recall('user-456', undefined, { ...LUMEN_OWNER, topics: ['work', 'ai'] });
 
       expect(mockSupabase._queryBuilder.overlaps).toHaveBeenCalledWith('topics', ['work', 'ai']);
     });
@@ -512,6 +522,7 @@ describe('MemoryRepository', () => {
         .mockResolvedValue([]);
 
       await repo.recall('user-456', 'latest policy', {
+        ...LUMEN_OWNER,
         recallMode: 'semantic',
         semanticChunkTypes: ['content'],
         applyChunkTypeBoosts: false,
@@ -586,6 +597,7 @@ describe('MemoryRepository', () => {
         });
 
       const results = await repo.recall('user-456', 'what is relevant?', {
+        ...LUMEN_OWNER,
         recallMode: 'semantic',
         semanticChunkTypes: ['content', 'entity'],
         semanticQueryStrategy: 'parallel-content-entity',
@@ -660,6 +672,7 @@ describe('MemoryRepository', () => {
       ]);
 
       const results = await repo.recall('user-456', 'latest policy', {
+        ...LUMEN_OWNER,
         recallMode: 'hybrid',
         hybridChunkStrategy: 'content-only',
         applyChunkTypeBoosts: false,
@@ -1693,6 +1706,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Detailed content about JWT auth decision',
         summary: 'Using self-issued JWTs with 30-day expiry',
         topicKey: 'decision:jwt-auth',
@@ -1736,6 +1751,8 @@ describe('MemoryRepository', () => {
 
       await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Some content',
         topicKey: 'project:inkwell',
         topics: ['dev'],
@@ -1771,6 +1788,8 @@ describe('MemoryRepository', () => {
 
       await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Some content',
         topicKey: 'project:inkwell',
         topics: ['project:inkwell', 'dev'],
@@ -1806,6 +1825,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Plain memory',
       });
 
@@ -1866,6 +1887,7 @@ describe('MemoryRepository', () => {
       const result = await repo.remember({
         userId: 'user-456',
         sbSlug: 'lumen',
+        sbId: 'sb-lumen',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
         topicKey: 'project:inkwell/memory',
@@ -1988,7 +2010,7 @@ describe('MemoryRepository', () => {
 
       mockSupabase._setArrayData(mockMemories);
 
-      const results = await repo.getKnowledgeMemories('user-456');
+      const results = await repo.getKnowledgeMemories('user-456', LUMEN_OWNER);
 
       // Should have called from('memories') and filtered by salience
       expect(mockSupabase.from).toHaveBeenCalledWith('memories');
@@ -2002,31 +2024,33 @@ describe('MemoryRepository', () => {
       expect(results[0].topicKey).toBe('decision:auth');
     });
 
-    it('should filter by sbSlug when provided', async () => {
+    it("filters on the owner's canonical id, with no branch for ownerless rows", async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.getKnowledgeMemories('user-456', 'wren');
+      await repo.getKnowledgeMemories('user-456', LUMEN_OWNER);
 
-      expect(mockSupabase._queryBuilder.or).toHaveBeenCalledWith(
-        'agent_id.eq.wren,agent_id.is.null'
-      );
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('sb_id', 'sb-lumen');
+      // The removed shared branch: no agent_id disjunction of any shape.
+      const orCalls = (mockSupabase._queryBuilder.or as ReturnType<typeof vi.fn>).mock.calls;
+      expect(orCalls.filter(([arg]: [string]) => arg.includes('agent_id'))).toHaveLength(0);
     });
 
-    it('should not filter by sbSlug when not provided', async () => {
-      mockSupabase._setArrayData([]);
+    it('reads nothing at all without an owner', async () => {
+      mockSupabase._setArrayData([
+        { id: 'mem-x', user_id: 'user-456', content: 'anyone', salience: 'critical', topics: [] },
+      ]);
 
-      await repo.getKnowledgeMemories('user-456');
+      const results = await repo.getKnowledgeMemories('user-456', undefined);
 
-      // or() should still be called for expires_at, but not for agent_id
-      const orCalls = (mockSupabase._queryBuilder.or as ReturnType<typeof vi.fn>).mock.calls;
-      const agentOrCalls = orCalls.filter(([arg]: [string]) => arg.includes('agent_id'));
-      expect(agentOrCalls).toHaveLength(0);
+      // It used to drop the owner filter here and return every SB's rows.
+      expect(results).toEqual([]);
+      expect(mockSupabase.from).not.toHaveBeenCalled();
     });
 
     it('should respect highLimit parameter', async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.getKnowledgeMemories('user-456', undefined, 25);
+      await repo.getKnowledgeMemories('user-456', LUMEN_OWNER, 25);
 
       // 3 queries: critical candidates (100), high by count (25), high by
       // window (50). Critical fetches a wider pool than the 30 it returns so
@@ -2040,7 +2064,7 @@ describe('MemoryRepository', () => {
     it('should apply time window for high memories', async () => {
       mockSupabase._setArrayData([]);
 
-      await repo.getKnowledgeMemories('user-456', undefined, 10, 14);
+      await repo.getKnowledgeMemories('user-456', LUMEN_OWNER, 10, 14);
 
       // gte should be called for the windowed high query
       const gteCalls = (mockSupabase._queryBuilder.gte as ReturnType<typeof vi.fn>).mock.calls;
@@ -2176,7 +2200,7 @@ describe('MemoryRepository', () => {
             version: 1,
             created_at: '2026-03-16T00:00:00Z',
             expires_at: null,
-            sb_id: null,
+            sb_id: 'sb-lumen',
             similarity: 0.88,
           },
         ],
@@ -2204,7 +2228,10 @@ describe('MemoryRepository', () => {
         }),
       };
 
-      const results = await repo.recall('user-456', 'semantic query', { recallMode: 'semantic' });
+      const results = await repo.recall('user-456', 'semantic query', {
+        ...LUMEN_OWNER,
+        recallMode: 'semantic',
+      });
 
       expect(rpc).toHaveBeenCalledTimes(1);
       expect(rpc).toHaveBeenCalledWith(
@@ -2246,7 +2273,7 @@ describe('MemoryRepository', () => {
             version: 1,
             created_at: '2026-03-16T00:00:00Z',
             expires_at: null,
-            sb_id: null,
+            sb_id: 'sb-lumen',
             matched_chunk_index: 0,
             matched_chunk_text: 'Semantic memory',
             matched_chunk_type: 'summary',
@@ -2277,7 +2304,10 @@ describe('MemoryRepository', () => {
         }),
       };
 
-      const results = await repo.recall('user-456', 'semantic query', { recallMode: 'semantic' });
+      const results = await repo.recall('user-456', 'semantic query', {
+        ...LUMEN_OWNER,
+        recallMode: 'semantic',
+      });
 
       expect(rpc).toHaveBeenCalledWith(
         'match_memory_embedding_chunks',
@@ -2313,7 +2343,7 @@ describe('MemoryRepository', () => {
               version: 1,
               created_at: '2026-03-16T00:00:00Z',
               expires_at: null,
-              sb_id: null,
+              sb_id: 'sb-lumen',
               similarity: 0.88,
             },
           ],
@@ -2342,7 +2372,10 @@ describe('MemoryRepository', () => {
         }),
       };
 
-      const results = await repo.recall('user-456', 'semantic query', { recallMode: 'semantic' });
+      const results = await repo.recall('user-456', 'semantic query', {
+        ...LUMEN_OWNER,
+        recallMode: 'semantic',
+      });
 
       expect(rpc).toHaveBeenNthCalledWith(
         1,
@@ -2385,7 +2418,10 @@ describe('MemoryRepository', () => {
         }),
       };
 
-      const results = await repo.recall('user-456', 'semantic query', { recallMode: 'semantic' });
+      const results = await repo.recall('user-456', 'semantic query', {
+        ...LUMEN_OWNER,
+        recallMode: 'semantic',
+      });
 
       expect(rpc).not.toHaveBeenCalled();
       expect(results).toEqual([]);
@@ -2406,6 +2442,7 @@ describe('MemoryRepository', () => {
               salience: 'high',
               topics: ['policy:wound-care'],
               agent_id: 'lumen',
+              sb_id: 'sb-lumen',
               embedding: '[0.1,0.2,0.3]',
               metadata: {},
               version: 1,
@@ -2432,6 +2469,7 @@ describe('MemoryRepository', () => {
               salience: 'high',
               topics: ['policy:wound-care'],
               agent_id: 'lumen',
+              sb_id: 'sb-lumen',
               embedding: '[0.1,0.2,0.3]',
               metadata: {},
               version: 1,
@@ -2471,6 +2509,7 @@ describe('MemoryRepository', () => {
       (repo as any).textRecallCandidates = vi.fn().mockResolvedValue([]);
 
       const results = await repo.recall('user-456', 'current override policy', {
+        ...LUMEN_OWNER,
         recallMode: 'hybrid',
         hybridChunkStrategy: 'multi-view',
       });
@@ -2597,6 +2636,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'Alice told me her address',
         contactId: 'contact-alice',
       });
@@ -2626,6 +2667,8 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
         content: 'General knowledge',
       });
 
@@ -2654,6 +2697,7 @@ describe('MemoryRepository', () => {
       mockSupabase._setArrayData([contactMemory]);
 
       const results = await repo.recall('user-456', undefined, {
+        ...LUMEN_OWNER,
         contactId: 'contact-alice',
         recallMode: 'text',
       });
@@ -2673,7 +2717,7 @@ describe('MemoryRepository', () => {
       disableEmbeddings();
       mockSupabase._setArrayData([]);
 
-      await repo.recall('user-456', undefined, { recallMode: 'text' });
+      await repo.recall('user-456', undefined, { ...LUMEN_OWNER, recallMode: 'text' });
 
       const eqCalls = (mockSupabase._queryBuilder.eq as ReturnType<typeof vi.fn>).mock.calls;
       const contactFilter = eqCalls.find((call: unknown[]) => call[0] === 'contact_id');

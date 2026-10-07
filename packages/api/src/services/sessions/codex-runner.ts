@@ -17,10 +17,12 @@ import type {
   ChannelResponse,
   ChannelType,
   IRunner,
+  MediaAttachment,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
+import { uploadDirsToGrant } from '../uploads/runner-media.js';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
@@ -70,15 +72,20 @@ interface CodexUsageStats {
 }
 
 export class CodexRunner implements IRunner {
+  readonly uploadMedia = 'grant' as const;
+
   async run(
     message: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
     const { backendSessionId, injectedContext, config } = options;
+    // Each attached upload's own directory, for this spawn only.
+    const uploadDirs = uploadDirsToGrant(options.mediaAttachments, !!config.container);
     const isResume = !!backendSessionId;
 
     let fullMessage = message;
@@ -107,7 +114,8 @@ export class CodexRunner implements IRunner {
         isResume,
         fullMessage,
         config,
-        containerPath || promptPath
+        containerPath || promptPath,
+        uploadDirs
       );
       logger.info('Spawning Codex CLI', {
         resumeSessionId: argsSessionId || null,
@@ -118,6 +126,15 @@ export class CodexRunner implements IRunner {
       });
 
       const result = await this.spawnProcess(args, runConfig);
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // Only return a backend session ID if we actually extracted one from
       // the Codex event stream, or if we were resuming an existing session.
@@ -159,7 +176,8 @@ export class CodexRunner implements IRunner {
     isResume: boolean,
     message: string,
     config: ClaudeRunnerConfig,
-    promptPath: string
+    promptPath: string,
+    uploadDirs: readonly string[] = []
   ): string[] {
     // Triggered sessions are non-interactive (no human present).
     // sandbox_bypass (opt-in per studio): bypasses sandbox + approvals so
@@ -180,6 +198,9 @@ export class CodexRunner implements IRunner {
     // must precede `resume` — exec scope applies to the resumed session too.
     // The run path ensures the directory exists first.
     args.push('--add-dir', inkStudiosRoot());
+    // Each attached upload's own directory (services/uploads/runner-media.ts),
+    // before `resume` for the same reason.
+    for (const dir of uploadDirs) args.push('--add-dir', dir);
 
     if (isResume) {
       args.push('resume');
@@ -250,8 +271,20 @@ export class CodexRunner implements IRunner {
      * it is reported as a completed turn. See the timer below.
      */
     timedOut?: { kind: 'hard'; message: string };
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const codexBin = await resolveBinaryPath('codex');
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Codex spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
 
     const runtimeLinkId = randomUUID();
     if (config.inkSessionId && config.workingDirectory) {
@@ -270,6 +303,8 @@ export class CodexRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
         ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
@@ -302,6 +337,7 @@ export class CodexRunner implements IRunner {
         env: target.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      if (proc.pid !== undefined) config.onSpawned?.({ pid: proc.pid });
 
       let stderr = '';
       const nonJsonLines: string[] = [];

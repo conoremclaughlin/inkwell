@@ -12,6 +12,7 @@ import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { configureLaunchRecording, holdSurvivors, resetLaunchHolds } from './launched-processes.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
@@ -45,6 +46,7 @@ import { spawn } from 'child_process';
 import { STOP_GRACE_MS } from './stop-process.js';
 import { clearInklingFences, fenceInkling } from '../inklings/inkling-stop-fence.js';
 import { carriedClassification, isRoutingRefusal } from '../../channels/trigger-retry.js';
+import { setUploadsRoot } from '../uploads/runtime.js';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -207,16 +209,19 @@ describe('SessionService', () => {
     };
 
     mockClaudeRunner = {
+      uploadMedia: 'grant',
       run: vi.fn().mockResolvedValue(createMockClaudeResult()),
     };
 
     mockCodexRunner = {
+      uploadMedia: 'grant',
       run: vi
         .fn()
         .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'codex-session-1' })),
     };
 
     mockInkRunner = {
+      uploadMedia: 'grant',
       run: vi.fn().mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
     };
 
@@ -242,6 +247,111 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  describe('turn hooks: each turn, in turn order (Lumen, #769)', () => {
+    const deferred = <T>() => {
+      let resolve!: (v: T) => void;
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    };
+    const hooksLogging = (order: string[], name: string, ended?: unknown[]) => ({
+      start: async () => {
+        order.push(`start ${name}`);
+      },
+      end: async (result: unknown) => {
+        order.push(`end ${name}`);
+        ended?.push(result);
+      },
+    });
+
+    it('wraps a direct turn: start before it runs, end with its result as admitted', async () => {
+      const order: string[] = [];
+      const ended: unknown[] = [];
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      vi.spyOn(sessionService as any, 'processMessage').mockImplementation(async () => {
+        order.push('turn');
+        return createMockClaudeResult({ finalTextResponse: 'done' });
+      });
+
+      const result = await sessionService.handleMessage({
+        ...createMockRequest(),
+        turnHooks: hooksLogging(order, 'A', ended),
+      } as never);
+
+      expect(order).toEqual(['start A', 'turn', 'end A']);
+      expect(ended).toEqual([
+        expect.objectContaining({ success: true, admitted: true, finalTextResponse: 'done' }),
+      ]);
+      expect(result.success).toBe(true);
+    });
+
+    it('ends a turn before the next queued one starts, although the first caller settles only after it', async () => {
+      const order: string[] = [];
+      const enteredA = deferred<void>();
+      const enteredB = deferred<void>();
+      const endA = deferred<unknown>();
+      const endB = deferred<unknown>();
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      vi.spyOn(sessionService as any, 'processMessage')
+        .mockImplementationOnce(async () => {
+          order.push('turn A');
+          enteredA.resolve();
+          return endA.promise;
+        })
+        .mockImplementationOnce(async () => {
+          order.push('turn B');
+          enteredB.resolve();
+          return endB.promise;
+        });
+
+      const a = sessionService.handleMessage({
+        ...createMockRequest({ content: 'A' }),
+        turnHooks: hooksLogging(order, 'A'),
+      } as never);
+      await enteredA.promise;
+      const b = sessionService.handleMessage({
+        ...createMockRequest({ content: 'B' }),
+        turnHooks: hooksLogging(order, 'B'),
+      } as never);
+      for (let n = 0; n < 50 && !(sessionService as any).pendingQueues.size; n++) {
+        await Promise.resolve();
+      }
+      expect((sessionService as any).pendingQueues.size).toBe(1);
+
+      endA.resolve(createMockClaudeResult({ finalTextResponse: 'Closing A' }));
+      await enteredB.promise;
+      // A's decision is made while B is still running: before it, in fact.
+      expect(order).toEqual(['start A', 'turn A', 'end A', 'start B', 'turn B']);
+
+      endB.resolve(createMockClaudeResult({ finalTextResponse: 'Closing B' }));
+      await Promise.all([a, b]);
+      expect(order).toEqual(['start A', 'turn A', 'end A', 'start B', 'turn B', 'end B']);
+    });
+
+    it('a hook that throws never fails the turn', async () => {
+      vi.spyOn(sessionService as any, 'getOrCreateSession').mockResolvedValue(createMockSession());
+      const turn = vi
+        .spyOn(sessionService as any, 'processMessage')
+        .mockResolvedValue(createMockClaudeResult({ finalTextResponse: 'done' }));
+
+      const result = await sessionService.handleMessage({
+        ...createMockRequest(),
+        turnHooks: {
+          start: async () => {
+            throw new Error('start exploded');
+          },
+          end: async () => {
+            throw new Error('end exploded');
+          },
+        },
+      } as never);
+
+      expect(turn).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ success: true, finalTextResponse: 'done' });
+    });
   });
 
   /**
@@ -1283,6 +1393,24 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
         });
 
+        it("gives an inkling's turn its own tool policy, beside the inklings' folders, and no other SB's turn one (task 0321ccf1)", async () => {
+          await turn(INKLING, fromOwner, OWNER);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            inklingToolPolicyPath: join(inklingsRoot, '.tool-policy', `${SB}.json`),
+          });
+          // Beside its folder, never inside it: nothing its turn reaches can write it.
+          const policy = (configPassedToRunner() as { inklingToolPolicyPath: string })
+            .inklingToolPolicyPath;
+          expect(policy.startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
+
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner(mockClaudeRunner)).not.toHaveProperty(
+            'inklingToolPolicyPath'
+          );
+        });
+
         it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
           const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
           expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
@@ -1635,6 +1763,143 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
           expect(mockInkRunner.run).not.toHaveBeenCalled();
           expect(runtimeRewrites().some((updates) => updates.backend === 'ink')).toBe(false);
+        });
+
+        describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const fromSystem = { sender: { id: 'system', name: 'x' } };
+          const launchSession = { backend: 'ink', id: 'launch-session' };
+          const fakeStore = () => ({
+            reserve: vi.fn(async () => 'row-1'),
+            attach: vi.fn(async () => undefined),
+            markExited: vi.fn(async () => undefined),
+            listOpen: vi.fn(async () => []),
+          });
+          const envs: Array<Record<string, string> | undefined> = [];
+          const reportingSpawn = (result: Record<string, unknown>) =>
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: {
+                config: {
+                  onSpawned?: (spawned: { pid: number }) => void;
+                  launchEnv?: Record<string, string>;
+                };
+              }
+            ) => {
+              envs.push(options.config.launchEnv);
+              options.config.onSpawned?.({ pid: 4242 });
+              return result;
+            }) as never);
+          afterEach(() => {
+            configureLaunchRecording(undefined);
+            resetLaunchHolds();
+          });
+
+          it('writes the launch before the runner starts, tags its process, and stamps it once the run confirmed its exit', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            envs.length = 0;
+            reportingSpawn({ success: true, responses: [], backendSessionId: 'ink-1' });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(store.reserve).toHaveBeenCalledWith(
+              expect.objectContaining({ sessionId: 'launch-session' })
+            );
+            expect(vi.mocked(store.reserve).mock.invocationCallOrder[0]).toBeLessThan(
+              vi.mocked(mockInkRunner.run).mock.invocationCallOrder[0]
+            );
+            expect(envs).toEqual([{ INK_LAUNCH_ID: 'row-1' }]);
+            await vi.waitFor(() =>
+              expect(store.attach).toHaveBeenCalledWith(
+                'row-1',
+                expect.objectContaining({ pid: 4242 })
+              )
+            );
+            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
+          });
+
+          it('starts nothing, and refuses the turn retryably, when its launch cannot be written', async () => {
+            const store = fakeStore();
+            store.reserve.mockRejectedValue(new Error('db down'));
+            configureLaunchRecording({
+              store,
+              serverInstance: 'host:3001',
+              bootId: 'boot',
+              reserveDelaysMs: [0],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/could not be recorded before starting it/);
+          });
+
+          it('leaves the row open when the runner could not confirm its processes stopped', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            reportingSpawn({
+              success: false,
+              responses: [],
+              backendSessionId: 'ink-1',
+              error: 'stopped, unconfirmed',
+              stopUnconfirmed: { leaderExited: false },
+            });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            await vi.waitFor(() => expect(store.attach).toHaveBeenCalled());
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(store.markExited).not.toHaveBeenCalled();
+          });
+
+          it('carries a hold installed while the turn was prepared to the runner’s spawn seam', async () => {
+            const asked: Array<string | undefined> = [];
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: { config: { admitSpawn?: () => string | undefined } }
+            ) => {
+              asked.push(options.config.admitSpawn?.());
+              // An earlier launch's failed record lands during the runner's preparation.
+              holdSurvivors({
+                stopped: [],
+                gone: [],
+                unstoppable: [],
+                uncertain: [
+                  {
+                    id: '',
+                    sessionId: 'launch-session',
+                    backend: 'ink',
+                    pid: process.pid,
+                    pgid: null,
+                    startIdentity: null,
+                    bootId: 'boot',
+                  },
+                ],
+              });
+              asked.push(options.config.admitSpawn?.());
+              return { success: false, responses: [], error: asked[1], refusedBeforeSpawn: true };
+            }) as never);
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(asked[0]).toBeUndefined();
+            expect(asked[1]).toMatch(/may still be running this session/);
+          });
+
+          it('starts nothing for a session held by a survivor that may still be alive', async () => {
+            holdSurvivors({
+              stopped: [],
+              gone: [],
+              unstoppable: [],
+              // This test process: certainly alive.
+              uncertain: [
+                {
+                  id: 'row-held',
+                  sessionId: 'launch-session',
+                  backend: 'ink',
+                  pid: process.pid,
+                  pgid: null,
+                  startIdentity: null,
+                  bootId: 'boot',
+                },
+              ],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/may still be running this session/);
+          });
         });
 
         it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
@@ -2341,6 +2606,77 @@ describe('SessionService', () => {
       expect((options as { config: { inkMcpUrl?: string } }).config).not.toHaveProperty(
         'inkMcpUrl'
       );
+    });
+  });
+
+  describe('the in-process ink runtime is opt-in, by agent (hosted-ink-session.ts)', () => {
+    const LISTED = '5f2a9c4e-0d6b-4c1a-9f3e-7a8b1c2d3e4f';
+    const OTHER = '0e1d2c3b-4a59-4687-9a8b-7c6d5e4f3a2b';
+    const hostedService = () => {
+      const hosted: IClaudeRunner = {
+        uploadMedia: 'refuse',
+        run: vi
+          .fn()
+          .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
+      };
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          hostedInk: { runner: hosted, sbIds: new Set([LISTED]) },
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+      return { service, hosted };
+    };
+
+    it("runs a listed agent's ink turn in process, matching its id in any case", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED.toUpperCase() })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
+    });
+
+    it("leaves an unlisted agent's ink turn on ink chat", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: OTHER })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it("never moves a listed agent's turn on another backend", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: LISTED })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it('compacts a listed agent in process too, never on ink chat beside it', async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED, backendSessionId: 'ink-session-1' })
+      );
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+      await service.triggerCompaction('session-123');
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
     });
   });
 
@@ -3335,6 +3671,142 @@ describe('SessionService', () => {
       // longer a usable proxy, since the post-finalize boundary ownership
       // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+    });
+
+    it('records the compaction run’s launch, so a restart can stop it too', async () => {
+      const store = {
+        reserve: vi.fn(async () => 'row-compaction'),
+        attach: vi.fn(async () => undefined),
+        markExited: vi.fn(async () => undefined),
+        listOpen: vi.fn(async () => []),
+      };
+      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+      try {
+        const session = createMockSession({ backendSessionId: 'claude-abc' });
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+        ) => {
+          options.config.onSpawned?.({ pid: 4343 });
+          return createMockClaudeResult({ success: true });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
+        expect(store.reserve).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-123' })
+        );
+        await vi.waitFor(() =>
+          expect(store.attach).toHaveBeenCalledWith(
+            'row-compaction',
+            expect.objectContaining({ pid: 4343 })
+          )
+        );
+      } finally {
+        configureLaunchRecording(undefined);
+      }
+    });
+
+    it('does not compact when a hold lands while the compaction lock is taken', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockImplementationOnce(async () => {
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          return true;
+        });
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('carries the hold to the compaction runner’s spawn seam', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        const asked: Array<string | undefined> = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { admitSpawn?: () => string | undefined } }
+        ) => {
+          asked.push(options.config.admitSpawn?.());
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          asked.push(options.config.admitSpawn?.());
+          return createMockClaudeResult({ success: false, error: asked[1] });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        expect(asked[0]).toBeUndefined();
+        expect(asked[1]).toMatch(/may still be running this session/);
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('does not compact a session held by a survivor that may still be alive', async () => {
+      holdSurvivors({
+        stopped: [],
+        gone: [],
+        unstoppable: [],
+        uncertain: [
+          {
+            id: 'row-held',
+            sessionId: 'session-123',
+            backend: 'claude-code',
+            pid: process.pid,
+            pgid: null,
+            startIdentity: null,
+            bootId: 'boot',
+          },
+        ],
+      });
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+      } finally {
+        resetLaunchHolds();
+      }
     });
 
     it('should skip compaction when lock is already held (re-entry guard)', async () => {
@@ -5738,6 +6210,86 @@ describe('SessionService', () => {
       expect(runOptions.mediaAttachments).toHaveLength(2);
       expect(runOptions.mediaAttachments![0].path).toBe('/tmp/photo1.jpg');
       expect(runOptions.mediaAttachments![1].path).toBe('/tmp/report.pdf');
+    });
+
+    describe('uploads at the dispatch seam (IRunner.uploadMedia)', () => {
+      const ROOT = '/home/u/.ink/uploads';
+      const upload = {
+        type: 'image' as const,
+        path: `${ROOT}/0a0a0a0a-0000-4000-8000-0000000000aa/1c1c1c1c-0000-4000-8000-0000000000cc/5a5a5a5a-0000-4000-8000-000000000001/5a5a5a5a-0000-4000-8000-000000000001.jpg`,
+      };
+      const photo = { type: 'image' as const, path: '/tmp/photo1.jpg' };
+
+      async function runWith(
+        policy: 'grant' | 'refuse',
+        media: Array<{ type: 'image'; path: string }> = [upload, photo],
+        content = 'Hello, Myra!',
+        triggerType?: 'agent'
+      ) {
+        (mockClaudeRunner as unknown as { uploadMedia: string }).uploadMedia = policy;
+        setUploadsRoot(ROOT);
+        try {
+          const session = createMockSession({ lifecycle: 'idle', backend: 'claude-code' });
+          vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+          await sessionService.handleMessage(
+            createMockRequest({ content, metadata: { media, triggerType } })
+          );
+          const [message, options] = vi.mocked(mockClaudeRunner.run).mock.calls[0];
+          return { message, attachments: options.mediaAttachments };
+        } finally {
+          setUploadsRoot(null);
+        }
+      }
+
+      it('never hands a refusing runner an upload, and tells the turn', async () => {
+        const { message, attachments } = await runWith('refuse');
+        expect(attachments).toEqual([photo]);
+        expect(
+          message.endsWith('\n\n(One attached file could not be opened in this runtime.)')
+        ).toBe(true);
+      });
+
+      it('leaves a refused upload’s path out of the prompt, and the rest as it was', async () => {
+        const { message } = await runWith('refuse');
+        expect(message).not.toContain(ROOT);
+        expect(message).toContain(
+          'Attachments:\n- image: /tmp/photo1.jpg\nView attached files with your file-reading tool'
+        );
+        expect(message).toContain('Hello, Myra!');
+        expect(message).toContain('From: TestUser');
+      });
+
+      it('keeps the rest of the request when it formats again', async () => {
+        const { message } = await runWith('refuse', [upload, photo], 'Hello, Myra!', 'agent');
+        expect(message).not.toContain(ROOT);
+        expect(message).toContain('[AGENT TRIGGER]');
+      });
+
+      it('lists no attachments when the only one was a refused upload', async () => {
+        const { message, attachments } = await runWith('refuse', [upload]);
+        expect(attachments).toBeUndefined();
+        expect(message).not.toContain(ROOT);
+        expect(message).not.toContain('Attachments:');
+        expect(message).toContain('Hello, Myra!');
+        expect(
+          message.endsWith('\n\n(One attached file could not be opened in this runtime.)')
+        ).toBe(true);
+      });
+
+      it('keeps what the person wrote as written, even when it names the path', async () => {
+        const content = `Is ${upload.path} the right one?`;
+        const { message } = await runWith('refuse', [upload, photo], content);
+        // Once, in their words; not again as an attachment.
+        expect(message.split(upload.path)).toHaveLength(2);
+        expect(message).toContain(content);
+      });
+
+      it('hands a granting runner its uploads with other media, unchanged', async () => {
+        const { message, attachments } = await runWith('grant');
+        expect(attachments).toEqual([upload, photo]);
+        expect(message).toContain(`- image: ${upload.path}\n- image: /tmp/photo1.jpg\n`);
+        expect(message).not.toContain('could not be opened');
+      });
     });
 
     it('formats full attachment paths into the message', async () => {

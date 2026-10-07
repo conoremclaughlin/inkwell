@@ -21,10 +21,12 @@ import type {
   ChannelResponse,
   ChannelType,
   IRunner,
+  MediaAttachment,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
+import { uploadDirsToGrant } from '../uploads/runner-media.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { ceilingFromEnv } from './turn-ceiling.js';
@@ -50,15 +52,20 @@ interface GeminiUsageStats {
 }
 
 export class GeminiRunner implements IRunner {
+  readonly uploadMedia = 'grant' as const;
+
   async run(
     message: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
     const { backendSessionId, injectedContext, config } = options;
+    // Each attached upload's own directory, for this spawn only.
+    const uploadDirs = uploadDirsToGrant(options.mediaAttachments, !!config.container);
     const isResume = !!backendSessionId;
 
     // Build the message with injected context on first turn (same as Claude/Codex)
@@ -141,7 +148,13 @@ export class GeminiRunner implements IRunner {
       await ensureInkStudiosRoot();
 
       const effectivePolicyPath = containerPolicyPath || policyPath;
-      const args = this.buildArgs(fullMessage, config, effectivePolicyPath, backendSessionId);
+      const args = this.buildArgs(
+        fullMessage,
+        config,
+        effectivePolicyPath,
+        backendSessionId,
+        uploadDirs
+      );
       logger.info('Spawning Gemini CLI', {
         isResume,
         backendSessionId: backendSessionId || '(new)',
@@ -158,6 +171,15 @@ export class GeminiRunner implements IRunner {
           ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsEnvPath }
           : undefined
       );
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // Use session ID from Gemini's init event, fall back to the one we passed in
       const resolvedSessionId = result.sessionId || backendSessionId || undefined;
@@ -205,7 +227,8 @@ export class GeminiRunner implements IRunner {
     message: string,
     config: ClaudeRunnerConfig,
     policyPath?: string,
-    resumeSessionId?: string
+    resumeSessionId?: string,
+    uploadDirs: readonly string[] = []
   ): string[] {
     const args: string[] = ['-p', message, '-o', 'stream-json', '--yolo'];
 
@@ -214,6 +237,8 @@ export class GeminiRunner implements IRunner {
     // shapes, so studios minted mid-session stay editable (PR #544 r1 P1).
     // The run path ensures the directory exists first.
     args.push('--include-directories', inkStudiosRoot());
+    // Each attached upload's own directory (services/uploads/runner-media.ts).
+    for (const dir of uploadDirs) args.push('--include-directories', dir);
 
     if (resumeSessionId) {
       args.push('-r', resumeSessionId);
@@ -246,13 +271,27 @@ export class GeminiRunner implements IRunner {
      * it is reported as a completed turn. See the timers below.
      */
     timedOut?: { kind: 'idle' | 'hard'; message: string };
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const geminiBin = await resolveBinaryPath('gemini');
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Gemini CLI spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
     return new Promise((resolve, reject) => {
       // The child inherits an allowlist of the server's env (resolveSpawnTarget
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(geminiBin),
         ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
@@ -284,6 +323,7 @@ export class GeminiRunner implements IRunner {
         env: target.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      if (proc.pid !== undefined) config.onSpawned?.({ pid: proc.pid });
 
       let stderr = '';
       let stdoutRemainder = '';

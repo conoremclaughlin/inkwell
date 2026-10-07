@@ -70,6 +70,18 @@ import {
   assertInklingThreadAllowed,
   INKLING_CONVERSATION_MARK,
 } from '../../services/inklings/inkling-thread-gate.js';
+import {
+  inklingWakeDue,
+  openReplyChain,
+  replyOrder,
+  routedInReplyChain,
+  routingDoneInReplyChain,
+  supersedeReplyChain,
+  takeReplyTicket,
+  waitingInReplyChain,
+  type DispatchWake,
+  type ReplyChain,
+} from '../../services/inklings/inkling-reply-chain.js';
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
 import { linkReaderForPrincipal } from './thread-link-views.js';
@@ -401,8 +413,16 @@ export interface InternalSendContext {
    * watchdog or heartbeat send always has. This context is the ONLY way a
    * message is authored as the system — no tool call reaches it. Absent, the
    * sender resolves as it does for a tool call.
+   *
+   * An SB sender is the server posting what that SB's own turn said, when
+   * the turn ended without sending it (an inkling's closing text,
+   * inkling-closing-text.ts). It meets every rule the SB's own send would,
+   * the inkling thread gate included.
    */
-  sender?: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  sender?: {
+    principal: SbPrincipal | UserPrincipal | SystemPrincipal;
+    workspaceId: string | null;
+  };
   /**
    * A wake source's tag (wake-source-breaker.ts): the trigger handler counts
    * the wake's completed turn against it. Written to the message metadata
@@ -426,6 +446,16 @@ export interface InternalSendContext {
    * this record matches it exactly (POST /api/admin/threads).
    */
   createIntent?: Record<string, unknown>;
+  /**
+   * How an owner's message to a group of their inklings wakes it
+   * (ink://specs/inkling-group-dynamics). `wake` names the members the
+   * person addressed, by slug: only they are woken. Without it, `inTurn`
+   * wakes one member and holds the rest, who answer in turn
+   * (inkling-reply-chain.ts). Either way every member is still routed.
+   * Applied only in an inkling conversation written to by its owner;
+   * POST /api/admin/threads and /threads/reply set it.
+   */
+  inklingGroup?: { wake?: string[]; inTurn?: boolean; ticket?: number };
 }
 
 export async function handleSendToInbox(
@@ -660,6 +690,21 @@ export async function handleSendToInbox(
       // — resolved from the table by owner and slug, never through the
       // ambient request's pin.
       sender = internal.sender.principal;
+      // An SB the server sends for writes with its owner's current role,
+      // exactly as its own send does below: server authorship never restores
+      // authority the owner has lost, and a role that can't be read refuses
+      // (Lumen, #769).
+      if (sender.kind === 'sb') {
+        assertWriteRole(
+          await roleOfUserIn(
+            supabase,
+            sender.workspaceId,
+            sender.userId,
+            `${sender.sbSlug}'s owner`
+          ),
+          'send to a thread'
+        );
+      }
       workspaceId =
         internal.sender.workspaceId ??
         (await resolveSbOwnedBy(supabase, resolved.user.id, allRecipients[0])).workspaceId;
@@ -1078,6 +1123,42 @@ export async function handleSendToInbox(
       }
     }
 
+    // An owner's message to their inklings' group: the members they named
+    // answer alone; otherwise they answer in turn, through a chain opened now,
+    // before any of them is routed, so a Stop or a newer message that lands
+    // while they are being routed ends it. A chain on an older message in
+    // this conversation ends here: the person has moved on.
+    let inTurnMembers: SbRef[] = [];
+    let chain: ReplyChain | undefined;
+    /** Set for an owner's send that wakes its named or only member directly. */
+    let ownerTicket: number | undefined;
+    if (internal?.inklingGroup && inklingVerdict.inklingConversation && sender.kind === 'user') {
+      const { wake, inTurn } = internal.inklingGroup;
+      // This send's place among what the person did, taken by the route on
+      // arrival, so a Stop or a newer send made meanwhile is seen here.
+      const ticket = internal.inklingGroup.ticket ?? takeReplyTicket();
+      if (inTurn && !wake && agentsToTrigger.length > 1) {
+        inTurnMembers = replyOrder(thread.id, agentsToTrigger);
+        agentsToTrigger = [];
+        chain = openReplyChain({
+          threadId: thread.id,
+          ownerMessageId: threadMessage.id,
+          ticket,
+          members: inTurnMembers,
+        });
+      } else {
+        supersedeReplyChain(thread.id, ticket);
+        if (wake) {
+          const named = new Set(wake);
+          agentsToTrigger = agentsToTrigger.filter((agent) => named.has(agent.sbSlug));
+        }
+        // Nobody is woken for it who was stopped after it arrived, nor by it
+        // at all once a newer send in the conversation has decided: asked
+        // just before each wake below, since routing awaits until then.
+        ownerTicket = ticket;
+      }
+    }
+
     logger.info('Thread message sent', {
       messageId: threadMessage.id,
       threadKey,
@@ -1086,6 +1167,7 @@ export async function handleSendToInbox(
       type: messageType,
       isNewThread: thread.isNew,
       triggering: agentsToTrigger.map((t) => t.sbSlug),
+      ...(chain ? { inTurn: inTurnMembers.map((t) => t.sbSlug) } : {}),
       recipientStudioId: recipientStudioId || null,
       recipientStudioHint: recipientStudioHint || null,
       resolvedRecipientStudioId: resolvedRecipientStudioId || null,
@@ -1111,10 +1193,10 @@ export async function handleSendToInbox(
         routingById.set(r.sbId, { sbId: r.sbId, sbSlug: r.sbSlug });
       }
     }
-    for (const t of agentsToTrigger) routingById.set(t.sbId, t);
+    for (const t of [...agentsToTrigger, ...inTurnMembers]) routingById.set(t.sbId, t);
     const routingSet = [...routingById.values()];
     // The wake prompt prints a trigger's metadata. A person's retry key and
-    // the record of what their create asked for are the stored message's,
+    // the record of what their send asked for are the stored message's,
     // not the recipient's: an SB that echoed clientMessageId on its own send
     // in this thread would have that send refused by the unique index.
     const wakeMetadata: Record<string, unknown> = { ...rawMeta };
@@ -1122,72 +1204,56 @@ export async function handleSendToInbox(
     if (wakeMetadata.pcp && typeof wakeMetadata.pcp === 'object') {
       const inkForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
       delete inkForWake.createRequest;
+      delete inkForWake.wake;
       if (Object.keys(inkForWake).length > 0) wakeMetadata.pcp = inkForWake;
       else delete wakeMetadata.pcp;
     }
     const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
+    const inTurnIds = new Set(inTurnMembers.map((t) => t.sbId));
+    // Members this request woke in turn, and whether each was accepted: the
+    // send receipt reads these as it reads wakeIds and triggeredAgents.
+    const wokeInTurn = new Set<string>();
+    const dispatchInTurn: DispatchWake = (payload) => {
+      const result = getAgentGateway().dispatchTrigger(payload);
+      if (payload.toSbId) wokeInTurn.add(payload.toSbId);
+      if (result.accepted) triggeredAgents.push(payload.toSlug);
+      return result;
+    };
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const target of routingSet) {
-        const toSlug = target.sbSlug;
-        const wake = wakeIds.has(target.sbId);
-        // Auto-resolve recipientSessionId: find the recipient's most recent
-        // message on this thread to extract their sender session. This ensures
-        // replies route back to the session that originated the conversation,
-        // not whatever session happens to be most recently updated.
-        //
-        // Cross-studio self-message: when sender === recipient, skip auto-resolve
-        // from thread history (it would find our own session). The trigger system
-        // will use recipientStudioId to route to the correct studio session.
-        let resolvedRecipientSessionId: string | undefined =
-          effectiveRecipientSessionId || undefined;
-        const isSelfStudioMessage = selfStudioTarget && toSlug === senderSlug;
-        if (!resolvedRecipientSessionId && !isSelfStudioMessage) {
-          try {
-            const { data: recipientMsg } = await threadTable(supabase, 'inbox_thread_messages')
-              .select('metadata')
-              .eq('thread_id', thread.id)
-              .eq('sender_sb_id', target.sbId)
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            const recipientInk = (recipientMsg?.metadata as Record<string, unknown>)?.pcp as
-              | Record<string, unknown>
-              | undefined;
-            const recipientSender = recipientInk?.sender as Record<string, unknown> | undefined;
-            if (recipientSender?.sessionId && typeof recipientSender.sessionId === 'string') {
-              resolvedRecipientSessionId = recipientSender.sessionId;
-              logger.debug('[ThreadTrigger] Auto-resolved recipientSessionId from thread history', {
-                threadKey,
-                toSlug,
-                recipientSessionId: resolvedRecipientSessionId,
-              });
-            }
-          } catch (err) {
-            logger.warn('[ThreadTrigger] Failed to resolve recipientSessionId from thread', {
-              threadKey,
-              toSlug,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-          // Still nothing: the thread may have a HOME for this agent that no
-          // message of theirs established — a studio created FOR the thread binds
-          // its creator here (create_studio threadKey). The stamp is written only by
-          // the sanctioned assignment writer, and the trigger handler still
-          // verifies the session is alive before delivering, so this is a hint to
-          // resolution, never an overwrite.
-          if (!resolvedRecipientSessionId) {
+      try {
+        for (const target of routingSet) {
+          const toSlug = target.sbSlug;
+          const wake = wakeIds.has(target.sbId);
+          // Auto-resolve recipientSessionId: find the recipient's most recent
+          // message on this thread to extract their sender session. This ensures
+          // replies route back to the session that originated the conversation,
+          // not whatever session happens to be most recently updated.
+          //
+          // Cross-studio self-message: when sender === recipient, skip auto-resolve
+          // from thread history (it would find our own session). The trigger system
+          // will use recipientStudioId to route to the correct studio session.
+          let resolvedRecipientSessionId: string | undefined =
+            effectiveRecipientSessionId || undefined;
+          const isSelfStudioMessage = selfStudioTarget && toSlug === senderSlug;
+          if (!resolvedRecipientSessionId && !isSelfStudioMessage) {
             try {
-              const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('session_id')
+              const { data: recipientMsg } = await threadTable(supabase, 'inbox_thread_messages')
+                .select('metadata')
                 .eq('thread_id', thread.id)
-                .eq('sb_id', target.sbId)
+                .eq('sender_sb_id', target.sbId)
+                .order('created_at', { ascending: false })
+                .limit(1)
                 .maybeSingle();
-              if (participant?.session_id && typeof participant.session_id === 'string') {
-                resolvedRecipientSessionId = participant.session_id;
+              const recipientInk = (recipientMsg?.metadata as Record<string, unknown>)?.pcp as
+                | Record<string, unknown>
+                | undefined;
+              const recipientSender = recipientInk?.sender as Record<string, unknown> | undefined;
+              if (recipientSender?.sessionId && typeof recipientSender.sessionId === 'string') {
+                resolvedRecipientSessionId = recipientSender.sessionId;
                 logger.debug(
-                  '[ThreadTrigger] Auto-resolved recipientSessionId from the participant stamp',
+                  '[ThreadTrigger] Auto-resolved recipientSessionId from thread history',
                   {
                     threadKey,
                     toSlug,
@@ -1196,108 +1262,161 @@ export async function handleSendToInbox(
                 );
               }
             } catch (err) {
-              logger.warn('[ThreadTrigger] Failed to read the participant stamp', {
+              logger.warn('[ThreadTrigger] Failed to resolve recipientSessionId from thread', {
                 threadKey,
                 toSlug,
                 error: err instanceof Error ? err.message : String(err),
               });
             }
+            // Still nothing: the thread may have a HOME for this agent that no
+            // message of theirs established — a studio created FOR the thread binds
+            // its creator here (create_studio threadKey). The stamp is written only by
+            // the sanctioned assignment writer, and the trigger handler still
+            // verifies the session is alive before delivering, so this is a hint to
+            // resolution, never an overwrite.
+            if (!resolvedRecipientSessionId) {
+              try {
+                const { data: participant } = await threadTable(
+                  supabase,
+                  'inbox_thread_participants'
+                )
+                  .select('session_id')
+                  .eq('thread_id', thread.id)
+                  .eq('sb_id', target.sbId)
+                  .maybeSingle();
+                if (participant?.session_id && typeof participant.session_id === 'string') {
+                  resolvedRecipientSessionId = participant.session_id;
+                  logger.debug(
+                    '[ThreadTrigger] Auto-resolved recipientSessionId from the participant stamp',
+                    {
+                      threadKey,
+                      toSlug,
+                      recipientSessionId: resolvedRecipientSessionId,
+                    }
+                  );
+                }
+              } catch (err) {
+                logger.warn('[ThreadTrigger] Failed to read the participant stamp', {
+                  threadKey,
+                  toSlug,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
           }
-        }
 
-        // Targeted studio routing: propagate studioId/Hint to the trigger
-        // payload for the agent the caller specifically addressed. Covers
-        // both self-studio sends (sender == recipient, different worktree)
-        // and cross-agent delegation (e.g., strategy service → owner agent
-        // in group.metadata.studioId). Incidental trigger participants —
-        // like a thread creator auto-woken on reply — do NOT inherit the
-        // routing, since the caller only explicitly targeted recipientSlug.
-        //
-        // Before this fix, studio was only forwarded when `isSelfStudioMessage`
-        // was true, so system/human → owner delegation lost the assigned
-        // studio and fell back to route patterns / default studio.
-        const isAddressedRecipient = !recipients && toSlug === recipientSlug;
-        // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
-        // as the deliberate-retarget signal. History-inferred
-        // recipientSessionId is a continuity hint, never an overwrite.
-        const explicitRecipientTarget = !!(
-          isAddressedRecipient &&
-          (recipientSessionId || sessionKey || recipientStudioId || recipientStudioSlugOrHint)
-        );
-        const payload: AgentTriggerPayload = {
-          fromSlug: triggerSenderId,
-          ...(senderSb ? { fromSbId: senderSb.sbId } : {}),
-          toSlug,
-          toSbId: target.sbId,
-          threadId: thread.id,
-          threadMessageId: threadMessage.id,
-          triggerType: triggerType || 'message',
-          summary:
-            triggerSummary ||
-            subject ||
-            `New ${messageType} in thread ${threadKey} from ${triggerSenderId}`,
-          priority,
-          threadKey,
-          recipientSessionId: resolvedRecipientSessionId,
-          // Server-derived, from the same context token that stamps
-          // metadata.pcp.sender.studioId — never caller body data.
-          ...senderRoutingContext(senderIsBridge),
-          ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
-          ...(isAddressedRecipient && (recipientSessionId || sessionKey)
-            ? { explicitRecipientSession: true }
-            : {}),
-          ...(isAddressedRecipient && sessionKey ? { sessionKey } : {}),
-          ...(isAddressedRecipient && resolvedRecipientStudioId
-            ? { studioId: resolvedRecipientStudioId }
-            : {}),
-          ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
-            ? { studioHint: recipientStudioSlugOrHint }
-            : {}),
-          // v18 S3: strategy dispatches declare spawn admission explicitly at
-          // the boundary where their intent enters the gateway, instead of the
-          // trigger handler rediscovering it from metadata.
-          ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
-          ...(Object.keys(wakeMetadata).length > 0 ? { metadata: wakeMetadata } : {}),
-        };
-
-        // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
-        //    handler, so the participant stamp is durable before send returns.
-        //    A crash after this line cannot orphan the message. A FAILED
-        //    assignment (success:false or throw) is captured per recipient
-        //    and surfaced in the response — never swallowed into success.
-        try {
-          const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
-          if (!assignResult.success) {
-            routingFailures.push({
-              sbSlug: toSlug,
-              error: assignResult.error || 'assignment failed',
-            });
+          // Targeted studio routing: propagate studioId/Hint to the trigger
+          // payload for the agent the caller specifically addressed. Covers
+          // both self-studio sends (sender == recipient, different worktree)
+          // and cross-agent delegation (e.g., strategy service → owner agent
+          // in group.metadata.studioId). Incidental trigger participants —
+          // like a thread creator auto-woken on reply — do NOT inherit the
+          // routing, since the caller only explicitly targeted recipientSlug.
+          //
+          // Before this fix, studio was only forwarded when `isSelfStudioMessage`
+          // was true, so system/human → owner delegation lost the assigned
+          // studio and fell back to route patterns / default studio.
+          const isAddressedRecipient = !recipients && toSlug === recipientSlug;
+          // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
+          // as the deliberate-retarget signal. History-inferred
+          // recipientSessionId is a continuity hint, never an overwrite.
+          const explicitRecipientTarget = !!(
+            isAddressedRecipient &&
+            (recipientSessionId || sessionKey || recipientStudioId || recipientStudioSlugOrHint)
+          );
+          const payload: AgentTriggerPayload = {
+            fromSlug: triggerSenderId,
+            ...(senderSb ? { fromSbId: senderSb.sbId } : {}),
+            toSlug,
+            toSbId: target.sbId,
+            threadId: thread.id,
+            threadMessageId: threadMessage.id,
+            triggerType: triggerType || 'message',
+            summary:
+              triggerSummary ||
+              subject ||
+              `New ${messageType} in thread ${threadKey} from ${triggerSenderId}`,
+            priority,
+            threadKey,
+            recipientSessionId: resolvedRecipientSessionId,
+            // Server-derived, from the same context token that stamps
+            // metadata.pcp.sender.studioId — never caller body data.
+            ...senderRoutingContext(senderIsBridge),
+            ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
+            ...(isAddressedRecipient && (recipientSessionId || sessionKey)
+              ? { explicitRecipientSession: true }
+              : {}),
+            ...(isAddressedRecipient && sessionKey ? { sessionKey } : {}),
+            ...(isAddressedRecipient && resolvedRecipientStudioId
+              ? { studioId: resolvedRecipientStudioId }
+              : {}),
+            ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
+              ? { studioHint: recipientStudioSlugOrHint }
+              : {}),
+            // v18 S3: strategy dispatches declare spawn admission explicitly at
+            // the boundary where their intent enters the gateway, instead of the
+            // trigger handler rediscovering it from metadata.
+            ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
+            ...(Object.keys(wakeMetadata).length > 0 ? { metadata: wakeMetadata } : {}),
+          };
+          // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
+          //    handler, so the participant stamp is durable before send returns.
+          //    A crash after this line cannot orphan the message. A FAILED
+          //    assignment (success:false or throw) is captured per recipient
+          //    and surfaced in the response — never swallowed into success.
+          try {
+            const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
+            if (!assignResult.success) {
+              routingFailures.push({
+                sbSlug: toSlug,
+                error: assignResult.error || 'assignment failed',
+              });
+              logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+                threadKey,
+                toSlug,
+                error: assignResult.error || 'assignment failed',
+              });
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            routingFailures.push({ sbSlug: toSlug, error: message });
             logger.warn('[ThreadTrigger] Synchronous assignment failed', {
               threadKey,
               toSlug,
-              error: assignResult.error || 'assignment failed',
+              error: message,
             });
           }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          routingFailures.push({ sbSlug: toSlug, error: message });
-          logger.warn('[ThreadTrigger] Synchronous assignment failed', {
-            threadKey,
-            toSlug,
-            error: message,
-          });
-        }
 
-        // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
-        //    thread continuity. Still attempted after an assignment failure:
-        //    the wake handler re-runs assignment (a transient DB error may
-        //    clear) and the wake itself surfaces the message to the agent.
-        if (wake) {
-          const result = gateway.dispatchTrigger(payload);
-          if (result.accepted) {
-            triggeredAgents.push(toSlug);
+          // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
+          //    thread continuity. Still attempted after an assignment failure:
+          //    the wake handler re-runs assignment (a transient DB error may
+          //    clear) and the wake itself surfaces the message to the agent.
+          // Routing awaited above: a Stop or a newer owner send may have
+          // landed meanwhile, and then this member is no longer to be woken.
+          if (
+            wake &&
+            ownerTicket !== undefined &&
+            !inklingWakeDue(thread.id, target.sbId, ownerTicket)
+          ) {
+            wakeIds.delete(target.sbId);
+          } else if (wake) {
+            const result = gateway.dispatchTrigger(payload);
+            if (result.accepted) {
+              triggeredAgents.push(toSlug);
+            }
+          }
+
+          // A member answering in turn is woken by its chain, after its own
+          // routing above and only when it is its turn: perhaps now, perhaps
+          // when an earlier member's wake ends (inkling-reply-chain.ts).
+          if (chain && inTurnIds.has(target.sbId)) {
+            routedInReplyChain(chain, target.sbId, payload, dispatchInTurn);
           }
         }
+      } finally {
+        // However routing ended, a member it never readied is passed over,
+        // so the rest of the chain is not left waiting for it.
+        if (chain) routingDoneInReplyChain(chain, dispatchInTurn);
       }
     }
 
@@ -1331,10 +1450,15 @@ export async function handleSendToInbox(
             // `recipients` (a reply wakes the thread's other SBs too), and
             // whether each was meant to be woken. A send receipt judges
             // delivery from this, never from the requested list.
-            dispatched: routingSet.map((t) => ({ sbSlug: t.sbSlug, wake: wakeIds.has(t.sbId) })),
+            dispatched: routingSet.map((t) => ({
+              sbSlug: t.sbSlug,
+              wake: wakeIds.has(t.sbId) || wokeInTurn.has(t.sbId),
+            })),
             messageType,
             priority,
             triggered: triggeredAgents,
+            // Members who will answer in turn, after those woken now.
+            ...(chain ? { inTurn: waitingInReplyChain(chain) } : {}),
             createdAt: threadMessage.created_at,
             ...(missingSenderSession
               ? {

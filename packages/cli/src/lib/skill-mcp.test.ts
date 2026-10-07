@@ -2,7 +2,18 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { parseSkillMcpConfig, discoverSkillMcpServers, buildMergedMcpConfig } from './skill-mcp.js';
+import {
+  parseSkillMcpConfig,
+  discoverSkillMcpServers,
+  buildMergedMcpConfig,
+  resolveChannelPluginPath,
+} from './skill-mcp.js';
+
+// The CLI's own Inkwell checkout is the last plugin candidate (task
+// 5cabaeeb). None by default, so a tmp repo resolves only what a test put on
+// disk; the tests that need one set it.
+const inkCheckout = vi.hoisted(() => ({ main: null as string | null }));
+vi.mock('./ink-checkout.js', () => ({ inkCliMainWorktree: () => inkCheckout.main }));
 
 // Mock discoverSkills so tests don't pick up user-installed skills from ~/.ink/skills/
 vi.mock('../repl/skills.js', () => ({
@@ -475,6 +486,51 @@ mcp:
       expect(config.mcpServers.inkwell).toBeUndefined();
     } finally {
       cleanup();
+    }
+  });
+
+  it("a repo that is not Inkwell takes the plugin from the CLI's own checkout (task 5cabaeeb)", () => {
+    const inkMain = mkdtempSync(join(tmpdir(), 'ink-main-'));
+    const plugin = join(inkMain, 'packages', 'channel-plugin', 'index.ts');
+    mkdirSync(join(inkMain, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(plugin, '// stub');
+    inkCheckout.main = inkMain;
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({ mcpServers: { inkmail: { command: 'npx', args: ['tsx', 'x.ts'] } } })
+    );
+    const { mcpConfigPath, hasChannelBridge, cleanup } = buildMergedMcpConfig(tmpDir, {
+      omitToolServers: true,
+    });
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(config.mcpServers.inkmail).toEqual({
+        type: 'stdio',
+        command: 'npx',
+        args: ['tsx', plugin],
+      });
+      expect(hasChannelBridge).toBe(true);
+    } finally {
+      cleanup();
+      inkCheckout.main = null;
+      rmSync(inkMain, { recursive: true, force: true });
+    }
+  });
+
+  it("the repo's own plugin still wins over the CLI's checkout", () => {
+    const inkMain = mkdtempSync(join(tmpdir(), 'ink-main-'));
+    mkdirSync(join(inkMain, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(inkMain, 'packages', 'channel-plugin', 'index.ts'), '// cli');
+    mkdirSync(join(tmpDir, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(tmpDir, 'packages', 'channel-plugin', 'index.ts'), '// repo');
+    inkCheckout.main = inkMain;
+    try {
+      expect(resolveChannelPluginPath(tmpDir)).toBe(
+        join(tmpDir, 'packages', 'channel-plugin', 'index.ts')
+      );
+    } finally {
+      inkCheckout.main = null;
+      rmSync(inkMain, { recursive: true, force: true });
     }
   });
 

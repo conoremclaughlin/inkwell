@@ -15,7 +15,8 @@ import {
   readSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
-import { join } from 'path';
+import { createRequire } from 'module';
+import { basename, join } from 'path';
 import { homedir } from 'os';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
@@ -105,33 +106,285 @@ export interface EncodedMedia {
    * reopens native read — the failure is reported loudly instead.
    */
   rejected: Array<{ media: TurnMedia; reason: string }>;
+  /** Raw bytes embedded, so a second batch can share the same request budget. */
+  totalBytes: number;
 }
 
 /** Encode injection candidates; the read fn is injectable for unit tests. */
 export function encodeMediaBlocks(
   candidates: TurnMedia[],
-  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded,
+  budgetBytes: number = MAX_MEDIA_TOTAL_BYTES
 ): EncodedMedia {
-  const out: EncodedMedia = { blocks: [], injected: [], rejected: [] };
-  let totalBytes = 0;
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
   for (const m of candidates) {
-    if (totalBytes >= MAX_MEDIA_TOTAL_BYTES) {
+    if (out.totalBytes >= budgetBytes) {
       out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
       continue;
     }
-    const buf = readBounded(
-      m.path,
-      Math.min(MAX_MEDIA_FILE_BYTES, MAX_MEDIA_TOTAL_BYTES - totalBytes)
-    );
+    const buf = readBounded(m.path, Math.min(MAX_MEDIA_FILE_BYTES, budgetBytes - out.totalBytes));
     if (!buf) {
       out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
       continue;
     }
-    totalBytes += buf.byteLength;
+    out.totalBytes += buf.byteLength;
     out.blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: m.mimeType, data: buf.toString('base64') },
     });
+    out.injected.push(m);
+  }
+  return out;
+}
+
+/**
+ * Tool-captured images as content blocks, each preceded by a one-line label
+ * naming its ref, so a spawn carrying several (a re-seed delivers every image
+ * still on the ledger) says which picture is which. Shares the request's
+ * media budget with the turn's own attachments, which are encoded first.
+ */
+export function encodeContextImageBlocks(
+  images: TurnMedia[],
+  usedBytes: number,
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
+): EncodedMedia {
+  const encoded = encodeMediaBlocks(
+    images,
+    readBounded,
+    Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes)
+  );
+  const labelled: Array<Record<string, unknown>> = [];
+  encoded.injected.forEach((image, i) => {
+    const ref = (image as { ref?: unknown }).ref;
+    labelled.push({
+      type: 'text',
+      text: `[image ${typeof ref === 'string' ? ref : image.path}]`,
+    });
+    labelled.push(encoded.blocks[i]!);
+  });
+  return { ...encoded, blocks: labelled };
+}
+
+/**
+ * Documents a withheld turn reads inline (task 0321ccf1). With no native
+ * tool, a file the provider can't take as an image block is shown as text
+ * this process reads: a text file as it is, a PDF as the text extracted from
+ * its first pages. Each sits in a fenced block that says which file it is.
+ * The fence keeps the file's words apart from the message's; it does not
+ * make instructions inside a file harmless.
+ */
+export const MAX_TEXT_DOCUMENT_BYTES = 1024 * 1024;
+export const MAX_PDF_PAGES = 30;
+export const MAX_DOCUMENT_TEXT_CHARS = 100_000;
+export const PDF_EXTRACT_TIMEOUT_MS = 20_000;
+
+type DocumentKind = 'text' | 'pdf';
+
+function documentKind(m: TurnMedia): DocumentKind | null {
+  const mime = (m.mimeType ?? '').split(';')[0]!.trim().toLowerCase();
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('text/') || mime === 'application/json') return 'text';
+  return null;
+}
+
+export interface ExtractedPdf {
+  text: string;
+  /** Pages the text came from (the first ones), and the document's total. */
+  pages: number;
+  total: number;
+}
+
+export type PdfExtractor = (
+  bytes: Buffer,
+  maxPages: number,
+  timeoutMs: number
+) => ExtractedPdf | null;
+
+/**
+ * Runs in a short-lived child process, so extraction stays synchronous for
+ * prepare() and a PDF that hangs or crashes the parser takes down only the
+ * child. pdf-parse is resolved from this package; the child gets the bytes
+ * on stdin and an empty environment.
+ */
+const PDF_EXTRACT_SCRIPT = `
+const { PDFParse } = require(process.argv[1]);
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', async () => {
+  const parser = new PDFParse({ data: new Uint8Array(Buffer.concat(chunks)), isEvalSupported: false });
+  try {
+    const result = await parser.getText({ first: Number(process.argv[2]) });
+    // result.text carries the page markers pdf-parse appends ('-- 1 of 1 --'),
+    // which help the model cite a page but which a blank PDF has as well. So
+    // it counts as text only when one of the pages has some (Lumen, #775).
+    const hasText = result.pages.some((page) => page.text.trim() !== '');
+    const text = hasText ? result.text : '';
+    process.stdout.write(JSON.stringify({ text: text.slice(0, Number(process.argv[3])), total: result.total }));
+  } finally {
+    await parser.destroy();
+  }
+});`;
+
+let pdfParseEntry: string | null | undefined;
+
+export function extractPdfTextSync(
+  bytes: Buffer,
+  maxPages: number,
+  timeoutMs: number = PDF_EXTRACT_TIMEOUT_MS
+): ExtractedPdf | null {
+  try {
+    pdfParseEntry ??= createRequire(import.meta.url).resolve('pdf-parse');
+  } catch {
+    pdfParseEntry = null;
+  }
+  if (!pdfParseEntry) return null;
+  try {
+    const args = [
+      '-e',
+      PDF_EXTRACT_SCRIPT,
+      pdfParseEntry,
+      String(maxPages),
+      String(MAX_DOCUMENT_TEXT_CHARS + 1),
+    ];
+    const out = execFileSync(process.execPath, args, {
+      input: bytes,
+      env: {},
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      // The child caps the text; room for it JSON-escaped, at up to six bytes a character.
+      maxBuffer: 6 * (MAX_DOCUMENT_TEXT_CHARS + 1) + 64 * 1024,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    const parsed = JSON.parse(out.toString('utf8')) as { text?: unknown; total?: unknown };
+    if (typeof parsed.text !== 'string' || typeof parsed.total !== 'number') return null;
+    return { text: parsed.text, pages: Math.min(maxPages, parsed.total), total: parsed.total };
+  } catch {
+    return null;
+  }
+}
+
+/** The text, cut at `max` characters without splitting a surrogate pair. */
+function capText(text: string, max: number): { text: string; cut: boolean } {
+  if (text.length <= max) return { text, cut: false };
+  let end = max;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return { text: text.slice(0, end), cut: true };
+}
+
+/** A fence no run of backticks in the content can close. */
+function fenceFor(content: string): string {
+  let longest = 0;
+  for (const run of content.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+/** A file name fit for one line of the label. */
+function labelName(path: string): string {
+  return basename(path).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '?');
+}
+
+function documentBlock(label: string, content: string, cut: boolean): Record<string, unknown> {
+  const fence = fenceFor(content);
+  const tail = cut
+    ? `\n[The text was cut at ${MAX_DOCUMENT_TEXT_CHARS.toLocaleString('en-US')} characters; the rest is not shown.]`
+    : '';
+  return { type: 'text', text: `${label}\n${fence}\n${content}\n${fence}${tail}` };
+}
+
+/**
+ * Encode a withheld turn's documents as text blocks. Shares the request's
+ * media budget with images: `usedBytes` is what the turn's images took, and
+ * each block's UTF-8 size counts against the rest. Anything that can't be
+ * shown (another type, unreadable, oversize, not UTF-8, a PDF with no
+ * readable text, an exhausted budget) is rejected with its reason, for the
+ * note the model is given; nothing reopens native read.
+ */
+export function encodeDocumentBlocks(
+  documents: TurnMedia[],
+  usedBytes: number,
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded,
+  extractPdf: PdfExtractor = extractPdfTextSync,
+  now: () => number = Date.now
+): EncodedMedia {
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
+  const budget = Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes);
+  // One extraction deadline for the whole turn, not one per PDF: prepare()
+  // is synchronous, so ink chat waits on it, and a message can carry several.
+  const deadline = now() + PDF_EXTRACT_TIMEOUT_MS;
+  for (const m of documents) {
+    const kind = documentKind(m);
+    if (!kind) {
+      out.rejected.push({ media: m, reason: 'not a type that can be shown in this conversation' });
+      continue;
+    }
+    if (out.totalBytes >= budget) {
+      out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
+      continue;
+    }
+    const name = labelName(m.path);
+    let block: Record<string, unknown>;
+    if (kind === 'text') {
+      const buf = readBounded(m.path, MAX_TEXT_DOCUMENT_BYTES);
+      if (!buf) {
+        out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
+        continue;
+      }
+      let text: string;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      } catch {
+        out.rejected.push({ media: m, reason: 'not valid UTF-8 text' });
+        continue;
+      }
+      const capped = capText(text, MAX_DOCUMENT_TEXT_CHARS);
+      const mime = (m.mimeType ?? 'text/plain').split(';')[0]!.trim();
+      block = documentBlock(
+        `[Attached file ${name} (${mime}, ${buf.byteLength.toLocaleString('en-US')} bytes). Its contents follow between the fences.]`,
+        capped.text,
+        capped.cut
+      );
+    } else {
+      const buf = readBounded(m.path, MAX_MEDIA_FILE_BYTES);
+      if (!buf) {
+        out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
+        continue;
+      }
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        out.rejected.push({ media: m, reason: 'the time for reading attached files ran out' });
+        continue;
+      }
+      const extracted = extractPdf(buf, MAX_PDF_PAGES, remaining);
+      if (!extracted) {
+        out.rejected.push({ media: m, reason: 'its text could not be read as a PDF' });
+        continue;
+      }
+      if (!extracted.text.trim()) {
+        out.rejected.push({
+          media: m,
+          reason: 'no text could be extracted (it may hold only scanned images)',
+        });
+        continue;
+      }
+      const capped = capText(extracted.text, MAX_DOCUMENT_TEXT_CHARS);
+      const pages =
+        extracted.pages < extracted.total
+          ? `pages 1–${extracted.pages} of ${extracted.total}`
+          : `${extracted.total} page${extracted.total === 1 ? '' : 's'}`;
+      block = documentBlock(
+        `[Attached file ${name} (PDF, ${pages}). The text extracted from it follows between the fences; its layout and images are not included.]`,
+        capped.text,
+        capped.cut
+      );
+    }
+    const size = Buffer.byteLength(block.text as string, 'utf8');
+    if (out.totalBytes + size > budget) {
+      out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
+      continue;
+    }
+    out.totalBytes += size;
+    out.blocks.push(block);
     out.injected.push(m);
   }
   return out;
@@ -160,6 +413,8 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly binary = 'claude';
   // Prompt is delivered via stdin (see prepare() below) — no argv ceiling.
   readonly promptTransport = 'stdin' as const;
+  // Embedded as stream-json image blocks alongside the prompt.
+  readonly acceptsContextImages = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(
@@ -169,6 +424,15 @@ export class ClaudeAdapter implements BackendAdapter {
     );
 
     const args: string[] = [];
+
+    // Withheld (task 0321ccf1): refused first, before any file is read, if
+    // the routing isn't ink-owned. startBackendTurn never asks for this;
+    // refuse rather than spawn a provider that keeps its own tools and the
+    // project's MCP servers.
+    const withhold = config.withholdProviderTools === true;
+    if (withhold && config.toolRouting !== 'local') {
+      throw new Error('withholdProviderTools requires ink-owned (local) tool routing');
+    }
 
     // Media injection (spec:provider-media-injection): embed images as
     // base64 content blocks in a stream-json user message instead of having
@@ -204,7 +468,61 @@ export class ClaudeAdapter implements BackendAdapter {
         '(fail-closed; no filesystem fallback). Tell the user, naming each file:\n' +
         encoded.rejected.map((r) => `- ${r.media.path} — ${r.reason}`).join('\n');
     }
-    const injecting = (encoded?.blocks.length ?? 0) > 0;
+    // Withheld: with no native tool there is no native read, so a document
+    // is read here and shown as text on the delivery spawn, and anything
+    // that can't be shown is named to the model as unopened rather than left
+    // for it to look for a way in.
+    const documents =
+      withhold && config.prompt && config.deliverMedia && classified.nativeRead.length > 0
+        ? encodeDocumentBlocks(classified.nativeRead, encoded?.totalBytes ?? 0)
+        : undefined;
+    if (documents && documents.rejected.length > 0) {
+      for (const r of documents.rejected) {
+        console.warn(`[media] document not shown (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote +=
+        '\n\n[media note] These attached file(s) could NOT be opened, and there is no other ' +
+        'way to read a file here. Tell the user you could not open each one, and why:\n' +
+        documents.rejected
+          .map(
+            (r) =>
+              `- ${labelName(r.media.path)}${r.media.mimeType ? ` (${r.media.mimeType})` : ''} — ${r.reason}`
+          )
+          .join('\n');
+    }
+    // Images a tool put in context. Embedded whenever the host sends them —
+    // it sends exactly what this provider session has not been given — and
+    // kept out of the --tools gate below, which reads `media` alone.
+    const contextImages = config.prompt ? (config.contextImages ?? []) : [];
+    const encodedContext =
+      contextImages.length > 0
+        ? encodeContextImageBlocks(
+            contextImages,
+            (encoded?.totalBytes ?? 0) + (documents?.totalBytes ?? 0)
+          )
+        : undefined;
+    if (encodedContext && encodedContext.rejected.length > 0) {
+      for (const r of encodedContext.rejected) {
+        console.warn(`[media] context image not injected (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote +=
+        '\n\n[image note] These image(s), named in your context, could NOT be attached to ' +
+        'this message, so you have not seen them. Each goes again with your next message ' +
+        'while it stays in your context; evict it if you no longer need it, or view the ' +
+        'file again if the reason is that it is unreadable:\n' +
+        encodedContext.rejected
+          .map((r) => {
+            const ref = (r.media as { ref?: unknown }).ref;
+            return `- ${typeof ref === 'string' ? ref : 'image'} — ${r.reason}`;
+          })
+          .join('\n');
+    }
+    const contentBlocks = [
+      ...(encoded?.blocks ?? []),
+      ...(documents?.blocks ?? []),
+      ...(encodedContext?.blocks ?? []),
+    ];
+    const injecting = contentBlocks.length > 0;
     const promptText = config.prompt ? config.prompt + rejectionNote : config.prompt;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
@@ -293,9 +611,13 @@ export class ClaudeAdapter implements BackendAdapter {
       // classification, so it is identical on every spawn of the logical
       // turn; injection FAILURES (oversize, unreadable, special files) fail
       // closed and never reopen Read.
+      //
+      // Withheld, there is no exception: the turn keeps no native tool,
+      // whatever it carries. Read's reach is Claude Code's read policy, not
+      // the attachment's directory (task 0321ccf1).
       const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
       const needsNativeRead =
-        hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
+        !withhold && hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
       args.push('--tools', needsNativeRead ? 'Read' : '');
     }
 
@@ -304,33 +626,39 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-skip-permissions');
     }
 
-    // Attachment directories: grant read access so files attached to the
-    // turn (--attach-file paths referenced in the prompt) are readable
-    // without permission prompts. Claude Code's Read renders images
-    // natively, so this is the full multimodal path for CLI spawns.
-    for (const dir of config.attachmentDirs ?? []) {
-      args.push('--add-dir', dir);
-    }
+    // Withheld, the spawn gets no directory grant at all. With no native
+    // tool one would be inert, and it stays out so nothing opened later
+    // inherits it. Injected images are read here, by this process, not by
+    // the provider, so they need none.
+    if (!withhold) {
+      // Attachment directories: grant read access so files attached to the
+      // turn (--attach-file paths referenced in the prompt) are readable
+      // without permission prompts. Claude Code's Read renders images
+      // natively, so this is the full multimodal path for CLI spawns.
+      for (const dir of config.attachmentDirs ?? []) {
+        args.push('--add-dir', dir);
+      }
 
-    // Inkwell media directory: always grant read access so agents can
-    // read downloaded attachments (email, Telegram, etc.) via the native
-    // Read tool. This is Inkwell's own directory, not arbitrary fs access.
-    const inkFilesDir = join(homedir(), '.ink', 'files');
-    if (existsSync(inkFilesDir)) {
-      args.push('--add-dir', inkFilesDir);
-    }
+      // Inkwell media directory: always grant read access so agents can
+      // read downloaded attachments (email, Telegram, etc.) via the native
+      // Read tool. This is Inkwell's own directory, not arbitrary fs access.
+      const inkFilesDir = join(homedir(), '.ink', 'files');
+      if (existsSync(inkFilesDir)) {
+        args.push('--add-dir', inkFilesDir);
+      }
 
-    // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
-    // so create_studio/overflow worktrees minted mid-session are accessible —
-    // a live session can never be granted a new directory. Created if
-    // missing: Claude Code ignores a nonexistent --add-dir.
-    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
-    try {
-      mkdirSync(inkStudiosDir, { recursive: true });
-    } catch {
-      // Non-fatal — worst case the grant is a no-op until the dir exists.
+      // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
+      // so create_studio/overflow worktrees minted mid-session are accessible —
+      // a live session can never be granted a new directory. Created if
+      // missing: Claude Code ignores a nonexistent --add-dir.
+      const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+      try {
+        mkdirSync(inkStudiosDir, { recursive: true });
+      } catch {
+        // Non-fatal — worst case the grant is a no-op until the dir exists.
+      }
+      args.push('--add-dir', inkStudiosDir);
     }
-    args.push('--add-dir', inkStudiosDir);
 
     // Inkwell channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges Inkwell's HTTP
@@ -342,8 +670,11 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-load-development-channels', 'server:inkmail');
     }
 
-    // Passthrough flags
-    args.push(...config.passthroughArgs);
+    // Passthrough flags. Appended last, so they could override any flag
+    // above; a withheld spawn takes none (Lumen).
+    if (!withhold) {
+      args.push(...config.passthroughArgs);
+    }
 
     // Consolidated context token for x-ink-context header. The `.mcp.json`
     // generated by buildMergedMcpConfig references ${INK_CONTEXT}; this env
@@ -363,7 +694,8 @@ export class ClaudeAdapter implements BackendAdapter {
     });
 
     // Injected turns switch stdin to stream-json: one JSONL user message
-    // whose content is the prompt text plus base64 image blocks. Text-only
+    // whose content is the prompt text plus base64 image blocks (and, on a
+    // withheld turn, a text block for each document shown). Text-only
     // turns and non-delivery spawns keep the plain-stdin path. Either way
     // the prompt carries the rejection note when something wasn't delivered.
     let stdinData = promptText;
@@ -374,7 +706,7 @@ export class ClaudeAdapter implements BackendAdapter {
           type: 'user',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: promptText }, ...(encoded?.blocks ?? [])],
+            content: [{ type: 'text', text: promptText }, ...contentBlocks],
           },
         }) + '\n';
     }
@@ -395,6 +727,12 @@ export class ClaudeAdapter implements BackendAdapter {
       },
       cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),
+      // Encoded images ride the stream-json message above (encoding needs a
+      // prompt, and a prompt with blocks always switches to stream-json), so
+      // what was injected is exactly what this spawn carries.
+      ...(encodedContext && encodedContext.injected.length > 0
+        ? { contextImagesDelivered: encodedContext.injected }
+        : {}),
     };
   }
 

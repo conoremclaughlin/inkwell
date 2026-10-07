@@ -69,6 +69,8 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /** Tool-captured images this spawn must carry (see BackendConfig.contextImages). */
+  contextImages?: TurnMedia[];
   /**
    * Whether the chat process that owns this turn is attached — an
    * interactive REPL, not `--non-interactive`/`--message`. Required: the
@@ -96,6 +98,12 @@ export interface BackendRunResult {
   /** Whether the process was reaped by a timeout, and which kind. */
   timedOut?: boolean;
   timeoutType?: 'idle' | 'hard';
+  /**
+   * The requested `contextImages` this spawn's input actually carried, as the
+   * adapter reported them (PreparedBackend.contextImagesDelivered). Absent
+   * means none — so nothing may be recorded as seen.
+   */
+  contextImagesDelivered?: TurnMedia[];
 }
 
 export interface BackendTurnHandle {
@@ -103,7 +111,55 @@ export interface BackendTurnHandle {
   abort: () => void;
 }
 
+/**
+ * Set once, for the life of this process, by a chat whose provider must have
+ * no tools of its own: `ink chat --no-provider-tools`, or a profile that
+ * implies it (the inkling profile, task 0321ccf1). Nothing clears it. Every
+ * spawn this process makes passes startBackendTurn, the parent's turns,
+ * continuations, reseeds, resumes, clones and compaction alike, so the
+ * restriction is applied here rather than threaded through each caller, and
+ * a later change to the runtime's backend, tool routing or profile can't
+ * lift it.
+ */
+let providerToolsWithheld = false;
+
+export function withholdProviderToolsForThisProcess(): void {
+  providerToolsWithheld = true;
+}
+
+export function providerToolsWithheldForThisProcess(): boolean {
+  return providerToolsWithheld;
+}
+
+/**
+ * The only backend that can withhold every native tool structurally (claude:
+ * `--tools ''` with no directory grants). Codex and Gemini run tools of their
+ * own that no flag here removes, so a withheld spawn on either is refused.
+ */
+const WITHHOLDING_BACKENDS = new Set(['claude']);
+
+function refusedTurn(request: BackendRunRequest, reason: string): BackendTurnHandle {
+  return {
+    result: Promise.resolve({
+      success: false,
+      stdout: '',
+      stderr: reason,
+      exitCode: 78, // EX_CONFIG
+      durationMs: 0,
+      command: `${request.backend} (refused)`,
+    }),
+    abort: () => undefined,
+  };
+}
+
 export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle {
+  const withhold = providerToolsWithheld;
+  if (withhold && !WITHHOLDING_BACKENDS.has(request.backend)) {
+    return refusedTurn(
+      request,
+      `Refused: this chat runs with no provider tools, and the ${request.backend} backend can't withhold its own.`
+    );
+  }
   const adapter = getBackend(request.backend);
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const streaming = Boolean(request.stream && adapter.createStreamParser);
@@ -115,15 +171,23 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     effort: request.effort,
     prompt: request.prompt,
     promptParts,
-    passthroughArgs: request.passthroughArgs || [],
+    // Withheld: no caller's arguments reach the provider. The adapter appends
+    // these after its own, where a trailing `--tools` or `--add-dir` would
+    // undo the restriction (Lumen); the adapter drops them too.
+    passthroughArgs: withhold ? [] : request.passthroughArgs || [],
     systemPromptOverride: request.systemPromptOverride,
     attachmentDirs: request.attachmentDirs,
     backendSessionId: request.backendSessionId,
     backendSessionSeedId: request.backendSessionSeedId,
     stream: streaming,
-    toolRouting: request.toolRouting,
+    // Withheld: always ink-owned routing, whatever the caller asked for.
+    // Compaction asks for none, which on claude meant the provider's own
+    // tools and MCP servers.
+    toolRouting: withhold ? 'local' : request.toolRouting,
+    ...(withhold ? { withholdProviderTools: true } : {}),
     media: request.media,
     deliverMedia: request.deliverMedia,
+    contextImages: request.contextImages,
     cliAttached: request.cliAttached,
   });
 
@@ -192,6 +256,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         ...(resumeFailedNoSession ? { resumeFailedNoSession: true } : {}),
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,
+        ...(prepared.contextImagesDelivered
+          ? { contextImagesDelivered: prepared.contextImagesDelivered }
+          : {}),
       };
     }),
     abort: () => {

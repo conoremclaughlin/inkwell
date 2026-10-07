@@ -14,6 +14,7 @@ import type {
   ChannelResponse,
   ChannelType,
   IRunner,
+  MediaAttachment,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
@@ -34,6 +35,8 @@ import { applyPermissionOverlay } from '../studio-settings.js';
 import { isGroupId, stopProcessAndWait } from './stop-process.js';
 import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
+import { uploadMediaForRunner } from '../uploads/runner-media.js';
+import { uploadsRoot } from '../uploads/runtime.js';
 
 /** Where the sandbox orchestrator mounts the studio checkout in a container. */
 const CONTAINER_STUDIO_ROOT = '/studio';
@@ -246,15 +249,35 @@ export function createLineReader(onLine: (line: string) => void): {
 }
 
 export class ClaudeRunner implements IRunner {
+  readonly uploadMedia = 'grant' as const;
+
   async run(
-    message: string,
+    turnMessage: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
     const { backendSessionId, injectedContext, config } = options;
+
+    // A person's uploads live outside this runner's standing grants (checked
+    // at startup, services/uploads/placement.ts): this spawn alone is granted
+    // each one's own directory. A container mounts no host media,
+    // so there the uploads are dropped and the turn is told.
+    const uploads = uploadMediaForRunner({
+      attachments: options.mediaAttachments,
+      root: uploadsRoot(),
+      policy: 'grant',
+      sandboxed: !!config.container,
+    });
+    if (uploads.note) {
+      logger.warn('[Uploads] attachments dropped for a Claude turn', {
+        container: !!config.container,
+      });
+    }
+    const message = uploads.note ? `${turnMessage}\n\n${uploads.note}` : turnMessage;
 
     // Determine if resuming or starting new session
     const isResume = !!backendSessionId;
@@ -276,7 +299,7 @@ export class ClaudeRunner implements IRunner {
     await ensureInkStudiosRoot();
 
     // Build Claude Code arguments
-    let args = this.buildArgs(sessionId, isResume, config);
+    let args = this.buildArgs(sessionId, isResume, config, uploads.grantDirs);
 
     logger.info('Spawning Claude Code', {
       sessionId,
@@ -306,7 +329,7 @@ export class ClaudeRunner implements IRunner {
 
         // Generate a new session ID and retry without resume
         sessionId = randomUUID();
-        args = this.buildArgs(sessionId, false, config);
+        args = this.buildArgs(sessionId, false, config, uploads.grantDirs);
 
         // Rebuild message with full context for new session
         if (injectedContext) {
@@ -366,7 +389,12 @@ export class ClaudeRunner implements IRunner {
     }
   }
 
-  private buildArgs(sessionId: string, isResume: boolean, config: ClaudeRunnerConfig): string[] {
+  private buildArgs(
+    sessionId: string,
+    isResume: boolean,
+    config: ClaudeRunnerConfig,
+    uploadDirs: readonly string[] = []
+  ): string[] {
     const args: string[] = ['--print', '--output-format', 'stream-json', '--verbose'];
 
     // Session handling
@@ -407,6 +435,10 @@ export class ClaudeRunner implements IRunner {
     // create_studio/overflow worktree must land somewhere already in scope.
     // run() ensures the directory exists (async) before args are built.
     args.push('--add-dir', inkStudiosRoot());
+
+    // Each attached upload's own directory, for this spawn only; never the
+    // uploads root (services/uploads/runner-media.ts).
+    for (const dir of uploadDirs) args.push('--add-dir', dir);
 
     return args;
   }
@@ -559,6 +591,8 @@ export class ClaudeRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
@@ -604,6 +638,8 @@ export class ClaudeRunner implements IRunner {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: killGroup,
       });
+      if (proc.pid !== undefined)
+        config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
       // No ceiling unless one is configured, for the module or for this run;
       // the lower one wins when both are.
       const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);

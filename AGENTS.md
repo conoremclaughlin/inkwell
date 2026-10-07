@@ -43,7 +43,7 @@ This returns:
 - **Identity Core**: Who you are, who you're working with, your relationship
 - **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
-- **Recent Memories**: High-salience memories filtered by your sbSlug (plus shared memories)
+- **Recent Memories**: Your own high-salience memories. Every memory belongs to exactly one SB; there are no shared memories (shared context lives in the constitution and specs)
 - **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
 ### Step 4: Start or Resume Session
@@ -270,10 +270,10 @@ When saving memories, include your sbSlug:
 remember(userId: "...", content: "...", sbSlug: "wren")
 ```
 
-When recalling, memories are filtered by sbSlug but include shared memories (sbSlug=null):
+Every memory has exactly one owner, the SB that wrote it, and you recall only your own. There are no shared memories: what is shared across SBs belongs in the constitution (values, process, user) or a spec. Omitting `sbSlug` reads and writes as you; an SB's token naming another SB's slug is refused ([ink://specs/remove-shared-memories](ink://specs/remove-shared-memories)):
 
 ```
-recall(userId: "...", query: "...", sbSlug: "wren", includeShared: true)
+recall(userId: "...", query: "...", sbSlug: "wren")
 ```
 
 ## Cross-Agent Communication & threadKey
@@ -797,7 +797,7 @@ Fixtures are where this has been broken, by SBs who had read the rule, and the m
 - An integration test that must reach a real account reads the id from the environment and skips when it is absent. The id never goes in the file.
 - A doc comment that cites an incident describes the mechanism and may credit a public contributor; it must not reveal a private contact or what a personal reminder was for.
 
-**What the machine checks.** The staged-file guard (`scripts/check-staged-files.sh` — run by `pre-commit` and replayed by `pre-push`) has two privacy arms: email addresses outside the fixture-domain list, and literal matches from `~/.ink/private-markers`. CI runs over every tracked file as `--tree HEAD` but explicitly opts out of the marker arm with `INK_PRIVATE_MARKERS=/dev/null`; its privacy backstop is the address check, not the local marker list. The marker list is per-machine, outside git, one literal per line, case-insensitive. It stays outside the tree because a list of private personal data is itself private personal data; never commit it to share it with the fleet. A missing list refuses the commit; an empty one is the explicit opt-out. Both arms report path and line numbers, never values. Only `.mailmap` and `.yarn/releases/` are exempt from these two arms; credential/path checks are separate. The domain list in `scripts/lib/fixture-domains.sh` carries frozen legacy placeholders: do not extend it. The allowlist makes accepting a real header require a visible edit to that list, in the diff, in review, rather than a hidden exemption. Keep fixture addresses reserved even when a contributor address is already public.
+**What the machine checks.** The staged-file guard (`scripts/check-staged-files.sh` — run by `pre-commit` and replayed by `pre-push`) has two privacy arms: email addresses outside the fixture-domain list, and literal matches from `~/.ink/private-markers`. CI runs over every tracked file as `--tree HEAD` but explicitly opts out of the marker arm with `INK_PRIVATE_MARKERS=/dev/null`; its privacy backstop is the address check, not the local marker list. The marker list is per-machine, outside git, one literal per line, case-insensitive. It stays outside the tree because a list of private personal data is itself private personal data; never commit it to share it with the fleet. A missing list refuses the commit; an empty one is the explicit opt-out. Both arms report path and line numbers, never values. Only `.mailmap` and `.yarn/releases/` are exempt from these two arms. One file is exempt from the marker arm alone: the emoji catalog's generated search data (`packages/shared/src/stories/reaction-picking/search.generated.ts`), because it is the Unicode standard's published CLDR text, regenerated from pinned files and never hand-edited (Conor, 2026-10-06). The address arm still reads it, and the catalog's other generated files are scanned as usual. The Inkling app, whose hooks run this same guard, carries a byte-for-byte copy at `packages/stories/src/reaction-picking/search.generated.ts`. That one path is exempt with it, but only while its blob is the catalog's as committed at the HEAD of the checkout the guard runs from. A copy edited by one byte, or the same bytes at any other path, is scanned (Myra, 2026-10-07, on Conor's ruling). Credential/path checks are separate. The domain list in `scripts/lib/fixture-domains.sh` carries frozen legacy placeholders: do not extend it. The allowlist makes accepting a real header require a visible edit to that list, in the diff, in review, rather than a hidden exemption. Keep fixture addresses reserved even when a contributor address is already public.
 
 **Passing the guard is not privacy clearance.** It does not generically detect a name or bare handle unless the literal is in the marker list. Inspect the context: a package scope, JSDoc tag or generic mention example is not a private Telegram username. Conversely, zero marker hits cannot prove that an incomplete list covers every private handle. Do not bypass a guard failure or treat every identifying word as a leak; classify it against the distinction above. When the classification or permission is unclear, treat the material as private and ask Conor before publishing it.
 

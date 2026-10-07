@@ -6,7 +6,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { sessionKeyMatchPattern } from '../../services/sessions/session-key';
 import { parseArchivedReason } from '../../services/sessions/session-archive';
 import type { Database, TablesInsert } from '../supabase/types';
-import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
+import { resolveSbIdResult, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
   buildChunkMetadataUpdate,
@@ -30,6 +30,7 @@ import type {
   MemoryRow,
   MemorySemanticQueryStrategy,
   MemorySearchOptions,
+  MemoryOwnerFilter,
   MemoryHistory,
   MemoryHistoryRow,
   Session,
@@ -103,6 +104,18 @@ type SemanticChunkMatchRow = Omit<MemoryRow, 'embedding'> & {
   matched_chunk_text?: string | null;
   matched_chunk_type?: string | null;
 };
+
+/**
+ * Whether an RPC row belongs to the owner a recall is for. The RPCs already
+ * match on p_sb_id; this is the server's own check of what came back, so a
+ * function that ignored the argument could not widen a recall.
+ */
+function isOwnedRow(
+  row: { sb_id?: string | null },
+  options: Pick<MemorySearchOptions, 'sbId'>
+): boolean {
+  return Boolean(options.sbId) && row.sb_id === options.sbId;
+}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
@@ -428,10 +441,26 @@ export class MemoryRepository {
    * Create a new memory
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
-    const sbId =
-      input.sbSlug && input.userId
-        ? await resolveSbId(this.supabase, input.userId, input.sbSlug)
-        : null;
+    // Every memory belongs to the SB that wrote it. A row with no owner used
+    // to be "shared" and reached every SB of the user, inklings included, so
+    // an ownerless write is refused here, below every caller
+    // (ink://specs/remove-shared-memories §3.1).
+    if (!input.sbSlug) {
+      throw new Error(
+        'A memory needs an owner: pass sbSlug. There are no shared memories ' +
+          '(ink://specs/remove-shared-memories).'
+      );
+    }
+    let sbId = input.sbId;
+    if (!sbId) {
+      const resolved = await resolveSbIdResult(this.supabase, input.userId, input.sbSlug);
+      if (!resolved.ok) {
+        throw new Error(
+          `A memory needs a canonical owner: "${input.sbSlug}" does not resolve to one identity (${resolved.reason}).`
+        );
+      }
+      sbId = resolved.sbId;
+    }
 
     // If topicKey is provided, ensure it's included in topics array
     const topics = input.topics || [];
@@ -451,7 +480,7 @@ export class MemoryRepository {
         topics,
         metadata: input.metadata || {},
         expires_at: input.expiresAt?.toISOString(),
-        agent_id: input.sbSlug || null,
+        agent_id: input.sbSlug,
         contact_id: input.contactId || null,
         sb_id: sbId,
       })
@@ -481,6 +510,9 @@ export class MemoryRepository {
     query?: string,
     options: MemorySearchOptions = {}
   ): Promise<Memory[]> {
+    // No owner, no memories: a recall never runs unfiltered
+    // (remove-shared-memories §3.3).
+    if (!options.sbSlug || !options.sbId) return [];
     const limit = options.limit || 20;
     const offset = options.offset || 0;
     const recallMode: RecallMode = options.recallMode || 'hybrid';
@@ -535,6 +567,9 @@ export class MemoryRepository {
     query?: string,
     options: MemorySearchOptions = {}
   ): Promise<RecallCandidate[]> {
+    // No owner, no memories: a recall never runs unfiltered
+    // (remove-shared-memories §3.3).
+    if (!options.sbSlug || !options.sbId) return [];
     const limit = options.limit || 20;
     const offset = options.offset || 0;
     const recallMode: RecallMode = options.recallMode || 'hybrid';
@@ -808,6 +843,8 @@ export class MemoryRepository {
     limit: number,
     offset: number
   ): Promise<RecallCandidate[]> {
+    const ownerId = options.sbId;
+    if (!ownerId) return [];
     let queryBuilder = this.supabase
       .from('memories')
       .select('*')
@@ -829,17 +866,10 @@ export class MemoryRepository {
       queryBuilder = queryBuilder.overlaps('topics', options.topics);
     }
 
-    // Filter by agent
-    if (options.sbSlug) {
-      const includeShared = options.includeShared !== false; // default true
-      if (includeShared) {
-        // Include both agent-specific and shared (null) memories
-        queryBuilder = queryBuilder.or(`agent_id.eq.${options.sbSlug},agent_id.is.null`);
-      } else {
-        // Only agent-specific memories
-        queryBuilder = queryBuilder.eq('agent_id', options.sbSlug);
-      }
-    }
+    // Only the owner's rows. A row with no owner was a shared memory, which no
+    // longer exists (remove-shared-memories §3.3); the public entry points
+    // return nothing without an owner, so this filter is never skipped.
+    queryBuilder = queryBuilder.eq('sb_id', ownerId);
 
     // Filter by contact for per-sender isolation
     if (options.contactId) {
@@ -894,6 +924,8 @@ export class MemoryRepository {
     offset: number,
     chunkTypes?: MemoryChunkType[]
   ): Promise<RecallCandidate[] | null> {
+    // Never call the RPCs without an owner: their no-owner arm matches every row.
+    if (!options.sbId) return [];
     const queryEmbedding = await this.embeddingRouter.embedQuery(query);
     if (!queryEmbedding) return null;
 
@@ -926,7 +958,10 @@ export class MemoryRepository {
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
       p_agent_id: options.sbSlug,
-      p_include_shared: options.includeShared !== false,
+      // The canonical owner, matched before the RPC ranks and cuts its page.
+      // With it set, the RPC consults neither the slug nor p_include_shared,
+      // which this server no longer sends (remove-shared-memories §3.3).
+      p_sb_id: options.sbId,
       p_include_expired: options.includeExpired === true,
       p_chunk_types: chunkTypes && chunkTypes.length > 0 ? chunkTypes : undefined,
     };
@@ -953,6 +988,9 @@ export class MemoryRepository {
 
     for (const row of rows) {
       const memory = this.rowToMemory(row);
+
+      // Rows the RPC matched on p_sb_id, checked again here.
+      if (!isOwnedRow(row, options)) continue;
 
       // Post-filter for contact-scoped isolation (RPC doesn't support contact_id yet)
       if (options.contactId && memory.contactId !== options.contactId) {
@@ -1025,7 +1063,10 @@ export class MemoryRepository {
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
       p_agent_id: options.sbSlug,
-      p_include_shared: options.includeShared !== false,
+      // The canonical owner, matched before the RPC ranks and cuts its page.
+      // With it set, the RPC consults neither the slug nor p_include_shared,
+      // which this server no longer sends (remove-shared-memories §3.3).
+      p_sb_id: options.sbId,
       p_include_expired: options.includeExpired === true,
     };
 
@@ -1039,7 +1080,10 @@ export class MemoryRepository {
       return null;
     }
 
-    const rows = ((data || []) as SemanticMatchRow[]).slice(offset, offset + limit);
+    // The owner check the chunked path makes, before the page is cut.
+    const rows = ((data || []) as SemanticMatchRow[])
+      .filter((row) => isOwnedRow(row, options))
+      .slice(offset, offset + limit);
     return rows.map((row) => {
       const memory = this.rowToMemory(row);
       const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
@@ -1061,7 +1105,8 @@ export class MemoryRepository {
    */
   private async tryEmbedMemory(
     memory: Memory,
-    input: MemoryCreateInput,
+    // The text being indexed; the owner is the memory row's, not the input's.
+    input: Omit<MemoryCreateInput, 'sbSlug' | 'sbId' | 'contactId'>,
     options: EmbedOptions
   ): Promise<EmbedOutcome> {
     if (!this.embeddingRouter.isEnabled()) return 'failed';
@@ -1235,12 +1280,15 @@ export class MemoryRepository {
    */
   async getKnowledgeMemories(
     userId: string,
-    sbSlug?: string,
+    owner: MemoryOwnerFilter | undefined,
     highLimit: number = 10,
     highWindowDays: number = 7,
     context: KnowledgeMemoryContext = {},
     contactId?: string
   ): Promise<Memory[]> {
+    // No owner, no memories: bootstrap and the context builder never read
+    // unfiltered (remove-shared-memories §3.3).
+    if (!owner) return [];
     const buildQuery = (salience: string, limit: number) => {
       let q = this.supabase
         .from('memories')
@@ -1251,9 +1299,7 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (sbSlug) {
-        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
-      }
+      q = q.eq('sb_id', owner.sbId);
       if (contactId) {
         q = q.eq('contact_id', contactId);
       }
@@ -1272,9 +1318,7 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (sbSlug) {
-        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
-      }
+      q = q.eq('sb_id', owner.sbId);
       if (contactId) {
         q = q.eq('contact_id', contactId);
       }
@@ -1348,7 +1392,13 @@ export class MemoryRepository {
    * Used after compaction to restore context continuity — the agent
    * likely just saved these via `remember` before compaction hit.
    */
-  async getRecentMemories(userId: string, sbSlug?: string, limit: number = 10): Promise<Memory[]> {
+  async getRecentMemories(
+    userId: string,
+    owner: MemoryOwnerFilter | undefined,
+    limit: number = 10
+  ): Promise<Memory[]> {
+    // No owner, no memories (remove-shared-memories §3.3).
+    if (!owner) return [];
     let q = this.supabase
       .from('memories')
       .select('*')
@@ -1357,9 +1407,7 @@ export class MemoryRepository {
       .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (sbSlug) {
-      q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
-    }
+    q = q.eq('sb_id', owner.sbId);
 
     const { data, error } = await q;
     if (error) {
@@ -1396,7 +1444,7 @@ export class MemoryRepository {
       .gt('created_at', data.computed_at);
 
     if (sbSlug) {
-      freshnessQuery = freshnessQuery.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
+      freshnessQuery = freshnessQuery.eq('agent_id', sbSlug);
     }
 
     const { count } = await freshnessQuery;
@@ -1482,12 +1530,14 @@ export class MemoryRepository {
   /**
    * Delete a memory (forget)
    */
-  async forget(id: string, userId: string): Promise<boolean> {
-    const { error } = await this.supabase
-      .from('memories')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', userId);
+  /**
+   * @param ownerSbId An SB caller's own identity: only a memory it owns is
+   *   deleted (remove-shared-memories §3.4).
+   */
+  async forget(id: string, userId: string, ownerSbId?: string): Promise<boolean> {
+    let query = this.supabase.from('memories').delete().eq('id', id).eq('user_id', userId);
+    if (ownerSbId) query = query.eq('sb_id', ownerSbId);
+    const { error } = await query;
 
     if (error) {
       logger.error('Failed to forget memory:', error);
@@ -1517,7 +1567,9 @@ export class MemoryRepository {
       salience?: Salience;
       topics?: string[];
       metadata?: Record<string, unknown>;
-    }
+    },
+    /** An SB caller's own identity: only a memory it owns is changed. */
+    ownerSbId?: string
   ): Promise<Memory | null> {
     const updateData: Record<string, unknown> = {};
     if (updates.content !== undefined) updateData.content = updates.content;
@@ -1526,13 +1578,13 @@ export class MemoryRepository {
     if (updates.topics) updateData.topics = updates.topics;
     if (updates.metadata) updateData.metadata = updates.metadata;
 
-    const { data, error } = await this.supabase
+    let updateQuery = this.supabase
       .from('memories')
       .update(updateData)
       .eq('id', id)
-      .eq('user_id', userId)
-      .select()
-      .single();
+      .eq('user_id', userId);
+    if (ownerSbId) updateQuery = updateQuery.eq('sb_id', ownerSbId);
+    const { data, error } = await updateQuery.select().single();
 
     if (error) {
       if (error.code === 'PGRST116') return null;
@@ -2439,13 +2491,24 @@ export class MemoryRepository {
   /**
    * Get version history for a specific memory
    */
-  async getMemoryHistory(memoryId: string, userId: string): Promise<MemoryHistory[]> {
-    const { data, error } = await this.supabase
+  /**
+   * @param ownerSbId An SB caller's own identity: only history rows it owns
+   *   are returned, and a row archived without an owner belongs to no SB
+   *   (remove-shared-memories §3.4). A person passes none and sees all of
+   *   their own user's history.
+   */
+  async getMemoryHistory(
+    memoryId: string,
+    userId: string,
+    ownerSbId?: string
+  ): Promise<MemoryHistory[]> {
+    let query = this.supabase
       .from('memory_history')
       .select('*')
       .eq('memory_id', memoryId)
-      .eq('user_id', userId)
-      .order('version', { ascending: false });
+      .eq('user_id', userId);
+    if (ownerSbId) query = query.eq('sb_id', ownerSbId);
+    const { data, error } = await query.order('version', { ascending: false });
 
     if (error) {
       logger.error('Failed to get memory history:', error);
@@ -2460,13 +2523,16 @@ export class MemoryRepository {
    */
   async getUserMemoryHistory(
     userId: string,
-    options: { limit?: number; changeType?: 'update' | 'delete' } = {}
+    options: { limit?: number; changeType?: 'update' | 'delete'; ownerSbId?: string } = {}
   ): Promise<MemoryHistory[]> {
     let query = this.supabase
       .from('memory_history')
       .select('*')
       .eq('user_id', userId)
       .order('archived_at', { ascending: false });
+
+    // As getMemoryHistory: an SB sees only the history it owns.
+    if (options.ownerSbId) query = query.eq('sb_id', options.ownerSbId);
 
     if (options.changeType) {
       query = query.eq('change_type', options.changeType);
@@ -2488,14 +2554,23 @@ export class MemoryRepository {
   /**
    * Restore a memory from history (creates new version with old content)
    */
-  async restoreMemory(historyId: string, userId: string): Promise<Memory | null> {
+  /**
+   * @param ownerSbId An SB caller's own identity: it restores only history it
+   *   owns, onto a memory it owns (remove-shared-memories §3.4).
+   */
+  async restoreMemory(
+    historyId: string,
+    userId: string,
+    ownerSbId?: string
+  ): Promise<Memory | null> {
     // Get the history entry
-    const { data: historyData, error: historyError } = await this.supabase
+    let historyQuery = this.supabase
       .from('memory_history')
       .select('*')
       .eq('id', historyId)
-      .eq('user_id', userId)
-      .single();
+      .eq('user_id', userId);
+    if (ownerSbId) historyQuery = historyQuery.eq('sb_id', ownerSbId);
+    const { data: historyData, error: historyError } = await historyQuery.single();
 
     if (historyError) {
       if (historyError.code === 'PGRST116') return null;
@@ -2509,6 +2584,15 @@ export class MemoryRepository {
     const existing = await this.getMemory(history.memoryId);
 
     if (existing) {
+      // A live row with no owner was a shared memory. Rewriting it would
+      // revive it as one, so it is left as it is. An SB restores only onto
+      // its own memory.
+      if (!existing.sbId) {
+        throw new Error(
+          'This memory has no owner, so it cannot be restored: there are no shared memories.'
+        );
+      }
+      if (ownerSbId && existing.sbId !== ownerSbId) return null;
       // Update the existing memory with the historical content
       const { data, error } = await this.supabase
         .from('memories')
@@ -2540,7 +2624,16 @@ export class MemoryRepository {
       await this.refreshMemoryEmbedding(restored);
       return restored;
     } else {
-      // Memory was deleted, recreate it
+      // The memory was deleted: recreate it under the owner its history
+      // recorded, with its contact scope. A row archived before history
+      // recorded owners has none, and recreating it would revive a shared
+      // memory, so it is refused.
+      if (!history.sbId || !history.sbSlug) {
+        throw new Error(
+          'This memory was deleted before its history recorded an owner, so it cannot be ' +
+            'restored: there are no shared memories. Its archived text is still in memory_history.'
+        );
+      }
       const { data, error } = await this.supabase
         .from('memories')
         .insert({
@@ -2551,6 +2644,9 @@ export class MemoryRepository {
           source: history.source,
           salience: history.salience,
           topics: history.topics,
+          agent_id: history.sbSlug,
+          sb_id: history.sbId,
+          contact_id: history.contactId ?? null,
           metadata: {
             ...history.metadata,
             restored_from_deleted: true,
@@ -2589,6 +2685,7 @@ export class MemoryRepository {
       salience: row.salience,
       topics: row.topics,
       sbSlug: row.agent_id || undefined,
+      sbId: row.sb_id || undefined,
       contactId: (row as MemoryRow).contact_id || undefined,
       embedding: parseEmbeddingValue(row.embedding),
       metadata: row.metadata,
@@ -2614,6 +2711,9 @@ export class MemoryRepository {
       createdAt: new Date(row.created_at),
       archivedAt: new Date(row.archived_at),
       changeType: row.change_type,
+      sbSlug: row.agent_id || undefined,
+      sbId: row.sb_id || undefined,
+      contactId: row.contact_id || undefined,
     };
   }
 

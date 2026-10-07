@@ -318,7 +318,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
   });
 
   // =========================================================================
-  // GET /reminders — loaded by reminders page
+  // GET /reminders — loaded by the Scheduled page
   // =========================================================================
 
   describe('GET /reminders', () => {

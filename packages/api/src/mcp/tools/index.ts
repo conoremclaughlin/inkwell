@@ -93,6 +93,7 @@ import {
   handleCompactSession,
   rememberSchema,
   listSessionsSchema,
+  startSessionSchema,
   updateSessionStateSchema,
 } from './memory-handlers';
 
@@ -1984,13 +1985,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         sbSlug: z
           .string()
           .optional()
-          .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
+          .describe('Whose memories to recall (e.g., "wren"). Defaults to you.'),
         includeShared: z
           .boolean()
           .optional()
-          .describe(
-            'Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'
-          ),
+          .describe('Deprecated and ignored: there are no shared memories.'),
       }),
     },
     async (args) => {
@@ -2178,54 +2177,13 @@ Session matching priority:
 2. studioId — scopes the session to a studio, allowing multiple active sessions per agent (one per studio). Read from .ink/identity.json.
 3. Default — returns any active session for the agent.
 
-When forceNew=true, start_session always creates a new session (skips active-session reuse). You can optionally provide sessionId to set a client-generated canonical UUID.
+When forceNew=true, start_session creates a new session (skips active-session reuse), with one exception: a live session already linked to the given backendSessionId is returned, because one backend conversation is one Inkwell session. You can optionally provide sessionId to set a client-generated canonical UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-        inputSchema: z.object({
-          ...userIdentifierFields,
-          sbSlug: z
-            .string()
-            .optional()
-            .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
-          sessionId: z
-            .string()
-            .guid()
-            .optional()
-            .describe(
-              'Optional Inkwell session UUID to use when creating a new session (typically with forceNew=true).'
-            ),
-          studioId: z
-            .string()
-            .optional()
-            .describe(
-              'Studio ID (UUID or "main") to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .ink/identity.json.'
-            ),
-          threadKey: z
-            .string()
-            .optional()
-            .describe(
-              'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
-            ),
-          backend: z
-            .string()
-            .optional()
-            .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
-          model: z
-            .string()
-            .optional()
-            .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
-          repoRoot: z
-            .string()
-            .optional()
-            .describe(
-              'Absolute path to the repository root. When studioId is "main" and no studio row exists, a studio is auto-created at this path.'
-            ),
-          metadata: z.record(z.string(), z.unknown()).optional().describe('Session metadata'),
-          forceNew: z
-            .boolean()
-            .optional()
-            .describe('If true, create a new session even if an active one exists for this scope.'),
-        }),
+        // The handler's own schema, never a copy: a copy here drifted, and
+        // strict args then refused the backendSessionId every resuming
+        // launcher sends (task c7f4b79a; real-caller-args.test.ts).
+        inputSchema: startSessionSchema,
       },
       async (args) => {
         try {

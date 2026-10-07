@@ -152,6 +152,17 @@ const SHARED_DISPLAY = [
   'packages/shared/src/stories/threads-api/wire.ts',
 ];
 
+/**
+ * The emoji catalog (task 873dfd66): the exact lookup that says which emoji a
+ * reaction may be added with, and the parity manifest, whose code names the
+ * reaction-picking files the Inkling app copies. Pinned data and a lookup;
+ * neither reads a stored reaction or decides anything from one.
+ */
+const EMOJI_CATALOG = [
+  'packages/shared/src/stories/reacting/normalize.ts',
+  'packages/shared/src/stories/reaction-picking/parity-manifest.generated.ts',
+];
+
 describe('reactions are never approval', () => {
   it('A: only the files that display or write reactions mention them', async () => {
     const files = (await Promise.all(ROOTS.map(sourceFiles))).flat();
@@ -165,7 +176,7 @@ describe('reactions are never approval', () => {
       }
     }
     expect(mentioning.sort()).toEqual(
-      [...REACTION_MODULES, ...SHARED_DISPLAY, ...Object.keys(REGISTRIES)].sort()
+      [...REACTION_MODULES, ...SHARED_DISPLAY, ...EMOJI_CATALOG, ...Object.keys(REGISTRIES)].sort()
     );
   });
 

@@ -29,6 +29,7 @@ import {
   type OwnerTestAllowlist,
 } from '../../config/inkling-flags';
 import { cancelInklingTurns } from './inkling-turns';
+import { dropReplyChainsFor } from './inkling-reply-chain';
 import { logger } from '../../utils/logger';
 
 /** The identity metadata tag for inklings born through this flow. */
@@ -64,6 +65,223 @@ export interface Inkling {
   createdAt: string;
   /** True for every inkling this service returns: only those born through this flow. */
   nameable: boolean;
+}
+
+/**
+ * The read-only profile the app shows for one of the person's own inklings:
+ * who it is (soul) and what it holds to (its own values), nothing else. Not
+ * the workspace's shared constitution, and never heartbeat, runtime config,
+ * backend, metadata, relationships, history or memories.
+ */
+export interface InklingProfile {
+  id: string;
+  /** Null until the person names it. */
+  displayName: string | null;
+  createdAt: string;
+  /**
+   * When the identity row last changed, for any reason (a rename included).
+   * Not when the soul was last written.
+   */
+  identityUpdatedAt: string;
+  /** Null when not written yet. */
+  soul: string | null;
+  /** This inkling's own values; empty when not written yet. */
+  values: string[];
+}
+
+/**
+ * One approval request an inkling made, as the person's Approvals view shows
+ * it (ink://designs/inkling-approvals-extension §A): what was asked and how
+ * it stands, never the tool's input, the grant it produced, or who decided.
+ */
+export interface InklingApproval {
+  id: string;
+  /** The tool the inkling asked to use. */
+  tool: string;
+  /** The reason the request gave, cut to APPROVAL_PURPOSE_MAX code points; null when it gave none. */
+  purpose: string | null;
+  status: InklingApprovalStatus;
+  createdAt: string;
+  expiresAt: string;
+  resolvedAt: string | null;
+}
+
+/**
+ * The stored statuses, with `expired` also covering a pending request past
+ * its deadline, as the approval interceptor reads it. Anything else stored
+ * reads as `unknown`, never passed through.
+ */
+export type InklingApprovalStatus =
+  | 'pending'
+  | 'granted'
+  | 'denied'
+  | 'expired'
+  | 'cancelled'
+  | 'unknown';
+
+export interface InklingApprovalsPage {
+  approvals: InklingApproval[];
+  /** Pass as `before` for the next, older page; null when this was the last. */
+  nextBefore: string | null;
+}
+
+export const APPROVALS_PAGE_DEFAULT = 20;
+export const APPROVALS_PAGE_MAX = 50;
+export const APPROVAL_PURPOSE_MAX = 280;
+
+const APPROVAL_COLUMNS = 'id, tool, reason, status, created_at, expires_at, resolved_at';
+const STORED_APPROVAL_STATUSES = new Set(['pending', 'granted', 'denied', 'expired', 'cancelled']);
+
+interface ApprovalRow {
+  id: string;
+  tool: string;
+  reason: string | null;
+  status: string;
+  created_at: string;
+  expires_at: string;
+  resolved_at: string | null;
+}
+
+/**
+ * A page cursor: the last row's created_at exactly as Postgres returned it,
+ * microseconds included, and its id. It never passes through a JS Date,
+ * which would cut it to milliseconds and skip rows within one millisecond.
+ */
+export function encodeApprovalCursor(row: { created_at: string; id: string }): string {
+  return Buffer.from(JSON.stringify({ c: row.created_at, i: row.id })).toString('base64url');
+}
+
+/**
+ * A timestamptz as PostgREST returns one: date, time, up to six fractional
+ * digits, and an optional offset.
+ */
+const CURSOR_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-](\d{2})(?::?(\d{2}))?)?$/;
+
+/**
+ * A real moment on Postgres's calendar. Postgres refuses an impossible date,
+ * hour or offset with an error, which reached the person as a 500 for what is
+ * a bad request (Lumen, #767). It accepts 24:00, a leap second and a seventh
+ * fractional digit by moving the time, so a cursor carrying one would no
+ * longer be the row it names; Postgres never returns any of them.
+ */
+function isCursorTimestamp(value: string): boolean {
+  const match = CURSOR_TIMESTAMP.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  if (month < 1 || month > 12) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return (
+    year >= 1 &&
+    day >= 1 &&
+    day <= monthDays &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    Number(match[7] ?? 0) <= 15 &&
+    Number(match[8] ?? 0) <= 59
+  );
+}
+
+export function decodeApprovalCursor(cursor: string): { createdAt: string; id: string } | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const { c, i } = parsed as { c?: unknown; i?: unknown };
+    if (typeof c !== 'string' || !isCursorTimestamp(c)) return null;
+    if (!isUuid(i)) return null;
+    return { createdAt: c, id: i };
+  } catch {
+    return null;
+  }
+}
+
+/** The status the person sees: pending past its deadline (Node's clock, inclusive) is expired. */
+export function approvalStatus(
+  row: { status: string; expires_at: string },
+  now: number
+): InklingApprovalStatus {
+  if (!STORED_APPROVAL_STATUSES.has(row.status)) return 'unknown';
+  if (row.status === 'pending' && Date.parse(row.expires_at) <= now) return 'expired';
+  return row.status as InklingApprovalStatus;
+}
+
+/** Cut by code points, so a surrogate pair is never split. */
+export function approvalPurpose(reason: string | null): string | null {
+  if (typeof reason !== 'string' || reason.trim() === '') return null;
+  const points = Array.from(reason);
+  return points.length <= APPROVAL_PURPOSE_MAX
+    ? reason
+    : `${points.slice(0, APPROVAL_PURPOSE_MAX - 1).join('')}…`;
+}
+
+/**
+ * One page of an owner's approval requests from one requester, newest first.
+ * The caller has already established that `filter` names the person's own
+ * inkling; this only reads. Exported for the database integration test.
+ *
+ * A keyset on (created_at, id), read as two plain queries: the rest of the
+ * cursor's own timestamp, then everything older.
+ */
+export async function readApprovalsPage(
+  supabase: SupabaseClient,
+  filter: { userId: string; workspaceId: string; sbId: string },
+  opts: { limit?: number; before?: string },
+  now: () => number
+): Promise<InklingApprovalsPage> {
+  const requested = Math.trunc(Number(opts.limit ?? APPROVALS_PAGE_DEFAULT));
+  const limit = Number.isFinite(requested)
+    ? Math.min(Math.max(requested, 1), APPROVALS_PAGE_MAX)
+    : APPROVALS_PAGE_DEFAULT;
+  const cursor = opts.before === undefined ? null : decodeApprovalCursor(opts.before);
+  if (opts.before !== undefined && !cursor) {
+    throw new InklingError(400, 'That page cursor is not valid');
+  }
+
+  const base = () =>
+    supabase
+      .from('approval_requests')
+      .select(APPROVAL_COLUMNS)
+      .eq('user_id', filter.userId)
+      .eq('workspace_id', filter.workspaceId)
+      .eq('sb_id', filter.sbId);
+
+  const rows: ApprovalRow[] = [];
+  if (cursor) {
+    const { data, error } = await base()
+      .eq('created_at', cursor.createdAt)
+      .lt('id', cursor.id)
+      .order('id', { ascending: false })
+      .limit(limit + 1);
+    if (error) throw new Error(`Failed to read the inkling's approvals: ${error.message}`);
+    rows.push(...((data ?? []) as ApprovalRow[]));
+  }
+  if (rows.length <= limit) {
+    let older = base();
+    if (cursor) older = older.lt('created_at', cursor.createdAt);
+    const { data, error } = await older
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(limit + 1 - rows.length);
+    if (error) throw new Error(`Failed to read the inkling's approvals: ${error.message}`);
+    rows.push(...((data ?? []) as ApprovalRow[]));
+  }
+
+  const page = rows.slice(0, limit);
+  const at = now();
+  return {
+    approvals: page.map((row) => ({
+      id: row.id,
+      tool: row.tool,
+      purpose: approvalPurpose(row.reason),
+      status: approvalStatus(row, at),
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      resolvedAt: row.resolved_at,
+    })),
+    nextBefore: rows.length > limit ? encodeApprovalCursor(page[page.length - 1]) : null,
+  };
 }
 
 export interface InklingScope {
@@ -119,6 +337,25 @@ interface LineageRow {
 }
 
 const IDENTITY_COLUMNS = 'id, agent_id, name, workspace_id, metadata, created_at, updated_at';
+
+/** A profile's columns: the identity's own soul and values, never anything else on the row. */
+const PROFILE_COLUMNS = 'id, name, metadata, created_at, updated_at, soul, values';
+
+interface ProfileRow {
+  id: string;
+  name: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  soul: unknown;
+  values: unknown;
+}
+
+/** Only strings with something in them count as values. */
+function valuesFrom(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+}
 
 export function toInkling(row: IdentityRow): Inkling {
   return {
@@ -335,6 +572,95 @@ export class InklingService {
   }
 
   /**
+   * One of the person's own inklings, read-only: its id, name, when it was
+   * awakened, when its row last changed, its soul and its own values.
+   *
+   * The same reader as list: this person, this workspace, the inkling tag and
+   * a self-serve lineage, all required. A malformed id, an unknown one,
+   * another person's, another workspace's, an agent that isn't an inkling,
+   * and one without the lineage all get the same 404.
+   */
+  async profile(scope: InklingScope, inklingId: string): Promise<InklingProfile> {
+    const row = await this.readOwnInkling<ProfileRow>(
+      scope,
+      inklingId,
+      PROFILE_COLUMNS,
+      "Failed to read the inkling's profile"
+    );
+    return {
+      id: row.id,
+      displayName: row.metadata?.named === true ? row.name : null,
+      createdAt: row.created_at,
+      identityUpdatedAt: row.updated_at,
+      soul: typeof row.soul === 'string' && row.soul.trim() !== '' ? row.soul : null,
+      values: valuesFrom(row.values),
+    };
+  }
+
+  /**
+   * The approval requests one of the person's own inklings made, newest
+   * first, read-only (ink://designs/inkling-approvals-extension §A).
+   *
+   * The same reader as profile: this person, this workspace, the inkling
+   * tag and a self-serve lineage, or the same 404. Only requests whose
+   * requester was recorded from a signed token (`sb_id`) are listed;
+   * older requests, and ones made with a person's token, carry none, so the
+   * list is what was attributed, not a promise that nothing else was asked.
+   *
+   * Paged by a keyset on (created_at, id), read as two plain queries: the
+   * rest of the cursor's own timestamp, then everything older.
+   */
+  async approvals(
+    scope: InklingScope,
+    inklingId: string,
+    opts: { limit?: number; before?: string } = {},
+    now: () => number = Date.now
+  ): Promise<InklingApprovalsPage> {
+    await this.readOwnInkling<{ id: string }>(
+      scope,
+      inklingId,
+      'id',
+      "Failed to read the inkling's approvals"
+    );
+
+    return readApprovalsPage(
+      this.supabase,
+      { userId: scope.userId, workspaceId: scope.workspaceId, sbId: inklingId },
+      opts,
+      now
+    );
+  }
+
+  /**
+   * One of the person's own inklings, or the same 404 for anything else: a
+   * malformed id, an unknown one, another person's, another workspace's, an
+   * agent that isn't an inkling, and one without a self-serve lineage. The
+   * reader profile and approvals share, so they cannot drift apart.
+   */
+  private async readOwnInkling<T extends { id: string }>(
+    scope: InklingScope,
+    inklingId: string,
+    columns: string,
+    failure: string
+  ): Promise<T> {
+    const missing = () => new InklingError(404, 'No inkling with that id');
+    if (!isUuid(inklingId)) throw missing();
+    const { data, error } = await this.supabase
+      .from('agent_identities')
+      .select(columns)
+      .eq('id', inklingId)
+      .eq('user_id', scope.userId)
+      .eq('workspace_id', scope.workspaceId)
+      .eq('metadata->>client', INKLING_CLIENT)
+      .maybeSingle();
+    if (error) throw new Error(`${failure}: ${error.message}`);
+    const row = data as T | null;
+    if (!row) throw missing();
+    if (!(await this.selfServeLineages(scope.userId, [row.id])).has(row.id)) throw missing();
+    return row;
+  }
+
+  /**
    * Set an inkling's display name. Idempotent, and renamable forever. The
    * slug is never touched; the lineage records the chosen name.
    */
@@ -369,7 +695,11 @@ export class InklingService {
     if (!identity || !isInklingRow(identity)) {
       throw new InklingError(404, 'No inkling with that id');
     }
-    return { cancelled: cancelInklingTurns(identity.id) > 0 };
+    // Waiting members first: aborting the running turn ends it, and an ended
+    // turn wakes the next member in turn (inkling-reply-chain.ts).
+    const dropped = dropReplyChainsFor(identity.id);
+    const aborted = cancelInklingTurns(identity.id);
+    return { cancelled: aborted > 0 || dropped > 0 };
   }
 
   /**

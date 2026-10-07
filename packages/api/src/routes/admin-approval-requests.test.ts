@@ -226,9 +226,118 @@ function pastIso(minutes = 5): string {
   return new Date(Date.now() - minutes * 60_000).toISOString();
 }
 
+/**
+ * The insert mock plus the identity lookup the signed requester makes: the
+ * identity table holds `identities`, keyed by id and user, as Postgres would.
+ */
+function installSignedInsertMock(
+  identities: Array<{ id: string; user_id: string; workspace_id: string }>
+) {
+  const inserted: Array<Record<string, unknown>> = [];
+  const lookups: Array<Record<string, unknown>> = [];
+  mockSupabaseFrom.mockImplementation((table: string) => {
+    if (table === 'approval_requests') {
+      return {
+        insert: vi.fn().mockImplementation((row: Record<string, unknown>) => {
+          inserted.push(row);
+          return {
+            select: vi.fn().mockReturnValue({
+              single: vi.fn().mockResolvedValue({
+                data: { id: 'req-signed', status: 'pending', expires_at: futureIso() },
+                error: null,
+              }),
+            }),
+          };
+        }),
+      };
+    }
+    if (table === 'agent_identities') {
+      const filters: Record<string, unknown> = {};
+      const chain = {
+        select: vi.fn(() => chain),
+        eq: vi.fn((key: string, value: unknown) => {
+          filters[key] = value;
+          return chain;
+        }),
+        maybeSingle: vi.fn(async () => {
+          lookups.push({ ...filters });
+          // A filter not applied constrains nothing, as in Postgres.
+          const row = identities.find(
+            (r) =>
+              (filters.id === undefined || r.id === filters.id) &&
+              (filters.user_id === undefined || r.user_id === filters.user_id)
+          );
+          return { data: row ? { id: row.id, workspace_id: row.workspace_id } : null, error: null };
+        }),
+      };
+      return chain;
+    }
+    throw new Error(`unexpected table ${table}`);
+  });
+  return { inserted, lookups };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('POST /approval-requests: the signed requester (Approvals step A)', () => {
+  const INKLING = '77777777-7777-4777-8777-777777777777';
+  const THEIRS = '88888888-8888-4888-8888-888888888888';
+  const WORKSPACE = '99999999-9999-4999-8999-999999999999';
+  const identities = [
+    { id: INKLING, user_id: USER_ID, workspace_id: WORKSPACE },
+    { id: THEIRS, user_id: 'someone-else', workspace_id: 'their-ws' },
+  ];
+  const headerFor = (sbSlug: string) =>
+    Buffer.from(JSON.stringify({ sbSlug, sessionId: 'x' })).toString('base64url');
+
+  beforeEach(() => vi.clearAllMocks());
+
+  async function create(req: Record<string, unknown>) {
+    const handler = findRouteHandler('post', '/approval-requests');
+    const res = createMockRes();
+    await handler!(
+      createAuthenticatedReq({ body: { tool: 'Bash' }, ...req }) as Request,
+      res as unknown as Response
+    );
+    return res;
+  }
+
+  it("records the signed token's identity and that identity's own workspace", async () => {
+    const db = installSignedInsertMock(identities);
+    const res = await create({ inkTokenSbId: INKLING, inkWorkspaceId: 'header-selected-ws' });
+    expect(res._status).toBe(201);
+    expect(db.inserted[0]).toMatchObject({ sb_id: INKLING, workspace_id: WORKSPACE });
+    expect(db.lookups).toEqual([{ id: INKLING, user_id: USER_ID }]);
+  });
+
+  it('is never moved by a header naming another SB', async () => {
+    const db = installSignedInsertMock(identities);
+    await create({
+      inkTokenSbId: INKLING,
+      headers: { authorization: 'Bearer t', 'x-ink-context': headerFor('lumen') },
+    });
+    // The header slug is still recorded as requesting_agent_id, as before.
+    expect(db.inserted[0]).toMatchObject({ sb_id: INKLING, requesting_agent_id: 'lumen' });
+  });
+
+  it("records no requester for a token signed for another user's identity", async () => {
+    const db = installSignedInsertMock(identities);
+    const res = await create({ inkTokenSbId: THEIRS });
+    expect(res._status).toBe(201);
+    expect(db.inserted[0]).toMatchObject({ sb_id: null, workspace_id: null });
+  });
+
+  it("records no requester for a person's token, and makes no lookup", async () => {
+    const db = installSignedInsertMock(identities);
+    await create({
+      headers: { authorization: 'Bearer t', 'x-ink-context': headerFor('kindle-x') },
+    });
+    expect(db.inserted[0]).toMatchObject({ sb_id: null, workspace_id: null });
+    expect(db.lookups).toEqual([]);
+  });
+});
 
 describe('POST /approval-requests', () => {
   beforeEach(() => {

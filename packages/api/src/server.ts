@@ -57,6 +57,12 @@ import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import {
+  attachReplyChain,
+  inTurnNote,
+  replyChainWakeDue,
+} from './services/inklings/inkling-reply-chain';
+import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
+import {
   TriggerRetryScheduler,
   getTriggerAttempt,
   BackendFailureError,
@@ -69,6 +75,11 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { evidenceMediaRoots } from './routes/admin';
+import { defaultUploadsRoot, inkDataDir, prepareUploadsRoot } from './services/uploads/layout';
+import { maintainUploads } from './services/uploads/maintenance';
+import { uploadsRootNeighbours } from './services/uploads/placement';
+import { setUploadsRoot, uploadsRoot } from './services/uploads/runtime';
 import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
 import { handleHangup } from './utils/hangup';
@@ -92,8 +103,13 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import {
+  HostedInkSessionRunner,
+  parseHostedInkSbIds,
+} from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
+import { startLaunchTracking } from './services/sessions/launched-processes';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -171,10 +187,27 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 1. Initialize data layer
   logger.info('Initializing data layer...');
   dataComposer = await getDataComposer();
+
+  // Before any input is handled: stop the backend processes this server
+  // launched before a restart and left running, then record every launch from
+  // here on (launched-processes.ts). A restart signals only the server, and the
+  // next message to such a session would start a second backend beside it.
+  await startLaunchTracking(dataComposer.getClient(), env.MCP_HTTP_PORT);
   logger.info('Data layer ready');
 
   // 2. Create SessionService (stateless, queries DB per-request)
   logger.info('Creating SessionService...');
+  // Opt-in only. No composition is bound yet (pr:701), so a listed agent's
+  // ink turns are refused, never sent to ink chat in its place.
+  const hostedInkSbIds = parseHostedInkSbIds(env.INK_RUNTIME_IN_PROCESS_SB_IDS);
+  if (hostedInkSbIds.size > 0) {
+    logger.warn(
+      "In-process ink runtime selected, with no composition bound: these agents' ink turns are refused",
+      {
+        sbIds: [...hostedInkSbIds],
+      }
+    );
+  }
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
@@ -191,6 +224,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
+    ...(hostedInkSbIds.size > 0
+      ? { hostedInk: { runner: new HostedInkSessionRunner({}), sbIds: hostedInkSbIds } }
+      : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -555,6 +591,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     logger.warn('ChannelGateway not available - response routing will fail');
   }
 
+  // Uploads stay off unless their root is inside ~/.ink and clear of the
+  // directories placement.ts lists. A placement check, not runner isolation
+  // (services/uploads/layout.ts).
+  const uploads = await prepareUploadsRoot(
+    env.INK_UPLOADS_DIR ?? defaultUploadsRoot(),
+    inkDataDir(),
+    uploadsRootNeighbours(await evidenceMediaRoots(), workingDirectory)
+  );
+  setUploadsRoot(uploads.ok ? uploads.rootReal : null);
+  if (uploads.ok) logger.info('Uploads root ready', { root: uploads.rootReal });
+  else logger.warn('Uploads are off', { reason: uploads.reason, detail: uploads.detail });
+
   // 6. Initialize heartbeat service for scheduled reminders
   // Useful for secondary/local dev servers where we want API/MCP without
   // participating in global reminder delivery.
@@ -866,6 +914,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
           });
         }
+
+        // Uploads: orphan sweep, finishing removals, and the claim
+        // reconciler. Inside this gate, and gated again on the same flags.
+        try {
+          const report = await maintainUploads({
+            db: dataComposer!.getClient(),
+            root: uploadsRoot(),
+            now: Date.now,
+          });
+          const { skipped, ...counts } = report;
+          if (!skipped && Object.values(counts).some((count) => count > 0)) {
+            logger.info('Uploads maintenance complete', counts);
+          }
+        } catch (uploadsErr) {
+          logger.error('Uploads maintenance failed', {
+            error: uploadsErr instanceof Error ? uploadsErr.message : String(uploadsErr),
+          });
+        }
       },
     });
     logger.info(
@@ -1143,6 +1209,10 @@ Type: ${payload.triggerType}`;
     }
     if (payload.threadKey) {
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
+      // A group of inklings answering their owner in turn: this one comes
+      // after others (inkling-reply-chain.ts).
+      const answeringInTurn = inTurnNote(payload.metadata);
+      if (answeringInTurn) triggerMessage += `\n${answeringInTurn}`;
 
       // The thread's own description, on the surface an SB reads BEFORE
       // deciding whether to act. A key alone ("inkwell:thread:legibility-commission")
@@ -1172,7 +1242,7 @@ Type: ${payload.triggerType}`;
 
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
-${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}"). Use send_to_inbox with threadKey to respond.` : 'Check your inbox for the full message using get_inbox.'}
+${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}", sbSlug: "${targetSlug}"). Use send_to_inbox with threadKey to respond.` : 'Check your inbox for the full message using get_inbox.'}
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
@@ -1199,6 +1269,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // caller-supplied payload.metadata. The inkling gate reads this
         // message to learn who sent it (Lumen's review of 8b9d7f50).
         triggerThreadMessageId: payload.threadMessageId,
+        triggerInboxMessageId: payload.inboxMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1742,6 +1813,30 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       });
     }
 
+    // A wake that may share a turn with the wakes queued beside it (spec
+    // trigger-pipe-in v7, 1.1): it points at a stored message, and is neither
+    // a force-spawn nor a strategy wake, whose turns are their own by design.
+    // SessionService keeps out anything that changes the launch itself.
+    request.metadata!.wakeCoalescible =
+      Boolean(payload.threadMessageId || payload.inboxMessageId) &&
+      payload.forceSpawn !== true &&
+      payload.metadata?.strategyTrigger !== true;
+
+    // An inkling's turn that ends without a word to its owner posts its
+    // closing text as its message (task 9edf62fe). Decided in the turn's own
+    // hooks, as that turn ends and before the next queued one starts: this
+    // handler's handleMessage can settle only once the queue behind it has
+    // drained (Lumen, #769).
+    if (payload.threadId && payload.threadMessageId && resolvedIdentityId) {
+      request.turnHooks = closingTextTurnHooks(dataComposer!, {
+        userId,
+        identityId: resolvedIdentityId,
+        threadId: payload.threadId,
+        threadKey: payload.threadKey,
+        threadMessageId: payload.threadMessageId,
+      });
+    }
+
     let result: SessionResult;
     try {
       result = await sessionService!.handleMessage(request);
@@ -1866,8 +1961,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       );
     }
 
-    await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
-    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`);
+    // A wake carried by another wake's turn was delivered by that turn.
+    await logInkmail('inkmail_deliver', payload, userId, {
+      deliveryMethod: result.wake ? 'coalesced' : 'spawn',
+    });
+    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`, {
+      ...(result.wake ? { coalescedInto: result.wake.coalescedInto } : {}),
+    });
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 
@@ -1879,6 +1979,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   // inbox row is restored to unread before the retry decision, and a threaded
   // failure is announced on its first failure rather than held silently.
   const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
+    // A group member's wake whose chain Stop or a newer owner message has
+    // since ended is not sent again (inkling-reply-chain.ts).
+    if (!replyChainWakeDue(retryPayload)) {
+      logger.info('[TriggerRetry] Not re-dispatching: its group reply chain has ended', {
+        to: retryPayload.toSlug,
+        threadKey: retryPayload.threadKey || null,
+      });
+      return;
+    }
     logger.info('[TriggerRetry] Re-dispatching trigger', {
       to: retryPayload.toSlug,
       from: retryPayload.fromSlug,
@@ -1889,18 +1998,37 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     agentGateway.dispatchTrigger(retryPayload);
   });
 
-  // 7c. Listen for trigger failures — transient errors get a delayed retry;
+  // 7c. A group of inklings answering their owner in turn: as each member's
+  // wake ends, the next is woken (inkling-reply-chain.ts). A processed wake
+  // has ended. A failed one has ended only if no retry is coming, which the
+  // failure listener below decides, so it reports those itself.
+  const replyChainWakeFailed = attachReplyChain(agentGateway);
+
+  // 7d. Listen for trigger failures — transient errors get a delayed retry;
   // otherwise restore inbox message + notify sender. The decision lives in
   // services/trigger-failure-listener.ts so it can run over a table-backed
   // client (Lumen, #618); the scheduler and the activity stream are handed in.
-  agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
-    handleTriggerFailure(dataComposer?.getClient(), event, {
+  // A failure with no retry coming then ends that wake's part in its chain;
+  // one with a retry keeps its place, so the retry never runs beside the
+  // next member's turn.
+  agentGateway.on('trigger:error', (event: TriggerFailureEvent) => {
+    let retrying = false;
+    return handleTriggerFailure(dataComposer?.getClient(), event, {
       logInkmailFailure: (payload, userId, extra) =>
         logInkmail('inkmail_fail', payload, userId, extra),
-      retryScheduler: triggerRetryScheduler,
+      retryScheduler: {
+        scheduleRetry: (payload, classification, error) => {
+          const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
+          // A retry already pending for this wake is still to come.
+          retrying = retry.scheduled || retry.reason === 'already_pending';
+          return retry;
+        },
+      },
       logRetryActivity: (entry) => dataComposer!.repositories.activityStream.logActivity(entry),
-    })
-  );
+    }).finally(() => {
+      if (!retrying) replyChainWakeFailed(event.payload);
+    });
+  });
 
   // 8. Print status
   printStatus();
