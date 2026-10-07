@@ -151,17 +151,45 @@ export function encodeApprovalCursor(row: { created_at: string; id: string }): s
   return Buffer.from(JSON.stringify({ c: row.created_at, i: row.id })).toString('base64url');
 }
 
+/**
+ * A timestamptz as PostgREST returns one: date, time, up to six fractional
+ * digits, and an optional offset.
+ */
+const CURSOR_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-](\d{2})(?::?(\d{2}))?)?$/;
+
+/**
+ * A real moment on Postgres's calendar. Postgres refuses an impossible date,
+ * hour or offset with an error, which reached the person as a 500 for what is
+ * a bad request (Lumen, #767). It accepts 24:00, a leap second and a seventh
+ * fractional digit by moving the time, so a cursor carrying one would no
+ * longer be the row it names; Postgres never returns any of them.
+ */
+function isCursorTimestamp(value: string): boolean {
+  const match = CURSOR_TIMESTAMP.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  if (month < 1 || month > 12) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return (
+    year >= 1 &&
+    day >= 1 &&
+    day <= monthDays &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    Number(match[7] ?? 0) <= 15 &&
+    Number(match[8] ?? 0) <= 59
+  );
+}
+
 export function decodeApprovalCursor(cursor: string): { createdAt: string; id: string } | null {
   try {
     const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object') return null;
     const { c, i } = parsed as { c?: unknown; i?: unknown };
-    if (
-      typeof c !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}[T ][\d:.]+([+-]\d{2}(:?\d{2})?|Z)?$/.test(c)
-    ) {
-      return null;
-    }
+    if (typeof c !== 'string' || !isCursorTimestamp(c)) return null;
     if (!isUuid(i)) return null;
     return { createdAt: c, id: i };
   } catch {

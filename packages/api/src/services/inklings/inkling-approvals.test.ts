@@ -186,6 +186,48 @@ describe('paging', () => {
     });
   });
 
+  it('takes only a moment that exists on the calendar, as Postgres writes one', () => {
+    const id = '66666666-6666-4666-8666-666666666666';
+    const decode = (c: string) =>
+      decodeApprovalCursor(Buffer.from(JSON.stringify({ c, i: id })).toString('base64url'));
+    for (const c of [
+      '2026-10-07T08:00:00+00:00',
+      '2026-10-07T08:00:00.637558+00:00',
+      '2026-10-07 08:00:00.1+00',
+      '2026-10-07T08:00:00.000Z',
+      '2026-10-07T08:00:00+0530',
+      '2026-10-07T08:00:00-15:59',
+      '2026-10-07T08:00:00',
+      '2024-02-29T23:59:59.999999+00:00',
+      '2000-02-29T00:00:00+00:00',
+      '2026-12-31T23:59:59+00:00',
+      '0001-01-01T00:00:00+00:00',
+    ]) {
+      expect(decode(c), c).toEqual({ createdAt: c, id });
+    }
+    for (const c of [
+      '2026-02-29T08:00:00+00:00', // not a leap year
+      '1900-02-29T08:00:00+00:00', // a century, not a leap year
+      '2026-02-30T08:00:00+00:00',
+      '2026-04-31T08:00:00+00:00',
+      '2026-00-07T08:00:00+00:00',
+      '2026-13-07T08:00:00+00:00',
+      '2026-10-00T08:00:00+00:00',
+      '0000-01-01T00:00:00+00:00',
+      '2026-10-07T24:00:00+00:00', // Postgres moves it to the next day
+      '2026-10-07T23:59:60+00:00', // and a leap second to the next minute
+      '2026-10-07T23:60:00+00:00',
+      '2026-10-07T08:00:00+16:00',
+      '2026-10-07T08:00:00+15:60',
+      '2026-10-07T08:00:00.1234567+00:00', // Postgres rounds a seventh digit
+      '2026-10-07T08:00+00:00',
+      '2026-10-07T:::+00:00',
+      '2026-10-07T08:00:00+00:00 ',
+    ]) {
+      expect(decode(c), c).toBeNull();
+    }
+  });
+
   it('refuses a cursor it did not make', async () => {
     const { inkling } = await service.awaken(ME, REQUEST);
     for (const before of ['nope', Buffer.from('{"c":1}').toString('base64url'), '']) {
