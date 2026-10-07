@@ -277,3 +277,48 @@ describe('GET /threads/messages names every author for the viewer', () => {
     expect(history.filter(([, m, c]) => m === 'eq' && c === 'user_id')).toEqual([]);
   });
 });
+
+describe('error text in an inkling conversation (task 935af241)', () => {
+  // A trigger-failure notice as it was written before its inkling wording:
+  // the raw error rides in its metadata.
+  const oldNotice = {
+    id: 'm-fail',
+    sender_kind: 'system',
+    sender_sb_id: null,
+    sender_user_id: null,
+    sender_agent_id: null,
+    content: 'Trigger to kindle-1 failed (timeout): …',
+    message_type: 'notification',
+    priority: 'high',
+    metadata: {
+      triggerFailure: true,
+      errorCategory: 'timeout',
+      errorSummary: 'Claude Code timeout',
+      errorDetail: 'Claude Code timeout: no output for 300s, process killed',
+    },
+    created_at: '2026-10-07T05:00:00Z',
+  };
+  const served = async () => {
+    const res = createRes();
+    await messages(createReq('user-a'), res);
+    expect(res._status).toBe(200);
+    return (res._json as { messages: Array<{ id: string; metadata: unknown }> }).messages;
+  };
+
+  it('never reaches the app from a system message, whatever wrote the row', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    tables.messages = [oldNotice];
+    const [notice] = await served();
+    expect(notice.metadata).toEqual({ triggerFailure: true, errorCategory: 'timeout' });
+  });
+
+  it('is served as stored outside an inkling conversation, and on a message that is not the system', async () => {
+    tables.thread = { ...tables.thread!, metadata: {} };
+    tables.messages = [oldNotice];
+    expect((await served())[0].metadata).toEqual(oldNotice.metadata);
+
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    tables.messages = [{ ...oldNotice, sender_kind: 'user', sender_user_id: 'user-a' }];
+    expect((await served())[0].metadata).toEqual(oldNotice.metadata);
+  });
+});

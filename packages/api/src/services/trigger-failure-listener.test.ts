@@ -258,3 +258,123 @@ describe('handleTriggerFailure', () => {
     expect(await rows(db, 'inbox_thread_messages')).toHaveLength(0);
   });
 });
+
+describe("in an inkling's own conversation, the notice is for its person (task 935af241)", () => {
+  const INKLING = { client: 'inkling-mobile', ownerTest: true };
+  const inklingWorld = (named: boolean, marked = true) =>
+    client({
+      agent_identities: [
+        ...identities.map((i) => ({ ...i })),
+        {
+          id: 'sb-ink',
+          agent_id: 'kindle-0a1b2c3d',
+          user_id: 'user-a',
+          workspace_id: 'ws-a',
+          name: named ? 'Pip' : 'unnamed inkling',
+          metadata: { ...INKLING, named },
+        },
+      ],
+      inbox_threads: [
+        {
+          id: 'thread-ink',
+          thread_key: 'chat:conversation-x',
+          workspace_id: 'ws-a',
+          status: 'open',
+          metadata: marked ? { inklingConversation: true } : {},
+        },
+      ],
+    });
+  const fromThePerson = (error: Error) => ({
+    triggerId: 'trig-ink',
+    error,
+    payload: {
+      fromSlug: 'user',
+      toSlug: 'kindle-0a1b2c3d',
+      toSbId: 'sb-ink',
+      threadId: 'thread-ink',
+      threadMessageId: 'msg-waking',
+      threadKey: 'chat:conversation-x',
+      triggerType: 'message',
+    },
+  });
+  const timeout = new Error('Claude Code timeout: no output for 300s, process killed');
+  const retrying = {
+    ...deps,
+    retryScheduler: {
+      scheduleRetry: vi.fn(() => ({ scheduled: true, attempt: 2, delayMs: 120_000 })),
+    },
+  };
+  const theNotice = async (db: Db) => {
+    const notices = await rows(db, 'inbox_thread_messages');
+    expect(notices).toHaveLength(1);
+    return notices[0] as Row & { content: string; metadata: Row };
+  };
+
+  it('says a retry is coming, by name, and asks for no resend', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, retrying as never);
+    const notice = await theNotice(db);
+    expect(notice.content).toBe(
+      "Pip couldn't answer yet and is trying again. No need to send your message again."
+    );
+    expect(notice).toMatchObject({ sender_kind: 'system', message_type: 'notification' });
+  });
+
+  it('asks for a resend once a retryable failure is final', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, deps);
+    expect((await theNotice(db)).content).toBe(
+      "Pip couldn't answer that message. If you asked Pip to do something, check whether it's done before sending it again."
+    );
+  });
+
+  it("doesn't ask for a resend a retry can't cure", async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(new Error('runner exited 1')) as never, deps);
+    expect((await theNotice(db)).content).toBe("Pip can't answer right now. Try again later.");
+  });
+
+  it('says "Your inkling" while it has no name', async () => {
+    const db = inklingWorld(false);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, deps);
+    expect((await theNotice(db)).content).toBe(
+      "Your inkling couldn't answer that message. If you asked your inkling to do something, check whether it's done before sending it again."
+    );
+  });
+
+  it('carries no slug, backend or error text, in the words or in what the app reads', async () => {
+    const db = inklingWorld(true);
+    await handleTriggerFailure(db, fromThePerson(timeout) as never, retrying as never);
+    const notice = await theNotice(db);
+    expect(JSON.stringify(notice)).not.toMatch(/kindle-0a1b2c3d|Claude|timeout: no output|300s/);
+    expect(notice.metadata).toEqual({
+      triggerFailure: true,
+      inklingNotice: true,
+      aboutMessageId: 'msg-waking',
+      triggerId: 'trig-ink',
+      errorCategory: 'timeout',
+      retryable: true,
+      attempts: 1,
+      retryPending: 2,
+    });
+    // The full error still reaches the logs.
+    expect(logInkmailFailure).toHaveBeenCalledWith(expect.anything(), 'user-a', {
+      error: timeout.message,
+    });
+  });
+
+  it("is today's notice anywhere else: a thread without the mark, or a target that isn't an inkling", async () => {
+    const unmarked = inklingWorld(true, false);
+    await handleTriggerFailure(unmarked, fromThePerson(timeout) as never, deps);
+    const notice = await theNotice(unmarked);
+    expect(notice.content).toContain('Trigger to kindle-0a1b2c3d failed');
+    expect(notice.metadata).toMatchObject({
+      errorSummary: expect.any(String),
+      errorDetail: timeout.message,
+    });
+
+    const db = client();
+    await handleTriggerFailure(db, threadBorne, deps);
+    expect((await theNotice(db)).metadata).toMatchObject({ errorDetail: 'runner exited 1' });
+  });
+});

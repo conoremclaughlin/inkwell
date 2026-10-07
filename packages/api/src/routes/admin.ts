@@ -100,7 +100,11 @@ import {
   type InklingScope,
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
-import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import {
+  INKLING_CONVERSATION_MARK,
+  InklingThreadRefusedError,
+} from '../services/inklings/inkling-thread-gate';
+import { FAILURE_NOTICE_ERROR_KEYS } from '../services/trigger-failure-notice';
 import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
@@ -8354,6 +8358,25 @@ const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
  * was drawn from (the whole thread, or everything older than the cursor),
  * so `meta.truncated` always means "there is more, further back".
  */
+/**
+ * A message's metadata as a reader receives it. In an inkling's conversation
+ * a system message never carries error text: a trigger-failure notice
+ * written before its inkling wording existed still holds the raw error
+ * (task 935af241, Myra).
+ */
+function metadataForReader(
+  message: { sender_kind: string; metadata: unknown },
+  threadMetadata: unknown
+): Record<string, unknown> | null {
+  const metadata = (message.metadata as Record<string, unknown> | null) ?? null;
+  const inklingConversation =
+    (threadMetadata as Record<string, unknown> | null)?.[INKLING_CONVERSATION_MARK] === true;
+  if (!metadata || !inklingConversation || message.sender_kind !== 'system') return metadata;
+  const shown = { ...metadata };
+  for (const key of FAILURE_NOTICE_ERROR_KEYS) delete shown[key];
+  return shown;
+}
+
 router.get('/threads/messages', async (req: Request, res: Response) => {
   try {
     const key = typeof req.query.key === 'string' ? req.query.key : '';
@@ -8376,7 +8399,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select(
-        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at'
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at, metadata'
       )
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
@@ -8523,7 +8546,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
-          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
+          metadata: metadataForReader(m, thread.metadata),
           createdAt: m.created_at,
           ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))

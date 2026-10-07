@@ -177,4 +177,48 @@ describe('resolveFailureNoticeAddress', () => {
     });
     expect(address.senderOwnerUserId).toBeUndefined();
   });
+
+  it('names an inkling target and its conversation, by its chosen name or none (task 935af241)', async () => {
+    const inklingWorld = (named: boolean, marked: boolean) =>
+      makeFakeSupabase({
+        agent_identities: [
+          ...identities(),
+          {
+            id: 'sb-ink',
+            agent_id: 'kindle-1',
+            user_id: 'user-a',
+            workspace_id: 'ws-a',
+            name: named ? 'Pip' : 'unnamed inkling',
+            metadata: { client: 'inkling-mobile', named },
+          },
+        ],
+        inbox_threads: [
+          {
+            id: 'thread-ink',
+            workspace_id: 'ws-a',
+            metadata: marked ? { inklingConversation: true } : {},
+          },
+        ],
+      });
+    const ask = (named: boolean, marked = true) =>
+      resolveFailureNoticeAddress(inklingWorld(named, marked) as never, {
+        threadId: 'thread-ink',
+        toSbId: 'sb-ink',
+      });
+    expect(await ask(true)).toMatchObject({
+      inklingConversation: true,
+      targetInkling: { displayName: 'Pip' },
+    });
+    expect((await ask(false)).targetInkling).toEqual({ displayName: null });
+    expect((await ask(true, false)).inklingConversation).toBeUndefined();
+    // Another SB is no inkling.
+    expect(
+      (
+        await resolveFailureNoticeAddress(world() as never, {
+          threadId: 'thread-a',
+          toSbId: 'sb-b',
+        })
+      ).targetInkling
+    ).toBeUndefined();
+  });
 });
