@@ -21,7 +21,7 @@
 import { webcrypto } from 'crypto';
 import { constants as fsConstants } from 'fs';
 import { chmod, lstat, mkdir, open, rename, rmdir, unlink } from 'fs/promises';
-import { join, relative, sep } from 'path';
+import { isAbsolute, join, relative, sep } from 'path';
 import { readContainedFile } from '../../channels/agent-media.js';
 import { MAX_UPLOAD_BYTES } from './sniff.js';
 import {
@@ -265,6 +265,11 @@ async function ensureRealDirs(rootReal: string, segments: readonly string[]): Pr
   let current = rootReal;
   for (const segment of segments) {
     current = join(current, segment);
+    // Every caller passes canonical ids, checked by uploadSegments; this keeps
+    // the same promise where the path is used, in the form CodeQL reads as a
+    // containment check (alerts #103 and #104 on #772).
+    const below = relative(rootReal, current);
+    if (below === '' || below.startsWith('..') || isAbsolute(below)) return false;
     try {
       await mkdir(current, { mode: 0o700 });
     } catch (error) {

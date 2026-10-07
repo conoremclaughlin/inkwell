@@ -125,7 +125,11 @@ export async function postUpload(
     return;
   }
 
-  const bytes = Buffer.isBuffer(req.body) ? req.body : null;
+  // The server's own copy, so everything below checks, stores and counts a
+  // Buffer this code made rather than a value the request handed over.
+  // isBuffer already rules out a string or an array; CodeQL's type-confusion
+  // analysis does not treat it as a guard (alerts #105 to #111 on #772).
+  const bytes = Buffer.isBuffer(req.body) ? Buffer.from(req.body) : null;
   if (!bytes) {
     res.status(400).json({ error: 'Send the file as the request body' });
     return;
