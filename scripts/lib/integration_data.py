@@ -65,6 +65,7 @@ WINDOWED_FIXTURE_TABLES = (
     ("20261004095944", "", ("thread_message_reactions",)),
     ("20261005042648", "", ("launched_processes",)),
     ("20261005081500", "", ("account_deletion_requests",)),
+    ("20261006214500", "", ("workspace_invitation_redemptions", "workspace_invitations")),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
