@@ -101,7 +101,11 @@ import {
   type InklingScope,
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
-import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import {
+  INKLING_CONVERSATION_MARK,
+  InklingThreadRefusedError,
+} from '../services/inklings/inkling-thread-gate';
+import { FAILURE_NOTICE_ERROR_KEYS } from '../services/trigger-failure-notice';
 import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
@@ -8362,6 +8366,34 @@ const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
  * was drawn from (the whole thread, or everything older than the cursor),
  * so `meta.truncated` always means "there is more, further back".
  */
+/** What a trigger-failure notice from before its inkling wording says to a person. */
+export const LEGACY_INKLING_FAILURE_TEXT = "Your inkling couldn't answer a message.";
+
+/**
+ * A message as a reader receives it. In an inkling's conversation a system
+ * message never carries error text (task 935af241, Myra): its error keys are
+ * dropped, and a trigger-failure notice written before its inkling wording
+ * existed, whose body is the developer line, is shown in plain words as a
+ * status line (Lumen, #771). Every other message is served as stored.
+ */
+function messageForReader(
+  message: { sender_kind: string; content: string; metadata: unknown },
+  threadMetadata: unknown
+): { content: string; metadata: Record<string, unknown> | null } {
+  const metadata = (message.metadata as Record<string, unknown> | null) ?? null;
+  const inklingConversation =
+    (threadMetadata as Record<string, unknown> | null)?.[INKLING_CONVERSATION_MARK] === true;
+  if (!metadata || !inklingConversation || message.sender_kind !== 'system') {
+    return { content: message.content, metadata };
+  }
+  const shown = { ...metadata };
+  for (const key of FAILURE_NOTICE_ERROR_KEYS) delete shown[key];
+  if (shown.triggerFailure === true && shown.inklingNotice !== true) {
+    return { content: LEGACY_INKLING_FAILURE_TEXT, metadata: { ...shown, inklingNotice: true } };
+  }
+  return { content: message.content, metadata: shown };
+}
+
 router.get('/threads/messages', async (req: Request, res: Response) => {
   try {
     const key = typeof req.query.key === 'string' ? req.query.key : '';
@@ -8384,7 +8416,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select(
-        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at'
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at, metadata'
       )
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
@@ -8528,10 +8560,9 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           senderName: senderName(m),
           isOwn:
             m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
-          content: m.content,
+          ...messageForReader(m, thread.metadata),
           messageType: m.message_type,
           priority: m.priority,
-          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
           ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))

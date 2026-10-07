@@ -15,6 +15,8 @@
 
 import { logger } from '../utils/logger';
 import { isWorkspaceMember } from './principals';
+import { INKLING_CLIENT } from './inklings/inkling-service';
+import { INKLING_CONVERSATION_MARK } from './inklings/inkling-thread-gate';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Client = { from: (table: string) => any };
@@ -140,6 +142,15 @@ export interface FailureNoticeAddress {
    * identity is unknown; the thread lane is then the only lane.
    */
   senderOwnerUserId?: string;
+  /** The thread is an inkling's conversation: marked so on its row. */
+  inklingConversation?: boolean;
+  /**
+   * The thread's row could not be read, so whether it is an inkling's
+   * conversation is unknown. A notice treats that as one that might be.
+   */
+  threadUnreadable?: boolean;
+  /** The failed target, when it is an inkling: its chosen name, or null while unnamed. */
+  targetInkling?: { displayName: string | null };
 }
 
 /**
@@ -171,20 +182,30 @@ export async function resolveFailureNoticeAddress(
   }
   if (threadId) {
     out.threadId = threadId;
-    const { data: thread } = await client
+    const { data: thread, error: threadError } = await client
       .from('inbox_threads')
-      .select('workspace_id')
+      .select('workspace_id, metadata')
       .eq('id', threadId)
       .single();
+    if (threadError || !thread) out.threadUnreadable = true;
     out.threadWorkspaceId = (thread?.workspace_id as string | undefined) ?? undefined;
+    const threadMetadata = thread?.metadata as Record<string, unknown> | null | undefined;
+    if (threadMetadata?.[INKLING_CONVERSATION_MARK] === true) out.inklingConversation = true;
   }
   if (payload.toSbId) {
     const { data: target } = await client
       .from('agent_identities')
-      .select('user_id')
+      .select('user_id, name, metadata')
       .eq('id', payload.toSbId)
       .maybeSingle();
     out.targetOwnerUserId = (target?.user_id as string | undefined) ?? undefined;
+    const metadata = target?.metadata as Record<string, unknown> | null | undefined;
+    if (metadata?.client === INKLING_CLIENT) {
+      out.targetInkling = {
+        displayName:
+          metadata.named === true && typeof target?.name === 'string' ? target.name : null,
+      };
+    }
   }
   if (payload.fromSbId) {
     const { data: sender } = await client

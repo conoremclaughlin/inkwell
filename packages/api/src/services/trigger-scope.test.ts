@@ -177,4 +177,71 @@ describe('resolveFailureNoticeAddress', () => {
     });
     expect(address.senderOwnerUserId).toBeUndefined();
   });
+
+  it('names an inkling target and its conversation, by its chosen name or none (task 935af241)', async () => {
+    const inklingWorld = (named: boolean, marked: boolean) =>
+      makeFakeSupabase({
+        agent_identities: [
+          ...identities(),
+          {
+            id: 'sb-ink',
+            agent_id: 'kindle-1',
+            user_id: 'user-a',
+            workspace_id: 'ws-a',
+            name: named ? 'Pip' : 'unnamed inkling',
+            metadata: { client: 'inkling-mobile', named },
+          },
+        ],
+        inbox_threads: [
+          {
+            id: 'thread-ink',
+            workspace_id: 'ws-a',
+            metadata: marked ? { inklingConversation: true } : {},
+          },
+        ],
+      });
+    const ask = (named: boolean, marked = true) =>
+      resolveFailureNoticeAddress(inklingWorld(named, marked) as never, {
+        threadId: 'thread-ink',
+        toSbId: 'sb-ink',
+      });
+    expect(await ask(true)).toMatchObject({
+      inklingConversation: true,
+      targetInkling: { displayName: 'Pip' },
+    });
+    expect((await ask(false)).targetInkling).toEqual({ displayName: null });
+    expect((await ask(true, false)).inklingConversation).toBeUndefined();
+    // A thread that can't be read is said so, never read as unmarked.
+    const failing = inklingWorld(true, true);
+    const from = failing.from.bind(failing);
+    failing.from = ((table: string) => {
+      const q = from(table);
+      if (table !== 'inbox_threads') return q;
+      return {
+        ...q,
+        select: () => {
+          const chain = q.select('*');
+          chain.single = (() =>
+            Promise.resolve({ data: null, error: { message: 'down' } })) as never;
+          return chain;
+        },
+      };
+    }) as never;
+    const unread = await resolveFailureNoticeAddress(failing as never, {
+      threadId: 'thread-ink',
+      toSbId: 'sb-ink',
+    });
+    expect(unread).toMatchObject({ threadUnreadable: true });
+    expect(unread.inklingConversation).toBeUndefined();
+    expect((await ask(true)).threadUnreadable).toBeUndefined();
+    // Another SB is no inkling.
+    expect(
+      (
+        await resolveFailureNoticeAddress(world() as never, {
+          threadId: 'thread-a',
+          toSbId: 'sb-b',
+        })
+      ).targetInkling
+    ).toBeUndefined();
+  });
 });

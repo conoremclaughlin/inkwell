@@ -21,6 +21,14 @@ import { logger } from '../utils/logger';
 // accept the loose client shape the trigger handler already uses.
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/**
+ * The failure-notice metadata keys that carry error text. They stay in the
+ * server log and the inkmail failure entry; an inkling conversation's notice
+ * never carries them, and the admin route drops them from one written before
+ * this did.
+ */
+export const FAILURE_NOTICE_ERROR_KEYS = ['errorSummary', 'errorDetail'] as const;
+
 export interface TriggerFailureNotice {
   /**
    * Owner of the inbox the legacy lane may write to — the sender's. Without
