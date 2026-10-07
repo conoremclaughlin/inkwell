@@ -1,7 +1,11 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
+import {
+  createSupabaseClient,
+  MemoryRepository,
+  resolveBenchmarkOwner,
+} from '@inklabs/api/benchmarks';
 import {
   buildRepresentationKey,
   parseBenchmarkPhase,
@@ -336,6 +340,7 @@ async function main() {
 
   const supabase = createSupabaseClient();
   const repo = new MemoryRepository(supabase);
+  const benchmarkOwner = await resolveBenchmarkOwner(supabase, userId, BENCHMARK_AGENT_ID);
   const createdMemoryIds: string[] = [];
 
   const caseTargets: Record<string, string[]> = {};
@@ -418,7 +423,8 @@ async function main() {
           () =>
             repo.remember({
               userId,
-              sbSlug: BENCHMARK_AGENT_ID,
+              sbSlug: benchmarkOwner.sbSlug,
+              sbId: benchmarkOwner.sbId,
               content: targetDocuments[i],
               summary:
                 targetDocuments.length > 1
@@ -440,7 +446,8 @@ async function main() {
         const distractor = await withRetries(`remember distractor ${benchCase.id} #${i + 1}`, () =>
           repo.remember({
             userId,
-            sbSlug: BENCHMARK_AGENT_ID,
+            sbSlug: benchmarkOwner.sbSlug,
+            sbId: benchmarkOwner.sbId,
             content: benchCase.distractors[i],
             summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
             source: 'observation',
@@ -536,7 +543,7 @@ async function main() {
               mode,
               variant,
               limit: TOP_K,
-              sbSlug: BENCHMARK_AGENT_ID,
+              owner: benchmarkOwner,
               topics: caseTopics[benchCase.id],
             })
           )

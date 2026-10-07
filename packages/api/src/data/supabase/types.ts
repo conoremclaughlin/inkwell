@@ -2382,6 +2382,7 @@ export type Database = {
       };
       memory_history: {
         Row: {
+          agent_id: string | null;
           archived_at: string | null;
           change_type: string;
           contact_id: string | null;
@@ -2391,6 +2392,7 @@ export type Database = {
           memory_id: string;
           metadata: Json | null;
           salience: string;
+          sb_id: string | null;
           source: string;
           summary: string | null;
           topic_key: string | null;
@@ -2399,6 +2401,7 @@ export type Database = {
           version: number;
         };
         Insert: {
+          agent_id?: string | null;
           archived_at?: string | null;
           change_type?: string;
           contact_id?: string | null;
@@ -2408,6 +2411,7 @@ export type Database = {
           memory_id: string;
           metadata?: Json | null;
           salience: string;
+          sb_id?: string | null;
           source: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -2416,6 +2420,7 @@ export type Database = {
           version?: number;
         };
         Update: {
+          agent_id?: string | null;
           archived_at?: string | null;
           change_type?: string;
           contact_id?: string | null;
@@ -2425,6 +2430,7 @@ export type Database = {
           memory_id?: string;
           metadata?: Json | null;
           salience?: string;
+          sb_id?: string | null;
           source?: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -5845,6 +5851,7 @@ export type Database = {
           p_include_expired?: boolean;
           p_include_shared?: boolean;
           p_salience?: string;
+          p_sb_id?: string;
           p_source?: string;
           p_topics?: string[];
           p_user_id?: string;
@@ -5878,6 +5885,7 @@ export type Database = {
           p_include_expired?: boolean;
           p_include_shared?: boolean;
           p_salience?: string;
+          p_sb_id?: string;
           p_source?: string;
           p_topics?: string[];
           p_user_id?: string;

@@ -467,6 +467,8 @@ export interface ToolCall {
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
+  /** The canonical identity (agent_identities.id). */
+  sbId?: string;
   sbSlug: string;
   name: string;
   /**

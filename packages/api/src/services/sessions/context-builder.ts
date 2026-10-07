@@ -21,6 +21,7 @@ import { MemoryRepository } from '../../data/repositories/memory-repository.js';
 import { buildKnowledgeSummary } from '../memory/knowledge-summary.js';
 import type { Memory } from '../../data/models/memory.js';
 import { logger } from '../../utils/logger.js';
+import { resolveSbIdResult } from '../../auth/resolve-identity.js';
 import { isUnnamed } from '../identity-name.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
@@ -39,6 +40,7 @@ export function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
   // Keyed off the stored flag, never off the placeholder text.
   const unnamed = isUnnamed(row);
   return {
+    sbId: row.id,
     sbSlug: row.agent_id,
     name: row.name,
     ...(unnamed ? { unnamed: true } : {}),
@@ -153,11 +155,18 @@ export class ContextBuilder implements IContextBuilder {
     // Fetch all required data in parallel
     // The identity resolves first because it names the workspace whose
     // constitution this session should read. Everything else runs alongside it.
+    // Memories are read for the session's canonical owner, which waits on
+    // the identity read (remove-shared-memories §3.3).
+    const identityRead = this.getAgentIdentity(userId, sbSlug, session.sbId);
     const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      this.getAgentIdentity(userId, sbSlug, session.sbId),
+      identityRead,
       this.getUser(userId),
       this.getContacts(userId),
-      this.getKnowledgeMemories(userId, sbSlug, session),
+      identityRead
+        .then((identity) => this.memoryOwnerId(userId, sbSlug, session, identity))
+        .then((ownerId) =>
+          ownerId ? this.getKnowledgeMemories(userId, sbSlug, ownerId, session) : []
+        ),
       this.getActiveProjects(userId),
     ]);
 
@@ -281,6 +290,42 @@ export class ContextBuilder implements IContextBuilder {
     };
   }
 
+  /**
+   * The canonical owner whose memories this session sees: the session's own,
+   * never a guess. getAgentIdentity may fall back to a slug lookup and pick
+   * one of several same-slug identities, which serves for prompt text but
+   * would hand a peer's memories to this session (Lumen, #764 review). So:
+   * - a session with an sbId gets that id, and only when it names this
+   *   user's identity by that slug; a miss gets no memories, never the
+   *   fallback's row;
+   * - a session without one gets its slug resolved to exactly one identity,
+   *   and an ambiguous or unreadable slug gets no memories.
+   */
+  private async memoryOwnerId(
+    userId: string,
+    sbSlug: string,
+    session: Session,
+    identity: AgentIdentity | null
+  ): Promise<string | null> {
+    if (session.sbId) {
+      if (identity?.sbId === session.sbId) return session.sbId;
+      logger.warn('Session sbId names no identity; reading no memories for it', {
+        userId,
+        sbSlug,
+        sbId: session.sbId,
+      });
+      return null;
+    }
+    const resolved = await resolveSbIdResult(this.supabase, userId, sbSlug);
+    if (resolved.ok) return resolved.sbId;
+    logger.warn('Session owner is not one identity; reading no memories for it', {
+      userId,
+      sbSlug,
+      reason: resolved.reason,
+    });
+    return null;
+  }
+
   private async getAgentIdentity(
     userId: string,
     sbSlug: string,
@@ -391,12 +436,13 @@ export class ContextBuilder implements IContextBuilder {
   private async getKnowledgeMemories(
     userId: string,
     sbSlug: string,
+    sbId: string,
     session: Session
   ): Promise<Memory[]> {
     try {
       return await this.memories.getKnowledgeMemories(
         userId,
-        sbSlug,
+        { sbSlug, sbId },
         HIGH_MEMORY_LIMIT,
         HIGH_MEMORY_WINDOW_DAYS,
         { threadKey: session.threadKey, focusText: session.taskDescription },

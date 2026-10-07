@@ -259,6 +259,8 @@ describe('ContextBuilder.buildContext — memory selection', () => {
     return {
       user_id: USER_ID,
       agent_id: 'aster',
+      // The identity below: memories are read by canonical owner.
+      sb_id: 'sb-1',
       content: `content-${over.id}`,
       source: 'observation',
       topics: [],

@@ -43,6 +43,15 @@ vi.mock('../../auth/enforce-identity', () => ({
   getEffectiveSlug: vi.fn().mockReturnValue('wren'),
 }));
 
+// The memory owner a completing SB resolves to (remove-shared-memories §3.2).
+vi.mock('./memory-owner', () => ({
+  resolveMemoryOwner: vi.fn().mockResolvedValue({
+    ok: true,
+    owner: { sbSlug: 'wren', sbId: 'sb-wren' },
+    agentBound: true,
+  }),
+}));
+
 // Mock logger
 vi.mock('../../utils/logger', () => ({
   logger: {
@@ -159,6 +168,7 @@ function createMockDataComposer() {
 
 // Import the mock so we can manipulate resolveUser per-test
 import { resolveUser } from '../../services/user-resolver';
+import { resolveMemoryOwner } from './memory-owner';
 
 const resolveUserMock = vi.mocked(resolveUser);
 
@@ -1008,8 +1018,34 @@ describe('handleCompleteTask', () => {
       salience: 'high', // critical priority maps to 'high'
       topics: ['task:task-1', 'backend', 'api', 'project:proj-1'],
       sbSlug: 'wren',
+      sbId: 'sb-wren',
       metadata: { taskId: 'task-1', autoCreated: true },
     });
+  });
+
+  it('completes the task and writes no memory when no SB is behind the call', async () => {
+    // It used to write the completion as an ownerless, shared memory.
+    vi.mocked(resolveMemoryOwner).mockResolvedValueOnce({ ok: false, error: 'no identity' });
+    dc.repositories.tasks.findById.mockResolvedValue({
+      id: 'task-1',
+      user_id: 'user-123',
+      title: 'Build feature',
+      status: 'in_progress',
+    });
+    dc.repositories.tasks.completeTask.mockResolvedValue({
+      id: 'task-1',
+      title: 'Build feature',
+      status: 'completed',
+      priority: 'medium',
+      tags: [],
+      completed_at: '2026-03-10T15:00:00Z',
+    });
+
+    const result = await handleCompleteTask({ userId: 'user-123', taskId: 'task-1' }, dc as any);
+
+    expect(dc.repositories.tasks.completeTask).toHaveBeenCalledWith('task-1');
+    expect(dc.repositories.memory.remember).not.toHaveBeenCalled();
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
   });
 
   it('should set salience to medium for low/medium priority tasks', async () => {

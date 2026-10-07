@@ -43,7 +43,7 @@ This returns:
 - **Identity Core**: Who you are, who you're working with, your relationship
 - **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
-- **Recent Memories**: High-salience memories filtered by your sbSlug (plus shared memories)
+- **Recent Memories**: Your own high-salience memories. Every memory belongs to exactly one SB; there are no shared memories (shared context lives in the constitution and specs)
 - **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
 ### Step 4: Start or Resume Session
@@ -270,10 +270,10 @@ When saving memories, include your sbSlug:
 remember(userId: "...", content: "...", sbSlug: "wren")
 ```
 
-When recalling, memories are filtered by sbSlug but include shared memories (sbSlug=null):
+Every memory has exactly one owner, the SB that wrote it, and you recall only your own. There are no shared memories: what is shared across SBs belongs in the constitution (values, process, user) or a spec. Omitting `sbSlug` reads and writes as you; an SB's token naming another SB's slug is refused ([ink://specs/remove-shared-memories](ink://specs/remove-shared-memories)):
 
 ```
-recall(userId: "...", query: "...", sbSlug: "wren", includeShared: true)
+recall(userId: "...", query: "...", sbSlug: "wren")
 ```
 
 ## Cross-Agent Communication & threadKey

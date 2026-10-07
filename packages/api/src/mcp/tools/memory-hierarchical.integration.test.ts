@@ -16,17 +16,24 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
 import { buildKnowledgeSummary } from './memory-handlers';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 
 describe('Hierarchical Memory Integration', () => {
   let dataComposer: DataComposer;
   let testUserId: string;
+  // Every memory has an owner (ink://specs/remove-shared-memories), so the
+  // suite writes and reads as an identity of its own.
+  let owner: { sbSlug: string; sbId: string };
   const createdMemoryIds: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     testUserId = fixture.userId;
+    owner = {
+      sbSlug: 'integration-test',
+      sbId: await ensureSuiteIdentity(dataComposer, fixture, 'integration-test'),
+    };
   });
 
   afterAll(async () => {
@@ -169,7 +176,7 @@ describe('Hierarchical Memory Integration', () => {
     it('should return critical and high salience memories', async () => {
       const memories = await dataComposer.repositories.memory.getKnowledgeMemories(
         testUserId,
-        'integration-test'
+        owner
       );
 
       const ids = memories.map((m) => m.id);
@@ -182,7 +189,7 @@ describe('Hierarchical Memory Integration', () => {
     it('should return critical memories before high memories', async () => {
       const memories = await dataComposer.repositories.memory.getKnowledgeMemories(
         testUserId,
-        'integration-test'
+        owner
       );
 
       const criticalIdx = memories.findIndex((m) => m.id === criticalMemId);
@@ -195,7 +202,7 @@ describe('Hierarchical Memory Integration', () => {
     it('should include summary and topicKey in results', async () => {
       const memories = await dataComposer.repositories.memory.getKnowledgeMemories(
         testUserId,
-        'integration-test'
+        owner
       );
 
       const critical = memories.find((m) => m.id === criticalMemId);
@@ -213,7 +220,7 @@ describe('Hierarchical Memory Integration', () => {
     it('should produce grouped summary from getKnowledgeMemories output', async () => {
       const memories = await dataComposer.repositories.memory.getKnowledgeMemories(
         testUserId,
-        'integration-test'
+        owner
       );
 
       const result = buildKnowledgeSummary(memories);
