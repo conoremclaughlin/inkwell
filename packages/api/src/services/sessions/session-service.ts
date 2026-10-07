@@ -48,6 +48,8 @@ import {
   admitStateWrite,
 } from './active-runs.js';
 import { launchHoldFor, reserveLaunch } from './launched-processes.js';
+import { uploadMediaForRunner } from '../uploads/runner-media.js';
+import { uploadsRoot } from '../uploads/runtime.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -3063,9 +3065,33 @@ export class SessionService implements ISessionService {
             }),
           };
 
+    // A person's uploads reach a runner only as it declares (IRunner.uploadMedia):
+    // granted per spawn, or dropped here with a line the turn sees. A dropped
+    // upload's path stays out of the prompt as well: the message is formatted
+    // again from the media that remain, so everything else in it is unchanged.
+    const uploads = uploadMediaForRunner({
+      attachments: mediaAttachments,
+      root: uploadsRoot(),
+      policy: runner.uploadMedia,
+      sandboxed: !!runnerConfig.container,
+    });
+    const runMessage =
+      uploads.dropped.length === 0
+        ? formattedMessage
+        : `${this.formatMessage(
+            {
+              ...request,
+              metadata: {
+                ...request.metadata,
+                media: request.metadata?.media?.filter((m) => !uploads.dropped.includes(m)),
+              },
+            },
+            injectedContext.user.timezone
+          )}\n\n${uploads.note}`;
+
     try {
       result = await turnRunner
-        .run(formattedMessage, {
+        .run(runMessage, {
           backendSessionId: session.backendSessionId || undefined,
           // Always handed over, including on resume. Every runner already gates
           // its own injection on `!isResume`, so this does not change what a
@@ -3085,7 +3111,7 @@ export class SessionService implements ISessionService {
             ...(launch ? { launchEnv: launch.env } : {}),
             onSpawned: (spawned) => launch?.spawned(spawned),
           },
-          mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+          mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
         })
         .then((ran) => {
           // A stop the runner could not confirm leaves its row open, for the

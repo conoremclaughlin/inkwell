@@ -11,6 +11,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
 import { connectorsRouter } from './admin-connectors';
+import { threadUploadsRouter } from './thread-uploads';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
@@ -124,6 +125,13 @@ import {
   recordDelivery,
   wakeRequestOf,
 } from '../services/send-receipt';
+import { canonicalManifest } from '../services/uploads/claims';
+import {
+  claimUploadsForSend,
+  confirmUploadsForSend,
+  sendKeyHasClaims,
+} from '../services/uploads/send';
+import { uploadsRetentionMs, uploadsRoot } from '../services/uploads/runtime';
 import { ThreadKeyTakenError } from '../mcp/tools/thread-key-taken';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
@@ -8940,7 +8948,8 @@ router.post('/threads', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads/reply
- * Body: { key, content, priority?, clientMessageId?: uuid, wake?: string[] }
+ * Body: { key, content, priority?, clientMessageId?: uuid, wake?: string[],
+ *         uploads?: string[] }
  *   → { success, messageId, threadId, triggered, warning, threadKeyWarning,
  *       delivery, replayed }
  *
@@ -8950,6 +8959,13 @@ router.post('/threads', async (req: Request, res: Response) => {
  * messageId and replayed: true, and wakes nobody; the same id with other
  * words, or naming other members in `wake`, is a 409. `delivery` comes from positive evidence only (see
  * services/send-receipt.ts and POST /threads above).
+ *
+ * `uploads` attaches 1 to 4 files the person uploaded to this thread
+ * (routes/thread-uploads.ts) and needs a clientMessageId: the send claims
+ * them as one set before its message is stored (services/uploads/send.ts),
+ * so an upload can belong to one message only. A retry naming other uploads
+ * is a 409, like other words; an upload that can no longer be sent is a 409
+ * with code `uploads_unavailable`.
  *
  * A human reply into an existing thread — the dashboard and mobile analogue of
  * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
@@ -8988,6 +9004,28 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
     if (!clientMessageId.ok) {
       res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
+    const rawUploads = req.body?.uploads;
+    const uploads =
+      rawUploads === undefined ||
+      rawUploads === null ||
+      (Array.isArray(rawUploads) && rawUploads.length === 0)
+        ? null
+        : canonicalManifest(rawUploads);
+    if (uploads && !uploads.ok) {
+      res.status(400).json({
+        error: 'uploads must list 1 to 4 different upload ids',
+        code: 'uploads_invalid',
+      });
+      return;
+    }
+    const uploadIds = uploads?.ok ? uploads.ids : undefined;
+    if (uploadIds && !clientMessageId.value) {
+      res.status(400).json({
+        error: 'clientMessageId is required when sending uploads',
+        code: 'uploads_need_client_message_id',
+      });
       return;
     }
 
@@ -9029,6 +9067,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
         content,
         // Checked before the members are read, so held to the request as sent.
         wake: wakeRequestOf(req.body?.wake),
+        uploads: uploadIds,
       });
       if (lookup.kind === 'conflict') {
         res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
@@ -9067,6 +9106,40 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!uploadIds && clientMessageId.value) {
+      // A send key whose uploads were claimed, by a send that then stored
+      // nothing, still belongs to that send: one naming no uploads is another.
+      if (await sendKeyHasClaims(supabase, thread.id, clientMessageId.value)) {
+        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
+        return;
+      }
+    }
+    if (uploadIds && clientMessageId.value) {
+      // Claimed before the message is stored, so a message can only ever
+      // name uploads its own send holds. A send that never stores leaves its
+      // claims for the reconciler to hold, never to release.
+      const claimed = await claimUploadsForSend(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        userId: authReq.inkUserId,
+        workspaceId: authReq.inkWorkspaceId,
+        content,
+        uploadIds,
+        createdAt: new Date().toISOString(),
+      });
+      if (!claimed.ok) {
+        res.status(409).json(
+          claimed.reason === 'conflict'
+            ? { error: CLIENT_MESSAGE_CONFLICT }
+            : {
+                error: 'An attached file can no longer be sent; attach it again',
+                code: 'uploads_unavailable',
+              }
+        );
+        return;
+      }
+    }
+
     let result: Awaited<ReturnType<typeof handleSendToInbox>>;
     try {
       result = await handleSendToInbox(
@@ -9087,6 +9160,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
                   pcp: { wake: wakeRequestOf(replyWake.wake) },
                 }
               : {}),
+            ...(uploadIds ? { media: uploadIds.map((upload) => ({ upload })) } : {}),
           },
         },
         dataComposer,
@@ -9127,6 +9201,14 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     if (clientMessageId.value) {
       await recordDelivery(supabase, String(parsed.messageId), delivery);
     }
+    if (uploadIds && clientMessageId.value) {
+      await confirmUploadsForSend(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        uploadIds,
+        messageId: String(parsed.messageId),
+      });
+    }
 
     res.json({
       // The handler folds trigger-routing outcomes into its own `success`,
@@ -9150,6 +9232,21 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to send reply', error));
   }
 });
+
+// Photos and documents a person sends into a thread (routes/thread-uploads.ts).
+// Mounted here, after THREAD_WRITE_ROLES, which it shares with the reply above.
+router.use(
+  '/threads/uploads',
+  threadUploadsRouter({
+    db: () =>
+      createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      }),
+    root: uploadsRoot,
+    writeRoles: THREAD_WRITE_ROLES,
+    retentionMs: uploadsRetentionMs(),
+  })
+);
 
 /**
  * POST /api/admin/threads/reactions
@@ -9550,7 +9647,7 @@ function getWorkspaceRoot(): Promise<string> {
  * including anything a crafted evidence row points at — resolves to null
  * and 404s without confirming existence.
  */
-async function evidenceMediaRoots(): Promise<string[]> {
+export async function evidenceMediaRoots(): Promise<string[]> {
   const workspaceRoot = await getWorkspaceRoot();
   return [
     path.join(os.homedir(), '.ink', 'files'),
