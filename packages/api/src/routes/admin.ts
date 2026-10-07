@@ -10,6 +10,8 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
+import { connectorsRouter } from './admin-connectors';
+import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
@@ -1790,6 +1792,9 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
+
+// The app's view of its Google connection (routes/admin-connectors.ts).
+router.use('/connectors', connectorsRouter);
 
 /**
  * Where a phone could reach this server, in the order it should try them.
@@ -4960,16 +4965,8 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
 // Connected Accounts (OAuth)
 // =============================================================================
 
-// In-memory store for OAuth state (in production, use Redis or similar)
-const oauthStateStore = new Map<
-  string,
-  {
-    userId: string;
-    workspaceId: string;
-    provider: string;
-    expiresAt: number;
-  }
->();
+// OAuth state lives in services/oauth-attempts.ts, shared with the app's
+// Connectors routes (routes/admin-connectors.ts).
 
 /**
  * GET /api/admin/connected-accounts
@@ -5063,20 +5060,9 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
 
-    // Build redirect URI
-    // OAUTH_REDIRECT_BASE_URL can be either:
-    // - Just the origin (e.g., http://localhost:3001) - path will be appended
-    // - Full redirect URI (e.g., http://localhost:3001/api/admin/oauth/google/callback) - used as-is
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      // If the configured URL has a path (not just origin), use it as-is
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    // One redirect URI for every flow (services/oauth-attempts.ts), so the
+    // authorize, upgrade and callback steps can't drift apart.
+    const redirectUri = oauthRedirectUri(provider);
 
     const authUrl = oauthService.getAuthorizationUrl(provider, redirectUri, state);
 
@@ -5096,11 +5082,26 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
   const { provider } = req.params;
   const { code, state, error: oauthError } = req.query;
 
-  const sendHtmlResponse = (result: OAuthCallbackResult) => {
+  // Set once the state is known: an app attempt is settled with the result,
+  // and its page offers the fixed way back to the app.
+  let appAttemptId: string | undefined;
+  const sendHtmlResponse = (result: OAuthCallbackResult, accountId: string | null = null) => {
+    // Only a consumed state for this provider sets appAttemptId, so an unknown
+    // or mismatched state settles nothing; a consumed one always settles, a
+    // malformed code included (as failed).
+    settleAttempt(
+      appAttemptId,
+      result === 'connected'
+        ? 'connected'
+        : result === 'denied' || result === 'expired'
+          ? result
+          : 'failed',
+      accountId
+    );
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.type('html').send(renderOAuthCallbackPage(result));
+    res.type('html').send(renderOAuthCallbackPage(result, { app: appAttemptId !== undefined }));
   };
 
   try {
@@ -5116,6 +5117,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       return;
     }
     oauthStateStore.delete(state);
+    appAttemptId = stateData.appAttemptId;
     if (Date.now() > stateData.expiresAt) {
       sendHtmlResponse('expired');
       return;
@@ -5131,15 +5133,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
 
     // Exchange code for tokens (redirect URI must match what was sent in auth request)
     const oauthService = getOAuthService();
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    const redirectUri = oauthRedirectUri(provider);
 
     const tokens = await oauthService.exchangeCode(provider, code, redirectUri);
 
@@ -5147,7 +5141,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
     const userInfo = await oauthService.getUserInfo(provider, tokens.accessToken);
 
     // Save connected account
-    await oauthService.saveConnectedAccount(
+    const saved = await oauthService.saveConnectedAccount(
       stateData.userId,
       provider,
       tokens,
@@ -5155,7 +5149,8 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       stateData.workspaceId
     );
 
-    sendHtmlResponse('connected');
+    // The row saved for this attempt, new or updated; only an app attempt reads it.
+    sendHtmlResponse('connected', (saved as { id?: string } | undefined)?.id ?? null);
   } catch (error) {
     logger.error('OAuth callback failed');
     sendHtmlResponse('failed');
@@ -5241,16 +5236,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
 
-    // Build redirect URI
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    const redirectUri = oauthRedirectUri(provider);
 
     // Get upgrade URL with login hint
     const authUrl = oauthService.getUpgradeScopesUrl(

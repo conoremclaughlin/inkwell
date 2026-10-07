@@ -118,6 +118,50 @@ describe('real caller args survive validation', () => {
     });
   });
 
+  it('start_session from the ink launcher resuming a transcript — claude.ts:3058, 3103', async () => {
+    // `backendSessionId` is the key the drifted inline schema refused. Every
+    // `ink -a` that resumed a transcript whose row had left the launcher's
+    // 40-row list failed both attempts and launched with an empty session id:
+    // inkmail off, and sends from the session woke nobody (task c7f4b79a).
+    await expectArgsAccepted('start_session', {
+      email: 'someone@example.test',
+      sbSlug: 'wren',
+      backend: 'claude',
+      forceNew: true,
+      sessionId: '00000000-0000-4000-8000-000000000000',
+      backendSessionId: 'abc123',
+    });
+    await expectArgsAccepted('start_session', {
+      email: 'someone@example.test',
+      sbSlug: 'wren',
+      studioId: 'main',
+      backend: 'claude',
+      forceNew: true,
+      backendSessionId: 'abc123',
+    });
+  });
+
+  it('start_session from the session-start hook — hooks.ts:2486', async () => {
+    await expectArgsAccepted('start_session', {
+      email: 'someone@example.test',
+      sbSlug: 'wren',
+      backend: 'claude-code',
+      studioId: 'main',
+      repoRoot: '/tmp/repo',
+    });
+  });
+
+  it('start_session from ink chat — chat.ts:4707', async () => {
+    await expectArgsAccepted('start_session', {
+      sbSlug: 'wren',
+      backend: 'ink',
+      metadata: { provider: 'claude' },
+      threadKey: 'pr:511',
+      studioId: 'main',
+      contactId: '00000000-0000-4000-8000-000000000001',
+    });
+  });
+
   it('remember from chat /eject — chat.ts:7162', async () => {
     await expectArgsAccepted('remember', {
       sbSlug: 'wren',
@@ -134,8 +178,10 @@ describe('the registered contract matches the one the handler enforces', () => {
     // The three breakages above all had the same root cause: index.ts
     // registered a hand-copied duplicate of a schema the handler parses with,
     // and the copy drifted. Registering the canonical object makes drift
-    // impossible; this asserts the three that had diverged stay converged.
-    const { rememberSchema, listSessionsSchema, updateSessionStateSchema } =
+    // impossible; this asserts the ones that had diverged stay converged.
+    // start_session was the fourth: it kept its copy, and when the handler
+    // learned backendSessionId the copy never did (task c7f4b79a).
+    const { rememberSchema, listSessionsSchema, updateSessionStateSchema, startSessionSchema } =
       await import('./memory-handlers');
 
     const captured = new Map<string, unknown>();
@@ -156,5 +202,6 @@ describe('the registered contract matches the one the handler enforces', () => {
     expect(keysOf(captured.get('remember'))).toEqual(keysOf(rememberSchema));
     expect(keysOf(captured.get('list_sessions'))).toEqual(keysOf(listSessionsSchema));
     expect(keysOf(captured.get('update_session_state'))).toEqual(keysOf(updateSessionStateSchema));
+    expect(keysOf(captured.get('start_session'))).toEqual(keysOf(startSessionSchema));
   });
 });

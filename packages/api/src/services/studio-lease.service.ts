@@ -1429,6 +1429,21 @@ export class StudioLeaseService {
   }
 
   /**
+   * The turn epochs stamped on the leases this session holds. A turn that
+   * carries several queued wakes runs under the one its members' routing
+   * actually left on the lease (spec trigger-pipe-in v7, 1.4).
+   */
+  async turnEpochsHeldBy(sessionId: string, userId: string): Promise<Set<string>> {
+    const epochs = new Set<string>();
+    // Strict: the caller decides on what the set does NOT hold, so a read
+    // that failed must not pass for a session with no stamped lease.
+    for (const row of await this.studiosHeldBy(sessionId, userId, { strict: true })) {
+      if (row.lease.turnEpoch !== undefined) epochs.add(row.lease.turnEpoch);
+    }
+    return epochs;
+  }
+
+  /**
    * Every studio this session currently holds a non-quarantine lease on.
    *
    * "One session holds at most one studio" is an invariant the service
@@ -1445,7 +1460,14 @@ export class StudioLeaseService {
    */
   private async studiosHeldBy(
     sessionId: string,
-    userId?: string
+    userId?: string,
+    opts: {
+      /**
+       * Throw when the read fails. PostgREST reports a failure as a resolved
+       * `{ data: null, error }`, which otherwise reads as holding nothing.
+       */
+      strict?: boolean;
+    } = {}
   ): Promise<
     Array<{
       id: string;
@@ -1462,7 +1484,10 @@ export class StudioLeaseService {
       .select('id, user_id, sb_id, lease, worktree_path, ephemeral, expires_at')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
-    const { data } = await query;
+    const { data, error } = await query;
+    if (error && opts.strict) {
+      throw new Error(`Could not read the studios session ${sessionId} holds: ${error.message}`);
+    }
     if (!data?.length) return [];
 
     const held = [];

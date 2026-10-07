@@ -27,6 +27,7 @@ import { isForbiddenInClone } from './clone-policy.js';
 import { initPiTools, isPiTool } from './pi-tools.js';
 import { isClientLocalTool } from './context-tools.js';
 import { COLLECT_AGENTS_TOOL, MAX_CLONES_PER_SPAWN, SPAWN_AGENT_TOOL } from './spawn-agent.js';
+import { VIEW_IMAGE_TOOL } from './view-image.js';
 import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /** Where a local tool runs, and which prompt block it belongs to. */
@@ -108,6 +109,25 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     group: 'coding',
     summary: 'List directory contents.',
     args: 'path (string, optional)',
+  },
+  {
+    name: VIEW_IMAGE_TOOL,
+    group: 'coding',
+    summary:
+      'Look at an image file (PNG, JPEG, GIF, WebP). The image is shown to you as an image, never as base64 text.',
+    args: 'path (string)',
+    note: 'Works under the working directory and under ~/.ink/files (downloaded attachments, SB screenshots). Large images are downscaled to 2000px on the long side; the result says so. The image costs roughly width x height / 750 tokens, shows in list_context, and evict_context removes it.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'The image file: absolute, relative to the working directory, or starting with ~/.',
+        },
+      },
+    },
   },
   {
     name: 'list_context',
@@ -366,6 +386,7 @@ export function isLocalRuntimeTool(name: string): boolean {
   return (
     isPiTool(bare) ||
     isClientLocalTool(bare) ||
+    bare === VIEW_IMAGE_TOOL ||
     bare === SPAWN_AGENT_TOOL ||
     bare === COLLECT_AGENTS_TOOL
   );

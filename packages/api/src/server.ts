@@ -1233,6 +1233,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // caller-supplied payload.metadata. The inkling gate reads this
         // message to learn who sent it (Lumen's review of 8b9d7f50).
         triggerThreadMessageId: payload.threadMessageId,
+        triggerInboxMessageId: payload.inboxMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1776,6 +1777,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       });
     }
 
+    // A wake that may share a turn with the wakes queued beside it (spec
+    // trigger-pipe-in v7, 1.1): it points at a stored message, and is neither
+    // a force-spawn nor a strategy wake, whose turns are their own by design.
+    // SessionService keeps out anything that changes the launch itself.
+    request.metadata!.wakeCoalescible =
+      Boolean(payload.threadMessageId || payload.inboxMessageId) &&
+      payload.forceSpawn !== true &&
+      payload.metadata?.strategyTrigger !== true;
+
     let result: SessionResult;
     try {
       result = await sessionService!.handleMessage(request);
@@ -1900,8 +1910,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       );
     }
 
-    await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
-    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`);
+    // A wake carried by another wake's turn was delivered by that turn.
+    await logInkmail('inkmail_deliver', payload, userId, {
+      deliveryMethod: result.wake ? 'coalesced' : 'spawn',
+    });
+    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`, {
+      ...(result.wake ? { coalescedInto: result.wake.coalescedInto } : {}),
+    });
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 

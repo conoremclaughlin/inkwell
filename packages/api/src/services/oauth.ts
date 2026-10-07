@@ -250,6 +250,10 @@ class OAuthService {
       state,
       access_type: 'offline', // Request refresh token
       prompt: 'consent', // Always show consent screen to get refresh token
+      // Keep what was granted before: a reconnect never quietly narrows a
+      // shared connection. The scopes stored are still only those the token
+      // response says were granted.
+      ...(provider === 'google' ? { include_granted_scopes: 'true' } : {}),
     });
 
     return `${config.authUrl}?${params.toString()}`;
@@ -945,13 +949,18 @@ class OAuthService {
   }
 
   /**
-   * Disconnect (revoke) a connected account
+   * Disconnect a connected account: ask the provider to revoke the grant, then
+   * delete Inkwell's row whatever it answered. `revoked` is true only when the
+   * provider confirmed the revocation (a 2xx), so a caller can say which of the
+   * two happened. The refresh token is revoked when there is one (revoking it
+   * ends the whole grant; an expired access token would just be refused), and
+   * it travels in the request body, never in the URL.
    */
   async disconnectAccount(
     accountId: string,
     userId: string,
     workspaceId?: string | null
-  ): Promise<void> {
+  ): Promise<{ revoked: boolean }> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
 
     // First get the account to revoke the token
@@ -973,16 +982,22 @@ class OAuthService {
       throw new Error('Account not found');
     }
 
-    // Try to revoke the token at the provider
+    // Ask the provider to revoke the grant. Its answer is reported, not
+    // assumed; the row is deleted either way below.
     const config = OAUTH_PROVIDERS[account.provider];
-    if (config?.revokeUrl && account.access_token) {
+    const token = account.refresh_token || account.access_token;
+    let revoked = false;
+    if (config?.revokeUrl && token) {
       try {
-        await fetch(`${config.revokeUrl}?token=${account.access_token}`, {
+        const response = await fetch(config.revokeUrl, {
           method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ token }).toString(),
         });
-      } catch (err) {
-        logger.warn(`Failed to revoke token at provider:`, err);
-        // Continue even if revocation fails
+        revoked = response.ok;
+        if (!revoked) logger.warn(`Provider did not revoke the token (HTTP ${response.status})`);
+      } catch {
+        logger.warn('Could not reach the provider to revoke the token');
       }
     }
 
@@ -1004,6 +1019,7 @@ class OAuthService {
     if (error) {
       throw new Error('Failed to disconnect account');
     }
+    return { revoked };
   }
 
   /**
