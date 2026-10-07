@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import {
+  applyLaunchProfile,
   applyProfile,
   formatProfileList,
   isValidProfileId,
@@ -8,6 +9,9 @@ import {
   type ToolProfileId,
 } from './tool-profiles.js';
 import { ToolPolicyState } from './tool-policy.js';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 function makePolicy(): ToolPolicyState {
   return new ToolPolicyState('backend', { persist: false });
@@ -16,7 +20,7 @@ function makePolicy(): ToolPolicyState {
 describe('tool-profiles', () => {
   describe('TOOL_PROFILES', () => {
     it('defines all expected profiles', () => {
-      expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full']);
+      expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full', 'inkling']);
     });
 
     it('each profile has required fields', () => {
@@ -278,5 +282,91 @@ describe('tool-profiles', () => {
       expect(output).toContain('safe (active)');
       expect(output).not.toContain('minimal (active)');
     });
+  });
+});
+
+describe('the inkling profile (task 0321ccf1)', () => {
+  // A policy file shaped like this machine's on 2026-10-07: the global scope
+  // permanently grants the shell and both comms tools to every agent.
+  function withMachineGrants(): { policy: ToolPolicyState; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'inkling-profile-'));
+    const policyPath = join(dir, 'tool-policy.json');
+    writeFileSync(
+      policyPath,
+      JSON.stringify({
+        version: 2,
+        scopes: {
+          global: {
+            mode: 'backend',
+            permanentGrants: ['bash', 'send_response', 'send_to_inbox'],
+          },
+        },
+      })
+    );
+    const policy = new ToolPolicyState('backend', { policyPath, persist: false });
+    policy.setContext({ sbSlug: 'kindle-0a1b2c3d' });
+    policy.setMutationScope('agent');
+    return { policy, dir };
+  }
+
+  it('denies the shell, file edits and writes, waking an agent and send_response, whatever is granted', () => {
+    const { policy, dir } = withMachineGrants();
+    try {
+      // The control: before the profile, the machine's grant opens the shell.
+      expect(policy.canCallInkTool('bash').allowed).toBe(true);
+      expect(applyProfile(policy, 'inkling').success).toBe(true);
+      for (const tool of ['bash', 'edit', 'write', 'trigger_agent', 'send_response']) {
+        const decision = policy.canCallInkTool(tool);
+        expect(decision.allowed, tool).toBe(false);
+        // Denied, not asked: nobody answers a prompt in an away turn.
+        expect(decision.promptable, tool).toBe(false);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps its reply, its reads and its other tools, with no narrowing allow list', () => {
+    const { policy, dir } = withMachineGrants();
+    try {
+      applyProfile(policy, 'inkling');
+      for (const tool of [
+        'send_to_inbox',
+        'read',
+        'grep',
+        'ls',
+        'recall',
+        'remember',
+        'list_emails',
+      ]) {
+        expect(policy.canCallInkTool(tool).allowed, tool).toBe(true);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a launch profile (task 0321ccf1)', () => {
+  it('applies a known profile, and refuses an unknown one without applying anything', () => {
+    const policy = makePolicy();
+    expect(applyLaunchProfile(policy, 'inkling')).toMatchObject({ ok: true });
+    expect(policy.canCallInkTool('bash').allowed).toBe(false);
+
+    const untouched = makePolicy();
+    const refused = applyLaunchProfile(untouched, 'inklnig');
+    expect(refused).toEqual({
+      ok: false,
+      message: 'Unknown profile: inklnig. Valid: minimal, safe, collaborative, full, inkling',
+    });
+    expect(untouched.canCallInkTool('bash').allowed).toBe(true);
+  });
+
+  it('stops the chat when it refuses: chat.ts exits rather than running unbounded', () => {
+    const source = readFileSync(join(__dirname, '../commands/chat.ts'), 'utf8');
+    const call = source.indexOf('applyLaunchProfile(toolPolicy, options.profile)');
+    expect(call).toBeGreaterThan(-1);
+    const refusal = source.slice(call, call + 400);
+    expect(refusal).toMatch(/if \(!launchProfile\.ok\) \{[^}]*process\.exit\(78\)/);
   });
 });

@@ -148,7 +148,12 @@ import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provide
 import { assessContextPressure } from '../repl/context-pressure.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
-import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
+import {
+  applyLaunchProfile,
+  applyProfile,
+  formatProfileList,
+  isValidProfileId,
+} from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
 import {
@@ -3743,21 +3748,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
   runtime.toolMode = toolPolicy.getMode();
 
-  // Apply --profile flag if provided
+  // Apply --profile flag if provided. A profile that can't be applied stops
+  // the chat: carrying on would run with whatever the policy file holds, and
+  // a server spawn names a profile precisely to bound its turn (task
+  // 0321ccf1). A typo at the terminal costs a rerun.
   if (options.profile) {
-    if (isValidProfileId(options.profile)) {
-      const profileResult = applyProfile(toolPolicy, options.profile);
-      if (profileResult.success) {
-        runtime.toolMode = toolPolicy.getMode();
-        console.log(chalk.green(profileResult.message));
-      }
-    } else {
-      console.log(
-        chalk.yellow(
-          `Unknown profile: ${options.profile}. Valid: minimal, safe, collaborative, full`
-        )
-      );
+    const launchProfile = applyLaunchProfile(toolPolicy, options.profile);
+    if (!launchProfile.ok) {
+      console.error(chalk.red(launchProfile.message));
+      process.exit(78); // EX_CONFIG
     }
+    runtime.toolMode = toolPolicy.getMode();
+    console.log(chalk.green(launchProfile.message));
   }
 
   // --session-candidates / --session-candidates-json: list what the session
@@ -10238,7 +10240,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
-      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
+      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full|inkling')
       .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--session-candidates', 'List attachable ink sessions and exit')

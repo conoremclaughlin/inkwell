@@ -7,7 +7,7 @@
 
 import type { ToolMode, ToolPolicyScopeRef, ToolPolicyState } from './tool-policy.js';
 
-export type ToolProfileId = 'minimal' | 'safe' | 'collaborative' | 'full';
+export type ToolProfileId = 'minimal' | 'safe' | 'collaborative' | 'full' | 'inkling';
 
 export interface ToolProfile {
   label: string;
@@ -60,6 +60,28 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
     promptSpecs: [],
     denySpecs: [],
   },
+  /**
+   * An inkling's own turn (task 0321ccf1). Denied outright, so no grant in
+   * the policy file can open them: the shell, which is the one local tool
+   * not confined to the working directory; file edits and writes; waking
+   * another agent; and send_response, which an inkling, answering in its
+   * conversation thread, never needs. Its reply, send_to_inbox, stays
+   * allowed, as do reads, which stay inside its own folder. The server
+   * also runs it against a policy file of its own, so the machine's grants
+   * are never read at all; these denials hold either way.
+   *
+   * No allow list: one would narrow every tool to the names on it.
+   */
+  inkling: {
+    label: 'Inkling',
+    description:
+      "An inkling's turn: no shell, no file edits or writes, never wakes another agent; it replies in its own conversation.",
+    mode: 'backend',
+    safeSpecs: ['group:ink-safe'],
+    allowSpecs: [],
+    promptSpecs: [],
+    denySpecs: ['group:write', 'trigger_agent', 'send_response'],
+  },
 };
 
 export const PROFILE_IDS = Object.keys(TOOL_PROFILES) as ToolProfileId[];
@@ -107,6 +129,25 @@ export function applyProfile(
     success: true,
     message: `Applied "${profile.label}" profile (${profile.description})`,
   };
+}
+
+/**
+ * The --profile a chat was launched with, applied, or the reason it can't
+ * be. The chat stops on a refusal: carrying on would run with whatever the
+ * policy file holds, and a server spawn names a profile precisely to bound
+ * its turn (task 0321ccf1).
+ */
+export function applyLaunchProfile(
+  policy: ToolPolicyState,
+  name: string
+): { ok: true; message: string } | { ok: false; message: string } {
+  if (!isValidProfileId(name)) {
+    return { ok: false, message: `Unknown profile: ${name}. Valid: ${PROFILE_IDS.join(', ')}` };
+  }
+  const applied = applyProfile(policy, name);
+  return applied.success
+    ? { ok: true, message: applied.message }
+    : { ok: false, message: applied.message };
 }
 
 /**

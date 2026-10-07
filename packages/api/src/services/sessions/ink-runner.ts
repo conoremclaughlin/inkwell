@@ -398,8 +398,11 @@ export class InkRunner implements IRunner {
     // Use the safe profile with away mode for non-interactive spawns.
     // Safe profile allows read tools freely but requires approval for
     // write/comms tools. Away mode routes approval prompts to the user's
-    // inbox (2FA) instead of auto-denying.
-    args.push('--profile', 'safe', '--away');
+    // inbox (2FA) instead of auto-denying. An inkling's turn runs the
+    // inkling profile instead, against its own policy file (task 0321ccf1):
+    // the shell, file writes, waking another agent and send_response are
+    // denied outright, and the machine's grants are never read.
+    args.push('--profile', config.inklingToolPolicyPath ? 'inkling' : 'safe', '--away');
 
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").
@@ -505,6 +508,10 @@ export class InkRunner implements IRunner {
       // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
       // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
       ...(config.inkAccessToken ? { INK_ACCESS_TOKEN: config.inkAccessToken } : {}),
+      // An inkling's own tool policy, never the machine's (task 0321ccf1).
+      ...(config.inklingToolPolicyPath
+        ? { INK_TOOL_POLICY_PATH: config.inklingToolPolicyPath }
+        : {}),
       // The run's own epoch. The chat's turn signal names it on every
       // lifecycle request; without it the chat claimed a fresh epoch at each
       // outer turn and this run's finalize matched zero rows.
