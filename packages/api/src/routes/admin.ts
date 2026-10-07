@@ -132,6 +132,19 @@ import {
   type ReminderSourceRow,
   type StrategyGroupSourceRow,
 } from '../services/automations/automation-shaper';
+import {
+  INVITE_ONLY,
+  emailInvitesHonoured,
+  invitationAttempts,
+  invitationDigest,
+  invitationStatus,
+  isInviteOnly,
+  newInvitationCode,
+  normalizeInvitationCode,
+  suffixedGroupSlug,
+  workspaceNameFrom,
+  type InvitationRow,
+} from '../services/workspace-invitations';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2083,6 +2096,9 @@ router.post('/workspaces', async (req: Request, res: Response) => {
 
     const rawType = req.body?.type;
     const workspaceType = rawType === 'team' ? 'team' : 'personal';
+    // A group that takes members only by invitation (limit B): set when it is
+    // created, never switched later.
+    const inviteOnly = workspaceType === 'team' && req.body?.membershipMode === INVITE_ONLY;
     const workspaceDescription =
       typeof req.body?.description === 'string' && req.body.description.trim()
         ? req.body.description.trim()
@@ -2092,13 +2108,26 @@ router.post('/workspaces', async (req: Request, res: Response) => {
         ? slugifyWorkspaceName(req.body.slug)
         : slugifyWorkspaceName(rawName);
 
-    const createdWorkspace = await workspaceRepo.create({
-      userId: authReq.inkUserId,
-      name: rawName,
-      slug: workspaceSlug,
-      type: workspaceType,
-      description: workspaceDescription,
-    });
+    // An invite-only group given no slug takes a free one: its plain slug may
+    // be taken (a group called "Personal" beside the person's own space).
+    const slugGiven = typeof req.body?.slug === 'string' && req.body.slug.trim() !== '';
+    const createWith = (slug: string) =>
+      workspaceRepo.create({
+        userId: authReq.inkUserId,
+        name: rawName,
+        slug,
+        type: workspaceType,
+        description: workspaceDescription,
+        ...(inviteOnly ? { metadata: { membershipMode: INVITE_ONLY } } : {}),
+      });
+    let createdWorkspace;
+    try {
+      createdWorkspace = await createWith(workspaceSlug);
+    } catch (error) {
+      const duplicate = error instanceof Error && error.message.toLowerCase().includes('duplicate');
+      if (!inviteOnly || slugGiven || !duplicate) throw error;
+      createdWorkspace = await createWith(suffixedGroupSlug(workspaceSlug));
+    }
 
     await workspaceRepo.addMember(createdWorkspace.id, authReq.inkUserId, 'owner');
 
@@ -2192,6 +2221,15 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
       res.status(403).json({ error: 'Only workspace owners/admins can invite collaborators' });
       return;
     }
+    // A group that takes members only by invitation is never added to
+    // directly: people join it themselves, by accepting one.
+    if (isInviteOnly(workspace.metadata)) {
+      res.status(409).json({
+        error: 'This group takes members by invitation only',
+        code: 'invite_only',
+      });
+      return;
+    }
     const actingRole = await workspaceRepo.getMemberRole(workspaceId, authReq.inkUserId);
 
     const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
@@ -2243,6 +2281,368 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
   } catch (error) {
     logger.error('Failed to add workspace member:', error);
     res.status(500).json(errorJson('Failed to add workspace member', error));
+  }
+});
+
+// =============================================================================
+// Group invitations (ink://designs/inkling-workspace-invitations)
+// =============================================================================
+//
+// Two kinds, one table: a shareable code anyone signed in may use until it
+// expires, is revoked or runs out of uses, and an invitation addressed to one
+// email address. Both are a ten-character code shown once, when created; only
+// its digest is kept. Joining is the database function
+// accept_workspace_invitation, which checks everything again under row locks.
+
+/** The fields an owner or admin sees about an invitation. Never the code. */
+function shapeInvitation(row: InvitationRow & Record<string, unknown>) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    email: row.invitee_email ?? null,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    maxUses: row.max_uses,
+    useCount: row.use_count,
+    revokedAt: row.revoked_at,
+    status: invitationStatus(row),
+  };
+}
+
+/** The group, if the caller is an owner or admin of it; otherwise the answer is sent. */
+async function managedGroup(
+  req: Request,
+  res: Response
+): Promise<{ id: string; name: string; type: string; metadata: unknown } | null> {
+  const authReq = req as AdminAuthRequest;
+  const dataComposer = await getDataComposer();
+  const workspaceRepo = dataComposer.repositories.workspaces;
+  const workspace = await workspaceRepo.findById(req.params.workspaceId, authReq.inkUserId);
+  if (!workspace) {
+    res.status(404).json({ error: 'Workspace not found or not accessible' });
+    return null;
+  }
+  if (!(await workspaceRepo.canManageWorkspace(workspace.id, authReq.inkUserId))) {
+    res.status(403).json({ error: 'Only the group’s owners and admins can do that' });
+    return null;
+  }
+  return workspace;
+}
+
+const INVITATION_UNAVAILABLE = {
+  error: 'This invitation isn’t available. Ask the person who shared it for a new one.',
+  code: 'invitation_unavailable',
+};
+
+/**
+ * PATCH /api/admin/workspaces/:workspaceId
+ * Body: { name }
+ * Renames a group. Owners and admins only; the name is display text, so
+ * nothing else about the group changes.
+ */
+router.patch('/workspaces/:workspaceId', async (req: Request, res: Response) => {
+  try {
+    const name = workspaceNameFrom(req.body?.name);
+    if (!name) {
+      res.status(400).json({ error: 'name must be 1–80 characters' });
+      return;
+    }
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspaces')
+      .update({ name })
+      .eq('id', workspace.id)
+      .select('id, name, slug, type')
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    res.json({ workspace: data });
+  } catch (error) {
+    logger.error('Failed to rename workspace:', error);
+    res.status(500).json(errorJson('Failed to rename workspace', error));
+  }
+});
+
+/**
+ * POST /api/admin/workspaces/:workspaceId/invitations
+ * Body: { kind: 'code' | 'email', email?, maxUses? }
+ * Owners and admins of a group create an invitation. The code is in this
+ * answer only; it is never stored or shown again.
+ */
+router.post('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const kind = req.body?.kind;
+    if (kind !== 'code' && kind !== 'email') {
+      res.status(400).json({ error: "kind must be 'code' or 'email'" });
+      return;
+    }
+    const email =
+      kind === 'email' && typeof req.body?.email === 'string'
+        ? req.body.email.trim().toLowerCase()
+        : null;
+    if (kind === 'email' && (!email || !email.includes('@') || email.length > 320)) {
+      res.status(400).json({ error: 'A valid email is required' });
+      return;
+    }
+    const rawMaxUses = req.body?.maxUses;
+    if (
+      kind === 'code' &&
+      rawMaxUses !== undefined &&
+      rawMaxUses !== null &&
+      !(Number.isInteger(rawMaxUses) && rawMaxUses > 0 && rawMaxUses <= 10_000)
+    ) {
+      res.status(400).json({ error: 'maxUses must be a whole number from 1 to 10000' });
+      return;
+    }
+
+    if (kind === 'email' && !emailInvitesHonoured()) {
+      res.status(409).json({
+        error:
+          'Email invitations need a server that confirms email addresses at sign-up. Share a group code instead.',
+        code: 'email_invites_unavailable',
+      });
+      return;
+    }
+
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    if (workspace.type !== 'team') {
+      res.status(409).json({
+        error: 'A personal space can’t take members. Create a group to invite people.',
+        code: 'personal_workspace',
+      });
+      return;
+    }
+
+    const code = newInvitationCode();
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspace_invitations')
+      .insert({
+        workspace_id: workspace.id,
+        kind,
+        invitee_email: email,
+        token_digest: invitationDigest(normalizeInvitationCode(code)!),
+        created_by: authReq.inkUserId,
+        max_uses: kind === 'email' ? 1 : ((rawMaxUses as number | null | undefined) ?? null),
+      })
+      .select('*')
+      .single();
+    if (error) throw new Error(error.message);
+    res.status(201).json({
+      invitation: shapeInvitation(data as InvitationRow & Record<string, unknown>),
+      code,
+    });
+  } catch (error) {
+    logger.error('Failed to create invitation:', error);
+    res.status(500).json(errorJson('Failed to create invitation', error));
+  }
+});
+
+/**
+ * GET /api/admin/workspaces/:workspaceId/invitations
+ * A group's invitations, newest first, for its owners and admins.
+ */
+router.get('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
+  try {
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspace_invitations')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw new Error(error.message);
+    res.json({
+      invitations: (data ?? []).map((row) =>
+        shapeInvitation(row as InvitationRow & Record<string, unknown>)
+      ),
+    });
+  } catch (error) {
+    logger.error('Failed to list invitations:', error);
+    res.status(500).json(errorJson('Failed to list invitations', error));
+  }
+});
+
+/**
+ * POST /api/admin/workspaces/:workspaceId/invitations/:invitationId/revoke
+ * Stops an invitation working. It answers with how the invitation stands,
+ * so revoking one already used or revoked says so rather than pretending.
+ */
+router.post(
+  '/workspaces/:workspaceId/invitations/:invitationId/revoke',
+  async (req: Request, res: Response) => {
+    try {
+      const workspace = await managedGroup(req, res);
+      if (!workspace) return;
+      const supabase = (await getDataComposer()).getClient();
+      const { error } = await supabase
+        .from('workspace_invitations')
+        .update({ revoked_at: new Date().toISOString() })
+        .eq('id', req.params.invitationId)
+        .eq('workspace_id', workspace.id)
+        .is('revoked_at', null);
+      if (error) throw new Error(error.message);
+      const { data, error: readError } = await supabase
+        .from('workspace_invitations')
+        .select('*')
+        .eq('id', req.params.invitationId)
+        .eq('workspace_id', workspace.id)
+        .maybeSingle();
+      if (readError) throw new Error(readError.message);
+      if (!data) {
+        res.status(404).json({ error: 'No invitation with that id in this group' });
+        return;
+      }
+      res.json({ invitation: shapeInvitation(data as InvitationRow & Record<string, unknown>) });
+    } catch (error) {
+      logger.error('Failed to revoke invitation:', error);
+      res.status(500).json(errorJson('Failed to revoke invitation', error));
+    }
+  }
+);
+
+/**
+ * POST /api/admin/invitations/preview
+ * Body: { code }
+ * What a signed-in person would join with this code: the group's name, or
+ * that the invitation isn't available. Refusals all read the same. It decides
+ * as accept_workspace_invitation does: someone already in the group is told
+ * so whatever state the invitation is in (so a join whose answer was lost
+ * shows as done, even on a code it used up); an account that used it and has
+ * since left can't use it again; anyone else needs a usable invitation from
+ * someone who may still invite.
+ */
+router.post('/invitations/preview', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!invitationAttempts.allow(authReq.inkUserId)) {
+      res
+        .status(429)
+        .json({ error: 'Too many tries. Wait a few minutes.', code: 'too_many_attempts' });
+      return;
+    }
+    const code = normalizeInvitationCode(req.body?.code);
+    if (!code) {
+      res.status(400).json({ error: 'That isn’t an invite code', code: 'invalid_code' });
+      return;
+    }
+    const supabase = (await getDataComposer()).getClient();
+    const { data: invitation, error } = await supabase
+      .from('workspace_invitations')
+      .select('*')
+      .eq('token_digest', invitationDigest(code))
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    const unavailable = () => res.json({ available: false, ...INVITATION_UNAVAILABLE });
+    if (!invitation) {
+      unavailable();
+      return;
+    }
+    const workspaceRepo = (await getDataComposer()).repositories.workspaces;
+    const role = await workspaceRepo.getMemberRole(invitation.workspace_id, authReq.inkUserId);
+    if (role === null) {
+      const email = (authReq.user?.email ?? '').trim().toLowerCase();
+      const usable =
+        invitationStatus(invitation as InvitationRow) === 'pending' &&
+        (invitation.kind === 'code' ||
+          (emailInvitesHonoured() && invitation.invitee_email === email));
+      if (!usable) {
+        unavailable();
+        return;
+      }
+      const { data: receipt, error: receiptError } = await supabase
+        .from('workspace_invitation_redemptions')
+        .select('invitation_id')
+        .eq('invitation_id', invitation.id)
+        .eq('user_id', authReq.inkUserId)
+        .maybeSingle();
+      if (receiptError) throw new Error(receiptError.message);
+      const inviterRole = await workspaceRepo.getMemberRole(
+        invitation.workspace_id,
+        invitation.created_by
+      );
+      if (receipt || (inviterRole !== 'owner' && inviterRole !== 'admin')) {
+        unavailable();
+        return;
+      }
+    }
+    const { data: workspace, error: workspaceError } = await supabase
+      .from('workspaces')
+      .select('id, name, type, archived_at')
+      .eq('id', invitation.workspace_id)
+      .maybeSingle();
+    if (workspaceError) throw new Error(workspaceError.message);
+    if (!workspace || (role === null && (workspace.type !== 'team' || workspace.archived_at))) {
+      unavailable();
+      return;
+    }
+    res.json({
+      available: true,
+      workspace: { id: workspace.id, name: workspace.name },
+      alreadyMember: role !== null,
+    });
+  } catch (error) {
+    logger.error('Failed to preview invitation:', error);
+    res.status(500).json(errorJson('Failed to preview invitation', error));
+  }
+});
+
+/**
+ * POST /api/admin/invitations/accept
+ * Body: { code }
+ * Joins the group the code belongs to, as the signed-in account. The check
+ * and the join are one transaction (accept_workspace_invitation). Retrying
+ * after a lost answer is safe: an invitation this account already used
+ * answers with the membership as it is now, and never recreates one.
+ */
+router.post('/invitations/accept', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!invitationAttempts.allow(authReq.inkUserId)) {
+      res
+        .status(429)
+        .json({ error: 'Too many tries. Wait a few minutes.', code: 'too_many_attempts' });
+      return;
+    }
+    const code = normalizeInvitationCode(req.body?.code);
+    if (!code) {
+      res.status(400).json({ error: 'That isn’t an invite code', code: 'invalid_code' });
+      return;
+    }
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase.rpc('accept_workspace_invitation', {
+      p_token_digest: invitationDigest(code),
+      p_user_id: authReq.inkUserId,
+      p_user_email: (authReq.user?.email ?? '').trim().toLowerCase(),
+      p_email_ownership_confirmed: emailInvitesHonoured(),
+    });
+    if (error) throw new Error(error.message);
+    const result = (data ?? {}) as {
+      status?: string;
+      workspaceId?: string;
+      alreadyMember?: boolean;
+    };
+    if (result.status !== 'joined' || !result.workspaceId) {
+      res.status(404).json(INVITATION_UNAVAILABLE);
+      return;
+    }
+    const { data: workspace } = await supabase
+      .from('workspaces')
+      .select('id, name')
+      .eq('id', result.workspaceId)
+      .maybeSingle();
+    res.json({
+      workspace: workspace ?? { id: result.workspaceId, name: null },
+      alreadyMember: result.alreadyMember === true,
+    });
+  } catch (error) {
+    logger.error('Failed to accept invitation:', error);
+    res.status(500).json(errorJson('Failed to accept invitation', error));
   }
 });
 

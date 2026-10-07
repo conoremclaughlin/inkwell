@@ -69,6 +69,23 @@ export interface UpdateWorkspaceInput {
   archivedAt?: string | null;
 }
 
+const isPlainObject = (value: unknown): value is Record<string, Json | undefined> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * Metadata as an update would leave it, with the group's membership mode as it
+ * was when the group was created: an invite-only group stays invite-only, and
+ * no group becomes invite-only later. Every other key is the caller's to set.
+ */
+export function keepingMembershipMode(current: unknown, next: Json): Json {
+  const mode = isPlainObject(current) ? current.membershipMode : undefined;
+  if (!isPlainObject(next)) {
+    return mode === undefined ? next : { membershipMode: mode };
+  }
+  const { membershipMode: _ignored, ...rest } = next;
+  return (mode === undefined ? rest : { ...rest, membershipMode: mode }) as Json;
+}
+
 export class WorkspacesRepository {
   constructor(private client: SupabaseClient<Database>) {}
 
@@ -276,8 +293,19 @@ export class WorkspacesRepository {
     if (input.slug !== undefined) updateData.slug = input.slug;
     if (input.type !== undefined) updateData.type = input.type;
     if (input.description !== undefined) updateData.description = input.description;
-    if (input.metadata !== undefined) updateData.metadata = input.metadata;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
+    if (input.metadata !== undefined) {
+      const { data: current, error: readError } = await this.client
+        .from('workspaces')
+        .select('metadata')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (readError) {
+        throw new Error(`Failed to update workspace: ${readError.message}`);
+      }
+      updateData.metadata = keepingMembershipMode(current?.metadata, input.metadata);
+    }
 
     const { data, error } = await this.client
       .from('workspaces')
