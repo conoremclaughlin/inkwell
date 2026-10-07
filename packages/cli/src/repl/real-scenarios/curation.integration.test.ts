@@ -121,7 +121,6 @@ async function inkRecallWithScores(query: string, limit: number): Promise<Scored
   const parsed = await mcpCall<RecallResponse>('recall', {
     query,
     sbSlug: AGENT_ID,
-    includeShared: true,
     limit,
     recallMode: 'hybrid',
   });

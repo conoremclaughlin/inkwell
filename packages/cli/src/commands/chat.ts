@@ -4345,7 +4345,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const result = await inkClient.callTool('recall', {
           query,
           sbSlug,
-          includeShared: true,
           limit,
           recallMode: 'hybrid',
         });

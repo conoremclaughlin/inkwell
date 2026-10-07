@@ -24,7 +24,8 @@ export interface Memory {
   source: MemorySource;
   salience: Salience;
   topics: string[];
-  sbSlug?: string; // Which AI being created this memory (wren, benson, etc). Null = shared memory.
+  sbSlug?: string; // The SB that owns this memory (wren, benson, etc). Every new memory has one; rows written before shared memories were removed may not.
+  sbId?: string; // The owner's canonical identity (agent_identities.id).
   contactId?: string; // Per-sender memory scoping. Null = owner/system memory.
   embedding?: number[]; // 1024 dimensions for Voyage AI, nullable for now
   metadata: Record<string, unknown>;
@@ -50,6 +51,10 @@ export interface MemoryHistory {
   createdAt: Date;
   archivedAt: Date;
   changeType: ChangeType;
+  /** The archived memory's owner. Null on rows archived before history recorded it. */
+  sbSlug?: string;
+  sbId?: string;
+  contactId?: string;
 }
 
 export interface MemoryCreateInput {
@@ -62,8 +67,20 @@ export interface MemoryCreateInput {
   topics?: string[];
   metadata?: Record<string, unknown>;
   expiresAt?: Date;
-  sbSlug?: string; // Which AI being created this memory
+  sbSlug: string; // The SB that owns this memory. Required: there are no shared memories (ink://specs/remove-shared-memories).
+  /** The owner's canonical identity. Resolved from sbSlug when absent; an unresolvable owner is refused. */
+  sbId?: string;
   contactId?: string; // Per-sender memory scoping
+}
+
+/**
+ * Whose memories a read returns (ink://specs/remove-shared-memories §3.3).
+ * Rows are matched on sbId, the canonical identity; the slug is carried for
+ * logging and for the RPCs' old slug argument.
+ */
+export interface MemoryOwnerFilter {
+  sbSlug: string;
+  sbId: string;
 }
 
 export type MemorySearchChunkType =
@@ -85,8 +102,10 @@ export interface MemorySearchOptions {
   limit?: number;
   offset?: number;
   includeExpired?: boolean;
-  sbSlug?: string; // Filter by agent
-  includeShared?: boolean; // Include shared memories (sbSlug=null) when filtering. Default true.
+  sbSlug?: string; // Whose memories. A recall with no owner returns nothing.
+  sbId?: string; // The owner's canonical identity: rows are matched on it, and a recall without it returns nothing.
+  /** @deprecated Ignored. There are no shared memories to include. */
+  includeShared?: boolean;
   contactId?: string; // Filter by contact for per-sender isolation
   semanticChunkTypes?: MemorySearchChunkType[];
   semanticQueryStrategy?: MemorySemanticQueryStrategy;
@@ -215,6 +234,7 @@ export interface MemoryRow {
   salience: Salience;
   topics: string[];
   agent_id: string | null;
+  sb_id?: string | null;
   contact_id?: string | null; // Optional: RPC functions may not return this column
   embedding_chunks_version?: number | null;
   embedding_chunk_count?: number | null;
@@ -241,6 +261,8 @@ export interface MemoryHistoryRow {
   archived_at: string;
   change_type: ChangeType;
   contact_id: string | null;
+  agent_id?: string | null;
+  sb_id?: string | null;
 }
 
 export interface SessionRow {

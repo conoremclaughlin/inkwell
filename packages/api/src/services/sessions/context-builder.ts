@@ -39,6 +39,7 @@ export function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
   // Keyed off the stored flag, never off the placeholder text.
   const unnamed = isUnnamed(row);
   return {
+    sbId: row.id,
     sbSlug: row.agent_id,
     name: row.name,
     ...(unnamed ? { unnamed: true } : {}),
@@ -153,11 +154,16 @@ export class ContextBuilder implements IContextBuilder {
     // Fetch all required data in parallel
     // The identity resolves first because it names the workspace whose
     // constitution this session should read. Everything else runs alongside it.
+    // Memories are read for that identity's canonical id, so they wait for
+    // it: a slug is unique only per workspace (remove-shared-memories §3.3).
+    const identityRead = this.getAgentIdentity(userId, sbSlug, session.sbId);
     const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      this.getAgentIdentity(userId, sbSlug, session.sbId),
+      identityRead,
       this.getUser(userId),
       this.getContacts(userId),
-      this.getKnowledgeMemories(userId, sbSlug, session),
+      identityRead.then((identity) =>
+        identity?.sbId ? this.getKnowledgeMemories(userId, sbSlug, identity.sbId, session) : []
+      ),
       this.getActiveProjects(userId),
     ]);
 
@@ -391,12 +397,13 @@ export class ContextBuilder implements IContextBuilder {
   private async getKnowledgeMemories(
     userId: string,
     sbSlug: string,
+    sbId: string,
     session: Session
   ): Promise<Memory[]> {
     try {
       return await this.memories.getKnowledgeMemories(
         userId,
-        sbSlug,
+        { sbSlug, sbId },
         HIGH_MEMORY_LIMIT,
         HIGH_MEMORY_WINDOW_DAYS,
         { threadKey: session.threadKey, focusText: session.taskDescription },

@@ -1985,13 +1985,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         sbSlug: z
           .string()
           .optional()
-          .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
+          .describe('Whose memories to recall (e.g., "wren"). Defaults to you.'),
         includeShared: z
           .boolean()
           .optional()
-          .describe(
-            'Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'
-          ),
+          .describe('Deprecated and ignored: there are no shared memories.'),
       }),
     },
     async (args) => {

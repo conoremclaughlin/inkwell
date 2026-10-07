@@ -76,7 +76,6 @@ async function callRecallForHooks(query: string, limit: number) {
   const result = await inkToolCall('recall', {
     query,
     sbSlug: 'wren',
-    includeShared: true,
     limit,
     recallMode: 'hybrid',
   });

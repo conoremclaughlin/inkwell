@@ -131,13 +131,13 @@ The format and file naming of these documents is implementation-defined.
 
 Every memory MUST have:
 
-| Field      | Type           | Description                                                                               |
-| ---------- | -------------- | ----------------------------------------------------------------------------------------- |
-| `id`       | UUID           | Unique identifier                                                                         |
-| `content`  | string         | The memory text                                                                           |
-| `source`   | enum           | One of: `conversation`, `observation`, `user_stated`, `inferred`, `session`, `reflection` |
-| `salience` | enum           | One of: `low`, `medium`, `high`, `critical`                                               |
-| `sbSlug`   | string or null | Creator agent. Null = shared across all agents.                                           |
+| Field      | Type   | Description                                                                               |
+| ---------- | ------ | ----------------------------------------------------------------------------------------- |
+| `id`       | UUID   | Unique identifier                                                                         |
+| `content`  | string | The memory text                                                                           |
+| `source`   | enum   | One of: `conversation`, `observation`, `user_stated`, `inferred`, `session`, `reflection` |
+| `salience` | enum   | One of: `low`, `medium`, `high`, `critical`                                               |
+| `sbSlug`   | string | Owning agent. Required: every memory belongs to exactly one agent.                        |
 
 The `source` field indicates how the memory was created:
 
@@ -172,7 +172,7 @@ Every memory MAY have:
 Conforming implementations MUST support these operations:
 
 - **`remember(content, salience, topicKey?, ...)`** — Create a new memory. MUST NOT require an active session.
-- **`recall(topicKey?, topics?, search?, ...)`** — Retrieve memories. MUST support filtering by agent (agent-specific + shared) and topic.
+- **`recall(topicKey?, topics?, search?, ...)`** — Retrieve memories. MUST return only the calling agent's own memories, and MUST support filtering by topic.
 - **`forget(id)`** — Delete a memory.
 - **`update_memory(id, salience?, summary?, topics?, metadata?)`** — Modify memory metadata. Content MUST be immutable after creation. Updates MUST increment version.
 
@@ -216,9 +216,9 @@ Implementations SHOULD define a bootstrap memory budget as a **recommended minim
 
 ### 3.5 Agent Scoping
 
-When `sbSlug` is set on a memory, that memory is private to that agent. When `sbSlug` is null, the memory is shared across all agents for that user.
+Every memory belongs to exactly one agent, the one that wrote it, and is private to that agent (and its owning user). There are no shared memories: context meant for every agent belongs in the shared documents (§2.3) instead.
 
-`recall` MUST return both agent-specific and shared memories by default. Implementations SHOULD provide a flag to exclude shared memories.
+A write with no owning agent MUST be refused. `recall`, and any read that surfaces memories at startup, MUST return only the calling agent's own memories, and MUST return none when the caller's agent cannot be established.
 
 ### 3.6 Semantic Search (Planned)
 
@@ -253,7 +253,7 @@ Reflection runs are typically triggered by heartbeats or reminders (see §4.4). 
 
 - **Daily reflection**: End-of-day review of the day's sessions and decisions
 - **Topic reflection**: Deep review of memories under a specific `topicKey` when the topic reaches a threshold of accumulated entries
-- **Cross-agent reflection**: Review of shared memories and sibling interactions to update relationship understanding
+- **Cross-agent reflection**: Review of shared documents and sibling interactions to update relationship understanding
 
 The frequency and scope of reflection is implementation-defined and MAY be configured per agent. Reflection is OPTIONAL for v0.1 conformance but is a core pattern for agents that maintain long-term coherence.
 
@@ -568,7 +568,7 @@ Agent identities MUST be scoped to a user. Agent A under User 1 MUST NOT be able
 
 ### 8.2 Memory Privacy
 
-Memories with a non-null `sbSlug` MUST only be visible to that agent (plus the owning user). Shared memories (null `sbSlug`) are visible to all agents under the same user.
+A memory MUST only be visible to the agent that owns it (plus the owning user). No memory is visible to every agent under a user.
 
 ### 8.3 Inbox Privacy
 
