@@ -7937,6 +7937,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
           relayBudgetBytes: () => relayBudgetBytes(runtime, relayOccupancy()),
+          // Nobody watches a non-interactive turn, so a call that failed (an
+          // invalid argument, say) gets a retry instead of ending the turn on
+          // the FINAL relay. A deliberate refusal still ends it.
+          continueOnFailure: Boolean(options.nonInteractive),
         },
         {
           ui: {
