@@ -446,6 +446,10 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
   // 3.5 (Oct 7 audit): an inkling's queued wakes merge as an ordinary SB's do,
   // but its gate reads each wake's own source. Only its owner's own messages
   // share a turn; every other wake runs alone and meets the gate there.
+  // One conversation: owner wakes share a turn only within it (Lumen, #780 P1).
+  const C1 = { threadKey: 'chat:c1' };
+  const C2 = { threadKey: 'chat:c2' };
+
   function inklingTurns() {
     const turns: Array<{ content: string; sources: unknown; trigger?: unknown }> = [];
     // A client to prove sources with; the proof itself is ownerProof's, and
@@ -503,9 +507,9 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     ]);
     const turns = inklingTurns();
     await queueBehindATurn([
-      wake('o1', {}, 'conor'),
-      wake('s1', {}, 'lumen'),
-      wake('o2', {}, 'conor'),
+      wake('o1', C1, 'conor'),
+      wake('s1', C1, 'lumen'),
+      wake('o2', C1, 'conor'),
     ]);
 
     expect(turns).toHaveLength(3);
@@ -526,9 +530,9 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     ]);
     const turns = inklingTurns();
     await queueBehindATurn([
-      wake('s1', {}, 'lumen'),
-      wake('o1', {}, 'conor'),
-      wake('o2', {}, 'conor'),
+      wake('s1', C1, 'lumen'),
+      wake('o1', C1, 'conor'),
+      wake('o2', C1, 'conor'),
     ]);
 
     expect(turns[1].trigger).toBe('o1');
@@ -544,9 +548,9 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     ]);
     const turns = inklingTurns();
     await queueBehindATurn([
-      wake('o1', {}, 'conor'),
-      wake('u1', {}, 'conor'),
-      wake('o2', {}, 'conor'),
+      wake('o1', C1, 'conor'),
+      wake('u1', C1, 'conor'),
+      wake('o2', C1, 'conor'),
     ]);
 
     expect(turns[1].content).not.toContain('wake for u1');
@@ -561,9 +565,40 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     ]);
     const turns = inklingTurns();
     (service as unknown as { supabase: unknown }).supabase = null;
-    await queueBehindATurn([wake('o1', {}, 'conor'), wake('o2', {}, 'conor')]);
+    await queueBehindATurn([wake('o1', C1, 'conor'), wake('o2', C1, 'conor')]);
 
     expect(turns.map((t) => t.content)).toEqual(['turn-a', 'wake for o1', 'wake for o2']);
+  });
+
+  it('never merges owner wakes from two conversations: a turn has one reply destination', async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([wake('o1', C1, 'conor'), wake('o2', C2, 'conor')]);
+
+    expect(turns.map((t) => t.content)).toEqual(['turn-a', 'wake for o1', 'wake for o2']);
+  });
+
+  it("merges the lead conversation's owner wakes, and runs another conversation's alone", async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+      ['o3', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('o1', C1, 'conor'),
+      wake('o2', C2, 'conor'),
+      wake('o3', C1, 'conor'),
+    ]);
+
+    expect(turns).toHaveLength(3);
+    expect(turns[1].content).toContain('wake for o1');
+    expect(turns[1].content).toContain('wake for o3');
+    expect(turns[1].content).not.toContain('wake for o2');
+    expect(turns[2]).toMatchObject({ content: 'wake for o2', trigger: 'o2' });
   });
 
   it('runs them one by one when fewer than two are the owner’s', async () => {
@@ -574,9 +609,9 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     ]);
     const turns = inklingTurns();
     await queueBehindATurn([
-      wake('o1', {}, 'conor'),
-      wake('s1', {}, 'lumen'),
-      wake('s2', {}, 'lumen'),
+      wake('o1', C1, 'conor'),
+      wake('s1', C1, 'lumen'),
+      wake('s2', C1, 'lumen'),
     ]);
 
     expect(turns.map((t) => t.content)).toEqual([

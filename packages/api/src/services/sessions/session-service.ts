@@ -261,6 +261,19 @@ function routePatternSpecificity(pattern: string): number {
 }
 
 /**
+ * The conversation a queued wake's reply belongs to: its thread, or the
+ * conversation it arrived in when it names none.
+ */
+function wakeDestination(pending: { request: SessionRequest }): string | undefined {
+  const threadKey = pending.request.metadata?.threadKey;
+  return typeof threadKey === 'string' && threadKey.length > 0
+    ? `thread:${threadKey}`
+    : pending.request.conversationId
+      ? `conversation:${pending.request.conversationId}`
+      : undefined;
+}
+
+/**
  * The routing options a message resolves its session with.
  *
  * A message resolves twice when it queues behind a running turn: once on
@@ -2279,10 +2292,16 @@ export class SessionService implements ISessionService {
               })
             );
             const proven = members.filter((_, index) => proofs[index] === 'yes');
-            mergeable = proven.length > 1;
+            // And only wakes bound for the lead's conversation: a merged turn
+            // has one reply destination, its lead's turn hooks, so a wake from
+            // another conversation would have its closing reply land in the
+            // lead's, or be dropped (Lumen, #780 P1).
+            const destination = proven.length > 0 ? wakeDestination(proven[0].pending) : undefined;
+            const shared = proven.filter(({ pending }) => wakeDestination(pending) === destination);
+            mergeable = destination !== undefined && shared.length > 1;
             if (mergeable) {
-              merging = proven;
-              alone = members.filter((_, index) => proofs[index] !== 'yes');
+              merging = shared;
+              alone = members.filter((member) => !shared.includes(member));
             }
           } else {
             // An identity that cannot be read keeps its wakes apart.
@@ -2822,7 +2841,10 @@ export class SessionService implements ISessionService {
       // to be pinned to one. Cycles 2..N are continuation prompts on the same
       // admitted message, never another message (chat.ts --non-interactive),
       // so they stay inside that message's owner test, the process group's
-      // Stop and the fence; each cycle's reply is posted as it ends.
+      // Stop and the fence. A wake sets turnHooks, not onTurnReply, so a
+      // cycle's text is not forwarded as it ends: explicit tool sends post
+      // during the run, and the closing-text fallback runs once around the
+      // whole turn (Lumen, #780).
       ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
       ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
