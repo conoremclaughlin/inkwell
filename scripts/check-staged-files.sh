@@ -40,7 +40,10 @@
 # object already carries, and .yarn/releases/, which is vendored. One file is
 # exempt from the MARKERS arm alone: the emoji catalog's generated search
 # data, packages/shared/src/stories/reaction-picking/search.generated.ts,
-# which is the Unicode standard's published text (see marker_exempt below).
+# which is the Unicode standard's published text. The Inkling app's copy at
+# packages/stories/src/reaction-picking/search.generated.ts is exempt with it
+# only while its bytes are the catalog's as committed in this guard's own
+# checkout (see marker_exempt below).
 #
 # The commit-msg guard cannot see files and this guard cannot see the message;
 # they are two halves. This one exists because `git add .` and `git add -A`
@@ -315,11 +318,42 @@ personal_exempt() {
 # files carry no CLDR words and stay scanned, as does any future generated
 # file. The ADDRESSES arm still reads it, and a hand edit shows in review as
 # a change to a file that only regeneration should touch.
+#
+# The Inkling app carries a byte-for-byte copy of that file at its own path,
+# and Inkling's hooks run this script. The copy is the same published text
+# the exemption was granted for (Myra, 2026-10-07, on Conor's 10-06 ruling),
+# so it is exempt with it, but only while it IS that text: its blob must be
+# the catalog's blob as committed at the HEAD of the checkout this guard runs
+# from. A copy edited by even one byte, or a catalog that has moved on without
+# it, is scanned like any other file. It names that one path exactly; the
+# same bytes anywhere else are scanned.
+catalog_path=packages/shared/src/stories/reaction-picking/search.generated.ts
+catalog_mirror_path=packages/stories/src/reaction-picking/search.generated.ts
 marker_exempt() {
   case "/$1" in
-    /packages/shared/src/stories/reaction-picking/search.generated.ts) return 0 ;;
+    "/$catalog_path") return 0 ;;
+    "/$catalog_mirror_path")
+      mirror_is_catalog "$1"
+      return
+      ;;
   esac
   return 1
+}
+
+# The approved bytes are read from the guard's own checkout at HEAD, never its
+# working tree: committed text is reviewed text. A hook runs with GIT_DIR and
+# its kin naming the repository being committed, so they are cleared for this
+# one read, or it would ask the wrong repository. No such file at that HEAD,
+# or any failed read, means no exemption: the copy is scanned.
+mirror_is_catalog() { # path
+  approved=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    git -C "$here/.." rev-parse -q --verify "HEAD:$catalog_path" 2>/dev/null) || return 1
+  case "$mode" in
+    index) candidate=$(git rev-parse -q --verify ":$1" 2>/dev/null) || return 1 ;;
+    *) candidate=$(git rev-parse -q --verify "$rev:$1" 2>/dev/null) || return 1 ;;
+  esac
+  [ -n "$approved" ] && [ "$candidate" = "$approved" ]
 }
 
 # ADDRESSES. The shape is deliberately loose — a local part, an at sign, a

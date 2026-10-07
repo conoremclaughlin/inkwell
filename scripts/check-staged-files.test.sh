@@ -491,6 +491,106 @@ for near in "$cat_dir/search.ts" "$cat_dir/parity-manifest.generated.ts" package
   [ "$rc" -eq 1 ] && ok "a marker is still refused in $near" || bad "a marker is still refused in $near" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 done
 
+# The Inkling app's copy of that file is exempt only while its blob is the
+# catalog's as committed in the guard's own checkout. A copy of the guard under
+# test runs from a scratch "guard checkout" standing in for Inkwell's, so the
+# approved bytes can carry the synthetic marker.
+mirror_dir=packages/stories/src/reaction-picking
+approved_catalog='["a name", "canaryperson|keyword"],
+'
+make_guard_checkout() { # name catalog-content|"" -> path of the guard copy
+  g="$work/$1"
+  git init -q "$g" || return 1
+  git -C "$g" config user.email tester@example.com
+  git -C "$g" config user.name tester
+  git -C "$g" config commit.gpgsign false
+  git -C "$g" config core.hooksPath "$nohooks"
+  mkdir -p "$g/scripts/lib"
+  cp "$guard" "$g/scripts/check-staged-files.sh"
+  cp "$root/scripts/lib/credential-patterns.sh" "$root/scripts/lib/fixture-domains.sh" "$g/scripts/lib/"
+  if [ -n "$2" ]; then
+    mkdir -p "$g/$cat_dir"
+    printf '%s' "$2" > "$g/$cat_dir/search.generated.ts"
+    git -C "$g" add -- "$cat_dir/search.generated.ts"
+    git -C "$g" commit -q --no-verify -m 'fixture: catalog' 2>/dev/null
+  fi
+  printf '%s\n' "$g/scripts/check-staged-files.sh"
+}
+copy_guard=$(make_guard_checkout guard-checkout "$approved_catalog")
+guard_checkout=$(cd "$(dirname "$copy_guard")/.." && pwd)
+run_copy() { # repo [guard] -> runs a guard copy in index mode
+  (cd "$1" && sh "${2:-$copy_guard}" 2>&1)
+}
+
+r=$(new_repo scan-marker-mirror "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" "$approved_catalog"
+out=$(run_copy "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "Inkling's byte-identical copy of the catalog is exempt from the marker arm" || bad "Inkling's byte-identical copy of the catalog is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-marker-mirror-edited "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" '["a name", "canaryperson|keywords"],
+'
+out=$(run_copy "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a copy edited by one byte loses the exemption" || bad "a copy edited by one byte loses the exemption" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q "$mirror_dir/search.generated.ts: line(s) 1" && ok "the edited copy's marker is reported by path and line" || bad "the edited copy's marker is reported by path and line" "$(echo "$out" | tr '\n' ' ')"
+
+for elsewhere in "$mirror_dir/other.generated.ts" packages/stories/src/search.generated.ts "vendor/$mirror_dir/search.generated.ts" "$mirror_dir/search.generated.tsx"; do
+  r=$(new_repo "scan-marker-mirror-elsewhere-$(printf '%s' "$elsewhere" | tr '/.' '--')" "$nohooks")
+  stage "$r" "$elsewhere" "$approved_catalog"
+  out=$(run_copy "$r"); rc=$?
+  [ "$rc" -eq 1 ] && ok "the catalog's bytes are still scanned at $elsewhere" || bad "the catalog's bytes are still scanned at $elsewhere" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+done
+
+# The approved bytes are the guard checkout's COMMITTED catalog: an uncommitted
+# edit in its working tree approves nothing.
+printf '%s' '["a name", "canaryperson|edited"],
+' > "$guard_checkout/$cat_dir/search.generated.ts"
+r=$(new_repo scan-marker-mirror-worktree "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" '["a name", "canaryperson|edited"],
+'
+out=$(run_copy "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "the guard checkout's uncommitted edit approves nothing" || bad "the guard checkout's uncommitted edit approves nothing" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+git -C "$guard_checkout" checkout -q -- "$cat_dir/search.generated.ts"
+
+# From inside a hook: git exports GIT_DIR and GIT_INDEX_FILE naming the
+# repository being committed. The approved read must still ask the guard's own
+# checkout, or a repository with no such commit would never match.
+r=$(new_repo scan-marker-mirror-hook-env "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" "$approved_catalog"
+out=$(cd "$r" && GIT_DIR="$r/.git" GIT_INDEX_FILE="$r/.git/index" sh "$copy_guard" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "the copy is judged against the guard's checkout under a hook's GIT_DIR" || bad "the copy is judged against the guard's checkout under a hook's GIT_DIR" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# The push replay (--commit) judges the committed blob the same way.
+r=$(new_repo scan-marker-mirror-commit "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" "$approved_catalog"
+git -C "$r" commit -q --no-verify -m 'fixture: mirror' 2>/dev/null
+out=$(cd "$r" && sh "$copy_guard" --commit HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a commit carrying the identical copy passes the push replay" || bad "a commit carrying the identical copy passes the push replay" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+printf '%s' 'canaryperson was added by hand' > "$r/$mirror_dir/search.generated.ts"
+git -C "$r" add -- "$mirror_dir/search.generated.ts"
+out=$(cd "$r" && sh "$copy_guard" --commit HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "the push replay judges the commit's blob, not a different staged one" || bad "the push replay judges the commit's blob, not a different staged one" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+git -C "$r" add -- "$mirror_dir/search.generated.ts"
+git -C "$r" commit -q --no-verify -m 'fixture: edited mirror' 2>/dev/null
+out=$(cd "$r" && sh "$copy_guard" --commit HEAD 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a commit that edits the copy is refused by the push replay" || bad "a commit that edits the copy is refused by the push replay" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# The address arm still reads the copy, identical or not.
+addr_guard=$(make_guard_checkout guard-checkout-address "// person@$realdom
+$approved_catalog")
+r=$(new_repo scan-marker-mirror-address "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" "// person@$realdom
+$approved_catalog"
+out=$(run_copy "$r" "$addr_guard"); rc=$?
+[ "$rc" -eq 1 ] && ok "the address arm still reads the identical copy" || bad "the address arm still reads the identical copy" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A guard checkout with no committed catalog approves nothing.
+bare_guard=$(make_guard_checkout guard-checkout-bare '')
+r=$(new_repo scan-marker-mirror-no-catalog "$nohooks")
+stage "$r" "$mirror_dir/search.generated.ts" "$approved_catalog"
+out=$(run_copy "$r" "$bare_guard"); rc=$?
+[ "$rc" -eq 1 ] && ok "with no committed catalog in the guard's checkout, the copy is scanned" || bad "with no committed catalog in the guard's checkout, the copy is scanned" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
 r=$(new_repo scan-marker-missing "$nohooks")
 stage "$r" src/x.ts 'clean'
 out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/does-not-exist" sh "$guard" 2>&1); rc=$?
