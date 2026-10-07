@@ -123,6 +123,8 @@ interface RigOptions {
   descriptor?: { lines: string[] };
   /** A successful SessionResult from handleMessage, verbatim (default `{ success: true }`). */
   resultSuccess?: Record<string, unknown>;
+  /** Make the inkling closing-text post throw. */
+  closingThrows?: boolean;
 }
 
 function rig(options: RigOptions = {}) {
@@ -137,6 +139,9 @@ function rig(options: RigOptions = {}) {
   const chainEndings: Array<Record<string, unknown>> = [];
   const inkmail: unknown[][] = [];
   const routed: unknown[][] = [];
+  const closings: unknown[][] = [];
+  /** The order the success path's steps ran in. */
+  const sequence: string[] = [];
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -328,6 +333,14 @@ function rig(options: RigOptions = {}) {
     storedTriggerMedia: async () => [],
     routeResponses: async (...args: unknown[]) => {
       routed.push(args);
+      sequence.push('route');
+    },
+    // The inkling closing-text post (inkling-closing-text.ts), recorded, not run.
+    postClosingTextIfSilent: async (...args: unknown[]) => {
+      closings.push(args);
+      sequence.push('closing');
+      if (options.closingThrows) throw new Error('closing text exploded');
+      return { posted: false, skipped: 'not-inkling' };
     },
     RoutingRefusedError,
     sendTriggerFailureNotice: loadModule(resolve(API_SRC, 'services/trigger-failure-notice.ts'), {
@@ -389,6 +402,8 @@ function rig(options: RigOptions = {}) {
     chainEndings,
     inkmail,
     routed,
+    closings,
+    sequence,
     chain,
     row,
     threadPayload,
@@ -644,6 +659,52 @@ describe('server.ts wiring', () => {
     expect(
       parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
     ).toBe('startServer');
+  });
+});
+
+describe("an inkling turn that sent nothing (task 9edf62fe): the handler's part", () => {
+  // inkling-closing-text.test.ts decides what is posted; this checks that the
+  // shipping handler asks it, with the wake the turn ran for, once the turn
+  // succeeded and its replies were routed.
+  const result = {
+    success: true,
+    admitted: true,
+    finalTextResponse: 'I could not read our conversation.',
+    sessionId: 'session-synthetic',
+    responses: [{ channel: 'api', conversationId: 'c', content: 'routed' }],
+  };
+
+  it('offers the turn and its wake after the replies are routed', async () => {
+    const r = rig({ resultSuccess: result });
+
+    await r.gateway.handler!(r.threadPayload);
+
+    expect(r.closings).toHaveLength(1);
+    const [, turn] = r.closings[0];
+    expect(turn).toEqual({
+      result,
+      userId: 'user-synthetic',
+      identityId: 'identity-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: 'pr:42',
+      threadMessageId: 'message-synthetic',
+    });
+    expect(r.sequence).toEqual(['route', 'closing']);
+  });
+
+  it('offers nothing for a failed turn', async () => {
+    const r = rig({ resultFailure: { success: false, admitted: true, error: 'backend died' } });
+
+    await r.gateway.handler!(r.threadPayload).catch(() => undefined);
+
+    expect(r.closings).toHaveLength(0);
+  });
+
+  it('a throw from it never fails the trigger after the turn succeeded', async () => {
+    const r = rig({ resultSuccess: result, closingThrows: true });
+
+    await expect(r.gateway.handler!(r.threadPayload)).resolves.not.toThrow();
+    expect(r.closings).toHaveLength(1);
   });
 });
 

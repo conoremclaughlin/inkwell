@@ -413,8 +413,16 @@ export interface InternalSendContext {
    * watchdog or heartbeat send always has. This context is the ONLY way a
    * message is authored as the system — no tool call reaches it. Absent, the
    * sender resolves as it does for a tool call.
+   *
+   * An SB sender is the server posting what that SB's own turn said, when
+   * the turn ended without sending it (an inkling's closing text,
+   * inkling-closing-text.ts). It meets every rule the SB's own send would,
+   * the inkling thread gate included.
    */
-  sender?: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  sender?: {
+    principal: SbPrincipal | UserPrincipal | SystemPrincipal;
+    workspaceId: string | null;
+  };
   /**
    * A wake source's tag (wake-source-breaker.ts): the trigger handler counts
    * the wake's completed turn against it. Written to the message metadata

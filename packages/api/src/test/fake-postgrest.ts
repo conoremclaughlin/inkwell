@@ -6,7 +6,7 @@
  * being answered by a fixture.
  *
  * Supported: from(table) with select / insert / update / delete, eq
- * (including `column->>key`), gt, in, order, limit, range, maybeSingle,
+ * (including `column->>key`), neq, gt, gte, lt, in, order, limit, range, maybeSingle,
  * single, and awaiting the builder for many rows; rpc through registered
  * handlers. Unique constraints are declared per table and refuse a write
  * with 23505, as Postgres does. A table with an updated_at column gets a
@@ -190,6 +190,29 @@ export class FakeQuery implements PromiseLike<FakeResult> {
       test: (row) => {
         const own = read(row, column);
         return own !== null && own !== undefined && String(own) > String(value);
+      },
+    });
+    return this;
+  }
+
+  gte(column: string, value: unknown): this {
+    this.filters.push({
+      label: `${column}>=${String(value)}`,
+      test: (row) => {
+        const own = read(row, column);
+        return own !== null && own !== undefined && String(own) >= String(value);
+      },
+    });
+    return this;
+  }
+
+  /** As in SQL, a null column is not "not equal" to anything: the row is left out. */
+  neq(column: string, value: unknown): this {
+    this.filters.push({
+      label: `${column}!=${String(value)}`,
+      test: (row) => {
+        const own = read(row, column);
+        return own !== null && own !== undefined && String(own) !== String(value);
       },
     });
     return this;
