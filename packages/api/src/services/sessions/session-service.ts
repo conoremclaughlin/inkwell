@@ -101,7 +101,11 @@ import {
   inklingTurnRefusal,
   isOwnersOwnMessage,
 } from '../inklings/inkling-turn-gate.js';
-import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import {
+  ensureInklingFolder,
+  inklingToolPolicyPath,
+  inklingsRoot,
+} from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
 import {
   INKLING_FENCE_REASON,
@@ -2748,6 +2752,16 @@ export class SessionService implements ISessionService {
       // tools are always ink-owned: a dashboard setting must not hand its
       // provider's native tools to the turn.
       toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
+      // An inkling's tools are bounded by its own profile and policy file,
+      // never by this machine's grants (task 0321ccf1).
+      ...(inklingTurn && inklingSbId
+        ? {
+            inklingToolPolicyPath: inklingToolPolicyPath(
+              inklingSbId,
+              this.config.inklingsRoot ?? inklingsRoot()
+            ),
+          }
+        : {}),
       ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       ...(launchPermissions ? { launchPermissions } : {}),

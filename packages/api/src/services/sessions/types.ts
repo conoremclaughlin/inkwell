@@ -911,6 +911,13 @@ export interface ClaudeRunnerConfig {
    */
   inkProvider?: InklingProvider;
   /**
+   * An inkling's turn only: the tool-policy file `ink chat` reads instead of
+   * the machine's (INK_TOOL_POLICY_PATH), with the `inkling` profile in place
+   * of `safe`, which denies the shell, file writes, waking another agent and
+   * send_response (task 0321ccf1). Unset for every other spawn.
+   */
+  inklingToolPolicyPath?: string;
+  /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts
    * (runUserTurn cycles) — NOT provider subprocess calls, of which one turn's

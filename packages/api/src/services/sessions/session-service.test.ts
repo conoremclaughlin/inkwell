@@ -1393,6 +1393,24 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
         });
 
+        it("gives an inkling's turn its own tool policy, beside the inklings' folders, and no other SB's turn one (task 0321ccf1)", async () => {
+          await turn(INKLING, fromOwner, OWNER);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            inklingToolPolicyPath: join(inklingsRoot, '.tool-policy', `${SB}.json`),
+          });
+          // Beside its folder, never inside it: nothing its turn reaches can write it.
+          const policy = (configPassedToRunner() as { inklingToolPolicyPath: string })
+            .inklingToolPolicyPath;
+          expect(policy.startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
+
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner(mockClaudeRunner)).not.toHaveProperty(
+            'inklingToolPolicyPath'
+          );
+        });
+
         it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
           const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
           expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
