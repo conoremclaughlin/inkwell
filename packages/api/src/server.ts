@@ -1118,6 +1118,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // Prefer recipient_sb_id from inbox; fallback to user+agent_id with disambiguation.
     let resolvedIdentityId = recipientSbId;
     let resolvedWorkspaceId: string | undefined;
+    // Read from the same identity row, for decideDelivery: an inkling's turns
+    // must pass its own gate, so it is never delivered inline.
+    let targetMetadata: unknown = null;
     const metadataWorkspaceId =
       payload.metadata &&
       typeof payload.metadata.workspaceId === 'string' &&
@@ -1129,7 +1132,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       const { data: identityRow } = await dataComposer!
         .getClient()
         .from('agent_identities')
-        .select('id, agent_id, workspace_id')
+        .select('id, agent_id, workspace_id, metadata')
         .eq('id', resolvedIdentityId)
         .eq('user_id', userId)
         .maybeSingle();
@@ -1147,11 +1150,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
 
       resolvedWorkspaceId = identityRow.workspace_id || undefined;
+      targetMetadata = identityRow.metadata;
     } else {
       let identityQuery = dataComposer!
         .getClient()
         .from('agent_identities')
-        .select('id, workspace_id')
+        .select('id, workspace_id, metadata')
         .eq('user_id', userId)
         .eq('agent_id', targetSlug);
 
@@ -1184,6 +1188,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         if (workspaceScoped.length === 1) {
           resolvedIdentityId = workspaceScoped[0].id;
           resolvedWorkspaceId = workspaceScoped[0].workspace_id || undefined;
+          targetMetadata = workspaceScoped[0].metadata;
           logger.info(
             `[Trigger] Disambiguated ${targetSlug}: preferred workspace-scoped identity ${resolvedIdentityId}`
           );
@@ -1195,6 +1200,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       } else {
         resolvedIdentityId = identityRows[0].id;
         resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
+        targetMetadata = identityRows[0].metadata;
       }
     }
 
@@ -1688,7 +1694,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // payload.forceSpawn is the first-class field.
       const forceSpawn = payload.forceSpawn === true || payload.metadata?.strategyTrigger === true;
 
-      const delivery = decideDelivery({ forceSpawn, pollRow, attachedRow });
+      const delivery = decideDelivery({
+        forceSpawn,
+        pollRow,
+        attachedRow,
+        targetMetadata,
+      });
 
       if (delivery.mode === 'inline') {
         // Stamped-only polling: the CLI on the delivery session sees this
@@ -1742,6 +1753,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           targetSlug,
           reason: payload.metadata?.reason,
           groupId: payload.metadata?.groupId,
+        });
+      }
+      if (delivery.inlineRefused === 'own-gate') {
+        // A CLI is attached to an inkling's session. Its wakes still go
+        // through the spawn path, where the owner test and profile run.
+        logger.warn('[Trigger] Inline delivery refused for an inkling — spawning instead', {
+          targetSlug,
+          routedSessionId: deliverySession.id,
+          threadKey: payload.threadKey,
         });
       }
 

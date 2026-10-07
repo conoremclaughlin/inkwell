@@ -31,9 +31,10 @@ import {
 import { cancelInklingTurns } from './inkling-turns';
 import { dropReplyChainsFor } from './inkling-reply-chain';
 import { logger } from '../../utils/logger';
+import { INKLING_CLIENT } from './inkling-client';
 
-/** The identity metadata tag for inklings born through this flow. */
-export const INKLING_CLIENT = 'inkling-mobile';
+/** The identity metadata tag for inklings born through this flow (defined in inkling-client.ts). */
+export { INKLING_CLIENT };
 
 /** The app's own limit (MAX_NAME_LENGTH), in Unicode code points. */
 export const MAX_DISPLAY_NAME_CODE_POINTS = 32;
