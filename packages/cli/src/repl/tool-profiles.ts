@@ -21,6 +21,13 @@ export interface ToolProfile {
   promptSpecs: string[];
   /** Tools to deny outright */
   denySpecs: string[];
+  /**
+   * The provider gets no native tools of its own and no directory grants on
+   * any spawn, for as long as the chat runs (backend-runner.ts,
+   * withholdProviderToolsForThisProcess). Every tool the turn has is then
+   * ink's, under this profile's rules.
+   */
+  withholdProviderTools?: true;
 }
 
 export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
@@ -74,6 +81,12 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
    * policy file of its own, so the machine's grants are never read at all;
    * these denials hold either way.
    *
+   * The provider's own tools are withheld as well. Claude Code's native Read
+   * was opened for any attachment it can't show inline, a document among
+   * them, on a spawn also granted the shared ~/.ink/files and the studios
+   * root, whose checkouts carry .env.local files (lane 2, measured on
+   * a0db3e57). Its reach is Claude Code's read policy, not this folder.
+   *
    * No allow list: one would narrow every tool to the names on it.
    */
   inkling: {
@@ -85,6 +98,7 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
     allowSpecs: [],
     promptSpecs: [],
     denySpecs: ['group:write', 'view_image', 'trigger_agent', 'send_response'],
+    withholdProviderTools: true,
   },
 };
 
@@ -144,13 +158,17 @@ export function applyProfile(
 export function applyLaunchProfile(
   policy: ToolPolicyState,
   name: string
-): { ok: true; message: string } | { ok: false; message: string } {
+): { ok: true; message: string; withholdProviderTools: boolean } | { ok: false; message: string } {
   if (!isValidProfileId(name)) {
     return { ok: false, message: `Unknown profile: ${name}. Valid: ${PROFILE_IDS.join(', ')}` };
   }
   const applied = applyProfile(policy, name);
   return applied.success
-    ? { ok: true, message: applied.message }
+    ? {
+        ok: true,
+        message: applied.message,
+        withholdProviderTools: TOOL_PROFILES[name].withholdProviderTools === true,
+      }
     : { ok: false, message: applied.message };
 }
 

@@ -386,4 +386,35 @@ describe('a launch profile (task 0321ccf1)', () => {
     expect(conflict).toBeLessThan(call);
     expect(source.slice(conflict, conflict + 300)).toMatch(/process\.exit\(78\)/);
   });
+
+  it('names the inkling as the one profile that withholds the provider tools', () => {
+    const withholding = PROFILE_IDS.filter((id) => TOOL_PROFILES[id].withholdProviderTools);
+    expect(withholding).toEqual(['inkling']);
+    expect(applyLaunchProfile(makePolicy(), 'inkling')).toMatchObject({
+      ok: true,
+      withholdProviderTools: true,
+    });
+    expect(applyLaunchProfile(makePolicy(), 'safe')).toMatchObject({
+      ok: true,
+      withholdProviderTools: false,
+    });
+  });
+
+  it('latches the withholding after the profile, or stops the chat without local routing on claude', () => {
+    const source = readFileSync(join(__dirname, '../commands/chat.ts'), 'utf8');
+    const applied = source.indexOf(
+      'profileWithholdsProviderTools = launchProfile.withholdProviderTools;'
+    );
+    const gate = source.indexOf(
+      'if (options.providerTools === false || profileWithholdsProviderTools) {'
+    );
+    expect(applied).toBeGreaterThan(-1);
+    expect(gate).toBeGreaterThan(applied);
+    const body = source.slice(gate, gate + 700);
+    expect(body).toMatch(
+      /if \(runtime\.toolRouting !== 'local' \|\| runtime\.backend !== 'claude'\) \{[\s\S]*?process\.exit\(78\);[\s\S]*?\}\s*withholdProviderToolsForThisProcess\(\);/
+    );
+    // The one call, and nothing that could undo it.
+    expect(source.split('withholdProviderToolsForThisProcess()').length - 1).toBe(1);
+  });
 });

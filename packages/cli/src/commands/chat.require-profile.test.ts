@@ -46,3 +46,21 @@ describe('ink chat --require-profile', () => {
     expect(ran).toBe(false);
   });
 });
+
+describe('ink chat --no-provider-tools (task 0321ccf1)', () => {
+  it('reaches the action as providerTools: false, and is absent (true) otherwise', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    for (const argv of [
+      ['chat', '--require-profile', 'inkling', '--no-provider-tools', '--away'],
+      ['chat', '--profile', 'safe', '--away'],
+    ]) {
+      const { program, chat } = chatCommand();
+      chat.action((options: Record<string, unknown>) => {
+        seen.push(options);
+      });
+      await program.parseAsync(['node', 'ink', ...argv]);
+    }
+    expect(seen[0]).toMatchObject({ requireProfile: 'inkling', providerTools: false });
+    expect(seen[1]).toMatchObject({ profile: 'safe', providerTools: true });
+  });
+});

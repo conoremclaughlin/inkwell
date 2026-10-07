@@ -410,8 +410,12 @@ export class InkRunner implements IRunner {
     // read. It names the profile with --require-profile, which a CLI built
     // before that option refuses as unknown before anything runs (Lumen,
     // #773): an old CLI would take --profile inkling, warn and carry on.
+    // --no-provider-tools does the same for the provider's own tools: Claude
+    // Code's native Read, which a document attachment opened, reaching past
+    // the inkling's folder. The profile implies it, so this is for the CLI
+    // built between the two, which takes the profile and not the option.
     if (config.inklingToolPolicyPath) {
-      args.push('--require-profile', 'inkling', '--away');
+      args.push('--require-profile', 'inkling', '--no-provider-tools', '--away');
     } else {
       args.push('--profile', 'safe', '--away');
     }
