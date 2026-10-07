@@ -171,6 +171,11 @@ const CANCELLED_UNCONFIRMED =
 const UNCONFIRMED_SUFFIX = ', but its processes did not confirm they had stopped';
 
 export class InkRunner implements IRunner {
+  // ink chat reads each --attach-file itself, as this user, and grants its
+  // backend only the file's own directory (packages/cli repl/attachments.ts),
+  // so an upload's original file is passed as is.
+  readonly uploadMedia = 'grant' as const;
+
   async run(
     message: string,
     options: {

@@ -46,6 +46,7 @@ import { spawn } from 'child_process';
 import { STOP_GRACE_MS } from './stop-process.js';
 import { clearInklingFences, fenceInkling } from '../inklings/inkling-stop-fence.js';
 import { carriedClassification, isRoutingRefusal } from '../../channels/trigger-retry.js';
+import { setUploadsRoot } from '../uploads/runtime.js';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -208,16 +209,19 @@ describe('SessionService', () => {
     };
 
     mockClaudeRunner = {
+      uploadMedia: 'grant',
       run: vi.fn().mockResolvedValue(createMockClaudeResult()),
     };
 
     mockCodexRunner = {
+      uploadMedia: 'grant',
       run: vi
         .fn()
         .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'codex-session-1' })),
     };
 
     mockInkRunner = {
+      uploadMedia: 'grant',
       run: vi.fn().mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
     };
 
@@ -2535,6 +2539,7 @@ describe('SessionService', () => {
     const OTHER = '0e1d2c3b-4a59-4687-9a8b-7c6d5e4f3a2b';
     const hostedService = () => {
       const hosted: IClaudeRunner = {
+        uploadMedia: 'refuse',
         run: vi
           .fn()
           .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
@@ -6130,6 +6135,86 @@ describe('SessionService', () => {
       expect(runOptions.mediaAttachments).toHaveLength(2);
       expect(runOptions.mediaAttachments![0].path).toBe('/tmp/photo1.jpg');
       expect(runOptions.mediaAttachments![1].path).toBe('/tmp/report.pdf');
+    });
+
+    describe('uploads at the dispatch seam (IRunner.uploadMedia)', () => {
+      const ROOT = '/home/u/.ink/uploads';
+      const upload = {
+        type: 'image' as const,
+        path: `${ROOT}/0a0a0a0a-0000-4000-8000-0000000000aa/1c1c1c1c-0000-4000-8000-0000000000cc/5a5a5a5a-0000-4000-8000-000000000001/5a5a5a5a-0000-4000-8000-000000000001.jpg`,
+      };
+      const photo = { type: 'image' as const, path: '/tmp/photo1.jpg' };
+
+      async function runWith(
+        policy: 'grant' | 'refuse',
+        media: Array<{ type: 'image'; path: string }> = [upload, photo],
+        content = 'Hello, Myra!',
+        triggerType?: 'agent'
+      ) {
+        (mockClaudeRunner as unknown as { uploadMedia: string }).uploadMedia = policy;
+        setUploadsRoot(ROOT);
+        try {
+          const session = createMockSession({ lifecycle: 'idle', backend: 'claude-code' });
+          vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+          await sessionService.handleMessage(
+            createMockRequest({ content, metadata: { media, triggerType } })
+          );
+          const [message, options] = vi.mocked(mockClaudeRunner.run).mock.calls[0];
+          return { message, attachments: options.mediaAttachments };
+        } finally {
+          setUploadsRoot(null);
+        }
+      }
+
+      it('never hands a refusing runner an upload, and tells the turn', async () => {
+        const { message, attachments } = await runWith('refuse');
+        expect(attachments).toEqual([photo]);
+        expect(
+          message.endsWith('\n\n(One attached file could not be opened in this runtime.)')
+        ).toBe(true);
+      });
+
+      it('leaves a refused upload’s path out of the prompt, and the rest as it was', async () => {
+        const { message } = await runWith('refuse');
+        expect(message).not.toContain(ROOT);
+        expect(message).toContain(
+          'Attachments:\n- image: /tmp/photo1.jpg\nView attached files with your file-reading tool'
+        );
+        expect(message).toContain('Hello, Myra!');
+        expect(message).toContain('From: TestUser');
+      });
+
+      it('keeps the rest of the request when it formats again', async () => {
+        const { message } = await runWith('refuse', [upload, photo], 'Hello, Myra!', 'agent');
+        expect(message).not.toContain(ROOT);
+        expect(message).toContain('[AGENT TRIGGER]');
+      });
+
+      it('lists no attachments when the only one was a refused upload', async () => {
+        const { message, attachments } = await runWith('refuse', [upload]);
+        expect(attachments).toBeUndefined();
+        expect(message).not.toContain(ROOT);
+        expect(message).not.toContain('Attachments:');
+        expect(message).toContain('Hello, Myra!');
+        expect(
+          message.endsWith('\n\n(One attached file could not be opened in this runtime.)')
+        ).toBe(true);
+      });
+
+      it('keeps what the person wrote as written, even when it names the path', async () => {
+        const content = `Is ${upload.path} the right one?`;
+        const { message } = await runWith('refuse', [upload, photo], content);
+        // Once, in their words; not again as an attachment.
+        expect(message.split(upload.path)).toHaveLength(2);
+        expect(message).toContain(content);
+      });
+
+      it('hands a granting runner its uploads with other media, unchanged', async () => {
+        const { message, attachments } = await runWith('grant');
+        expect(attachments).toEqual([upload, photo]);
+        expect(message).toContain(`- image: ${upload.path}\n- image: /tmp/photo1.jpg\n`);
+        expect(message).not.toContain('could not be opened');
+      });
     });
 
     it('formats full attachment paths into the message', async () => {

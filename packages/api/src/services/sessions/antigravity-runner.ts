@@ -34,10 +34,12 @@ import type {
   RunnerResult,
   ChannelResponse,
   IRunner,
+  MediaAttachment,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
+import { uploadDirsToGrant } from '../uploads/runner-media.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { ceilingFromEnv } from './turn-ceiling.js';
@@ -305,15 +307,20 @@ interface AgyResult {
 }
 
 export class AntigravityRunner implements IRunner {
+  readonly uploadMedia = 'grant' as const;
+
   async run(
     message: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
     const { backendSessionId, injectedContext, config } = options;
+    // Each attached upload's own directory, for this spawn only.
+    const uploadDirs = uploadDirsToGrant(options.mediaAttachments, !!config.container);
     const isResume = !!backendSessionId;
 
     // agy has no system-prompt flag, so identity has to ride in the message.
@@ -342,7 +349,7 @@ export class AntigravityRunner implements IRunner {
       // event loop is never blocked.
       await ensureInkStudiosRoot();
 
-      const args = buildAgyArgs(fullMessage, config, backendSessionId);
+      const args = buildAgyArgs(fullMessage, config, backendSessionId, uploadDirs);
       logger.info('Spawning Antigravity CLI', {
         isResume,
         backendSessionId: backendSessionId || '(new)',
@@ -869,7 +876,8 @@ export function isTurnSuccessful(result: { status?: string; finalTextResponse?: 
 export function buildAgyArgs(
   message: string,
   config: ClaudeRunnerConfig,
-  resumeConversationId?: string
+  resumeConversationId?: string,
+  uploadDirs: readonly string[] = []
 ): string[] {
   const args: string[] = [
     '-p',
@@ -888,6 +896,8 @@ export function buildAgyArgs(
   // One flat arg shape covers fresh and resume; the run path ensures the
   // directory exists first.
   args.push('--add-dir', inkStudiosRoot());
+  // Each attached upload's own directory (services/uploads/runner-media.ts).
+  for (const dir of uploadDirs) args.push('--add-dir', dir);
 
   if (resumeConversationId) {
     args.push('--conversation', resumeConversationId);

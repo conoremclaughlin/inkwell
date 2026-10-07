@@ -75,6 +75,11 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { evidenceMediaRoots } from './routes/admin';
+import { defaultUploadsRoot, inkDataDir, prepareUploadsRoot } from './services/uploads/layout';
+import { maintainUploads } from './services/uploads/maintenance';
+import { uploadsRootNeighbours } from './services/uploads/placement';
+import { setUploadsRoot, uploadsRoot } from './services/uploads/runtime';
 import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
 import { handleHangup } from './utils/hangup';
@@ -586,6 +591,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     logger.warn('ChannelGateway not available - response routing will fail');
   }
 
+  // Uploads stay off unless their root is inside ~/.ink and clear of the
+  // directories placement.ts lists. A placement check, not runner isolation
+  // (services/uploads/layout.ts).
+  const uploads = await prepareUploadsRoot(
+    env.INK_UPLOADS_DIR ?? defaultUploadsRoot(),
+    inkDataDir(),
+    uploadsRootNeighbours(await evidenceMediaRoots(), workingDirectory)
+  );
+  setUploadsRoot(uploads.ok ? uploads.rootReal : null);
+  if (uploads.ok) logger.info('Uploads root ready', { root: uploads.rootReal });
+  else logger.warn('Uploads are off', { reason: uploads.reason, detail: uploads.detail });
+
   // 6. Initialize heartbeat service for scheduled reminders
   // Useful for secondary/local dev servers where we want API/MCP without
   // participating in global reminder delivery.
@@ -895,6 +912,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         } catch (sweepErr) {
           logger.error('Lease sweep failed', {
             error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
+
+        // Uploads: orphan sweep, finishing removals, and the claim
+        // reconciler. Inside this gate, and gated again on the same flags.
+        try {
+          const report = await maintainUploads({
+            db: dataComposer!.getClient(),
+            root: uploadsRoot(),
+            now: Date.now,
+          });
+          const { skipped, ...counts } = report;
+          if (!skipped && Object.values(counts).some((count) => count > 0)) {
+            logger.info('Uploads maintenance complete', counts);
+          }
+        } catch (uploadsErr) {
+          logger.error('Uploads maintenance failed', {
+            error: uploadsErr instanceof Error ? uploadsErr.message : String(uploadsErr),
           });
         }
       },

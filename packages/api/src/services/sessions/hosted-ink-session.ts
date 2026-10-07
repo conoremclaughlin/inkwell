@@ -427,6 +427,10 @@ export function parseHostedInkSbIds(value: string | undefined): ReadonlySet<stri
 }
 
 export class HostedInkSessionRunner implements IRunner {
+  // As constructed by the server it refuses every turn (no executor), so it
+  // takes no uploads; session-service drops them and tells the turn.
+  readonly uploadMedia = 'refuse' as const;
+
   private readonly settleMs: number;
   private readonly prepareMs: number;
 

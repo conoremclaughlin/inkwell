@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
 import { isUuid } from './inklings/inkling-service';
+import { mediaUploadIds } from './uploads/claims';
 
 /** The unique index that makes a second copy of one client message impossible. */
 export const CLIENT_MESSAGE_INDEX = 'inbox_thread_messages_thread_client_message_key';
@@ -284,13 +285,26 @@ function sameCreateRequest(metadata: Record<string, unknown> | null, request: Cr
   );
 }
 
+function sameUploads(
+  metadata: Record<string, unknown> | null,
+  uploads: readonly string[]
+): boolean {
+  const stored = mediaUploadIds(metadata);
+  return (
+    stored !== null &&
+    stored.length === uploads.length &&
+    stored.every((id, i) => id === uploads[i])
+  );
+}
+
 /**
  * Has this client message id already stored a message in this thread? The
  * caller has checked the person's workspace role; the sender check here is
  * what keeps a replay to the person who sent the original. A replay must
  * come from the same person with the same words, naming the same members to
- * wake (`wake`, from wakeRequestOf) and, for a create, the same recipients
- * and title (`createRequest`); anything else is a conflict.
+ * wake (`wake`, from wakeRequestOf), attaching exactly the same uploads
+ * (`uploads`, sorted; none when absent) and, for a create, the same
+ * recipients and title (`createRequest`); anything else is a conflict.
  */
 export async function lookUpClientMessage(
   supabase: SupabaseClient,
@@ -300,6 +314,8 @@ export async function lookUpClientMessage(
     userId: string;
     content: string;
     wake: string[] | null;
+    /** The send's upload ids, sorted (canonicalManifest). Absent: it attaches none. */
+    uploads?: readonly string[];
     createRequest?: CreateRequest;
   }
 ): Promise<ReplayLookup> {
@@ -317,6 +333,7 @@ export async function lookUpClientMessage(
     stored.sender_user_id === input.userId &&
     stored.content === input.content &&
     sameWakeRequest(stored.metadata, input.wake) &&
+    sameUploads(stored.metadata, input.uploads ?? []) &&
     (input.createRequest === undefined || sameCreateRequest(stored.metadata, input.createRequest));
   if (!sameSend) return { kind: 'conflict' };
   return {

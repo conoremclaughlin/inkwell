@@ -1030,6 +1030,15 @@ export type ClaudeRunnerResult = RunnerResult;
 
 export interface IRunner {
   /**
+   * What this runner does with a person's uploads among a turn's attachments
+   * (services/uploads/runner-media.ts). `grant`: it gives its backend each
+   * upload's own directory for that spawn only, never the uploads root.
+   * `refuse`: session-service drops the uploads before the run and tells the
+   * turn. Required, so a new runner cannot compile without choosing.
+   */
+  readonly uploadMedia: 'grant' | 'refuse';
+
+  /**
    * Run a message through a backend CLI.
    * Spawns process with --resume or equivalent as appropriate.
    */
