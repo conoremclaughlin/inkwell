@@ -105,29 +105,28 @@ export interface EncodedMedia {
    * reopens native read — the failure is reported loudly instead.
    */
   rejected: Array<{ media: TurnMedia; reason: string }>;
+  /** Raw bytes embedded, so a second batch can share the same request budget. */
+  totalBytes: number;
 }
 
 /** Encode injection candidates; the read fn is injectable for unit tests. */
 export function encodeMediaBlocks(
   candidates: TurnMedia[],
-  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded,
+  budgetBytes: number = MAX_MEDIA_TOTAL_BYTES
 ): EncodedMedia {
-  const out: EncodedMedia = { blocks: [], injected: [], rejected: [] };
-  let totalBytes = 0;
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
   for (const m of candidates) {
-    if (totalBytes >= MAX_MEDIA_TOTAL_BYTES) {
+    if (out.totalBytes >= budgetBytes) {
       out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
       continue;
     }
-    const buf = readBounded(
-      m.path,
-      Math.min(MAX_MEDIA_FILE_BYTES, MAX_MEDIA_TOTAL_BYTES - totalBytes)
-    );
+    const buf = readBounded(m.path, Math.min(MAX_MEDIA_FILE_BYTES, budgetBytes - out.totalBytes));
     if (!buf) {
       out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
       continue;
     }
-    totalBytes += buf.byteLength;
+    out.totalBytes += buf.byteLength;
     out.blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: m.mimeType, data: buf.toString('base64') },
@@ -135,6 +134,34 @@ export function encodeMediaBlocks(
     out.injected.push(m);
   }
   return out;
+}
+
+/**
+ * Tool-captured images as content blocks, each preceded by a one-line label
+ * naming its ref, so a spawn carrying several (a re-seed delivers every image
+ * still on the ledger) says which picture is which. Shares the request's
+ * media budget with the turn's own attachments, which are encoded first.
+ */
+export function encodeContextImageBlocks(
+  images: TurnMedia[],
+  usedBytes: number,
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
+): EncodedMedia {
+  const encoded = encodeMediaBlocks(
+    images,
+    readBounded,
+    Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes)
+  );
+  const labelled: Array<Record<string, unknown>> = [];
+  encoded.injected.forEach((image, i) => {
+    const ref = (image as { ref?: unknown }).ref;
+    labelled.push({
+      type: 'text',
+      text: `[image ${typeof ref === 'string' ? ref : image.path}]`,
+    });
+    labelled.push(encoded.blocks[i]!);
+  });
+  return { ...encoded, blocks: labelled };
 }
 
 /**
@@ -160,6 +187,8 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly binary = 'claude';
   // Prompt is delivered via stdin (see prepare() below) — no argv ceiling.
   readonly promptTransport = 'stdin' as const;
+  // Embedded as stream-json image blocks alongside the prompt.
+  readonly acceptsContextImages = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(
@@ -204,7 +233,32 @@ export class ClaudeAdapter implements BackendAdapter {
         '(fail-closed; no filesystem fallback). Tell the user, naming each file:\n' +
         encoded.rejected.map((r) => `- ${r.media.path} — ${r.reason}`).join('\n');
     }
-    const injecting = (encoded?.blocks.length ?? 0) > 0;
+    // Images a tool put in context. Embedded whenever the host sends them —
+    // it sends exactly what this provider session has not been given — and
+    // kept out of the --tools gate below, which reads `media` alone.
+    const contextImages = config.prompt ? (config.contextImages ?? []) : [];
+    const encodedContext =
+      contextImages.length > 0
+        ? encodeContextImageBlocks(contextImages, encoded?.totalBytes ?? 0)
+        : undefined;
+    if (encodedContext && encodedContext.rejected.length > 0) {
+      for (const r of encodedContext.rejected) {
+        console.warn(`[media] context image not injected (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote +=
+        '\n\n[image note] These image(s), named in your context, could NOT be attached to ' +
+        'this message, so you have not seen them. Each goes again with your next message ' +
+        'while it stays in your context; evict it if you no longer need it, or view the ' +
+        'file again if the reason is that it is unreadable:\n' +
+        encodedContext.rejected
+          .map((r) => {
+            const ref = (r.media as { ref?: unknown }).ref;
+            return `- ${typeof ref === 'string' ? ref : 'image'} — ${r.reason}`;
+          })
+          .join('\n');
+    }
+    const imageBlocks = [...(encoded?.blocks ?? []), ...(encodedContext?.blocks ?? [])];
+    const injecting = imageBlocks.length > 0;
     const promptText = config.prompt ? config.prompt + rejectionNote : config.prompt;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
@@ -374,7 +428,7 @@ export class ClaudeAdapter implements BackendAdapter {
           type: 'user',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: promptText }, ...(encoded?.blocks ?? [])],
+            content: [{ type: 'text', text: promptText }, ...imageBlocks],
           },
         }) + '\n';
     }
@@ -395,6 +449,12 @@ export class ClaudeAdapter implements BackendAdapter {
       },
       cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),
+      // Encoded images ride the stream-json message above (encoding needs a
+      // prompt, and a prompt with blocks always switches to stream-json), so
+      // what was injected is exactly what this spawn carries.
+      ...(encodedContext && encodedContext.injected.length > 0
+        ? { contextImagesDelivered: encodedContext.injected }
+        : {}),
     };
   }
 

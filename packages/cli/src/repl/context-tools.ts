@@ -557,6 +557,9 @@ function handleListContext(
             tokens: e.approxTokens,
             age: e.createdAt,
             preview: e.preview,
+            // An image's cost is in `tokens` already; this says which part of
+            // it is the picture, so evicting a large entry is not a guess.
+            ...(e.images ? { images: e.images } : {}),
           })),
         }),
       },
