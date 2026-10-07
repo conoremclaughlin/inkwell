@@ -144,6 +144,11 @@ export interface FailureNoticeAddress {
   senderOwnerUserId?: string;
   /** The thread is an inkling's conversation: marked so on its row. */
   inklingConversation?: boolean;
+  /**
+   * The thread's row could not be read, so whether it is an inkling's
+   * conversation is unknown. A notice treats that as one that might be.
+   */
+  threadUnreadable?: boolean;
   /** The failed target, when it is an inkling: its chosen name, or null while unnamed. */
   targetInkling?: { displayName: string | null };
 }
@@ -177,11 +182,12 @@ export async function resolveFailureNoticeAddress(
   }
   if (threadId) {
     out.threadId = threadId;
-    const { data: thread } = await client
+    const { data: thread, error: threadError } = await client
       .from('inbox_threads')
       .select('workspace_id, metadata')
       .eq('id', threadId)
       .single();
+    if (threadError || !thread) out.threadUnreadable = true;
     out.threadWorkspaceId = (thread?.workspace_id as string | undefined) ?? undefined;
     const threadMetadata = thread?.metadata as Record<string, unknown> | null | undefined;
     if (threadMetadata?.[INKLING_CONVERSATION_MARK] === true) out.inklingConversation = true;

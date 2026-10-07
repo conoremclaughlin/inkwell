@@ -61,6 +61,25 @@ function withFailingTargetRead(db: Db, targetSbId: string): Db {
   return db;
 }
 
+/** The thread row's own read fails; its insert still works. */
+function withFailingThreadRead(db: Db): Db {
+  const from = db.from.bind(db);
+  db.from = ((table: string) => {
+    const q = from(table);
+    if (table !== 'inbox_threads') return q;
+    return {
+      ...q,
+      select: () => {
+        const chain = q.select('*');
+        chain.single = (() =>
+          Promise.resolve({ data: null, error: { message: 'thread read failed' } })) as never;
+        return chain;
+      },
+    };
+  }) as never;
+  return db;
+}
+
 /** The thread lane's insert fails, as when the thread row is gone. */
 function withFailingThreadInsert(db: Db): Db {
   const from = db.from.bind(db);
@@ -261,18 +280,26 @@ describe('handleTriggerFailure', () => {
 
 describe("in an inkling's own conversation, the notice is for its person (task 935af241)", () => {
   const INKLING = { client: 'inkling-mobile', ownerTest: true };
-  const inklingWorld = (named: boolean, marked = true) =>
+  const inklingWorld = (
+    named: boolean,
+    marked = true,
+    target: 'inkling' | 'missing' | 'no-metadata' = 'inkling'
+  ) =>
     client({
       agent_identities: [
         ...identities.map((i) => ({ ...i })),
-        {
-          id: 'sb-ink',
-          agent_id: 'kindle-0a1b2c3d',
-          user_id: 'user-a',
-          workspace_id: 'ws-a',
-          name: named ? 'Pip' : 'unnamed inkling',
-          metadata: { ...INKLING, named },
-        },
+        ...(target === 'missing'
+          ? []
+          : [
+              {
+                id: 'sb-ink',
+                agent_id: 'kindle-0a1b2c3d',
+                user_id: 'user-a',
+                workspace_id: 'ws-a',
+                name: named ? 'Pip' : 'unnamed inkling',
+                metadata: target === 'no-metadata' ? null : { ...INKLING, named },
+              },
+            ]),
       ],
       inbox_threads: [
         {
@@ -363,18 +390,50 @@ describe("in an inkling's own conversation, the notice is for its person (task 9
     });
   });
 
-  it("is today's notice anywhere else: a thread without the mark, or a target that isn't an inkling", async () => {
-    const unmarked = inklingWorld(true, false);
-    await handleTriggerFailure(unmarked, fromThePerson(timeout) as never, deps);
-    const notice = await theNotice(unmarked);
-    expect(notice.content).toContain('Trigger to kindle-0a1b2c3d failed');
-    expect(notice.metadata).toMatchObject({
-      errorSummary: expect.any(String),
-      errorDetail: timeout.message,
-    });
-
+  it("is today's notice on a readable, unmarked thread whose target is an SB", async () => {
     const db = client();
     await handleTriggerFailure(db, threadBorne, deps);
-    expect((await theNotice(db)).metadata).toMatchObject({ errorDetail: 'runner exited 1' });
+    const notice = await theNotice(db);
+    expect(notice.content).toContain('Trigger to lumen failed');
+    expect(notice.metadata).toMatchObject({ errorDetail: 'runner exited 1' });
+    // Its target unreadable changes nothing there: no inkling can be in an unmarked thread.
+    const unreadable = withFailingTargetRead(client(), 'sb-b');
+    await handleTriggerFailure(unreadable, threadBorne, deps);
+    expect((await theNotice(unreadable)).content).toContain('Trigger to lumen failed');
+  });
+
+  it('is for the person wherever an inkling could be reading (Lumen, #771)', async () => {
+    const plain =
+      "Your inkling couldn't answer that message. If you asked your inkling to do something, check whether it's done before sending it again.";
+    const pip =
+      "Pip couldn't answer that message. If you asked Pip to do something, check whether it's done before sending it again.";
+    const cases: Array<[string, Db, string]> = [
+      // A marked conversation, whatever its target reads as.
+      ['target unreadable', withFailingTargetRead(inklingWorld(true), 'sb-ink'), plain],
+      ['target missing', inklingWorld(true, true, 'missing'), plain],
+      ['target without metadata', inklingWorld(true, true, 'no-metadata'), plain],
+      // An inkling target, even where the mark is missing.
+      ['unmarked thread, inkling target', inklingWorld(true, false), pip],
+      // A thread that can't be read, whatever its target: it could be a conversation.
+      ['thread unreadable', withFailingThreadRead(inklingWorld(true)), pip],
+    ];
+    for (const [label, db, expected] of cases) {
+      await handleTriggerFailure(
+        db,
+        fromThePerson(new Error('private-diagnostic-marker timeout')) as never,
+        deps
+      );
+      const notice = await theNotice(db);
+      expect(notice.content, label).toBe(expected);
+      expect(JSON.stringify(notice), label).not.toContain('private-diagnostic-marker');
+    }
+  });
+
+  it('treats an unreadable thread as one a person may read, even with an SB target', async () => {
+    const db = withFailingThreadRead(client());
+    await handleTriggerFailure(db, threadBorne, deps);
+    const notice = await theNotice(db);
+    expect(notice.content).toBe("Your inkling can't answer right now. Try again later.");
+    expect(JSON.stringify(notice)).not.toContain('runner exited 1');
   });
 });

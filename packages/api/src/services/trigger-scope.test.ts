@@ -211,6 +211,29 @@ describe('resolveFailureNoticeAddress', () => {
     });
     expect((await ask(false)).targetInkling).toEqual({ displayName: null });
     expect((await ask(true, false)).inklingConversation).toBeUndefined();
+    // A thread that can't be read is said so, never read as unmarked.
+    const failing = inklingWorld(true, true);
+    const from = failing.from.bind(failing);
+    failing.from = ((table: string) => {
+      const q = from(table);
+      if (table !== 'inbox_threads') return q;
+      return {
+        ...q,
+        select: () => {
+          const chain = q.select('*');
+          chain.single = (() =>
+            Promise.resolve({ data: null, error: { message: 'down' } })) as never;
+          return chain;
+        },
+      };
+    }) as never;
+    const unread = await resolveFailureNoticeAddress(failing as never, {
+      threadId: 'thread-ink',
+      toSbId: 'sb-ink',
+    });
+    expect(unread).toMatchObject({ threadUnreadable: true });
+    expect(unread.inklingConversation).toBeUndefined();
+    expect((await ask(true)).threadUnreadable).toBeUndefined();
     // Another SB is no inkling.
     expect(
       (

@@ -309,7 +309,44 @@ describe('error text in an inkling conversation (task 935af241)', () => {
     tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
     tables.messages = [oldNotice];
     const [notice] = await served();
-    expect(notice.metadata).toEqual({ triggerFailure: true, errorCategory: 'timeout' });
+    expect(notice.metadata).toEqual({
+      triggerFailure: true,
+      errorCategory: 'timeout',
+      inklingNotice: true,
+    });
+  });
+
+  it("shows an old notice's developer line in plain words, and leaves every other message as written (Lumen, #771)", async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    const plainNotice = {
+      ...oldNotice,
+      id: 'm-new',
+      content: "Pip couldn't answer yet and is trying again. No need to send your message again.",
+      metadata: { triggerFailure: true, inklingNotice: true, errorCategory: 'timeout' },
+    };
+    const closed = {
+      ...oldNotice,
+      id: 'm-closed',
+      content: 'closed',
+      message_type: 'system',
+      metadata: { closed: true },
+    };
+    const person = {
+      ...oldNotice,
+      id: 'm-person',
+      sender_kind: 'user',
+      sender_user_id: 'user-a',
+      content: 'Trigger to kindle-1 failed: my own words',
+      metadata: null,
+    };
+    tables.messages = [person, closed, plainNotice, oldNotice];
+    const served_ = (await served()) as unknown as Array<{ id: string; content: string }>;
+    const byId = new Map(served_.map((m) => [m.id, m.content]));
+    expect(byId.get('m-fail')).toBe("Your inkling couldn't answer a message.");
+    expect(byId.get('m-new')).toBe(plainNotice.content);
+    expect(byId.get('m-closed')).toBe('closed');
+    expect(byId.get('m-person')).toBe('Trigger to kindle-1 failed: my own words');
+    expect(JSON.stringify(served_)).not.toContain('no output for 300s');
   });
 
   it('is served as stored outside an inkling conversation, and on a message that is not the system', async () => {

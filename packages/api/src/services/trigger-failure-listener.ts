@@ -158,8 +158,14 @@ export async function handleTriggerFailure(
     resolvedThreadWorkspaceId = address.threadWorkspaceId;
     recipientUserId = address.targetOwnerUserId;
     senderOwnerUserId = address.senderOwnerUserId;
-    if (address.inklingConversation && address.targetInkling) {
-      inklingNoticeFor = address.targetInkling;
+    // For a person whenever it could be: an inkling's conversation, whatever
+    // its target reads as (an identity that can't be read, or has no row or
+    // metadata, is no proof of anything); a thread that can't be read; or an
+    // inkling target. Every thread holding an inkling is marked when it is
+    // created, so only a readable, unmarked thread with an SB target keeps
+    // the developer notice (Lumen, #771).
+    if (address.inklingConversation || address.threadUnreadable || address.targetInkling) {
+      inklingNoticeFor = address.targetInkling ?? { displayName: null };
     }
   }
 

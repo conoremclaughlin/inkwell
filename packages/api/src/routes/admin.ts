@@ -8358,23 +8358,32 @@ const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
  * was drawn from (the whole thread, or everything older than the cursor),
  * so `meta.truncated` always means "there is more, further back".
  */
+/** What a trigger-failure notice from before its inkling wording says to a person. */
+export const LEGACY_INKLING_FAILURE_TEXT = "Your inkling couldn't answer a message.";
+
 /**
- * A message's metadata as a reader receives it. In an inkling's conversation
- * a system message never carries error text: a trigger-failure notice
- * written before its inkling wording existed still holds the raw error
- * (task 935af241, Myra).
+ * A message as a reader receives it. In an inkling's conversation a system
+ * message never carries error text (task 935af241, Myra): its error keys are
+ * dropped, and a trigger-failure notice written before its inkling wording
+ * existed, whose body is the developer line, is shown in plain words as a
+ * status line (Lumen, #771). Every other message is served as stored.
  */
-function metadataForReader(
-  message: { sender_kind: string; metadata: unknown },
+function messageForReader(
+  message: { sender_kind: string; content: string; metadata: unknown },
   threadMetadata: unknown
-): Record<string, unknown> | null {
+): { content: string; metadata: Record<string, unknown> | null } {
   const metadata = (message.metadata as Record<string, unknown> | null) ?? null;
   const inklingConversation =
     (threadMetadata as Record<string, unknown> | null)?.[INKLING_CONVERSATION_MARK] === true;
-  if (!metadata || !inklingConversation || message.sender_kind !== 'system') return metadata;
+  if (!metadata || !inklingConversation || message.sender_kind !== 'system') {
+    return { content: message.content, metadata };
+  }
   const shown = { ...metadata };
   for (const key of FAILURE_NOTICE_ERROR_KEYS) delete shown[key];
-  return shown;
+  if (shown.triggerFailure === true && shown.inklingNotice !== true) {
+    return { content: LEGACY_INKLING_FAILURE_TEXT, metadata: { ...shown, inklingNotice: true } };
+  }
+  return { content: message.content, metadata: shown };
 }
 
 router.get('/threads/messages', async (req: Request, res: Response) => {
@@ -8543,10 +8552,9 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           senderName: senderName(m),
           isOwn:
             m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
-          content: m.content,
+          ...messageForReader(m, thread.metadata),
           messageType: m.message_type,
           priority: m.priority,
-          metadata: metadataForReader(m, thread.metadata),
           createdAt: m.created_at,
           ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))
