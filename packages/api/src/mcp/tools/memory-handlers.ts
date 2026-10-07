@@ -363,6 +363,7 @@ const topicsSchema = z
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
+import { presenceRefused } from '../../services/inklings/poll-gate';
 import {
   actorOwnerSbId,
   resolveMemoryActor,
@@ -1489,10 +1490,12 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   // Persist CLI-attached flag from request context to session record.
   // This tells the trigger handler to route messages to the pending queue
   // instead of spawning a new process.
+  // Never for an inkling (poll-gate.ts): the row may be an existing one linked
+  // to this transcript, so a refused stamp writes false, not nothing.
   const reqCtx = getRequestContext();
   if (reqCtx?.cliAttached) {
     await dataComposer.repositories.memory.updateSession(session.id, {
-      cliAttached: true,
+      cliAttached: !(await presenceRefused(dataComposer.getClient(), session.sbId)),
     });
   }
 
@@ -2309,7 +2312,10 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     updates.backendSessionId = params.backendSessionId;
   }
   if (params.cliAttached !== undefined) {
-    updates.cliAttached = params.cliAttached;
+    // An inkling's session is never marked attached (poll-gate.ts); a refused
+    // true clears the flag rather than leaving an earlier one standing.
+    updates.cliAttached =
+      params.cliAttached && !(await presenceRefused(dataComposer.getClient(), priorSession?.sbId));
   }
   if (params.context !== undefined) {
     updates.context = params.context;

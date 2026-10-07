@@ -40,6 +40,14 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
 });
 
 // Mock logger
+// The inkling poll gate (poll-gate.ts): these suites' callers are ordinary
+// SBs, so it answers "may read" unless a test says otherwise. The gate itself
+// is tested over a real classification in services/inklings/poll-gate.test.ts.
+const pollGate = vi.hoisted(() => ({ refusal: vi.fn(async (): Promise<string | null> => null) }));
+vi.mock('../../services/inklings/poll-gate.js', () => ({
+  pollReaderRefusal: pollGate.refusal,
+  presenceRefused: vi.fn(async () => false),
+}));
 vi.mock('../../utils/logger', () => ({
   logger: {
     info: vi.fn(),
@@ -2433,6 +2441,27 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     expect(mockSb.getEqCalls()['sessions']).toContainEqual(['id', 'session-mock-123']);
     const sessionEqCols = (mockSb.getEqCalls()['sessions'] || []).map((c) => c[0]);
     expect(sessionEqCols).toContain('user_id');
+  });
+
+  // #779: a polling client never reads as an inkling, before anything is
+  // read or any pointer moves (poll-gate.ts).
+  it('returns nothing and touches no mail when the session is an inkling’s', async () => {
+    pollGate.refusal.mockResolvedValueOnce(
+      "an inkling's mail is never delivered to a polling client"
+    );
+    const mockSb = createScopedPollMockSupabase();
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.count).toBe(0);
+    const tables = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tables).not.toContain('agent_inbox');
+    expect(tables).not.toContain('inbox_thread_messages');
+    expect(tables).not.toContain('agent_inbox_read_status');
+    expect(mockSb.rpc).not.toHaveBeenCalled();
   });
 
   it('fails closed when the session agent does not match the pinned identity (round 3)', async () => {
