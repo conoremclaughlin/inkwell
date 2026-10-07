@@ -9,10 +9,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { LOCAL_TOOL_CALL_PLACEHOLDER } from '@inklabs/shared';
 import {
   applyChannelForward,
   attributeResponses,
+  createTurnReplyForwarder,
   decideChannelForward,
+  decideTurnReply,
   hasDeliveryEvidence,
   type ChannelForwardDecision,
   type ChannelForwardPayload,
@@ -109,6 +112,20 @@ describe('decideChannelForward', () => {
       action: 'explicit-response',
     });
   });
+
+  /**
+   * An ink turn that ended on tool calls stores this placeholder as its text,
+   * and an ink run's final text is its last turn's. Forwarded, the user got a
+   * line about a transcript they cannot see.
+   */
+  it.each([
+    ['bare', LOCAL_TOOL_CALL_PLACEHOLDER],
+    ['padded', `\n${LOCAL_TOOL_CALL_PLACEHOLDER}  `],
+  ])('treats the %s tool-call placeholder as no final text', (_label, text) => {
+    expect(
+      decideChannelForward({ hadExplicitResponse: false, success: true, finalTextResponse: text })
+    ).toEqual({ action: 'nothing-delivered', reason: 'no-final-text' });
+  });
 });
 
 /**
@@ -190,12 +207,292 @@ describe('applyChannelForward', () => {
     }
   );
 
-  it('stays quiet at debug when the agent answered explicitly', async () => {
+  /**
+   * A skip is a decision not to deliver the run's text. At debug it was not
+   * persisted, so when the skip was wrong (task 0eb376e5) nothing showed it.
+   */
+  it('logs the explicit-response skip at info, with the text it held back', async () => {
     const { fx, released, calls } = spyEffects();
-    await applyChannelForward({ action: 'explicit-response' }, ctx, fx);
-    expect(calls.debug).toHaveLength(1);
+    await applyChannelForward(
+      { action: 'explicit-response' },
+      { ...ctx, hadExplicitResponse: true, finalTextLength: 42 },
+      fx
+    );
+    expect(calls.info).toHaveLength(1);
+    expect(calls.info[0]![1]).toMatchObject({ hadExplicitResponse: true, finalTextLength: 42 });
+    expect(calls.debug).toHaveLength(0);
     expect(calls.warn).toHaveLength(0);
     expect(released).toEqual([undefined]);
+  });
+});
+
+/**
+ * A spawned ink chat runs several outer turns, and the whole-run rule above
+ * lost replies two ways (task 0eb376e5, Myra's Telegram run of 2026-10-03):
+ * only the last turn's text was considered, and a send_response in any turn
+ * suppressed every turn's text. Her reply was turn 1's text; turn 2 called
+ * send_response; turn 3 ended on a tool call. The whole-run rule saw a marker
+ * and forwarded nothing.
+ */
+describe('decideTurnReply', () => {
+  it('forwards a turn that wrote text and sent nothing here', () => {
+    expect(decideTurnReply({ sentHere: false, text: 'the reply' })).toEqual({
+      action: 'forward',
+      content: 'the reply',
+    });
+  });
+
+  it("keeps a turn's text back when that turn delivered here through send_response", () => {
+    expect(decideTurnReply({ sentHere: true, text: 'Sent it.' })).toEqual({
+      action: 'explicit-response',
+    });
+  });
+
+  it.each([
+    ['null', null],
+    ['blank', '  \n'],
+    ['the tool-call placeholder', LOCAL_TOOL_CALL_PLACEHOLDER],
+  ])('has nothing to forward for %s text', (_label, text) => {
+    expect(decideTurnReply({ sentHere: false, text })).toEqual({ action: 'no-text' });
+  });
+});
+
+describe('createTurnReplyForwarder', () => {
+  const HERE = { channel: 'telegram', conversationId: '100200300' };
+
+  function harness(options: { send?: (p: ChannelForwardPayload) => Promise<void> } = {}) {
+    // The conversation's explicit-send marker, as consumeExplicitResponse
+    // reads it: read and cleared in one step.
+    let marker = false;
+    let markerReads = 0;
+    const sent: ChannelForwardPayload[] = [];
+    const log = { info: [] as unknown[][], warn: [] as unknown[][], error: [] as unknown[][] };
+    let releases = 0;
+    const forwarder = createTurnReplyForwarder(HERE, {
+      consumeExplicitResponse: () => {
+        markerReads += 1;
+        const had = marker;
+        marker = false;
+        return had;
+      },
+      send: async (payload) => {
+        if (options.send) await options.send(payload);
+        sent.push(payload);
+      },
+      info: (m, meta) => log.info.push([m, meta]),
+      warn: (m, meta) => log.warn.push([m, meta]),
+      error: (m, meta) => log.error.push([m, meta]),
+      release: async () => {
+        releases += 1;
+      },
+    });
+    return {
+      forwarder,
+      sent,
+      log,
+      releases: () => releases,
+      /** A send_response to this conversation landed: the server set the marker. */
+      setMarker: () => {
+        marker = true;
+      },
+      markerStanding: () => marker,
+      markerReads: () => markerReads,
+    };
+  }
+
+  const turn = (
+    n: number,
+    text: string | null,
+    sends: Array<{ channel: string; conversationId: string }> = []
+  ) => ({
+    turn: n,
+    label: n === 1 ? 'telegram' : 'continuation',
+    text,
+    sends,
+    sessionId: 'session-of-the-run',
+  });
+
+  it("delivers Myra's turn-1 reply, and nothing the send_response turn wrote", async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'Here is the answer you asked for.'));
+    h.setMarker(); // turn 2's send_response
+    await h.forwarder.onTurnReply(turn(2, 'The reply went out by send_response.', [HERE]));
+    await h.forwarder.onTurnReply(turn(3, null)); // ended on signal_status
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent).toEqual([
+      {
+        content: 'Here is the answer you asked for.',
+        format: 'markdown',
+        sessionId: 'session-of-the-run',
+      },
+    ]);
+    expect(h.forwarder.turnsSeen).toBe(3);
+    expect(h.releases()).toBe(1);
+    expect(h.log.warn).toHaveLength(0);
+    expect(h.log.info.at(-1)).toEqual([
+      'Run replies settled',
+      expect.objectContaining({ forwardedTurns: [1], explicitTurns: [2], turnsSeen: 3 }),
+    ]);
+    // The rule this replaces, on the same run: the last text, and a marker.
+    expect(
+      decideChannelForward({ hadExplicitResponse: true, success: true, finalTextResponse: null })
+    ).toEqual({ action: 'explicit-response' });
+  });
+
+  it('forwards every turn that wrote a reply without sending one, in order', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'first'));
+    await h.forwarder.onTurnReply(turn(2, 'second'));
+    await h.forwarder.finish({ success: true });
+    expect(h.sent.map((p) => p.content)).toEqual(['first', 'second']);
+  });
+
+  /**
+   * Lumen's reproduction on PR #735: turn 1's stdout line arrived split, and
+   * turn 2's send_response set the conversation marker before the rest of it
+   * did. A forwarder that read the marker per turn took turn 2's send for
+   * turn 1's, dropped turn 1's reply and forwarded turn 2's already-sent text.
+   * Nothing orders an MCP request against a stdout line; each turn now says
+   * what it sent on its own line.
+   */
+  it("a marker set by a later turn's send does not keep an earlier reply back", async () => {
+    const h = harness();
+    h.setMarker(); // turn 2's send lands before turn 1's line is complete
+    await h.forwarder.onTurnReply(turn(1, 'turn one reply'));
+    await h.forwarder.onTurnReply(turn(2, 'already sent by turn two', [HERE]));
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent.map((p) => p.content)).toEqual(['turn one reply']);
+    expect(h.log.info.at(-1)![1]).toMatchObject({ forwardedTurns: [1], explicitTurns: [2] });
+    // Read once, at the end, and cleared there.
+    expect(h.markerReads()).toBe(1);
+    expect(h.markerStanding()).toBe(false);
+  });
+
+  it.each([
+    ['another channel', { channel: 'whatsapp', conversationId: '100200300' }],
+    ['another conversation', { channel: 'telegram', conversationId: '999888777' }],
+  ])('a send to %s does not stand in for the reply here', async (_label, elsewhere) => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'the reply for this conversation', [elsewhere]));
+    await h.forwarder.finish({ success: true });
+    expect(h.sent.map((p) => p.content)).toEqual(['the reply for this conversation']);
+  });
+
+  it('keeps replies in turn order when an earlier send is slow', async () => {
+    let releaseFirstSend!: () => void;
+    const firstSendHeld = new Promise<void>((resolve) => {
+      releaseFirstSend = resolve;
+    });
+    const started: string[] = [];
+    const h = harness({
+      send: async (p) => {
+        started.push(p.content);
+        if (p.content === 'first') await firstSendHeld;
+      },
+    });
+    void h.forwarder.onTurnReply(turn(1, 'first'));
+    void h.forwarder.onTurnReply(turn(2, 'second'));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(started).toEqual(['first']);
+    const finished = h.forwarder.finish({ success: true });
+    expect(h.releases()).toBe(0);
+    releaseFirstSend();
+    await finished;
+    expect(h.sent.map((p) => p.content)).toEqual(['first', 'second']);
+    expect(h.releases()).toBe(1);
+  });
+
+  it('forwards the original text, whitespace and all', async () => {
+    const markdown = '  - nested item\n\n    ```\n    code\n    ```\n';
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, markdown));
+    expect(h.sent[0]!.content).toBe(markdown);
+  });
+
+  it.each([
+    ['no-final-text', true],
+    ['run-failed', false],
+  ] as const)('warns when the run delivered nothing (%s)', async (reason, success) => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, null));
+    await h.forwarder.onTurnReply(turn(2, '   '));
+    await h.forwarder.finish({ success });
+    expect(h.sent).toEqual([]);
+    expect(h.log.warn).toEqual([
+      ['Nothing delivered to the user for this run', expect.objectContaining({ reason })],
+    ]);
+    expect(h.releases()).toBe(1);
+  });
+
+  it('reports a failed send as a turn that reached nobody, and warns if it was the only one', async () => {
+    const h = harness({
+      send: async () => {
+        throw new Error('telegram 502');
+      },
+    });
+    await h.forwarder.onTurnReply(turn(1, 'the reply'));
+    await h.forwarder.finish({ success: true });
+    expect(h.log.error).toEqual([
+      [
+        'Failed to forward turn reply; this turn reached nobody',
+        expect.objectContaining({ turn: 1, error: 'telegram 502' }),
+      ],
+    ]);
+    expect(h.log.warn).toEqual([
+      [
+        'Nothing delivered to the user for this run',
+        expect.objectContaining({ reason: 'send-failed' }),
+      ],
+    ]);
+  });
+
+  /**
+   * A run can crash mid-turn after its send_response went out, and so never
+   * report that turn. The send still reached the user, and its marker must not
+   * outlive the run to be read by the next one.
+   */
+  it('counts a send no turn reported, and clears its marker', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, null));
+    h.setMarker();
+    await h.forwarder.finish({ success: false });
+    expect(h.log.warn).toHaveLength(0);
+    expect(h.log.info.at(-1)![1]).toMatchObject({ explicitMarker: true });
+    expect(h.markerStanding()).toBe(false);
+  });
+
+  /**
+   * A send through a path the turns do not observe (a shell wrapper, a backend
+   * with no stream parser) leaves the turn's text to be forwarded too. That is
+   * a duplicate, the chosen failure direction, and `finish` names it.
+   */
+  it('names a send no turn reported, and a likely duplicate, at info', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'the reply'));
+    h.setMarker();
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent.map((p) => p.content)).toEqual(['the reply']);
+    const unobserved = h.log.info.filter(([m]) => String(m).includes('no turn reported'));
+    expect(unobserved).toEqual([
+      [
+        'A send reached this conversation that no turn reported',
+        expect.objectContaining({ possibleDuplicate: true, explicitMarker: true }),
+      ],
+    ]);
+    expect(h.log.warn).toHaveLength(0);
+  });
+
+  it('says nothing of an unobserved send when a turn reported the send', async () => {
+    const h = harness();
+    await h.forwarder.onTurnReply(turn(1, 'sent it', [HERE]));
+    h.setMarker();
+    await h.forwarder.finish({ success: true });
+
+    expect(h.sent).toEqual([]);
+    expect(h.log.info.some(([m]) => String(m).includes('no turn reported'))).toBe(false);
   });
 });
 

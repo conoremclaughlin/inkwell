@@ -144,6 +144,12 @@ describe('registration records the worktree as it is', () => {
             return payload.studio.id;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       expect(report.audit.complete).toBe(true);
@@ -176,6 +182,12 @@ describe('registration records the worktree as it is', () => {
             return payload.studio.id;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       expect(report.audit.complete).toBe(true);
@@ -287,6 +299,12 @@ describe('registration reuse boundaries (Lumen, PR #692 round 2)', () => {
             return payload.success ? payload.studio.id : null;
           },
           syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+          // A manual init reads its permission profile from the row by path;
+          // never the live server from a test.
+          lookupStudio: async () => ({
+            status: 'found' as const,
+            row: { id: ROW_ID, sbSlug: 'wren', permissionProfile: 'builder' as const },
+          }),
         }
       );
       // Either revive the row deliberately or refuse; success with an

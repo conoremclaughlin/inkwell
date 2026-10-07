@@ -83,7 +83,14 @@ const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 1
 // cli_poll_at stamp steered the server to inline delivery rather than a queued
 // turn (task 2f892701). The spawner declares print mode through
 // PRINT_MODE_CHANNEL_ENV (@inklabs/shared); this package cannot import it.
-const hostRendersChannel = process.env.INK_CHANNEL_HOST !== 'print';
+const hostRendersChannel = !['print', 'codex'].includes(process.env.INK_CHANNEL_HOST ?? '');
+
+// A directly launched Codex MCP client may not inherit the ink wrapper env.
+// Do not consume mail for a host that cannot render Claude channel pushes.
+function canDeliverChannel(): boolean {
+  const client = mcp.getClientVersion();
+  return hostRendersChannel && Boolean(client?.name) && !/codex/i.test(client!.name);
+}
 
 function resolveEmail(): string | undefined {
   const configPath = join(homedir(), '.ink', 'config.json');
@@ -223,6 +230,7 @@ const mcp = new Server(
   { name: 'inkmail', version: '0.1.0' },
   {
     capabilities: {
+      tools: {},
       experimental: {
         'claude/channel': {},
         // TODO: permission relay needs to integrate with Inkwell's existing
@@ -243,13 +251,17 @@ When you receive a channel message:
 - To reply, use the existing send_to_inbox tool (from the inkwell MCP server) with the thread_key from the channel tag metadata
 
 Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`
-      : `InkMail push is off in this process: it runs in print mode, which cannot show channel messages. Messages that arrive during this turn stay unread and are delivered separately.`,
+      : `InkMail push is off in this process: this host cannot show Claude channel messages. Messages that arrive during this turn stay unread and are delivered separately.`,
   }
 );
 
 // No tools exposed — Claude already has send_to_inbox via the inkwell HTTP MCP
 // server. This channel plugin is purely for push notifications (one-way in,
 // replies go through the existing inkwell MCP tools).
+
+// Generic MCP clients (including Codex) discover tools even on push-only
+// servers. An empty list is valid; MethodNotFound breaks their startup.
+mcp.setRequestHandler('tools/list', async () => ({ tools: [] }));
 
 // ─── Polling Loop ───────────────────────────────────────────
 
@@ -300,7 +312,7 @@ let unscopedNoticeSent = false;
 let pollInFlight = false;
 
 async function pollInbox(): Promise<void> {
-  if (!email) return;
+  if (!email || !canDeliverChannel()) return;
   if (pollInFlight) {
     log('debug', 'Poll skipped — previous poll still in flight');
     return;
@@ -467,6 +479,7 @@ async function pollInbox(): Promise<void> {
 // ─── Start ──────────────────────────────────────────────────
 
 async function clearCliAttached(): Promise<void> {
+  if (!canDeliverChannel()) return;
   if (!sessionId || !accessToken) return;
   try {
     await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {

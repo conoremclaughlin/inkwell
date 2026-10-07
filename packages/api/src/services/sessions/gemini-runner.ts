@@ -11,7 +11,7 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type {
@@ -27,17 +27,18 @@ import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { ceilingFromEnv } from './turn-ceiling.js';
 import {
   buildSessionEnv,
   resolveSpawnTarget,
   CONTAINER_RUNNER_FILES,
   encodeContextToken,
+  readLaunchMcpServers,
 } from '@inklabs/shared';
 
-/** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
- *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
+/** The general ceiling on a Gemini turn: none unless GEMINI_PROCESS_TIMEOUT_MS
+ *  sets one (turn-ceiling.ts). */
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.GEMINI_PROCESS_TIMEOUT_MS);
 
 /** Idle timeout: no output for this long = stuck */
 export const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -87,17 +88,10 @@ export class GeminiRunner implements IRunner {
     let geminiSettingsEnvPath: string | undefined;
     let geminiSettingsHostPath: string | undefined;
     if (config.inkAccessToken) {
-      const mcpJsonPath = join(config.workingDirectory, '.mcp.json');
-      // Start from workspace .mcp.json servers (includes supabase, github, etc.)
-      let mcpServers: Record<string, unknown> = {};
-      if (existsSync(mcpJsonPath)) {
-        try {
-          const parsed = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-          mcpServers = parsed.mcpServers || {};
-        } catch {
-          // ignore parse errors
-        }
-      }
+      // Start from workspace .mcp.json servers (includes supabase, github,
+      // etc.), with Playwright launched headless and isolated like every
+      // other session's.
+      const mcpServers = readLaunchMcpServers(join(config.workingDirectory, '.mcp.json'));
 
       // Build consolidated context token
       const contextToken = encodeContextToken({
@@ -164,6 +158,15 @@ export class GeminiRunner implements IRunner {
           ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsEnvPath }
           : undefined
       );
+      if (result.refusedBeforeSpawn !== undefined) {
+        return {
+          success: false,
+          backendSessionId: backendSessionId || null,
+          responses: [],
+          error: result.refusedBeforeSpawn,
+          refusedBeforeSpawn: true,
+        };
+      }
 
       // Use session ID from Gemini's init event, fall back to the one we passed in
       const resolvedSessionId = result.sessionId || backendSessionId || undefined;
@@ -252,13 +255,27 @@ export class GeminiRunner implements IRunner {
      * it is reported as a completed turn. See the timers below.
      */
     timedOut?: { kind: 'idle' | 'hard'; message: string };
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const geminiBin = await resolveBinaryPath('gemini');
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      logger.warn('Gemini CLI spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
     return new Promise((resolve, reject) => {
       // The child inherits an allowlist of the server's env (resolveSpawnTarget
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(geminiBin),
         ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
@@ -290,6 +307,7 @@ export class GeminiRunner implements IRunner {
         env: target.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      if (proc.pid !== undefined) config.onSpawned?.({ pid: proc.pid });
 
       let stderr = '';
       let stdoutRemainder = '';
@@ -339,29 +357,34 @@ export class GeminiRunner implements IRunner {
       };
       resetIdleTimer();
 
-      // Hard ceiling timeout
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          logger.error('Gemini CLI process hit hard timeout, killing', {
-            timeoutMs: PROCESS_TIMEOUT_MS,
-          });
-          this.killProcess(proc);
-          settled = true;
-          resolve({
-            responses,
-            usage,
-            toolCalls,
-            finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
-            sessionId: resolvedSessionId,
-            timedOut: {
-              kind: 'hard',
-              message: `Gemini CLI timeout: exceeded the ${Math.round(
-                PROCESS_TIMEOUT_MS / 1000
-              )}s ceiling, process killed`,
-            },
-          });
-        }
-      }, PROCESS_TIMEOUT_MS);
+      // A configured ceiling stops the run however active it is. With none,
+      // only the silence timeout above ends it.
+      const ceilingMs = PROCESS_TIMEOUT_MS;
+      const timeout =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              if (!settled) {
+                logger.error('Gemini CLI process hit hard timeout, killing', {
+                  timeoutMs: ceilingMs,
+                });
+                this.killProcess(proc);
+                settled = true;
+                resolve({
+                  responses,
+                  usage,
+                  toolCalls,
+                  finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+                  sessionId: resolvedSessionId,
+                  timedOut: {
+                    kind: 'hard',
+                    message: `Gemini CLI timeout: exceeded the ${Math.round(
+                      ceilingMs / 1000
+                    )}s ceiling, process killed`,
+                  },
+                });
+              }
+            }, ceilingMs);
 
       proc.stdout.on('data', (data) => {
         lastActivityAt = Date.now();

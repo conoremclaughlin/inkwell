@@ -16,8 +16,10 @@
  * launching slug, and then the routine registers a row for it, as `ink
  * init` there would. When the server cannot say — unreachable, a timeout,
  * a refused credential — the owner is UNKNOWN and nothing that names an
- * owner is written: hooks, permissions and backend config are completed,
- * identity and registration are left for a launch that can ask. A guess
+ * owner is written: hooks and backend config are completed; identity,
+ * registration and Claude permissions (whose profile is read from the same
+ * row, and whose scratch paths name the owner) are left for a launch that
+ * can ask. A guess
  * here is durable: completeStudio never replaces an owner it finds, so a
  * transient failure that wrote the visitor's slug would have kept it after
  * the server came back (Lumen, PR #699 round 1).
@@ -27,25 +29,22 @@
  */
 
 import chalk from 'chalk';
+import { createInterface } from 'readline/promises';
 import { auditStudio, type StudioCheckId } from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
 import type { CompleteStudioReport, StepResult } from './studio-complete.js';
-import { callInkTool } from './ink-mcp.js';
+import { lookupStudioByPath, type StudioLookup, type StudioRowSummary } from './studio-lookup.js';
 import { sbDebugLog } from './sb-debug.js';
 
-export interface LaunchStudioRow {
-  id?: string;
-  sbSlug?: string;
-}
+/** The studio row a launch completes against (see studio-lookup.ts). */
+export type LaunchStudioRow = StudioRowSummary;
 
 /**
  * What the server said about the worktree: a row, confirmed none, or no
- * answer. Only the first two license an identity write.
+ * answer. Only the first two license an identity write, and only the first
+ * names a permission profile.
  */
-export type LaunchStudioLookup =
-  | { status: 'found'; row: LaunchStudioRow }
-  | { status: 'none' }
-  | { status: 'unknown'; reason: string };
+export type LaunchStudioLookup = StudioLookup;
 
 export interface LaunchStudioDeps {
   placement?: (cwd: string) => WorktreePlacement;
@@ -62,38 +61,6 @@ export interface LaunchStudioResult {
   ownerUnknown?: string;
   missingBefore?: StudioCheckId[];
   report?: CompleteStudioReport;
-}
-
-/** The server's own words for a worktree it has no row for. */
-const NOT_FOUND = /studio not found/i;
-
-/**
- * The launcher's own lookup: get_studio by path, bounded. A "Studio not
- * found" from the server is the one answer that means none; every other
- * failure is no answer at all.
- */
-async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLookup> {
-  try {
-    const result = await callInkTool<{ studio?: { id?: string; sbSlug?: string } }>(
-      'get_studio',
-      { path: worktreePath },
-      { timeoutMs: 3000, idempotent: true }
-    );
-    if (result?.studio?.id) {
-      return {
-        status: 'found',
-        row: {
-          id: result.studio.id,
-          ...(result.studio.sbSlug ? { sbSlug: result.studio.sbSlug } : {}),
-        },
-      };
-    }
-    return { status: 'unknown', reason: 'the server returned no studio and no error' };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (NOT_FOUND.test(message)) return { status: 'none' };
-    return { status: 'unknown', reason: message };
-  }
 }
 
 /**
@@ -116,13 +83,25 @@ export async function completeStudioForLaunch(
   const lookup = await (deps.lookupStudio ?? lookupStudioByPath)(placement.toplevel);
   const init = deps.runInit ?? runInit;
   if (lookup.status === 'unknown') {
-    const report = await init(placement.toplevel, { agent: launchSlug, studioSetup: false });
+    // No row, no profile: permissions are left for a launch that can ask,
+    // as identity is. A guessed profile would be kept by every later run.
+    const report = await init(placement.toplevel, {
+      agent: launchSlug,
+      studioSetup: false,
+      permissions: false,
+    });
     return { ran: true, ownerUnknown: lookup.reason, missingBefore: audit.missing, report };
   }
   const owner = (lookup.status === 'found' && lookup.row.sbSlug) || launchSlug;
+  // Only a row names a profile. A worktree the server confirms has no row
+  // gets identity and registration as ink init would, and no permissions:
+  // in a detached PR checkout a default would be kept by every later run
+  // (review 4177f7fe, P2 1).
+  const profile = lookup.status === 'found' ? lookup.row.permissionProfile : undefined;
   const report = await init(placement.toplevel, {
     agent: owner,
     ...(lookup.status === 'found' && lookup.row.id ? { studioId: lookup.row.id } : {}),
+    ...(profile ? { permissionProfile: profile } : { permissions: false }),
   });
   return { ran: true, owner, missingBefore: audit.missing, report };
 }
@@ -205,4 +184,96 @@ export async function completeStudioAtLaunch(
   const [first, ...rest] = lines;
   if (first) console.error(chalk.dim(first));
   for (const line of rest) console.error(chalk.yellow(`⚠ ${line}`));
+}
+
+// ============================================================================
+// A main worktree ink was never set up in (task 5cabaeeb)
+// ============================================================================
+
+export interface RootInitDeps {
+  placement?: (cwd: string) => WorktreePlacement;
+  confirm?: (question: string) => Promise<boolean>;
+  runInit?: typeof runInit;
+}
+
+export interface RootInitResult {
+  /** The person was asked. */
+  offered: boolean;
+  /** ink init ran. */
+  ran: boolean;
+  missingBefore?: StudioCheckId[];
+  report?: CompleteStudioReport;
+}
+
+/** Ask on stderr, Enter meaning yes; stdout stays the launch's own. */
+async function confirmOnStderr(question: string): Promise<boolean> {
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = (await prompt.question(question)).trim().toLowerCase();
+    return answer === '' || answer === 'y' || answer === 'yes';
+  } finally {
+    prompt.close();
+  }
+}
+
+/**
+ * `ink -a` in a main worktree whose checklist is incomplete, typically a
+ * repo `ink init` never ran in: no `.mcp.json`, so no inkwell tools and no
+ * inkmail. The studio path above never rewrites a main worktree on its own;
+ * this asks first, and runs `ink init` only on a yes. Without a person to
+ * ask (`interactive` false) it prints the repair and changes nothing. A
+ * main-worktree `ink init` writes no permissions, so no lane rule is
+ * touched either way. Never throws: a launch is not refused because setup
+ * failed.
+ */
+export async function offerRootInitAtLaunch(
+  cwd: string,
+  launchSlug: string,
+  options: { interactive: boolean },
+  deps: RootInitDeps = {}
+): Promise<RootInitResult> {
+  try {
+    const placement = (deps.placement ?? detectWorktree)(cwd);
+    if (placement.linked || !placement.toplevel) return { offered: false, ran: false };
+    const root = placement.toplevel;
+    const audit = auditStudio(root, { linked: false });
+    if (audit.complete) return { offered: false, ran: false };
+    const missing = audit.checks
+      .filter((check) => check.required && !check.ok)
+      .map((check) => check.label)
+      .join(', ');
+    if (!options.interactive) {
+      console.error(
+        chalk.yellow(
+          `⚠ Inkwell is not fully set up in ${root} (missing: ${missing}). Run: ink init`
+        )
+      );
+      return { offered: false, ran: false, missingBefore: audit.missing };
+    }
+    const yes = await (deps.confirm ?? confirmOnStderr)(
+      chalk.cyan(
+        `Inkwell is not fully set up in ${root} (missing: ${missing}). Run ink init now? [Y/n] `
+      )
+    );
+    if (!yes) {
+      console.error(chalk.dim(`  Skipped. Run ink init in ${root} when you're ready.`));
+      return { offered: true, ran: false, missingBefore: audit.missing };
+    }
+    const report = await (deps.runInit ?? runInit)(root, { agent: launchSlug });
+    const changed = describeStepsWritten(report.steps);
+    console.error(chalk.dim(`ink init ran${changed ? `: ${changed}` : ''}`));
+    if (!report.audit.complete) {
+      console.error(
+        chalk.yellow(`⚠ Still incomplete (${report.audit.missing.join(', ')}). Run: ink init`)
+      );
+    }
+    return { offered: true, ran: true, missingBefore: audit.missing, report };
+  } catch (error) {
+    sbDebugLog('sb', 'launch_root_init_failed', {
+      cwd,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    console.error(chalk.yellow('⚠ Could not set up Inkwell in this repo. Run: ink init'));
+    return { offered: false, ran: false };
+  }
 }

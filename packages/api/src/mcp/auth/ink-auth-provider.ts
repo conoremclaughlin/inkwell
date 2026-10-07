@@ -418,12 +418,15 @@ export class InkAuthProvider {
     /** Signed runner binding — authenticated, unlike the x-ink-context header. */
     sessionId?: string;
     contactId?: string;
+    /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
+    expiresAt?: number;
   } | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
     const payload = verifyInkAccessToken(token, 'mcp_access');
     if (!payload) return null;
+    const exp = (payload as { exp?: unknown }).exp;
 
     return {
       userId: payload.sub,
@@ -436,6 +439,7 @@ export class InkAuthProvider {
           : {}),
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
       ...(payload.contactId ? { contactId: payload.contactId } : {}),
+      ...(typeof exp === 'number' ? { expiresAt: exp } : {}),
     };
   }
 

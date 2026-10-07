@@ -248,6 +248,10 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   COMPACTION_THRESHOLD: optionalNumber,
+
+  // The in-process ink runtime, for these agents only (comma-separated
+  // agent identity UUIDs). Unset by default: every ink turn spawns ink chat.
+  INK_RUNTIME_IN_PROCESS_SB_IDS: optionalString,
 });
 
 // Parse and validate environment variables

@@ -20,8 +20,17 @@ import {
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { auditStudio } from '@inklabs/shared';
-import { detectWorktree, runInit, studioNameFromPath } from './init.js';
+// Namespace imports: against a tree without the profiles or the new flags,
+// each test that needs one fails on its own.
+import * as shared from '@inklabs/shared';
+import { Command } from 'commander';
+import { detectWorktree, registerInitCommand, runInit, studioNameFromPath } from './init.js';
 import type { StepResult } from '../lib/studio-complete.js';
+import type { StudioLookup } from '../lib/studio-lookup.js';
+
+// The CLI's own Inkwell checkout is the last inkmail plugin candidate (task
+// 5cabaeeb); none here, so a tmp repo resolves only what a test put on disk.
+vi.mock('../lib/ink-checkout.js', () => ({ inkCliMainWorktree: () => null }));
 
 let root: string;
 let main: string;
@@ -48,6 +57,13 @@ const stubs = (backend?: string) => ({
   // The owner's backend lookup reaches the server (cached) by default; a
   // test never does.
   lookupBackend: vi.fn(async () => backend),
+  // So does the studio row lookup a manual init makes for its profile.
+  lookupStudio: vi.fn(
+    async (): Promise<StudioLookup> => ({
+      status: 'found',
+      row: { id: STUDIO_ID, sbSlug: 'wren', permissionProfile: 'builder' },
+    })
+  ),
 });
 
 beforeEach(() => {
@@ -132,10 +148,10 @@ describe('runInit in a linked worktree', () => {
         purpose: 'alpha work',
       })
     );
-    const settings = readJson(join(studio, '.claude', 'settings.local.json')) as {
-      permissions: { allow: string[] };
-    };
-    expect(settings.permissions.allow).toEqual(['Bash(git *)']);
+    // The builder profile, not the main worktree's rules: `ink init` is the
+    // path every server creator takes, and none of them passes inheritance.
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toEqual(shared.studioPermissionRules('builder', 'wren'));
   });
 
   it('--no-root-sync and --no-studio-setup turn the two switches off', async () => {
@@ -294,5 +310,102 @@ describe('runInit in the main worktree', () => {
     expect(JSON.stringify(settings.hooks)).toContain('hooks on-stop --backend claude-code');
     expect(existsSync(join(main, '.codex', 'config.toml'))).toBe(true);
     expect(existsSync(join(main, '.gemini', 'settings.json'))).toBe(true);
+  });
+});
+
+describe('runInit permission options (design v3 items 3 and 5)', () => {
+  it('--inherit-claude-permissions copies the main worktree rules', async () => {
+    await runInit(studio, { agent: 'wren', inheritClaudePermissions: true }, stubs());
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual({
+      allow: ['Bash(git *)'],
+      deny: [],
+    });
+  });
+
+  it('--permission-profile reviewer writes the reviewer profile', async () => {
+    await runInit(studio, { agent: 'wren', permissionProfile: 'reviewer' }, stubs());
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual(
+      shared.studioPermissionRules('reviewer', 'wren')
+    );
+  });
+
+  it('--no-permissions writes none', async () => {
+    const report = await runInit(studio, { agent: 'wren', permissions: false }, stubs());
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toBeUndefined();
+    expect(report.audit.missing).toEqual(['claude-permissions']);
+  });
+
+  it("a manual init with no profile reads the row's profile and owner by path", async () => {
+    const deps = {
+      ...stubs(),
+      lookupStudio: vi.fn(
+        async (): Promise<StudioLookup> => ({
+          status: 'found',
+          row: { id: STUDIO_ID, sbSlug: 'lumen', permissionProfile: 'reviewer' },
+        })
+      ),
+    };
+    await runInit(studio, {}, deps);
+    expect(deps.lookupStudio).toHaveBeenCalledWith(studio);
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual(
+      shared.studioPermissionRules('reviewer', 'lumen')
+    );
+  });
+
+  it('a manual init where the server has no row, or no answer, writes no permissions', async () => {
+    for (const answer of [
+      { status: 'none' } as const,
+      { status: 'unknown', reason: 'offline' } as const,
+    ]) {
+      rmSync(join(studio, '.claude'), { recursive: true, force: true });
+      const deps = { ...stubs(), lookupStudio: vi.fn(async (): Promise<StudioLookup> => answer) };
+      await runInit(studio, { agent: 'wren' }, deps);
+      expect(
+        readJson(join(studio, '.claude', 'settings.local.json')).permissions,
+        answer.status
+      ).toBeUndefined();
+    }
+  });
+
+  it('an explicit profile, or --no-permissions, never asks the server', async () => {
+    const deps = stubs();
+    await runInit(studio, { agent: 'wren', permissionProfile: 'builder' }, deps);
+    rmSync(join(studio, '.claude'), { recursive: true, force: true });
+    await runInit(studio, { agent: 'wren', permissions: false }, deps);
+    expect(deps.lookupStudio).not.toHaveBeenCalled();
+  });
+});
+
+describe('ink init flags parse to the options runInit reads', () => {
+  async function parse(args: string[]): Promise<Record<string, unknown>> {
+    const program = new Command();
+    program.exitOverride();
+    registerInitCommand(program);
+    let captured: Record<string, unknown> = {};
+    program.commands
+      .find((c) => c.name() === 'init')!
+      .action((opts: Record<string, unknown>) => {
+        captured = opts;
+      });
+    await program.parseAsync(['node', 'ink', 'init', ...args]);
+    return captured;
+  }
+
+  it('no flag: no inheritance, no profile, permissions on', async () => {
+    const opts = await parse([]);
+    expect(opts.inheritClaudePermissions).toBeUndefined();
+    expect(opts.permissionProfile).toBeUndefined();
+    expect(opts.permissions).not.toBe(false);
+  });
+
+  it('each flag sets its option', async () => {
+    expect((await parse(['--inherit-claude-permissions'])).inheritClaudePermissions).toBe(true);
+    expect((await parse(['--permission-profile', 'reviewer'])).permissionProfile).toBe('reviewer');
+    expect((await parse(['--no-permissions'])).permissions).toBe(false);
+  });
+
+  it('an unknown profile is refused by the parser', async () => {
+    await expect(parse(['--permission-profile', 'admin'])).rejects.toThrow();
   });
 });

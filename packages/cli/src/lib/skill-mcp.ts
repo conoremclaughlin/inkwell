@@ -11,8 +11,9 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { injectSessionHeaders } from '@inklabs/shared';
+import { injectSessionHeaders, pinIsolatedPlaywright } from '@inklabs/shared';
 import { discoverSkills } from '../repl/skills.js';
+import { inkCliMainWorktree } from './ink-checkout.js';
 
 export interface SkillMcpServer {
   name: string;
@@ -145,6 +146,10 @@ interface McpJsonConfig {
  * `ink init` (which generates the project entry from the same candidates) so
  * the generator and the withholding boundary can never disagree about what
  * the plugin IS. Returns null when no candidate exists.
+ *
+ * The last candidate is the main worktree of the Inkwell checkout this CLI
+ * runs from, so a repo that is not Inkwell and does not sit beside a
+ * `personal-context-protocol` checkout still finds it (task 5cabaeeb).
  */
 export function resolveChannelPluginPath(cwd: string): string | null {
   // Look for the channel plugin relative to the repo root
@@ -152,6 +157,8 @@ export function resolveChannelPluginPath(cwd: string): string | null {
     join(cwd, 'packages', 'channel-plugin', 'index.ts'),
     join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
   ];
+  const inkCheckout = inkCliMainWorktree();
+  if (inkCheckout) candidates.push(join(inkCheckout, 'packages', 'channel-plugin', 'index.ts'));
   for (const p of candidates) {
     if (existsSync(p)) return p;
   }
@@ -324,6 +331,9 @@ export function buildMergedMcpConfig(
       skillsModified = true;
     }
   }
+  // A skill copy synced before the Playwright pin still carries the old
+  // arguments; what it adds launches like every other session's.
+  config.mcpServers = pinIsolatedPlaywright(config.mcpServers).servers;
 
   if (!skillsModified) {
     return {

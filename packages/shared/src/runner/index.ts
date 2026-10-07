@@ -1,5 +1,6 @@
 export {
   buildCleanEnv,
+  LAUNCH_TAG,
   SPAWN_ENV_INHERITED_NAMES,
   SESSION_ENV_HANDOFF_NAMES,
   RUN_TURN_EPOCH_ENV,
@@ -15,6 +16,7 @@ export {
 
 export {
   injectSessionHeaders,
+  readLaunchMcpServers,
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
@@ -25,6 +27,17 @@ export {
 } from './mcp-config.js';
 
 export { writeRuntimeSessionHint } from './runtime-hints.js';
+
+export {
+  TURN_REPLY_EVENT,
+  TURN_REPLY_TOKEN_ENV,
+  LOCAL_TOOL_CALL_PLACEHOLDER,
+  userFacingReplyText,
+  parseTurnReplyEvent,
+  type TurnReply,
+  type TurnReplyEvent,
+  type TurnSend,
+} from './turn-reply.js';
 
 export {
   stripAnsi,

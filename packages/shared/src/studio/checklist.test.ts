@@ -7,10 +7,12 @@
  * main worktree does not, and that a complete studio reads as complete.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, STUDIO_CHECK_IDS } from './checklist';
+import { syncMcpConfig } from './mcp-config-sync';
 
 const INK = 'node /repo/packages/cli/dist/cli.js';
 const claudeHooks = () => ({
@@ -195,11 +197,13 @@ describe('auditStudio', () => {
           ),
       },
       {
+        // No permissions key at all. An empty allow list is no longer a
+        // break: it is an authored policy (design v3, item 4).
         id: 'claude-permissions',
         break: (r) =>
           writeFile(
             path.join(r, '.claude', 'settings.local.json'),
-            JSON.stringify({ permissions: { allow: [] }, hooks: claudeHooks() })
+            JSON.stringify({ hooks: claudeHooks() })
           ),
       },
       {
@@ -259,6 +263,57 @@ describe('auditStudio', () => {
         const audit = auditStudio(root, { linked: true });
         const failed = audit.checks.filter((x) => !x.ok).map((x) => x.id);
         expect(failed, c.id).toEqual([c.id]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('any authored permissions object completes the item: deny-only, ask-only, mode-only, empty, empty allow', async () => {
+    const authored: Array<Record<string, unknown>> = [
+      { deny: ['Bash(git push *)'] },
+      { ask: ['Bash(*)'] },
+      { defaultMode: 'plan' },
+      {},
+      { allow: [] },
+    ];
+    for (const permissions of authored) {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(
+          path.join(root, '.claude', 'settings.local.json'),
+          JSON.stringify({ permissions, hooks: claudeHooks() })
+        );
+        const audit = auditStudio(root, { linked: true });
+        const check = audit.checks.find((c) => c.id === 'claude-permissions');
+        expect(check?.ok, JSON.stringify(permissions)).toBe(true);
+        expect(audit.complete, JSON.stringify(permissions)).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('no permissions key, a non-object permissions, and an unparseable file each fail the item, saying which', async () => {
+    const cases: Array<{ content: string; detail: string }> = [
+      { content: JSON.stringify({ hooks: claudeHooks() }), detail: 'no permissions' },
+      {
+        content: JSON.stringify({ permissions: ['Bash(*)'], hooks: claudeHooks() }),
+        detail: 'permissions is not an object',
+      },
+      { content: '{ "permissions": ', detail: 'unparseable' },
+    ];
+    for (const c of cases) {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(path.join(root, '.claude', 'settings.local.json'), c.content);
+        const check = auditStudio(root, { linked: true }).checks.find(
+          (x) => x.id === 'claude-permissions'
+        );
+        expect(check?.ok, c.detail).toBe(false);
+        expect(check?.detail).toBe(c.detail);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -332,5 +387,121 @@ describe('auditStudio', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  // A table defined twice is a parse error: Codex refused every spawn in
+  // lumen-alpha on 2026-09-29 (#701), while this check called it complete.
+  // It is read by what the keys resolve to, not how a header is spelled
+  // (Myra, #701 d0f4698e).
+  describe('codex-mcp reads the config by what its keys resolve to', () => {
+    const codexDetail = (root: string) =>
+      auditStudio(root, { linked: true }).checks.find((c) => c.id === 'codex-mcp')?.detail;
+    const figmaStudio = async (root: string) => {
+      await completeStudio(root, { studioId: STUDIO_ID });
+      await writeFile(
+        path.join(root, '.mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+            figma: { type: 'http', url: 'https://mcp.example.com/figma' },
+          },
+        })
+      );
+      syncMcpConfig(root);
+      expect(auditStudio(root, { linked: true }).complete).toBe(true);
+      return readFileSync(path.join(root, '.codex', 'config.toml'), 'utf-8');
+    };
+
+    // Every form that defines the table mcp_servers.figma itself (Myra, #701 73a3b6fd).
+    for (const [name, outside] of [
+      [
+        'a two-segment header, quoted and spaced, after the block',
+        (t: string) => `${t}\n[ mcp_servers . "figma" ]\nurl = "x"\n`,
+      ],
+      ['root dotted keys before the block', (t: string) => `mcp_servers.figma.url = "x"\n\n${t}`],
+      [
+        'dotted keys under [mcp_servers] after the block',
+        (t: string) => `${t}\n[mcp_servers]\nfigma.url = "x"\n`,
+      ],
+      [
+        'an inline table under [mcp_servers] after the block',
+        (t: string) => `${t}\n[mcp_servers]\nfigma = { url = "x" }\n`,
+      ],
+      [
+        'a root inline table before the block',
+        (t: string) => `mcp_servers.figma = { url = "x" }\n\n${t}`,
+      ],
+    ] as const) {
+      it(`fails figma defined twice, by ${name}, until one sync repairs it`, async () => {
+        const root = await scratch();
+        try {
+          const synced = await figmaStudio(root);
+          await writeFile(path.join(root, '.codex', 'config.toml'), outside(synced));
+          expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+          expect(codexDetail(root)).toBe(
+            'defines [mcp_servers.figma] more than once, which Codex cannot parse; run `ink mcp sync`'
+          );
+
+          syncMcpConfig(root);
+
+          expect(auditStudio(root, { linked: true }).complete).toBe(true);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it('fails inkwell defined outside the block, and still fails after a sync, naming the hand edit', async () => {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(
+          path.join(root, '.codex', 'config.toml'),
+          `${codexToml()}\n[mcp_servers.inkwell]\nurl = "http://localhost:3001/mcp"\n`
+        );
+        expect(codexDetail(root)).toContain('[mcp_servers.inkwell] more than once');
+
+        const synced = syncMcpConfig(root);
+
+        expect(synced.codexHandEdit).toHaveLength(1);
+        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(codexDetail(root)).toBe(
+          "defines [mcp_servers.inkwell] outside ink's managed block, where `ink mcp sync` cannot update it; remove that definition, then run `ink mcp sync`"
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('passes inkwell spelled another way inside the block (control)', async () => {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(
+          path.join(root, '.codex', 'config.toml'),
+          codexToml().replace('[mcp_servers.inkwell]', '[ "mcp_servers" . inkwell ]')
+        );
+        expect(auditStudio(root, { linked: true }).complete).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('fails a config it cannot read, naming the line, never calling it clean', async () => {
+      const root = await scratch();
+      try {
+        await completeStudio(root, { studioId: STUDIO_ID });
+        await writeFile(path.join(root, '.codex', 'config.toml'), `model = "open\n${codexToml()}`);
+        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(codexDetail(root)).toBe('could not be read at line 1');
+        // After the inkwell server, where everything read so far looks fine:
+        // the part not read may still define it twice.
+        await writeFile(path.join(root, '.codex', 'config.toml'), `${codexToml()}model = "open\n`);
+        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(codexDetail(root)).toBe('could not be read at line 13');
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
   });
 });

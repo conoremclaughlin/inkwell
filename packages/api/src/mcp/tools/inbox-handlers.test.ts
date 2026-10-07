@@ -62,6 +62,27 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
 });
 
 // Mock agent gateway
+// The send-time address check (T4) has its own unit and integration tests.
+// Here it accepts every named address as given, a key resolving to a fixed
+// session, so these cases keep exercising the send path. The refusal cases
+// override it.
+vi.mock('../../services/sessions/explicit-address', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../services/sessions/explicit-address')>();
+  return {
+    ...actual,
+    resolveExplicitAddress: vi.fn(
+      async (_sb: unknown, input: { recipientSessionId?: string; sessionKey?: string }) =>
+        input.recipientSessionId || input.sessionKey
+          ? {
+              sessionId: input.recipientSessionId ?? 'c0dec0de-1111-4222-8333-444455556666',
+              via: input.recipientSessionId ? 'recipientSessionId' : 'sessionKey',
+              ended: false,
+            }
+          : null
+    ),
+  };
+});
+
 vi.mock('../../channels/agent-gateway.js', () => ({
   getAgentGateway: vi.fn().mockReturnValue({
     dispatchTrigger: vi.fn().mockReturnValue({
@@ -1867,7 +1888,89 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(advances).toHaveLength(0);
   });
 
-  it('does NOT advance the sender pointer for sessionAlias self-sends either', async () => {
+  it('does NOT advance the sender pointer for sessionKey self-sends either', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-890',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
+        sessionKey: 'wren:inkwell:review',
+        threadKey: 'thread:self-key-handoff',
+        content: 'Pick this up in the review session',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(0);
+  });
+
+  it('refuses a blank sessionKey rather than sending without its target', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-892',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'wren',
+          senderSlug: 'lumen',
+          sessionKey: '   ',
+          threadKey: 'thread:blank-key',
+          content: 'never sent',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/sessionKey/);
+    expect(mockSb.getRpcCalls()).toHaveLength(0);
+  });
+
+  it('refuses a sessionKey it cannot normalise before anything is sent', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-891',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'wren',
+          senderSlug: 'lumen',
+          sessionKey: 'wren main',
+          threadKey: 'thread:bad-key',
+          content: 'never sent',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/sessionKey/);
+    expect(mockSb.getRpcCalls()).toHaveLength(0);
+  });
+
+  it('does NOT advance the sender pointer for self-sends under the deprecated sessionAlias spelling', async () => {
     // Lumen PR #454 review blocker 1: the exemption must cover ALL explicit
     // self-target forms — alias included — with the same predicate that
     // drives trigger self-inclusion.
@@ -3077,5 +3180,192 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.threadUnreadCount).toBe(0);
+  });
+});
+
+describe('handleSendToInbox — caller-named sessions (T4)', () => {
+  // Session lifecycle v7 §3 rungs 1–2: a session the caller names, by id or
+  // key, is checked before anything is stored. A wrong address refuses the
+  // send; a key is replaced downstream by the id it resolved to.
+  const KEY_SESSION = 'c0dec0de-1111-4222-8333-444455556666';
+
+  beforeEach(async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    // A sender session, so the unthreaded path does not suppress its wake.
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    gw.processTrigger.mockClear();
+    gw.dispatchTrigger.mockClear();
+  });
+
+  async function refuseNextAddress() {
+    const mod = await import('../../services/sessions/explicit-address');
+    vi.mocked(mod.resolveExplicitAddress).mockRejectedValueOnce(
+      new mod.ExplicitAddressRefusedError(
+        'unknown-session',
+        'recipientSessionId 9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a is not a session of "lumen". Nothing was sent.'
+      )
+    );
+  }
+
+  it('refuses a wrong address on a thread before the thread, participants or message exist', async () => {
+    await refuseNextAddress();
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'lumen',
+          senderSlug: 'wren',
+          recipientSessionId: '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
+          threadKey: 'thread:wrong-address',
+          content: 'never stored',
+        },
+        createThreadMockDataComposer(mockSb) as never
+      )
+    ).rejects.toThrow(/not a session of "lumen"/);
+
+    expect(mockSb.getWrites()).toEqual([]);
+    expect(mockSb.getInsertedMessage()).toBeNull();
+    expect(gw.processTrigger).not.toHaveBeenCalled();
+    expect(gw.dispatchTrigger).not.toHaveBeenCalled();
+  });
+
+  it('refuses a wrong address on an unthreaded send before the inbox row exists', async () => {
+    await refuseNextAddress();
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createMockSupabase();
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'lumen',
+          senderSlug: 'wren',
+          recipientSessionId: '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
+          content: 'never stored',
+        },
+        createMockDataComposer(mockSb) as never
+      )
+    ).rejects.toThrow(/Nothing was sent/);
+
+    expect(mockSb._chainable.insert).not.toHaveBeenCalled();
+    expect(gw.dispatchTrigger).not.toHaveBeenCalled();
+  });
+
+  it('carries the id a key resolved to, marked as caller-named, and echoes it', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
+        sessionKey: 'lumen:inkwell:review',
+        threadKey: 'thread:key-resolves',
+        content: 'to the review session',
+      },
+      createThreadMockDataComposer(mockSb) as never
+    );
+
+    expect(gw.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientSessionId: KEY_SESSION,
+        explicitRecipientSession: true,
+        explicitRecipientTarget: true,
+        sessionKey: 'lumen:inkwell:review',
+      })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.resolvedSessionId).toBe(KEY_SESSION);
+    expect(parsed.addressedBy).toBe('sessionKey');
+  });
+
+  it('marks an unthreaded caller-named session as explicit, which it never was', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createMockSupabase();
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
+        messageType: 'session_resume',
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        content: 'Resume this session',
+      },
+      createMockDataComposer(mockSb) as never
+    );
+
+    expect(gw.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        explicitRecipientTarget: true,
+        explicitRecipientSession: true,
+      })
+    );
+  });
+
+  it('a named studio alone addresses the studio, not a session', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const gw = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
+        recipientStudioId: '5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b',
+        threadKey: 'thread:studio-only',
+        content: 'to that studio',
+      },
+      createThreadMockDataComposer(mockSb) as never
+    );
+
+    const payload = gw.processTrigger.mock.calls[0][0];
+    expect(payload.explicitRecipientTarget).toBe(true);
+    expect(payload.explicitRecipientSession).toBeUndefined();
+    const mod = await import('../../services/sessions/explicit-address');
+    expect(mod.resolveExplicitAddress).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        recipientSlug: 'lumen',
+        recipientSessionId: undefined,
+        sessionKey: undefined,
+      })
+    );
+  });
+});
+
+// Lumen's probe from the #737 review: links without a thread were accepted,
+// the legacy inbox row was written, and the links were dropped.
+describe('send_to_inbox links precondition', () => {
+  it('refuses links without a thread instead of silently delivering and dropping them', async () => {
+    const sb = createMockSupabase();
+    const dc = createMockDataComposer(sb);
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'sender@example.com',
+          recipientSlug: 'lumen',
+          senderSlug: 'wren',
+          content: 'Synthetic message with thread links but no source thread',
+          links: ['spec:example'],
+          trigger: false,
+        },
+        dc as never
+      )
+    ).rejects.toThrow(/threadKey/);
+    expect(sb.from).not.toHaveBeenCalledWith('agent_inbox');
   });
 });

@@ -46,7 +46,8 @@ export interface SpawnBackendOptions {
    * limit (~256KB on macOS) and large transcripts trigger spawn E2BIG.
    */
   stdinData?: string;
-  /** Hard timeout in ms (default: 30 minutes) */
+  /** Hard timeout in ms, applied only when given (default: none). A working
+   *  turn is never killed on wall-clock; idleTimeoutMs ends a silent one. */
   timeoutMs?: number;
   /** Idle timeout in ms — kill if no output for this long (default: none) */
   idleTimeoutMs?: number;
@@ -206,6 +207,12 @@ export const SPAWN_ENV_INHERITED_NAMES: readonly string[] = [
 ];
 
 /**
+ * The variable carrying a launch's record id into its process, by which a
+ * restarted server finds the process (packages/api launched-processes.ts).
+ */
+export const LAUNCH_TAG = 'INK_LAUNCH_ID';
+
+/**
  * Build the env a spawned backend starts from.
  *
  * Only the names in SPAWN_ENV_INHERITED_NAMES cross from the parent (the
@@ -225,7 +232,11 @@ export function buildCleanEnv(
     const value = parent[name];
     if (value !== undefined) inherited[name] = value;
   }
-  return { ...inherited, ...extraEnv };
+  // The launch tag goes first. macOS lists a process's environment joined by
+  // spaces, so only the first variable can be read exactly: any later
+  // variable's value could contain the tag's text.
+  const tag = extraEnv?.[LAUNCH_TAG];
+  return { ...(tag !== undefined ? { [LAUNCH_TAG]: tag } : {}), ...inherited, ...extraEnv };
 }
 
 /**
@@ -397,18 +408,20 @@ export function spawnBackend(options: SpawnBackendOptions): {
       });
     };
 
-    // Hard ceiling timeout
-    const hardTimeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
-    hardTimer = setTimeout(() => {
-      timedOut = true;
-      timeoutType = 'hard';
-      child.kill('SIGTERM');
-      // Give 5s for graceful shutdown, then SIGKILL
-      const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-      killTimer.unref?.();
-      finalize(124);
-    }, hardTimeoutMs);
-    hardTimer.unref?.();
+    // Hard ceiling, only when the caller sets one.
+    const hardTimeoutMs = options.timeoutMs;
+    if (hardTimeoutMs !== undefined && hardTimeoutMs > 0) {
+      hardTimer = setTimeout(() => {
+        timedOut = true;
+        timeoutType = 'hard';
+        child.kill('SIGTERM');
+        // Give 5s for graceful shutdown, then SIGKILL
+        const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
+        killTimer.unref?.();
+        finalize(124);
+      }, hardTimeoutMs);
+      hardTimer.unref?.();
+    }
 
     // Idle timeout (optional) — resets on any output
     const resetIdleTimer = () => {

@@ -13,7 +13,11 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync }
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-const hoisted = vi.hoisted(() => ({ home: '' }));
+const hoisted = vi.hoisted(() => {
+  // The runner reads its ceiling at import; these tests start from none.
+  delete process.env.ANTIGRAVITY_PROCESS_TIMEOUT_MS;
+  return { home: '' };
+});
 
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
@@ -101,12 +105,25 @@ describe('buildAgyArgs', () => {
     expect(args).not.toContain('-m');
   });
 
-  it('raises --print-timeout above the agy default of 5m', () => {
+  it('tells agy to wait until the turn completes when no ceiling is configured', () => {
+    // No ceiling of ours unless ANTIGRAVITY_PROCESS_TIMEOUT_MS sets one
+    // (turn-ceiling.ts). agy's help: 0 waits until the turn completes. It is
+    // passed explicitly, never left to a default that was once 5m.
     const args = buildAgyArgs('hi', baseConfig());
-    const raw = args[args.indexOf('--print-timeout') + 1];
-    expect(raw).toMatch(/^\d+s$/);
-    // Anything at or under agy's own 300s default would cap agent work.
-    expect(Number(raw.replace('s', ''))).toBeGreaterThan(300);
+    expect(args[args.indexOf('--print-timeout') + 1]).toBe('0s');
+  });
+
+  it('with a configured ceiling, tells agy 30 seconds under it', async () => {
+    vi.stubEnv('ANTIGRAVITY_PROCESS_TIMEOUT_MS', String(60 * 60 * 1000));
+    vi.resetModules();
+    try {
+      const fresh = await import('./antigravity-runner.js');
+      const args = fresh.buildAgyArgs('hi', baseConfig());
+      expect(args[args.indexOf('--print-timeout') + 1]).toBe(`${60 * 60 - 30}s`);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });
 

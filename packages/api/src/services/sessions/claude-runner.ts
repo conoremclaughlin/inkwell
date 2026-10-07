@@ -5,7 +5,7 @@
  * Handles message processing and response parsing.
  */
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
@@ -27,15 +27,20 @@ import {
   CONTAINER_RUNNER_FILES,
   PRINT_MODE_CHANNEL_ENV,
 } from '@inklabs/shared';
-import { homedir } from 'os';
-import { join } from 'path';
+import { homedir, tmpdir } from 'os';
+import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
+import { isGroupId, stopProcessAndWait } from './stop-process.js';
+import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
+import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 
-/** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
- *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.CLAUDE_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
+/** Where the sandbox orchestrator mounts the studio checkout in a container. */
+const CONTAINER_STUDIO_ROOT = '/studio';
+
+/** The general ceiling on a Claude Code turn: none unless
+ *  CLAUDE_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). */
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.CLAUDE_PROCESS_TIMEOUT_MS);
 
 /** Time (ms) with no output from the subprocess before it is treated as stuck.
  *  Activity-based: reset every time the process writes anything, so this
@@ -280,8 +285,18 @@ export class ClaudeRunner implements IRunner {
       messageLength: fullMessage.length,
     });
 
+    // Refused at the spawn seam: no process, so no session either.
+    const refusedRun = (reason: string): RunnerResult => ({
+      success: false,
+      backendSessionId: backendSessionId ?? null,
+      responses: [],
+      error: reason,
+      refusedBeforeSpawn: true,
+    });
+
     try {
       const result = await this.spawnProcess(args, fullMessage, runConfig);
+      if (result.refusedBeforeSpawn !== undefined) return refusedRun(result.refusedBeforeSpawn);
 
       // Check if resume failed because session doesn't exist
       if (result.resumeFailedNoSession && isResume) {
@@ -302,6 +317,9 @@ export class ClaudeRunner implements IRunner {
 
         logger.info('Retrying with fresh session', { sessionId });
         const retryResult = await this.spawnProcess(args, fullMessage, runConfig);
+        if (retryResult.refusedBeforeSpawn !== undefined) {
+          return refusedRun(retryResult.refusedBeforeSpawn);
+        }
 
         return {
           success: !retryResult.timedOut,
@@ -312,6 +330,7 @@ export class ClaudeRunner implements IRunner {
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
           ...(retryResult.timedOut ? { error: retryResult.timedOut.message } : {}),
+          ...(retryResult.stopUnconfirmed ? { stopUnconfirmed: retryResult.stopUnconfirmed } : {}),
         };
       }
 
@@ -330,6 +349,7 @@ export class ClaudeRunner implements IRunner {
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
         ...(result.timedOut ? { error: result.timedOut.message } : {}),
+        ...(result.stopUnconfirmed ? { stopUnconfirmed: result.stopUnconfirmed } : {}),
       };
     } catch (error) {
       logger.error('Claude Code process failed', {
@@ -407,7 +427,10 @@ export class ClaudeRunner implements IRunner {
      * `run()` decides `success` from this, so a timeout that resolves without
      * it is reported as a completed turn. See the timers below.
      */
-    timedOut?: { kind: 'idle' | 'hard'; message: string };
+    timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
+    stopUnconfirmed?: RunnerResult['stopUnconfirmed'];
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -442,6 +465,49 @@ export class ClaudeRunner implements IRunner {
     // It now runs in the session service before EVERY runner (task
     // 2841c7a9), so a Codex or Gemini SB's studio is completed too.
 
+    // The studio's permission profile, in a settings file of this launch's
+    // own (design v5, phase A). Prepared before the overlay so a refused
+    // launch leaves nothing applied. A profile that cannot be validated or
+    // delivered fails the launch: no builder fallback.
+    let launchSettings: LaunchSettings | null = null;
+    if (config.launchPermissions && config.workingDirectory) {
+      try {
+        launchSettings = await prepareLaunchSettings({
+          worktreePath: config.workingDirectory,
+          studioWorktreePath: config.launchPermissions.worktreePath,
+          mainRoot: config.launchPermissions.mainRoot,
+          profile: config.launchPermissions.profile,
+          owner: config.launchPermissions.owner,
+          outputDir: config.container?.runtimeDir ?? join(tmpdir(), 'ink-claude-settings'),
+          ...(config.container
+            ? {
+                executionRoot: CONTAINER_STUDIO_ROOT,
+                processPathFor: (hostPath: string) =>
+                  `${CONTAINER_RUNNER_FILES}/${basename(hostPath)}`,
+              }
+            : {}),
+        });
+      } catch (err) {
+        mcpInjection?.cleanup();
+        const reason = err instanceof Error ? err.message : String(err);
+        logger.error('Launch refused: the studio permission profile could not be delivered', {
+          cwd: config.workingDirectory,
+          studioId: config.studioId,
+          reason,
+        });
+        throw new Error(`Launch refused: ${reason}`);
+      }
+      args.push('--settings', launchSettings.processPath);
+      logger.info('Launch settings delivered', {
+        launchId: launchSettings.launchId,
+        studioId: config.studioId,
+        profile: launchSettings.profile,
+        delivered: launchSettings.delivered,
+        sources: launchSettings.sources,
+        precedence: launchSettings.precedence,
+      });
+    }
+
     // Apply per-session permission overlay (from strategy config or 2FA grant).
     // The restore function is called after the process exits to revert the overlay.
     let restoreOverlay: (() => Promise<void>) | null = null;
@@ -457,6 +523,21 @@ export class ClaudeRunner implements IRunner {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    // The caller's admission, asked again past the last await above. Nothing
+    // below awaits before spawn(), so no answer can change between the two.
+    // A refusal undoes what was prepared and starts nothing.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      mcpInjection?.cleanup();
+      restoreOverlay?.().catch(() => {});
+      launchSettings?.cleanup().catch(() => {});
+      logger.warn('Claude Code spawn refused by its caller at the spawn seam; nothing started', {
+        workingDirectory: config.workingDirectory,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
     }
 
     // If headers were injected, patch the --mcp-config arg to point to the temp file.
@@ -478,6 +559,8 @@ export class ClaudeRunner implements IRunner {
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
+        // The launch's tag, by which a restarted server finds this process.
+        ...config.launchEnv,
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
@@ -514,11 +597,20 @@ export class ClaudeRunner implements IRunner {
         container: config.container,
       });
 
+      // A run that must stop with its tools leads its own process group, so a
+      // stop can signal the whole group (stopProcess).
+      const killGroup = config.killProcessGroup === true;
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
         env: target.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: killGroup,
       });
+      if (proc.pid !== undefined)
+        config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
+      // No ceiling unless one is configured, for the module or for this run;
+      // the lower one wins when both are.
+      const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);
 
       let stderr = '';
       const responses: ChannelResponse[] = [];
@@ -536,6 +628,66 @@ export class ClaudeRunner implements IRunner {
       // we get output from the process.
       let idleTimer: NodeJS.Timeout;
 
+      /**
+       * Stop the process, and settle once it has gone, not when it was
+       * signalled. The caller releases the session when this settles, and a
+       * process still winding down can still write to that session: settling
+       * at the signal let a queued or new turn start a second `--resume` of
+       * the same Claude session beside it (measured on the #740 thread,
+       * a0b00a78). For a group stop, "gone" is the whole group, so a tool
+       * child that outlives its leader holds the turn too. Past the bound the
+       * turn settles anyway, says the stop was not confirmed, and names the
+       * processes still seen, so the caller can keep new work off them. The
+       * outcome is read at settle time, so it carries the stream events
+       * parsed while the process wound down.
+       */
+      const stopThenSettle = (
+        stopped: () => {
+          finalTextResponse: string;
+          kind: 'idle' | 'hard' | 'cancelled';
+          message: string;
+          unconfirmedMessage: string;
+        }
+      ) => {
+        settled = true;
+        clearTimeout(timeout);
+        clearTimeout(idleTimer);
+        void stopProcessAndWait(proc, { group: killGroup }).then((stop) => {
+          const outcome = stopped();
+          // A group stop is confirmed only by a group seen empty, never by an
+          // outcome that says nothing of the group.
+          const confirmed = stop.exited && (!killGroup || stop.group === 'empty');
+          let stopUnconfirmed: RunnerResult['stopUnconfirmed'];
+          if (!confirmed) {
+            const pgid = killGroup && isGroupId(proc.pid) ? proc.pid : undefined;
+            stopUnconfirmed = {
+              leaderExited: stop.exited,
+              ...(pgid !== undefined ? { pgid } : {}),
+              ...(stop.group !== undefined ? { group: stop.group } : {}),
+            };
+            // Process metadata only: never arguments, environment or content.
+            logger.error('Claude Code stop could not confirm its processes had gone', {
+              pid: proc.pid,
+              kind: outcome.kind,
+              leaderExited: stop.exited,
+              group: stop.group,
+            });
+          }
+          resolve({
+            responses,
+            usage,
+            servedModel,
+            toolCalls,
+            finalTextResponse: outcome.finalTextResponse,
+            timedOut: {
+              kind: outcome.kind,
+              message: confirmed ? outcome.message : outcome.unconfirmedMessage,
+            },
+            ...(stopUnconfirmed ? { stopUnconfirmed } : {}),
+          });
+        });
+      };
+
       const resetIdleTimer = () => {
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
@@ -546,56 +698,67 @@ export class ClaudeRunner implements IRunner {
               hasResponses: responses.length > 0,
               hasFinalText: !!finalTextResponse,
             });
-            this.killProcess(proc);
-            settled = true;
-            resolve({
-              responses,
-              usage,
-              servedModel,
-              toolCalls,
+            // `timedOut`, not just the marker string. Resolving bare reports a
+            // SIGKILLed turn as a completed one: the session goes idle, a
+            // heartbeat beat records `delivered`, and the marker is
+            // auto-forwarded to the human as if the agent had written it.
+            // The word "timeout" is load-bearing — classifyError matches on
+            // it, and without it this lands in the non-retryable `unknown`
+            // category. (Same fix Lumen made in antigravity-runner, #507.)
+            const message = `Claude Code timeout: no output for ${idleSecs}s, process killed`;
+            stopThenSettle(() => ({
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
-              // `timedOut`, not just the marker string. Resolving bare reports a
-              // SIGKILLed turn as a completed one: the session goes idle, a
-              // heartbeat beat records `delivered`, and the marker above is
-              // auto-forwarded to the human as if the agent had written it.
-              // The word "timeout" is load-bearing — classifyError matches on
-              // it, and without it this lands in the non-retryable `unknown`
-              // category. (Same fix Lumen made in antigravity-runner, #507.)
-              timedOut: {
-                kind: 'idle',
-                message: `Claude Code timeout: no output for ${idleSecs}s, process killed`,
-              },
-            });
+              kind: 'idle',
+              message,
+              unconfirmedMessage: `${message}, but its processes did not confirm they had stopped`,
+            }));
           }
         }, IDLE_TIMEOUT_MS);
       };
       resetIdleTimer();
 
-      // Hard ceiling: no process should run longer than this regardless of activity
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          logger.error('Claude Code process hit hard timeout, killing', {
-            timeoutMs: PROCESS_TIMEOUT_MS,
-            hasResponses: responses.length > 0,
-            hasFinalText: !!finalTextResponse,
-          });
-          this.killProcess(proc);
-          settled = true;
-          resolve({
-            responses,
-            usage,
-            servedModel,
-            toolCalls,
-            finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
-            timedOut: {
-              kind: 'hard',
-              message: `Claude Code timeout: exceeded the ${Math.round(
-                PROCESS_TIMEOUT_MS / 1000
-              )}s ceiling, process killed`,
-            },
-          });
-        }
-      }, PROCESS_TIMEOUT_MS);
+      // A configured ceiling stops the run however active it is. With none,
+      // only the silence timeout above or a cancel ends it.
+      const timeout =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              if (!settled) {
+                logger.error('Claude Code process hit hard timeout, killing', {
+                  timeoutMs: ceilingMs,
+                  hasResponses: responses.length > 0,
+                  hasFinalText: !!finalTextResponse,
+                });
+                const message = `Claude Code timeout: exceeded the ${Math.round(
+                  ceilingMs / 1000
+                )}s ceiling, process killed`;
+                stopThenSettle(() => ({
+                  finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+                  kind: 'hard',
+                  message,
+                  unconfirmedMessage: `${message}, but its processes did not confirm they had stopped`,
+                }));
+              }
+            }, ceilingMs);
+
+      // Cancellation (an owner stopping an inkling's turn): the same stop as
+      // a timeout, reported without the word "timeout", which the retry
+      // classifier would read as transient.
+      const onAbort = () => {
+        if (settled) return;
+        logger.warn('Claude Code turn cancelled, stopping', {
+          hasResponses: responses.length > 0,
+        });
+        stopThenSettle(() => ({
+          finalTextResponse: finalTextResponse || '[Turn cancelled]',
+          kind: 'cancelled',
+          message: 'Claude Code turn cancelled, process stopped',
+          unconfirmedMessage:
+            'Claude Code turn cancelled; its processes did not confirm they had stopped',
+        }));
+      };
+      if (config.signal?.aborted) onAbort();
+      else config.signal?.addEventListener('abort', onAbort, { once: true });
 
       const consumeLine = (line: string) => {
         {
@@ -681,6 +844,7 @@ export class ClaudeRunner implements IRunner {
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         restoreOverlay?.().catch(() => {});
+        launchSettings?.cleanup().catch(() => {});
         if (!settled) {
           settled = true;
           reject(new Error(`Failed to spawn Claude: ${error.message}`));
@@ -688,10 +852,12 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('close', (code) => {
+        config.signal?.removeEventListener('abort', onAbort);
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         mcpInjection?.cleanup();
         restoreOverlay?.().catch(() => {});
+        launchSettings?.cleanup().catch(() => {});
         if (settled) return; // Already resolved by timeout
         settled = true;
         // Before resolving: the stream's last line may have arrived without a
@@ -727,27 +893,6 @@ export class ClaudeRunner implements IRunner {
       proc.stdin.write(message);
       proc.stdin.end();
     });
-  }
-
-  /**
-   * Kill a Claude Code subprocess gracefully, with escalation to SIGKILL.
-   */
-  private killProcess(proc: ChildProcess): void {
-    try {
-      proc.kill('SIGTERM');
-      // If it doesn't die in 5s, force kill
-      setTimeout(() => {
-        try {
-          if (!proc.killed) {
-            proc.kill('SIGKILL');
-          }
-        } catch {
-          // Process already dead
-        }
-      }, 5000);
-    } catch {
-      // Process already dead
-    }
   }
 
   /**
@@ -802,7 +947,8 @@ export class ClaudeRunner implements IRunner {
  */
 export function buildIdentityPrompt(
   sbSlug: string,
-  agentName: string,
+  /** Null for an inkling that hasn't been named yet: its stored name is a placeholder. */
+  agentName: string | null,
   soul?: string,
   timezone?: string,
   heartbeat?: string,
@@ -810,7 +956,7 @@ export function buildIdentityPrompt(
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
-**You are ${agentName}. Your slug is \`${sbSlug}\`.**
+**You are ${agentName ?? "an inkling who hasn't been named yet"}. Your slug is \`${sbSlug}\`.**
 
 When calling Inkwell tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 

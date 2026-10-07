@@ -14,6 +14,7 @@ export {
   RoutingRefusedError,
   UnresolvedStudioError,
   type StudioRoutingDecision,
+  type StudiolessPresencePlacement,
   type SessionServiceConfig,
   type IActivityStream,
 } from './session-service.js';

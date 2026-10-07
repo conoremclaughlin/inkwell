@@ -4,6 +4,13 @@ const inkPortBase = Number(process.env.INK_PORT_BASE || 3001);
 const apiUrl = process.env.API_URL || `http://localhost:${inkPortBase}`;
 
 const nextConfig: NextConfig = {
+  // In development Next logs every server function call with its arguments,
+  // and the sign-in action's arguments are an email address and a password.
+  logging: { serverFunctions: false },
+  // Pages that moved keep their old address working, bookmarks included
+  async redirects() {
+    return [{ source: '/reminders', destination: '/scheduled', permanent: true }];
+  },
   // Allow API calls to the backend
   async rewrites() {
     return [

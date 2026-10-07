@@ -22,7 +22,7 @@ import { execFile } from 'child_process';
 import { lstat } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
-import { auditStudio, type StudioCheckId } from '@inklabs/shared';
+import { auditStudio, type StudioCheckId, type StudioPermissionProfile } from '@inklabs/shared';
 import { resolveInkCli, inkCliSpawn } from './ink-cli';
 import { logger } from '../utils/logger';
 
@@ -43,6 +43,21 @@ export interface CompleteStudioViaCliOptions {
    * SB would have kept it after the lookup recovered (Lumen, PR #699).
    */
   owner?: () => Promise<string | null | undefined>;
+  /**
+   * Looks up the Claude permission profile from the studio's row
+   * (`studioPermissionProfile`), never from the checkout; consulted by
+   * `ensureStudioComplete` only when the checklist is incomplete, as
+   * `owner` is. A thrown error means the row could not be read: the routine
+   * then writes no permissions at all, since a guess would be kept by every
+   * later run.
+   */
+  profile?: () => Promise<StudioPermissionProfile | undefined>;
+  /**
+   * The profile itself, passed to `ink init --permission-profile`. Creators
+   * take it from the row they hold; `ensureStudioComplete` fills it from
+   * `profile`.
+   */
+  permissionProfile?: StudioPermissionProfile;
   /** The studio row this worktree is; recorded into identity.json, never re-registered. */
   studioId?: string;
   /**
@@ -56,6 +71,11 @@ export interface CompleteStudioViaCliOptions {
   rootSync?: boolean;
   /** Default true: write identity.json and record the studio row. */
   studioSetup?: boolean;
+  /**
+   * Default true: write Claude permissions into a settings file that has
+   * none. False when the studio's row could not be read.
+   */
+  writePermissions?: boolean;
   timeoutMs?: number;
   /** For tests: the environment the CLI is resolved from and run with. */
   env?: NodeJS.ProcessEnv;
@@ -132,6 +152,15 @@ export async function completeStudioViaCli(
     ...(options.purpose ? ['--purpose', options.purpose] : []),
     ...(options.rootSync === false ? ['--no-root-sync'] : []),
     ...(options.studioSetup === false ? ['--no-studio-setup'] : []),
+    // Never `--inherit-claude-permissions`: a studio the server creates gets
+    // a profile, not the main worktree's lane rules (design v3, item 3).
+    ...(options.permissionProfile ? ['--permission-profile', options.permissionProfile] : []),
+    // No profile means no permissions, never a guess: the server always
+    // tells ink init which, so init never falls back to a default or to a
+    // lookup of its own (review 4177f7fe, P2 1).
+    ...(options.writePermissions === false || !options.permissionProfile
+      ? ['--no-permissions']
+      : []),
   ];
 
   let stdout = '';
@@ -180,7 +209,8 @@ export async function completeStudioViaCli(
 /**
  * The pre-spawn safety net: read the checklist, and only when something is
  * missing run the routine. A complete studio costs a few file reads; the
- * owner lookup, when one is given, is paid only on the incomplete path.
+ * owner and profile lookups, when given, are paid only on the incomplete
+ * path.
  */
 export async function ensureStudioComplete(
   worktreePath: string,
@@ -197,28 +227,57 @@ export async function ensureStudioComplete(
     });
     return { ok: true, complete: false, missing: audit.missing };
   }
-  const { owner, ...rest } = options;
+  const { owner, profile: lookupProfile, ...rest } = options;
+  // The profile, read from the studio's row. No answer means no permissions
+  // are written: a builder profile guessed into a review checkout would be
+  // kept by every later run, and so would a reviewer one in a builder's.
+  let profile = rest.permissionProfile;
+  let writePermissions = rest.writePermissions !== false;
+  if (lookupProfile && writePermissions) {
+    try {
+      profile = await lookupProfile();
+    } catch (err) {
+      profile = undefined;
+      writePermissions = false;
+      logger.warn('Studio permission profile could not be looked up; leaving permissions alone', {
+        worktreePath,
+        missing: audit.missing,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  const permissionArgs = {
+    ...(profile ? { permissionProfile: profile } : {}),
+    ...(writePermissions ? {} : { writePermissions: false }),
+  };
   let ownerSlug: string | null | undefined = null;
   if (owner) {
     try {
       ownerSlug = await owner();
     } catch (err) {
-      // No answer is not "no owner". Complete what needs no owner — hooks,
-      // permissions, backend config — and leave identity and registration
-      // for a spawn that can ask.
+      // No answer is not "no owner". Complete what needs no owner — hooks
+      // and backend config — and leave identity and registration for a
+      // spawn that can ask. Permissions too: they name the owner's scratch
+      // directories.
       logger.warn(
-        'Studio owner could not be looked up; completing without identity or registration',
+        'Studio owner could not be looked up; completing without identity, registration or permissions',
         {
           worktreePath,
           missing: audit.missing,
           error: err instanceof Error ? err.message : String(err),
         }
       );
-      return completeStudioViaCli(worktreePath, { ...rest, studioSetup: false });
+      return completeStudioViaCli(worktreePath, {
+        ...rest,
+        ...permissionArgs,
+        studioSetup: false,
+        writePermissions: false,
+      });
     }
   }
   return completeStudioViaCli(worktreePath, {
     ...rest,
+    ...permissionArgs,
     sbSlug: ownerSlug || options.sbSlug,
   });
 }

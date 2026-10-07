@@ -26,6 +26,7 @@ import {
   SessionService,
   RoutingRefusedError,
   type SessionServiceConfig,
+  type StudiolessPresencePlacement,
 } from './services/sessions';
 import type {
   SessionRequest,
@@ -45,13 +46,21 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryContext,
   type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
+import { recordWakeSourceCompletion } from './services/wake-source-breaker';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import {
+  attachReplyChain,
+  inTurnNote,
+  replyChainWakeDue,
+} from './services/inklings/inkling-reply-chain';
 import {
   TriggerRetryScheduler,
   getTriggerAttempt,
@@ -65,6 +74,7 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
 import { handleHangup } from './utils/hangup';
 import { resolveThreadTriggerScope } from './services/trigger-scope';
@@ -76,6 +86,7 @@ import {
   decideChannelForward,
   applyChannelForward,
   attributeResponses,
+  createTurnReplyForwarder,
 } from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
@@ -86,8 +97,13 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import {
+  HostedInkSessionRunner,
+  parseHostedInkSbIds,
+} from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
+import { startLaunchTracking } from './services/sessions/launched-processes';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -165,10 +181,27 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 1. Initialize data layer
   logger.info('Initializing data layer...');
   dataComposer = await getDataComposer();
+
+  // Before any input is handled: stop the backend processes this server
+  // launched before a restart and left running, then record every launch from
+  // here on (launched-processes.ts). A restart signals only the server, and the
+  // next message to such a session would start a second backend beside it.
+  await startLaunchTracking(dataComposer.getClient(), env.MCP_HTTP_PORT);
   logger.info('Data layer ready');
 
   // 2. Create SessionService (stateless, queries DB per-request)
   logger.info('Creating SessionService...');
+  // Opt-in only. No composition is bound yet (pr:701), so a listed agent's
+  // ink turns are refused, never sent to ink chat in its place.
+  const hostedInkSbIds = parseHostedInkSbIds(env.INK_RUNTIME_IN_PROCESS_SB_IDS);
+  if (hostedInkSbIds.size > 0) {
+    logger.warn(
+      "In-process ink runtime selected, with no composition bound: these agents' ink turns are refused",
+      {
+        sbIds: [...hostedInkSbIds],
+      }
+    );
+  }
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
@@ -185,6 +218,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
+    ...(hostedInkSbIds.size > 0
+      ? { hostedInk: { runner: new HostedInkSessionRunner({}), sbIds: hostedInkSbIds } }
+      : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -307,6 +343,41 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
+    // External channels get their replies back on the channel: through
+    // send_response, or the runtime forwards the text.
+    const isExternalChannel =
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
+    // A run with several outer turns reports each turn's reply as the turn
+    // ends, and each is forwarded then (createTurnReplyForwarder). A runner
+    // that reports no turns leaves this unused, and the run's final text is
+    // decided below as before.
+    const gatewayForTurns = isExternalChannel ? channelGateway : null;
+    const turnReplies = gatewayForTurns
+      ? createTurnReplyForwarder(
+          { channel, conversationId },
+          {
+            consumeExplicitResponse: () => consumeExplicitResponse(channel, conversationId),
+            send: async (payload) => {
+              await gatewayForTurns.sendResponse({
+                channel: channel as ChannelType,
+                conversationId,
+                content: payload.content,
+                format: payload.format,
+                ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+              });
+            },
+            info: (m, meta) => logger.info(m, meta),
+            warn: (m, meta) => logger.warn(m, meta),
+            error: (m, meta) => logger.error(m, meta),
+            release: () =>
+              gatewayForTurns.releaseConversation(channel as GatewayChannel, conversationId),
+          }
+        )
+      : null;
+
     // Build SessionRequest
     const request: SessionRequest = {
       userId,
@@ -333,6 +404,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         // for a message that was never a reply, so its presence means one was.
         ...(replyRouting ? { replyRouting } : {}),
       },
+      ...(turnReplies ? { onTurnReply: turnReplies.onTurnReply } : {}),
     };
 
     // Process through SessionService
@@ -376,13 +448,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
-    // and auto-route the text response if no explicit send_response was called
-    const isExternalChannel =
-      channel === 'telegram' ||
-      channel === 'whatsapp' ||
-      channel === 'discord' ||
-      channel === 'slack';
-    if (isExternalChannel && channelGateway) {
+    // and auto-route the text response if no explicit send_response was called.
+    // A run that reported its turns was decided turn by turn; only the release
+    // and the run-level verdict are left.
+    if (turnReplies && turnReplies.turnsSeen > 0) {
+      await turnReplies.finish({ success: result.success });
+    } else if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       // Reads AND clears. releaseConversation below drains a pending next turn
       // synchronously, and a marker still standing then is read by that nested
@@ -411,7 +482,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         {
           info: (m, meta) => logger.info(m, meta),
           warn: (m, meta) => logger.warn(m, meta),
-          debug: (m, meta) => logger.debug(m, meta),
           release: (payload) =>
             gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
         }
@@ -537,6 +607,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     ...heartbeatServiceFlags,
   });
 
+  // The owner test's accounts are counted here, never named. An entry that
+  // isn't a UUID was left out of the test, and this is where that shows.
+  const inklingOwnerTest = inklingOwnerTestAllowlist();
+  logger.info('Inkling owner test evaluated', {
+    accounts: inklingOwnerTest.userIds.size,
+  });
+  if (inklingOwnerTest.malformed.length > 0) {
+    logger.warn('Inkling owner test: entries left out because they are not UUIDs', {
+      entries: inklingOwnerTest.malformed,
+    });
+  }
+
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
    *
@@ -546,7 +628,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    * exactly when a monitor is most likely to be broken.
    */
   const deliverReminderViaSession = async (
-    reminder: DueReminder
+    reminder: DueReminder,
+    deliveryContext?: HeartbeatDeliveryContext
   ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
@@ -687,19 +770,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // cascade (agent's own studio → main studio) instead of searching
     // for a studio literally named 'home' which doesn't exist.
 
-    const reminderContent = `[HEARTBEAT REMINDER]
-Title: ${reminder.title}
-Description: ${reminder.description || 'No description'}
-Delivery: ${reminder.delivery_channel} → ${reminder.delivery_target || 'default'}
-
----
-IMPORTANT: This reminder was triggered by the heartbeat service.
-Refer to your HEARTBEAT identity document for how to handle scheduled tasks.
-If you need to message a user on Telegram, use send_response with:
-- channel: "${reminder.delivery_channel}"
-- conversationId: "${reminder.delivery_target}"
-
-Do NOT just respond here — you MUST explicitly call send_response to reach external channels.`;
+    // A quiet-hours firing (the reminder's switch is on) is told not to contact
+    // the user until the window ends, in place of the send_response lines.
+    const reminderContent = buildHeartbeatReminderPrompt(reminder, deliveryContext);
 
     const request: SessionRequest = {
       userId,
@@ -802,7 +875,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         const stats = await processHeartbeat(
           deliverReminderViaSession,
           heartbeatEscalation?.onFailure,
-          heartbeatEscalation?.onRecovery
+          heartbeatEscalation?.onRecovery,
+          heartbeatEscalation?.drainHeldNotices
         );
         logger.info('Heartbeat complete', stats);
 
@@ -1099,6 +1173,10 @@ Type: ${payload.triggerType}`;
     }
     if (payload.threadKey) {
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
+      // A group of inklings answering their owner in turn: this one comes
+      // after others (inkling-reply-chain.ts).
+      const answeringInTurn = inTurnNote(payload.metadata);
+      if (answeringInTurn) triggerMessage += `\n${answeringInTurn}`;
 
       // The thread's own description, on the surface an SB reads BEFORE
       // deciding whether to act. A key alone ("inkwell:thread:legibility-commission")
@@ -1149,7 +1227,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
-        sessionAlias: payload.sessionAlias,
+        recipientSessionNamed: !!payload.explicitRecipientSession,
+        sessionKey: payload.sessionKey,
+        // The payload's own field, which only the send path sets; never the
+        // caller-supplied payload.metadata. The inkling gate reads this
+        // message to learn who sent it (Lumen's review of 8b9d7f50).
+        triggerThreadMessageId: payload.threadMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1228,6 +1311,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
         ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
+        ...(refusal.detail.explicit ? { explicit: refusal.detail.explicit } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
@@ -1235,7 +1319,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
               : refusal.detail.reason === 'project-without-repo'
                 ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
-                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+                : refusal.detail.reason === 'explicit-address'
+                  ? 'the sender named a session that cannot take this message; re-send to one the recipient owns, or without the address'
+                  : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1260,6 +1346,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             // The pinned project a project-without-repo refusal names; this
             // hand-built copy is where it went missing (Lumen, #681 round 1).
             project: refusal.detail.project ?? null,
+            explicit: refusal.detail.explicit ?? null,
           },
         });
       }
@@ -1275,10 +1362,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Only a delivery that actually admits a spawn provisions, inside
     // handleMessage's own full resolution below.
     try {
+      // The plan's studioless-presence decision. The stamp's winner, and a
+      // newer stamp met during repair, are tested against it, so neither is
+      // judged by a different decision than the routed candidate (task
+      // bd4657a0). Stays null if the plan never reached routing.
+      let studiolessPresence: StudiolessPresencePlacement | null = null;
       const routedSession = await sessionService!.getOrCreateSession(userId, targetSlug, {
         planOnly: true,
+        onStudiolessPresence: (placement) => {
+          studiolessPresence = placement;
+        },
         threadKey: payload.threadKey,
-        alias: payload.sessionAlias,
+        alias: payload.sessionKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
@@ -1286,6 +1381,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // from thread history / the participant stamp is a continuity hint
         // that routing tests against the thread's project repo (#681 r2).
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // The caller named this session itself (T4): refused if it cannot
+        // take the message, reopened if it ended. A named studio alone never
+        // sets it.
+        recipientSessionNamed: !!payload.explicitRecipientSession,
         repoRoot:
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
@@ -1334,6 +1433,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           } else {
             stampedSessionId = assignment.sessionId;
           }
+          // A named session is an address (T4; Lumen, #725). If its stamp could
+          // not be written and another session holds the binding, the message
+          // is held and reported, never delivered to that other session.
+          if (assignment.rerouted && payload.explicitRecipientSession) {
+            throw new RoutingRefusedError(payload.threadKey || '(unthreaded)', targetSlug, {
+              triedCallerRepo: false,
+              reason: 'explicit-address',
+              anchor: 'session',
+              explicit: { sessionId: payload.recipientSessionId, cause: 'binding-held' },
+            });
+          }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
             // to the winner, and archive our freshly-created loser candidate so
@@ -1352,7 +1462,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                   userId,
                   resolvedIdentityId,
                   payload.threadKey,
-                  winner
+                  winner,
+                  studiolessPresence
                 )
               : false;
             if (winner && winnerAllowed) {
@@ -1402,7 +1513,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                       userId,
                       resolvedIdentityId,
                       payload.threadKey,
-                      newer
+                      newer,
+                      studiolessPresence
                     )
                   : false;
                 if (newer && newerAllowed) {
@@ -1430,6 +1542,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
         } catch (err) {
+          // A refused address is a routing decision, not a failed write: it
+          // holds the message instead of degrading to the routed candidate.
+          if (err instanceof RoutingRefusedError) throw err;
           assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
@@ -1607,6 +1722,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // candidate is promoted as the continuity hint it is, and admission
         // re-checks it against the thread's project repo.
         recipientSessionExplicit: !!payload.explicitRecipientTarget,
+        // Named only while the delivery session IS the one the caller named:
+        // a reroute to a concurrent winner is routing's choice, not theirs.
+        recipientSessionNamed:
+          !!payload.explicitRecipientSession && deliverySession.id === payload.recipientSessionId,
       };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
@@ -1740,6 +1859,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // guard passed.)
     await clearHoldAtTerminal();
 
+    // A completed, admitted wake: count it against its source's no-progress
+    // breaker (spec session-lifecycle-model §5). Only a message a wake source
+    // tagged is counted; never throws.
+    await recordWakeSourceCompletion(dataComposer!, userId, payload.metadata);
+
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =
       payload.metadata && typeof payload.metadata.groupId === 'string'
@@ -1789,6 +1913,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   // inbox row is restored to unread before the retry decision, and a threaded
   // failure is announced on its first failure rather than held silently.
   const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
+    // A group member's wake whose chain Stop or a newer owner message has
+    // since ended is not sent again (inkling-reply-chain.ts).
+    if (!replyChainWakeDue(retryPayload)) {
+      logger.info('[TriggerRetry] Not re-dispatching: its group reply chain has ended', {
+        to: retryPayload.toSlug,
+        threadKey: retryPayload.threadKey || null,
+      });
+      return;
+    }
     logger.info('[TriggerRetry] Re-dispatching trigger', {
       to: retryPayload.toSlug,
       from: retryPayload.fromSlug,
@@ -1799,18 +1932,37 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     agentGateway.dispatchTrigger(retryPayload);
   });
 
-  // 7c. Listen for trigger failures — transient errors get a delayed retry;
+  // 7c. A group of inklings answering their owner in turn: as each member's
+  // wake ends, the next is woken (inkling-reply-chain.ts). A processed wake
+  // has ended. A failed one has ended only if no retry is coming, which the
+  // failure listener below decides, so it reports those itself.
+  const replyChainWakeFailed = attachReplyChain(agentGateway);
+
+  // 7d. Listen for trigger failures — transient errors get a delayed retry;
   // otherwise restore inbox message + notify sender. The decision lives in
   // services/trigger-failure-listener.ts so it can run over a table-backed
   // client (Lumen, #618); the scheduler and the activity stream are handed in.
-  agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
-    handleTriggerFailure(dataComposer?.getClient(), event, {
+  // A failure with no retry coming then ends that wake's part in its chain;
+  // one with a retry keeps its place, so the retry never runs beside the
+  // next member's turn.
+  agentGateway.on('trigger:error', (event: TriggerFailureEvent) => {
+    let retrying = false;
+    return handleTriggerFailure(dataComposer?.getClient(), event, {
       logInkmailFailure: (payload, userId, extra) =>
         logInkmail('inkmail_fail', payload, userId, extra),
-      retryScheduler: triggerRetryScheduler,
+      retryScheduler: {
+        scheduleRetry: (payload, classification, error) => {
+          const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
+          // A retry already pending for this wake is still to come.
+          retrying = retry.scheduled || retry.reason === 'already_pending';
+          return retry;
+        },
+      },
       logRetryActivity: (entry) => dataComposer!.repositories.activityStream.logActivity(entry),
-    })
-  );
+    }).finally(() => {
+      if (!retrying) replyChainWakeFailed(event.payload);
+    });
+  });
 
   // 8. Print status
   printStatus();

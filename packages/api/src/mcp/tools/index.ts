@@ -227,8 +227,11 @@ import {
   handleMarkThreadRead,
   handleReopenThread,
   handleUpdateThread,
+  handleReactToMessage,
   threadTool,
 } from './thread-handlers';
+
+import { threadLinkToolDefinitions } from './thread-link-handlers';
 
 import {
   handleTriggerAgent,
@@ -4533,6 +4536,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
+    'react_to_message',
+    {
+      description: `${threadTool('react_to_message').description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadTool('react_to_message').schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleReactToMessage(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in react_to_message:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     'add_thread_participant',
     {
       description: `Add an agent to a thread. Idempotent (no-op if already a participant). Creates an audited system event in the thread. Triggers the new participant by default so they can catch up.
@@ -4705,6 +4737,38 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       }
     }
   );
+
+  // Thread links: link_thread, unlink_thread, list_thread_links.
+  for (const tool of threadLinkToolDefinitions) {
+    server.registerTool(
+      tool.name,
+      {
+        description: `${tool.description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+        inputSchema: tool.schema,
+      },
+      async (args: Record<string, unknown>) => {
+        try {
+          return await tool.handler(args, dataComposer);
+        } catch (error) {
+          logger.error(`Error in ${tool.name}:`, error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
 
   // =====================================================
   // AGENT TRIGGER TOOLS (real-time agent-to-agent wakeup)

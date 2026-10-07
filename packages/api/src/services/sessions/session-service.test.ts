@@ -7,12 +7,17 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { configureLaunchRecording, holdSurvivors, resetLaunchHolds } from './launched-processes.js';
 import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
+  IdentityUnclassifiedError,
   SessionService,
   resolveRuntimeModel,
   parseRuntimeConfig,
@@ -34,6 +39,13 @@ import type {
   ClaudeRunnerResult,
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
+import { InkRunner } from './ink-runner.js';
+import { resolveInkCli } from '../ink-cli.js';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { spawn } from 'child_process';
+import { STOP_GRACE_MS } from './stop-process.js';
+import { clearInklingFences, fenceInkling } from '../inklings/inkling-stop-fence.js';
+import { carriedClassification, isRoutingRefusal } from '../../channels/trigger-retry.js';
 
 // Mock logger (still needed as it's imported directly)
 // The thread-home check and the thread behavior lookup resolve the
@@ -170,6 +182,16 @@ describe('SessionService', () => {
       update: vi
         .fn()
         .mockImplementation(async (id, updates) => createMockSession({ id, ...updates })),
+      // The conditional reopen (T4): reports the row reopened from the state
+      // the caller observed.
+      reopenEnded: vi.fn().mockImplementation(async (id, observed) => ({
+        kind: 'reopened',
+        session: createMockSession({
+          id,
+          endedAt: null,
+          lifecycle: observed.lifecycle === 'completed' ? 'idle' : observed.lifecycle,
+        }),
+      })),
       updateTokenUsage: vi.fn().mockResolvedValue(undefined),
       markCompacted: vi.fn().mockResolvedValue(undefined),
       tryAcquireCompactionLock: vi.fn().mockResolvedValue(true),
@@ -890,6 +912,1335 @@ describe('SessionService', () => {
       return call[1].config.model;
     };
 
+    describe('an inkling turn starts only in the owner test (Lumen 97b1d66a)', () => {
+      const OWNER = '11111111-1111-4111-8111-111111111111';
+      const SB = '3f1c2b7a-9d4e-4c1a-8b2f-6e5d4c3b2a10';
+      /** A second account in the owner test. */
+      const SECOND = '55555555-5555-4555-8555-555555555555';
+      const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
+      const fromOwner = {
+        sender: { id: 'user', name: 'Owner' },
+        metadata: { triggerThreadMessageId: 'msg-owner' },
+      };
+
+      /** The inkling's conversation, as the send path stores it: the gate reads these. */
+      const THREAD_TABLES = {
+        inbox_thread_messages: [
+          { id: 'msg-owner', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: OWNER },
+          { id: 'msg-sb', thread_id: 'thread-1', sender_kind: 'sb', sender_user_id: null },
+          // The second account's message, in the same conversation.
+          { id: 'msg-second', thread_id: 'thread-1', sender_kind: 'user', sender_user_id: SECOND },
+          // The inkling's own reply in its conversation.
+          {
+            id: 'msg-inkling',
+            thread_id: 'thread-1',
+            sender_kind: 'sb',
+            sender_sb_id: SB,
+            sender_user_id: null,
+          },
+          {
+            id: 'msg-someone',
+            thread_id: 'thread-1',
+            sender_kind: 'user',
+            sender_user_id: '44444444-4444-4444-8444-444444444444',
+          },
+          {
+            id: 'msg-elsewhere',
+            thread_id: 'thread-2',
+            sender_kind: 'user',
+            sender_user_id: OWNER,
+          },
+        ],
+        inbox_thread_participants: [{ thread_id: 'thread-1', sb_id: SB, user_id: null }],
+      };
+      let inklingsRoot: string;
+
+      beforeEach(async () => {
+        inklingsRoot = await mkdtemp(join(tmpdir(), 'inklings-'));
+      });
+
+      afterEach(async () => {
+        vi.unstubAllEnvs();
+        await rm(inklingsRoot, { recursive: true, force: true });
+      });
+
+      /**
+       * The config `runner` was handed on its first call: the ink runner, where
+       * every inkling turn runs, unless a test names another.
+       */
+      const configPassedToRunner = (runner: IClaudeRunner = mockInkRunner) =>
+        (
+          vi.mocked(runner.run).mock.calls[0] as unknown as [
+            string,
+            {
+              config: { timeoutMs?: number; killProcessGroup?: boolean } & Record<string, unknown>;
+            },
+          ]
+        )[1].config;
+
+      const cwdPassedToRunner = () =>
+        (
+          vi.mocked(mockInkRunner.run).mock.calls[0] as unknown as [
+            string,
+            { config: { workingDirectory?: string } },
+          ]
+        )[1].config.workingDirectory;
+
+      /** A turn for sb-1 (with `metadata`) on OWNER's account, the gate set to `gate`. */
+      const turn = async (
+        metadata: Record<string, unknown>,
+        request: Record<string, unknown> = fromOwner,
+        gate = OWNER,
+        extra: {
+          session?: Record<string, unknown>;
+          row?: Record<string, unknown>;
+          /** More identity rows (for a slug two identities share). */
+          rows?: Record<string, unknown>[];
+          /** The by-id identity read fails, as a dropped connection would. */
+          readError?: boolean;
+          /** These reads (table and select columns) fail, as a dropped connection would. */
+          failReads?: Array<{ table: string; columns: string }>;
+          /** No session exists yet: routing creates one. */
+          create?: boolean;
+          /**
+           * The first `times` reads of an identity's metadata fail (`error`)
+           * or find no row (`missing`), then reads recover. Routing's
+           * classification of the identity is the first such read a
+           * delivery makes.
+           */
+          metadataFaults?: { mode: 'error' | 'missing'; times: number };
+          /**
+           * The first `times` reads that find the identity by slug (the
+           * routing scope read, `select('id')`) fail, then reads recover.
+           */
+          scopeReadFaults?: number;
+        } = {}
+      ) => {
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
+        const tables = {
+          // agent_id is the request's slug, as an inkling's own slug is: routing
+          // resolves the identity by it.
+          agent_identities: [
+            {
+              id: SB,
+              agent_id: 'myra',
+              user_id: OWNER,
+              sandbox_bypass: false,
+              metadata,
+              // NOT NULL in the table; the turn-cap claim's conditional update needs it.
+              updated_at: '2026-10-02T08:00:00.000Z',
+              ...extra.row,
+            },
+            ...(extra.rows ?? []),
+          ],
+          studios: [],
+          ...THREAD_TABLES,
+        };
+        lastTables = tables;
+        const supabase = makeFakeSupabase(tables);
+        // makeFakeSupabase is typed `never`, so it fits any client parameter.
+        // The read faults below wrap its tables' select, so they reach it
+        // through the part of its shape they use.
+        type FaultableQuery = { maybeSingle: () => Promise<unknown>; then?: unknown };
+        type FaultableTable = { select: (cols?: string) => FaultableQuery };
+        const client = supabase as unknown as { from: (table: string) => FaultableTable };
+        /**
+         * From now on, a read of `table` whose select columns `matches` answers
+         * `answer` (and counts as one of its `times`, when given), instead of
+         * reaching the fake's rows.
+         */
+        const faultReads = (
+          table: string | undefined,
+          matches: (cols: string | undefined) => boolean,
+          answer: { data: null; error: { message: string } | null },
+          times = Infinity
+        ) => {
+          let left = times;
+          const from = client.from.bind(client);
+          client.from = (name: string) => {
+            const query = from(name);
+            if (table !== undefined && name !== table) return query;
+            const select = query.select.bind(query);
+            query.select = (cols?: string) => {
+              const q = select(cols);
+              if (left > 0 && matches(cols)) {
+                left -= 1;
+                q.maybeSingle = async () => answer;
+                q.then = (resolve: (v: unknown) => unknown) =>
+                  Promise.resolve(answer).then(resolve);
+              }
+              return q;
+            };
+            return query;
+          };
+        };
+        const failed = { data: null, error: { message: 'fixture read failed' } };
+        const failing = [
+          ...(extra.failReads ?? []),
+          ...(extra.readError
+            ? [{ table: 'agent_identities', columns: 'id, user_id, metadata' }]
+            : []),
+        ];
+        for (const { table, columns } of failing) {
+          faultReads(table, (cols) => cols === columns, failed);
+        }
+        if (extra.metadataFaults) {
+          faultReads(
+            'agent_identities',
+            (cols) => (cols ?? '').split(',').some((col) => col.trim() === 'metadata'),
+            extra.metadataFaults.mode === 'error' ? failed : { data: null, error: null },
+            extra.metadataFaults.times
+          );
+        }
+        if (extra.scopeReadFaults) {
+          faultReads('agent_identities', (cols) => cols === 'id', failed, extra.scopeReadFaults);
+        }
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          {
+            defaultWorkingDirectory: '/test',
+            mcpConfigPath: '/test/.mcp.json',
+            inklingsRoot,
+            defaultModel: 'claude-test-model',
+            defaultCodexModel: 'codex-test-model',
+          },
+          mockCodexRunner,
+          supabase,
+          undefined,
+          mockInkRunner
+        );
+        // A session as routing creates one, with no native conversation yet:
+        // ink for an inkling, else the runtime its identity names (none, so
+        // claude-code).
+        const asCreated = metadata.client === 'inkling-mobile' ? { backend: 'ink' } : {};
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          extra.create
+            ? null
+            : createMockSession({
+                sbId: SB,
+                userId: OWNER,
+                backendSessionId: null,
+                ...asCreated,
+                ...extra.session,
+              } as never)
+        );
+        lastService = service;
+        return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
+      };
+      let lastService: SessionService;
+      let lastTables: Record<string, Row[]>;
+      /**
+       * The old turn counter (metadata.ownerTestTurns) in the last turn's
+       * tables. Nothing writes it since the cap was dropped, so it stays as
+       * the test set it: undefined unless seeded.
+       */
+      const turnsCounted = () =>
+        (lastTables.agent_identities.find((r) => r.id === SB)?.metadata as Row | undefined)
+          ?.ownerTestTurns;
+      /**
+       * No runner was asked to run a turn. An inkling's turn would reach the
+       * ink runner, any other SB's the Claude one, so a refusal checks both.
+       */
+      const expectNothingRan = () => {
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      };
+
+      it("the owner's own message wakes an inkling born under the test", async () => {
+        const result = await turn(INKLING);
+        expect(mockInkRunner.run).toHaveBeenCalled();
+        expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it("a second account in the test wakes its own inkling with its own message, and no other account's message does", async () => {
+        // OWNER is listed first, so a wake proof bound to any one listed
+        // account, rather than to this inkling's own owner, fails here.
+        vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', `${OWNER},${SECOND}`);
+        const theirs = { row: { user_id: SECOND }, session: { userId: SECOND } };
+        const asSecond = (triggerThreadMessageId: string) => ({
+          userId: SECOND,
+          sender: { id: 'user', name: 'Tester' },
+          metadata: { triggerThreadMessageId },
+        });
+
+        const woken = await turn(INKLING, asSecond('msg-second'), OWNER, theirs);
+        expect(woken.errorCode).not.toBe('INKLING_TURN_REFUSED');
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+
+        // The first account is in the test too, but it is not this inkling's owner.
+        const notTheirs = await turn(INKLING, asSecond('msg-owner'), OWNER, theirs);
+        expect(notTheirs.errorCode).toBe('INKLING_TURN_REFUSED');
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      });
+
+      it("the inkling's own reply starts no turn", async () => {
+        // Control: the owner's message does start one. Nothing is counted
+        // either way: there is no turn cap (Conor, Oct 4 2026, 5:00 PM).
+        await turn(INKLING);
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+        expect(turnsCounted()).toBeUndefined();
+        vi.mocked(mockInkRunner.run).mockClear();
+
+        const result = await turn(INKLING, {
+          sender: { id: 'user', name: 'Owner' },
+          metadata: { triggerThreadMessageId: 'msg-inkling' },
+        });
+        expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+        expect(result.classification?.retryable).toBe(false);
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        expect(turnsCounted()).toBeUndefined();
+      });
+
+      describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
+        const MISSING = '99999999-9999-4999-8999-999999999999';
+
+        it("a 'user' label proves nothing: only the owner's own stored message, in its conversation, wakes it", async () => {
+          const label = { id: 'user', name: 'Owner' };
+          for (const messageId of [
+            undefined, // trigger_agent: a caller-supplied fromSlug 'user' and no stored message
+            'msg-sb', // an SB's message in its conversation
+            'msg-someone', // another person's
+            'msg-elsewhere', // the owner's, but in a conversation the inkling is not on
+            'msg-missing', // names no stored message
+          ]) {
+            const result = await turn(INKLING, {
+              sender: label,
+              metadata: messageId ? { triggerThreadMessageId: messageId } : {},
+            });
+            expect(result.errorCode, String(messageId)).toBe('INKLING_TURN_REFUSED');
+          }
+          expectNothingRan();
+        });
+
+        it('an identity that cannot be established is refused, whatever its slug (Lumen 5bd4de42)', async () => {
+          // An sbId that names no row: refused, kindle- slug or not. Not retryable.
+          for (const sbSlug of ['kindle-zzz', 'myra']) {
+            const result = await turn({}, { ...fromOwner, sbSlug }, OWNER, {
+              session: { sbId: MISSING, sbSlug },
+            });
+            expect(result.errorCode, sbSlug).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, sbSlug).toBe(false);
+          }
+          // A failed identity read: refused, but retryable, so a blip loses nothing.
+          const blip = await turn({}, fromOwner, OWNER, { readError: true });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          // With no sbId, a slug two identities share is ambiguous: refused.
+          const ambiguous = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(ambiguous.errorCode).toBe('INKLING_TURN_REFUSED');
+          expectNothingRan();
+        });
+
+        it("a failed read while proving the owner's message refuses without running, as retryable (Lumen 7d40b0aa)", async () => {
+          for (const read of [
+            { table: 'inbox_thread_messages', columns: 'thread_id, sender_kind, sender_user_id' },
+            { table: 'inbox_thread_participants', columns: 'sb_id' },
+          ]) {
+            const result = await turn(INKLING, fromOwner, OWNER, { failReads: [read] });
+            expect(result.errorCode, read.table).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, read.table).toBe(true);
+          }
+          // A definite no (an SB's message) stays a refusal not worth retrying.
+          const definite = await turn(INKLING, {
+            sender: { id: 'user', name: 'Owner' },
+            metadata: { triggerThreadMessageId: 'msg-sb' },
+          });
+          expect(definite.classification?.retryable).toBe(false);
+          expectNothingRan();
+        });
+
+        it('with no sbId, a failed identity lookup refuses as retryable; a shared slug does not (Lumen 7d40b0aa)', async () => {
+          const blip = await turn(INKLING, fromOwner, OWNER, {
+            session: { sbId: null },
+            failReads: [{ table: 'agent_identities', columns: 'id' }],
+          });
+          expect(blip).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          const shared = await turn({}, fromOwner, OWNER, {
+            session: { sbId: null },
+            rows: [{ id: MISSING, agent_id: 'myra', user_id: OWNER, metadata: {} }],
+          });
+          expect(shared.classification?.retryable).toBe(false);
+          expectNothingRan();
+        });
+
+        it('positively no identity row, or a readable ordinary one, runs as today', async () => {
+          // No sbId, and the account has no identity row for this slug at all.
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' }, sbSlug: 'nobody' }, OWNER, {
+            session: { sbId: null, sbSlug: 'nobody' },
+          });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+        });
+
+        it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {
+          const off = await turn(INKLING, fromOwner, '', { session: { sbId: null } });
+          expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
+          expectNothingRan();
+          await turn(INKLING, fromOwner, OWNER, { session: { sbId: null } });
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({ killProcessGroup: true });
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        });
+
+        it("another account's inkling is refused though the turn names the owner's account", async () => {
+          const result = await turn(INKLING, fromOwner, OWNER, {
+            row: { user_id: '33333333-3333-4333-8333-333333333333' },
+          });
+          expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+          expectNothingRan();
+        });
+
+        /** The context a turn is built from, with the identity's stored runtime and provider. */
+        const contextWith = (agent: Record<string, unknown>) => {
+          const context = createMockInjectedContext();
+          return { ...context, agent: { ...context.agent, ...agent } } as never;
+        };
+        /** The updates that rewrote a session's runtime or its native session id. */
+        const runtimeRewrites = () =>
+          vi
+            .mocked(mockRepository.update)
+            .mock.calls.map(([, updates]) => updates as Record<string, unknown>)
+            .filter((updates) => 'backend' in updates || 'backendSessionId' in updates);
+
+        it('a new inkling session is created as ink and runs there; another SB keeps the runtime its identity names (Conor, 5:08 PM)', async () => {
+          await turn(INKLING, fromOwner, OWNER, { create: true });
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, OWNER, { create: true });
+          const created = vi
+            .mocked(mockRepository.create)
+            .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+          expect(created).toEqual(['ink', 'claude-code']);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(configPassedToRunner()).toMatchObject({
+            inkProvider: 'claude',
+            model: 'claude-test-model',
+          });
+        });
+
+        it('an identity read that fails or finds no row at creation creates nothing and is retryable; the healthy retry creates the inkling as ink (Lumen, #750 r2)', async () => {
+          for (const mode of ['error', 'missing'] as const) {
+            vi.mocked(mockRepository.create).mockClear();
+            vi.mocked(mockInkRunner.run).mockClear();
+            const faulted = await turn(INKLING, fromOwner, OWNER, {
+              create: true,
+              metadataFaults: { mode, times: 1 },
+            });
+            expect(faulted, mode).toMatchObject({
+              success: false,
+              errorCode: 'INKLING_TURN_REFUSED',
+              classification: { retryable: true },
+              admitted: false,
+            });
+            // No row on a guessed runtime: nothing to be refused for good later.
+            expect(mockRepository.create, mode).not.toHaveBeenCalled();
+            expectNothingRan();
+
+            const retried = await turn(INKLING, fromOwner, OWNER, { create: true });
+            expect(retried.errorCode, mode).not.toBe('INKLING_TURN_REFUSED');
+            const created = vi
+              .mocked(mockRepository.create)
+              .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+            expect(created, mode).toEqual(['ink']);
+            expect(mockInkRunner.run, mode).toHaveBeenCalledTimes(1);
+          }
+        });
+
+        it('an ordinary SB whose identity read fails at routing is refused retryably too, and nothing is created; its retry runs as before', async () => {
+          const heartbeat = { sender: { id: 'system', name: 'heartbeat' } };
+          const faulted = await turn({}, heartbeat, OWNER, {
+            create: true,
+            metadataFaults: { mode: 'error', times: 1 },
+          });
+          expect(faulted).toMatchObject({
+            success: false,
+            classification: { retryable: true },
+            admitted: false,
+          });
+          expect(mockRepository.create).not.toHaveBeenCalled();
+          expectNothingRan();
+
+          await turn({}, heartbeat, OWNER, { create: true });
+          const created = vi
+            .mocked(mockRepository.create)
+            .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+          expect(created).toEqual(['claude-code']);
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('a failed read of the identity by slug, with no id to classify, creates nothing: unthreaded it is retried, threaded it is held as before; the healthy delivery creates the inkling as ink (Lumen, #750 r3)', async () => {
+          const threaded = {
+            ...fromOwner,
+            metadata: {
+              ...fromOwner.metadata,
+              threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+            },
+          };
+          for (const [label, request, refusal] of [
+            [
+              'unthreaded',
+              fromOwner,
+              {
+                errorCode: 'INKLING_TURN_REFUSED',
+                classification: { retryable: true },
+              },
+            ],
+            // The ambiguous-identity hold threaded routing already had (#514).
+            ['threaded', threaded, { errorCode: 'ROUTING_REFUSED' }],
+          ] as const) {
+            vi.mocked(mockRepository.create).mockClear();
+            vi.mocked(mockInkRunner.run).mockClear();
+            const faulted = await turn(INKLING, request, OWNER, {
+              create: true,
+              scopeReadFaults: 1,
+            });
+            expect(faulted, label).toMatchObject({ success: false, admitted: false, ...refusal });
+            expect(mockRepository.create, label).not.toHaveBeenCalled();
+            expectNothingRan();
+
+            const healthy = await turn(INKLING, request, OWNER, { create: true });
+            expect(healthy.errorCode, label).toBeUndefined();
+            const created = vi
+              .mocked(mockRepository.create)
+              .mock.calls.map(([data]) => (data as { backend?: string }).backend);
+            expect(created, label).toEqual(['ink']);
+            expect(mockInkRunner.run, label).toHaveBeenCalledTimes(1);
+          }
+        });
+
+        it('an ordinary SB whose identity read by slug fails is refused retryably too, and nothing is created', async () => {
+          const heartbeat = { sender: { id: 'system', name: 'heartbeat' } };
+          const faulted = await turn({}, heartbeat, OWNER, { create: true, scopeReadFaults: 1 });
+          expect(faulted).toMatchObject({
+            success: false,
+            classification: { retryable: true },
+            admitted: false,
+          });
+          expect(mockRepository.create).not.toHaveBeenCalled();
+          expectNothingRan();
+        });
+
+        it('the refusal carries a retryable verdict the trigger retry scheduler reads, and is not a routing hold', () => {
+          // A queued turn's re-resolution rethrows this error raw; the
+          // scheduler reads the verdict off the error object itself.
+          const error = new IdentityUnclassifiedError('myra', SB);
+          expect(carriedClassification(error)).toMatchObject({ retryable: true });
+          expect(isRoutingRefusal(error)).toBe(false);
+        });
+
+        it('an inkling runs on ink whatever runtime its identity stored, a direct Claude one included, with Claude as its provider and model', async () => {
+          const stored = ['claude-code', 'claude', 'ink', null];
+          for (const backend of stored) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ backend }));
+            const result = await turn(INKLING);
+            expect(result.errorCode, String(backend)).not.toBe('INKLING_TURN_REFUSED');
+          }
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(stored.length);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          for (const [, options] of vi.mocked(mockInkRunner.run).mock.calls) {
+            expect(options.config).toMatchObject({
+              inkProvider: 'claude',
+              model: 'claude-test-model',
+            });
+          }
+        });
+
+        it('a session that stored another runtime is refused, native id or not, with its earlier messages in the thread (Lumen 36c31fe3)', async () => {
+          // The thread already holds a conversation: the owner's messages and
+          // the inkling's own earlier reply. A missing native id says nothing
+          // about that history.
+          expect(
+            THREAD_TABLES.inbox_thread_messages.some(
+              (message) => message.id === 'msg-inkling' && message.sender_sb_id === SB
+            )
+          ).toBe(true);
+          for (const backend of ['claude-code', 'codex-cli', null]) {
+            for (const backendSessionId of [null, 'native-conversation-1']) {
+              const label = `${backend} / ${backendSessionId}`;
+              const result = await turn(INKLING, fromOwner, OWNER, {
+                session: { backend, backendSessionId },
+              });
+              expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+              expect(result.classification?.retryable, label).toBe(false);
+              expect(result.error, label).toMatch(/would not carry its history/);
+            }
+          }
+          expectNothingRan();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+          // The row keeps the runtime and the native id it had: nothing is relabelled.
+          expect(runtimeRewrites()).toEqual([]);
+
+          // Control: an ink session, its own native id and all, runs.
+          await turn(INKLING, fromOwner, OWNER, {
+            session: { backend: 'ink', backendSessionId: 'session-123' },
+          });
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('its provider is Claude Code when none is set or Claude is named, and ink is told so with the Claude model (Conor, 5:32 PM)', async () => {
+          const providers = [null, 'claude-code', 'claude', ' Claude-Code '];
+          for (const provider of providers) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith({ provider }));
+            const result = await turn(INKLING);
+            expect(result.errorCode, String(provider)).not.toBe('INKLING_TURN_REFUSED');
+          }
+          const configs = vi
+            .mocked(mockInkRunner.run)
+            .mock.calls.map(([, options]) => options.config);
+          expect(configs).toHaveLength(providers.length);
+          for (const config of configs) {
+            expect(config).toMatchObject({ inkProvider: 'claude', model: 'claude-test-model' });
+          }
+        });
+
+        it('a Codex provider, or a runtime or provider ink does not run for inklings, is refused by name: never run as Claude, never given a Codex model', async () => {
+          const cases = [
+            { agent: { provider: 'codex-cli' }, reason: /provider is Codex/ },
+            { agent: { provider: 'codex' }, reason: /provider is Codex/ },
+            { agent: { provider: 'gemini' }, reason: /provider "gemini"/ },
+            { agent: { backend: 'codex-cli' }, reason: /"codex-cli" runtime/ },
+            { agent: { backend: 'gemini' }, reason: /"gemini" runtime/ },
+            { agent: { backend: 'something-else' }, reason: /"something-else" runtime/ },
+          ];
+          for (const { agent, reason } of cases) {
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(contextWith(agent));
+            const result = await turn(INKLING);
+            const label = JSON.stringify(agent);
+            expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+            expect(result.classification?.retryable, label).toBe(false);
+            expect(result.error, label).toMatch(reason);
+          }
+          expectNothingRan();
+          expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        });
+
+        /** The config the ink runner was handed on its first call. */
+        const configPassedToInkRunner = () =>
+          (
+            vi.mocked(mockInkRunner.run).mock.calls[0] as unknown as [
+              string,
+              { config: Record<string, unknown> },
+            ]
+          )[1].config;
+
+        it('an inkling session on ink runs on InkRunner, bounded as on Claude, one outer cycle and local tools whatever the dashboard says', async () => {
+          vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '60000');
+          const result = await turn(
+            { ...INKLING, runtimeConfig: { maxTurns: 7, toolRouting: 'backend' } },
+            fromOwner,
+            OWNER,
+            { session: { backend: 'ink' } }
+          );
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+          const config = configPassedToInkRunner();
+          expect(config).toMatchObject({
+            killProcessGroup: true,
+            timeoutMs: 60000,
+            maxTurns: 1,
+            toolRouting: 'local',
+            workingDirectory: join(inklingsRoot, SB),
+            inkProvider: 'claude',
+          });
+          expect(config.signal).toBeInstanceOf(AbortSignal);
+          expect(typeof config.admitSpawn).toBe('function');
+        });
+
+        it("another SB on ink keeps its dashboard's outer cycles and tool routing (the pins are the inkling's)", async () => {
+          await turn(
+            { runtimeConfig: { maxTurns: 7, toolRouting: 'backend' } },
+            { sender: { id: 'system', name: 'x' } },
+            OWNER,
+            { session: { backend: 'ink' } }
+          );
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          const config = configPassedToInkRunner();
+          expect(config).toMatchObject({ maxTurns: 7, toolRouting: 'backend' });
+          expect(config.killProcessGroup).toBeUndefined();
+          // Its provider is still the chat's own default: only an inkling names one.
+          expect(config.inkProvider).toBeUndefined();
+        });
+
+        it("another SB keeps its stored runtime: a direct Claude session isn't moved to ink", async () => {
+          await turn({}, { sender: { id: 'system', name: 'x' } });
+          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+          expect(mockInkRunner.run).not.toHaveBeenCalled();
+          expect(runtimeRewrites().some((updates) => updates.backend === 'ink')).toBe(false);
+        });
+
+        describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const fromSystem = { sender: { id: 'system', name: 'x' } };
+          const launchSession = { backend: 'ink', id: 'launch-session' };
+          const fakeStore = () => ({
+            reserve: vi.fn(async () => 'row-1'),
+            attach: vi.fn(async () => undefined),
+            markExited: vi.fn(async () => undefined),
+            listOpen: vi.fn(async () => []),
+          });
+          const envs: Array<Record<string, string> | undefined> = [];
+          const reportingSpawn = (result: Record<string, unknown>) =>
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: {
+                config: {
+                  onSpawned?: (spawned: { pid: number }) => void;
+                  launchEnv?: Record<string, string>;
+                };
+              }
+            ) => {
+              envs.push(options.config.launchEnv);
+              options.config.onSpawned?.({ pid: 4242 });
+              return result;
+            }) as never);
+          afterEach(() => {
+            configureLaunchRecording(undefined);
+            resetLaunchHolds();
+          });
+
+          it('writes the launch before the runner starts, tags its process, and stamps it once the run confirmed its exit', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            envs.length = 0;
+            reportingSpawn({ success: true, responses: [], backendSessionId: 'ink-1' });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(store.reserve).toHaveBeenCalledWith(
+              expect.objectContaining({ sessionId: 'launch-session' })
+            );
+            expect(vi.mocked(store.reserve).mock.invocationCallOrder[0]).toBeLessThan(
+              vi.mocked(mockInkRunner.run).mock.invocationCallOrder[0]
+            );
+            expect(envs).toEqual([{ INK_LAUNCH_ID: 'row-1' }]);
+            await vi.waitFor(() =>
+              expect(store.attach).toHaveBeenCalledWith(
+                'row-1',
+                expect.objectContaining({ pid: 4242 })
+              )
+            );
+            await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
+          });
+
+          it('starts nothing, and refuses the turn retryably, when its launch cannot be written', async () => {
+            const store = fakeStore();
+            store.reserve.mockRejectedValue(new Error('db down'));
+            configureLaunchRecording({
+              store,
+              serverInstance: 'host:3001',
+              bootId: 'boot',
+              reserveDelaysMs: [0],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/could not be recorded before starting it/);
+          });
+
+          it('leaves the row open when the runner could not confirm its processes stopped', async () => {
+            const store = fakeStore();
+            configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+            reportingSpawn({
+              success: false,
+              responses: [],
+              backendSessionId: 'ink-1',
+              error: 'stopped, unconfirmed',
+              stopUnconfirmed: { leaderExited: false },
+            });
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            await vi.waitFor(() => expect(store.attach).toHaveBeenCalled());
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            expect(store.markExited).not.toHaveBeenCalled();
+          });
+
+          it('carries a hold installed while the turn was prepared to the runner’s spawn seam', async () => {
+            const asked: Array<string | undefined> = [];
+            vi.mocked(mockInkRunner.run).mockImplementationOnce((async (
+              _message: string,
+              options: { config: { admitSpawn?: () => string | undefined } }
+            ) => {
+              asked.push(options.config.admitSpawn?.());
+              // An earlier launch's failed record lands during the runner's preparation.
+              holdSurvivors({
+                stopped: [],
+                gone: [],
+                unstoppable: [],
+                uncertain: [
+                  {
+                    id: '',
+                    sessionId: 'launch-session',
+                    backend: 'ink',
+                    pid: process.pid,
+                    pgid: null,
+                    startIdentity: null,
+                    bootId: 'boot',
+                  },
+                ],
+              });
+              asked.push(options.config.admitSpawn?.());
+              return { success: false, responses: [], error: asked[1], refusedBeforeSpawn: true };
+            }) as never);
+            await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(asked[0]).toBeUndefined();
+            expect(asked[1]).toMatch(/may still be running this session/);
+          });
+
+          it('starts nothing for a session held by a survivor that may still be alive', async () => {
+            holdSurvivors({
+              stopped: [],
+              gone: [],
+              unstoppable: [],
+              // This test process: certainly alive.
+              uncertain: [
+                {
+                  id: 'row-held',
+                  sessionId: 'launch-session',
+                  backend: 'ink',
+                  pid: process.pid,
+                  pgid: null,
+                  startIdentity: null,
+                  bootId: 'boot',
+                },
+              ],
+            });
+            const result = await turn({}, fromSystem, OWNER, { session: launchSession });
+            expect(mockInkRunner.run).not.toHaveBeenCalled();
+            expect(JSON.stringify(result)).toMatch(/may still be running this session/);
+          });
+        });
+
+        it('a run on ink that reports an unconfirmed stop fences the inkling like a Claude run does', async () => {
+          vi.mocked(mockInkRunner.run).mockResolvedValueOnce({
+            success: false,
+            responses: [],
+            backendSessionId: 'ink-session-1',
+            error: 'ink chat turn cancelled; its processes did not confirm they had stopped',
+            stopUnconfirmed: { leaderExited: false, pgid: 4242, group: 'unknown' },
+          } as never);
+          // Fully mocked: the fence's probe of the synthetic group never reaches the host.
+          const kill = vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
+            if (pid < 0) throw Object.assign(new Error('synthetic'), { code: 'EPERM' });
+            return true;
+          }) as typeof process.kill);
+          try {
+            await turn(INKLING, fromOwner, OWNER, { session: { backend: 'ink' } });
+            const refused = await turn(INKLING, fromOwner, OWNER, { session: { backend: 'ink' } });
+            expect(refused).toMatchObject({
+              errorCode: 'INKLING_TURN_REFUSED',
+              classification: { retryable: true },
+            });
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          } finally {
+            kill.mockRestore();
+            clearInklingFences();
+          }
+        });
+
+        it('an inkling session is never compacted; another SB still is', async () => {
+          for (const [metadata, compacts] of [
+            [INKLING, false],
+            [{}, true],
+          ] as const) {
+            await turn(metadata, { sender: { id: 'system', name: 'x' } });
+            vi.mocked(mockRepository.tryAcquireCompactionLock).mockClear();
+            vi.mocked(mockRepository.findById).mockResolvedValueOnce(
+              createMockSession({ sbId: SB, userId: OWNER } as never)
+            );
+            await lastService.triggerCompaction('session-123');
+            expect(
+              vi.mocked(mockRepository.tryAcquireCompactionLock).mock.calls.length > 0,
+              JSON.stringify(metadata)
+            ).toBe(compacts);
+          }
+        });
+      });
+
+      it('its turn runs in its own folder, made on demand: never the default directory', async () => {
+        await turn(INKLING);
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        // This file mocks fs/promises' stat; the folder check needs the real one.
+        const fs = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+        expect((await fs.stat(join(inklingsRoot, SB))).isDirectory()).toBe(true);
+      });
+
+      it('its stop takes its tools with it, and it has a ceiling only when one is configured', async () => {
+        vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '');
+        await turn(INKLING);
+        const unset = configPassedToRunner() as Record<string, unknown>;
+        expect(unset.killProcessGroup).toBe(true);
+        // A working turn is not killed on wall-clock (Conor, 2026-10-04): the
+        // first test's five minutes is gone unless the env sets a ceiling.
+        expect('timeoutMs' in unset).toBe(false);
+
+        vi.mocked(mockInkRunner.run).mockClear();
+        vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '90000');
+        await turn(INKLING);
+        expect(configPassedToRunner()).toMatchObject({ timeoutMs: 90000, killProcessGroup: true });
+      });
+
+      it('another SB keeps the runner defaults: no inkling ceiling, no group stop', async () => {
+        await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+        const config = configPassedToRunner(mockClaudeRunner) as {
+          signal?: AbortSignal;
+        } & Record<string, unknown>;
+        expect(config.timeoutMs).toBeUndefined();
+        expect(config.killProcessGroup).toBeUndefined();
+        expect(config.signal).toBeUndefined();
+      });
+
+      it('its owner can cancel it while it runs; it is released when the run ends', async () => {
+        let during = -1;
+        let aborted = false;
+        vi.mocked(mockInkRunner.run).mockImplementationOnce(async (_m, options) => {
+          during = liveInklingTurns(SB);
+          cancelInklingTurns(SB);
+          aborted = (options.config as { signal?: AbortSignal }).signal?.aborted === true;
+          return {
+            success: false,
+            responses: [],
+            backendSessionId: null,
+            error: 'cancelled',
+          } as never;
+        });
+        await turn(INKLING);
+        expect(during).toBe(1);
+        expect(aborted).toBe(true);
+        expect(liveInklingTurns(SB)).toBe(0);
+      });
+
+      describe('a stopped turn holds its session until its process has exited (two processes on one session)', () => {
+        let leaderPid = 0;
+        let toolPid = 0;
+
+        afterEach(() => {
+          for (const pid of [leaderPid, toolPid]) {
+            if (!pid) continue;
+            try {
+              process.kill(pid, 'SIGKILL');
+            } catch {
+              // already gone
+            }
+          }
+          leaderPid = 0;
+          toolPid = 0;
+          clearInklingFences();
+        });
+
+        /**
+         * Make `lines` the fake `ink` (INK_CLI_PATH) in a new directory, and
+         * return that directory. Refuses to go on unless InkRunner will run
+         * this fake: the checkout's real CLI would start a real `ink chat`.
+         * Paths come from the fake's own location (the runner hands it a
+         * clean env): no path is spliced into code.
+         */
+        const installFakeInk = async (prefix: string, lines: string[]): Promise<string> => {
+          const dir = await mkdtemp(join(tmpdir(), prefix));
+          const script = join(dir, 'ink.mjs');
+          writeFileSync(
+            script,
+            [
+              "import { writeFileSync } from 'fs';",
+              "import { dirname, join } from 'path';",
+              "import { fileURLToPath } from 'url';",
+              'const here = dirname(fileURLToPath(import.meta.url));',
+              ...lines,
+            ].join('\n')
+          );
+          vi.stubEnv('INK_CLI_PATH', script);
+          if (resolveInkCli()?.path !== script) {
+            throw new Error('InkRunner would not run the fake ink; refusing to spawn anything');
+          }
+          return dir;
+        };
+
+        /**
+         * A fake `ink` that exits as soon as it gets SIGTERM, having started a
+         * tool that ignores it. Each reports its pid once its handler is set;
+         * the tool is handed its pid file as an argument.
+         */
+        const writeFakeInkWithStubbornTool = async (): Promise<{
+          leader: string;
+          tool: string;
+        }> => {
+          const dir = await installFakeInk('stop-then-send-tool-', [
+            "import { spawn } from 'child_process';",
+            "process.on('SIGTERM', () => process.exit(0));",
+            `const tool = "process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";`,
+            "spawn(process.execPath, ['-e', tool, join(here, 'tool.pid')], { stdio: 'ignore' });",
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+            'setInterval(() => {}, 1000);',
+          ]);
+          return { leader: join(dir, 'leader.pid'), tool: join(dir, 'tool.pid') };
+        };
+
+        const pidOf = async (pidFile: string): Promise<number> => {
+          const until = Date.now() + 10_000;
+          for (;;) {
+            const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf-8')) : 0;
+            if (pid > 0) return pid;
+            if (Date.now() > until) throw new Error('the fake never reported its pid');
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        };
+
+        const alive = (pid: number): boolean => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+
+        /** Turn 1 runs the real InkRunner on the fake; turn 2 records when it began. */
+        const wire = (stoppedAt: () => number) => {
+          const real = new InkRunner();
+          const second: { leaderAlive?: boolean; toolAlive?: boolean; afterStopMs?: number } = {};
+          vi.mocked(mockInkRunner.run)
+            .mockImplementationOnce((message, options) => real.run(message, options))
+            .mockImplementationOnce(async () => {
+              second.leaderAlive = alive(leaderPid);
+              second.toolAlive = toolPid ? alive(toolPid) : undefined;
+              second.afterStopMs = Date.now() - stoppedAt();
+              return { success: true, responses: [], backendSessionId: 'ink-session-1' } as never;
+            });
+          return second;
+        };
+
+        /**
+         * A fake `ink` that exits 400 ms after SIGTERM, the way a CLI winding
+         * down does, and reports its pid beside itself once that handler is set.
+         */
+        const writeFakeInk = async (): Promise<string> => {
+          const dir = await installFakeInk('stop-then-send-ink-', [
+            "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));",
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+            'setInterval(() => {}, 1000);',
+          ]);
+          return join(dir, 'leader.pid');
+        };
+
+        it('Stop, then the owner sends at once: the next turn starts only once the stopped one has exited', async () => {
+          const pidFile = await writeFakeInk();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(pidFile);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          await first;
+          const next = await lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          expect(next.success).toBe(true);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+          // Never a second `ink chat` on the session beside the first.
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        it('the owner sends during the turn, then presses Stop: the queued turn waits for the exit, and still runs', async () => {
+          const pidFile = await writeFakeInk();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(pidFile);
+          const queued = lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          // Long enough to reach the session lock and queue behind it.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          const [, next] = await Promise.all([first, queued]);
+          expect(next.success).toBe(true);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+          expect(second.leaderAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(350);
+        }, 20_000);
+
+        it('Stop, then the owner sends at once: a TERM-ignoring tool the stopped turn left holds the next turn until it is gone (Lumen 42298771)', async () => {
+          const files = await writeFakeInkWithStubbornTool();
+          let stoppedAt = 0;
+          const second = wire(() => stoppedAt);
+          const first = turn(INKLING);
+          leaderPid = await pidOf(files.leader);
+          toolPid = await pidOf(files.tool);
+          stoppedAt = Date.now();
+          expect(cancelInklingTurns(SB)).toBe(1);
+          await first;
+          const next = await lastService.handleMessage(
+            createMockRequest({ userId: OWNER, ...fromOwner })
+          );
+          expect(next.success).toBe(true);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+          // The leader went at once; the tool only at the group's SIGKILL,
+          // and the next turn waited for it.
+          expect(second.leaderAlive).toBe(false);
+          expect(second.toolAlive).toBe(false);
+          expect(second.afterStopMs).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+        }, 20_000);
+
+        it('a run that reports an unconfirmed stop fences its inkling: the next turn is refused until that group is gone', async () => {
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          vi.mocked(mockInkRunner.run).mockResolvedValueOnce({
+            success: false,
+            responses: [],
+            backendSessionId: 'ink-session-1',
+            error: 'ink chat turn cancelled; its processes did not confirm they had stopped',
+            stopUnconfirmed: { leaderExited: true, pgid: toolPid, group: 'unknown' },
+          } as never);
+          await turn(INKLING);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+
+          const gone = new Promise((resolve) => survivor.once('exit', resolve));
+          process.kill(toolPid, 'SIGKILL');
+          await gone;
+          await turn(INKLING);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(2);
+        }, 20_000);
+
+        it('a fenced inkling is refused, retryably, spawning and counting nothing, until its group is observed gone', async () => {
+          // A stand-in for a stopped turn's surviving group: a disposable
+          // group of our own, recorded as an unconfirmed stop records one.
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          fenceInkling(SB, { leaderExited: true, pgid: toolPid, group: 'alive' });
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expectNothingRan();
+          expect(turnsCounted()).toBeUndefined();
+
+          const gone = new Promise((resolve) => survivor.once('exit', resolve));
+          process.kill(toolPid, 'SIGKILL');
+          await gone;
+          const admitted = await turn(INKLING);
+          expect(admitted.errorCode).not.toBe('INKLING_TURN_REFUSED');
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+        }, 20_000);
+
+        /** A disposable group of our own, standing in for a stopped turn's survivors. */
+        const startSurvivor = () => {
+          const survivor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          toolPid = survivor.pid as number;
+          return toolPid;
+        };
+
+        it("a fence that lands while the turn is being prepared still keeps the runner from starting (Lumen's review of #747)", async () => {
+          const pgid = startSurvivor();
+          // The takeover write is an await past the early check: hold the
+          // turn there, and fence the inkling as another conversation's
+          // stopped turn would.
+          let reached!: () => void;
+          const atTakeover = new Promise<void>((resolve) => (reached = resolve));
+          let release!: () => void;
+          const held = new Promise<void>((resolve) => (release = resolve));
+          const update = vi.mocked(mockRepository.update);
+          const plain = update.getMockImplementation()!;
+          update.mockImplementation(async (id, updates) => {
+            if ((updates as { lifecycle?: string }).lifecycle === 'running') {
+              reached();
+              await held;
+            }
+            return plain(id, updates);
+          });
+          const pending = turn(INKLING);
+          await atTakeover;
+          fenceInkling(SB, { leaderExited: true, pgid, group: 'alive' });
+          release();
+          const refused = await pending;
+
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expectNothingRan();
+          // Nothing ran, so the turn records no outcome and leaves no run registered.
+          expect(update.mock.calls.at(-1)?.[1]).toEqual({ backend: 'ink' });
+          expect(activeRunCount()).toBe(0);
+          // No turn-count slot is claimed at admission any more (the cap is
+          // gone), so a late refusal spends nothing.
+          expect(turnsCounted()).toBeUndefined();
+        }, 20_000);
+
+        it('a fence that lands once the runner is entered stops it at the spawn seam: nothing starts', async () => {
+          const pgid = startSurvivor();
+          // A fake ink that records its pid and exits at once, so a spawn by
+          // mistake ends cleanly and leaves its mark.
+          const dir = await installFakeInk('fenced-at-spawn-', [
+            "writeFileSync(join(here, 'leader.pid'), String(process.pid));",
+          ]);
+          const pidFile = join(dir, 'leader.pid');
+          const real = new InkRunner();
+          vi.mocked(mockInkRunner.run).mockImplementationOnce((message, options) => {
+            // Past every check SessionService makes: only the runner's own
+            // spawn seam is left to see this fence. InkRunner does not await
+            // between entering its spawn and asking that seam, so the fence
+            // has to be in place before it is entered.
+            fenceInkling(SB, { leaderExited: true, pgid, group: 'alive' });
+            return real.run(message, options);
+          });
+
+          const refused = await turn(INKLING);
+          expect(refused).toMatchObject({
+            success: false,
+            errorCode: 'INKLING_TURN_REFUSED',
+            classification: { retryable: true },
+          });
+          expect(refused.error).toMatch(/not yet confirmed stopped/);
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+          expect(existsSync(pidFile)).toBe(false);
+          expect(activeRunCount()).toBe(0);
+          expect(liveInklingTurns(SB)).toBe(0);
+        }, 20_000);
+      });
+
+      it('a threaded message is placed in its folder, not held for want of a studio', async () => {
+        const result = await turn(INKLING, {
+          ...fromOwner,
+          metadata: {
+            ...fromOwner.metadata,
+            threadKey: 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+          },
+        });
+        expect(result.errorCode).not.toBe('ROUTING_REFUSED');
+        expect(mockInkRunner.run).toHaveBeenCalled();
+        expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+      });
+
+      it('a named studio or hint cannot put it in a worktree: its folder wins first', async () => {
+        for (const named of [
+          { studioId: '77777777-7777-4777-8777-777777777777' },
+          { studioHint: 'some-studio' },
+        ]) {
+          vi.mocked(mockInkRunner.run).mockClear();
+          const result = await turn(INKLING, {
+            ...fromOwner,
+            metadata: { ...fromOwner.metadata, threadKey: 'chat:conversation-named', ...named },
+          });
+          expect(result.errorCode, JSON.stringify(named)).not.toBe('ROUTING_REFUSED');
+          expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+        }
+      });
+
+      it('an inkling is admitted however many turns its old counter records: there is no turn cap', async () => {
+        // Conor, Oct 4 2026, 5:00 PM: drop the turn cap now. The counter is
+        // already past the old default of 20, and a leftover INKLING_TURN_CAP
+        // must not bring the cap back. Old counters are left as they are:
+        // neither reset nor advanced.
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', OWNER);
+        vi.stubEnv('INKLING_TURN_CAP', '2');
+        const row = {
+          id: SB,
+          agent_id: 'myra',
+          user_id: OWNER,
+          sandbox_bypass: false,
+          metadata: { ...INKLING, ownerTestTurns: 25 },
+          updated_at: '2026-10-02T08:00:00.000Z',
+        };
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
+          mockCodexRunner,
+          makeFakeSupabase({ agent_identities: [row], studios: [], ...THREAD_TABLES }),
+          undefined,
+          mockInkRunner
+        );
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({
+            sbId: SB,
+            userId: OWNER,
+            backend: 'ink',
+            backendSessionId: null,
+          } as never)
+        );
+        const results = [];
+        for (let i = 0; i < 3; i++) {
+          results.push(
+            await service.handleMessage(createMockRequest({ userId: OWNER, ...fromOwner }))
+          );
+        }
+        expect(mockInkRunner.run).toHaveBeenCalledTimes(3);
+        for (const result of results) {
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+        }
+        expect((row.metadata as Record<string, unknown>).ownerTestTurns).toBe(25);
+      });
+
+      it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
+        const result = await turn(INKLING, fromOwner, '');
+        expectNothingRan();
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: { retryable: false },
+        });
+      });
+
+      it('a heartbeat, the system, an SB or a channel message never wakes it', async () => {
+        for (const id of ['system', 'myra', '123456789', OWNER]) {
+          const result = await turn(INKLING, { sender: { id, name: 'not a person here' } });
+          expect(result.errorCode, id).toBe('INKLING_TURN_REFUSED');
+        }
+        expectNothingRan();
+      });
+
+      it('an inkling not born under the test, or on another account, never wakes', async () => {
+        const unborn = await turn({ client: 'inkling-mobile', named: false });
+        const elsewhere = await turn(INKLING, fromOwner, '33333333-3333-4333-8333-333333333333');
+        expect([unborn.errorCode, elsewhere.errorCode]).toEqual([
+          'INKLING_TURN_REFUSED',
+          'INKLING_TURN_REFUSED',
+        ]);
+        expectNothingRan();
+      });
+
+      it('any other SB is untouched, gate on or off', async () => {
+        for (const gate of [OWNER, '']) {
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, gate);
+        }
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+      });
+    });
+
     it('passes a pinned model through to the runner config', async () => {
       const service = serviceWithIdentity(
         { runtimeConfig: { model: 'claude-opus-5' } },
@@ -1074,6 +2425,76 @@ describe('SessionService', () => {
     });
   });
 
+  describe('the in-process ink runtime is opt-in, by agent (hosted-ink-session.ts)', () => {
+    const LISTED = '5f2a9c4e-0d6b-4c1a-9f3e-7a8b1c2d3e4f';
+    const OTHER = '0e1d2c3b-4a59-4687-9a8b-7c6d5e4f3a2b';
+    const hostedService = () => {
+      const hosted: IClaudeRunner = {
+        run: vi
+          .fn()
+          .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
+      };
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          hostedInk: { runner: hosted, sbIds: new Set([LISTED]) },
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+      return { service, hosted };
+    };
+
+    it("runs a listed agent's ink turn in process, matching its id in any case", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED.toUpperCase() })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
+    });
+
+    it("leaves an unlisted agent's ink turn on ink chat", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: OTHER })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it("never moves a listed agent's turn on another backend", async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: LISTED })
+      );
+      await service.handleMessage(createMockRequest());
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      expect(hosted.run).not.toHaveBeenCalled();
+    });
+
+    it('compacts a listed agent in process too, never on ink chat beside it', async () => {
+      const { service, hosted } = hostedService();
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ backend: 'ink', sbId: LISTED, backendSessionId: 'ink-session-1' })
+      );
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+      await service.triggerCompaction('session-123');
+      expect(hosted.run).toHaveBeenCalledTimes(1);
+      expect(mockInkRunner.run).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Message Locking', () => {
     it('should process messages sequentially for the same session', async () => {
       const session = createMockSession();
@@ -1213,7 +2634,7 @@ describe('SessionService', () => {
       const resolveSpy = vi.spyOn(sessionService, 'getOrCreateSession');
       const metadata = {
         contactId: 'contact-1',
-        sessionAlias: 'main',
+        sessionKey: 'main',
         repoRoot: '/repo',
         recipientSessionId: 'session-123',
         replyToSessionId: 'session-456',
@@ -2067,6 +3488,142 @@ describe('SessionService', () => {
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
+    it('records the compaction run’s launch, so a restart can stop it too', async () => {
+      const store = {
+        reserve: vi.fn(async () => 'row-compaction'),
+        attach: vi.fn(async () => undefined),
+        markExited: vi.fn(async () => undefined),
+        listOpen: vi.fn(async () => []),
+      };
+      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+      try {
+        const session = createMockSession({ backendSessionId: 'claude-abc' });
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+        ) => {
+          options.config.onSpawned?.({ pid: 4343 });
+          return createMockClaudeResult({ success: true });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
+        expect(store.reserve).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: 'session-123' })
+        );
+        await vi.waitFor(() =>
+          expect(store.attach).toHaveBeenCalledWith(
+            'row-compaction',
+            expect.objectContaining({ pid: 4343 })
+          )
+        );
+      } finally {
+        configureLaunchRecording(undefined);
+      }
+    });
+
+    it('does not compact when a hold lands while the compaction lock is taken', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockImplementationOnce(async () => {
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          return true;
+        });
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('carries the hold to the compaction runner’s spawn seam', async () => {
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        const asked: Array<string | undefined> = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+          _message: string,
+          options: { config: { admitSpawn?: () => string | undefined } }
+        ) => {
+          asked.push(options.config.admitSpawn?.());
+          holdSurvivors({
+            stopped: [],
+            gone: [],
+            unstoppable: [],
+            uncertain: [
+              {
+                id: '',
+                sessionId: 'session-123',
+                backend: 'claude-code',
+                pid: process.pid,
+                pgid: null,
+                startIdentity: null,
+                bootId: 'boot',
+              },
+            ],
+          });
+          asked.push(options.config.admitSpawn?.());
+          return createMockClaudeResult({ success: false, error: asked[1] });
+        }) as never);
+        await sessionService.triggerCompaction('session-123');
+        expect(asked[0]).toBeUndefined();
+        expect(asked[1]).toMatch(/may still be running this session/);
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
+    it('does not compact a session held by a survivor that may still be alive', async () => {
+      holdSurvivors({
+        stopped: [],
+        gone: [],
+        unstoppable: [],
+        uncertain: [
+          {
+            id: 'row-held',
+            sessionId: 'session-123',
+            backend: 'claude-code',
+            pid: process.pid,
+            pgid: null,
+            startIdentity: null,
+            bootId: 'boot',
+          },
+        ],
+      });
+      try {
+        vi.mocked(mockRepository.findById).mockResolvedValue(
+          createMockSession({ backendSessionId: 'claude-abc' })
+        );
+        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+        await sessionService.triggerCompaction('session-123');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
+      } finally {
+        resetLaunchHolds();
+      }
+    });
+
     it('should skip compaction when lock is already held (re-entry guard)', async () => {
       const session = createMockSession({ backendSessionId: 'claude-abc' });
       vi.mocked(mockRepository.findById).mockResolvedValue(session);
@@ -2674,6 +4231,17 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockImplementation(async (id: string) =>
         id === authoring.id ? authoring : id === home.id ? home : null
       );
+      // An update returns the row with the write applied, as the repository's
+      // does: a reopened authoring session is the same transcript, not a
+      // fresh mock. The fixture row itself is left as the test set it.
+      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) =>
+        id === authoring.id ? { ...authoring, ...updates } : createMockSession({ id, ...updates })
+      );
+      vi.mocked(mockRepository.reopenEnded!).mockImplementation(async (id) =>
+        id === authoring.id
+          ? { kind: 'reopened', session: { ...authoring, endedAt: null } }
+          : { kind: 'missing' }
+      );
       // General reuse: what an unanchored reply lands in.
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(home);
 
@@ -2816,12 +4384,90 @@ describe('SessionService', () => {
       });
     });
 
-    it('declines a session that ended after the reply lookup, and routes without its studio', async () => {
-      // Finding 3 of the review, at the unit: no reuse match, so the reply
-      // creates. The anchor used to pin its studio first, and the new session
-      // was created inside it.
-      const { service } = replyFixture({ authoring: { ...inPrStudio, endedAt: new Date() } });
+    it('reopens a session that ended after the reply lookup, and resumes it (audit row 6)', async () => {
+      // A reply resumes the session that wrote the message it answers, ended
+      // or not (session lifecycle v7 §3 rung 3). It reopens in one write.
+      const { service, tables } = replyFixture({
+        authoring: { ...inPrStudio, endedAt: new Date() },
+      });
+
+      const session = await reply(service, { turnEpochCandidate: 'epoch-1' });
+
+      expect(session.id).toBe('authoring');
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('authoring', expect.any(Object));
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(tables.studios[0].lease).toMatchObject({ sessionId: 'authoring' });
+    });
+
+    it('keeps a newer running turn when another resume reopened the session first (Lumen, #725)', async () => {
+      // The reply read the authoring session ended; a human resume reopened
+      // it and entered running with a new epoch before this reopen landed.
+      const { service } = replyFixture({
+        authoring: { endedAt: new Date(), lifecycle: 'completed' },
+      });
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({
+        kind: 'open',
+        session: createMockSession({
+          id: 'authoring',
+          sbSlug: 'wren',
+          sbId: 'sb-wren',
+          endedAt: null,
+          lifecycle: 'running',
+          turnEpoch: 'epoch-2',
+        }),
+      });
+
+      const session = await reply(service);
+
+      expect(session.id).toBe('authoring');
+      expect(session.lifecycle).toBe('running');
+      expect(session.turnEpoch).toBe('epoch-2');
+      expect(mockRepository.update).not.toHaveBeenCalledWith(
+        'authoring',
+        expect.objectContaining({ lifecycle: 'idle' })
+      );
+    });
+
+    it('declines when a terminal attached while it reopened, rechecking the row it got back (Lumen, #725 r2)', async () => {
+      // The reply read the authoring session ended and unattached. Before its
+      // reopen landed, a human picked the transcript and attached a terminal:
+      // the reopen loses its compare-and-set and hands back that live row.
+      // Resuming it headless would run a second process on the human's
+      // conversation, so the refreshed row is checked again.
+      const { service, tables } = replyFixture({
+        authoring: { endedAt: new Date(), lifecycle: 'completed' },
+      });
+      vi.mocked(mockRepository.reopenEnded!).mockImplementationOnce(async () => {
+        tables.sessions[0].cli_attached = true;
+        tables.sessions[0].updated_at = stamp();
+        return {
+          kind: 'open',
+          session: createMockSession({
+            id: 'authoring',
+            sbSlug: 'wren',
+            sbId: 'sb-wren',
+            endedAt: null,
+            lifecycle: 'running',
+          }),
+        };
+      });
+
+      const session = await reply(service);
+
+      expect(mockRepository.reopenEnded).toHaveBeenCalledTimes(1);
+      expect(session.id).toBe('home');
+    });
+
+    it('declines when its session key is now held by a live session, and routes without its studio', async () => {
+      // Reopening would need the key's unique index to admit a second live
+      // holder. It does not, so the reply declines. Finding 3 of the #682
+      // review still holds for a declined anchor: no reuse match, so the
+      // reply creates, and nothing pins the new session to the old studio.
+      const { service, tables } = replyFixture({
+        authoring: { ...inPrStudio, endedAt: new Date(), alias: 'wren:inkwell:pr' },
+      });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'key-held' });
 
       const session = await reply(service);
 
@@ -2831,6 +4477,8 @@ describe('SessionService', () => {
       expect(vi.mocked(mockRepository.findByUserAndAgent).mock.calls[0][2]).not.toMatchObject({
         studioId: 'studio-pr',
       });
+      // Declined before the lease: the studio stays free.
+      expect(tables.studios[0].lease ?? null).toBeNull();
     });
 
     describe("a live terminal on the session, by the trigger path's delivery decision", () => {
@@ -2996,11 +4644,12 @@ describe('SessionService', () => {
       expect(queued.sessionId).toBe('authoring');
     });
 
-    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+    it('checks again at dequeue: a queued reply reopens a session that ended meanwhile', async () => {
       const { resumed, queued } = await queueTwoReplies({ endWhileQueued: true });
 
-      expect(resumed).toEqual(['backend-authoring', 'backend-home']);
-      expect(queued.sessionId).toBe('home');
+      expect(resumed).toEqual(['backend-authoring', 'backend-authoring']);
+      expect(queued.sessionId).toBe('authoring');
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('authoring', expect.anything());
     });
   });
 
@@ -3306,25 +4955,58 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'main' },
+          metadata: { sessionKey: 'main' },
         })
       );
 
       // 4th arg is the studio scope: undefined here because no studio was named.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
+      // 6th is the contact scope: undefined for an owner request (task F1).
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        undefined
+      );
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
-    it('should fall through to threadKey when alias has no match', async () => {
+    it('passes the contact scope to the alias lookup for a contact request', async () => {
+      const mockFindByAlias = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'contact-main', contactId: 'contact-1' }));
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      await sessionService.getOrCreateSession('user-456', 'myra', {
+        alias: 'main',
+        contactId: 'contact-1',
+      });
+
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        'contact-1'
+      );
+    });
+
+    it('refuses a session key no live session carries, instead of falling through or minting one', async () => {
+      // T4 (session lifecycle v7 §3 rung 2): a key is always caller-supplied,
+      // so a miss is a wrong address. It used to fall through to thread
+      // routing and, failing that, create a new session under the key.
       const threadSession = createMockSession({ id: 'thread-session', threadKey: 'pr:42' });
       const mockFindByAlias = vi.fn().mockResolvedValue(null);
       const mockFindByThreadKey = vi.fn().mockResolvedValue(threadSession);
       (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
       (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
 
-      await sessionService.handleMessage(
+      const result = await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'nonexistent', threadKey: 'pr:42' },
+          metadata: { sessionKey: 'nonexistent', threadKey: 'pr:42' },
         })
       );
 
@@ -3333,17 +5015,19 @@ describe('SessionService', () => {
         'myra',
         'nonexistent',
         undefined,
-        null
+        null,
+        undefined
       );
-      expect(mockFindByThreadKey).toHaveBeenCalledWith(
-        'user-456',
-        'myra',
-        'pr:42',
-        undefined,
-        undefined,
-        // Canonical identity — null here because the mock has no identity row.
-        null
-      );
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal?.detail).toMatchObject({
+        reason: 'explicit-address',
+        explicit: { sessionKey: 'nonexistent', cause: 'session-key-miss' },
+      });
+      // Control for the old behaviour: neither fallback ran.
+      expect(mockFindByThreadKey).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
     });
 
     it('should prefer alias over threadKey when both match', async () => {
@@ -3356,7 +5040,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'main', threadKey: 'pr:42' },
+          metadata: { sessionKey: 'main', threadKey: 'pr:42' },
         })
       );
 
@@ -3413,7 +5097,14 @@ describe('SessionService', () => {
       // The alias wins. Unscoped is safe here on its own terms: findByAlias
       // refuses an alias spanning two studios, so no-scope means must-be-
       // unique rather than pick-one.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        undefined
+      );
       expect(session.id).toBe('alias-session');
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
     });
@@ -3463,7 +5154,7 @@ describe('SessionService', () => {
       await serviceWithSupabase.handleMessage(
         createMockRequest({
           metadata: {
-            sessionAlias: 'review',
+            sessionKey: 'review',
             // A slug that resolves to nothing — stale, cleaned, or another
             // agent's studio.
             studioHint: 'no-such-studio',
@@ -3564,6 +5255,182 @@ describe('SessionService', () => {
     });
   });
 
+  describe('Caller-named sessions — T4 (session lifecycle v7 §3 rung 1)', () => {
+    // A session the caller named by id or key is an address. One that cannot
+    // take the message is refused, never dropped for the ladder to pick
+    // another; an ended one reopens. The inferred cases are the controls:
+    // they keep today's behaviour until the T5 readers.
+    const named = (recipientSessionId: string) =>
+      createMockRequest({
+        sbSlug: 'wren',
+        metadata: {
+          threadKey: 'pr:210',
+          recipientSessionId,
+          recipientSessionExplicit: true,
+          recipientSessionNamed: true,
+          triggerType: 'agent',
+        },
+      });
+    const inferred = (recipientSessionId: string) =>
+      createMockRequest({
+        sbSlug: 'wren',
+        metadata: { threadKey: 'pr:210', recipientSessionId, triggerType: 'agent' },
+      });
+
+    function expectRefused(
+      result: Awaited<ReturnType<SessionService['handleMessage']>>,
+      cause: string
+    ) {
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal?.detail).toMatchObject({
+        reason: 'explicit-address',
+        anchor: 'session',
+        explicit: { cause },
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+    }
+
+    it('refuses a named id that names no session', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+      expectRefused(
+        await sessionService.handleMessage(named('missing-session')),
+        'unknown-session'
+      );
+    });
+
+    it('control: an inferred id that names no session is dropped and routing continues', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+      const result = await sessionService.handleMessage(inferred('missing-session'));
+      expect(result.success).toBe(true);
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+
+    it('refuses a named session of another identity', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'lumen-session', sbSlug: 'lumen' })
+      );
+      expectRefused(await sessionService.handleMessage(named('lumen-session')), 'unknown-session');
+    });
+
+    it('refuses a named per-sender contact session for an owner message', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'contact-session', sbSlug: 'wren', contactId: 'contact-9' })
+      );
+      expectRefused(await sessionService.handleMessage(named('contact-session')), 'contact-scope');
+    });
+
+    it('control: an inferred contact session is dropped for an owner message', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'contact-session', sbSlug: 'wren', contactId: 'contact-9' })
+      );
+      const result = await sessionService.handleMessage(inferred('contact-session'));
+      expect(result.success).toBe(true);
+      expect(result.sessionId).not.toBe('contact-session');
+    });
+
+    it('reopens a named ended session in one write and resumes it', async () => {
+      const ended = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        threadKey: 'pr:210',
+        endedAt: new Date(),
+        lifecycle: 'completed',
+        status: 'completed',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+
+      const result = await sessionService.handleMessage(named('ended-session'));
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('ended-session');
+      // A compare-and-set on the state this resolution observed, never an
+      // update by id from the snapshot (Lumen, #725).
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('ended-session', {
+        lifecycle: 'completed',
+        status: 'completed',
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('a plan resolution returns a named ended session without writing', async () => {
+      const ended = createMockSession({ id: 'ended-session', sbSlug: 'wren', endedAt: new Date() });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+
+      const session = await sessionService.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:210',
+        recipientSessionId: 'ended-session',
+        recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+        planOnly: true,
+      });
+
+      expect(session.id).toBe('ended-session');
+      expect(mockRepository.update).not.toHaveBeenCalled();
+      expect(mockRepository.reopenEnded).not.toHaveBeenCalled();
+    });
+
+    it('keeps a newer running turn when another resume reopened the session first', async () => {
+      // Lumen's interleaving (#725): this resolution read the row ended and
+      // completed; a concurrent resume reopened it and entered running with a
+      // new epoch. The conditional reopen finds it open and hands it back as
+      // it stands; nothing writes idle over the newer turn.
+      const stale = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: new Date(),
+        lifecycle: 'completed',
+      });
+      const resumed = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: null,
+        lifecycle: 'running',
+        turnEpoch: 'epoch-2',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(stale);
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({
+        kind: 'open',
+        session: resumed,
+      });
+
+      const session = await sessionService.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:210',
+        recipientSessionId: 'ended-session',
+        recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+      });
+
+      expect(session.lifecycle).toBe('running');
+      expect(session.turnEpoch).toBe('epoch-2');
+      expect(mockRepository.update).not.toHaveBeenCalledWith(
+        'ended-session',
+        expect.objectContaining({ lifecycle: 'idle' })
+      );
+    });
+
+    it('refuses a named ended session that is gone by the time it reopens', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'ended-session', sbSlug: 'wren', endedAt: new Date() })
+      );
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'missing' });
+      expectRefused(await sessionService.handleMessage(named('ended-session')), 'unknown-session');
+    });
+
+    it('refuses a named ended session whose key a live session now holds', async () => {
+      const ended = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: new Date(),
+        alias: 'wren:inkwell:review',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'key-held' });
+      expectRefused(await sessionService.handleMessage(named('ended-session')), 'session-key-held');
+    });
+  });
+
   describe('Default Session Routing (default_session_id)', () => {
     // Helper: chainable Supabase mock — every method returns `this` except terminal ones
     function createChainableMock(terminalResult: unknown) {
@@ -3623,6 +5490,43 @@ describe('SessionService', () => {
       );
       expect(mockRepository.findById).toHaveBeenCalledWith('default-session');
       expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it("never sends a contact's thread miss to the owner's default session (T4)", async () => {
+      // The unthreaded home rung already exempted a contact; the threaded
+      // fallback did not (Lumen, #719 review). A per-sender contact's message
+      // must never run in the owner's home.
+      const defaultSession = createMockSession({ id: 'default-session' });
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi.fn().mockResolvedValue(null);
+      vi.mocked(mockRepository.findById).mockResolvedValue(defaultSession);
+      const mockSupabase = {
+        from: vi
+          .fn()
+          .mockImplementation((table: string) =>
+            table === 'agent_identities'
+              ? createChainableMock({ data: { default_session_id: 'default-session' } })
+              : createChainableMock({ data: null })
+          ),
+      };
+      const serviceWithDefault = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      const session = await serviceWithDefault.getOrCreateSession('user-456', 'myra', {
+        threadKey: 'pr:99',
+        contactId: 'contact-1',
+      });
+
+      expect(session.id).not.toBe('default-session');
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ contactId: 'contact-1', threadKey: 'pr:99' })
+      );
     });
 
     it('should create new thread-scoped session when no default_session_id', async () => {
@@ -3696,6 +5600,174 @@ describe('SessionService', () => {
   // reject. The flush semantics are unchanged; only the transport of
   // the failure to the caller moved.
   // ═══════════════════════════════════════════════════════════════
+  describe('Home session routing — one session per bridge SB', () => {
+    // 2026-09-10 06:52Z: Myra's home session (88b728cb, the identity's
+    // default_session_id) sat in lifecycle `failed` after a broken ink build
+    // crashed four heartbeat turns. A Telegram message arrived unthreaded,
+    // general-active skipped the failed row, and a twin (64e1eb49) was born.
+    // For fifteen days reminders fired in one session and threads in the
+    // other. These pin the three rules that close that path.
+    // One terminal per table, shaped the way each reader expects it: an
+    // awaited chain yields rows (an object becomes a one-row list, so the
+    // identity scope settles on its `id`), maybeSingle/single yield the row.
+    function chain(terminal: { data?: unknown; error?: unknown }) {
+      const data = terminal.data;
+      const rows = Array.isArray(data) || data == null ? (data ?? null) : [data];
+      const row = Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+      const error = terminal.error ?? null;
+      const c: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'or', 'in', 'order', 'limit']) {
+        c[m] = vi.fn().mockReturnValue(c);
+      }
+      c.maybeSingle = vi.fn().mockResolvedValue({ data: row, error });
+      c.single = vi.fn().mockResolvedValue({ data: row, error });
+      c.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: rows, error }).then(resolve);
+      return c;
+    }
+    function serviceWith(tables: Record<string, unknown>) {
+      const from = vi.fn((table: string) => chain(tables[table] ?? { data: null, error: null }));
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        { from } as never
+      );
+      return { service, from };
+    }
+    const sibling = { id: 'older-home', lifecycle: 'failed', started_at: '2026-08-04T00:30:52Z' };
+
+    it('an unthreaded request goes to the identity default session, not the newest active one', async () => {
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
+      const newerTwin = createMockSession({ id: 'newer-twin' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(home);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(newerTwin);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(session.id).toBe('home-session');
+      expect(mockRepository.findById).toHaveBeenCalledWith('home-session');
+      // The rung answered before general-active could prefer the twin.
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('an ended default session falls through to general-active', async () => {
+      const ended = createMockSession({ id: 'home-session', endedAt: new Date() });
+      const current = createMockSession({ id: 'current-home' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(current);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(session.id).toBe('current-home');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it("a contact-scoped request never lands in the owner's default session", async () => {
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(home);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      await service.getOrCreateSession('user-456', 'myra', { contactId: 'contact-9' });
+
+      expect(mockRepository.findById).not.toHaveBeenCalledWith('home-session');
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        expect.objectContaining({ contactId: 'contact-9' })
+      );
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ contactId: 'contact-9' })
+      );
+    });
+
+    it('general-active reuses a crashed home session instead of creating a twin', async () => {
+      const crashedHome = createMockSession({ id: 'crashed-home', lifecycle: 'failed' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(crashedHome);
+
+      // No supabase → no default session; the rung under test is general-active.
+      const session = await sessionService.getOrCreateSession('user-456', 'myra', {});
+
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        expect.objectContaining({ type: 'primary', includeFailed: true })
+      );
+      expect(session.id).toBe('crashed-home');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('a second home for a bridge is born labelled, and the log says so at error level', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service, from } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: null, metadata: { bridge: true } },
+        },
+        sessions: { data: [sibling], error: null },
+      });
+      const { logger } = await import('../../utils/logger.js');
+
+      const created = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(from).toHaveBeenCalledWith('sessions');
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            routing_decision: expect.objectContaining({ homeSiblings: ['older-home'] }),
+          }),
+        })
+      );
+      const report = vi
+        .mocked(logger.error)
+        .mock.calls.find((c) => String(c[0]).includes('more than one home session'));
+      expect(report).toBeDefined();
+      const detail = report?.[1] as Record<string, unknown>;
+      expect(detail.createdSessionId).toBe(created.id);
+      expect(detail.siblings).toEqual([
+        { id: 'older-home', lifecycle: 'failed', startedAt: '2026-08-04T00:30:52Z' },
+      ]);
+    });
+
+    it('a non-bridge identity is never checked for home siblings', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service, from } = serviceWith({
+        agent_identities: { data: { id: 'sb-wren', default_session_id: null, metadata: {} } },
+        sessions: { data: [sibling], error: null },
+      });
+      const { logger } = await import('../../utils/logger.js');
+
+      await service.getOrCreateSession('user-456', 'wren', {});
+
+      expect(from).not.toHaveBeenCalledWith('sessions');
+      const createArg = vi.mocked(mockRepository.create).mock.calls[0][0] as {
+        metadata: { routing_decision: Record<string, unknown> };
+      };
+      expect(createArg.metadata.routing_decision).not.toHaveProperty('homeSiblings');
+      expect(
+        vi.mocked(logger.error).mock.calls.some((c) => String(c[0]).includes('more than one home'))
+      ).toBe(false);
+    });
+  });
+
   describe('Queue flush on non-retryable errors', () => {
     it('should flush remaining queue when a queued message hits a quota error', async () => {
       const session = createMockSession();
@@ -5985,8 +8057,16 @@ describe('SessionService', () => {
       (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
 
+      // The caller's own identity row exists, as it does for any sbId routing
+      // is handed: routing classifies it before any tier, and an id that names
+      // no row is an unknown identity, refused before anything is created.
+      const mine = { id: 'sb-MINE', user_id: 'user-456', metadata: {} };
       const mockSupabase = {
-        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+        from: vi
+          .fn()
+          .mockImplementation((table: string) =>
+            createRecordingChain({ data: table === 'agent_identities' ? mine : null }, [])
+          ),
       };
       const service = serviceWith(mockSupabase);
 

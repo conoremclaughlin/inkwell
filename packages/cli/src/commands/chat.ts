@@ -23,6 +23,12 @@ import { acceptsContextImagesFor, promptTransportFor } from '../backends/index.j
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
+  backendSendTarget,
+  continuationPrompt,
+  localDeliveredSend,
+  turnReplyEvent,
+} from '../repl/turn-reply.js';
+import {
   CloneRegistry,
   formatCloneLine,
   isSettled,
@@ -225,7 +231,9 @@ import {
   encodeContextToken,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
+  TURN_REPLY_TOKEN_ENV,
   verifyDelegationToken,
+  type TurnSend,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
 
@@ -1630,9 +1638,12 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
   if (session.endedAt) return false;
   if (session.lifecycle === 'completed') return false;
 
-  const phase = (session.currentPhase || '').trim().toLowerCase();
-  if (phase === 'complete' || phase.startsWith('complete:')) return false;
-
+  // The agent-set work phase is deliberately not read. `complete` there
+  // means a piece of work finished on a live conversation, and reading it as
+  // the conversation's end hid the row, made its transcript look untracked,
+  // and had the launcher start a second Inkwell session for the same
+  // conversation on every relaunch (2026-10-01). Mirrors isSessionResumable
+  // in claude.ts and the server's `active`/`attachable` filters.
   const status = (session.status || '').trim().toLowerCase();
   if (status === 'completed' || status.startsWith('completed:')) return false;
 
@@ -1694,7 +1705,7 @@ export function reopenSucceeded(session: SessionSummary | null | undefined): Reo
       ? 'ended_at is still set'
       : session.lifecycle === 'completed'
         ? "lifecycle is still 'completed'"
-        : `phase/status still reads ${session.currentPhase || session.status}`;
+        : `status still reads ${session.status}`;
     return { ok: false, reason: `${stuck} (an older server may not support reopen)` };
   }
   return { ok: true };
@@ -3495,6 +3506,11 @@ export async function prepareChatStudio(
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
+  // Read once and removed before anything is spawned: the token is how the
+  // server tells this process's turn_reply lines from anything else on its
+  // stdout, so no tool or provider child may inherit it (turn-reply.ts).
+  const turnReplyToken = process.env[TURN_REPLY_TOKEN_ENV] || undefined;
+  delete process.env[TURN_REPLY_TOKEN_ENV];
   const debugFile = initSbDebug({
     enabled: options.sbDebug,
     context: {
@@ -3564,7 +3580,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? Number.parseInt(options.backendTimeoutSeconds, 10)
       : Number.NaN;
   // Hard ceiling: an explicit --backend-timeout-seconds override, else undefined
-  // (→ backend-runner's 4-hour runaway backstop). The old blunt 120s
+  // (→ no ceiling at all; the 4-hour backstop went on 2026-10-04). The old blunt 120s
   // non-interactive wall is GONE — it killed legitimately long turns at the
   // completion boundary (exit 124 → false backend-error). Long turns are now
   // governed by the idle/token-flow timeout below, not wall-clock.
@@ -4080,6 +4096,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // first iteration's results while the note claimed they followed.
   let turnDialogue: ReseedDialogueEntry[] = [];
   let turnDialogueMuted = false;
+  // The assistant text the last completed outer turn stored, or null when it
+  // stored none (aborted, failed before the ledger write). The non-interactive
+  // loop reads it after each turn to report that turn's reply (turn_reply).
+  let lastTurnAssistantText: string | null = null;
+  // The send_response calls the current outer turn made that delivered, for
+  // its turn_reply line. Backend-routed calls are held by id from tool-use
+  // until their tool-result says whether they failed.
+  let turnSends: TurnSend[] = [];
+  const pendingBackendSends = new Map<string, TurnSend>();
   // This spawn's assistant text, UNCUT, and the dialogue entry it is written
   // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
   // earlier block (`Looking.\nuser`) is retracted when a later block reveals
@@ -4206,6 +4231,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      const sendTarget = backendSendTarget(evt.name, evt.input);
+      if (sendTarget && evt.id) pendingBackendSends.set(evt.id, sendTarget);
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
       printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
@@ -4225,6 +4252,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
+      const sendTarget = evt.id ? pendingBackendSends.get(evt.id) : undefined;
+      if (sendTarget) {
+        pendingBackendSends.delete(evt.id!);
+        if (!evt.isError) turnSends.push(sendTarget);
+      }
       runtime.log.append({
         type: 'backend_tool',
         status: evt.isError ? 'error' : 'done',
@@ -6976,6 +7008,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             })
             .then((outcome) => outcome.approved),
         onResult: (result: ToolCallResult) => {
+          const delivered = localDeliveredSend(result);
+          if (delivered) turnSends.push(delivered);
           if (result.status === 'blocked' || result.status === 'denied') {
             const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
             printEvent(
@@ -7978,6 +8012,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } else {
       ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
+      // A failed backend's text is whatever it printed before failing, not a
+      // reply: the same rule the server applies to a failed run.
+      lastTurnAssistantText = loopResult.success ? assistantDisplayText : null;
       runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
@@ -8411,8 +8448,37 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
     // system message — it's harness-delivered, not typed by the human.
     const messageLabel = options.messageLabel?.trim();
+    // Each outer turn's reply goes out as one line the moment the turn ends;
+    // the server forwards it to the channel then, not after the last turn.
+    // Only the last turn's text used to survive the run (turn-reply.ts). The
+    // server mints the token only when it forwards these lines, so without one
+    // nothing is printed.
+    const runTurnAndReport = async (
+      turn: number,
+      raw: string,
+      source: 'user' | 'system',
+      label: string | undefined
+    ): Promise<void> => {
+      lastTurnAssistantText = null;
+      turnSends = [];
+      pendingBackendSends.clear();
+      await enqueueTurn(raw, source, label);
+      if (!turnReplyToken) return;
+      console.log(
+        JSON.stringify(
+          turnReplyEvent({
+            turn,
+            label: label || 'user',
+            assistantText: lastTurnAssistantText,
+            sends: turnSends,
+            token: turnReplyToken,
+          })
+        )
+      );
+    };
+    const repliesForwarded = Boolean(turnReplyToken);
     clearLastSignal();
-    await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
+    await runTurnAndReport(1, message, messageLabel ? 'system' : 'user', messageLabel);
     // Actual completed outer turns — reported instead of the configured cap,
     // which lies whenever signal_status halts the loop early.
     let turnsCompleted = 1;
@@ -8431,8 +8497,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!exitReason) {
       for (let turn = 2; turn <= maxTurns; turn++) {
         clearLastSignal();
-        await enqueueTurn(
-          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
+        await runTurnAndReport(
+          turn,
+          continuationPrompt(repliesForwarded),
           'system',
           'continuation'
         );

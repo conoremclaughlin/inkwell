@@ -80,6 +80,8 @@ describe('completeStudioViaCli', () => {
       STUDIO_ID,
       '--purpose',
       'alpha work',
+      // No profile given: the server says so, and init never guesses one.
+      '--no-permissions',
     ]);
   });
 
@@ -99,6 +101,7 @@ describe('completeStudioViaCli', () => {
       STUDIO_ID,
       '--backend',
       'codex',
+      '--no-permissions',
     ]);
   });
 
@@ -116,6 +119,7 @@ describe('completeStudioViaCli', () => {
       'wren',
       '--no-root-sync',
       '--no-studio-setup',
+      '--no-permissions',
     ]);
   });
 
@@ -232,6 +236,84 @@ describe('ensureStudioComplete', () => {
     expect(result.ok).toBe(true);
     expect(result.complete).toBe(false);
     expect(() => stubCall()).toThrow();
+  });
+});
+
+describe('the permission profile reaches ink init (design v3, items 3 and 5)', () => {
+  const linkedWorktree = () =>
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
+
+  it('a creator passes the profile it read from the row; inheritance is never passed', async () => {
+    await completeStudioViaCli(worktree, {
+      sbSlug: 'lumen',
+      studioId: STUDIO_ID,
+      permissionProfile: 'reviewer',
+      env: env(),
+    });
+    const argv = stubCall().argv;
+    expect(
+      argv.slice(argv.indexOf('--permission-profile'), argv.indexOf('--permission-profile') + 2)
+    ).toEqual(['--permission-profile', 'reviewer']);
+    expect(argv).not.toContain('--inherit-claude-permissions');
+    expect(argv).not.toContain('--no-permissions');
+  });
+
+  it('writePermissions: false passes --no-permissions', async () => {
+    await completeStudioViaCli(worktree, { sbSlug: 'wren', writePermissions: false, env: env() });
+    expect(stubCall().argv).toContain('--no-permissions');
+  });
+
+  it('the pre-spawn repair asks for the profile only when incomplete, and passes what the row says', async () => {
+    linkedWorktree();
+    seedComplete(worktree);
+    const profile = vi.fn(async () => 'reviewer' as const);
+    await ensureStudioComplete(worktree, { sbSlug: 'lumen', profile, env: env() });
+    expect(profile).not.toHaveBeenCalled();
+
+    rmSync(join(worktree, '.claude'), { recursive: true, force: true });
+    await ensureStudioComplete(worktree, {
+      sbSlug: 'lumen',
+      studioId: STUDIO_ID,
+      profile,
+      env: env(),
+    });
+    expect(profile).toHaveBeenCalledTimes(1);
+    const argv = stubCall().argv;
+    expect(argv).toContain('--permission-profile');
+    expect(argv[argv.indexOf('--permission-profile') + 1]).toBe('reviewer');
+  });
+
+  it('a profile lookup that throws writes no permissions rather than guessing a profile', async () => {
+    linkedWorktree();
+    const profile = vi.fn(async () => {
+      throw new Error('db down');
+    });
+    const result = await ensureStudioComplete(worktree, {
+      sbSlug: 'lumen',
+      studioId: STUDIO_ID,
+      profile,
+      env: env(),
+    });
+    expect(result.ok).toBe(true);
+    const argv = stubCall().argv;
+    expect(argv).toContain('--no-permissions');
+    expect(argv).not.toContain('--permission-profile');
+  });
+
+  it('an owner lookup that throws leaves permissions alone too: they name the owner', async () => {
+    linkedWorktree();
+    await ensureStudioComplete(worktree, {
+      sbSlug: 'myra',
+      studioId: STUDIO_ID,
+      owner: async () => {
+        throw new Error('db down');
+      },
+      profile: async () => 'builder' as const,
+      env: env(),
+    });
+    const argv = stubCall().argv;
+    expect(argv).toContain('--no-studio-setup');
+    expect(argv).toContain('--no-permissions');
   });
 });
 

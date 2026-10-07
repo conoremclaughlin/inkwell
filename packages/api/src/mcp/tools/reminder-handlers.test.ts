@@ -561,3 +561,152 @@ describe('create_reminder quiet-hours advisory', () => {
     expect(mockSupabase.from).toHaveBeenCalledWith('heartbeat_state');
   });
 });
+
+/**
+ * runDuringQuietHours: the per-reminder switch (Conor's option B, task 2301cb3c).
+ *
+ * Each assertion reads the payload the handler actually wrote, not just the
+ * response, because the response echoes the row the mock returns and would
+ * pass whatever was written.
+ */
+describe('runDuringQuietHours', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryResultQueues.clear();
+    tableBuilders.clear();
+    eqCalls.length = 0;
+  });
+
+  const ROW = {
+    id: 'r2',
+    title: 'Overnight check',
+    description: null,
+    sb_id: null,
+    delivery_channel: 'telegram',
+    delivery_target: '123456789',
+    cron_expression: null,
+    next_run_at: '2026-09-02T09:00:00+00:00',
+    studio_hint: null,
+    status: 'active',
+    run_during_quiet_hours: true,
+  };
+
+  const insertPayload = () =>
+    (getBuilder('scheduled_reminders').insert as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+  const updatePayload = () =>
+    (getBuilder('scheduled_reminders').update as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+
+  it('create writes the switch and echoes it', async () => {
+    setQueryResult('scheduled_reminders', ROW);
+
+    const result = await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Overnight check', runDuringQuietHours: true } as never,
+      mockDataComposer as never
+    );
+
+    expect(insertPayload()).toMatchObject({ run_during_quiet_hours: true });
+    expect(parseResponse(result).reminder.runDuringQuietHours).toBe(true);
+  });
+
+  it('create defaults the switch to false, so existing callers change nothing', async () => {
+    setQueryResult('scheduled_reminders', { ...ROW, run_during_quiet_hours: false });
+
+    await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Daytime nudge' } as never,
+      mockDataComposer as never
+    );
+
+    expect(insertPayload()).toMatchObject({ run_during_quiet_hours: false });
+  });
+
+  it('a one-shot inside quiet hours with the switch on gets no deferral warning', async () => {
+    setQueryResult('heartbeat_state', {
+      quiet_start: '22:00:00',
+      quiet_end: '08:00:00',
+      timezone: 'America/Los_Angeles',
+    });
+    setQueryResult('scheduled_reminders', ROW);
+
+    const result = await handleCreateReminder(
+      {
+        userId: TEST_USER_ID,
+        title: 'Overnight check',
+        runAt: '2026-09-02T09:00:00Z', // 02:00 PDT, inside the window
+        runDuringQuietHours: true,
+      } as never,
+      mockDataComposer as never
+    );
+
+    expect(parseResponse(result).quietHours).toBeUndefined();
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('heartbeat_state');
+  });
+
+  it('control: the same one-shot with the switch off is still warned', async () => {
+    setQueryResult('heartbeat_state', {
+      quiet_start: '22:00:00',
+      quiet_end: '08:00:00',
+      timezone: 'America/Los_Angeles',
+    });
+    setQueryResult('scheduled_reminders', { ...ROW, run_during_quiet_hours: false });
+
+    const result = await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Overnight check', runAt: '2026-09-02T09:00:00Z' } as never,
+      mockDataComposer as never
+    );
+
+    expect(parseResponse(result).quietHours).toBeDefined();
+  });
+
+  it('update turns the switch on for an ordinary reminder', async () => {
+    setQueryResult('scheduled_reminders', { ...ROW, run_during_quiet_hours: false, metadata: {} });
+
+    const result = await handleUpdateReminder(
+      { userId: TEST_USER_ID, reminderId: 'r2', runDuringQuietHours: true },
+      mockDataComposer
+    );
+
+    expect(updatePayload()).toEqual({ run_during_quiet_hours: true });
+    expect(parseResponse(result).success).toBe(true);
+  });
+
+  it('update refuses to turn the switch on for a strategy watchdog', async () => {
+    setQueryResult('scheduled_reminders', {
+      ...ROW,
+      run_during_quiet_hours: false,
+      metadata: { strategyWatchdog: true, groupId: 'g1' },
+    });
+
+    const result = await handleUpdateReminder(
+      { userId: TEST_USER_ID, reminderId: 'r2', runDuringQuietHours: true },
+      mockDataComposer
+    );
+
+    const parsed = parseResponse(result);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('strategy watchdog');
+    expect(updatePayload()).toBeUndefined();
+  });
+
+  it('update may always turn the switch off, watchdog or not', async () => {
+    setQueryResult('scheduled_reminders', {
+      ...ROW,
+      metadata: { strategyWatchdog: true, groupId: 'g1' },
+    });
+
+    const result = await handleUpdateReminder(
+      { userId: TEST_USER_ID, reminderId: 'r2', runDuringQuietHours: false },
+      mockDataComposer
+    );
+
+    expect(updatePayload()).toEqual({ run_during_quiet_hours: false });
+    expect(parseResponse(result).success).toBe(true);
+  });
+
+  it('list shows the switch', async () => {
+    setQueryResult('scheduled_reminders', [ROW]);
+
+    const result = await handleListReminders({ userId: TEST_USER_ID }, mockDataComposer);
+
+    expect(parseResponse(result).reminders[0].runDuringQuietHours).toBe(true);
+  });
+});

@@ -5,7 +5,7 @@
  * tools) and validates stateless request handling via fetch.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import { verifyInkAccessToken } from '../auth/ink-tokens';
 
 const mockVerifyAccessToken = vi.fn();
@@ -23,6 +23,26 @@ vi.mock('../config/env', async () => ({
     SUPABASE_ANON_KEY: 'test-anon-key',
   },
 }));
+
+// The real signer, with one switch: move the clock on by N seconds at the
+// moment of signing, the boundary Lumen's 9372b0c7 probe found.
+const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0 }));
+vi.mock('../auth/ink-tokens', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../auth/ink-tokens')>();
+  return {
+    ...actual,
+    signInkAccessToken: (...args: Parameters<typeof actual.signInkAccessToken>) => {
+      if (!signerClock.advanceSecondsAtSigning) return actual.signInkAccessToken(...args);
+      const later = Date.now() + signerClock.advanceSecondsAtSigning * 1000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+      try {
+        return actual.signInkAccessToken(...args);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  };
+});
 
 vi.mock('../utils/logger', () => ({
   logger: {
@@ -575,6 +595,169 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+
+  // =========================================================================
+  // Delegation never widens the presenting token (task f460c7a3). Lumen's
+  // probe at 916b0369: an SB-bound token asked for a sibling SB of the same
+  // user and got one, without its session and contact bindings.
+  // =========================================================================
+
+  describe('/token/delegate never widens the presenting token', () => {
+    const SB_ALPHA = { id: 'identity-alpha', agent_id: 'synthetic-alpha' };
+    const SB_BETA = { id: 'identity-beta', agent_id: 'synthetic-beta' };
+    const USER = { userId: 'user-123', email: 'user@example.com' };
+    const BOUND = {
+      ...USER,
+      sbSlug: SB_ALPHA.agent_id,
+      sbId: SB_ALPHA.id,
+      sessionId: 'session-synthetic',
+      contactId: 'contact-synthetic',
+    };
+    const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+    async function delegate(sbSlug: string) {
+      const res = await fetch(`${baseUrl}/token/delegate`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sbSlug }),
+      });
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    }
+
+    beforeEach(() => {
+      // Every other test here returns early when the server could not bind;
+      // these must run or fail, never pass by skipping.
+      expect(serverUnavailableError).toBeNull();
+      signerClock.advanceSecondsAtSigning = 0;
+    });
+
+    afterEach(() => {
+      signerClock.advanceSecondsAtSigning = 0;
+    });
+
+    it('refuses an SB-bound token asking for another SB of the same user', async () => {
+      mockVerifyAccessToken.mockResolvedValue(BOUND);
+      delegatedIdentity = SB_BETA;
+
+      const { status, body } = await delegate(SB_BETA.agent_id);
+
+      expect(status).toBe(403);
+      expect(body.access_token).toBeUndefined();
+    });
+
+    it('refuses by slug when the token carries no canonical id', async () => {
+      const { sbId: _sbId, ...slugOnly } = BOUND;
+      mockVerifyAccessToken.mockResolvedValue(slugOnly);
+      delegatedIdentity = SB_BETA;
+
+      const { status, body } = await delegate(SB_BETA.agent_id);
+
+      expect(status).toBe(403);
+      expect(body.access_token).toBeUndefined();
+    });
+
+    it('refuses by canonical id when the token carries no slug', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...USER, sbId: SB_ALPHA.id });
+      delegatedIdentity = SB_BETA;
+
+      const { status, body } = await delegate(SB_BETA.agent_id);
+
+      expect(status).toBe(403);
+      expect(body.access_token).toBeUndefined();
+    });
+
+    it('refuses when the slug matches but now names a different identity', async () => {
+      mockVerifyAccessToken.mockResolvedValue(BOUND);
+      delegatedIdentity = { id: 'identity-reused', agent_id: SB_ALPHA.agent_id };
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(403);
+      expect(body.access_token).toBeUndefined();
+    });
+
+    it('gives a bound token one refusal for a missing SB and for another SB', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...USER, sbId: SB_ALPHA.id });
+      delegatedIdentity = SB_BETA;
+      const sibling = await delegate(SB_BETA.agent_id);
+      delegatedIdentity = null;
+      const missing = await delegate('synthetic-nobody');
+
+      expect(missing.status).toBe(sibling.status);
+      expect(missing.body).toEqual(sibling.body);
+    });
+
+    it('re-mints for its own SB and keeps the session and contact', async () => {
+      mockVerifyAccessToken.mockResolvedValue(BOUND);
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access');
+      expect(payload).toMatchObject({
+        sub: USER.userId,
+        sbSlug: SB_ALPHA.agent_id,
+        identityId: SB_ALPHA.id,
+        sessionId: BOUND.sessionId,
+        contactId: BOUND.contactId,
+      });
+    });
+
+    it('never outlives the presenting token', async () => {
+      const presentedExp = nowSeconds() + 600;
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, expiresAt: presentedExp });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.expires_in).toBeLessThanOrEqual(600);
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access') as {
+        exp?: number;
+      } | null;
+      expect(payload?.exp).toBeLessThanOrEqual(presentedExp);
+    });
+
+    it('never outlives the presenting token across a second boundary at signing', async () => {
+      const presentedExp = nowSeconds() + 600;
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, expiresAt: presentedExp });
+      delegatedIdentity = SB_ALPHA;
+      signerClock.advanceSecondsAtSigning = 1;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access') as {
+        exp?: number;
+      } | null;
+      expect(payload?.exp).toBeLessThanOrEqual(presentedExp);
+    });
+
+    it('refuses when the presenting token has no lifetime left', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, expiresAt: nowSeconds() - 1 });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(401);
+      expect(body.access_token).toBeUndefined();
+    });
+
+    it('still lets a user-level token mint for any SB its user owns', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...USER, expiresAt: nowSeconds() + 30 * 86400 });
+      delegatedIdentity = SB_BETA;
+
+      const { status, body } = await delegate(SB_BETA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.expires_in).toBe(3600);
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access');
+      expect(payload).toMatchObject({ sbSlug: SB_BETA.agent_id, identityId: SB_BETA.id });
+      expect(payload?.sessionId).toBeUndefined();
+      expect(payload?.contactId).toBeUndefined();
+    });
   });
 
   // =========================================================================

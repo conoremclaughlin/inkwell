@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   clearPinnedAgent,
   clearSessionContext,
+  getAuthenticatedPrincipal,
   getPinnedSlug,
+  getUserFromContext,
   mergeWithContext,
   pinSessionAgent,
   runWithRequestContext,
@@ -33,6 +35,40 @@ describe('request-context workspace merging', () => {
     );
 
     clearSessionContext();
+  });
+});
+
+describe('user context inside and outside a request', () => {
+  it('a request with no user does not inherit the process-global session user', async () => {
+    clearSessionContext();
+    setSessionContext({ userId: 'someone-who-bootstrapped' });
+
+    await runWithRequestContext({}, async () => {
+      expect(getUserFromContext()).toBeUndefined();
+      expect(getAuthenticatedPrincipal()).toBeUndefined();
+      expect(mergeWithContext({}).userId).toBeUndefined();
+    });
+
+    clearSessionContext();
+  });
+
+  it('outside any request the session user is still used, as stdio needs', () => {
+    clearSessionContext();
+    setSessionContext({ userId: 'stdio-user' });
+
+    expect(getUserFromContext()?.userId).toBe('stdio-user');
+    expect(getAuthenticatedPrincipal()).toBeUndefined();
+
+    clearSessionContext();
+  });
+
+  it('the authenticated principal is the request context user', async () => {
+    await runWithRequestContext({ userId: 'user-1', email: 'user-1@example.com' }, async () => {
+      expect(getAuthenticatedPrincipal()).toEqual({
+        userId: 'user-1',
+        email: 'user-1@example.com',
+      });
+    });
   });
 });
 

@@ -32,6 +32,9 @@ vi.mock('@/lib/api', () => ({
     isLoading: fake.newest === undefined,
   }),
   apiGet: (path: string) => fake.apiGet(path) as Promise<unknown>,
+  // Reactions post through these; nothing here reacts.
+  useApiPost: () => ({ mutate: () => {}, isError: false, error: null }),
+  useQueryClient: () => ({ invalidateQueries: () => Promise.resolve() }),
 }));
 vi.mock('./reply-composer', () => ({ ReplyComposer: () => null }));
 vi.mock('./reopen-button', () => ({ ReopenThreadButton: () => null }));
@@ -260,5 +263,18 @@ describe('ThreadConversation', () => {
     mount(at(150));
     expect(screen.getByTestId('loading').textContent).toBe('false');
     expect(fake.apiGet).not.toHaveBeenCalled();
+  });
+
+  it('gives the header a solid background, with no backdrop-filter layer', () => {
+    // Guards the mitigation, not the symptom: the blank frames in Conor's
+    // recording (task 190eeb01) came from the browser's rendering path,
+    // which this test cannot see. It keeps the blur from coming back.
+    fake.newest = pageOf(1, 20);
+    mount(at(20));
+    const header = document.querySelector('header');
+    expect(header, 'the conversation header rendered').not.toBeNull();
+    const classes = header!.className.split(/\s+/);
+    expect(classes.filter((c) => c.startsWith('backdrop-'))).toEqual([]);
+    expect(classes).toContain('bg-background');
   });
 });

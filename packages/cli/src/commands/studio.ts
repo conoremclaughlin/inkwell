@@ -45,7 +45,11 @@ import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { resolveSlug, normalizeIdentityJson } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
 import { copyBootstrapFiles, syncMcpConfig } from '@inklabs/shared';
-import { completeStudio, type CompleteStudioReport } from '../lib/studio-complete.js';
+import {
+  completeStudio,
+  type CompleteStudioOptions,
+  type CompleteStudioReport,
+} from '../lib/studio-complete.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -336,7 +340,9 @@ async function runInteractiveFlow(sbSlug: string, gitRoot: string): Promise<Inte
     default: defaultBranch,
   });
 
-  // Step 3: Config directories to copy
+  // Step 3: Config directories to copy. None is pre-checked: the studio's
+  // own permissions and hooks come from the completion routine, and a
+  // copied folder is opt-in (design v3, item 3).
   const candidateDirs = ['.claude', '.codex', '.gemini'].filter((dir) =>
     existsSync(join(gitRoot, dir))
   );
@@ -348,18 +354,21 @@ async function runInteractiveFlow(sbSlug: string, gitRoot: string): Promise<Inte
       choices: candidateDirs.map((dir) => ({
         name: dir,
         value: dir,
-        checked: dir === '.claude',
+        checked: false,
       })),
     });
   }
 
-  // Step 4: Claude permission inheritance from source settings
-  let inheritClaudePermissions = true;
+  // Step 4: Claude permission inheritance from source settings. Opt-in: the
+  // source's settings carry its own lane rules (absolute paths into that
+  // checkout, its denies), and a new studio gets the builder profile.
+  let inheritClaudePermissions = false;
   const sourceClaudeSettings = join(gitRoot, '.claude', 'settings.local.json');
   if (existsSync(sourceClaudeSettings)) {
     inheritClaudePermissions = await confirm({
-      message: 'Inherit Claude permissions from source .claude/settings.local.json?',
-      default: true,
+      message:
+        'Inherit Claude permissions from source .claude/settings.local.json instead of the studio builder profile?',
+      default: false,
     });
   }
 
@@ -369,7 +378,11 @@ async function runInteractiveFlow(sbSlug: string, gitRoot: string): Promise<Inte
 /**
  * Copy config directories from git root into the new studio.
  *
- * - .claude/ is always copied as-is (hand-authored permissions)
+ * - .claude/ is copied without settings.local.json: that file holds the
+ *   source checkout's lane rules, and once it is in the studio the
+ *   completion routine keeps it as an authored policy. Permissions come
+ *   from the builder profile, or from the source with
+ *   --inherit-claude-permissions.
  * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
  * - .ink/identity.json is always freshly written (never copied)
  */
@@ -381,8 +394,8 @@ function copyConfigDirs(sourceRoot: string, wsPath: string, dirs: string[]): voi
     if (!existsSync(source)) continue;
 
     if (dir === '.claude') {
-      // Always copy as-is
-      cpSync(source, target, { recursive: true });
+      const localSettings = join(source, 'settings.local.json');
+      cpSync(source, target, { recursive: true, filter: (src) => src !== localSettings });
     } else if ((dir === '.codex' || dir === '.gemini') && existsSync(join(wsPath, '.mcp.json'))) {
       // Will be regenerated via syncMcpConfig — skip copying stale generated files
       continue;
@@ -785,11 +798,12 @@ const DEFAULT_STUDIO_SET: Array<{ suffix: string; template: string; purpose: str
 
 async function setupStudios(
   sbSlug: string,
-  options: { backend?: string; copyFrom?: string; inheritClaudePermissions?: boolean }
+  options: { backend?: string; copyFrom?: string; inheritClaudePermissions?: boolean },
+  deps: StudioCreateDeps = {}
 ): Promise<void> {
   console.log(chalk.bold(`\nSetting up studios for ${chalk.cyan(sbSlug)}...\n`));
 
-  const gitRoot = findGitRoot();
+  const gitRoot = deps.gitRoot ?? findGitRoot();
   const results: Array<{ name: string; status: 'created' | 'exists' | 'failed'; path: string }> =
     [];
 
@@ -804,14 +818,19 @@ async function setupStudios(
 
     const spinner = ora(`Creating studio: ${name}`).start();
     try {
-      await createStudioInner(name, {
-        agent: sbSlug,
-        purpose: studio.purpose,
-        template: studio.template,
-        backend: options.backend,
-        copyFrom: options.copyFrom,
-        inheritClaudePermissions: options.inheritClaudePermissions,
-      });
+      await createStudioInner(
+        name,
+        {
+          agent: sbSlug,
+          purpose: studio.purpose,
+          template: studio.template,
+          backend: options.backend,
+          copyFrom: options.copyFrom,
+          inheritClaudePermissions: options.inheritClaudePermissions,
+        },
+        undefined,
+        deps
+      );
       spinner.succeed(`Created: ${name}`);
       results.push({ name, status: 'created', path: wsPath });
     } catch (error) {
@@ -845,6 +864,17 @@ async function setupStudios(
 }
 
 /**
+ * What studio creation reaches outside the worktree for, injectable so a
+ * test runs it against a synthetic repository without a server.
+ */
+interface StudioCreateDeps {
+  /** The repository to create the studio from (default: cwd's git root). */
+  gitRoot?: string;
+  register?: CompleteStudioOptions['register'];
+  syncSkills?: CompleteStudioOptions['syncSkills'];
+}
+
+/**
  * Inner studio creation logic — throws on failure instead of process.exit.
  * Used by both `createStudio` (interactive) and `setupStudios` (batch).
  */
@@ -859,14 +889,16 @@ async function createStudioInner(
     copyConfig?: boolean;
     configDirs?: string;
     copyFrom?: string;
+    /** Copy the source's Claude permissions instead of the builder profile. Only `true` copies. */
     inheritClaudePermissions?: boolean;
     /** commander: `--no-install` sets install=false; absent means true. */
     install?: boolean;
   },
-  overrides?: { branch?: string; configDirsList?: string[] }
+  overrides?: { branch?: string; configDirsList?: string[] },
+  deps: StudioCreateDeps = {}
 ): Promise<StudioCreateResult> {
   const sbSlug = options.agent || resolveSlug() || 'sb';
-  const gitRoot = findGitRoot();
+  const gitRoot = deps.gitRoot ?? findGitRoot();
   const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
   const wsPath = getStudioPath(gitRoot, name);
   const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(sbSlug, name);
@@ -918,13 +950,20 @@ async function createStudioInner(
     sbSlug,
     mainRoot: copySourceRoot,
     rootSync: true,
-    inheritPermissions: options.inheritClaudePermissions !== false,
+    inheritPermissions: options.inheritClaudePermissions === true,
+    // The creator's own input names the profile: this studio is on a branch
+    // of its own, and its row records the role template, so a 'reviewer'
+    // template is a reviewer (review 4177f7fe, decision 2).
+    permissionProfile: options.template === 'reviewer' ? 'reviewer' : 'builder',
+    permissionOwner: sbSlug,
     studioSetup: true,
     studioName: name,
     ...(options.purpose ? { purpose: options.purpose } : {}),
     branch,
     ...(options.backend ? { backend: options.backend } : {}),
     ...(options.template ? { role: options.template } : {}),
+    ...(deps.register ? { register: deps.register } : {}),
+    ...(deps.syncSkills ? { syncSkills: deps.syncSkills } : {}),
   });
 
   // Dependencies, as the server's creators do after a worktree add.
@@ -1395,8 +1434,12 @@ export {
   shouldWarnMissingCliBinPath,
   planInit,
   git,
+  runInteractiveFlow,
+  copyConfigDirs,
+  createStudioInner,
+  setupStudios,
 };
-export type { InitResult };
+export type { InitResult, StudioCreateDeps };
 
 async function registerStudioCommand(options: { agent?: string }): Promise<void> {
   const gitRoot = findGitRoot();
@@ -1480,10 +1523,14 @@ export function registerStudioCommands(program: Command): void {
       '--copy-from <source>',
       'Copy bootstrap files (.mcp.json, .env.local) and config dirs from source studio/path (default: main worktree)'
     )
+    // Opt-in. The negative form is the default and stays accepted so a
+    // script written for the old opt-out still parses; defined after the
+    // positive one, it does not make inheritance the default.
     .option(
-      '--no-inherit-claude-permissions',
-      'Do not copy .claude/settings.local.json permissions from the source worktree'
+      '--inherit-claude-permissions',
+      "Copy the source worktree's .claude/settings.local.json permissions instead of the studio builder profile"
     )
+    .option('--no-inherit-claude-permissions', 'Use the studio builder profile (the default)')
     .option('--no-install', 'Skip yarn install in the new studio')
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
@@ -1553,10 +1600,11 @@ export function registerStudioCommands(program: Command): void {
       'Copy bootstrap files from source studio/path (default: main worktree)'
     )
     .option(
-      '--no-inherit-claude-permissions',
-      'Do not copy .claude/settings.local.json permissions from the source worktree'
+      '--inherit-claude-permissions',
+      "Copy the source worktree's .claude/settings.local.json permissions instead of the studio builder profile"
     )
-    .action(setupStudios);
+    .option('--no-inherit-claude-permissions', 'Use the studio builder profile (the default)')
+    .action((sbSlug: string, options) => setupStudios(sbSlug, options));
 
   studio
     .command('cli')

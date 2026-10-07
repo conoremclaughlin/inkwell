@@ -26,12 +26,17 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
+import { isGroupId, stopProcessAndWait } from './stop-process.js';
 import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
 import {
   injectSessionHeaders,
   buildSessionEnv,
   buildCleanEnv,
   RUN_TURN_EPOCH_ENV,
+  TURN_REPLY_TOKEN_ENV,
+  TURN_REPLY_EVENT,
+  parseTurnReplyEvent,
   writeRuntimeSessionHint,
   describeExitResult,
   type ErrorClassification,
@@ -55,16 +60,12 @@ class BackendExitError extends Error {
   }
 }
 
-// Absolute wall-clock backstop for a single ink turn — a final safety net for a
-// truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
-// can't distinguish a turn that's still legitimately working from a hung one,
-// so it sits far above any realistic turn. The primary guard is the inactivity
-// timeout below. Override with INK_PROCESS_TIMEOUT_MS.
-//
-// 4 hours: agents doing real multi-step work on the user's behalf can run a
-// long time — the goal is to keep going wherever possible, not to reap eagerly.
-export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
+// Absolute wall-clock backstop for a single ink turn: none unless
+// INK_PROCESS_TIMEOUT_MS sets one (turn-ceiling.ts). It can't distinguish a
+// turn that's still legitimately working from a hung one, so a working turn is
+// never killed on wall-clock (Conor, 2026-10-04); the inactivity timeout below
+// and Stop end a stuck one. It was 4 hours.
+export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.INK_PROCESS_TIMEOUT_MS);
 
 // Continuation-loop turn cap when the SB's dashboard settings don't specify
 // one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
@@ -163,6 +164,12 @@ const MAX_ATTACHMENT_ARGS = 10;
  */
 export const BOOTSTRAP_REQUIRED_EXIT_MARKER = 'INK_BOOTSTRAP_REQUIRED_FAILURE';
 
+/** What a cancelled run says. Never the word "timeout", which the retry classifier reads as transient. */
+const CANCELLED = 'ink chat turn cancelled, process stopped';
+const CANCELLED_UNCONFIRMED =
+  'ink chat turn cancelled; its processes did not confirm they had stopped';
+const UNCONFIRMED_SUFFIX = ', but its processes did not confirm they had stopped';
+
 export class InkRunner implements IRunner {
   async run(
     message: string,
@@ -245,6 +252,35 @@ export class InkRunner implements IRunner {
         });
 
         const result = await this.spawnProcess(args, fullMessage, config);
+
+        // Refused at the spawn seam: nothing started, on this attempt or any.
+        if (result.refusedBeforeSpawn !== undefined) {
+          return {
+            success: false,
+            backendSessionId: sessionId,
+            responses: [],
+            error: result.refusedBeforeSpawn,
+            refusedBeforeSpawn: true,
+          };
+        }
+
+        // A stopped attempt (cancel or timeout) is the run's outcome, checked
+        // before either recovery: nothing in its output can start another
+        // attempt (Lumen 0a811b37). What it reported is kept; it is never a
+        // success.
+        if (result.timedOut) {
+          return {
+            success: false,
+            backendSessionId: sessionId,
+            responses: result.responses,
+            usage: result.usage,
+            servedModel: result.servedModel,
+            finalTextResponse: result.finalTextResponse,
+            toolCalls: result.toolCalls,
+            error: result.timedOut.message,
+            ...(result.stopUnconfirmed ? { stopUnconfirmed: result.stopUnconfirmed } : {}),
+          };
+        }
 
         if (result.bootstrapRequiredFailure) {
           if (usedContextFallback || !injectedContext) return noContextFailure();
@@ -333,6 +369,12 @@ export class InkRunner implements IRunner {
 
     args.push('--session-id', sessionId);
 
+    // Named only when the caller chose one (an inkling's turn always does);
+    // otherwise the chat's own default provider runs, as it always has.
+    if (config.inkProvider) {
+      args.push('--backend', config.inkProvider);
+    }
+
     if (config.model) {
       args.push('--model', config.model);
     }
@@ -397,6 +439,11 @@ export class InkRunner implements IRunner {
     bootstrapRequiredFailure?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
+    /** Set when WE stopped the attempt (a timeout or a cancel), never when it ended on its own. */
+    timedOut?: { kind: 'idle' | 'hard' | 'cancelled'; message: string };
+    stopUnconfirmed?: RunnerResult['stopUnconfirmed'];
+    /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
+    refusedBeforeSpawn?: string;
   }> {
     // This checkout's own CLI (or INK_CLI_PATH), run through this server's
     // node. Never the global link. Only a checkout with no CLI build falls
@@ -439,11 +486,16 @@ export class InkRunner implements IRunner {
       delegationSecret: config.inkDelegationSecret,
     });
 
+    // Minted per spawn, so a line that looks like an event is not one.
+    const turnReplyToken = config.onTurnReply ? randomUUID() : undefined;
+
     // The child inherits an allowlist of the server's env (buildCleanEnv),
     // never the whole of it: spec:sender-token-binding Phase 0. Everything
     // else it needs is set here, explicitly.
     const env = buildCleanEnv({
       ...sessionEnv,
+      // The launch's tag, by which a restarted server finds this process.
+      ...config.launchEnv,
       PATH: spawnPath,
       SB_SLUG: config.sbSlug || '',
       AGENT_ID: config.sbSlug || '',
@@ -457,6 +509,11 @@ export class InkRunner implements IRunner {
       // lifecycle request; without it the chat claimed a fresh epoch at each
       // outer turn and this run's finalize matched zero rows.
       ...(config.turnEpoch ? { [RUN_TURN_EPOCH_ENV]: config.turnEpoch } : {}),
+      // Only when someone forwards the turn replies. The chat prints it on
+      // each turn_reply line, and those lines are accepted on nothing else:
+      // its stdout also carries whatever it echoes, the delivered message
+      // included (Lumen, PR #735).
+      ...(turnReplyToken ? { [TURN_REPLY_TOKEN_ENV]: turnReplyToken } : {}),
     }) as Record<string, string>;
 
     // Turn-scope the observer replay tail: drop anything buffered from a prior
@@ -464,20 +521,116 @@ export class InkRunner implements IRunner {
     // while idle replays nothing (a finished turn must never re-render as live).
     if (config.inkSessionId) sessionEventBus.clearReplay(config.inkSessionId);
 
+    // The caller's admission, asked again at every physical spawn, the
+    // recovery attempts included (Lumen 0a811b37). Nothing below awaits before
+    // spawn(), so no answer can change between the two. A refusal, or a turn
+    // already cancelled, starts nothing.
+    const refusal = config.admitSpawn?.();
+    if (refusal !== undefined) {
+      mcpInjection?.cleanup();
+      logger.warn('ink chat spawn refused by its caller at the spawn seam; nothing started', {
+        sessionId: config.inkSessionId,
+        reason: refusal,
+      });
+      return { responses: [], toolCalls: [], refusedBeforeSpawn: refusal };
+    }
+    if (config.signal?.aborted) {
+      mcpInjection?.cleanup();
+      return { responses: [], toolCalls: [], timedOut: { kind: 'cancelled', message: CANCELLED } };
+    }
+
+    // A run that must stop with its tools leads its own process group, so a
+    // stop can signal the whole group. The provider and tools ink starts stay
+    // in it only while they don't detach (stop-process.ts).
+    const killGroup = config.killProcessGroup === true;
+    // No ceiling unless one is configured, for the module or for this run;
+    // the lower one wins when both are.
+    const ceilingMs = lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs);
+
     return new Promise((resolve, reject) => {
       const child: ChildProcess = spawn(inkBin, fullArgs, {
         cwd: config.workingDirectory,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: killGroup,
       });
+      if (child.pid !== undefined)
+        config.onSpawned?.({ pid: child.pid, ...(killGroup ? { pgid: child.pid } : {}) });
 
       let stdout = '';
       let stderr = '';
-      let killed = false;
+      // Set once a stop is requested: from then on the stop's own path settles
+      // the attempt, and the exit it causes is never classified as a result.
+      let stopping = false;
+      // One settlement, whichever of close, error or a stop gets there first.
+      let settled = false;
+      const settleOnce = (finish: () => void): void => {
+        if (settled) return;
+        settled = true;
+        finish();
+      };
+      // Set once the run's outcome is known (a stop's, or a normal close).
+      // From then on this process is no longer heard: no fresh turn reply is
+      // accepted and no fresh activity is published, so the replies the run
+      // waits for are exactly those accepted before (Lumen's review of #748).
+      let sealed = false;
+      // The run's own cleanup, once, whichever of a normal close and a stop's
+      // outcome comes first. A late close of a stopped child must not touch
+      // the session's observer state: a replacement run may own it by then.
+      let cleanedUp = false;
+      const cleanupOnce = (): void => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimers();
+        mcpInjection?.cleanup();
+        config.signal?.removeEventListener('abort', onAbort);
+        if (config.inkSessionId) {
+          // Turn over: the buffered tail now describes a COMPLETED turn, so
+          // drop it. A later idle attach must not replay it as live activity.
+          sessionEventBus.clearReplay(config.inkSessionId);
+          // Observer channel: start the retention window; observers detach
+          // after it unless a new turn re-registers the session. The durable
+          // ledger remains the replay source regardless.
+          sessionEventBus.releaseObserverSession(config.inkSessionId);
+        }
+      };
       let idleTimer: NodeJS.Timeout;
       // Carries a partial trailing line between stdout chunks so we only parse
       // complete NDJSON events for live fan-out.
       let stdoutLineBuffer = '';
+      // Each outer turn's reply, handed over as its line arrives, in arrival
+      // order. Everything the caller decides about the turn is on that line,
+      // the turn's own sends included; its completion is chained so the run
+      // does not settle while a reply is still being sent.
+      let turnRepliesSettled: Promise<void> = Promise.resolve();
+      const handOverTurnReply = (event: Record<string, unknown>): void => {
+        const handler = config.onTurnReply;
+        if (!handler || !turnReplyToken) return;
+        const reply = parseTurnReplyEvent(event);
+        if (!reply || reply.token !== turnReplyToken) {
+          // Not this run's event: echoed text shaped like one. Logged without
+          // its content, which may be anyone's.
+          logger.warn('Ignored a turn_reply line without this run token', {
+            sessionId: config.inkSessionId,
+            reason: reply ? 'token-mismatch' : 'malformed',
+          });
+          return;
+        }
+        const handled = handler({
+          turn: reply.turn,
+          label: reply.label,
+          text: reply.text,
+          sends: reply.sends,
+          ...(config.inkSessionId ? { sessionId: config.inkSessionId } : {}),
+        }).catch((error: unknown) => {
+          logger.error('Turn reply handler failed', {
+            sessionId: config.inkSessionId,
+            turn: reply.turn,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        turnRepliesSettled = turnRepliesSettled.then(() => handled);
+      };
 
       // Live fan-out: the worker emits one NDJSON event per line as it works
       // (tool_call, result, status chrome). Parse complete lines as they arrive
@@ -487,7 +640,7 @@ export class InkRunner implements IRunner {
       // human-readable chrome are ignored; the authoritative RunnerResult is
       // still assembled from the full stdout in parseOutput on close.
       const publishStreamEvents = (text: string): void => {
-        if (!config.inkSessionId) return;
+        if (!config.inkSessionId && !config.onTurnReply) return;
         stdoutLineBuffer += text;
         let nl: number;
         while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
@@ -506,6 +659,13 @@ export class InkRunner implements IRunner {
             typeof (evt as { type?: unknown }).type === 'string'
           ) {
             const typed = evt as { type: string } & Record<string, unknown>;
+            // Never republished: the line carries the run's token, and
+            // observers already get the turn's text from its ledger entry.
+            if (typed.type === TURN_REPLY_EVENT) {
+              handOverTurnReply(typed);
+              continue;
+            }
+            if (!config.inkSessionId) continue;
             if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
               // Canonical ledger entry (spec:observer-attach §4.2) — the exact
               // appended transcript object, ledger eid included. Publish on the
@@ -527,94 +687,194 @@ export class InkRunner implements IRunner {
         }
       };
 
-      const killProcess = (reason: string, detail?: Record<string, unknown>) => {
-        if (killed) return;
-        killed = true;
-        logger.warn(`ink chat process ${reason}, killing`, {
+      // The run's caller decides what the run delivered once it settles, so it
+      // must not settle while a turn's reply is still on its way out, a
+      // stopped attempt included. turnRepliesSettled never rejects: each
+      // handler's failure is logged. That wait is the reply handler's, not the
+      // process's: nothing here bounds it.
+      const afterTurnReplies = (finish: () => void): void => {
+        void turnRepliesSettled.then(finish);
+      };
+
+      /**
+       * Stop the attempt, and settle once its processes have gone, as the
+       * Claude runner does (#743, #747): SIGTERM, SIGKILL after the grace
+       * period, and for a group stop, settled only on the leader's exit plus
+       * an explicitly empty group. Past the bound it settles anyway and says
+       * the stop was not confirmed. What the process reported before it went
+       * (responses, usage, tool calls) is kept, and the attempt is never a
+       * success.
+       */
+      const requestStop = (stop: {
+        kind: 'idle' | 'hard' | 'cancelled';
+        reason: string;
+        message: string;
+        unconfirmedMessage: string;
+        detail?: Record<string, unknown>;
+      }): void => {
+        if (stopping || settled) return;
+        stopping = true;
+        clearTimers();
+        config.signal?.removeEventListener('abort', onAbort);
+        logger.warn(`ink chat process ${stop.reason}, stopping`, {
           sessionId: config.inkSessionId,
           inactivityMs: INACTIVITY_TIMEOUT_MS,
-          absoluteMs: PROCESS_TIMEOUT_MS,
-          ...detail,
+          ceilingMs,
+          ...stop.detail,
         });
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 3000);
+        void stopProcessAndWait(child, { group: killGroup }).then((outcome) => {
+          // A group stop is confirmed only by a group seen empty.
+          const confirmed = outcome.exited && (!killGroup || outcome.group === 'empty');
+          let stopUnconfirmed: RunnerResult['stopUnconfirmed'];
+          if (!confirmed) {
+            const pgid = killGroup && isGroupId(child.pid) ? child.pid : undefined;
+            stopUnconfirmed = {
+              leaderExited: outcome.exited,
+              ...(pgid !== undefined ? { pgid } : {}),
+              ...(outcome.group !== undefined ? { group: outcome.group } : {}),
+            };
+            // Process metadata only: never arguments, environment or content.
+            logger.error('ink chat stop could not confirm its processes had gone', {
+              pid: child.pid,
+              kind: stop.kind,
+              leaderExited: outcome.exited,
+              group: outcome.group,
+            });
+          }
+          // The outcome is known: seal the run, then clean up once. The replies
+          // it waits for below are only those already accepted.
+          sealed = true;
+          cleanupOnce();
+          const partial = this.parseOutput(stdout, stderr);
+          afterTurnReplies(() =>
+            settleOnce(() =>
+              resolve({
+                ...partial,
+                timedOut: {
+                  kind: stop.kind,
+                  message: confirmed ? stop.message : stop.unconfirmedMessage,
+                },
+                ...(stopUnconfirmed ? { stopUnconfirmed } : {}),
+              })
+            )
+          );
+        });
       };
+
+      // Cancellation (an owner stopping an inkling's turn).
+      const onAbort = (): void =>
+        requestStop({
+          kind: 'cancelled',
+          reason: 'cancelled',
+          message: CANCELLED,
+          unconfirmedMessage: CANCELLED_UNCONFIRMED,
+        });
 
       // Inactivity guard — reset on every byte the subprocess emits. A turn
       // that's still working (tool calls, status lines) keeps this alive; a
       // silent, hung one is reaped.
       const resetIdleTimer = () => {
-        if (killed) return;
+        if (stopping) return;
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
           const lower = stderr.toLowerCase();
           const stallSignature = PROVIDER_STALL_SIGNATURES.find((s) => lower.includes(s));
-          killProcess(`idle for ${Math.round(INACTIVITY_TIMEOUT_MS / 1000)}s`, {
-            cause: stallSignature ? 'provider-stall' : 'unknown-hang',
-            ...(stallSignature ? { stallSignature } : {}),
-            stderrTail: stderr.slice(-500) || undefined,
+          const idleSecs = Math.round(INACTIVITY_TIMEOUT_MS / 1000);
+          const message = `ink chat timeout: no output for ${idleSecs}s, process stopped`;
+          requestStop({
+            kind: 'idle',
+            reason: `idle for ${idleSecs}s`,
+            message,
+            unconfirmedMessage: `${message}${UNCONFIRMED_SUFFIX}`,
+            detail: {
+              cause: stallSignature ? 'provider-stall' : 'unknown-hang',
+              ...(stallSignature ? { stallSignature } : {}),
+              stderrTail: stderr.slice(-500) || undefined,
+            },
           });
         }, INACTIVITY_TIMEOUT_MS);
       };
 
+      // Once sealed, the process is no longer heard (see `sealed`).
       child.stdout?.on('data', (chunk: Buffer) => {
+        if (sealed) return;
         const text = chunk.toString();
         stdout += text;
         publishStreamEvents(text);
         resetIdleTimer();
       });
       child.stderr?.on('data', (chunk: Buffer) => {
+        if (sealed) return;
         stderr += chunk.toString();
         resetIdleTimer();
       });
 
-      // Absolute backstop — fires regardless of activity, for a process wedged
-      // in a way that still emits output (or none at all).
-      const absoluteTimer = setTimeout(() => {
-        killProcess(`exceeded ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s absolute backstop`);
-      }, PROCESS_TIMEOUT_MS);
-
-      // Start the inactivity countdown immediately so a process that never
-      // emits anything (wedged at startup) is still reaped.
-      resetIdleTimer();
+      // A ceiling only when one is configured, for the module (env) or for
+      // this run (an inkling turn's), the lower one winning (#745's
+      // lowestCeiling). It fires regardless of activity.
+      const absoluteTimer =
+        ceilingMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              const secs = Math.round(ceilingMs / 1000);
+              const message = `ink chat timeout: exceeded the ${secs}s ceiling, process stopped`;
+              requestStop({
+                kind: 'hard',
+                reason: `exceeded the ${secs}s ceiling`,
+                message,
+                unconfirmedMessage: `${message}${UNCONFIRMED_SUFFIX}`,
+              });
+            }, ceilingMs);
 
       const clearTimers = () => {
         clearTimeout(idleTimer);
         clearTimeout(absoluteTimer);
       };
 
+      // Start the inactivity countdown immediately so a process that never
+      // emits anything (wedged at startup) is still reaped.
+      resetIdleTimer();
+
+      config.signal?.addEventListener('abort', onAbort, { once: true });
+
       child.on('close', (code) => {
-        clearTimers();
-        mcpInjection?.cleanup();
-        // Turn over: the buffered tail now describes a COMPLETED turn, so drop
-        // it. A later idle attach must not replay it as live activity.
-        if (config.inkSessionId) {
-          sessionEventBus.clearReplay(config.inkSessionId);
-          // Observer channel: start the retention window; observers detach
-          // after it unless a new turn re-registers the session. The durable
-          // ledger remains the replay source regardless.
-          sessionEventBus.releaseObserverSession(config.inkSessionId);
-        }
+        // A no-op when a stop's outcome already cleaned up: this may be the
+        // old child closing long after a replacement run took the session.
+        cleanupOnce();
+
+        // A requested stop settles on its own path once its processes are
+        // gone. This exit is part of that stop: never a result to classify,
+        // and never a reason for a recovery attempt (Lumen 0a811b37).
+        if (stopping) return;
+        sealed = true;
 
         if (code !== 0) {
           // The child refused to answer without identity context. Recoverable:
           // the server holds that context and can supply it directly.
           if (stderr.includes(BOOTSTRAP_REQUIRED_EXIT_MARKER)) {
-            resolve({
-              responses: [],
-              bootstrapRequiredFailure: true,
-              toolCalls: [],
-            });
+            afterTurnReplies(() =>
+              settleOnce(() =>
+                resolve({
+                  responses: [],
+                  bootstrapRequiredFailure: true,
+                  toolCalls: [],
+                })
+              )
+            );
             return;
           }
 
           // Check for resume failure
           if (stderr.includes('session not found') || stderr.includes('No such session')) {
-            resolve({
-              responses: [],
-              resumeFailedNoSession: true,
-              toolCalls: [],
-            });
+            afterTurnReplies(() =>
+              settleOnce(() =>
+                resolve({
+                  responses: [],
+                  resumeFailedNoSession: true,
+                  toolCalls: [],
+                })
+              )
+            );
             return;
           }
 
@@ -647,18 +907,23 @@ export class InkRunner implements IRunner {
             stderr,
             backend: 'ink',
           });
-          reject(new BackendExitError(described.text, described.classification));
+          afterTurnReplies(() =>
+            settleOnce(() => reject(new BackendExitError(described.text, described.classification)))
+          );
           return;
         }
 
         const result = this.parseOutput(stdout, stderr);
-        resolve(result);
+        afterTurnReplies(() => settleOnce(() => resolve(result)));
       });
 
       child.on('error', (err) => {
         clearTimers();
         mcpInjection?.cleanup();
-        reject(new Error(`Failed to spawn ink: ${err.message}`));
+        config.signal?.removeEventListener('abort', onAbort);
+        // During a stop, the stop's own path settles.
+        if (stopping) return;
+        settleOnce(() => reject(new Error(`Failed to spawn ink: ${err.message}`)));
       });
 
       // Close stdin — message is passed via --message arg

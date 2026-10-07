@@ -541,7 +541,7 @@ export default function RoutingPage() {
               {summary.unassignedReminderCount !== 1 ? 's' : ''}
             </span>{' '}
             not assigned to any SB.{' '}
-            <Link href="/reminders" className="underline hover:text-amber-900">
+            <Link href="/scheduled" className="underline hover:text-amber-900">
               View reminders
             </Link>
           </p>

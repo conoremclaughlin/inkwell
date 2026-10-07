@@ -25,6 +25,7 @@ import type {
   ISessionService,
   ClaudeRunnerConfig,
   IRunner,
+  RunnerResult,
   ISessionRepository,
   IContextBuilder,
   ToolCall,
@@ -46,6 +47,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
+import { launchHoldFor, reserveLaunch } from './launched-processes.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -55,8 +57,15 @@ import {
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
+import { selectInkRunner, type HostedInkSelection } from './hosted-ink-session.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from '@inklabs/shared';
+import {
+  classifyError,
+  isPathWithinWorkspaceAsync,
+  isPreAcceptanceRefusal,
+  studioPermissionProfile,
+  type ErrorClassification,
+} from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -78,6 +87,21 @@ import { StudiosRepository, type Studio } from '../../data/repositories/studios.
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
+import {
+  classifyIdentityById,
+  type InklingIdentity,
+  inklingTurnRefusal,
+  isOwnersOwnMessage,
+} from '../inklings/inkling-turn-gate.js';
+import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import { trackInklingTurn } from '../inklings/inkling-turns.js';
+import {
+  INKLING_FENCE_REASON,
+  fenceInkling,
+  inklingFenceHolds,
+} from '../inklings/inkling-stop-fence.js';
+import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
+import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -85,6 +109,8 @@ import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 export interface SessionServiceConfig {
   /** Default working directory for Claude Code */
   defaultWorkingDirectory: string;
+  /** Where inklings' own folders are made; ~/.ink/inklings unless given (tests). */
+  inklingsRoot?: string;
   /** Path to MCP config file */
   mcpConfigPath: string;
   /** Optional explicit model override for Claude backend */
@@ -107,6 +133,13 @@ export interface SessionServiceConfig {
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
   responseHandler?: (responses: ChannelResponse[], sessionId?: string) => Promise<void>;
+  /**
+   * The in-process ink runtime (hosted-ink-session.ts), for the agents named
+   * here only: an `ink` turn of any other agent still spawns `ink chat`.
+   * Absent by default. A listed agent's turn goes to this runner whether or
+   * not it can run: an unbound runner refuses, never falls back.
+   */
+  hostedInk?: HostedInkSelection;
 }
 
 const DEFAULT_CONFIG: SessionServiceConfig = {
@@ -171,6 +204,19 @@ interface PendingMessage {
   turnEpochCandidate: string;
 }
 
+/**
+ * How an inkling's turn is bounded: a stop takes the tools it started with
+ * it, and a ceiling applies only when one is configured.
+ */
+function inklingRunBounds(ceilingMs: number | undefined): {
+  killProcessGroup: true;
+  timeoutMs?: number;
+} {
+  return ceilingMs === undefined
+    ? { killProcessGroup: true }
+    : { killProcessGroup: true, timeoutMs: ceilingMs };
+}
+
 // ── Route pattern matching (spec:trigger-studio-routing) ──
 
 /**
@@ -212,11 +258,12 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     taskDescription: metadata?.taskDescription,
     parentSessionId: metadata?.parentSessionId,
     threadKey: metadata?.threadKey,
-    alias: metadata?.sessionAlias,
+    alias: metadata?.sessionKey,
     studioId: metadata?.studioId,
     studioHint: metadata?.studioHint,
     recipientSessionId: metadata?.recipientSessionId,
     recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
+    recipientSessionNamed: metadata?.recipientSessionNamed === true,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -346,6 +393,70 @@ export interface ThreadProjectRepo {
   cause?: ProjectRepoCause;
 }
 
+/**
+ * Routing's affirmative decision that this identity's work on a pinned thread
+ * runs with no studio (task bd4657a0). It exists only when routing positively
+ * found no studio for the identity in the project's repo AND the thread type
+ * is presence + reuse-only, so the create boundary proceeds studioless rather
+ * than building a worktree (Conor's ruling: discussions execute). A refusal, a
+ * failed studio lookup, a write-intent thread awaiting provisioning, and a
+ * project with no repo all produce none. A null studio on a session is never
+ * this decision; it is only what the decision leaves behind.
+ *
+ * Studioless presence is repo-neutral. The runner gives a studioless session
+ * the server's default working directory (resolveWorkingDirectory), never the
+ * project's repo, so nothing here claims the session ran in the project.
+ */
+export interface StudiolessPresencePlacement {
+  /** The pinned project's canonical slug. */
+  project: string;
+  /** The project's repo, as routing read it for this decision. */
+  repoRoot: string;
+}
+
+/** routing_decision.placement.kind on a row created under that decision. */
+const STUDIOLESS_PRESENCE = 'studioless-presence';
+
+/**
+ * The decision, read off a routing result. Only the project-repo tier's
+ * deferred create yields one: resolveStudioForRepo returns it after a
+ * successful lookup found no studio and no main studio in the repo, while a
+ * failed lookup returns nothing and routing refuses. The create boundary
+ * proceeds studioless on exactly this condition, and reads it from here.
+ */
+export function studiolessPresenceOf(
+  routing: StudioRoutingDecision,
+  projectRepo: ThreadProjectRepo | null | undefined,
+  writeIntent: WriteIntent,
+  studioPolicy: StudioPolicy
+): StudiolessPresencePlacement | null {
+  const deferred = routing.deferredCreate;
+  if (!deferred || deferred.source !== 'project' || routing.studioId) return null;
+  if (writeIntent !== 'presence' || studioPolicy !== 'reuse-only') return null;
+  if (!projectRepo?.repoRoot || deferred.repoRoot !== projectRepo.repoRoot) return null;
+  return { project: projectRepo.slug, repoRoot: projectRepo.repoRoot };
+}
+
+/**
+ * Whether routing recorded, when it created this row, that it placed the
+ * row studioless for this project and repo. Rows created before the record
+ * existed carry none and are not admitted on a null working_dir.
+ */
+function recordedStudiolessPresence(
+  session: Session,
+  project: { slug: string; repoRoot: string }
+): boolean {
+  const decision = session.metadata?.routing_decision as { placement?: unknown } | undefined;
+  const placement = decision?.placement as
+    | { kind?: unknown; project?: unknown; repoRoot?: unknown }
+    | undefined;
+  return (
+    placement?.kind === STUDIOLESS_PRESENCE &&
+    placement.project === project.slug &&
+    placement.repoRoot === project.repoRoot
+  );
+}
+
 /** The pinned project, as a refusal reports it. */
 export interface ThreadProjectRefusal {
   slug: string;
@@ -368,6 +479,8 @@ export interface StudioRoutingDecision {
     | 'project-repo-reuse'
     | 'project-repo-created'
     | 'main-fallback'
+    /** An inkling: no studio, ever; its turns run in its own folder. */
+    | 'inkling-folder'
     | 'refused'
     | 'none';
   /**
@@ -467,6 +580,44 @@ export class UnresolvedStudioError extends Error {
  * Recovery needs no special path: give the thread a route pattern, a
  * studio_hint, or a project, and the next delivery attempt resolves normally.
  */
+/** Why a caller-named session could not take a message (T4). */
+export interface ExplicitAddressHold {
+  sessionId?: string;
+  sessionKey?: string;
+  cause:
+    | 'unknown-session'
+    | 'contact-scope'
+    | 'session-key-miss'
+    | 'session-key-held'
+    | 'binding-held';
+}
+
+/**
+ * The identity a delivery is for could not be classified: its read failed, or
+ * the id named no row at that moment. Routing creates and provisions nothing
+ * on a guess (Lumen, #750 r2). An inkling's session created on an ordinary
+ * runtime would be refused for good once the read recovered, so the delivery
+ * is retried instead. The verdict travels with the error, so the trigger retry
+ * scheduler reads it (carriedClassification) whichever path it surfaces on:
+ * the plan call, handleMessage, or a queued turn's re-resolution.
+ */
+export class IdentityUnclassifiedError extends Error {
+  readonly code = 'IDENTITY_UNCLASSIFIED';
+  readonly classification: ErrorClassification;
+
+  constructor(
+    readonly sbSlug: string,
+    /** Absent when no id was found to classify: the read by slug failed. */
+    readonly sbId?: string
+  ) {
+    const summary =
+      "Inkling turn refused: the SB's identity could not be read, so no session was created";
+    super(summary);
+    this.name = 'IdentityUnclassifiedError';
+    this.classification = { category: 'network', summary, retryable: true };
+  }
+}
+
 export class RoutingRefusedError extends Error {
   readonly code = 'ROUTING_REFUSED';
 
@@ -476,7 +627,12 @@ export class RoutingRefusedError extends Error {
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
+      reason?:
+        | 'no-route'
+        | 'occupied'
+        | 'ambiguous-identity'
+        | 'project-without-repo'
+        | 'explicit-address';
       /**
        * The caller named an exact studio/session and THAT is what we refused.
        * Without this the message recommends naming one — advice the caller has
@@ -488,6 +644,11 @@ export class RoutingRefusedError extends Error {
       policy?: 'reuse-only';
       /** The thread's pinned project, when the decision was made by it. */
       project?: ThreadProjectRefusal;
+      /**
+       * The caller named a session (by id or key) that cannot take the
+       * message. Never redirected elsewhere (session-lifecycle-model §3).
+       */
+      explicit?: ExplicitAddressHold;
     }
   ) {
     super(RoutingRefusedError.describe(threadKey, sbSlug, detail));
@@ -499,6 +660,28 @@ export class RoutingRefusedError extends Error {
     sbSlug: string,
     detail: RoutingRefusedError['detail']
   ): string {
+    if (detail.reason === 'explicit-address' && detail.explicit) {
+      const named = detail.explicit.sessionKey
+        ? `sessionKey "${detail.explicit.sessionKey}"`
+        : `session ${detail.explicit.sessionId ?? 'unknown'}`;
+      const why: Record<ExplicitAddressHold['cause'], string> = {
+        'unknown-session': `which is not a session of "${sbSlug}"`,
+        'contact-scope': `which belongs to a different contact scope than this message`,
+        'session-key-miss': `which no live session of "${sbSlug}" carries`,
+        'session-key-held':
+          `which ended, and its session key is now held by another live session, ` +
+          `so it cannot be reopened without taking that key`,
+        'binding-held':
+          `but the thread's binding could not be moved to it and another session ` +
+          `holds it, so delivery would have gone to a session you did not name`,
+      };
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
+        `${named}, ${why[detail.explicit.cause]}. Message held; it was not redirected ` +
+        `to another session. Re-send to a session of "${sbSlug}" (list_sessions shows ` +
+        `them), or send without the address.`
+      );
+    }
     // Ambiguity refuses BEFORE any tier runs, so the generic message below —
     // which names route patterns, project affinity and the caller repo — is
     // false here: none of them were consulted. It cost Myra and Lumen a night
@@ -655,6 +838,11 @@ export class SessionService implements ISessionService {
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+  }
+
+  /** The runner for an `ink` turn: in process for the agents opted in, else `ink chat`. */
+  private inkRunnerFor(sbId: string | null | undefined): IRunner {
+    return selectInkRunner(this.config.hostedInk, this.inkRunner, sbId);
   }
 
   private getLeaseService(): StudioLeaseService | null {
@@ -1389,11 +1577,19 @@ export class SessionService implements ISessionService {
     userId: string,
     sbId: string | null,
     threadKey: string | undefined,
-    session: Session
+    session: Session,
+    /**
+     * The plan resolution's own studioless-presence decision, reported by
+     * getOrCreateSession's onStudiolessPresence. The winner and any stamp
+     * the repair meets are tested against the decision that produced the
+     * routed candidate, never a fresh one (task bd4657a0). Absent means
+     * none: a studioless session is then refused, as before.
+     */
+    studiolessPresence?: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!threadKey) return true;
     const { project } = await this.resolveThreadBehavior(userId, sbId, threadKey);
-    return this.threadMatchAllowed(userId, session, project, threadKey);
+    return this.threadMatchAllowed(userId, session, project, threadKey, studiolessPresence ?? null);
   }
 
   /**
@@ -1416,24 +1612,181 @@ export class SessionService implements ISessionService {
     );
   }
 
+  /**
+   * The one test a session takes before it may carry a project-pinned
+   * thread: an inferred anchor, a thread-key match, an assignment winner and
+   * a stamp met during repair all go through here (task bd4657a0).
+   *
+   * A session in a studio must be in a studio of the project's repo, as
+   * before. A session with no studio was refused outright, which contradicted
+   * routing: for an identity with no studio in the project's repo, routing
+   * itself places presence work studioless, so every session the thread could
+   * produce was refused on its next message and a new row was minted each
+   * time (Lumen on inkling:thread:app-build, 2026-10-02: 20 rows, 6 that
+   * ran). A studioless session is now admitted when, and only when, routing's
+   * current decision for this thread is that same studioless placement — see
+   * studiolessMatchAllowed for the evidence it must also carry.
+   */
   private async threadMatchAllowed(
     userId: string,
     match: Session,
     projectRepo: ThreadProjectRepo | null | undefined,
-    threadKey: string
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!projectRepo) return true;
-    if (!projectRepo.repoRoot || !match.studioId) {
+    if (!projectRepo.repoRoot) {
       logger.warn('[StudioResolve] Thread-key reuse refused — pinned project repo unverifiable', {
         threadKey,
         sessionId: match.id,
         studioId: match.studioId ?? null,
         project: projectRepo.slug,
-        projectRepoRoot: projectRepo.repoRoot,
+        cause: projectRepo.cause ?? null,
       });
       return false;
     }
+    if (!match.studioId) {
+      return this.studiolessMatchAllowed(
+        match,
+        { slug: projectRepo.slug, repoRoot: projectRepo.repoRoot },
+        threadKey,
+        studiolessPresence
+      );
+    }
     return this.continuityStudioAllowed(userId, match.studioId, { threadKey, projectRepo });
+  }
+
+  /**
+   * A studioless session on a project-pinned thread. Two things must hold.
+   *
+   * 1. Routing's decision for THIS resolution is studioless presence for this
+   *    project and repo. That is what makes reuse placement-neutral: reusing
+   *    the session puts the work exactly where a new session would go.
+   * 2. The session itself is evidence of that placement, not merely a row
+   *    with a null studio:
+   *    - a recorded working_dir inside the project's repo is repository
+   *      evidence on its own (the session ran there);
+   *    - otherwise the row must carry the placement routing recorded when it
+   *      created it (routing_decision.placement), and any recorded
+   *      working_dir must be inside the default working directory, which is
+   *      where the runner puts every studioless session. Claude hooks report
+   *      that directory on every lifecycle event, so it is the expected value
+   *      for a spawned presence session, not a stray one.
+   *    A working_dir anywhere else means the session ran in another repo
+   *    (a terminal resumed it elsewhere), and it is refused whatever it
+   *    carries. A missing working_dir never counts as project placement.
+   *
+   * Paths are compared by containment after realpath (path.relative), never
+   * by string prefix, and only absolute ones count.
+   *
+   * A row admitted on its working_dir alone has no record, and once it runs
+   * here the runner gives it the default directory; see
+   * adoptStudiolessPresence for how it keeps continuity after that.
+   */
+  private async studiolessMatchAllowed(
+    match: Session,
+    project: { slug: string; repoRoot: string },
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
+  ): Promise<boolean> {
+    const refuse = (reason: string): false => {
+      logger.warn('[StudioResolve] Thread-key reuse refused — studioless session', {
+        threadKey,
+        sessionId: match.id,
+        reason,
+        workingDir: match.workingDir ?? null,
+        project: project.slug,
+        projectRepoRoot: project.repoRoot,
+      });
+      return false;
+    };
+    if (
+      !studiolessPresence ||
+      studiolessPresence.project !== project.slug ||
+      studiolessPresence.repoRoot !== project.repoRoot
+    ) {
+      return refuse('routing does not place this thread studioless');
+    }
+    // A relative path names no directory: containment resolves it against
+    // the root being tested, so `.` or `app` was "inside" every root (Lumen,
+    // #721 r1). update_session_state stores whatever string it is given.
+    if (match.workingDir && !path.isAbsolute(match.workingDir)) {
+      return refuse('working_dir is not an absolute path');
+    }
+    if (
+      match.workingDir &&
+      (await isPathWithinWorkspaceAsync(match.workingDir, project.repoRoot))
+    ) {
+      return true;
+    }
+    if (!recordedStudiolessPresence(match, project)) {
+      return refuse(
+        match.workingDir
+          ? 'working_dir is outside the project repo'
+          : 'no recorded studioless placement, and no working_dir'
+      );
+    }
+    if (
+      match.workingDir &&
+      !(await isPathWithinWorkspaceAsync(match.workingDir, this.config.defaultWorkingDirectory))
+    ) {
+      return refuse('working_dir is outside both the project repo and the default directory');
+    }
+    return true;
+  }
+
+  /**
+   * Record the studioless placement on a session the predicate admitted and
+   * this spawn is about to run (Lumen, #721 r1). A row admitted on a
+   * working_dir inside the project repo carries no record; the runner gives
+   * it the default directory, its hook then reports that directory, and on
+   * the next message it was refused with nothing to show for itself. The
+   * record makes it what a row routing created under the same decision is.
+   *
+   * Only for a match the predicate admitted: an inferred anchor or a
+   * thread-key match. An explicit address bypasses the predicate, and
+   * recording a placement there would turn a one-off address into
+   * continuity. Only at spawn: a plan runs nothing, so nothing moved.
+   * A failed write is logged and the turn proceeds; continuity then breaks
+   * on the next message, as before this fix, rather than this one.
+   */
+  private async adoptStudiolessPresence(
+    session: Session,
+    studiolessPresence: StudiolessPresencePlacement | null,
+    planOnly: boolean
+  ): Promise<Session> {
+    if (planOnly || !studiolessPresence || session.studioId) return session;
+    const project = { slug: studiolessPresence.project, repoRoot: studiolessPresence.repoRoot };
+    if (recordedStudiolessPresence(session, project)) return session;
+    // metadata merges at the top level, so the whole decision is rewritten.
+    const decision = (session.metadata?.routing_decision ?? {}) as Record<string, unknown>;
+    try {
+      const adopted = await this.repository.update(session.id, {
+        metadata: {
+          routing_decision: {
+            ...decision,
+            placement: {
+              kind: STUDIOLESS_PRESENCE,
+              ...studiolessPresence,
+              adoptedAt: new Date().toISOString(),
+            },
+          },
+        },
+      });
+      logger.info('[SessionRouting] Recorded studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        workingDir: session.workingDir ?? null,
+      });
+      return adopted;
+    } catch (err) {
+      logger.warn('[SessionRouting] Could not record studioless placement on an adopted session', {
+        sessionId: session.id,
+        project: project.slug,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return session;
+    }
   }
 
   private async continuityStudioAllowed(
@@ -1655,6 +2008,24 @@ export class SessionService implements ISessionService {
           refusal: { threadKey: error.threadKey, detail: error.detail },
           // Refusals are pre-admission by construction — withStudioLease
           // throws before getOrCreateSession returns.
+          admitted: false,
+        };
+      }
+
+      // Thrown by routing before anything is created or provisioned, so it
+      // is pre-admission too, and retryable: the read may recover.
+      if (error instanceof IdentityUnclassifiedError) {
+        return {
+          success: false,
+          sessionId: '',
+          backendSessionId: null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: error.message,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: error.classification,
           admitted: false,
         };
       }
@@ -1926,7 +2297,8 @@ export class SessionService implements ISessionService {
     const formattedMessage = this.formatMessage(request, injectedContext.user.timezone);
 
     // Resolve working directory from studio when available.
-    const resolvedWorkingDirectory = await this.resolveWorkingDirectory(
+    // An inkling's turn moves to its own folder below, once its identity is read.
+    let resolvedWorkingDirectory = await this.resolveWorkingDirectory(
       userId,
       sbSlug,
       session.studioId
@@ -1941,7 +2313,8 @@ export class SessionService implements ISessionService {
       session
     );
 
-    // 4. Select runtime backend and model
+    // 4. Select runtime backend and model. An inkling's session is stored as
+    // ink, and its turn is refused below if it is not (inkling-runtime.ts).
     const resolvedBackend = this.resolveRuntimeBackend(
       session.backend,
       injectedContext.agent.backend
@@ -1952,6 +2325,9 @@ export class SessionService implements ISessionService {
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
+    // The provider `ink chat` is told to run. Only an inkling's turn names
+    // one; every other ink spawn keeps the chat's own default.
+    let inkProvider: InklingProvider | undefined;
     let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
@@ -1963,6 +2339,9 @@ export class SessionService implements ISessionService {
     // scope. Missing/invalid identity fails CLOSED: toolRouting stays
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
+    // Set once an inkling's turn has passed the gate.
+    let inklingTurn = false;
+    let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
     if (this.supabase) {
@@ -1976,6 +2355,95 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+
+      // An inkling's turn starts only in the owner test, on its owner's
+      // account, for its owner's own message (Lumen 97b1d66a). Refused
+      // here, before anything is logged, registered or spawned, and not
+      // retryable, unless an identity read failed.
+      // Classified on the canonical identity (the session's sbId, else the one
+      // routing resolves), read by id with no user filter, so an unreadable,
+      // ambiguous or absent-row identity cannot pass for "not an inkling"
+      // (Lumen's review of 8b9d7f50).
+      const inklingIdentity = await this.classifyTurnIdentity(userId, sbSlug, session.sbId);
+      const refuseInklingTurn = (reason: string, retryable = false): SessionResult => {
+        logger.warn('[Inkling] Turn refused', { sbSlug, sbId: session.sbId, reason });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: `Inkling turn refused: ${reason}`,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: {
+            category: retryable ? 'network' : 'config',
+            summary: `Inkling turn refused: ${reason}`,
+            retryable,
+          },
+        };
+      };
+      const ownerTestUserIds = inklingOwnerTestUserIds();
+      // Only the inkling's own owner can have sent the message that wakes
+      // it. Whether that owner is in the test at all is the refusal's call.
+      const ownerMessage =
+        inklingIdentity.kind === 'inkling'
+          ? await isOwnersOwnMessage(this.supabase, {
+              threadMessageId: metadata?.triggerThreadMessageId,
+              inklingId: inklingIdentity.id,
+              ownerUserId: inklingIdentity.userId,
+            })
+          : 'no';
+      const inklingRefusal = inklingTurnRefusal(
+        { identity: inklingIdentity, userId, ownerMessage },
+        ownerTestUserIds
+      );
+      if (inklingRefusal) {
+        return refuseInklingTurn(inklingRefusal.reason, inklingRefusal.retryable);
+      }
+
+      if (inklingIdentity.kind === 'inkling') {
+        // Every inkling runs on ink, under a provider chosen on its own
+        // (inkling-runtime.ts). Its session is created as ink, and one that
+        // stored another runtime is refused here, so an admitted turn always
+        // reaches InkRunner, which enforces its ceiling, group stop,
+        // cancellation and spawn-seam admission (task 7d9aa453). A setting ink
+        // cannot honour, or a conversation it cannot carry, is refused, never
+        // translated.
+        const runtime = inklingRuntime({
+          sessionBackend: session.backend,
+          identityBackend: injectedContext.agent.backend,
+          identityProvider: injectedContext.agent.provider,
+        });
+        if (!runtime.ok) {
+          return refuseInklingTurn(runtime.reason);
+        }
+        inkProvider = runtime.provider;
+        // A stopped turn whose processes were not confirmed gone fences the
+        // inkling until its group is (inkling-stop-fence.ts): no new turn
+        // runs beside them. Retryable, because the fence lifts once the group
+        // is observed gone. Asked again at the spawn seam (below), because
+        // this answer can go stale while the turn is prepared.
+        if (inklingFenceHolds(inklingIdentity.id)) {
+          return refuseInklingTurn(INKLING_FENCE_REASON, true);
+        }
+        // There is no count of turns: Conor dropped the turn cap on Oct 4
+        // 2026 (5:00 PM). Usage limits will be monthly token allowances
+        // (ink://specs/inkling-model-access, task 2a00148f); until then a turn
+        // is bounded by the owner test above, Stop, the fence and its one
+        // outer cycle.
+        inklingTurn = true;
+        inklingSbId = inklingIdentity.id;
+        // Its turn runs in its own folder, never the Inkwell checkout or the
+        // server's default directory (organisation, not isolation:
+        // inkling-folder.ts). Routing gave it no studio to resolve from.
+        resolvedWorkingDirectory = await ensureInklingFolder(
+          inklingIdentity.id,
+          this.config.inklingsRoot ?? inklingsRoot()
+        );
+      }
+
       const parsed = parseRuntimeConfig(identity?.metadata);
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;
@@ -2006,6 +2474,24 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A Claude session in a studio gets its profile at launch, from the row
+    // (design v5, phase A). A row that cannot be read, or is gone, fails the
+    // launch here rather than letting it start without the profile it was
+    // meant to have; the runner then refuses a profile it cannot validate.
+    // A service with no database (an embedded or test configuration) has no
+    // studio rows at all, so there is no profile to deliver; that is logged,
+    // not refused.
+    let launchPermissions: ClaudeRunnerConfig['launchPermissions'];
+    if (resolvedBackend === 'claude-code' && session.studioId && session.studioId !== 'main') {
+      if (this.getStudiosRepo()) {
+        launchPermissions = await this.resolveLaunchPermissions(session.studioId);
+      } else {
+        logger.warn('No studios repository: launch profile not delivered', {
+          studioId: session.studioId,
+        });
+      }
+    }
+
     const strategyGroupId = (metadata?.taskGroupId as string) || undefined;
     const permissionOverlay = strategyGroupId
       ? {
@@ -2026,11 +2512,14 @@ export class SessionService implements ISessionService {
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
+      // An inkling turn's stop takes the tools it started with it. It has a
+      // ceiling only when INKLING_TURN_TIMEOUT_MS sets one.
+      ...(inklingTurn ? inklingRunBounds(inklingTurnTimeoutMs()) : {}),
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         sbSlug,
-        injectedContext.agent.name,
+        injectedContext.agent.unnamed ? null : injectedContext.agent.name,
         injectedContext.agent.soul,
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat,
@@ -2049,11 +2538,24 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
-      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      // An inkling turn is one outer cycle per admitted message, whatever its
+      // dashboard says: an execution boundary, not a product quota, and not a
+      // claim of one provider call (a cycle's tool loop may make several).
+      // Further continuations would need their own admission.
+      ...(inklingTurn
+        ? { maxTurns: 1 }
+        : runtimeMaxTurns !== undefined
+          ? { maxTurns: runtimeMaxTurns }
+          : {}),
+      ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
-      // .ink/identity.json preferences or Commander defaults.
-      toolRouting: runtimeToolRouting,
+      // .ink/identity.json preferences or Commander defaults. An inkling's
+      // tools are always ink-owned: a dashboard setting must not hand its
+      // provider's native tools to the turn.
+      toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
+      ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
+      ...(launchPermissions ? { launchPermissions } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
       // Route CLI execution into sandbox container when triggered by a sandboxed strategy
@@ -2098,7 +2600,7 @@ export class SessionService implements ISessionService {
           : resolvedBackend === 'antigravity'
             ? this.antigravityRunner
             : resolvedBackend === 'ink'
-              ? this.inkRunner
+              ? this.inkRunnerFor(session.sbId)
               : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
@@ -2332,23 +2834,78 @@ export class SessionService implements ISessionService {
     await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     const turnStartMs = Date.now();
+    // The inkling's fence, asked again where the answer cannot go stale:
+    // here, with no await before the runner is entered, and by the runner at
+    // its spawn seam, past its own preparation. Everything since the
+    // admission check has awaited, and a fence can land in between (Lumen's
+    // review of #747). A refusal here is a run that never began, and is
+    // recorded as one (refusedBeforeAcceptance, below).
+    // A survivor's hold (launched-processes.ts) is asked at both points as
+    // well: an earlier launch's failed record can install one in between.
+    const fencedSbId = inklingTurn ? inklingSbId : undefined;
+    const admitSpawn = (): string | undefined =>
+      (fencedSbId && inklingFenceHolds(fencedSbId)
+        ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
+        : undefined) ?? launchHoldFor(session.id);
+    // The launch is written before its process exists, so a restarted server
+    // can find the process whatever happens next (launched-processes.ts). A
+    // launch that cannot be written is refused, and starts nothing.
+    const launch =
+      admitSpawn() === undefined ? await reserveLaunch(session.id, resolvedBackend) : undefined;
+    const refusedAtEntry = admitSpawn() ?? launch?.refused;
+    // A live inkling turn its owner can cancel (inkling-turns.ts), released
+    // however the run ends.
+    const inklingTracking = inklingTurn && inklingSbId ? trackInklingTurn(inklingSbId) : null;
+    // Refused here, the turn goes to a stand-in that starts nothing.
+    const turnRunner: Pick<IRunner, 'run'> =
+      refusedAtEntry === undefined
+        ? runner
+        : {
+            run: async (): Promise<RunnerResult> => ({
+              success: false,
+              backendSessionId: session.backendSessionId ?? null,
+              responses: [],
+              error: refusedAtEntry,
+              refusedBeforeSpawn: true,
+            }),
+          };
 
     try {
-      result = await runner.run(formattedMessage, {
-        backendSessionId: session.backendSessionId || undefined,
-        // Always handed over, including on resume. Every runner already gates
-        // its own injection on `!isResume`, so this does not change what a
-        // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
-        // that re-bootstraps on every turn, and needs this copy on hand to
-        // recover when that bootstrap fails.
-        injectedContext,
-        // The epoch every terminal write for this turn is fenced on. A
-        // backend process that reports its own turns to the lifecycle route
-        // (ink chat) names this one instead of claiming its own, which fenced
-        // this run out of its own finalize on every ink-backed turn.
-        config: { ...runnerConfig, turnEpoch },
-        mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
-      });
+      result = await turnRunner
+        .run(formattedMessage, {
+          backendSessionId: session.backendSessionId || undefined,
+          // Always handed over, including on resume. Every runner already gates
+          // its own injection on `!isResume`, so this does not change what a
+          // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+          // that re-bootstraps on every turn, and needs this copy on hand to
+          // recover when that bootstrap fails.
+          injectedContext,
+          // The epoch every terminal write for this turn is fenced on. A
+          // backend process that reports its own turns to the lifecycle route
+          // (ink chat) names this one instead of claiming its own, which fenced
+          // this run out of its own finalize on every ink-backed turn.
+          config: {
+            ...runnerConfig,
+            turnEpoch,
+            ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+            admitSpawn,
+            ...(launch ? { launchEnv: launch.env } : {}),
+            onSpawned: (spawned) => launch?.spawned(spawned),
+          },
+          mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+        })
+        .then((ran) => {
+          // A stop the runner could not confirm leaves its row open, for the
+          // next start's sweep to look at.
+          if (!ran.stopUnconfirmed) launch?.exited();
+          // Fenced before the turn is released below, so no admission can
+          // fall between the two.
+          if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
+            fenceInkling(inklingSbId, ran.stopUnconfirmed);
+          }
+          return ran;
+        })
+        .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most
@@ -2374,16 +2931,22 @@ export class SessionService implements ISessionService {
       // PR #662). A runner that saw the whole output classified it there.
       // Runners without that seam carry nothing, and this falls back to
       // exactly what it did before.
-      errorClassification =
-        !result.success && result.error
+      //
+      // A run refused at the spawn seam started nothing. It is classified as
+      // the admission refusal is (refuseInklingTurn: retryable, because the
+      // fence lifts once its group is observed gone), and recorded as a run
+      // that never began.
+      errorClassification = result.refusedBeforeSpawn
+        ? { category: 'network', summary: result.error ?? 'Refused before spawn', retryable: true }
+        : !result.success && result.error
           ? (result.classification ??
             classifyError({ errorText: result.error, backend: resolvedBackend }))
           : null;
-      refusedBeforeAcceptance = errorClassification
-        ? isPreAcceptanceRefusal(errorClassification.category)
-        : false;
+      refusedBeforeAcceptance =
+        result.refusedBeforeSpawn === true ||
+        (errorClassification ? isPreAcceptanceRefusal(errorClassification.category) : false);
       if (refusedBeforeAcceptance) {
-        logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+        logger.warn('The run was refused before it was accepted; not recording an outcome', {
           sessionId: session.id,
           backend: resolvedBackend,
           category: errorClassification!.category,
@@ -2858,6 +3421,8 @@ export class SessionService implements ISessionService {
       compactionTriggered: false,
       finalTextResponse: result.finalTextResponse,
       error: result.error,
+      // A run refused at the spawn seam answers as the admission refusal does.
+      ...(result.refusedBeforeSpawn ? { errorCode: 'INKLING_TURN_REFUSED' as const } : {}),
       // The verdict this turn was judged by, not a fresh reading of `error`.
       // The heartbeat outage alert prints a category to a human; deriving it
       // again from the excerpt is how the alert could name one category while
@@ -2919,6 +3484,57 @@ export class SessionService implements ISessionService {
       sessionId: session.id,
       contactId: session.contactId,
     });
+  }
+
+  /**
+   * Reopen an ended session for an address that names it: a session the
+   * caller named, or the session a reply answers (spec session-lifecycle-model
+   * §3 rungs 1 and 3). Clears ended_at and the completed spellings of
+   * lifecycle and status in one conditional write; the agent's work phase is
+   * its own and is left alone. Refuses when the row's session key is now held
+   * by another live session (the key's unique index admits one live holder)
+   * or the row is gone: the caller decides whether that is a refusal or a
+   * decline.
+   */
+  private async reopenEndedSession(
+    session: Session,
+    via: 'named-session' | 'reply-anchor'
+  ): Promise<{ session: Session } | { refused: 'key-held' | 'missing' }> {
+    // A conditional write of the ended state this resolution observed, never
+    // an update by id from a snapshot (Lumen, #725): a resume that got there
+    // first is kept as it stands, newer lifecycle and epoch included.
+    if (!this.repository.reopenEnded) {
+      throw new Error('Session repository cannot reopen an ended session conditionally');
+    }
+    const result = await this.repository.reopenEnded(session.id, {
+      lifecycle: session.lifecycle,
+      status: session.status,
+    });
+    switch (result.kind) {
+      case 'reopened':
+        logger.info('[SessionRouting] Reopened an ended session for an address that names it', {
+          sessionId: session.id,
+          via,
+          endedAt: session.endedAt?.toISOString() ?? null,
+        });
+        return { session: result.session };
+      case 'open':
+        logger.info('[SessionRouting] Session was already reopened; resuming it as it stands', {
+          sessionId: session.id,
+          via,
+          lifecycle: result.session.lifecycle,
+        });
+        return { session: result.session };
+      case 'key-held':
+        logger.warn('[SessionRouting] Cannot reopen: its session key is held by a live session', {
+          sessionId: session.id,
+          sessionKey: session.alias ?? null,
+          via,
+        });
+        return { refused: 'key-held' };
+      case 'missing':
+        return { refused: 'missing' };
+    }
   }
 
   /**
@@ -2986,7 +3602,9 @@ export class SessionService implements ISessionService {
       });
     }
 
-    if (session.endedAt) return decline('ended');
+    // An ended session no longer declines (finished-session audit row 6): it
+    // is reopened below, once the read-only checks pass and before any lease
+    // is taken.
 
     // A live terminal, judged by the trigger path's own delivery decision on
     // the same columns. The trigger path would deliver inline to it, but
@@ -2995,31 +3613,40 @@ export class SessionService implements ISessionService {
     // finalize then clears the terminal's attachment flag. A read that cannot
     // rule a terminal out counts as one: declining costs the reply its
     // conversation, while resuming could cost the terminal its turn.
-    if (!this.supabase) return decline('terminal_unverified');
-    const { data: attachment, error: attachmentError } = await this.supabase
-      .from('sessions')
-      .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
-      .eq('id', session.id)
-      .eq('user_id', ctx.userId)
-      .maybeSingle();
-    if (attachmentError || !attachment) {
-      return decline('terminal_unverified', {
-        error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+    const terminalDecline = async (candidate: Session): Promise<null | 'declined'> => {
+      if (!this.supabase) {
+        decline('terminal_unverified');
+        return 'declined';
+      }
+      const { data: attachment, error: attachmentError } = await this.supabase
+        .from('sessions')
+        .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
+        .eq('id', candidate.id)
+        .eq('user_id', ctx.userId)
+        .maybeSingle();
+      if (attachmentError || !attachment) {
+        decline('terminal_unverified', {
+          error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+        });
+        return 'declined';
+      }
+      const delivery = decideDelivery({
+        forceSpawn: false,
+        pollRow: attachment,
+        attachedRow: {
+          cli_attached: attachment.cli_attached === true,
+          // A row with no update stamp cannot be shown stale, so a set
+          // attachment flag on it stands.
+          updated_at: attachment.updated_at ?? new Date().toISOString(),
+        },
       });
-    }
-    const delivery = decideDelivery({
-      forceSpawn: false,
-      pollRow: attachment,
-      attachedRow: {
-        cli_attached: attachment.cli_attached === true,
-        // A row with no update stamp cannot be shown stale, so a set
-        // attachment flag on it stands.
-        updated_at: attachment.updated_at ?? new Date().toISOString(),
-      },
-    });
-    if (delivery.mode === 'inline') {
-      return decline('terminal_attached', { source: delivery.source });
-    }
+      if (delivery.mode === 'inline') {
+        decline('terminal_attached', { source: delivery.source });
+        return 'declined';
+      }
+      return null;
+    };
+    if (await terminalDecline(session)) return null;
 
     // The lease gate runs only for a request that carries a threadKey, and a
     // reply carries none, so on its own a reply would enter the anchor's
@@ -3040,6 +3667,27 @@ export class SessionService implements ISessionService {
     // An anchor would open an older one, whoever holds its studio now.
     if (session.studioId && !session.threadKey) {
       return decline('studio_without_thread', { studioId: session.studioId });
+    }
+    // Reopen before the lease, so a key collision declines without holding a
+    // studio. A plan resolution writes nothing.
+    if (session.endedAt && !ctx.planOnly) {
+      const reopened = await this.reopenEndedSession(session, 'reply-anchor');
+      if (!('session' in reopened)) {
+        return decline(reopened.refused === 'missing' ? 'missing' : 'ended_key_held', {
+          sessionKey: session.alias ?? null,
+        });
+      }
+      session = reopened.session;
+      // The row the reopen hands back may not be the one the checks above
+      // read: a human pick that attached a terminal in between won the
+      // compare-and-set, and the reopen returns its row (Lumen, #725 r2).
+      // That row is checked again before any lease or return. Running alone
+      // is no reason to decline: a concurrent server-side resume queues this
+      // reply behind its turn as usual.
+      if (await terminalDecline(session)) return null;
+      if (session.studioId && !session.threadKey) {
+        return decline('studio_without_thread', { studioId: session.studioId });
+      }
     }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
@@ -3101,6 +3749,12 @@ export class SessionService implements ISessionService {
        */
       recipientSessionExplicit?: boolean;
       /**
+       * The caller named this session itself, by id or key (T4; spec
+       * session-lifecycle-model §3 rung 1). Unknown, foreign or other-contact:
+       * refused, never dropped. Ended: reopened. Implies explicit.
+       */
+      recipientSessionNamed?: boolean;
+      /**
        * The session that wrote the message a channel reply answers. Tried
        * after recipientSessionId and before every other rung, but only
        * admitted while it can safely take the turn — see admitReplyAnchor.
@@ -3147,6 +3801,14 @@ export class SessionService implements ISessionService {
        * stay unfenced (released as before).
        */
       turnEpochCandidate?: string;
+      /**
+       * Receives this resolution's studioless-presence decision (null when
+       * routing placed the thread anywhere else), once routing has run. The
+       * trigger handler tests the participant stamp's winner against it, so
+       * a winner is judged by the same decision as the routed candidate
+       * (task bd4657a0). Not called when resolution throws before routing.
+       */
+      onStudiolessPresence?: (placement: StudiolessPresencePlacement | null) => void;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -3171,6 +3833,7 @@ export class SessionService implements ISessionService {
       id: options?.sbId ?? discovered.id,
       absent: discovered.absent === true,
       ambiguous: discovered.ambiguous === true,
+      unreadable: discovered.unreadable === true,
     };
     const identitySbId = identity.id ?? null;
 
@@ -3204,6 +3867,23 @@ export class SessionService implements ISessionService {
     let authorizedRecipientSessionId = options?.recipientSessionId;
     let anchorLookupFailed = false;
     let recipientCandidate: Session | null = null;
+    // A session the caller named, by id or key, is an address (T4; spec
+    // session-lifecycle-model §3 rung 1). One that cannot take the message is
+    // refused and the message held; it is never dropped so that the ladder
+    // below can pick some other session.
+    const recipientSessionNamed = options?.recipientSessionNamed === true;
+    const refuseNamedSession = (cause: ExplicitAddressHold['cause']): never => {
+      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', sbSlug, {
+        triedCallerRepo: false,
+        reason: 'explicit-address',
+        anchor: 'session',
+        explicit: {
+          sessionId: options?.recipientSessionId,
+          ...(options?.alias ? { sessionKey: options.alias } : {}),
+          cause,
+        },
+      });
+    };
     if (options?.recipientSessionId) {
       let candidate: Session | null = null;
       try {
@@ -3232,6 +3912,25 @@ export class SessionService implements ISessionService {
             requestedSbId: identitySbId,
           });
         }
+        authorizedRecipientSessionId = undefined;
+        if (recipientSessionNamed) refuseNamedSession('unknown-session');
+      }
+
+      // Contact scope is part of the admission invariant (spec §3): an owner
+      // message never resumes a per-sender contact session, and a contact's
+      // never resumes the owner's. A named session refuses; an inferred one
+      // is dropped, as an unauthorized one is.
+      if (
+        authorizedRecipientSessionId &&
+        candidate &&
+        (candidate.contactId ?? null) !== (options.contactId ?? null)
+      ) {
+        if (recipientSessionNamed) refuseNamedSession('contact-scope');
+        logger.warn('[SessionRouting] Dropping recipientSessionId — another contact scope', {
+          recipientSessionId: options.recipientSessionId,
+          sessionContactId: candidate.contactId ?? null,
+          requestContactId: options.contactId ?? null,
+        });
         authorizedRecipientSessionId = undefined;
       }
     }
@@ -3267,14 +3966,34 @@ export class SessionService implements ISessionService {
     // every repo-scoped rung. Only a caller-explicit anchor is addressing; an
     // inferred one takes the same repo test as continuity, or is dropped and
     // the ladder decides.
-    if (
-      authorizedRecipientSessionId &&
-      recipientCandidate &&
+    //
+    // A studio-bound anchor is tested HERE, before routing, because routing's
+    // recipient-session tier places the thread in the anchor's studio. A
+    // studioless anchor gives that tier nothing to place by, so it is tested
+    // after routing, against routing's own decision (task bd4657a0).
+    const inferredAnchorOnPinnedThread =
+      !!recipientCandidate &&
       options?.recipientSessionExplicit !== true &&
-      projectRepo &&
-      options?.threadKey &&
-      !(await this.threadMatchAllowed(userId, recipientCandidate, projectRepo, options.threadKey))
-    ) {
+      !!projectRepo &&
+      !!options?.threadKey;
+    const dropInferredAnchor = async (
+      studiolessPresence: StudiolessPresencePlacement | null
+    ): Promise<void> => {
+      if (
+        !authorizedRecipientSessionId ||
+        !recipientCandidate ||
+        !projectRepo ||
+        !options?.threadKey ||
+        (await this.threadMatchAllowed(
+          userId,
+          recipientCandidate,
+          projectRepo,
+          options.threadKey,
+          studiolessPresence
+        ))
+      ) {
+        return;
+      }
       logger.warn(
         '[SessionRouting] Dropping inferred recipientSessionId — outside the project repo',
         {
@@ -3286,6 +4005,9 @@ export class SessionService implements ISessionService {
         }
       );
       authorizedRecipientSessionId = undefined;
+    };
+    if (inferredAnchorOnPinnedThread && recipientCandidate?.studioId) {
+      await dropInferredAnchor(null);
     }
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
@@ -3303,6 +4025,7 @@ export class SessionService implements ISessionService {
       sbId: identitySbId,
       identityAmbiguous: identity.ambiguous === true,
       identityAbsent: identity.absent === true,
+      identityUnreadable: identity.unreadable,
       backend,
       planOnly: options?.planOnly === true,
     });
@@ -3321,6 +4044,20 @@ export class SessionService implements ISessionService {
     if (routing.unresolvedNamedStudio) {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, sbSlug);
     }
+
+    // Routing's own answer to "does this identity's work on this thread run
+    // studioless?" Every studioless session the rungs below consider is
+    // tested against this one decision (task bd4657a0).
+    const studiolessPresence = studiolessPresenceOf(
+      routing,
+      projectRepo,
+      writeIntent,
+      studioPolicy
+    );
+    if (inferredAnchorOnPinnedThread && !recipientCandidate?.studioId) {
+      await dropInferredAnchor(studiolessPresence);
+    }
+    options?.onStudiolessPresence?.(studiolessPresence);
 
     const leaseCtx = {
       userId,
@@ -3341,9 +4078,20 @@ export class SessionService implements ISessionService {
       turnEpochCandidate: options?.turnEpochCandidate,
     };
 
-    // Resolve default_session_id from agent identity. When set, threadKey
-    // misses route to this session instead of creating new ones.
-    const defaultSessionId = await this.resolveDefaultSessionId(userId, sbSlug, identitySbId);
+    // Resolve default_session_id from agent identity. When set, thread misses
+    // AND unthreaded requests route to this session instead of creating new
+    // ones — it is the identity's home. The bridge flag rides along for the
+    // duplicate-home check at creation.
+    const identityRouting = await this.resolveIdentityRouting(userId, sbSlug, identitySbId);
+    const defaultSessionId = identityRouting.defaultSessionId;
+
+    // Whether the caller named a studio. 'explicit' and 'studio-hint' are the
+    // caller-qualified tiers; every tier below them is inferred (route
+    // pattern, caller repo, most-recent, fallback). A rung that pins its
+    // answer to a studio does so only for a named one: pinning to an inferred
+    // studio would turn a resolvable alias or home into a miss — the resolver
+    // refusing to see a session the caller never said anything about.
+    const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -3355,9 +4103,37 @@ export class SessionService implements ISessionService {
         // Authorized above (same user, same identity) — this rung only has to
         // check liveness.
         const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
+        if (!recipientSession && recipientSessionNamed) refuseNamedSession('unknown-session');
+        // An ended session the caller named reopens: an explicit address
+        // resumes any transcript (Conor, 2026-10-02; finished-session audit
+        // row 1). An inferred one still falls through until the T5 readers.
+        // A plan resolution writes nothing; the spawn path's resolution, which
+        // carries the same named flag, reopens it.
+        if (recipientSession?.endedAt && recipientSessionNamed) {
+          const reopened =
+            options?.planOnly === true
+              ? { session: recipientSession }
+              : await this.reopenEndedSession(recipientSession, 'named-session');
+          if (!('session' in reopened)) {
+            return refuseNamedSession(
+              reopened.refused === 'missing' ? 'unknown-session' : 'session-key-held'
+            );
+          }
+          this.logRungMatch('recipient-session', reopened.session, routing, options?.threadKey);
+          return this.withStudioLease(reopened.session, routing, leaseCtx);
+        }
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
-          return this.withStudioLease(recipientSession, routing, leaseCtx);
+          // A studioless inferred anchor reaching here passed the predicate
+          // after routing; an explicit one did not take it.
+          const anchor = inferredAnchorOnPinnedThread
+            ? await this.adoptStudiolessPresence(
+                recipientSession,
+                studiolessPresence,
+                options?.planOnly === true
+              )
+            : recipientSession;
+          return this.withStudioLease(anchor, routing, leaseCtx);
         }
       }
 
@@ -3389,18 +4165,14 @@ export class SessionService implements ISessionService {
             a: string,
             alias: string,
             studioId?: string,
-            sb?: string | null
+            sb?: string | null,
+            contactId?: string
           ) => Promise<Session | null>;
         };
 
-        // Pin the alias lookup to a studio only when the caller named one.
-        // 'explicit' and 'studio-hint' are the caller-qualified tiers; every
-        // tier below them is inferred (route pattern, most-recent, fallback),
-        // and pinning to an inferred studio would turn a resolvable alias into
-        // a miss — the resolver would refuse to see a session the caller never
-        // said anything about.
-        const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
-
+        // Pin the alias lookup to a studio only when the caller named one
+        // (callerNamedStudio, above).
+        //
         // Scope to the caller's studio when they named one that resolved.
         // Otherwise the lookup is unscoped, which is safe on its own terms:
         // findByAlias refuses an alias matching across two studios rather
@@ -3426,7 +4198,9 @@ export class SessionService implements ISessionService {
           aliasStudioScope,
           // Identity by UUID: a same-slug session from another identity must
           // not satisfy this alias (Lumen, PR #514 round 6).
-          identitySbId
+          identitySbId,
+          // Contact scope, as on every other rung (task F1).
+          options?.contactId
         );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
@@ -3438,11 +4212,17 @@ export class SessionService implements ISessionService {
           this.logRungMatch('alias', aliasMatch, routing, options?.threadKey);
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
-        logger.debug('No session found for alias', {
+        // A key is always caller-supplied, so a miss is a wrong address:
+        // refused, never a new session minted under the key (Conor,
+        // 2026-10-02: "If the address is wrong, just like the mail, we should
+        // know"). send_to_inbox refuses a miss before storing anything; this
+        // covers a key that stopped resolving while the message waited.
+        logger.warn('[SessionRouting] Refusing a session key no live session carries', {
           alias: options.alias,
           sbSlug,
           aliasStudioScope: aliasStudioScope ?? null,
         });
+        refuseNamedSession('session-key-miss');
       }
 
       // ThreadKey match — find session scoped to this topic
@@ -3469,15 +4249,31 @@ export class SessionService implements ISessionService {
         if (
           threadMatch &&
           (this.matchInCallerNamedStudio(routing, resolvedStudioId, threadMatch) ||
-            (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey)))
+            (await this.threadMatchAllowed(
+              userId,
+              threadMatch,
+              projectRepo,
+              options.threadKey,
+              studiolessPresence
+            )))
         ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
-          return this.withStudioLease(threadMatch, routing, leaseCtx);
+          return this.withStudioLease(
+            await this.adoptStudiolessPresence(
+              threadMatch,
+              studiolessPresence,
+              options.planOnly === true
+            ),
+            routing,
+            leaseCtx
+          );
         }
 
         // Thread-scoped request with no match. If the agent has a default
-        // session, route there instead of creating a new one.
-        if (defaultSessionId) {
+        // session, route there instead of creating a new one. Not for a
+        // contact's message: the default session is the owner's (T4; the
+        // unthreaded home rung below already guards this).
+        if (defaultSessionId && !options?.contactId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
           if (defaultSession && !defaultSession.endedAt) {
             this.logRungMatch('default-session', defaultSession, routing, options.threadKey);
@@ -3520,6 +4316,60 @@ export class SessionService implements ISessionService {
       }
 
       if (!options?.threadKey) {
+        // Home rung. An identity with a default_session_id has ONE session
+        // that everything unaddressed belongs to. Until now this rung ran only
+        // for threaded requests, so a thread miss went to the default session
+        // while an unthreaded channel message or heartbeat went through
+        // general-active — two anchors, free to name two sessions. They did:
+        // on 2026-09-09 Myra's home session crashed (a broken ink build),
+        // general-active skipped it as `failed`, the next Telegram message
+        // created 64e1eb49, and for fifteen days her reminders fired in one
+        // session while her threads (bound by this rung) lived in 88b728cb.
+        // A contact-scoped request is exempt: the default session is the
+        // owner's, and a per-sender contact must never land in it.
+        //
+        // Two more boundaries (Lumen, PR #680 round 1), both about what
+        // "unaddressed" means:
+        //  - Identity. The default session is read by slug when no canonical
+        //    id settled, so with two same-slug identities it is a guess.
+        //    The row must belong to the settled identity — the same check
+        //    every explicit anchor passes — or it is not a home.
+        //  - Placement. A caller who named a studio, by id or by hint, has
+        //    addressed the work. The home is honoured only where it lives:
+        //    a home in another studio (or none) never steals a request the
+        //    caller pointed somewhere specific, and the studio-scoped
+        //    general lookup below answers instead. Myra's channel route
+        //    hints "main", which resolves to no studio for her, and her home
+        //    has none: that is a match, and it is the case this rung is for.
+        //    Only a NAMED studio is an address (Lumen, PR #680 round 2). With
+        //    none, resolvedStudioId is inferred or empty, and the home
+        //    supplies the placement: comparing against it rejected a home in
+        //    studio A for a bare request, and general-active then picked any
+        //    newer twin — the split this rung exists to close.
+        if (defaultSessionId && !options?.contactId) {
+          const defaultSession = await this.repository.findById(defaultSessionId);
+          const usable = defaultSession
+            ? defaultSession.endedAt
+              ? 'ended'
+              : !anchorBelongsToTarget(defaultSession)
+                ? 'foreign-identity'
+                : callerNamedStudio &&
+                    (defaultSession.studioId ?? null) !== (resolvedStudioId ?? null)
+                  ? 'other-placement'
+                  : 'home'
+            : 'missing';
+          if (usable === 'home' && defaultSession) {
+            this.logRungMatch('default-session', defaultSession, routing, options?.threadKey);
+            return this.withStudioLease(defaultSession, routing, leaseCtx);
+          }
+          logger.debug('default_session_id is not a home for this request; falling through', {
+            defaultSessionId,
+            sbSlug,
+            reason: usable,
+            requestedStudioId: resolvedStudioId ?? null,
+          });
+        }
+
         // Fall back to general active session for non-threaded requests.
         // Ambiguous identity with no canonical id: general reuse would fall
         // back to the slug and hand back a sibling's session, so skip reuse
@@ -3533,6 +4383,12 @@ export class SessionService implements ISessionService {
               ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
               contactId: options?.contactId,
               sbId: identitySbId,
+              // A crashed home session is still the home session. Excluding
+              // `failed` here is what turned one bad build into a second
+              // Myra: the crash is a lifecycle the next turn overwrites, and
+              // the recipient-session and default-session rungs already
+              // resume such a session without a second thought.
+              includeFailed: true,
             })
           : null;
 
@@ -3578,6 +4434,11 @@ export class SessionService implements ISessionService {
     // about to create a session now — every reuse rung above has missed — so
     // building the worktree here cannot be wasted by an explicit address
     // winning afterwards.
+    //
+    // Read before the presence branch below clears deferredCreate: a row
+    // created under studioless presence records it, and that record is what
+    // lets the thread's next message reuse the row (task bd4657a0).
+    const createdStudioless = studiolessPresenceOf(routing, projectRepo, writeIntent, studioPolicy);
     if (routing.deferredCreate && !resolvedStudioId && studioPolicy === 'reuse-only') {
       // The third worktree-creating path, gated like the other two (Lumen
       // #523 r1 P1): the D1 parent is durable rather than ephemeral, but it
@@ -3678,6 +4539,23 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Is this a HOME creation for a bridge — unthreaded, unaliased, owner-
+    // scoped, studioless? Then a sibling home session must not exist, and if
+    // one does the new row records it and the log says so at error level.
+    // Checked before the insert so the twin is labelled from birth.
+    const isHomeCreation =
+      type === 'primary' &&
+      !options?.threadKey &&
+      !options?.alias &&
+      !options?.contactId &&
+      !resolvedStudioId;
+    // Only for a settled canonical identity: by slug alone the census would
+    // count another workspace's same-named bridge as a sibling.
+    const homeSiblings =
+      isHomeCreation && identityRouting.bridge && identitySbId
+        ? await this.findHomeSiblings(userId, sbSlug, identitySbId)
+        : [];
+
     // Create new session
     const session = await this.repository.create({
       userId,
@@ -3700,7 +4578,11 @@ export class SessionService implements ISessionService {
       totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
-      backend,
+      // An inkling's session is ink's from birth (Conor, Oct 4 2026, 5:08 PM):
+      // its turns run nowhere else, and a session that stored another runtime
+      // is refused rather than moved (inkling-runtime.ts). Routing read the
+      // identity and placed it in its folder.
+      backend: routing.tier === 'inkling-folder' ? 'ink' : backend,
       // Null until a turn runs — the model that actually served the turn is
       // recorded post-run, so this never claims a model that was only asked for.
       model: null,
@@ -3717,7 +4599,11 @@ export class SessionService implements ISessionService {
           threadKey: options?.threadKey ?? null,
           occupancyChecked: routing.occupancyChecked,
           ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
+          ...(createdStudioless && !resolvedStudioId
+            ? { placement: { kind: STUDIOLESS_PRESENCE, ...createdStudioless } }
+            : {}),
           resolvedAt: new Date().toISOString(),
+          ...(homeSiblings.length > 0 ? { homeSiblings: homeSiblings.map((s) => s.id) } : {}),
         },
       },
     });
@@ -3731,6 +4617,22 @@ export class SessionService implements ISessionService {
       studioId: resolvedStudioId || null,
       routingTier: routing.tier,
     });
+
+    if (homeSiblings.length > 0) {
+      // ERROR, not warn: a second home for a bridge is a second Myra. Every
+      // reminder, thread and Telegram message from here on picks one of them
+      // by anchor, and the two drift. The row carries the sibling ids
+      // (metadata.routing_decision.homeSiblings) so the census is a query.
+      logger.error('[SessionRouting] Bridge identity now has more than one home session', {
+        sbSlug,
+        sbId: identitySbId,
+        createdSessionId: session.id,
+        siblings: homeSiblings,
+        recovery:
+          'end the newer session, rebind its inbox_thread_participants rows and ' +
+          'channel_routes.active_session_id to the survivor',
+      });
+    }
 
     this.logRungMatch('created', session, routing, options?.threadKey);
     return this.withStudioLease(session, routing, leaseCtx);
@@ -3765,6 +4667,8 @@ export class SessionService implements ISessionService {
       identityAmbiguous?: boolean;
       /** No identity row exists at all — only then is a slug match a proof. */
       identityAbsent?: boolean;
+      /** The read that would find the identity by slug failed: there is nothing to classify. */
+      identityUnreadable?: boolean;
       /** v18 S3: decision-only resolution — the gate never mints overflow. */
       planOnly?: boolean;
       /**
@@ -3829,6 +4733,34 @@ export class SessionService implements ISessionService {
       // identity is genuinely absent — nothing to confuse it with.
       return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', sbSlug)) as T;
     };
+
+    // An inkling has no studio and never takes one: its turns run in its own
+    // folder, which processMessage sets once it has read the identity. Placed
+    // before every tier, explicit ones included, so no studio hint, route
+    // pattern or continuity row can put it in a worktree, and its threaded
+    // message is placed rather than held for want of a studio.
+    // Classified, never guessed: an identity whose kind cannot be read stops
+    // here, before any tier, lease or session row (Lumen, #750 r2). The turn
+    // gate refuses the same identity retryably anyway; refusing it here also
+    // keeps a new session from being created on a runtime the identity may
+    // not have.
+    if (this.supabase && options.sbId) {
+      const identity = await classifyIdentityById(this.supabase, options.sbId);
+      if (identity.kind === 'unknown') {
+        throw new IdentityUnclassifiedError(sbSlug, options.sbId);
+      }
+      if (identity.kind === 'inkling') {
+        return { studioId: undefined, tier: 'inkling-folder', occupancyChecked: false };
+      }
+    } else if (this.supabase && options.identityUnreadable && !options.threadKey) {
+      // No id to classify, because the read that would have found one by
+      // slug failed (Lumen, #750 r3). An unthreaded delivery used to fall
+      // through every tier to a new row on the identity's default runtime;
+      // it is retried instead, like the classification failure above. A
+      // threaded one is already held below as an ambiguous identity (#514),
+      // which creates nothing.
+      throw new IdentityUnclassifiedError(sbSlug);
+    }
 
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
@@ -4401,8 +5333,26 @@ export class SessionService implements ISessionService {
     // The repo-scoped main studio — this is the re-scoped former tier 8. It
     // only runs against a repo we resolved, never the server's ambient cwd.
     // Scoped by the canonical identity too — this rung dropped it and looked
-    // up by slug (Lumen, PR #514 round 3).
-    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, sbSlug, sbId);
+    // up by slug (Lumen, PR #514 round 3). A failed read refuses like the
+    // lookup above: reading it as "none" deferred a create, and for a
+    // presence thread that is a studioless placement nobody decided (task
+    // bd4657a0).
+    const { data: main, error: mainError } = await mainStudioQuery(
+      this.supabase,
+      userId,
+      repoRoot,
+      sbSlug,
+      sbId
+    ).maybeSingle();
+    if (mainError) {
+      logger.warn('[StudioResolve] Repo main-studio lookup failed', {
+        repoRoot,
+        sbSlug,
+        error: mainError.message,
+      });
+      return null;
+    }
+    const mainStudioId: string | undefined = main?.id;
     if (mainStudioId) {
       logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
         repoRoot,
@@ -4450,10 +5400,33 @@ export class SessionService implements ISessionService {
    *   { ambiguous }     → several identities share this slug; caller-repo
    *                       resolution must not run at all
    */
+  /**
+   * The canonical identity a turn is for, classified for the inkling gate:
+   * the session's sbId, else the one routing resolves for this account and
+   * slug (resolveIdentityScope, which refuses ambiguity). No identity row at
+   * all is positively not an inkling; an ambiguous slug is unknown. The slug
+   * itself is never the authority (Lumen, 5bd4de42).
+   */
+  private async classifyTurnIdentity(
+    userId: string,
+    sbSlug: string,
+    sbId: string | null | undefined
+  ): Promise<InklingIdentity> {
+    if (!this.supabase) return { kind: 'other' };
+    let canonical = sbId ?? null;
+    if (!canonical) {
+      const scope = await this.resolveIdentityScope(userId, sbSlug);
+      if (scope.absent) return { kind: 'other' };
+      if (!scope.id) return { kind: 'unknown', transient: scope.unreadable === true };
+      canonical = scope.id;
+    }
+    return classifyIdentityById(this.supabase, canonical);
+  }
+
   private async resolveIdentityScope(
     userId: string,
     sbSlug: string
-  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
+  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean; unreadable?: boolean }> {
     if (!this.supabase) return { absent: true };
     try {
       const { data, error } = await this.supabase
@@ -4474,7 +5447,9 @@ export class SessionService implements ISessionService {
           sbSlug,
           error: error.message,
         });
-        return { ambiguous: true };
+        // Still ambiguous to routing; `unreadable` lets the inkling gate tell a
+        // failed read (worth retrying) from a slug two identities share.
+        return { ambiguous: true, unreadable: true };
       }
 
       if (!data?.length) {
@@ -4491,7 +5466,7 @@ export class SessionService implements ISessionService {
     } catch {
       // Unreadable identity is not "unambiguous" — treat it as ambiguous and
       // fall through to a hold rather than routing by slug.
-      return { ambiguous: true };
+      return { ambiguous: true, unreadable: true };
     }
   }
 
@@ -4712,6 +5687,33 @@ export class SessionService implements ISessionService {
       return;
     }
 
+    // Compaction is a turn outside every inkling bound (gate, folder, cap,
+    // ceiling, cancellation), so an inkling's session is never compacted, nor
+    // is one that may be an inkling's and cannot be read (Lumen's review of
+    // 8b9d7f50).
+    if (this.supabase) {
+      const identity = await this.classifyTurnIdentity(
+        session.userId,
+        session.sbSlug,
+        session.sbId
+      );
+      if (identity.kind !== 'other') {
+        logger.info('[Inkling] Not compacting an inkling session', {
+          sessionId,
+          sbSlug: session.sbSlug,
+        });
+        return;
+      }
+    }
+
+    // A compaction is a launch too: never beside a survivor that may still be
+    // running this session (launched-processes.ts).
+    const launchHold = launchHoldFor(sessionId);
+    if (launchHold) {
+      logger.warn('Not compacting a held session', { sessionId, reason: launchHold });
+      return;
+    }
+
     // Acquire database-backed compaction lock (atomic, multi-server safe)
     const lockAcquired = await this.repository.tryAcquireCompactionLock(sessionId);
     if (!lockAcquired) {
@@ -4787,7 +5789,7 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.sbSlug,
-          context.agent.name,
+          context.agent.unnamed ? null : context.agent.name,
           context.agent.soul,
           fullContext.user.timezone,
           context.agent.heartbeat
@@ -4809,7 +5811,7 @@ This session will continue with a fresh context after compaction. Your identity,
             : runtimeBackend === 'antigravity'
               ? this.antigravityRunner
               : runtimeBackend === 'ink'
-                ? this.inkRunner
+                ? this.inkRunnerFor(session.sbId)
                 : this.claudeRunner;
 
       await this.completeStudioBeforeSpawn(
@@ -4818,11 +5820,30 @@ This session will continue with a fresh context after compaction. Your identity,
         session.sbSlug
       );
 
+      // Asked again past the awaits since the first check, and by the runner
+      // at its spawn seam, as a turn's admission is.
+      // The launch is written first, as a turn's is.
+      const compactionHold = (): string | undefined => launchHoldFor(sessionId);
+      const launch =
+        compactionHold() === undefined ? await reserveLaunch(sessionId, runtimeBackend) : undefined;
+      const refusedAtRun = compactionHold() ?? launch?.refused;
+      if (refusedAtRun) {
+        logger.warn('Not compacting a held session', { sessionId, reason: refusedAtRun });
+        launch?.exited();
+        return;
+      }
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
-        config: runnerConfig,
+        config: {
+          ...runnerConfig,
+          admitSpawn: compactionHold,
+          ...(launch ? { launchEnv: launch.env } : {}),
+          onSpawned: (spawned) => launch?.spawned(spawned),
+        },
       });
+      if (!result.stopUnconfirmed) launch?.exited();
 
       // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
       if (result.responses.length > 0 && this.config.responseHandler) {
@@ -4875,29 +5896,82 @@ This session will continue with a fresh context after compaction. Your identity,
    * misses route to this session instead of creating new ones (Myra, etc.).
    * Returns the session UUID or null.
    */
-  private async resolveDefaultSessionId(
+  private async resolveIdentityRouting(
     userId: string,
     sbSlug: string,
     sbId?: string | null
-  ): Promise<string | null> {
-    if (!this.supabase) return null;
+  ): Promise<{ defaultSessionId: string | null; bridge: boolean }> {
+    const none = { defaultSessionId: null, bridge: false };
+    if (!this.supabase) return none;
     try {
       // default_session_id not yet in generated types — cast result
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let q = (this.supabase as any)
         .from('agent_identities')
-        .select('default_session_id')
+        .select('default_session_id, metadata')
         .eq('user_id', userId);
       // Canonical identity when known: reading the default session by slug
       // could hand identity A the session identity B configured
       // (Lumen, PR #514 round 5).
       q = sbId ? q.eq('id', sbId) : q.eq('agent_id', sbSlug).not('workspace_id', 'is', null);
       const { data } = (await q.limit(1).maybeSingle()) as {
-        data: { default_session_id: string | null } | null;
+        data: { default_session_id: string | null; metadata?: unknown } | null;
       };
-      return data?.default_session_id || null;
+      const meta = data?.metadata;
+      const bridge =
+        !!meta && typeof meta === 'object' && (meta as Record<string, unknown>).bridge === true;
+      return { defaultSessionId: data?.default_session_id || null, bridge };
     } catch {
-      return null;
+      return none;
+    }
+  }
+
+  /**
+   * A bridge identity (Telegram/WhatsApp/Discord relay) has exactly one home:
+   * the unended session with no studio, no thread and no contact. Every reuse
+   * rung above creation resolves to it, so reaching creation for such a
+   * request is correct only when nothing exists. This asks the table before
+   * the row is written, so a twin is born labelled as one — the 2026-09-10
+   * twin went unnoticed for fifteen days because nothing at the moment of
+   * creation could see the session it duplicated.
+   */
+  private async findHomeSiblings(
+    userId: string,
+    sbSlug: string,
+    sbId: string | null
+  ): Promise<Array<{ id: string; lifecycle: string | null; startedAt: string | null }>> {
+    if (!this.supabase) return [];
+    try {
+      let q = this.supabase
+        .from('sessions')
+        .select('id, lifecycle, started_at')
+        .eq('user_id', userId)
+        .is('ended_at', null)
+        .is('studio_id', null)
+        .is('thread_key', null)
+        .is('contact_id', null)
+        .order('started_at', { ascending: false })
+        .limit(5);
+      q = sbId ? q.eq('sb_id', sbId) : q.eq('agent_id', sbSlug);
+      const { data, error } = await q;
+      if (error) {
+        logger.warn('[SessionRouting] Home-sibling lookup failed', {
+          sbSlug,
+          error: error.message,
+        });
+        return [];
+      }
+      return (data ?? []).map((row) => ({
+        id: row.id,
+        lifecycle: row.lifecycle,
+        startedAt: row.started_at,
+      }));
+    } catch (err) {
+      logger.warn('[SessionRouting] Home-sibling lookup threw', {
+        sbSlug,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
     }
   }
 
@@ -4942,6 +6016,43 @@ This session will continue with a fresh context after compaction. Your identity,
    * spawned into a studio is not always the SB it belongs to. Non-fatal: the
    * spawn goes ahead either way, and the failure is logged.
    */
+  /**
+   * The profile, owner and main checkout a studio's Claude launch is given,
+   * read from the studio row and never from the checkout. Throws when the
+   * row cannot be read or no longer exists: the launch fails closed.
+   */
+  private async resolveLaunchPermissions(
+    studioId: string
+  ): Promise<ClaudeRunnerConfig['launchPermissions']> {
+    const repo = this.getStudiosRepo();
+    if (!repo) throw new Error('Launch refused: no studios repository to read the profile from');
+    const row = await repo.findById(studioId);
+    if (!row)
+      throw new Error(`Launch refused: studio ${studioId} has no row to read a profile from`);
+    // Absence is not proof of the root: a row with no repo root could be any
+    // studio, and skipping it would drop both its profile and the
+    // working-directory check (Lumen d74ce85d, P2 1).
+    if (typeof row.repoRoot !== 'string' || row.repoRoot === '') {
+      throw new Error(
+        `Launch refused: studio ${studioId} names no repo root, so whether it is the root studio is unknown`
+      );
+    }
+    // The root (home) studio is the main checkout itself, identified
+    // positively. Its lane rules live in its own settings.local.json until
+    // phase B designs a root launch profile, so it gets none here: logged,
+    // not refused (review 44db8c0c, P2 1).
+    if (row.worktreePath === row.repoRoot) {
+      logger.info('Root studio: no launch profile (phase B)', { studioId });
+      return undefined;
+    }
+    return {
+      profile: studioPermissionProfile(row),
+      owner: row.sbSlug ?? undefined,
+      mainRoot: row.repoRoot,
+      worktreePath: row.worktreePath,
+    };
+  }
+
   private async completeStudioBeforeSpawn(
     workingDirectory: string | undefined,
     studioId: string | null | undefined,
@@ -4949,6 +6060,14 @@ This session will continue with a fresh context after compaction. Your identity,
   ): Promise<void> {
     if (!workingDirectory) return;
     const rowId = studioId && studioId !== 'main' ? studioId : undefined;
+    // One read of the row serves both lookups, and only on the incomplete path.
+    let rowRead: ReturnType<StudiosRepository['findById']> | undefined;
+    const readRow = () => {
+      const repo = this.getStudiosRepo();
+      if (!repo) throw new Error('no studios repository to look the studio up in');
+      rowRead ??= repo.findById(rowId as string);
+      return rowRead;
+    };
     try {
       await ensureStudioComplete(workingDirectory, {
         sbSlug,
@@ -4959,11 +6078,15 @@ This session will continue with a fresh context after compaction. Your identity,
         // then writes nothing that names an owner (Lumen, PR #699).
         owner: async () => {
           if (!rowId) return null;
-          const repo = this.getStudiosRepo();
-          if (!repo) throw new Error('no studios repository to look the owner up in');
-          const row = await repo.findById(rowId);
+          const row = await readRow();
           return row?.sbSlug ?? null;
         },
+        // The permission profile comes from the row, never the checkout: a
+        // PR-review checkout or a 'reviewer' row is a reviewer. No studio on
+        // the session, or a row that is gone, is no profile, and a failed
+        // read throws; either way no permissions are written rather than a
+        // guess (design v3 item 5; review 4177f7fe, P2 1).
+        profile: async () => (rowId ? studioPermissionProfile(await readRow()) : undefined),
       });
     } catch (err) {
       logger.debug('Studio checklist before spawn failed (non-fatal)', {
@@ -5283,6 +6406,35 @@ This session will continue with a fresh context after compaction. Your identity,
 }
 
 /**
+ * The root-checkout studio of a repo: the identity's studio whose worktree IS
+ * the repo root. resolveMainStudio reads a failed lookup as "none"; the repo
+ * tiers cannot, because "no studio in this repo" is what places presence work
+ * studioless (task bd4657a0), so they run this query themselves.
+ */
+function mainStudioQuery(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  repoRoot: string,
+  sbSlug?: string,
+  sbId?: string | null
+) {
+  let q = supabase
+    .from('studios')
+    .select('id, updated_at')
+    .eq('user_id', userId)
+    .eq('repo_root', repoRoot)
+    .eq('worktree_path', repoRoot)
+    .in('status', ['active', 'idle', 'archived'])
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  // Canonical identity when we have it — a slug can name different
+  // identities in different workspaces (Lumen, PR #514 round 3).
+  if (sbId) q = q.eq('sb_id', sbId);
+  else if (sbSlug) q = q.eq('agent_id', sbSlug);
+  return q;
+}
+
+/**
  * Resolve 'main' to a studio ID. "Main" = the root repo.
  *
  * Finds the most recently updated studio whose repo_root matches the
@@ -5303,22 +6455,7 @@ export async function resolveMainStudio(
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
 
-  const lookupQuery = () => {
-    let q = supabase
-      .from('studios')
-      .select('id, updated_at')
-      .eq('user_id', userId)
-      .eq('repo_root', targetRoot)
-      .eq('worktree_path', targetRoot)
-      .in('status', ['active', 'idle', 'archived'])
-      .order('updated_at', { ascending: false })
-      .limit(1);
-    // Canonical identity when we have it — a slug can name different
-    // identities in different workspaces (Lumen, PR #514 round 3).
-    if (options?.sbId) q = q.eq('sb_id', options.sbId);
-    else if (sbSlug) q = q.eq('agent_id', sbSlug);
-    return q;
-  };
+  const lookupQuery = () => mainStudioQuery(supabase, userId, targetRoot, sbSlug, options?.sbId);
 
   const { data: match } = await lookupQuery().maybeSingle();
   if (match?.id) return match.id;

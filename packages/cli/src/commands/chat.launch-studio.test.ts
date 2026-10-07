@@ -88,7 +88,13 @@ describe('prepareChatStudio', () => {
     const { identity } = await prepareChatStudio(studio, 'wren', deps());
     expect(identity).toBeNull();
     expect(existsSync(join(studio, '.ink', 'identity.json'))).toBe(false);
-    expect(auditStudio(studio, { linked: true }).missing).toEqual(['identity', 'studio-id']);
+    // Permissions wait for an answer too (design v3, item 5): their profile
+    // comes from the studio row the server could not return.
+    expect(auditStudio(studio, { linked: true }).missing).toEqual([
+      'identity',
+      'studio-id',
+      'claude-permissions',
+    ]);
   });
 
   it('an existing identity is read as it is when the studio is already complete', async () => {

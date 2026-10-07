@@ -10,9 +10,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createHeartbeatEscalation } from './heartbeat-escalation.js';
+import {
+  createHeartbeatEscalation,
+  createQuietGate,
+  type QuietGateDecision,
+} from './heartbeat-escalation.js';
 import { backoffForAttempt } from './heartbeat-notification-store.js';
 import type { DueReminder } from './heartbeat.js';
+import { logger } from '../utils/logger.js';
 
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -33,6 +38,12 @@ interface FakeRow {
   failedBeats: number;
   nextAttemptAt: number | null;
   episodeClosedAt: string | null;
+  // Quiet-hours hold (task 2301cb3c).
+  userId?: string;
+  holdReason?: string | null;
+  heldUntil?: string | null;
+  drainOwned?: boolean;
+  payload?: unknown;
 }
 
 /**
@@ -66,8 +77,24 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
   const keyOf = (k: { reminderId: string; kind: string; episodeKey: string }) =>
     `${k.reminderId}|${k.kind}|${k.episodeKey}`;
 
+  // One clock for row creation and for beats, standing in for created_at and
+  // reminder_history.triggered_at, which the owed-recovery view compares.
+  let clock = 0;
+  const createdAt = new Map<string, number>();
+  for (const k of rows.keys()) createdAt.set(k, ++clock);
+  const insertRow = rows.set.bind(rows);
+  rows.set = (k: string, v: FakeRow) => {
+    if (!rows.has(k)) createdAt.set(k, ++clock);
+    return insertRow(k, v);
+  };
+  const beats: Array<{ reminderId: string; status: 'delivered' | 'failed'; at: number }> = [];
+
   const store = {
     rows,
+    /** A beat as reminder_history records it, before any hook runs. */
+    recordBeat: (reminderId: string, status: 'delivered' | 'failed') => {
+      beats.push({ reminderId, status, at: ++clock });
+    },
     openEpisode: vi.fn(async (reminderId: string) => {
       for (const [k, row] of rows) {
         const [rid, kind, episodeKey] = k.split('|');
@@ -75,7 +102,7 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
       }
       return `minted-${reminderId}-${rows.size}`;
     }),
-    claimNotice: vi.fn(async (key: never) => {
+    claimNotice: vi.fn(async (key: never, opts?: { payload?: unknown }) => {
       const k = keyOf(key);
       let row = rows.get(k);
       if (!row) {
@@ -87,6 +114,14 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
           episodeClosedAt: null,
         };
         rows.set(k, row);
+      }
+      // The claim carries the replayable send, so the drain owns the notice
+      // from the moment it is claimed (PR #723 review): a hold that fails to
+      // write, or a crash before it, leaves nothing stranded.
+      if (opts?.payload && row.status === 'pending' && !row.payload) {
+        row.payload = opts.payload;
+        row.drainOwned = true;
+        row.userId = (key as never as { userId: string }).userId;
       }
       const record = { id: k, status: row.status as never, attempts: row.attempts };
       if (row.status === 'delivered') return { shouldSend: false, record };
@@ -150,6 +185,127 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
         };
       }
       return null;
+    }),
+    // Mirrors the real store: a hold touches nothing but the hold fields.
+    holdNotice: vi.fn(
+      async (key: never, hold: { heldUntil: string; payload: unknown }): Promise<boolean> => {
+        const k = keyOf(key);
+        const row = rows.get(k) ?? {
+          status: 'pending',
+          attempts: 0,
+          failedBeats: 0,
+          nextAttemptAt: null,
+          episodeClosedAt: null,
+        };
+        row.userId = (key as never as { userId: string }).userId;
+        row.holdReason = 'quiet-hours';
+        row.heldUntil = hold.heldUntil;
+        row.drainOwned = true;
+        row.payload = hold.payload;
+        rows.set(k, row);
+        return true;
+      }
+    ),
+    // Whether the outage an all-clear closes has reached the human.
+    outageStatus: vi.fn(
+      async (key: never): Promise<'delivered' | 'pending' | 'stranded' | 'absent' | 'unknown'> => {
+        const { reminderId, episodeKey } = key as never as {
+          reminderId: string;
+          episodeKey: string;
+        };
+        const outage = rows.get(`${reminderId}|outage|${episodeKey}`);
+        if (!outage) return 'absent';
+        if (outage.status === 'delivered') return 'delivered';
+        return outage.drainOwned && outage.payload ? 'pending' : 'stranded';
+      }
+    ),
+    // The drain's reads, with the real store's rules: pending and drain-owned,
+    // past backoff, oldest (insertion) first, no all-clear ahead of its outage.
+    listDrainUsers: vi.fn(async (): Promise<string[] | null> => {
+      const users = new Set<string>();
+      for (const row of rows.values()) {
+        if (row.drainOwned && row.status === 'pending' && row.userId) users.add(row.userId);
+      }
+      return [...users];
+    }),
+    listDrainCandidates: vi.fn(async (userIds: string[], limit: number) => {
+      const out: Array<{ key: never; payload: never }> = [];
+      for (const [k, row] of rows) {
+        if (!row.drainOwned || row.status !== 'pending' || !row.payload) continue;
+        if (!row.userId || !userIds.includes(row.userId)) continue;
+        if (row.nextAttemptAt !== null && row.nextAttemptAt > Date.now()) continue;
+        const [reminderId, kind, episodeKey] = k.split('|');
+        if (kind === 'recovery') {
+          // Only an outage the drain can still send blocks its all-clear, as
+          // in the eligibility view: a stranded one never will be sent.
+          const outage = rows.get(`${reminderId}|outage|${episodeKey}`);
+          if (outage && outage.status !== 'delivered' && outage.drainOwned && outage.payload) {
+            continue;
+          }
+        }
+        out.push({
+          key: {
+            reminderId,
+            userId: row.userId,
+            kind,
+            episodeKey,
+            destination: null,
+            failedBeats: row.failedBeats,
+          } as never,
+          payload: (row.payload ?? null) as never,
+        });
+      }
+      return out.slice(0, limit);
+    }),
+    /** Per-reminder fields for owed all-clears, as the reminder row now reads. */
+    reminders: new Map<string, Partial<DueReminder>>(),
+    // The owed-recovery view's rules: a delivered, drain-owned outage whose
+    // episode is open, followed by a delivered beat, and with no recovery row
+    // that is delivered or that the drain can send.
+    // Every owed row, oldest recovery first.
+    listOwedRecoveries: vi.fn(async () => {
+      const out: Array<{
+        reminder: DueReminder;
+        episodeKey: string;
+        destination: string | null;
+        failedBeats: number;
+        recoveredAt: number;
+      }> = [];
+      for (const [k, row] of rows) {
+        const [reminderId, kind, episodeKey] = k.split('|');
+        if (kind !== 'outage' || row.status !== 'delivered' || !row.drainOwned) continue;
+        if (row.episodeClosedAt) continue;
+        const recovery = rows.get(`${reminderId}|recovery|${episodeKey}`);
+        if (
+          recovery &&
+          (recovery.status === 'delivered' || (recovery.drainOwned && recovery.payload))
+        ) {
+          continue;
+        }
+        const created = createdAt.get(k) ?? 0;
+        const mine = beats.filter((b) => b.reminderId === reminderId);
+        const ended = mine.find((b) => b.status === 'delivered' && b.at > created);
+        if (!ended) continue;
+        const floor = Math.max(
+          -Infinity,
+          ...mine.filter((b) => b.status === 'delivered' && b.at < created).map((b) => b.at)
+        );
+        const failed = mine.filter(
+          (b) => b.status === 'failed' && b.at < ended.at && b.at > floor
+        ).length;
+        out.push({
+          reminder: makeReminder({
+            id: reminderId,
+            user_id: row.userId ?? 'user-1',
+            ...store.reminders.get(reminderId),
+          }),
+          episodeKey,
+          destination: null,
+          failedBeats: Math.max(row.failedBeats, failed),
+          recoveredAt: ended.at,
+        });
+      }
+      return out.sort((a, b) => a.recoveredAt - b.recoveredAt);
     }),
   };
   return store;
@@ -518,10 +674,16 @@ describe('heartbeat escalation', () => {
 
     it('sends exactly one recovery notice carrying the outage length', async () => {
       const { client } = makeClient();
+      // The outage this all-clear closes has landed. An all-clear never goes
+      // out ahead of its outage, so that is the precondition for sending one.
+      const store = makeFakeStore({
+        [`rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`]: { status: 'delivered' },
+      });
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
         defaultSlug: 'myra',
+        store,
       });
 
       await onRecovery(makeReminder(), 8, FIRST_FOR_DESTINATION);
@@ -1175,5 +1337,654 @@ describe('heartbeat escalation', () => {
     // The tail is still there — this keeps both ends, it does not swap which
     // end gets lost.
     expect(content).toContain('at step9');
+  });
+});
+
+/**
+ * The quiet-hours gate on direct notices (task 2301cb3c).
+ *
+ * A reminder allowed to run overnight can fail overnight. Its outage notice,
+ * and later its all-clear, must wait for quiet hours to end. The gate runs
+ * after claimNotice and immediately before the send.
+ */
+describe('notices wait out quiet hours', () => {
+  let sendToChannel: ReturnType<typeof vi.fn>;
+  const HOLD: QuietGateDecision = {
+    kind: 'hold',
+    until: new Date('2026-09-02T15:00:00.000Z'),
+    timezone: 'America/Los_Angeles',
+  };
+  const outageKey = `rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`;
+  const recoveryKey = `rem-001|recovery|${FIRST_FOR_DESTINATION.episodeKey}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendToChannel = vi.fn().mockResolvedValue(undefined);
+  });
+
+  const escalation = (store: ReturnType<typeof makeFakeStore>, decision: QuietGateDecision) =>
+    createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: vi.fn().mockResolvedValue(decision),
+    });
+
+  it('holds an outage notice during quiet hours: no send, no attempt, handed to the drain', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, HOLD);
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.settleNotice).not.toHaveBeenCalled();
+    const row = store.rows.get(outageKey);
+    expect(row).toMatchObject({
+      status: 'pending',
+      attempts: 0,
+      nextAttemptAt: null,
+      holdReason: 'quiet-hours',
+      heldUntil: '2026-09-02T15:00:00.000Z',
+      drainOwned: true,
+    });
+    expect(row?.payload).toMatchObject({ channel: 'telegram', target: '123456789' });
+    expect((row?.payload as { content: string }).content).toContain('Heartbeat FAILED');
+  });
+
+  it('control: the same failure with quiet hours clear is sent at once', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, { kind: 'clear' });
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(store.holdNotice).not.toHaveBeenCalled();
+  });
+
+  it('an unreadable quiet-hours setting sends, and says so', async () => {
+    const store = makeFakeStore();
+    const { onFailure } = escalation(store, { kind: 'unreadable', error: 'db down' });
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(store.holdNotice).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('quiet-policy-unreadable'),
+      expect.objectContaining({ error: 'db down' })
+    );
+  });
+
+  it('a hold the store could not record is still a hold', async () => {
+    const store = makeFakeStore();
+    store.holdNotice.mockResolvedValueOnce(false);
+    const { onFailure } = escalation(store, HOLD);
+
+    const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('hold was not recorded'),
+      expect.anything()
+    );
+  });
+
+  it('holds an all-clear during quiet hours and leaves the episode open', async () => {
+    // The outage was announced, so an all-clear is owed.
+    const store = makeFakeStore({ [outageKey]: { status: 'delivered' } });
+    const { onRecovery } = escalation(store, HOLD);
+
+    const result = await onRecovery(makeReminder(), 3, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+    expect(store.rows.get(outageKey)?.episodeClosedAt).toBeNull();
+    expect(store.rows.get(recoveryKey)).toMatchObject({
+      attempts: 0,
+      drainOwned: true,
+      holdReason: 'quiet-hours',
+    });
+    expect((store.rows.get(recoveryKey)?.payload as { content: string }).content).toContain(
+      'Heartbeat recovered'
+    );
+  });
+});
+
+describe('createQuietGate', () => {
+  const clientWith = (result: { data?: unknown; error?: { message: string } | null }) =>
+    ({
+      from: () => ({
+        select: () => ({
+          eq: () => ({ maybeSingle: vi.fn().mockResolvedValue(result) }),
+        }),
+      }),
+    }) as never;
+
+  const WINDOW = {
+    quiet_start: '22:00:00',
+    quiet_end: '08:00:00',
+    timezone: 'America/Los_Angeles',
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+  });
+
+  it('holds inside the window, until its end', async () => {
+    vi.setSystemTime(new Date('2026-09-02T09:00:00Z')); // 02:00 PDT
+    const decision = await createQuietGate(clientWith({ data: WINDOW, error: null }))('u1');
+    expect(decision).toEqual({
+      kind: 'hold',
+      until: new Date('2026-09-02T15:00:00.000Z'),
+      timezone: 'America/Los_Angeles',
+    });
+    vi.useRealTimers();
+  });
+
+  it('is clear outside the window, and with no quiet hours set', async () => {
+    vi.setSystemTime(new Date('2026-09-02T20:00:00Z')); // 13:00 PDT
+    expect(await createQuietGate(clientWith({ data: WINDOW, error: null }))('u1')).toEqual({
+      kind: 'clear',
+    });
+    expect(await createQuietGate(clientWith({ data: null, error: null }))('u1')).toEqual({
+      kind: 'clear',
+    });
+    vi.useRealTimers();
+  });
+
+  it('is unreadable on a read error and on a throw, never clear', async () => {
+    expect(
+      await createQuietGate(clientWith({ data: null, error: { message: 'boom' } }))('u1')
+    ).toEqual({ kind: 'unreadable', error: 'boom' });
+    const throwing = {
+      from: () => {
+        throw new Error('no client');
+      },
+    } as never;
+    expect(await createQuietGate(throwing)('u1')).toEqual({
+      kind: 'unreadable',
+      error: 'no client',
+    });
+    vi.useRealTimers();
+  });
+});
+
+/**
+ * The drain that sends what quiet hours held (task 2301cb3c). Every case runs
+ * with no reminder involved at all: the drain must not depend on a future run.
+ */
+describe('held notices drain when quiet hours end', () => {
+  let sendToChannel: ReturnType<typeof vi.fn>;
+  let decision: QuietGateDecision;
+  const HOLD: QuietGateDecision = {
+    kind: 'hold',
+    until: new Date(Date.now() + 6 * 60 * 60_000), // still hours away
+    timezone: 'America/Los_Angeles',
+  };
+  const outageKey = `rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`;
+  const recoveryKey = `rem-001|recovery|${FIRST_FOR_DESTINATION.episodeKey}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendToChannel = vi.fn().mockResolvedValue(undefined);
+    decision = HOLD;
+  });
+
+  const escalation = (store: ReturnType<typeof makeFakeStore>) =>
+    createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: vi.fn(async () => decision),
+    });
+
+  it('a one-time reminder failed overnight: its outage goes out once the window ends', async () => {
+    const store = makeFakeStore();
+    const { onFailure, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder({ cron_expression: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    expect(sendToChannel).not.toHaveBeenCalled();
+
+    // Still night: nothing goes, and the rows are never even read.
+    expect(await drainHeldNotices()).toEqual({
+      sent: 0,
+      failed: 0,
+      held: 0,
+      skipped: 0,
+      waiting: 0,
+      rebuilt: 0,
+    });
+    expect(store.listDrainCandidates).not.toHaveBeenCalled();
+
+    // Morning (or quiet hours switched off): sent once, settled, closed out.
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1, failed: 0 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'delivered', attempts: 1 });
+
+    // Nothing left to send.
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases on the next pass once the gate clears, whatever held_until said', async () => {
+    const store = makeFakeStore();
+    const { onFailure, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    // held_until is hours away; the backoff is untouched by the hold.
+    expect(Date.parse(store.rows.get(outageKey)!.heldUntil!)).toBeGreaterThan(Date.now());
+    expect(store.rows.get(outageKey)!.nextAttemptAt).toBeNull();
+
+    decision = { kind: 'clear' }; // e.g. quiet hours disabled early
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+  });
+
+  it('keeps a notice whose morning send failed, and retries it after its backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const store = makeFakeStore();
+      const { onFailure, drainHeldNotices } = escalation(store);
+      await onFailure(
+        makeReminder({ cron_expression: null }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+
+      decision = { kind: 'clear' };
+      sendToChannel.mockRejectedValueOnce(new Error('telegram blip'));
+      expect(await drainHeldNotices()).toMatchObject({ sent: 0, failed: 1 });
+      expect(store.rows.get(outageKey)).toMatchObject({
+        status: 'pending',
+        attempts: 1,
+        drainOwned: true,
+      });
+
+      // The first retry is immediate (backoff 0), and it lands.
+      expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+      expect(store.rows.get(outageKey)).toMatchObject({ status: 'delivered', attempts: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a notice in backoff is not sent early', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const store = makeFakeStore();
+      const { onFailure, drainHeldNotices } = escalation(store);
+      await onFailure(
+        makeReminder({ cron_expression: null }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+      decision = { kind: 'clear' };
+      sendToChannel.mockRejectedValue(new Error('telegram down'));
+      await drainHeldNotices(); // attempt 1, immediate retry allowed
+      await drainHeldNotices(); // attempt 2, now backed off
+      expect(sendToChannel).toHaveBeenCalledTimes(2);
+
+      await drainHeldNotices(); // still inside the backoff
+      expect(sendToChannel).toHaveBeenCalledTimes(2);
+
+      vi.setSystemTime(Date.now() + backoffForAttempt(2) + 1_000);
+      sendToChannel.mockResolvedValue(undefined);
+      expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an outage and its all-clear both held: the outage goes first, then the all-clear', async () => {
+    const store = makeFakeStore();
+    const { onFailure, onRecovery, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    // The fake's onRecovery path only claims a recovery that is owed; the
+    // outage is still pending here, which is exactly the overnight case.
+    await onRecovery(makeReminder(), 1, FIRST_FOR_DESTINATION);
+    expect(store.rows.get(recoveryKey)?.drainOwned).toBe(true);
+
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel.mock.calls[1][0].content).toContain('Heartbeat recovered');
+    expect(store.closeEpisode).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks quiet hours immediately before each send', async () => {
+    const store = makeFakeStore();
+    const gate = vi.fn<(userId: string) => Promise<QuietGateDecision>>();
+    const { onFailure, drainHeldNotices } = createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: gate,
+    });
+    gate.mockResolvedValueOnce(HOLD); // the hold in onFailure
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    // The prefilter says clear; the moment of sending says hold.
+    gate.mockResolvedValueOnce({ kind: 'clear' }).mockResolvedValueOnce(HOLD);
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0, held: 1 });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it('a held row whose payload cannot be sent is skipped loudly, never sent blind', async () => {
+    const store = makeFakeStore({
+      [outageKey]: {
+        drainOwned: true,
+        userId: 'user-1',
+        payload: { channel: 'heartbeat', target: '', content: 'x' },
+      },
+    });
+    const { drainHeldNotices } = escalation(store);
+    decision = { kind: 'clear' };
+
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0, skipped: 1 });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('nothing sendable'),
+      expect.anything()
+    );
+  });
+
+  it('a row with no payload is never a candidate (the store filters it before the batch)', async () => {
+    const store = makeFakeStore({
+      [outageKey]: { drainOwned: true, userId: 'user-1', payload: null },
+    });
+    const { drainHeldNotices } = escalation(store);
+    decision = { kind: 'clear' };
+
+    expect(await drainHeldNotices()).toEqual({
+      sent: 0,
+      failed: 0,
+      held: 0,
+      skipped: 0,
+      waiting: 0,
+      rebuilt: 0,
+    });
+  });
+
+  /**
+   * PR #723 review, finding 3. The claim is durable before the hold is: if
+   * the hold write fails (or the process dies between the two), the notice
+   * must still be owed and found by the drain, with no future reminder run.
+   */
+  it('a completed reminder whose hold write failed is still sent when quiet hours end', async () => {
+    const store = makeFakeStore();
+    store.holdNotice.mockResolvedValueOnce(false); // the hold UPDATE fails
+    const { onFailure, drainHeldNotices } = escalation(store);
+
+    await onFailure(makeReminder({ cron_expression: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    expect(sendToChannel).not.toHaveBeenCalled(); // still a hold
+
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'delivered' });
+  });
+
+  /**
+   * PR #723 review, finding 1. The ordinary beat path must not send an
+   * all-clear ahead of the outage it closes. Trace: the outage is held
+   * overnight; its morning drain send fails; the recurring reminder then
+   * succeeds and calls onRecovery.
+   */
+  it('the beat path holds back an all-clear until its outage is delivered', async () => {
+    const store = makeFakeStore();
+    const { onFailure, onRecovery, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION); // held overnight
+
+    decision = { kind: 'clear' };
+    sendToChannel.mockRejectedValueOnce(new Error('telegram blip'));
+    expect(await drainHeldNotices()).toMatchObject({ failed: 1 }); // outage still owed
+
+    // The reminder runs fine now. Its all-clear must not overtake the outage.
+    const recovery = await onRecovery(makeReminder(), 1, FIRST_FOR_DESTINATION);
+    expect(recovery).toEqual({ alerted: false });
+    expect(sendToChannel).toHaveBeenCalledTimes(1); // only the failed outage attempt
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'pending', drainOwned: true });
+
+    // The drain delivers the outage, then the all-clear, in that order.
+    await drainHeldNotices();
+    await drainHeldNotices();
+    const contents = sendToChannel.mock.calls.map((c) => c[0].content as string);
+    expect(contents.slice(1).map((c) => c.split(':')[0])).toEqual([
+      '⚠️ Heartbeat FAILED',
+      '✅ Heartbeat recovered',
+    ]);
+    expect(store.closeEpisode).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * PR #723 re-review. The causal check must not depend on the all-clear's
+   * own claim having produced a row: a failed recovery INSERT is no evidence
+   * that the outage was delivered.
+   */
+  it('an all-clear whose own claim failed still waits for a pending outage', async () => {
+    const store = makeFakeStore({
+      [outageKey]: {
+        status: 'pending',
+        drainOwned: true,
+        userId: 'user-1',
+        payload: { channel: 'telegram', target: '123456789', content: 'x' },
+      },
+    });
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+  });
+
+  it('a final run whose all-clear waited unrecorded still gets it, with no further run', async () => {
+    // Overnight: the beat fails and its outage notice is held.
+    const store = makeFakeStore();
+    const final = makeReminder({ cron_expression: null, run_during_quiet_hours: true });
+    store.recordBeat('rem-001', 'failed');
+    const before = escalation(store);
+    await before.onFailure(final, AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'pending', drainOwned: true });
+
+    // The final run succeeds while the outage is still held. Only the
+    // all-clear's own claim fails; it waits behind its outage, recorded nowhere.
+    store.recordBeat('rem-001', 'delivered');
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    expect(await before.onRecovery(final, 1, FIRST_FOR_DESTINATION)).toEqual({ alerted: false });
+    expect(store.rows.has(recoveryKey)).toBe(false);
+    expect(sendToChannel).not.toHaveBeenCalled();
+
+    // Restart. Quiet hours end, and no reminder is ever due again: only the
+    // drain runs.
+    decision = { kind: 'clear' };
+    const after = escalation(store);
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 2, rebuilt: 1 });
+
+    // The outage, then its all-clear, and the episode is closed.
+    expect(sendToChannel.mock.calls.map((c) => c[0].content.split('\n')[0])).toEqual([
+      expect.stringContaining('Heartbeat FAILED'),
+      expect.stringContaining('Heartbeat recovered'),
+    ]);
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'delivered' });
+    expect(store.rows.get(outageKey)!.episodeClosedAt).not.toBeNull();
+
+    // Nothing is owed any more.
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 0, rebuilt: 0 });
+    expect(sendToChannel).toHaveBeenCalledTimes(2);
+  });
+
+  it('a rebuilt all-clear whose claim and send both failed is rebuilt again after a restart', async () => {
+    // The outage has landed and the final run has succeeded.
+    const store = makeFakeStore({
+      [outageKey]: {
+        status: 'delivered',
+        drainOwned: true,
+        payload: { channel: 'telegram', target: '123456789', content: 'x' },
+      },
+    });
+    store.recordBeat('rem-001', 'delivered');
+    decision = { kind: 'clear' };
+
+    // The rebuild's claim fails, then its send fails: the settle recreates
+    // the recovery row with nothing the drain could replay.
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    sendToChannel.mockRejectedValueOnce(new Error('telegram unreachable'));
+    expect(await escalation(store).drainHeldNotices()).toMatchObject({ sent: 0, rebuilt: 1 });
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(store.rows.get(recoveryKey)!.drainOwned).toBeFalsy();
+
+    // Restart. The empty row holds nothing, so the episode is still owed.
+    const after = escalation(store);
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 1, rebuilt: 1 });
+    expect(sendToChannel.mock.calls.at(-1)![0].content).toContain('Heartbeat recovered');
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'delivered' });
+    expect(store.rows.get(outageKey)!.episodeClosedAt).not.toBeNull();
+    expect(await after.drainHeldNotices()).toMatchObject({ sent: 0, rebuilt: 0 });
+  });
+
+  it('owed all-clears that can never be sent do not use up the batch ahead of one that can', async () => {
+    // Twenty older debts whose reminders now point at no external destination:
+    // each stays owed, recorded nowhere, every pass.
+    const seed: Record<string, Partial<FakeRow>> = {};
+    for (let i = 0; i < 20; i += 1) {
+      seed[`stuck-${i}|outage|ep-${i}`] = {
+        status: 'delivered',
+        drainOwned: true,
+        payload: { channel: 'telegram', target: '123456789', content: 'x' },
+      };
+    }
+    seed[outageKey] = {
+      status: 'delivered',
+      drainOwned: true,
+      payload: { channel: 'telegram', target: '123456789', content: 'x' },
+    };
+    const store = makeFakeStore(seed);
+    for (let i = 0; i < 20; i += 1) {
+      store.reminders.set(`stuck-${i}`, { delivery_channel: 'heartbeat' });
+      store.recordBeat(`stuck-${i}`, 'delivered');
+    }
+    store.recordBeat('rem-001', 'delivered'); // the newest recovery
+    decision = { kind: 'clear' };
+
+    expect(await escalation(store).drainHeldNotices()).toMatchObject({ sent: 1, rebuilt: 21 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'delivered' });
+  });
+
+  it('control: no all-clear is rebuilt for an episode that has not ended', async () => {
+    const store = makeFakeStore();
+    store.recordBeat('rem-001', 'failed');
+    const { onFailure, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    store.recordBeat('rem-001', 'failed'); // still failing
+
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.rows.has(recoveryKey)).toBe(false);
+    expect(store.rows.get(outageKey)!.episodeClosedAt).toBeNull();
+  });
+
+  /**
+   * Option A (product decision, 2026-10-02): when the all-clear's claim was
+   * not recorded and its outage cannot be read, nothing durable could hold
+   * the all-clear, so it is sent best effort, with the ordering uncertainty
+   * logged. Quiet hours still hold it, and a recorded claim still waits.
+   */
+  it('an unrecorded all-clear whose outage cannot be read is sent anyway, and says so', async () => {
+    const store = makeFakeStore();
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('without knowing whether its outage notice landed'),
+      expect.objectContaining({ outage: 'unknown', claimRecorded: false })
+    );
+  });
+
+  it('control: that best-effort all-clear still waits out a known quiet-hours hold', async () => {
+    const store = makeFakeStore();
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    store.holdNotice.mockResolvedValueOnce(false); // no row to record the hold on
+    decision = HOLD;
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    // Held, so the log does not claim it was sent.
+    expect(logger.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('without knowing whether its outage notice landed'),
+      expect.anything()
+    );
+  });
+
+  it('control: a recorded all-clear whose outage cannot be read waits for the drain', async () => {
+    const store = makeFakeStore();
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.rows.get(recoveryKey)).toMatchObject({ status: 'pending', drainOwned: true });
+  });
+
+  it('control: an all-clear whose own claim failed still goes out after a delivered outage', async () => {
+    const store = makeFakeStore({ [outageKey]: { status: 'delivered' } });
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
+  });
+
+  it('an all-clear does not wait on an outage row that nothing can ever send', async () => {
+    // A pending outage from before notices carried their send: no payload, so
+    // neither the drain nor a future beat will send it. Waiting on it would be
+    // permanent silence; the all-clear goes out.
+    const store = makeFakeStore({
+      [outageKey]: { status: 'pending', drainOwned: false, payload: null },
+    });
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
   });
 });

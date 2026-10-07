@@ -21,9 +21,21 @@ import {
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { auditStudio, DEFAULT_CLAUDE_ALLOW_RULES } from '@inklabs/shared';
+import { auditStudio } from '@inklabs/shared';
+// A namespace import: against a tree without the profiles, each test that
+// needs one fails on its own instead of the file failing to load.
+import * as shared from '@inklabs/shared';
 import { completeStudio, type StepResult } from './studio-complete.js';
 import { installHooks } from '../commands/hooks.js';
+
+// The CLI's own Inkwell checkout is the last plugin candidate (task
+// 5cabaeeb). None by default, so these tmp repos resolve only what a test
+// put on disk.
+const inkCheckout = vi.hoisted(() => ({ main: null as string | null }));
+vi.mock('./ink-checkout.js', () => ({ inkCliMainWorktree: () => inkCheckout.main }));
+
+const profile = (name: 'builder' | 'reviewer', sbSlug = 'wren') =>
+  shared.studioPermissionRules(name, sbSlug);
 
 let root: string;
 let main: string;
@@ -72,6 +84,8 @@ afterEach(() => {
 
 const baseOptions = () => ({
   sbSlug: 'wren',
+  // Every creator names the profile; there is no default (review 4177f7fe).
+  permissionProfile: 'builder' as const,
   mainRoot: main,
   studioName: 'alpha',
   branch: 'wren/feat/alpha',
@@ -111,7 +125,7 @@ describe('completeStudio — hook steps say whether they created or repaired', (
 });
 
 describe('completeStudio — a fresh linked worktree', () => {
-  it('ends complete by the checklist, with the main worktree config, its permissions, identity, registration and hooks for all three backends', async () => {
+  it('ends complete by the checklist, with the main worktree config, the builder profile, identity, registration and hooks for all three backends', async () => {
     const opts = baseOptions();
     const report = await completeStudio(studio, opts);
 
@@ -123,12 +137,11 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(readFileSync(join(studio, '.env.local'), 'utf-8')).toBe(
       readFileSync(join(main, '.env.local'), 'utf-8')
     );
-    // Permissions come from the main worktree, not the defaults.
+    // Permissions are the builder profile, not the main worktree's rules:
+    // root sync no longer carries them (design v3, item 3).
     const settings = readJson(join(studio, '.claude', 'settings.local.json'));
-    expect(settings.permissions).toEqual({
-      allow: ['Bash(git *)', 'Read(*)'],
-      deny: ['Bash(rm -rf *)'],
-    });
+    expect(settings.permissions).toEqual(profile('builder'));
+    expect(statusOf(report.steps, 'permissions')).toBe('created');
     expect(settings.enableAllProjectMcpServers).toBe(true);
     // Identity names this studio, its branch and its row.
     const identity = readJson(join(studio, '.ink', 'identity.json'));
@@ -177,7 +190,7 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(opts.register).toHaveBeenCalledTimes(1);
   });
 
-  it('without root sync it generates the default .mcp.json and the default permissions, and copies no env file', async () => {
+  it('without root sync it generates the default .mcp.json and the builder profile, and copies no env file', async () => {
     const opts = { ...baseOptions(), rootSync: false };
     const report = await completeStudio(studio, opts);
 
@@ -186,10 +199,8 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(mcp.mcpServers).toHaveProperty('inkwell');
     expect(mcp.mcpServers).not.toHaveProperty('trusted');
     expect(existsSync(join(studio, '.env.local'))).toBe(false);
-    const settings = readJson(join(studio, '.claude', 'settings.local.json')) as {
-      permissions: { allow: string[] };
-    };
-    expect(settings.permissions.allow).toEqual([...DEFAULT_CLAUDE_ALLOW_RULES]);
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toEqual(profile('builder'));
     expect(statusOf(report.steps, 'permissions')).toBe('created');
   });
 
@@ -242,6 +253,45 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(report.audit.complete).toBe(false);
     expect(report.audit.missing).toEqual(['studio-id']);
     expect(readJson(join(studio, '.ink', 'identity.json')).studioId).toBeUndefined();
+  });
+
+  it('a Codex config the sync cannot repair fails the backend configs step, naming the hand edit, rather than reporting a repair (Myra, #701)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.inkwell]\nurl = "http://localhost:9999/stale"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('failed');
+    expect(step?.detail).toContain("kept outside ink's Codex block, as defined there: inkwell");
+    expect(step?.detail).toContain(
+      "defines the inkwell server outside ink's managed block, where the sync cannot update it"
+    );
+    expect(again.audit.missing).toEqual(['codex-mcp']);
+  });
+
+  it('names a server it kept outside the Codex block, and the studio stays complete (Myra, #701 73a3b6fd)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.trusted]\ncommand = "node"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('updated');
+    expect(step?.detail).toBe(
+      ".codex/, .gemini/; kept outside ink's Codex block, as defined there: trusted"
+    );
+    expect(again.audit.complete).toBe(true);
   });
 
   it('never writes identity or settings through a symlink', async () => {
@@ -331,5 +381,68 @@ describe('completeStudio — the main worktree', () => {
     expect(mcp.mcpServers).toHaveProperty('other');
     expect(mcp.mcpServers).toHaveProperty('inkwell');
     expect(statusOf(report.steps, '.mcp.json')).toBe('updated');
+  });
+});
+
+describe("completeStudio — a repo that is not Inkwell gets inkmail from the CLI's checkout (task 5cabaeeb)", () => {
+  let inkMain: string;
+  let plugin: string;
+  beforeEach(() => {
+    inkMain = join(root, 'inkwell');
+    plugin = join(inkMain, 'packages', 'channel-plugin', 'index.ts');
+    mkdirSync(join(inkMain, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(plugin, '// trusted');
+    inkCheckout.main = inkMain;
+  });
+  afterEach(() => {
+    inkCheckout.main = null;
+  });
+
+  it('a root with no .mcp.json gets inkwell and inkmail', async () => {
+    rmSync(join(main, '.mcp.json'));
+    const report = await completeStudio(main, { ...baseOptions(), mainRoot: null });
+    expect(statusOf(report.steps, '.mcp.json')).toBe('created');
+    const mcp = readJson(join(main, '.mcp.json')) as {
+      mcpServers: { inkwell?: unknown; inkmail?: { args?: string[] } };
+    };
+    expect(mcp.mcpServers.inkwell).toBeDefined();
+    expect(mcp.mcpServers.inkmail?.args).toEqual(['tsx', plugin]);
+  });
+
+  it('a root whose .mcp.json predates it gains inkmail on the next ink init', async () => {
+    const report = await completeStudio(main, { ...baseOptions(), mainRoot: null });
+    expect(statusOf(report.steps, '.mcp.json')).toBe('updated');
+    const mcp = readJson(join(main, '.mcp.json')) as {
+      mcpServers: Record<string, { args?: string[] }>;
+    };
+    expect(mcp.mcpServers.inkmail?.args).toEqual(['tsx', plugin]);
+    expect(mcp.mcpServers.trusted).toEqual({ command: 'node', args: ['trusted.js'] });
+  });
+
+  it('a root whose .mcp.json has only other servers gains inkwell and inkmail in one pass (Lumen, PR #752)', async () => {
+    // Adding inkwell alone left the checklist complete, so the next launch
+    // never asked again and the session had no inbox push.
+    writeFileSync(
+      join(main, '.mcp.json'),
+      JSON.stringify({ mcpServers: { other: { command: 'node', args: ['other.js'] } } })
+    );
+    const report = await completeStudio(main, { ...baseOptions(), mainRoot: null });
+    expect(statusOf(report.steps, '.mcp.json')).toBe('updated');
+    const mcp = readJson(join(main, '.mcp.json')) as {
+      mcpServers: Record<string, { args?: string[]; url?: string }>;
+    };
+    expect(mcp.mcpServers.inkwell?.url).toBe('http://localhost:3001/mcp');
+    expect(mcp.mcpServers.inkmail?.args).toEqual(['tsx', plugin]);
+    expect(mcp.mcpServers.other).toEqual({ command: 'node', args: ['other.js'] });
+  });
+
+  it("a studio of that repo names the CLI checkout's plugin, never its own copy", async () => {
+    mkdirSync(join(studio, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(studio, 'packages', 'channel-plugin', 'index.ts'), '// untrusted');
+    await completeStudio(studio, baseOptions());
+    const mcp = readJson(join(studio, '.mcp.json')) as {
+      mcpServers: { inkmail?: { args?: string[] } };
+    };
+    expect(mcp.mcpServers.inkmail?.args).toEqual(['tsx', plugin]);
   });
 });

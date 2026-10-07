@@ -24,6 +24,8 @@
 
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { readCodexConfig } from './mcp-config-sync.js';
+import { describePermissions } from './claude-defaults.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -222,25 +224,31 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
   );
 
   // .claude/settings.local.json — permissions and hooks live in one file,
-  // and are two different items: a file with hooks and no allow list makes
-  // every tool call ask.
+  // and are two different items: a file with hooks and no permissions makes
+  // every tool call ask. Any `permissions` object counts, whatever it holds:
+  // deny or ask rules alone, `defaultMode` alone, or nothing at all are
+  // someone's deliberate policy, and `ink init` keeps them as they are, so
+  // the checklist must not call them missing (design v3, item 4).
   const settingsPath = join(worktreePath, '.claude', 'settings.local.json');
   const settings = readJson(settingsPath);
   const permissions =
-    settings?.permissions && typeof settings.permissions === 'object'
+    settings?.permissions &&
+    typeof settings.permissions === 'object' &&
+    !Array.isArray(settings.permissions)
       ? (settings.permissions as Record<string, unknown>)
       : null;
-  const allow = Array.isArray(permissions?.allow) ? (permissions?.allow as unknown[]) : [];
   add(
     'claude-permissions',
     '.claude/settings.local.json permissions',
     linked,
-    allow.length > 0 || !linked,
-    allow.length > 0
-      ? `${allow.length} allow rule(s)`
+    !!permissions || !linked,
+    permissions
+      ? describePermissions(permissions)
       : linked
         ? settings
-          ? 'no allow rules'
+          ? settings.permissions === undefined
+            ? 'no permissions'
+            : 'permissions is not an object'
           : existsSync(settingsPath)
             ? 'unparseable'
             : 'missing'
@@ -263,14 +271,31 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
 
   // .codex/config.toml — the MCP section `ink mcp sync` writes and the
   // hooks table `ink hooks install --backend codex` writes.
+  // Read by what its keys resolve to, not by how a header is spelled: a
+  // table defined twice in any spelling is a parse error, and Codex refuses
+  // to start at all (lumen-alpha, 2026-09-29, #701).
   const codex = readText(join(worktreePath, '.codex', 'config.toml'));
-  const codexMcp = !!codex && /^\[mcp_servers\.inkwell\]\s*$/m.test(codex);
+  const codexReading = codex === null ? undefined : readCodexConfig(codex);
   add(
     'codex-mcp',
     '.codex/config.toml inkwell MCP section',
     true,
-    codexMcp,
-    codexMcp ? 'inkwell server configured' : codex ? 'no [mcp_servers.inkwell]' : 'missing'
+    !!codexReading &&
+      codexReading.unreadableLine === undefined &&
+      codexReading.redefined.length === 0 &&
+      codexReading.definesInkwell &&
+      !codexReading.inkwellOutsideBlock,
+    !codexReading
+      ? 'missing'
+      : codexReading.unreadableLine !== undefined
+        ? `could not be read at line ${codexReading.unreadableLine}`
+        : codexReading.redefined.length > 0
+          ? `defines [${codexReading.redefined.join('], [')}] more than once, which Codex cannot parse; run \`ink mcp sync\``
+          : !codexReading.definesInkwell
+            ? 'no [mcp_servers.inkwell]'
+            : codexReading.inkwellOutsideBlock
+              ? "defines [mcp_servers.inkwell] outside ink's managed block, where `ink mcp sync` cannot update it; remove that definition, then run `ink mcp sync`"
+              : 'inkwell server configured'
   );
   const codexCommands = codex
     ? codex

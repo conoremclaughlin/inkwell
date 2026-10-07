@@ -406,6 +406,8 @@ describe('reply admission, through session routing', () => {
         status: 'active',
         route_patterns: [],
         ephemeral: false,
+        // NOT NULL in the schema; a launch refuses a row that names no root.
+        repo_root: worktrees,
         worktree_path: mkdtempSync(path.join(worktrees, `${id}-`)),
         lease:
           opts.occupied && id === 'studio-old'
@@ -459,6 +461,23 @@ describe('reply admission, through session routing', () => {
       updateIfTurnEpoch: vi.fn(async (id: string, epoch: string, update: Partial<Session>) => {
         const row = rows.find((s) => s.id === id)!;
         return row.turnEpoch === epoch ? Object.assign(row, update) : null;
+      }),
+      // The conditional reopen (T4), as the repository's: clears the ended
+      // state only while it is still the one observed, else rereads.
+      reopenEnded: vi.fn(async (id: string, observed: Pick<Session, 'lifecycle' | 'status'>) => {
+        const row = rows.find((s) => s.id === id);
+        if (!row) return { kind: 'missing' as const };
+        if (!row.endedAt) return { kind: 'open' as const, session: row };
+        // A lifecycle that moved since it was observed is kept; only a
+        // still-observed `completed` resets.
+        const reset = row.lifecycle === 'completed' && observed.lifecycle === 'completed';
+        return {
+          kind: 'reopened' as const,
+          session: Object.assign(row, {
+            endedAt: null,
+            ...(reset ? { lifecycle: 'idle' as const } : {}),
+          }),
+        };
       }),
       updateTokenUsage: vi.fn(async () => {}),
     };

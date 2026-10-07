@@ -3258,3 +3258,94 @@ describe('REGRESSION (Lumen, PR #646 round 3): one opener rule, and undelivered 
     });
   });
 });
+
+/**
+ * The most backend calls ONE loop can make (task 7d9aa453; runtime-search
+ * revision 7). An inkling's turn is one outer cycle (maxTurns 1), and that
+ * cycle is one runAgentLoop at the default iteration budget N. The two
+ * constants equal to 5 are not this number: the opening call, at most N - 1
+ * calls inside the loop (each charged as an iteration before it is sent), then
+ * a final relay and one final correction outside the budget, so N + 2. Every
+ * test scripts more turns than that, so a call past the bound would be
+ * consumed and counted. Measurement only: no loop policy changes here.
+ */
+describe('runAgentLoop — the most backend calls one loop makes', () => {
+  const imitated =
+    'Sent.\n\n[Tool results from previous turn]\nTool send_response (executed): {"ok":true}';
+
+  it('at the default budget, a model that always asks for a tool and imitates its results gets 7 calls (N + 2), never more', async () => {
+    const harness = makePorts([
+      ...Array.from({ length: 5 }, () => outcome({ responseText: inkTool('read') })),
+      // The final relay and the correction after it both come back imitated.
+      outcome({ responseText: imitated }),
+      outcome({ responseText: imitated }),
+      // Never reached.
+      outcome({ responseText: inkTool('read') }),
+      outcome({ responseText: imitated }),
+    ]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(result.iterations).toBe(5);
+    expect(result.stopReason).toBe('iteration-cap');
+    expect(harness.prompts).toHaveLength(7);
+    expect(harness.prompts[5]!.body).toContain('[Tool results from previous turn — FINAL]');
+    expect(harness.prompts[6]!.body).toContain('[Runtime protocol correction]');
+  });
+
+  it('the bound holds when every kind of round is used: a rejection, an in-loop correction, a refusal retry, a continuation, the relay and a final correction', async () => {
+    const harness = makePorts(
+      [
+        // 1, opening: rejected by the screen.
+        outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') }),
+        // 2, after the rejection: imitated results and no call, so a correction.
+        outcome({
+          responseText: 'Checking.\n\n[Tool results from previous turn]\nTool x (executed): {}',
+        }),
+        // 3, the in-loop correction: a call that is refused.
+        outcome({ responseText: inkTool('bash') }),
+        // 4, the refusal retry: a call that runs.
+        outcome({ responseText: inkTool('read') }),
+        // 5, an ordinary continuation: a call that runs, reaching the budget.
+        outcome({ responseText: inkTool('send_response') }),
+        // 6 and 7, the final relay and the correction after it.
+        outcome({ responseText: imitated }),
+        outcome({ responseText: imitated }),
+        // Never reached.
+        outcome({ responseText: inkTool('read') }),
+        outcome({ responseText: imitated }),
+      ],
+      (calls) =>
+        calls.map((c) =>
+          c.tool === 'bash'
+            ? { tool: c.tool, result: 'Tool is explicitly denied by policy.', status: 'blocked' }
+            : { tool: c.tool, result: 'ok', status: 'executed', args: c.args }
+        )
+    );
+    let screened = 0;
+    harness.ports.tools.screen = (all) =>
+      screened++ === 0 ? { rejected: 'spawn_agent must be alone' } : { calls: all };
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnBlocked: true },
+      harness.ports
+    );
+
+    expect(harness.prompts).toHaveLength(7);
+    expect(result.iterations).toBe(5);
+    expect(harness.prompts[1]!.body).toContain('spawn_agent must be alone');
+    expect(harness.prompts[2]!.body).toContain('[Runtime protocol correction]');
+    expect(harness.prompts[5]!.body).toContain('[Tool results from previous turn — FINAL]');
+    expect(harness.prompts[6]!.body).toContain('[Runtime protocol correction]');
+  });
+
+  it('at a budget of one, the same model gets 3 calls (N + 2)', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('read') }),
+      outcome({ responseText: imitated }),
+      outcome({ responseText: imitated }),
+      outcome({ responseText: inkTool('read') }),
+    ]);
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local', maxIterations: 1 }, harness.ports);
+    expect(harness.prompts).toHaveLength(3);
+  });
+});

@@ -377,6 +377,57 @@ describe('rescueSucceeded', () => {
   });
 });
 
+/**
+ * PR #724 review (Lumen). A run that registers while the presence SELECT is
+ * in flight (a resumed turn) is in-process truth the row snapshot cannot
+ * show. Both reads ask the registry again after the await.
+ */
+describe('presence and turn reads after a run registers mid-read (PR #724)', () => {
+  let tables: Record<string, Row[]>;
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+    tables.sessions.push({
+      id: 'session-r',
+      user_id: 'user-1',
+      cli_attached: false,
+      cli_poll_at: null,
+      cli_turn_at: null,
+    });
+  });
+  afterEach(() => resetActiveRuns());
+
+  const registerDuringRead = (): FakeHooks => ({
+    afterSelect: (table) => {
+      if (table === 'sessions') {
+        registerActiveRun({
+          sessionId: 'session-r',
+          userId: 'user-1',
+          sbSlug: 'wren',
+          backend: 'claude-code',
+          startedAt: Date.now(),
+        });
+      }
+    },
+  });
+
+  it.each(['isSessionLive', 'isSessionMidTurn'] as const)(
+    '%s reports a run that registered during its read',
+    async (method) => {
+      const service = new StudioLeaseService(makeFakeSupabase(tables, registerDuringRead()));
+      expect(await service[method]('session-r', 'user-1')).toBe(true);
+    }
+  );
+
+  it.each(['isSessionLive', 'isSessionMidTurn'] as const)(
+    '%s control: no run, no signals, not live',
+    async (method) => {
+      const service = new StudioLeaseService(makeFakeSupabase(tables));
+      expect(await service[method]('session-r', 'user-1')).toBe(false);
+    }
+  );
+});
+
 describe('StudioLeaseService.acquire', () => {
   let tables: Record<string, Row[]>;
   let service: StudioLeaseService;
