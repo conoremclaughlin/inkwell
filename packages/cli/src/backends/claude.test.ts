@@ -17,6 +17,7 @@ import {
   MAX_MEDIA_TOTAL_BYTES,
   MAX_PDF_PAGES,
   MAX_TEXT_DOCUMENT_BYTES,
+  PDF_EXTRACT_TIMEOUT_MS,
 } from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
@@ -1179,6 +1180,36 @@ describe('documents on a withheld turn (task 0321ccf1 follow-up)', () => {
       ).toBe(true);
     });
 
+    it('shares one extraction deadline across the turn, and names a PDF it had no time for', () => {
+      let clock = 1_000;
+      const given: number[] = [];
+      const files = {
+        '/u/a.pdf': Buffer.from('%PDF-a'),
+        '/u/b.pdf': Buffer.from('%PDF-b'),
+        '/u/c.pdf': Buffer.from('%PDF-c'),
+      };
+      const out = encodeDocumentBlocks(
+        [
+          doc('/u/a.pdf', 'application/pdf'),
+          doc('/u/b.pdf', 'application/pdf'),
+          doc('/u/c.pdf', 'application/pdf'),
+        ],
+        0,
+        reader(files),
+        (_b, _n, timeoutMs) => {
+          given.push(timeoutMs);
+          clock += 12_000; // each extraction takes 12 s of the turn
+          return { text: 'words', pages: 1, total: 1 };
+        },
+        () => clock
+      );
+      expect(given).toEqual([PDF_EXTRACT_TIMEOUT_MS, PDF_EXTRACT_TIMEOUT_MS - 12_000]);
+      expect(out.injected.map((m) => m.path)).toEqual(['/u/a.pdf', '/u/b.pdf']);
+      expect(out.rejected.map((r) => [r.media.path, r.reason])).toEqual([
+        ['/u/c.pdf', 'the time for reading attached files ran out'],
+      ]);
+    });
+
     it('says "2 pages" when it read the whole PDF', () => {
       const out = encodeDocumentBlocks(
         [doc('/u/r.pdf', 'application/pdf')],
@@ -1272,6 +1303,42 @@ describe('documents on a withheld turn (task 0321ccf1 follow-up)', () => {
     it('returns null for bytes that are not a PDF, never throwing', () => {
       expect(extractPdfTextSync(Buffer.from('%PDF-1.4 not really'), MAX_PDF_PAGES)).toBeNull();
       expect(extractPdfTextSync(Buffer.alloc(0), MAX_PDF_PAGES)).toBeNull();
+    });
+
+    it('kills a child that runs past its time, even one that ignores SIGTERM', async () => {
+      // A controlled hanging child stands in for a PDF that stalls pdf.js: it
+      // ignores SIGTERM, never answers, and leaves by itself after 15 s, so a
+      // broken kill can't strand it.
+      const actual = await vi.importActual<typeof import('child_process')>('child_process');
+      const HANG = "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 15000);";
+      let signal: string | null = null;
+      let options: Record<string, unknown> = {};
+      vi.mocked(execFileSyncForTest).mockImplementationOnce(((
+        file: string,
+        _args: string[],
+        opts: Record<string, unknown>
+      ) => {
+        options = opts;
+        try {
+          return actual.execFileSync(file, ['-e', HANG], opts);
+        } catch (error) {
+          signal = (error as { signal?: string }).signal ?? null;
+          throw error;
+        }
+      }) as never);
+      const started = Date.now();
+      expect(extractPdfTextSync(minimalPdf(['never read']), 1, 300)).toBeNull();
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(signal).toBe('SIGKILL');
+      expect(options).toMatchObject({ timeout: 300, killSignal: 'SIGKILL' });
+    }, 30_000);
+
+    it('waits 20 s by default', () => {
+      const calls = vi.mocked(execFileSyncForTest).mock.calls.length;
+      extractPdfTextSync(Buffer.from('%PDF-1.4 not really'), 1);
+      const call = vi.mocked(execFileSyncForTest).mock.calls[calls]!;
+      expect(PDF_EXTRACT_TIMEOUT_MS).toBe(20_000);
+      expect(call[2]).toMatchObject({ timeout: PDF_EXTRACT_TIMEOUT_MS, killSignal: 'SIGKILL' });
     });
 
     it('gives the child no environment of its own', () => {

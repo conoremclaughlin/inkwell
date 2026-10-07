@@ -176,7 +176,7 @@ export function encodeContextImageBlocks(
 export const MAX_TEXT_DOCUMENT_BYTES = 1024 * 1024;
 export const MAX_PDF_PAGES = 30;
 export const MAX_DOCUMENT_TEXT_CHARS = 100_000;
-const PDF_EXTRACT_TIMEOUT_MS = 20_000;
+export const PDF_EXTRACT_TIMEOUT_MS = 20_000;
 
 type DocumentKind = 'text' | 'pdf';
 
@@ -194,7 +194,11 @@ export interface ExtractedPdf {
   total: number;
 }
 
-export type PdfExtractor = (bytes: Buffer, maxPages: number) => ExtractedPdf | null;
+export type PdfExtractor = (
+  bytes: Buffer,
+  maxPages: number,
+  timeoutMs: number
+) => ExtractedPdf | null;
 
 /**
  * Runs in a short-lived child process, so extraction stays synchronous for
@@ -218,7 +222,11 @@ process.stdin.on('end', async () => {
 
 let pdfParseEntry: string | null | undefined;
 
-export function extractPdfTextSync(bytes: Buffer, maxPages: number): ExtractedPdf | null {
+export function extractPdfTextSync(
+  bytes: Buffer,
+  maxPages: number,
+  timeoutMs: number = PDF_EXTRACT_TIMEOUT_MS
+): ExtractedPdf | null {
   try {
     pdfParseEntry ??= createRequire(import.meta.url).resolve('pdf-parse');
   } catch {
@@ -236,7 +244,7 @@ export function extractPdfTextSync(bytes: Buffer, maxPages: number): ExtractedPd
     const out = execFileSync(process.execPath, args, {
       input: bytes,
       env: {},
-      timeout: PDF_EXTRACT_TIMEOUT_MS,
+      timeout: timeoutMs,
       killSignal: 'SIGKILL',
       // The child caps the text; room for it JSON-escaped, at up to six bytes a character.
       maxBuffer: 6 * (MAX_DOCUMENT_TEXT_CHARS + 1) + 64 * 1024,
@@ -291,10 +299,14 @@ export function encodeDocumentBlocks(
   documents: TurnMedia[],
   usedBytes: number,
   readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded,
-  extractPdf: PdfExtractor = extractPdfTextSync
+  extractPdf: PdfExtractor = extractPdfTextSync,
+  now: () => number = Date.now
 ): EncodedMedia {
   const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
   const budget = Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes);
+  // One extraction deadline for the whole turn, not one per PDF: prepare()
+  // is synchronous, so ink chat waits on it, and a message can carry several.
+  const deadline = now() + PDF_EXTRACT_TIMEOUT_MS;
   for (const m of documents) {
     const kind = documentKind(m);
     if (!kind) {
@@ -333,7 +345,12 @@ export function encodeDocumentBlocks(
         out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
         continue;
       }
-      const extracted = extractPdf(buf, MAX_PDF_PAGES);
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        out.rejected.push({ media: m, reason: 'the time for reading attached files ran out' });
+        continue;
+      }
+      const extracted = extractPdf(buf, MAX_PDF_PAGES, remaining);
       if (!extracted) {
         out.rejected.push({ media: m, reason: 'its text could not be read as a PDF' });
         continue;
