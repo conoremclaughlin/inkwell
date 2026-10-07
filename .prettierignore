@@ -4,3 +4,5 @@ dist
 .yarn
 coverage
 *.lock
+# Generated emoji catalog files: byte-exact, hashed by the parity manifest.
+packages/shared/src/stories/*/*.generated.ts
