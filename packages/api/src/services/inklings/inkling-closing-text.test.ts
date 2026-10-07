@@ -3,6 +3,9 @@
  * text posted as its message (task 9edf62fe), through the real admin create
  * route and the real handleSendToInbox, with only the database (the
  * in-memory FakePostgrest), the gateway and the read-pointer RPC faked.
+ *
+ * Each case plays a turn's life: the owner's message lands, the turn starts
+ * (its boundary is read), things happen, the turn ends (the decision).
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -61,10 +64,16 @@ import {
   CLOSING_TEXT_FOR,
   CLOSING_TEXT_MAX,
   closingText,
+  closingTextTurnHooks,
   postClosingTextIfSilent,
+  readTurnBoundary,
   type ClosingTextTurn,
+  type ClosingTextWake,
+  type TurnBoundary,
 } from './inkling-closing-text';
 import { resetReplyChains } from './inkling-reply-chain';
+import type { SessionResult } from '../sessions/types';
+import { logger } from '../../utils/logger';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -124,30 +133,44 @@ const lastMessageIn = (key: string) => {
     .filter((m) => m.thread_id === thread.id)
     .at(-1)!;
 };
+const wakeFor = (key: string, identityId = 'sb-pip'): ClosingTextWake => ({
+  userId: ME,
+  identityId,
+  threadId: threadOf(key).id as string,
+  threadKey: key,
+  threadMessageId: lastMessageIn(key).id as string,
+});
 
 /** The owner starts the conversation; returns what a wake for that message names. */
-async function ownerStarts(
-  recipients: string[] = ['pip'],
-  key = KEY
-): Promise<Omit<ClosingTextTurn, 'result'>> {
+async function ownerStarts(recipients: string[] = ['pip'], key = KEY): Promise<ClosingTextWake> {
   const started = await call(create, { key, recipients, content: 'hi' });
   expect(started.status).toBe(200);
-  const waking = lastMessageIn(key);
-  return {
-    userId: ME,
-    identityId: 'sb-pip',
-    threadId: threadOf(key).id as string,
-    threadKey: key,
-    threadMessageId: waking.id as string,
-  };
+  return wakeFor(key);
 }
 
-const SILENT = {
+/** The owner writes again; returns the wake for that message. */
+async function ownerWrites(content: string, key = KEY): Promise<ClosingTextWake> {
+  expect((await call(reply, { key, content })).status).toBe(200);
+  return wakeFor(key);
+}
+
+/** The turn begins: the boundary its hooks read. */
+const turnStarts = (wake: ClosingTextWake): Promise<TurnBoundary> =>
+  readTurnBoundary(dataComposer, wake.threadId!);
+
+const SILENT: ClosingTextTurn['result'] = {
   success: true,
   admitted: true,
   finalTextResponse: "  I couldn't read our conversation, so I didn't reply.  ",
   sessionId: '44444444-4444-4444-8444-444444444444',
 };
+
+/** The turn ends: the decision. */
+const turnEnds = (
+  wake: ClosingTextWake,
+  boundary: TurnBoundary | undefined,
+  result: ClosingTextTurn['result'] = SILENT
+) => postClosingTextIfSilent(dataComposer, { ...wake, boundary, result });
 
 /** The inkling's own reply, as the server sends one for it. */
 async function inklingReplies(content = 'here I am', key = KEY): Promise<void> {
@@ -162,6 +185,9 @@ async function inklingReplies(content = 'here I am', key = KEY): Promise<void> {
     }
   );
 }
+
+const ownerMembership = () =>
+  db.rows('workspace_members').find((m) => m.user_id === ME && m.workspace_id === WS)!;
 
 beforeEach(() => {
   gateway.dispatchTrigger.mockClear();
@@ -183,12 +209,12 @@ afterEach(() => {
 describe('a silent turn on its own conversation', () => {
   it("posts the closing text once, as the inkling's message, and wakes nobody", async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     gateway.dispatchTrigger.mockClear();
     const before = messages().length;
 
-    const outcome = await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT });
+    expect(await turnEnds(wake, boundary)).toMatchObject({ posted: true });
 
-    expect(outcome).toMatchObject({ posted: true });
     expect(messages()).toHaveLength(before + 1);
     const posted = messages().at(-1)!;
     expect(posted).toMatchObject({
@@ -201,79 +227,78 @@ describe('a silent turn on its own conversation', () => {
     expect(woken()).toEqual([]);
   });
 
-  it('posts nothing a second time: its own post is the reply', async () => {
+  it('a replay of the same wake, in a later turn, posts nothing more', async () => {
     const wake = await ownerStarts();
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toMatchObject({
-      posted: true,
-    });
+    expect(await turnEnds(wake, await turnStarts(wake))).toMatchObject({ posted: true });
     const after = messages().length;
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
+    // A new turn for the same message: its boundary is after the first post.
+    expect(await turnEnds(wake, await turnStarts(wake))).toEqual({
       posted: false,
-      skipped: 'replied',
+      skipped: 'already-posted',
     });
     expect(messages()).toHaveLength(after);
   });
 
   it('two completions racing for the same message post once', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     const before = messages().length;
-    const outcomes = await Promise.all([
-      postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT }),
-      postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT }),
-    ]);
+    const outcomes = await Promise.all([turnEnds(wake, boundary), turnEnds(wake, boundary)]);
     expect(outcomes.filter((o) => o.posted)).toHaveLength(1);
     expect(outcomes).toContainEqual({ posted: false, skipped: 'in-flight' });
     expect(messages()).toHaveLength(before + 1);
   });
 
-  it("the owner's own follow-up isn't a reply: it still posts", async () => {
-    const wake = await ownerStarts();
-    // Sent while the turn ran; it queues behind it.
-    expect((await call(reply, { key: KEY, content: 'are you there?' })).status).toBe(200);
+  it("an earlier turn's reply doesn't silence a later turn (Lumen, #769)", async () => {
+    // A wakes; its turn starts. B arrives while A runs, and A replies.
+    const wakeA = await ownerStarts();
+    const boundaryA = await turnStarts(wakeA);
+    const wakeB = await ownerWrites('and another thing');
+    await inklingReplies('answer to the first');
+    expect(await turnEnds(wakeA, boundaryA)).toEqual({ posted: false, skipped: 'replied' });
+
+    // B's turn starts after A's ended, says nothing, and ends.
+    const boundaryB = await turnStarts(wakeB);
     const before = messages().length;
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toMatchObject({
-      posted: true,
-    });
+    expect(await turnEnds(wakeB, boundaryB)).toMatchObject({ posted: true });
     expect(messages()).toHaveLength(before + 1);
-    expect(messages().at(-1)).toMatchObject({ sender_sb_id: 'sb-pip' });
+    expect((messages().at(-1)!.metadata as Row)[CLOSING_TEXT_FOR]).toBe(wakeB.threadMessageId);
   });
 
-  it("an earlier turn's reply doesn't count: only one after the waking message does", async () => {
-    await ownerStarts();
-    await inklingReplies('answer to the first');
-    const second = await call(reply, { key: KEY, content: 'and another thing' });
-    expect(second.status).toBe(200);
-    const waking = lastMessageIn(KEY);
+  it("the owner's own follow-up during the turn isn't a reply: it still posts", async () => {
+    const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
+    await ownerWrites('are you there?');
     const before = messages().length;
-
-    const outcome = await postClosingTextIfSilent(dataComposer, {
-      userId: ME,
-      identityId: 'sb-pip',
-      threadId: threadOf(KEY).id as string,
-      threadKey: KEY,
-      threadMessageId: waking.id as string,
-      result: SILENT,
-    });
-
-    expect(outcome).toMatchObject({ posted: true });
+    expect(await turnEnds(wake, boundary)).toMatchObject({ posted: true });
     expect(messages()).toHaveLength(before + 1);
+    expect(messages().at(-1)).toMatchObject({ sender_sb_id: 'sb-pip' });
   });
 });
 
 describe('nothing is posted', () => {
-  it('when the inkling already replied after the waking message', async () => {
+  it('when the inkling replied during the turn', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     await inklingReplies();
     const before = messages().length;
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
-      posted: false,
-      skipped: 'replied',
-    });
+    expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'replied' });
+    expect(messages()).toHaveLength(before);
+  });
+
+  it('when the turn routed a reply of its own, landed or not', async () => {
+    const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
+    const before = messages().length;
+    expect(
+      await turnEnds(wake, boundary, { ...SILENT, responses: [{ channel: 'api', content: 'hi' }] })
+    ).toEqual({ posted: false, skipped: 'replied' });
     expect(messages()).toHaveLength(before);
   });
 
   it('for a failed, stopped, unadmitted or carried turn', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     const before = messages().length;
     for (const result of [
       { ...SILENT, success: false },
@@ -281,98 +306,89 @@ describe('nothing is posted', () => {
       { ...SILENT, admitted: undefined },
       { ...SILENT, wake: { coalescedInto: '55555555-5555-4555-8555-555555555555' } },
     ]) {
-      expect(await postClosingTextIfSilent(dataComposer, { ...wake, result })).toEqual({
-        posted: false,
-        skipped: 'turn',
-      });
+      expect(await turnEnds(wake, boundary, result)).toEqual({ posted: false, skipped: 'turn' });
     }
     expect(messages()).toHaveLength(before);
   });
 
   it('when the turn ended with no text', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     for (const finalTextResponse of [undefined, '', ' \n\t ']) {
-      expect(
-        await postClosingTextIfSilent(dataComposer, {
-          ...wake,
-          result: { ...SILENT, finalTextResponse },
-        })
-      ).toEqual({ posted: false, skipped: 'empty' });
+      expect(await turnEnds(wake, boundary, { ...SILENT, finalTextResponse })).toEqual({
+        posted: false,
+        skipped: 'empty',
+      });
+    }
+  });
+
+  it("when the turn's start was never read, or its read failed", async () => {
+    const wake = await ownerStarts();
+    for (const boundary of [undefined, 'unreadable' as const]) {
+      expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'unreadable' });
     }
   });
 
   it('when the wake names no thread or waking message, or one from another thread', async () => {
     const wake = await ownerStarts();
-    await ownerStarts(['pip'], 'chat:conversation-other');
-    const elsewhere = lastMessageIn('chat:conversation-other');
+    const boundary = await turnStarts(wake);
+    const elsewhere = await ownerStarts(['pip'], 'chat:conversation-other');
     for (const over of [
       { threadId: undefined },
       { threadKey: undefined },
       { threadMessageId: undefined },
       { identityId: undefined },
-      { threadMessageId: elsewhere.id as string },
+      { threadMessageId: elsewhere.threadMessageId },
     ]) {
-      expect(
-        await postClosingTextIfSilent(dataComposer, { ...wake, ...over, result: SILENT }),
-        JSON.stringify(over)
-      ).toEqual({ posted: false, skipped: 'no-trigger' });
+      expect(await turnEnds({ ...wake, ...over }, boundary), JSON.stringify(over)).toEqual({
+        posted: false,
+        skipped: 'no-trigger',
+      });
     }
   });
 
   it("for an SB that isn't an inkling, or another account's", async () => {
-    const started = await call(create, { key: 'pr:9', recipients: ['fern'], content: 'hi' });
-    expect(started.status).toBe(200);
-    const fernWake = {
-      userId: ME,
-      identityId: 'sb-fern',
-      threadId: threadOf('pr:9').id as string,
-      threadKey: 'pr:9',
-      threadMessageId: lastMessageIn('pr:9').id as string,
-    };
-    expect(await postClosingTextIfSilent(dataComposer, { ...fernWake, result: SILENT })).toEqual({
+    expect((await call(create, { key: 'pr:9', recipients: ['fern'], content: 'hi' })).status).toBe(
+      200
+    );
+    const fernWake = wakeFor('pr:9', 'sb-fern');
+    expect(await turnEnds(fernWake, await turnStarts(fernWake))).toEqual({
       posted: false,
       skipped: 'not-inkling',
     });
 
     const wake = await ownerStarts();
-    expect(
-      await postClosingTextIfSilent(dataComposer, { ...wake, userId: SOMEONE, result: SILENT })
-    ).toEqual({ posted: false, skipped: 'not-inkling' });
+    expect(await turnEnds({ ...wake, userId: SOMEONE }, await turnStarts(wake))).toEqual({
+      posted: false,
+      skipped: 'not-inkling',
+    });
   });
 
   it("on a thread that isn't the inkling's conversation", async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     // The mark is what makes a thread a conversation; the key alone doesn't.
     const thread = threadOf(KEY);
     thread.metadata = {};
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
+    expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'not-conversation' });
+    thread.metadata = { inklingConversation: true };
+    // The key the wake names must be the thread's own.
+    expect(await turnEnds({ ...wake, threadKey: 'chat:else' }, boundary)).toEqual({
       posted: false,
       skipped: 'not-conversation',
     });
-    thread.metadata = { inklingConversation: true };
-    // The key the wake names must be the thread's own.
-    expect(
-      await postClosingTextIfSilent(dataComposer, {
-        ...wake,
-        threadKey: 'chat:else',
-        result: SILENT,
-      })
-    ).toEqual({ posted: false, skipped: 'not-conversation' });
     // And the inkling must be one of its members.
     db.rows('inbox_thread_participants').splice(
       db.rows('inbox_thread_participants').findIndex((p) => p.sb_id === 'sb-pip'),
       1
     );
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
-      posted: false,
-      skipped: 'not-conversation',
-    });
+    expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'not-conversation' });
   });
 
   it('in a group conversation, where staying quiet can be the reply', async () => {
     const wake = await ownerStarts(['pip', 'moss']);
     const before = messages().length;
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
+    expect(await turnEnds(wake, await turnStarts(wake))).toEqual({
       posted: false,
       skipped: 'group',
     });
@@ -381,6 +397,7 @@ describe('nothing is posted', () => {
 
   it('when a read fails, and decides nothing', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     const before = messages().length;
     const originalFrom = db.from.bind(db);
     db.from = ((table: string) => {
@@ -389,21 +406,129 @@ describe('nothing is posted', () => {
       }
       return originalFrom(table);
     }) as typeof db.from;
-    expect(await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT })).toEqual({
-      posted: false,
-      skipped: 'unreadable',
-    });
+    expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'unreadable' });
     db.from = originalFrom;
     expect(messages()).toHaveLength(before);
   });
 
   it('when the gate refuses the post: the owner test is off', async () => {
     const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
     const before = messages().length;
     vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
-    const outcome = await postClosingTextIfSilent(dataComposer, { ...wake, result: SILENT });
-    expect(outcome).toEqual({ posted: false, error: 'Inklings are not open on this server' });
+    expect(await turnEnds(wake, boundary)).toEqual({
+      posted: false,
+      error: 'Inklings are not open on this server',
+    });
     expect(messages()).toHaveLength(before);
+  });
+
+  it("when the owner's role no longer writes, or they've left the workspace (Lumen, #769)", async () => {
+    const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
+    const before = messages().length;
+
+    ownerMembership().role = 'viewer';
+    expect(await turnEnds(wake, boundary)).toEqual({
+      posted: false,
+      error: 'Your role in this workspace (viewer) cannot send to a thread',
+    });
+
+    db.rows('workspace_members').splice(db.rows('workspace_members').indexOf(ownerMembership()), 1);
+    expect(await turnEnds(wake, boundary)).toEqual({
+      posted: false,
+      error: "pip's owner cannot act in this workspace: not a member",
+    });
+    expect(messages()).toHaveLength(before);
+  });
+});
+
+describe('the turn hooks', () => {
+  const sessionResult = (over: Partial<SessionResult> = {}): SessionResult =>
+    ({
+      ...SILENT,
+      sessionId: SILENT.sessionId!,
+      responses: [],
+      sessionStatus: 'active',
+      compactionTriggered: false,
+      ...over,
+    }) as SessionResult;
+
+  it("read the turn's start, and post at its end when it said nothing", async () => {
+    const wake = await ownerStarts();
+    const hooks = closingTextTurnHooks(dataComposer, wake);
+    await hooks.start();
+    await ownerWrites('still there?');
+    const before = messages().length;
+    await hooks.end(sessionResult());
+    expect(messages()).toHaveLength(before + 1);
+    expect(messages().at(-1)).toMatchObject({ sender_sb_id: 'sb-pip' });
+  });
+
+  it('post nothing when the inkling replied between start and end', async () => {
+    const wake = await ownerStarts();
+    const hooks = closingTextTurnHooks(dataComposer, wake);
+    await hooks.start();
+    await inklingReplies();
+    const before = messages().length;
+    await hooks.end(sessionResult());
+    expect(messages()).toHaveLength(before);
+  });
+
+  it("cost another SB's turn one read, and post nothing", async () => {
+    expect((await call(create, { key: 'pr:9', recipients: ['fern'], content: 'hi' })).status).toBe(
+      200
+    );
+    const hooks = closingTextTurnHooks(dataComposer, wakeFor('pr:9', 'sb-fern'));
+    const read: string[] = [];
+    const originalFrom = db.from.bind(db);
+    db.from = ((table: string) => {
+      read.push(table);
+      return originalFrom(table);
+    }) as typeof db.from;
+    const before = messages().length;
+    vi.mocked(logger.warn).mockClear();
+    await hooks.start();
+    await hooks.end(sessionResult());
+    db.from = originalFrom;
+    expect(read).toEqual(['agent_identities']);
+    expect(messages()).toHaveLength(before);
+    // Nor a warning: it isn't a decision that failed, there was none to make.
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("judge without a boundary when the turn's start was never called", async () => {
+    const wake = await ownerStarts();
+    const before = messages().length;
+    await closingTextTurnHooks(dataComposer, wake).end(sessionResult());
+    expect(messages()).toHaveLength(before);
+  });
+});
+
+describe('the boundary', () => {
+  it("is the conversation's newest message as the turn begins", async () => {
+    const wake = await ownerStarts();
+    await ownerWrites('second');
+    expect(await turnStarts(wake)).toEqual({ createdAt: lastMessageIn(KEY).created_at });
+  });
+
+  it('is unreadable when the read fails', async () => {
+    const wake = await ownerStarts();
+    const originalFrom = db.from.bind(db);
+    db.from = ((table: string) => {
+      if (table === 'inbox_thread_messages') {
+        return {
+          select: () => ({
+            eq: () => ({
+              order: () => ({ limit: async () => ({ data: null, error: { message: 'down' } }) }),
+            }),
+          }),
+        };
+      }
+      return originalFrom(table);
+    }) as typeof db.from;
+    expect(await turnStarts(wake)).toBe('unreadable');
+    db.from = originalFrom;
   });
 });
 

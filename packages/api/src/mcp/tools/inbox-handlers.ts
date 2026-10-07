@@ -690,6 +690,21 @@ export async function handleSendToInbox(
       // — resolved from the table by owner and slug, never through the
       // ambient request's pin.
       sender = internal.sender.principal;
+      // An SB the server sends for writes with its owner's current role,
+      // exactly as its own send does below: server authorship never restores
+      // authority the owner has lost, and a role that can't be read refuses
+      // (Lumen, #769).
+      if (sender.kind === 'sb') {
+        assertWriteRole(
+          await roleOfUserIn(
+            supabase,
+            sender.workspaceId,
+            sender.userId,
+            `${sender.sbSlug}'s owner`
+          ),
+          'send to a thread'
+        );
+      }
       workspaceId =
         internal.sender.workspaceId ??
         (await resolveSbOwnedBy(supabase, resolved.user.id, allRecipients[0])).workspaceId;

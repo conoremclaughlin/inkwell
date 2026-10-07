@@ -61,7 +61,7 @@ import {
   inTurnNote,
   replyChainWakeDue,
 } from './services/inklings/inkling-reply-chain';
-import { postClosingTextIfSilent } from './services/inklings/inkling-closing-text';
+import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
 import {
   TriggerRetryScheduler,
   getTriggerAttempt,
@@ -1787,6 +1787,21 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       payload.forceSpawn !== true &&
       payload.metadata?.strategyTrigger !== true;
 
+    // An inkling's turn that ends without a word to its owner posts its
+    // closing text as its message (task 9edf62fe). Decided in the turn's own
+    // hooks, as that turn ends and before the next queued one starts: this
+    // handler's handleMessage can settle only once the queue behind it has
+    // drained (Lumen, #769).
+    if (payload.threadId && payload.threadMessageId && resolvedIdentityId) {
+      request.turnHooks = closingTextTurnHooks(dataComposer!, {
+        userId,
+        identityId: resolvedIdentityId,
+        threadId: payload.threadId,
+        threadKey: payload.threadKey,
+        threadMessageId: payload.threadMessageId,
+      });
+    }
+
     let result: SessionResult;
     try {
       result = await sessionService!.handleMessage(request);
@@ -1909,44 +1924,6 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         `[Trigger] Response routing failed for ${targetSlug} (session succeeded):`,
         routeErr
       );
-    }
-
-    // An inkling's turn that ended without a word to its owner: its closing
-    // text is posted as its message (task 9edf62fe). After the routing above,
-    // so a reply routed there counts as posted. The turn already succeeded,
-    // so nothing here may fail the trigger.
-    try {
-      const closing = await postClosingTextIfSilent(dataComposer!, {
-        result,
-        userId,
-        identityId: resolvedIdentityId,
-        threadId: payload.threadId,
-        threadKey: payload.threadKey,
-        threadMessageId: payload.threadMessageId,
-      });
-      if (closing.posted) {
-        logger.info('[Trigger] Posted an inkling turn closing text: it sent nothing itself', {
-          targetSlug,
-          threadKey: payload.threadKey,
-          wakingMessageId: payload.threadMessageId,
-          messageId: closing.messageId,
-        });
-      } else if ('error' in closing) {
-        logger.warn('[Trigger] Could not post an inkling turn closing text', {
-          targetSlug,
-          threadKey: payload.threadKey,
-          wakingMessageId: payload.threadMessageId,
-          error: closing.error,
-        });
-      } else if (closing.skipped === 'unreadable') {
-        logger.warn('[Trigger] Inkling closing text undecided: a read failed', {
-          targetSlug,
-          threadKey: payload.threadKey,
-          wakingMessageId: payload.threadMessageId,
-        });
-      }
-    } catch (closingErr) {
-      logger.error(`[Trigger] Inkling closing text failed for ${targetSlug}:`, closingErr);
     }
 
     // A wake carried by another wake's turn was delivered by that turn.

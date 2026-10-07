@@ -17,7 +17,11 @@ import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/in
 import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
 import { userPrincipal } from '../principals';
 import { INKLING_CLIENT } from './inkling-service';
-import { CLOSING_TEXT_FOR, postClosingTextIfSilent } from './inkling-closing-text';
+import {
+  CLOSING_TEXT_FOR,
+  postClosingTextIfSilent,
+  readTurnBoundary,
+} from './inkling-closing-text';
 
 const RUN = randomUUID().slice(0, 8);
 const INK = `closing-ink-${RUN}`;
@@ -91,7 +95,12 @@ describe('an inkling closing text on Postgres', () => {
   });
 
   it("is stored as the inkling's own message, naming the message it answers, once", async () => {
+    // The turn starts: its boundary is the conversation's newest message,
+    // read from Postgres's own clock.
+    const boundary = await readTurnBoundary(dc, threadId);
+    expect(boundary).toEqual({ createdAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
     const turn = {
+      boundary,
       result: {
         success: true,
         admitted: true,
@@ -116,7 +125,13 @@ describe('an inkling closing text on Postgres', () => {
     });
     expect((rows[1].metadata as Record<string, unknown>)[CLOSING_TEXT_FOR]).toBe(wakingId);
 
-    // Its own post is the reply now: a replay of the same completion adds nothing.
+    // A replay of the same wake in a later turn finds the stored closing text.
+    const later = { ...turn, boundary: await readTurnBoundary(dc, threadId) };
+    expect(await postClosingTextIfSilent(dc, later)).toEqual({
+      posted: false,
+      skipped: 'already-posted',
+    });
+    // And the turn that posted it, judged again, sees its own post after its start.
     expect(await postClosingTextIfSilent(dc, turn)).toEqual({ posted: false, skipped: 'replied' });
     expect(await messagesInThread()).toHaveLength(2);
   });

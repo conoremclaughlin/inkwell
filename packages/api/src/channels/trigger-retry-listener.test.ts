@@ -123,8 +123,6 @@ interface RigOptions {
   descriptor?: { lines: string[] };
   /** A successful SessionResult from handleMessage, verbatim (default `{ success: true }`). */
   resultSuccess?: Record<string, unknown>;
-  /** Make the inkling closing-text post throw. */
-  closingThrows?: boolean;
 }
 
 function rig(options: RigOptions = {}) {
@@ -139,9 +137,9 @@ function rig(options: RigOptions = {}) {
   const chainEndings: Array<Record<string, unknown>> = [];
   const inkmail: unknown[][] = [];
   const routed: unknown[][] = [];
-  const closings: unknown[][] = [];
-  /** The order the success path's steps ran in. */
-  const sequence: string[] = [];
+  const closingHooks: unknown[][] = [];
+  /** What closingTextTurnHooks hands back, so a test can find it on the request. */
+  const closingHooksMade = { start: async () => {}, end: async () => {} };
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -333,14 +331,11 @@ function rig(options: RigOptions = {}) {
     storedTriggerMedia: async () => [],
     routeResponses: async (...args: unknown[]) => {
       routed.push(args);
-      sequence.push('route');
     },
-    // The inkling closing-text post (inkling-closing-text.ts), recorded, not run.
-    postClosingTextIfSilent: async (...args: unknown[]) => {
-      closings.push(args);
-      sequence.push('closing');
-      if (options.closingThrows) throw new Error('closing text exploded');
-      return { posted: false, skipped: 'not-inkling' };
+    // The inkling closing-text hooks (inkling-closing-text.ts), recorded, not run.
+    closingTextTurnHooks: (...args: unknown[]) => {
+      closingHooks.push(args);
+      return closingHooksMade;
     },
     RoutingRefusedError,
     sendTriggerFailureNotice: loadModule(resolve(API_SRC, 'services/trigger-failure-notice.ts'), {
@@ -402,8 +397,8 @@ function rig(options: RigOptions = {}) {
     chainEndings,
     inkmail,
     routed,
-    closings,
-    sequence,
+    closingHooks,
+    closingHooksMade,
     chain,
     row,
     threadPayload,
@@ -663,48 +658,33 @@ describe('server.ts wiring', () => {
 });
 
 describe("an inkling turn that sent nothing (task 9edf62fe): the handler's part", () => {
-  // inkling-closing-text.test.ts decides what is posted; this checks that the
-  // shipping handler asks it, with the wake the turn ran for, once the turn
-  // succeeded and its replies were routed.
-  const result = {
-    success: true,
-    admitted: true,
-    finalTextResponse: 'I could not read our conversation.',
-    sessionId: 'session-synthetic',
-    responses: [{ channel: 'api', conversationId: 'c', content: 'routed' }],
-  };
-
-  it('offers the turn and its wake after the replies are routed', async () => {
-    const r = rig({ resultSuccess: result });
+  // inkling-closing-text.test.ts decides what is posted, and session-service
+  // runs the hooks around each turn. This checks that the shipping handler
+  // builds them from the wake and hands them to the turn, before the turn runs.
+  it('hands the turn hooks built from its wake to the request it runs', async () => {
+    const r = rig();
 
     await r.gateway.handler!(r.threadPayload);
 
-    expect(r.closings).toHaveLength(1);
-    const [, turn] = r.closings[0];
-    expect(turn).toEqual({
-      result,
+    expect(r.closingHooks).toHaveLength(1);
+    const [, wake] = r.closingHooks[0];
+    expect(wake).toEqual({
       userId: 'user-synthetic',
       identityId: 'identity-synthetic',
       threadId: 'thread-synthetic',
       threadKey: 'pr:42',
       threadMessageId: 'message-synthetic',
     });
-    expect(r.sequence).toEqual(['route', 'closing']);
+    expect(r.requests[0]?.turnHooks).toBe(r.closingHooksMade);
   });
 
-  it('offers nothing for a failed turn', async () => {
-    const r = rig({ resultFailure: { success: false, admitted: true, error: 'backend died' } });
+  it('hands none to a trigger that names no thread message', async () => {
+    const r = rig();
 
-    await r.gateway.handler!(r.threadPayload).catch(() => undefined);
+    await r.gateway.handler!({ ...r.threadPayload, threadMessageId: undefined });
 
-    expect(r.closings).toHaveLength(0);
-  });
-
-  it('a throw from it never fails the trigger after the turn succeeded', async () => {
-    const r = rig({ resultSuccess: result, closingThrows: true });
-
-    await expect(r.gateway.handler!(r.threadPayload)).resolves.not.toThrow();
-    expect(r.closings).toHaveLength(1);
+    expect(r.closingHooks).toHaveLength(0);
+    expect(r.requests[0]?.turnHooks).toBeUndefined();
   });
 });
 

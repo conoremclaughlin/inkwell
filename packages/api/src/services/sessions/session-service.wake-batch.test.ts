@@ -290,6 +290,21 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     expect(internals().processingLocks.size).toBe(0);
   });
 
+  it("wraps a merged turn in its lead's turn hooks alone (Lumen, #769)", async () => {
+    const order: string[] = [];
+    const hooks = (name: string) => ({
+      start: async () => void order.push(`start ${name}`),
+      end: async (result: SessionResult) =>
+        void order.push(`end ${name}${result.wake ? ' (carried)' : ''}`),
+    });
+    await behindABusyTurn([
+      { ...wake('m1'), turnHooks: hooks('m1') },
+      { ...wake('m2'), turnHooks: hooks('m2') },
+    ]);
+    expect(turnsAfterTheFirst()).toHaveLength(1);
+    expect(order).toEqual(['start m1', 'end m1']);
+  });
+
   it('keeps a channel message between wakes in its place', async () => {
     await behindABusyTurn([
       wake('m1'),
