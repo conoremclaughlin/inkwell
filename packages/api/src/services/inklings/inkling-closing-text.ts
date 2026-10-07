@@ -158,8 +158,9 @@ export function closingTextTurnHooks(
         .select('metadata')
         .eq('id', wake.identityId)
         .maybeSingle();
-      // An identity that can't be read is judged again at the end, where a
-      // missing boundary decides nothing.
+      // An identity that can't be read here is taken as possibly an inkling,
+      // so the boundary is read; the end reads the identity again itself, and
+      // only an inkling of this user is ever posted for (Lumen, #769).
       inkling =
         Boolean(error) ||
         (data as { metadata: Record<string, unknown> | null } | null)?.metadata?.client ===
