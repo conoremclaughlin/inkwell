@@ -18,6 +18,8 @@ import { hasUnread } from '@inklabs/shared/stories/thread-read-state';
 | `thread-browsing`   | Scanning the thread list: which threads show, how a row reads, what search and filters match.                                                                                            |
 | `thread-viewing`    | Reading one thread as a conversation: who wrote what, day and unread dividers, grouping, older history, folding long bodies, and markdown parsed for any renderer that is not a browser. |
 | `thread-read-state` | Knowing what's new: which messages count as unread against a read cursor.                                                                                                                |
+| `reacting`          | Reacting to a message: which emoji a reaction may be added with, by one exact lookup over a pinned Unicode and CLDR catalog.                                                             |
+| `reaction-picking`  | Browsing the full reaction picker: every emoji's CLDR name and keywords, and search. A client loads it only when the picker opens.                                                       |
 
 ## Rules
 
@@ -35,7 +37,7 @@ import { hasUnread } from '@inklabs/shared/stories/thread-read-state';
   one bundle break hooks. `packages/mobile/metro.config.js` shows how.
 - **Stories may import each other, through the other story's `index.ts`,
   without cycles.** Today the order is: `threads-api` ← `thread-read-state` ←
-  `thread-viewing` ← `thread-browsing`.
+  `thread-viewing` ← `thread-browsing`, and `reacting` ← `reaction-picking`.
 - **Tests sit beside the code** and run in CI with the package's own
   `yarn test`.
 - **New shared client code starts a story, or joins one.** Name the story after

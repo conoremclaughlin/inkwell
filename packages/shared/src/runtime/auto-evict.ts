@@ -59,6 +59,8 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'grep',
   'find',
   'ls',
+  // Writes only its own content-addressed cache copy; viewing again is safe.
+  'view_image',
   // memory & context
   'bootstrap',
   'recall',

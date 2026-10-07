@@ -1,5 +1,14 @@
 /** Compatibility path; the implementation lives in @inklabs/shared/providers. */
 export {
+  MAX_TEXT_DOCUMENT_BYTES,
+  MAX_PDF_PAGES,
+  MAX_DOCUMENT_TEXT_CHARS,
+  PDF_EXTRACT_TIMEOUT_MS,
+  encodeContextImageBlocks,
+  encodeDocumentBlocks,
+  extractPdfText,
+  type ExtractedPdf,
+  type PdfExtractor,
   MAX_MEDIA_FILE_BYTES,
   MAX_MEDIA_TOTAL_BYTES,
   classifyMedia,

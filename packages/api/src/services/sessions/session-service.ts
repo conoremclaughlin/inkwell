@@ -48,6 +48,8 @@ import {
   admitStateWrite,
 } from './active-runs.js';
 import { launchHoldFor, reserveLaunch } from './launched-processes.js';
+import { uploadMediaForRunner } from '../uploads/runner-media.js';
+import { uploadsRoot } from '../uploads/runtime.js';
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
@@ -57,6 +59,12 @@ import {
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
+import {
+  batchTurnEpoch,
+  coalescibleWakeSource,
+  mergedWakeContent,
+  takeWakeBatch,
+} from './wake-batch.js';
 import { selectInkRunner, type HostedInkSelection } from './hosted-ink-session.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import {
@@ -93,14 +101,19 @@ import {
   inklingTurnRefusal,
   isOwnersOwnMessage,
 } from '../inklings/inkling-turn-gate.js';
-import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
+import {
+  ensureInklingFolder,
+  inklingToolPolicyPath,
+  inklingsRoot,
+} from '../inklings/inkling-folder.js';
 import { trackInklingTurn } from '../inklings/inkling-turns.js';
 import {
   INKLING_FENCE_REASON,
   fenceInkling,
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
-import { inklingRuntime, type InklingProvider } from '../inklings/inkling-runtime.js';
+import { inklingRuntime } from '../inklings/inkling-runtime.js';
+import { inkProviderFor, type InkProvider } from './ink-provider.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 
 /**
@@ -202,6 +215,11 @@ interface PendingMessage {
    * releases.
    */
   turnEpochCandidate: string;
+  /**
+   * Set when a batch found this wake's merge in doubt, so the next dequeue
+   * runs it alone (wake-batch.ts).
+   */
+  noMerge?: boolean;
 }
 
 /**
@@ -1962,7 +1980,7 @@ export class SessionService implements ISessionService {
       logger.debug('Acquired processing lock', { lockKey });
 
       try {
-        const result = await this.processMessage(request, session, turnEpochCandidate);
+        const result = await this.runTurn(request, session, turnEpochCandidate);
         // If the initial lock-holder failed with a non-retryable error,
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
@@ -2100,6 +2118,14 @@ export class SessionService implements ISessionService {
     const queue = this.pendingQueues.get(lockKey);
 
     if (queue && queue.length > 0) {
+      // Wakes queued side by side run as one turn (spec trigger-pipe-in v7).
+      const batch = takeWakeBatch(queue);
+      if (batch) {
+        if (queue.length === 0) this.pendingQueues.delete(lockKey);
+        await this.runWakeBatch(lockKey, batch);
+        return;
+      }
+
       // Pop next message and process it (keep lock held)
       const pending = queue.shift()!;
       logger.info('Processing queued message', {
@@ -2163,11 +2189,7 @@ export class SessionService implements ISessionService {
     session: Session
   ): Promise<void> {
     try {
-      const result = await this.processMessage(
-        pending.request,
-        session,
-        pending.turnEpochCandidate
-      );
+      const result = await this.runTurn(pending.request, session, pending.turnEpochCandidate);
       // Same admission evidence as the direct path: resolution succeeded
       // before this turn ran, so whatever the turn did, routing admitted it.
       pending.resolve({ ...result, admitted: true });
@@ -2181,6 +2203,148 @@ export class SessionService implements ISessionService {
       // Continue processing queue (if not flushed above)
       await this.processQueueOrReleaseLock(lockKey);
     }
+  }
+
+  /**
+   * Run wakes taken off the queue together as one turn (spec trigger-pipe-in
+   * v7, slice 1), then continue the lock's queue. Each is re-resolved on its
+   * own, in queue order. One that fails is rejected alone, and one that now
+   * resolves to another session is handed off alone; only the members still
+   * resolving to this lock's session share the turn. When anything leaves the
+   * merge in doubt, they run one by one, exactly as they would have before.
+   */
+  private async runWakeBatch(lockKey: string, batch: PendingMessage[]): Promise<void> {
+    logger.info('Processing queued wakes together', { lockKey, count: batch.length });
+    const handled = new Set<PendingMessage>();
+    const reject = (pending: PendingMessage, error: unknown) => {
+      handled.add(pending);
+      pending.reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    // Set when a turn this method started continues the queue itself.
+    let queueContinued = false;
+    try {
+      const members: Array<{ pending: PendingMessage; session: Session }> = [];
+      for (const pending of batch) {
+        let session: Session;
+        try {
+          session = await this.getOrCreateSession(
+            pending.request.userId,
+            pending.request.sbSlug,
+            sessionRoutingOptions(pending.request, pending.turnEpochCandidate)
+          );
+        } catch (error) {
+          // This member alone: its resolution failing is no verdict on the
+          // other members or on the queue behind them, so nothing is flushed.
+          reject(pending, error);
+          continue;
+        }
+        const targetKey = `${pending.request.sbSlug}:${session.id}`;
+        if (targetKey !== lockKey) {
+          handled.add(pending);
+          this.handOffQueuedTurn(lockKey, targetKey, pending, session);
+          continue;
+        }
+        members.push({ pending, session });
+      }
+      if (members.length === 0) return;
+
+      const lead = members[0];
+      const { userId, sbSlug } = lead.pending.request;
+      let mergeable = members.length > 1;
+      let stamped = new Set<string>();
+      if (mergeable) {
+        try {
+          // An inkling's gate reads each wake's own source, so its turns stay
+          // apart, and so do those of an identity that cannot be read.
+          const identity = await this.classifyTurnIdentity(userId, sbSlug, lead.session.sbId);
+          mergeable = identity.kind === 'other';
+          if (mergeable) stamped = await this.leaseTurnEpochs(lead.session.id, userId);
+        } catch (error) {
+          logger.warn('Running queued wakes one by one; their merge could not be checked', {
+            lockKey,
+            error: serializeError(error),
+          });
+          mergeable = false;
+        }
+      }
+
+      if (!mergeable) {
+        // One by one, from the front: the rest go back where they were, and
+        // are not offered for merging again.
+        const rest = members.slice(1).map(({ pending }) => {
+          pending.noMerge = true;
+          handled.add(pending);
+          return pending;
+        });
+        if (rest.length > 0) {
+          this.pendingQueues.set(lockKey, [...rest, ...(this.pendingQueues.get(lockKey) ?? [])]);
+        }
+        handled.add(lead.pending);
+        queueContinued = true;
+        await this.runQueuedTurn(lockKey, lead.pending, lead.session);
+        return;
+      }
+
+      // The epoch its members' routing actually left on the lease (wake-batch.ts).
+      const epoch = batchTurnEpoch(
+        members.map(({ pending }) => pending.turnEpochCandidate),
+        stamped
+      );
+      const sources = members.map(({ pending }) => coalescibleWakeSource(pending)!);
+      const request: SessionRequest = {
+        ...lead.pending.request,
+        sender: {
+          ...lead.pending.request.sender,
+          name: [...new Set(members.map(({ pending }) => pending.request.sender.name))].join(', '),
+        },
+        content: mergedWakeContent(members.map(({ pending }) => pending.request.content)),
+        metadata: { ...lead.pending.request.metadata, coalescedSources: sources },
+      };
+      logger.info('Running queued wakes as one turn', {
+        lockKey,
+        sources,
+        epochOfMember: members.findIndex(({ pending }) => pending.turnEpochCandidate === epoch),
+      });
+
+      let result: SessionResult;
+      try {
+        result = await this.runTurn(request, members[members.length - 1].session, epoch);
+      } catch (error) {
+        for (const { pending } of members) reject(pending, error);
+        this.flushQueueOnNonRetryableError(
+          lockKey,
+          error instanceof Error ? error.message : String(error)
+        );
+        return;
+      }
+      // The lead owns what the turn sent; the others share its outcome and
+      // are told which wake carried them, so nothing is routed twice.
+      handled.add(lead.pending);
+      lead.pending.resolve({ ...result, admitted: true });
+      for (const { pending } of members.slice(1)) {
+        handled.add(pending);
+        pending.resolve({
+          ...result,
+          admitted: true,
+          responses: [],
+          finalTextResponse: undefined,
+          wake: { coalescedInto: sources[0] },
+        });
+      }
+      if (!result.success && result.error) {
+        this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
+      }
+    } catch (error) {
+      // Nothing taken off the queue is left unsettled.
+      for (const pending of batch) if (!handled.has(pending)) reject(pending, error);
+    } finally {
+      if (!queueContinued) await this.processQueueOrReleaseLock(lockKey);
+    }
+  }
+
+  /** The turn epochs stamped on the leases this session holds; none without a lease service. */
+  private async leaseTurnEpochs(sessionId: string, userId: string): Promise<Set<string>> {
+    return (await this.getLeaseService()?.turnEpochsHeldBy(sessionId, userId)) ?? new Set();
   }
 
   private rejectQueuedTurn(lockKey: string, pending: PendingMessage, error: unknown): void {
@@ -2280,6 +2444,42 @@ export class SessionService implements ISessionService {
   }
 
   /**
+   * One turn of `request`, with its caller's turn hooks around it
+   * (SessionTurnHooks). Every path that runs a turn comes through here, so a
+   * hook sees each of its request's turns, in turn order, before the next
+   * queued turn begins. A turn that throws has no end to report.
+   */
+  private async runTurn(
+    request: SessionRequest,
+    session: Session,
+    turnEpochCandidate?: string
+  ): Promise<SessionResult> {
+    const hooks = request.turnHooks;
+    if (hooks) await this.callTurnHook('start', request, () => hooks.start());
+    const result = await this.processMessage(request, session, turnEpochCandidate);
+    // Every caller of this reports the turn as admitted: it ran.
+    if (hooks)
+      await this.callTurnHook('end', request, () => hooks.end({ ...result, admitted: true }));
+    return result;
+  }
+
+  private async callTurnHook(
+    which: 'start' | 'end',
+    request: SessionRequest,
+    hook: () => Promise<void>
+  ): Promise<void> {
+    try {
+      await hook();
+    } catch (error) {
+      logger.warn(`A turn ${which} hook failed; the turn goes on`, {
+        sbSlug: request.sbSlug,
+        threadKey: request.metadata?.threadKey,
+        error: serializeError(error),
+      });
+    }
+  }
+
+  /**
    * Process a message with an already-acquired lock.
    * This is the core message processing logic, separated from locking.
    */
@@ -2325,9 +2525,10 @@ export class SessionService implements ISessionService {
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
-    // The provider `ink chat` is told to run. Only an inkling's turn names
-    // one; every other ink spawn keeps the chat's own default.
-    let inkProvider: InklingProvider | undefined;
+    // The provider `ink chat` is told to run: an inkling's from its runtime
+    // decision below, an ordinary SB's from the provider its identity names.
+    // None named keeps the chat's own default.
+    let inkProvider: InkProvider | undefined;
     let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
@@ -2474,6 +2675,40 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // An ordinary SB's ink turn runs the provider its identity names, named to
+    // `ink chat` so the model chosen for that provider meets the provider that
+    // runs it (ink-provider.ts). One ink does not run is refused here, before
+    // the provider is launched and before the session's runtime or native id
+    // is rewritten, never run as Claude in its place. (The message is already
+    // logged, and its session row may already exist or hold a lease.) An
+    // inkling's provider was decided with its runtime above. triggerCompaction
+    // builds its own runner and names no provider; it runs only for
+    // claude-code sessions today, so it is outside this decision.
+    if (resolvedBackend === 'ink' && !inklingTurn) {
+      const choice = inkProviderFor(injectedContext.agent.provider);
+      if (!choice.ok) {
+        const summary = `Ink turn refused: ${choice.reason}`;
+        logger.warn('[InkProvider] Turn refused', {
+          sbSlug,
+          sbId: session.sbId,
+          reason: choice.reason,
+        });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: summary,
+          errorCode: 'INK_PROVIDER_UNSUPPORTED',
+          classification: { category: 'config', summary, retryable: false },
+        };
+      }
+      inkProvider = choice.provider;
+    }
+
     // A Claude session in a studio gets its profile at launch, from the row
     // (design v5, phase A). A row that cannot be read, or is gone, fails the
     // launch here rather than letting it start without the profile it was
@@ -2553,6 +2788,16 @@ export class SessionService implements ISessionService {
       // tools are always ink-owned: a dashboard setting must not hand its
       // provider's native tools to the turn.
       toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
+      // An inkling's tools are bounded by its own profile and policy file,
+      // never by this machine's grants (task 0321ccf1).
+      ...(inklingTurn && inklingSbId
+        ? {
+            inklingToolPolicyPath: inklingToolPolicyPath(
+              inklingSbId,
+              this.config.inklingsRoot ?? inklingsRoot()
+            ),
+          }
+        : {}),
       ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       ...(launchPermissions ? { launchPermissions } : {}),
@@ -2870,9 +3115,33 @@ export class SessionService implements ISessionService {
             }),
           };
 
+    // A person's uploads reach a runner only as it declares (IRunner.uploadMedia):
+    // granted per spawn, or dropped here with a line the turn sees. A dropped
+    // upload's path stays out of the prompt as well: the message is formatted
+    // again from the media that remain, so everything else in it is unchanged.
+    const uploads = uploadMediaForRunner({
+      attachments: mediaAttachments,
+      root: uploadsRoot(),
+      policy: runner.uploadMedia,
+      sandboxed: !!runnerConfig.container,
+    });
+    const runMessage =
+      uploads.dropped.length === 0
+        ? formattedMessage
+        : `${this.formatMessage(
+            {
+              ...request,
+              metadata: {
+                ...request.metadata,
+                media: request.metadata?.media?.filter((m) => !uploads.dropped.includes(m)),
+              },
+            },
+            injectedContext.user.timezone
+          )}\n\n${uploads.note}`;
+
     try {
       result = await turnRunner
-        .run(formattedMessage, {
+        .run(runMessage, {
           backendSessionId: session.backendSessionId || undefined,
           // Always handed over, including on resume. Every runner already gates
           // its own injection on `!isResume`, so this does not change what a
@@ -2892,7 +3161,7 @@ export class SessionService implements ISessionService {
             ...(launch ? { launchEnv: launch.env } : {}),
             onSpawned: (spawned) => launch?.spawned(spawned),
           },
-          mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
+          mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
         })
         .then((ran) => {
           // A stop the runner could not confirm leaves its row open, for the

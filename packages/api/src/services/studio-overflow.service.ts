@@ -59,6 +59,7 @@ import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
 import { isSafeStudioComponent, studioPermissionProfile, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
+import type { Json } from '../data/supabase/types';
 import { ephemeralWorktreePath } from './studio-paths';
 import { completeStudioViaCli } from './studio-complete';
 import {
@@ -74,8 +75,12 @@ import {
 } from './studio-lease.service';
 import { logger } from '../utils/logger';
 import { withKeyedLock } from '../utils/keyed-lock';
+import { worktreeInUse, type WorktreeUse } from './worktree-in-use';
 
 const execFileAsync = promisify(execFile);
+
+/** How long a teardown that backed out of an in-use worktree waits before the sweep looks again. */
+const IN_USE_RETRY_MS = 15 * 60 * 1000;
 
 /** `pr:476` → `pr-476`; deterministic, filesystem- and branch-safe. */
 export function threadSlug(threadKey: string): string {
@@ -230,8 +235,58 @@ interface OverflowVariantState {
 export class StudioOverflowService {
   constructor(
     private studios: StudiosRepository,
-    private leases: StudioLeaseService
+    private leases: StudioLeaseService,
+    /** What is running from a worktree; injectable for tests. */
+    private inUse: (worktreePath: string) => Promise<WorktreeUse> = worktreeInUse
   ) {}
+
+  /**
+   * Back out of a teardown when anything is running from the worktree.
+   *
+   * The lease is not a complete liveness signal: a turn routed into a studio
+   * need not take its lease, and a dev server or a shell never does. On
+   * 2026-10-07 the sweep removed an expired ephemeral checkout 17 seconds
+   * into a Codex turn spawned there, under a running Metro (task 7ec05d10).
+   * Removing a checkout something is running from is never the sweep's call,
+   * and a check that could not run counts as in use.
+   *
+   * Clears this teardown's own claim, so the studio is not left quarantined,
+   * and pushes expires_at out so the sweep looks again later.
+   */
+  private async backOutIfInUse(
+    studio: Studio,
+    claim: StudioLease,
+    reason: string
+  ): Promise<boolean> {
+    const use = await this.inUse(studio.worktreePath).catch(
+      (error: unknown): WorktreeUse => ({
+        state: 'unknown',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
+    if (use.state === 'idle') return false;
+
+    await this.leases.clearTeardownClaim(studio.id, studio.userId, claim).catch(() => false);
+    await this.studios
+      .update(studio.id, { expiresAt: new Date(Date.now() + IN_USE_RETRY_MS).toISOString() })
+      .catch(() => undefined);
+    const detail: Record<string, Json> =
+      use.state === 'in-use'
+        ? { processes: use.processes.map(({ pid, command }) => ({ pid, command })) }
+        : { checkFailed: use.error };
+    logger.warn('[StudioOverflow] Teardown skipped — worktree in use', {
+      studioId: studio.id,
+      worktreePath: studio.worktreePath,
+      reason,
+      ...detail,
+    });
+    await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
+      sbSlug: studio.sbSlug ?? undefined,
+      reason: `teardown-skipped-in-use (${reason})`,
+      detail,
+    });
+    return true;
+  }
 
   /**
    * Is this row genuinely the overflow studio for (parent, threadKey)? A slug
@@ -1136,6 +1191,10 @@ export class StudioOverflowService {
       return;
     }
 
+    // Before the rescue, which stashes a dirty tree: live work in a checkout
+    // that is still being used must not be stashed out from under it.
+    if (await this.backOutIfInUse(studio, claim, opts.reason)) return;
+
     const worktreeExists = await access(studio.worktreePath)
       .then(() => true)
       .catch(() => false);
@@ -1167,8 +1226,15 @@ export class StudioOverflowService {
         return;
       }
 
+      // Again at the last moment: something may have started in the
+      // worktree while the rescue ran.
+      if (await this.backOutIfInUse(studio, claim, opts.reason)) return;
+
       // Token revalidation immediately before destruction: if our claim aged
       // out and another worker took over, the removal is theirs, not ours.
+      // After the process probe, never before it: that probe awaits lsof for
+      // up to 15 seconds, long enough for a stale claim to be replaced
+      // (Lumen, #766).
       if (!(await this.leases.verifyClaim(studio.id, studio.userId, claim))) {
         logger.warn('[StudioOverflow] Teardown aborted — claim no longer ours', {
           studioId: studio.id,

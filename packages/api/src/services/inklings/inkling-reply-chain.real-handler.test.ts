@@ -146,6 +146,8 @@ beforeEach(() => {
   resetReplyChains();
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
+  // An SB writes with its owner's role, on every send path (Lumen, #769).
+  db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
   sb('pip', OWNER_TEST_INKLING);
   sb('fern');
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);

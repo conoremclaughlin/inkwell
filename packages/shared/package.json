@@ -60,7 +60,8 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "marked": "^15.0.12"
+    "marked": "^15.0.12",
+    "pdf-parse": "^2.4.5"
   },
   "peerDependencies": {
     "react": ">=18.0.0"

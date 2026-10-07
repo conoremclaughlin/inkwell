@@ -100,12 +100,17 @@ export function ledgerEntryPromptBytes(entry: {
   role: string;
   content: string;
   source?: string;
+  images?: ReadonlyArray<{ approxTokens: number }>;
 }): number {
   return (
     utf8Bytes(entry.content) +
     utf8Bytes(entry.role) +
     utf8Bytes(entry.source ?? '') +
-    LEDGER_ENTRY_FRAME_BYTES
+    LEDGER_ENTRY_FRAME_BYTES +
+    // An image rides the spawn as a block, not as text, but it fills the
+    // window all the same. Its token estimate stands in for bytes here, which
+    // keeps the bound this function promises: never less than it costs.
+    (entry.images ?? []).reduce((sum, image) => sum + image.approxTokens, 0)
   );
 }
 

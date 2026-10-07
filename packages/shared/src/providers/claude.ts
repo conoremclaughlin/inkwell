@@ -6,6 +6,16 @@
  */
 
 import { constants as fsConstants } from 'fs';
+import { basename } from 'path';
+import { extractPdfText, type PdfExtractor } from './pdf-extractor.js';
+export {
+  extractPdfText,
+  type PdfExtractor,
+  type ExtractedPdf,
+  PDF_EXTRACT_TIMEOUT_MS,
+  MAX_DOCUMENT_TEXT_CHARS,
+} from './pdf-extractor.js';
+import { PDF_EXTRACT_TIMEOUT_MS, MAX_DOCUMENT_TEXT_CHARS } from './pdf-extractor.js';
 import { mkdir, open, stat, type FileHandle } from 'fs/promises';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import { buildIdentityPrompt } from './identity-prompt.js';
@@ -103,6 +113,8 @@ export interface EncodedMedia {
    * reopens native read — the failure is reported loudly instead.
    */
   rejected: Array<{ media: TurnMedia; reason: string }>;
+  /** Raw image bytes or UTF-8 document-block bytes spent in this batch. */
+  totalBytes: number;
 }
 
 /**
@@ -114,28 +126,209 @@ export async function encodeMediaBlocks(
   readBounded: (
     path: string,
     maxBytes: number
-  ) => Promise<Buffer | null> | Buffer | null = readMediaBounded
+  ) => Promise<Buffer | null> | Buffer | null = readMediaBounded,
+  budgetBytes: number = MAX_MEDIA_TOTAL_BYTES
 ): Promise<EncodedMedia> {
-  const out: EncodedMedia = { blocks: [], injected: [], rejected: [] };
-  let totalBytes = 0;
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
   for (const m of candidates) {
-    if (totalBytes >= MAX_MEDIA_TOTAL_BYTES) {
+    if (out.totalBytes >= budgetBytes) {
       out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
       continue;
     }
     const buf = await readBounded(
       m.path,
-      Math.min(MAX_MEDIA_FILE_BYTES, MAX_MEDIA_TOTAL_BYTES - totalBytes)
+      Math.min(MAX_MEDIA_FILE_BYTES, budgetBytes - out.totalBytes)
     );
     if (!buf) {
       out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
       continue;
     }
-    totalBytes += buf.byteLength;
+    out.totalBytes += buf.byteLength;
     out.blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: m.mimeType, data: buf.toString('base64') },
     });
+    out.injected.push(m);
+  }
+  return out;
+}
+
+/**
+ * Tool-captured images as content blocks, each preceded by a one-line label
+ * naming its ref, so a spawn carrying several (a re-seed delivers every image
+ * still on the ledger) says which picture is which. Shares the request's
+ * media budget with the turn's own attachments, which are encoded first.
+ */
+export async function encodeContextImageBlocks(
+  images: TurnMedia[],
+  usedBytes: number,
+  readBounded: (
+    path: string,
+    maxBytes: number
+  ) => Promise<Buffer | null> | Buffer | null = readMediaBounded
+): Promise<EncodedMedia> {
+  const encoded = await encodeMediaBlocks(
+    images,
+    readBounded,
+    Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes)
+  );
+  const labelled: Array<Record<string, unknown>> = [];
+  encoded.injected.forEach((image, i) => {
+    const ref = (image as { ref?: unknown }).ref;
+    labelled.push({
+      type: 'text',
+      text: `[image ${typeof ref === 'string' ? ref : image.path}]`,
+    });
+    labelled.push(encoded.blocks[i]!);
+  });
+  return { ...encoded, blocks: labelled };
+}
+
+/**
+ * Documents a withheld turn reads inline (task 0321ccf1). With no native
+ * tool, a file the provider can't take as an image block is shown as text
+ * this process reads: a text file as it is, a PDF as the text extracted from
+ * its first pages. Each sits in a fenced block that says which file it is.
+ * The fence keeps the file's words apart from the message's; it does not
+ * make instructions inside a file harmless.
+ */
+export const MAX_TEXT_DOCUMENT_BYTES = 1024 * 1024;
+export const MAX_PDF_PAGES = 30;
+
+type DocumentKind = 'text' | 'pdf';
+
+function documentKind(m: TurnMedia): DocumentKind | null {
+  const mime = (m.mimeType ?? '').split(';')[0]!.trim().toLowerCase();
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('text/') || mime === 'application/json') return 'text';
+  return null;
+}
+
+/** The text, cut at `max` characters without splitting a surrogate pair. */
+function capText(text: string, max: number): { text: string; cut: boolean } {
+  if (text.length <= max) return { text, cut: false };
+  let end = max;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return { text: text.slice(0, end), cut: true };
+}
+
+/** A fence no run of backticks in the content can close. */
+function fenceFor(content: string): string {
+  let longest = 0;
+  for (const run of content.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+/** A file name fit for one line of the label. */
+function labelName(path: string): string {
+  return basename(path).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '?');
+}
+
+function documentBlock(label: string, content: string, cut: boolean): Record<string, unknown> {
+  const fence = fenceFor(content);
+  const tail = cut
+    ? `\n[The text was cut at ${MAX_DOCUMENT_TEXT_CHARS.toLocaleString('en-US')} characters; the rest is not shown.]`
+    : '';
+  return { type: 'text', text: `${label}\n${fence}\n${content}\n${fence}${tail}` };
+}
+
+/**
+ * Encode a withheld turn's documents as text blocks. Shares the request's
+ * media budget with images: `usedBytes` is what the turn's images took, and
+ * each block's UTF-8 size counts against the rest. Anything that can't be
+ * shown (another type, unreadable, oversize, not UTF-8, a PDF with no
+ * readable text, an exhausted budget) is rejected with its reason, for the
+ * note the model is given; nothing reopens native read.
+ */
+export async function encodeDocumentBlocks(
+  documents: TurnMedia[],
+  usedBytes: number,
+  readBounded: (
+    path: string,
+    maxBytes: number
+  ) => Promise<Buffer | null> | Buffer | null = readMediaBounded,
+  extractPdf: PdfExtractor = extractPdfText,
+  now: () => number = Date.now
+): Promise<EncodedMedia> {
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [], totalBytes: 0 };
+  const budget = Math.max(0, MAX_MEDIA_TOTAL_BYTES - usedBytes);
+  // One extraction deadline for the whole turn, not one per PDF. Multiple
+  // documents never multiply the parser budget, and no parser blocks the host.
+  const deadline = now() + PDF_EXTRACT_TIMEOUT_MS;
+  for (const m of documents) {
+    const kind = documentKind(m);
+    if (!kind) {
+      out.rejected.push({ media: m, reason: 'not a type that can be shown in this conversation' });
+      continue;
+    }
+    if (out.totalBytes >= budget) {
+      out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
+      continue;
+    }
+    const name = labelName(m.path);
+    let block: Record<string, unknown>;
+    if (kind === 'text') {
+      const buf = await readBounded(m.path, MAX_TEXT_DOCUMENT_BYTES);
+      if (!buf) {
+        out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
+        continue;
+      }
+      let text: string;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      } catch {
+        out.rejected.push({ media: m, reason: 'not valid UTF-8 text' });
+        continue;
+      }
+      const capped = capText(text, MAX_DOCUMENT_TEXT_CHARS);
+      const mime = (m.mimeType ?? 'text/plain').split(';')[0]!.trim();
+      block = documentBlock(
+        `[Attached file ${name} (${mime}, ${buf.byteLength.toLocaleString('en-US')} bytes). Its contents follow between the fences.]`,
+        capped.text,
+        capped.cut
+      );
+    } else {
+      const buf = await readBounded(m.path, MAX_MEDIA_FILE_BYTES);
+      if (!buf) {
+        out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
+        continue;
+      }
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        out.rejected.push({ media: m, reason: 'the time for reading attached files ran out' });
+        continue;
+      }
+      const extracted = await extractPdf(buf, MAX_PDF_PAGES, remaining);
+      if (!extracted) {
+        out.rejected.push({ media: m, reason: 'its text could not be read as a PDF' });
+        continue;
+      }
+      if (!extracted.text.trim()) {
+        out.rejected.push({
+          media: m,
+          reason: 'no text could be extracted (it may hold only scanned images)',
+        });
+        continue;
+      }
+      const capped = capText(extracted.text, MAX_DOCUMENT_TEXT_CHARS);
+      const pages =
+        extracted.pages < extracted.total
+          ? `pages 1–${extracted.pages} of ${extracted.total}`
+          : `${extracted.total} page${extracted.total === 1 ? '' : 's'}`;
+      block = documentBlock(
+        `[Attached file ${name} (PDF, ${pages}). The text extracted from it follows between the fences; its layout and images are not included.]`,
+        capped.text,
+        capped.cut
+      );
+    }
+    const size = Buffer.byteLength(block.text as string, 'utf8');
+    if (out.totalBytes + size > budget) {
+      out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
+      continue;
+    }
+    out.totalBytes += size;
+    out.blocks.push(block);
     out.injected.push(m);
   }
   return out;
@@ -146,8 +339,14 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly binary = 'claude';
   // Prompt is delivered via stdin (see prepare() below) — no argv ceiling.
   readonly promptTransport = 'stdin' as const;
+  readonly acceptsContextImages = true;
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
+    // Refuse before any file read or temp write if a direct adapter caller
+    // requests an incoherent boundary. The shared runner forces local.
+    if (config.withholdProviderTools && config.toolRouting !== 'local') {
+      throw new Error('withholdProviderTools requires ink-owned (local) tool routing');
+    }
     // MCP config: merge project .mcp.json with skill-provided MCP servers.
     // Pass inkSessionId/studioId explicitly — process.env doesn't have them yet
     // (they're set in the spawn env below, not in the sb CLI's own env).
@@ -203,6 +402,7 @@ export class ClaudeAdapter implements BackendAdapter {
     );
 
     const args: string[] = [];
+    const withhold = config.withholdProviderTools === true;
 
     // Media injection (spec:provider-media-injection): embed images as
     // base64 content blocks in a stream-json user message instead of having
@@ -238,7 +438,61 @@ export class ClaudeAdapter implements BackendAdapter {
         '(fail-closed; no filesystem fallback). Tell the user, naming each file:\n' +
         encoded.rejected.map((r) => `- ${r.media.path} — ${r.reason}`).join('\n');
     }
-    const injecting = (encoded?.blocks.length ?? 0) > 0;
+    // Withheld: with no native tool there is no native read, so a document
+    // is read here and shown as text on the delivery spawn, and anything
+    // that can't be shown is named to the model as unopened rather than left
+    // for it to look for a way in.
+    const documents =
+      withhold && config.prompt && config.deliverMedia && classified.nativeRead.length > 0
+        ? await encodeDocumentBlocks(classified.nativeRead, encoded?.totalBytes ?? 0)
+        : undefined;
+    if (documents && documents.rejected.length > 0) {
+      for (const r of documents.rejected) {
+        host.warn(`[media] document not shown (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote +=
+        '\n\n[media note] These attached file(s) could NOT be opened, and there is no other ' +
+        'way to read a file here. Tell the user you could not open each one, and why:\n' +
+        documents.rejected
+          .map(
+            (r) =>
+              `- ${labelName(r.media.path)}${r.media.mimeType ? ` (${r.media.mimeType})` : ''} — ${r.reason}`
+          )
+          .join('\n');
+    }
+    // Images a tool put in context. Embedded whenever the host sends them —
+    // it sends exactly what this provider session has not been given — and
+    // kept out of the --tools gate below, which reads `media` alone.
+    const contextImages = config.prompt ? (config.contextImages ?? []) : [];
+    const encodedContext =
+      contextImages.length > 0
+        ? await encodeContextImageBlocks(
+            contextImages,
+            (encoded?.totalBytes ?? 0) + (documents?.totalBytes ?? 0)
+          )
+        : undefined;
+    if (encodedContext && encodedContext.rejected.length > 0) {
+      for (const r of encodedContext.rejected) {
+        host.warn(`[media] context image not injected (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote +=
+        '\n\n[image note] These image(s), named in your context, could NOT be attached to ' +
+        'this message, so you have not seen them. Each goes again with your next message ' +
+        'while it stays in your context; evict it if you no longer need it, or view the ' +
+        'file again if the reason is that it is unreadable:\n' +
+        encodedContext.rejected
+          .map((r) => {
+            const ref = (r.media as { ref?: unknown }).ref;
+            return `- ${typeof ref === 'string' ? ref : 'image'} — ${r.reason}`;
+          })
+          .join('\n');
+    }
+    const contentBlocks = [
+      ...(encoded?.blocks ?? []),
+      ...(documents?.blocks ?? []),
+      ...(encodedContext?.blocks ?? []),
+    ];
+    const injecting = contentBlocks.length > 0;
     const promptText = config.prompt ? config.prompt + rejectionNote : config.prompt;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
@@ -310,7 +564,7 @@ export class ClaudeAdapter implements BackendAdapter {
       // closed and never reopen Read.
       const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
       const needsNativeRead =
-        hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
+        !withhold && hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
       args.push('--tools', needsNativeRead ? 'Read' : '');
     }
 
@@ -319,35 +573,39 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-skip-permissions');
     }
 
-    // Attachment directories: grant read access so files attached to the
-    // turn (--attach-file paths referenced in the prompt) are readable
-    // without permission prompts. Claude Code's Read renders images
-    // natively, so this is the full multimodal path for CLI spawns.
-    for (const dir of config.attachmentDirs ?? []) {
-      args.push('--add-dir', dir);
-    }
+    // A withheld spawn receives no grants, including ambient media and
+    // studios. Files injected above are read here, never by a native tool.
+    if (!withhold) {
+      // Attachment directories: grant read access so files attached to the
+      // turn (--attach-file paths referenced in the prompt) are readable
+      // without permission prompts. Claude Code's Read renders images
+      // natively, so this is the full multimodal path for CLI spawns.
+      for (const dir of config.attachmentDirs ?? []) {
+        args.push('--add-dir', dir);
+      }
 
-    // Inkwell media directory: always grant read access so agents can
-    // read downloaded attachments (email, Telegram, etc.) via the native
-    // Read tool. This is Inkwell's own directory, not arbitrary fs access.
-    const inkFilesDir = host.paths.inkFiles;
-    if (
-      await stat(inkFilesDir).then(
-        () => true,
-        () => false
-      )
-    ) {
-      args.push('--add-dir', inkFilesDir);
-    }
+      // Inkwell media directory: always grant read access so agents can
+      // read downloaded attachments (email, Telegram, etc.) via the native
+      // Read tool. This is Inkwell's own directory, not arbitrary fs access.
+      const inkFilesDir = host.paths.inkFiles;
+      if (
+        await stat(inkFilesDir).then(
+          () => true,
+          () => false
+        )
+      ) {
+        args.push('--add-dir', inkFilesDir);
+      }
 
-    // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
-    // so create_studio/overflow worktrees minted mid-session are accessible —
-    // a live session can never be granted a new directory. Created if
-    // missing: Claude Code ignores a nonexistent --add-dir.
-    const inkStudiosDir = host.paths.studiosRoot;
-    // Non-fatal — worst case the grant is a no-op until the dir exists.
-    await mkdir(inkStudiosDir, { recursive: true }).catch(() => undefined);
-    args.push('--add-dir', inkStudiosDir);
+      // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
+      // so create_studio/overflow worktrees minted mid-session are accessible —
+      // a live session can never be granted a new directory. Created if
+      // missing: Claude Code ignores a nonexistent --add-dir.
+      const inkStudiosDir = host.paths.studiosRoot;
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+      await mkdir(inkStudiosDir, { recursive: true }).catch(() => undefined);
+      args.push('--add-dir', inkStudiosDir);
+    }
 
     // Inkwell channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges Inkwell's HTTP
@@ -359,8 +617,8 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-load-development-channels', 'server:inkmail');
     }
 
-    // Passthrough flags
-    args.push(...config.passthroughArgs);
+    // Last-wins flags could reopen tools, MCP configs or directory grants.
+    if (!withhold) args.push(...config.passthroughArgs);
 
     // Consolidated context token for x-ink-context header. The `.mcp.json`
     // generated by buildMergedMcpConfig references ${INK_CONTEXT}; this env
@@ -391,7 +649,7 @@ export class ClaudeAdapter implements BackendAdapter {
           type: 'user',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: promptText }, ...(encoded?.blocks ?? [])],
+            content: [{ type: 'text', text: promptText }, ...contentBlocks],
           },
         }) + '\n';
     }
@@ -412,6 +670,9 @@ export class ClaudeAdapter implements BackendAdapter {
       },
       cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),
+      ...(encodedContext && encodedContext.injected.length > 0
+        ? { contextImagesDelivered: encodedContext.injected }
+        : {}),
     };
   }
 

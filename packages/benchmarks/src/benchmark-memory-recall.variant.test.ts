@@ -5,6 +5,9 @@ import {
   parseBenchmarkRecallVariant,
 } from './benchmark-memory-recall.variant';
 
+// Benchmarks recall as one canonical owner (ink://specs/remove-shared-memories).
+const OWNER = { sbSlug: 'lumen', sbId: 'sb-lumen' };
+
 describe('benchmark-memory-recall variants', () => {
   it('parses friendly aliases', () => {
     expect(parseBenchmarkRecallVariant(undefined)).toBe('default');
@@ -30,13 +33,14 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-only',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-1'],
       })
     ).toMatchObject({
       recallMode: 'hybrid',
       limit: 5,
       sbSlug: 'lumen',
+      sbId: 'sb-lumen',
       topics: ['benchmark:memory-recall:case-1'],
       hybridChunkStrategy: 'content-only',
       applyChunkTypeBoosts: false,
@@ -51,7 +55,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'derived-only',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-2'],
       })
     ).toMatchObject({
@@ -67,7 +71,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'entity-only',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-entity'],
       })
     ).toMatchObject({
@@ -81,7 +85,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'entity-only',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-entity'],
       })
     ).toMatchObject({
@@ -100,7 +104,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-entity',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-entity'],
       })
     ).toMatchObject({
@@ -114,7 +118,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-plus-entity',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-entity'],
       })
     ).toMatchObject({
@@ -133,7 +137,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-entity-parallel',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-entity-parallel'],
       })
     ).toMatchObject({
@@ -148,7 +152,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-plus-entity-parallel',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-entity-parallel'],
       })
     ).toMatchObject({
@@ -168,7 +172,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'exact-only',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-exact'],
       })
     ).toMatchObject({
@@ -182,7 +186,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-exact',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-exact'],
       })
     ).toMatchObject({
@@ -198,7 +202,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-derived',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-content-derived'],
       })
     ).toMatchObject({
@@ -234,13 +238,14 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'multiview-no-chrono',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-3'],
       })
     ).toMatchObject({
       recallMode: 'semantic',
       limit: 5,
       sbSlug: 'lumen',
+      sbId: 'sb-lumen',
       topics: ['benchmark:memory-recall:case-3'],
     });
     expect(
@@ -248,7 +253,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'multiview-no-chrono',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-3'],
       })
     ).not.toHaveProperty('semanticChunkTypes');
@@ -260,7 +265,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'multiview-no-boost',
         limit: 5,
-        sbSlug: 'lumen',
+        owner: OWNER,
         topics: ['benchmark:memory-recall:case-4'],
       })
     ).toMatchObject({
@@ -270,5 +275,17 @@ describe('benchmark-memory-recall variants', () => {
       applyMultiViewBoost: false,
       applyChronologyBoost: false,
     });
+  });
+
+  it('recalls as the canonical owner, and no longer asks for shared memories', () => {
+    const options = buildBenchmarkRecallOptions({
+      mode: 'hybrid',
+      variant: 'default',
+      limit: 5,
+      owner: OWNER,
+      topics: ['benchmark:memory-recall:owner'],
+    });
+    expect(options).toMatchObject({ sbSlug: 'lumen', sbId: 'sb-lumen' });
+    expect(options).not.toHaveProperty('includeShared');
   });
 });

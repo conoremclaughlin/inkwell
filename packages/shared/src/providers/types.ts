@@ -166,6 +166,12 @@ export interface BackendConfig {
    */
   toolRouting?: 'backend' | 'local';
   /**
+   * No native tools, passthrough arguments or directory grants. The runner
+   * forces local routing and refuses providers that cannot enforce this.
+   * Explicit per request: never a process-global restriction in shared.
+   */
+  withholdProviderTools?: boolean;
+  /**
    * Media files for the LOGICAL turn (spec:provider-media-injection),
    * passed on every spawn of that turn — delivery, reseed, and tool-loop
    * continuations alike. Injecting adapters embed them in the prompt
@@ -185,6 +191,16 @@ export interface BackendConfig {
    * (server heartbeat/reattach) — the latter MUST embed.
    */
   deliverMedia?: boolean;
+  /**
+   * Images a TOOL put in context (view_image, `read` on an image), for this
+   * spawn to carry. Unlike `media` these are not the turn's attachments: the
+   * host chooses them per spawn (only what the target provider session has not
+   * yet been given), so an adapter embeds whatever arrives here and never
+   * derives a boundary decision from it — the --tools gate stays a function of
+   * `media` alone, identical on every spawn of the turn. Adapters without image
+   * input ignore this; the host does not capture images for them.
+   */
+  contextImages?: TurnMedia[];
   /**
    * Whether a human-facing process that can deliver inline messages owns
    * this spawn's session — carried in the INK_CONTEXT token the backend's
@@ -220,6 +236,13 @@ export interface PreparedBackend {
    */
   stdinData?: string;
   /**
+   * The `contextImages` this spawn's input actually carries — never merely
+   * the ones it was offered. An adapter can refuse some (the request's media
+   * budget, a file gone from disk), and the host records delivery from this
+   * list alone: an image offered but not carried must go again with the next
+   * spawn, not be counted as seen.
+   */
+  contextImagesDelivered?: TurnMedia[]; /**
    * What of this launch affects the backend's configuration, for its
    * effective-config check to apply as the spawn will: the arguments in
    * launch order, or a fixed reason they cannot be applied to a check.
@@ -246,6 +269,14 @@ export interface BackendAdapter {
    * budgets for its backend.
    */
   readonly promptTransport: 'stdin' | 'argv';
+
+  /**
+   * Whether this adapter embeds `contextImages` in what it sends the model.
+   * The host captures a tool's image only for an adapter that says yes; for
+   * any other it tells the model the image was not shown, rather than
+   * reporting a picture that never arrives.
+   */
+  readonly acceptsContextImages?: boolean;
 
   /**
    * Prepare everything needed to spawn the backend process.

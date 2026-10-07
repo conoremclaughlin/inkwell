@@ -79,6 +79,8 @@ export interface BackendRunRequest {
    * ('local') routing withholds tool-bearing MCP servers from the provider.
    */
   toolRouting?: 'backend' | 'local';
+  /** Explicit per-host/request restriction, never process-global in shared. */
+  withholdProviderTools?: boolean;
   /**
    * Media files attached to this turn — injecting adapters embed them in
    * the prompt envelope (spec:provider-media-injection).
@@ -86,6 +88,8 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /** Tool-captured images selected for this spawn by the host. */
+  contextImages?: TurnMedia[];
   /**
    * Whether the chat process that owns this turn is attached — an
    * interactive REPL, not `--non-interactive`/`--message`. Required: the
@@ -144,6 +148,8 @@ export interface BackendRunResult {
    * a stop gave up waiting after SIGKILL; see SpawnBackendResult.childExited.
    */
   childExited: boolean;
+  /** Only images the adapter actually carried, not everything offered. */
+  contextImagesDelivered?: TurnMedia[];
 }
 
 export interface BackendTurnHandle {
@@ -158,6 +164,23 @@ export interface BackendTurnHandle {
 const ABORTED_BEFORE_SPAWN_EXIT_CODE = 128 + 15;
 
 export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle {
+  const withhold = request.withholdProviderTools === true;
+  // Refuse before preparation, credentials or provider lookup. No other
+  // adapter here can structurally remove every one of its native tools.
+  if (withhold && request.backend !== 'claude') {
+    return {
+      result: Promise.resolve({
+        success: false,
+        stdout: '',
+        stderr: `Refused: this chat runs with no provider tools, and the ${request.backend} backend can't withhold its own.`,
+        exitCode: CONFIG_REFUSED_EXIT_CODE,
+        durationMs: 0,
+        command: `${request.backend} (refused)`,
+        childExited: true,
+      }),
+      abort: () => undefined,
+    };
+  }
   const adapter = getBackend(request.backend);
   const host = request.host;
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
@@ -206,15 +229,17 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         effort: request.effort,
         prompt: request.prompt,
         promptParts,
-        passthroughArgs: request.passthroughArgs || [],
+        passthroughArgs: withhold ? [] : request.passthroughArgs || [],
         systemPromptOverride: request.systemPromptOverride,
         attachmentDirs: request.attachmentDirs,
         backendSessionId: request.backendSessionId,
         backendSessionSeedId: request.backendSessionSeedId,
         stream: streaming,
-        toolRouting: request.toolRouting,
+        toolRouting: withhold ? 'local' : request.toolRouting,
+        ...(withhold ? { withholdProviderTools: true } : {}),
         media: request.media,
         deliverMedia: request.deliverMedia,
+        contextImages: request.contextImages,
         cliAttached: request.cliAttached,
         cwd: request.workingDirectory,
         explicitSession: true,
@@ -399,6 +424,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,
         childExited: spawnResult.childExited,
+        ...(prepared.contextImagesDelivered
+          ? { contextImagesDelivered: prepared.contextImagesDelivered }
+          : {}),
       };
     } finally {
       // After the child has stopped (spawnBackend settles no sooner), or

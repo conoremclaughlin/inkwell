@@ -1,6 +1,10 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
+import {
+  createSupabaseClient,
+  MemoryRepository,
+  resolveBenchmarkOwner,
+} from '@inklabs/api/benchmarks';
 import {
   buildBenchmarkRecallOptions,
   parseBenchmarkRecallVariant,
@@ -112,7 +116,9 @@ async function main() {
     );
   });
 
-  const repo = new MemoryRepository(createSupabaseClient());
+  const supabase = createSupabaseClient();
+  const repo = new MemoryRepository(supabase);
+  const benchmarkOwner = await resolveBenchmarkOwner(supabase, userId, BENCHMARK_AGENT_ID);
   const runs = [];
   const startedAt = Date.now();
 
@@ -132,7 +138,7 @@ async function main() {
         mode,
         variant,
         limit: TOP_K,
-        sbSlug: BENCHMARK_AGENT_ID,
+        owner: benchmarkOwner,
         topics: [seeded.topic],
       })
     );

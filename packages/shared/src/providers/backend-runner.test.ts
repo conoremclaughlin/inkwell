@@ -21,13 +21,16 @@ vi.mock('./registry.js', () => ({
   getBackend: (backend: string) => ({
     name: backend,
     binary: 'mock-backend',
-    prepare: (config: { promptParts: string[] }) => {
+    prepare: (config: { promptParts: string[]; contextImages?: unknown[] }) => {
       state.prepareCalls.push({ backend, promptParts: [...config.promptParts] });
       state.prepareConfigs.push({ ...config });
       return {
         binary: 'mock-backend',
         args: [...config.promptParts],
         env: { ...state.preparedEnv },
+        ...(config.contextImages?.length
+          ? { contextImagesDelivered: config.contextImages.slice(0, 1) }
+          : {}),
         ...(state.preparedLaunchConfig ? { launchConfig: state.preparedLaunchConfig } : {}),
         cleanup: async () => {
           state.cleanups += 1;
@@ -375,6 +378,81 @@ describe('runBackendTurn', () => {
       });
       expect(state.prepareConfigs[0]?.cliAttached).toBe(cliAttached);
     }
+  });
+
+  // The host records an image as seen from this report alone (PR #708): the
+  // offered list is what it asked for, not what the provider received.
+  it('reports the context images the adapter carried, not the ones it was offered', async () => {
+    spawnMock.mockImplementation(() => createMockChild(0));
+    state.prepareConfigs = [];
+    const offered = [
+      { path: '/virtual/a.png', mimeType: 'image/png' },
+      { path: '/virtual/b.png', mimeType: 'image/png' },
+    ];
+    const result = await runBackendTurn({
+      ...spawnContext,
+      backend: 'claude',
+      sbSlug: 'myra',
+      prompt: 'ping',
+      contextImages: offered,
+      cliAttached: false,
+    });
+    expect(state.prepareConfigs[0]?.contextImages).toEqual(offered);
+    expect(result.contextImagesDelivered).toEqual([offered[0]]);
+
+    const none = await runBackendTurn({
+      ...spawnContext,
+      backend: 'claude',
+      sbSlug: 'myra',
+      prompt: 'ping',
+      cliAttached: false,
+    });
+    expect(none).not.toHaveProperty('contextImagesDelivered');
+  });
+
+  it('keeps withholding request-local across concurrent hosted sessions', async () => {
+    state.prepareConfigs = [];
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+    const requests = [true, false, true, false].map((withholdProviderTools, index) => ({
+      ...spawnContext,
+      backend: 'claude',
+      sbSlug: 'synthetic',
+      prompt: `session-${index}`,
+      withholdProviderTools,
+      toolRouting: 'backend' as const,
+      passthroughArgs: ['--tools', 'Bash', '--add-dir', '/'],
+    }));
+    await Promise.all(requests.map(runBackendTurn));
+    for (const request of requests) {
+      const config = state.prepareConfigs.find((item) => item.prompt === request.prompt)!;
+      expect(config.toolRouting).toBe(request.withholdProviderTools ? 'local' : 'backend');
+      expect(config.passthroughArgs).toEqual(
+        request.withholdProviderTools ? [] : request.passthroughArgs
+      );
+      expect(config.withholdProviderTools).toBe(request.withholdProviderTools ? true : undefined);
+    }
+    expect(spawnMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('refuses unsupported withheld providers before preparing or minting anything', async () => {
+    state.prepareConfigs = [];
+    spawnMock.mockReset();
+    const sessionEnv = vi.fn(async () => ({}));
+    for (const backend of ['codex', 'gemini', 'unknown']) {
+      const result = await runBackendTurn({
+        ...spawnContext,
+        backend,
+        sbSlug: 'synthetic',
+        prompt: 'ping',
+        withholdProviderTools: true,
+        host: fakeHost({ sessionEnv }),
+      });
+      expect(result).toMatchObject({ success: false, exitCode: 78, childExited: true });
+      expect(result.stderr).toContain(`the ${backend} backend can't withhold its own`);
+    }
+    expect(state.prepareConfigs).toEqual([]);
+    expect(sessionEnv).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   // The child's on-prompt hook reads this. Without it, a headless child's

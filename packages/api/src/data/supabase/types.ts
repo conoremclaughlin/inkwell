@@ -762,6 +762,7 @@ export type Database = {
           metadata: Json | null;
           reason: string | null;
           requesting_agent_id: string;
+          sb_id: string | null;
           resolved_at: string | null;
           session_id: string | null;
           status: string;
@@ -770,6 +771,7 @@ export type Database = {
           tool: string;
           updated_at: string | null;
           user_id: string;
+          workspace_id: string | null;
         };
         Insert: {
           action?: string | null;
@@ -783,6 +785,7 @@ export type Database = {
           reason?: string | null;
           requesting_agent_id: string;
           resolved_at?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           status?: string;
           studio_id?: string | null;
@@ -790,6 +793,7 @@ export type Database = {
           tool: string;
           updated_at?: string | null;
           user_id: string;
+          workspace_id?: string | null;
         };
         Update: {
           action?: string | null;
@@ -802,6 +806,7 @@ export type Database = {
           metadata?: Json | null;
           reason?: string | null;
           requesting_agent_id?: string;
+          sb_id?: string | null;
           resolved_at?: string | null;
           session_id?: string | null;
           status?: string;
@@ -810,6 +815,7 @@ export type Database = {
           tool?: string;
           updated_at?: string | null;
           user_id?: string;
+          workspace_id?: string | null;
         };
         Relationships: [
           {
@@ -2382,6 +2388,7 @@ export type Database = {
       };
       memory_history: {
         Row: {
+          agent_id: string | null;
           archived_at: string | null;
           change_type: string;
           contact_id: string | null;
@@ -2391,6 +2398,7 @@ export type Database = {
           memory_id: string;
           metadata: Json | null;
           salience: string;
+          sb_id: string | null;
           source: string;
           summary: string | null;
           topic_key: string | null;
@@ -2399,6 +2407,7 @@ export type Database = {
           version: number;
         };
         Insert: {
+          agent_id?: string | null;
           archived_at?: string | null;
           change_type?: string;
           contact_id?: string | null;
@@ -2408,6 +2417,7 @@ export type Database = {
           memory_id: string;
           metadata?: Json | null;
           salience: string;
+          sb_id?: string | null;
           source: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -2416,6 +2426,7 @@ export type Database = {
           version?: number;
         };
         Update: {
+          agent_id?: string | null;
           archived_at?: string | null;
           change_type?: string;
           contact_id?: string | null;
@@ -2425,6 +2436,7 @@ export type Database = {
           memory_id?: string;
           metadata?: Json | null;
           salience?: string;
+          sb_id?: string | null;
           source?: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -5292,6 +5304,69 @@ export type Database = {
           },
         ];
       };
+      workspace_invitation_redemptions: {
+        Row: {
+          invitation_id: string;
+          membership_id: string | null;
+          redeemed_at: string;
+          user_id: string;
+        };
+        Insert: {
+          invitation_id: string;
+          membership_id?: string | null;
+          redeemed_at?: string;
+          user_id: string;
+        };
+        Update: {
+          invitation_id?: string;
+          membership_id?: string | null;
+          redeemed_at?: string;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
+      workspace_invitations: {
+        Row: {
+          created_at: string;
+          created_by: string;
+          expires_at: string;
+          id: string;
+          invitee_email: string | null;
+          kind: string;
+          max_uses: number | null;
+          revoked_at: string | null;
+          token_digest: string;
+          use_count: number;
+          workspace_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          created_by: string;
+          expires_at?: string;
+          id?: string;
+          invitee_email?: string | null;
+          kind: string;
+          max_uses?: number | null;
+          revoked_at?: string | null;
+          token_digest: string;
+          use_count?: number;
+          workspace_id: string;
+        };
+        Update: {
+          created_at?: string;
+          created_by?: string;
+          expires_at?: string;
+          id?: string;
+          invitee_email?: string | null;
+          kind?: string;
+          max_uses?: number | null;
+          revoked_at?: string | null;
+          token_digest?: string;
+          use_count?: number;
+          workspace_id?: string;
+        };
+        Relationships: [];
+      };
       workspace_members: {
         Row: {
           created_at: string | null;
@@ -5418,6 +5493,15 @@ export type Database = {
       };
     };
     Functions: {
+      accept_workspace_invitation: {
+        Args: {
+          p_email_ownership_confirmed: boolean;
+          p_token_digest: string;
+          p_user_email: string;
+          p_user_id: string;
+        };
+        Returns: Json;
+      };
       swap_memory_embedding: {
         Args: {
           p_memory_id: string;
@@ -5773,6 +5857,7 @@ export type Database = {
           p_include_expired?: boolean;
           p_include_shared?: boolean;
           p_salience?: string;
+          p_sb_id?: string;
           p_source?: string;
           p_topics?: string[];
           p_user_id?: string;
@@ -5806,6 +5891,7 @@ export type Database = {
           p_include_expired?: boolean;
           p_include_shared?: boolean;
           p_salience?: string;
+          p_sb_id?: string;
           p_source?: string;
           p_topics?: string[];
           p_user_id?: string;

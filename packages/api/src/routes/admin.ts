@@ -10,6 +10,9 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
+import { connectorsRouter } from './admin-connectors';
+import { threadUploadsRouter } from './thread-uploads';
+import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
@@ -98,7 +101,11 @@ import {
   type InklingScope,
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserIds } from '../config/inkling-flags';
-import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
+import {
+  INKLING_CONVERSATION_MARK,
+  InklingThreadRefusedError,
+} from '../services/inklings/inkling-thread-gate';
+import { FAILURE_NOTICE_ERROR_KEYS } from '../services/trigger-failure-notice';
 import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
@@ -122,6 +129,13 @@ import {
   recordDelivery,
   wakeRequestOf,
 } from '../services/send-receipt';
+import { canonicalManifest } from '../services/uploads/claims';
+import {
+  claimUploadsForSend,
+  confirmUploadsForSend,
+  sendKeyHasClaims,
+} from '../services/uploads/send';
+import { uploadsRetentionMs, uploadsRoot } from '../services/uploads/runtime';
 import { ThreadKeyTakenError } from '../mcp/tools/thread-key-taken';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
@@ -130,6 +144,19 @@ import {
   type ReminderSourceRow,
   type StrategyGroupSourceRow,
 } from '../services/automations/automation-shaper';
+import {
+  INVITE_ONLY,
+  emailInvitesHonoured,
+  invitationAttempts,
+  invitationDigest,
+  invitationStatus,
+  isInviteOnly,
+  newInvitationCode,
+  normalizeInvitationCode,
+  suffixedGroupSlug,
+  workspaceNameFrom,
+  type InvitationRow,
+} from '../services/workspace-invitations';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -140,6 +167,12 @@ type AdminAuthRequest = Request & {
   inkUserId: string;
   inkWorkspaceId: string;
   inkWorkspaceRole: WorkspaceMemberRole | 'trusted';
+  /**
+   * The canonical identity an agent's access token was signed for, on the
+   * routes that accept one (CLI transcript sync and approval requests).
+   * Absent for a person's cookie or token. Never read from a header.
+   */
+  inkTokenSbId?: string;
 };
 
 type CommentAuthorUser = {
@@ -1072,6 +1105,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     let inkUserId: string | undefined;
     let userEmail: string | undefined;
+    let tokenSbId: string | undefined;
     let issueTokenCookies = false;
 
     // --- Tier 1: Inkwell admin access JWT (local, ~0ms) ---
@@ -1093,6 +1127,9 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       if (mcpPayload) {
         inkUserId = mcpPayload.sub;
         userEmail = mcpPayload.email;
+        // A runner's token is signed for one identity; keep that, so an
+        // approval request records who asked from a signed source.
+        tokenSbId = mcpPayload.sbId ?? mcpPayload.identityId;
       }
     }
 
@@ -1326,6 +1363,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     authReq.inkUserId = inkUserId!;
     authReq.inkWorkspaceId = activeWorkspaceId;
     authReq.inkWorkspaceRole = activeWorkspaceRole || 'trusted';
+    authReq.inkTokenSbId = tokenSbId;
 
     // Wrap the rest of the request in context
     runWithRequestContext(
@@ -1791,6 +1829,9 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
 
+// The app's view of its Google connection (routes/admin-connectors.ts).
+router.use('/connectors', connectorsRouter);
+
 /**
  * Where a phone could reach this server, in the order it should try them.
  *
@@ -2078,6 +2119,9 @@ router.post('/workspaces', async (req: Request, res: Response) => {
 
     const rawType = req.body?.type;
     const workspaceType = rawType === 'team' ? 'team' : 'personal';
+    // A group that takes members only by invitation (limit B): set when it is
+    // created, never switched later.
+    const inviteOnly = workspaceType === 'team' && req.body?.membershipMode === INVITE_ONLY;
     const workspaceDescription =
       typeof req.body?.description === 'string' && req.body.description.trim()
         ? req.body.description.trim()
@@ -2087,13 +2131,26 @@ router.post('/workspaces', async (req: Request, res: Response) => {
         ? slugifyWorkspaceName(req.body.slug)
         : slugifyWorkspaceName(rawName);
 
-    const createdWorkspace = await workspaceRepo.create({
-      userId: authReq.inkUserId,
-      name: rawName,
-      slug: workspaceSlug,
-      type: workspaceType,
-      description: workspaceDescription,
-    });
+    // An invite-only group given no slug takes a free one: its plain slug may
+    // be taken (a group called "Personal" beside the person's own space).
+    const slugGiven = typeof req.body?.slug === 'string' && req.body.slug.trim() !== '';
+    const createWith = (slug: string) =>
+      workspaceRepo.create({
+        userId: authReq.inkUserId,
+        name: rawName,
+        slug,
+        type: workspaceType,
+        description: workspaceDescription,
+        ...(inviteOnly ? { metadata: { membershipMode: INVITE_ONLY } } : {}),
+      });
+    let createdWorkspace;
+    try {
+      createdWorkspace = await createWith(workspaceSlug);
+    } catch (error) {
+      const duplicate = error instanceof Error && error.message.toLowerCase().includes('duplicate');
+      if (!inviteOnly || slugGiven || !duplicate) throw error;
+      createdWorkspace = await createWith(suffixedGroupSlug(workspaceSlug));
+    }
 
     await workspaceRepo.addMember(createdWorkspace.id, authReq.inkUserId, 'owner');
 
@@ -2187,6 +2244,15 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
       res.status(403).json({ error: 'Only workspace owners/admins can invite collaborators' });
       return;
     }
+    // A group that takes members only by invitation is never added to
+    // directly: people join it themselves, by accepting one.
+    if (isInviteOnly(workspace.metadata)) {
+      res.status(409).json({
+        error: 'This group takes members by invitation only',
+        code: 'invite_only',
+      });
+      return;
+    }
     const actingRole = await workspaceRepo.getMemberRole(workspaceId, authReq.inkUserId);
 
     const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
@@ -2238,6 +2304,368 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
   } catch (error) {
     logger.error('Failed to add workspace member:', error);
     res.status(500).json(errorJson('Failed to add workspace member', error));
+  }
+});
+
+// =============================================================================
+// Group invitations (ink://designs/inkling-workspace-invitations)
+// =============================================================================
+//
+// Two kinds, one table: a shareable code anyone signed in may use until it
+// expires, is revoked or runs out of uses, and an invitation addressed to one
+// email address. Both are a ten-character code shown once, when created; only
+// its digest is kept. Joining is the database function
+// accept_workspace_invitation, which checks everything again under row locks.
+
+/** The fields an owner or admin sees about an invitation. Never the code. */
+function shapeInvitation(row: InvitationRow & Record<string, unknown>) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    email: row.invitee_email ?? null,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    maxUses: row.max_uses,
+    useCount: row.use_count,
+    revokedAt: row.revoked_at,
+    status: invitationStatus(row),
+  };
+}
+
+/** The group, if the caller is an owner or admin of it; otherwise the answer is sent. */
+async function managedGroup(
+  req: Request,
+  res: Response
+): Promise<{ id: string; name: string; type: string; metadata: unknown } | null> {
+  const authReq = req as AdminAuthRequest;
+  const dataComposer = await getDataComposer();
+  const workspaceRepo = dataComposer.repositories.workspaces;
+  const workspace = await workspaceRepo.findById(req.params.workspaceId, authReq.inkUserId);
+  if (!workspace) {
+    res.status(404).json({ error: 'Workspace not found or not accessible' });
+    return null;
+  }
+  if (!(await workspaceRepo.canManageWorkspace(workspace.id, authReq.inkUserId))) {
+    res.status(403).json({ error: 'Only the group’s owners and admins can do that' });
+    return null;
+  }
+  return workspace;
+}
+
+const INVITATION_UNAVAILABLE = {
+  error: 'This invitation isn’t available. Ask the person who shared it for a new one.',
+  code: 'invitation_unavailable',
+};
+
+/**
+ * PATCH /api/admin/workspaces/:workspaceId
+ * Body: { name }
+ * Renames a group. Owners and admins only; the name is display text, so
+ * nothing else about the group changes.
+ */
+router.patch('/workspaces/:workspaceId', async (req: Request, res: Response) => {
+  try {
+    const name = workspaceNameFrom(req.body?.name);
+    if (!name) {
+      res.status(400).json({ error: 'name must be 1–80 characters' });
+      return;
+    }
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspaces')
+      .update({ name })
+      .eq('id', workspace.id)
+      .select('id, name, slug, type')
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    res.json({ workspace: data });
+  } catch (error) {
+    logger.error('Failed to rename workspace:', error);
+    res.status(500).json(errorJson('Failed to rename workspace', error));
+  }
+});
+
+/**
+ * POST /api/admin/workspaces/:workspaceId/invitations
+ * Body: { kind: 'code' | 'email', email?, maxUses? }
+ * Owners and admins of a group create an invitation. The code is in this
+ * answer only; it is never stored or shown again.
+ */
+router.post('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const kind = req.body?.kind;
+    if (kind !== 'code' && kind !== 'email') {
+      res.status(400).json({ error: "kind must be 'code' or 'email'" });
+      return;
+    }
+    const email =
+      kind === 'email' && typeof req.body?.email === 'string'
+        ? req.body.email.trim().toLowerCase()
+        : null;
+    if (kind === 'email' && (!email || !email.includes('@') || email.length > 320)) {
+      res.status(400).json({ error: 'A valid email is required' });
+      return;
+    }
+    const rawMaxUses = req.body?.maxUses;
+    if (
+      kind === 'code' &&
+      rawMaxUses !== undefined &&
+      rawMaxUses !== null &&
+      !(Number.isInteger(rawMaxUses) && rawMaxUses > 0 && rawMaxUses <= 10_000)
+    ) {
+      res.status(400).json({ error: 'maxUses must be a whole number from 1 to 10000' });
+      return;
+    }
+
+    if (kind === 'email' && !emailInvitesHonoured()) {
+      res.status(409).json({
+        error:
+          'Email invitations need a server that confirms email addresses at sign-up. Share a group code instead.',
+        code: 'email_invites_unavailable',
+      });
+      return;
+    }
+
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    if (workspace.type !== 'team') {
+      res.status(409).json({
+        error: 'A personal space can’t take members. Create a group to invite people.',
+        code: 'personal_workspace',
+      });
+      return;
+    }
+
+    const code = newInvitationCode();
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspace_invitations')
+      .insert({
+        workspace_id: workspace.id,
+        kind,
+        invitee_email: email,
+        token_digest: invitationDigest(normalizeInvitationCode(code)!),
+        created_by: authReq.inkUserId,
+        max_uses: kind === 'email' ? 1 : ((rawMaxUses as number | null | undefined) ?? null),
+      })
+      .select('*')
+      .single();
+    if (error) throw new Error(error.message);
+    res.status(201).json({
+      invitation: shapeInvitation(data as InvitationRow & Record<string, unknown>),
+      code,
+    });
+  } catch (error) {
+    logger.error('Failed to create invitation:', error);
+    res.status(500).json(errorJson('Failed to create invitation', error));
+  }
+});
+
+/**
+ * GET /api/admin/workspaces/:workspaceId/invitations
+ * A group's invitations, newest first, for its owners and admins.
+ */
+router.get('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
+  try {
+    const workspace = await managedGroup(req, res);
+    if (!workspace) return;
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase
+      .from('workspace_invitations')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw new Error(error.message);
+    res.json({
+      invitations: (data ?? []).map((row) =>
+        shapeInvitation(row as InvitationRow & Record<string, unknown>)
+      ),
+    });
+  } catch (error) {
+    logger.error('Failed to list invitations:', error);
+    res.status(500).json(errorJson('Failed to list invitations', error));
+  }
+});
+
+/**
+ * POST /api/admin/workspaces/:workspaceId/invitations/:invitationId/revoke
+ * Stops an invitation working. It answers with how the invitation stands,
+ * so revoking one already used or revoked says so rather than pretending.
+ */
+router.post(
+  '/workspaces/:workspaceId/invitations/:invitationId/revoke',
+  async (req: Request, res: Response) => {
+    try {
+      const workspace = await managedGroup(req, res);
+      if (!workspace) return;
+      const supabase = (await getDataComposer()).getClient();
+      const { error } = await supabase
+        .from('workspace_invitations')
+        .update({ revoked_at: new Date().toISOString() })
+        .eq('id', req.params.invitationId)
+        .eq('workspace_id', workspace.id)
+        .is('revoked_at', null);
+      if (error) throw new Error(error.message);
+      const { data, error: readError } = await supabase
+        .from('workspace_invitations')
+        .select('*')
+        .eq('id', req.params.invitationId)
+        .eq('workspace_id', workspace.id)
+        .maybeSingle();
+      if (readError) throw new Error(readError.message);
+      if (!data) {
+        res.status(404).json({ error: 'No invitation with that id in this group' });
+        return;
+      }
+      res.json({ invitation: shapeInvitation(data as InvitationRow & Record<string, unknown>) });
+    } catch (error) {
+      logger.error('Failed to revoke invitation:', error);
+      res.status(500).json(errorJson('Failed to revoke invitation', error));
+    }
+  }
+);
+
+/**
+ * POST /api/admin/invitations/preview
+ * Body: { code }
+ * What a signed-in person would join with this code: the group's name, or
+ * that the invitation isn't available. Refusals all read the same. It decides
+ * as accept_workspace_invitation does: someone already in the group is told
+ * so whatever state the invitation is in (so a join whose answer was lost
+ * shows as done, even on a code it used up); an account that used it and has
+ * since left can't use it again; anyone else needs a usable invitation from
+ * someone who may still invite.
+ */
+router.post('/invitations/preview', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!invitationAttempts.allow(authReq.inkUserId)) {
+      res
+        .status(429)
+        .json({ error: 'Too many tries. Wait a few minutes.', code: 'too_many_attempts' });
+      return;
+    }
+    const code = normalizeInvitationCode(req.body?.code);
+    if (!code) {
+      res.status(400).json({ error: 'That isn’t an invite code', code: 'invalid_code' });
+      return;
+    }
+    const supabase = (await getDataComposer()).getClient();
+    const { data: invitation, error } = await supabase
+      .from('workspace_invitations')
+      .select('*')
+      .eq('token_digest', invitationDigest(code))
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    const unavailable = () => res.json({ available: false, ...INVITATION_UNAVAILABLE });
+    if (!invitation) {
+      unavailable();
+      return;
+    }
+    const workspaceRepo = (await getDataComposer()).repositories.workspaces;
+    const role = await workspaceRepo.getMemberRole(invitation.workspace_id, authReq.inkUserId);
+    if (role === null) {
+      const email = (authReq.user?.email ?? '').trim().toLowerCase();
+      const usable =
+        invitationStatus(invitation as InvitationRow) === 'pending' &&
+        (invitation.kind === 'code' ||
+          (emailInvitesHonoured() && invitation.invitee_email === email));
+      if (!usable) {
+        unavailable();
+        return;
+      }
+      const { data: receipt, error: receiptError } = await supabase
+        .from('workspace_invitation_redemptions')
+        .select('invitation_id')
+        .eq('invitation_id', invitation.id)
+        .eq('user_id', authReq.inkUserId)
+        .maybeSingle();
+      if (receiptError) throw new Error(receiptError.message);
+      const inviterRole = await workspaceRepo.getMemberRole(
+        invitation.workspace_id,
+        invitation.created_by
+      );
+      if (receipt || (inviterRole !== 'owner' && inviterRole !== 'admin')) {
+        unavailable();
+        return;
+      }
+    }
+    const { data: workspace, error: workspaceError } = await supabase
+      .from('workspaces')
+      .select('id, name, type, archived_at')
+      .eq('id', invitation.workspace_id)
+      .maybeSingle();
+    if (workspaceError) throw new Error(workspaceError.message);
+    if (!workspace || (role === null && (workspace.type !== 'team' || workspace.archived_at))) {
+      unavailable();
+      return;
+    }
+    res.json({
+      available: true,
+      workspace: { id: workspace.id, name: workspace.name },
+      alreadyMember: role !== null,
+    });
+  } catch (error) {
+    logger.error('Failed to preview invitation:', error);
+    res.status(500).json(errorJson('Failed to preview invitation', error));
+  }
+});
+
+/**
+ * POST /api/admin/invitations/accept
+ * Body: { code }
+ * Joins the group the code belongs to, as the signed-in account. The check
+ * and the join are one transaction (accept_workspace_invitation). Retrying
+ * after a lost answer is safe: an invitation this account already used
+ * answers with the membership as it is now, and never recreates one.
+ */
+router.post('/invitations/accept', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!invitationAttempts.allow(authReq.inkUserId)) {
+      res
+        .status(429)
+        .json({ error: 'Too many tries. Wait a few minutes.', code: 'too_many_attempts' });
+      return;
+    }
+    const code = normalizeInvitationCode(req.body?.code);
+    if (!code) {
+      res.status(400).json({ error: 'That isn’t an invite code', code: 'invalid_code' });
+      return;
+    }
+    const supabase = (await getDataComposer()).getClient();
+    const { data, error } = await supabase.rpc('accept_workspace_invitation', {
+      p_token_digest: invitationDigest(code),
+      p_user_id: authReq.inkUserId,
+      p_user_email: (authReq.user?.email ?? '').trim().toLowerCase(),
+      p_email_ownership_confirmed: emailInvitesHonoured(),
+    });
+    if (error) throw new Error(error.message);
+    const result = (data ?? {}) as {
+      status?: string;
+      workspaceId?: string;
+      alreadyMember?: boolean;
+    };
+    if (result.status !== 'joined' || !result.workspaceId) {
+      res.status(404).json(INVITATION_UNAVAILABLE);
+      return;
+    }
+    const { data: workspace } = await supabase
+      .from('workspaces')
+      .select('id, name')
+      .eq('id', result.workspaceId)
+      .maybeSingle();
+    res.json({
+      workspace: workspace ?? { id: result.workspaceId, name: null },
+      alreadyMember: result.alreadyMember === true,
+    });
+  } catch (error) {
+    logger.error('Failed to accept invitation:', error);
+    res.status(500).json(errorJson('Failed to accept invitation', error));
   }
 });
 
@@ -4037,6 +4465,51 @@ router.post('/inklings/:id/name', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/inklings/:id/profile → 200 { profile }
+ *
+ * One of the person's own inklings, read-only, for the app's profile: id,
+ * displayName, createdAt, identityUpdatedAt, soul (or null) and its own
+ * values (InklingService.profile). Nothing else from the identity row, and
+ * no fallback to /individuals. Every role may read its own; anything else
+ * is the same 404. Not cached by anything between.
+ */
+router.get('/inklings/:id/profile', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const profile = await (await inklingService()).profile(inklingScope(authReq), req.params.id);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ profile });
+  } catch (error) {
+    answerInklingError(res, "Failed to read the inkling's profile", error);
+  }
+});
+
+/**
+ * GET /api/admin/inklings/:id/approvals?limit=&before= → 200 { approvals, nextBefore }
+ *
+ * The approval requests one of the person's own inklings made, newest first,
+ * read-only (ink://designs/inkling-approvals-extension §A). Each is its id,
+ * tool, purpose, status, createdAt, expiresAt and resolvedAt; never the
+ * tool's input, the grant, or who decided. The same 404 as the profile for
+ * anything that isn't one of the caller's inklings. Not cached by anything
+ * between, error answers included. Nothing here approves or denies.
+ */
+router.get('/inklings/:id/approvals', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const authReq = req as AdminAuthRequest;
+    const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+    const page = await (
+      await inklingService()
+    ).approvals(inklingScope(authReq), req.params.id, { limit, before });
+    res.json(page);
+  } catch (error) {
+    answerInklingError(res, "Failed to read the inkling's approvals", error);
+  }
+});
+
+/**
  * POST /api/admin/inklings/:id/cancel → 200 { cancelled }
  *
  * Stops the inkling's running turn, with everything it started, if it has
@@ -4960,16 +5433,8 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
 // Connected Accounts (OAuth)
 // =============================================================================
 
-// In-memory store for OAuth state (in production, use Redis or similar)
-const oauthStateStore = new Map<
-  string,
-  {
-    userId: string;
-    workspaceId: string;
-    provider: string;
-    expiresAt: number;
-  }
->();
+// OAuth state lives in services/oauth-attempts.ts, shared with the app's
+// Connectors routes (routes/admin-connectors.ts).
 
 /**
  * GET /api/admin/connected-accounts
@@ -5063,20 +5528,9 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
 
-    // Build redirect URI
-    // OAUTH_REDIRECT_BASE_URL can be either:
-    // - Just the origin (e.g., http://localhost:3001) - path will be appended
-    // - Full redirect URI (e.g., http://localhost:3001/api/admin/oauth/google/callback) - used as-is
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      // If the configured URL has a path (not just origin), use it as-is
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    // One redirect URI for every flow (services/oauth-attempts.ts), so the
+    // authorize, upgrade and callback steps can't drift apart.
+    const redirectUri = oauthRedirectUri(provider);
 
     const authUrl = oauthService.getAuthorizationUrl(provider, redirectUri, state);
 
@@ -5096,11 +5550,26 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
   const { provider } = req.params;
   const { code, state, error: oauthError } = req.query;
 
-  const sendHtmlResponse = (result: OAuthCallbackResult) => {
+  // Set once the state is known: an app attempt is settled with the result,
+  // and its page offers the fixed way back to the app.
+  let appAttemptId: string | undefined;
+  const sendHtmlResponse = (result: OAuthCallbackResult, accountId: string | null = null) => {
+    // Only a consumed state for this provider sets appAttemptId, so an unknown
+    // or mismatched state settles nothing; a consumed one always settles, a
+    // malformed code included (as failed).
+    settleAttempt(
+      appAttemptId,
+      result === 'connected'
+        ? 'connected'
+        : result === 'denied' || result === 'expired'
+          ? result
+          : 'failed',
+      accountId
+    );
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.type('html').send(renderOAuthCallbackPage(result));
+    res.type('html').send(renderOAuthCallbackPage(result, { app: appAttemptId !== undefined }));
   };
 
   try {
@@ -5116,6 +5585,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       return;
     }
     oauthStateStore.delete(state);
+    appAttemptId = stateData.appAttemptId;
     if (Date.now() > stateData.expiresAt) {
       sendHtmlResponse('expired');
       return;
@@ -5131,15 +5601,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
 
     // Exchange code for tokens (redirect URI must match what was sent in auth request)
     const oauthService = getOAuthService();
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    const redirectUri = oauthRedirectUri(provider);
 
     const tokens = await oauthService.exchangeCode(provider, code, redirectUri);
 
@@ -5147,7 +5609,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
     const userInfo = await oauthService.getUserInfo(provider, tokens.accessToken);
 
     // Save connected account
-    await oauthService.saveConnectedAccount(
+    const saved = await oauthService.saveConnectedAccount(
       stateData.userId,
       provider,
       tokens,
@@ -5155,7 +5617,8 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       stateData.workspaceId
     );
 
-    sendHtmlResponse('connected');
+    // The row saved for this attempt, new or updated; only an app attempt reads it.
+    sendHtmlResponse('connected', (saved as { id?: string } | undefined)?.id ?? null);
   } catch (error) {
     logger.error('OAuth callback failed');
     sendHtmlResponse('failed');
@@ -5241,16 +5704,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
 
-    // Build redirect URI
-    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
-    const defaultPath = `/api/admin/oauth/${provider}/callback`;
-    let redirectUri: string;
-    if (configuredUrl) {
-      const url = new URL(configuredUrl);
-      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
-    } else {
-      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
-    }
+    const redirectUri = oauthRedirectUri(provider);
 
     // Get upgrade URL with login hint
     const authUrl = oauthService.getUpgradeScopesUrl(
@@ -7912,6 +8366,34 @@ const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
  * was drawn from (the whole thread, or everything older than the cursor),
  * so `meta.truncated` always means "there is more, further back".
  */
+/** What a trigger-failure notice from before its inkling wording says to a person. */
+export const LEGACY_INKLING_FAILURE_TEXT = "Your inkling couldn't answer a message.";
+
+/**
+ * A message as a reader receives it. In an inkling's conversation a system
+ * message never carries error text (task 935af241, Myra): its error keys are
+ * dropped, and a trigger-failure notice written before its inkling wording
+ * existed, whose body is the developer line, is shown in plain words as a
+ * status line (Lumen, #771). Every other message is served as stored.
+ */
+function messageForReader(
+  message: { sender_kind: string; content: string; metadata: unknown },
+  threadMetadata: unknown
+): { content: string; metadata: Record<string, unknown> | null } {
+  const metadata = (message.metadata as Record<string, unknown> | null) ?? null;
+  const inklingConversation =
+    (threadMetadata as Record<string, unknown> | null)?.[INKLING_CONVERSATION_MARK] === true;
+  if (!metadata || !inklingConversation || message.sender_kind !== 'system') {
+    return { content: message.content, metadata };
+  }
+  const shown = { ...metadata };
+  for (const key of FAILURE_NOTICE_ERROR_KEYS) delete shown[key];
+  if (shown.triggerFailure === true && shown.inklingNotice !== true) {
+    return { content: LEGACY_INKLING_FAILURE_TEXT, metadata: { ...shown, inklingNotice: true } };
+  }
+  return { content: message.content, metadata: shown };
+}
+
 router.get('/threads/messages', async (req: Request, res: Response) => {
   try {
     const key = typeof req.query.key === 'string' ? req.query.key : '';
@@ -7934,7 +8416,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select(
-        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at'
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at, metadata'
       )
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
@@ -8078,10 +8560,9 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           senderName: senderName(m),
           isOwn:
             m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
-          content: m.content,
+          ...messageForReader(m, thread.metadata),
           messageType: m.message_type,
           priority: m.priority,
-          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
           ...(reactionsByMessage ? { reactions: reactionsByMessage.get(m.id) ?? [] } : {}),
         }))
@@ -8498,7 +8979,8 @@ router.post('/threads', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads/reply
- * Body: { key, content, priority?, clientMessageId?: uuid, wake?: string[] }
+ * Body: { key, content, priority?, clientMessageId?: uuid, wake?: string[],
+ *         uploads?: string[] }
  *   → { success, messageId, threadId, triggered, warning, threadKeyWarning,
  *       delivery, replayed }
  *
@@ -8508,6 +8990,13 @@ router.post('/threads', async (req: Request, res: Response) => {
  * messageId and replayed: true, and wakes nobody; the same id with other
  * words, or naming other members in `wake`, is a 409. `delivery` comes from positive evidence only (see
  * services/send-receipt.ts and POST /threads above).
+ *
+ * `uploads` attaches 1 to 4 files the person uploaded to this thread
+ * (routes/thread-uploads.ts) and needs a clientMessageId: the send claims
+ * them as one set before its message is stored (services/uploads/send.ts),
+ * so an upload can belong to one message only. A retry naming other uploads
+ * is a 409, like other words; an upload that can no longer be sent is a 409
+ * with code `uploads_unavailable`.
  *
  * A human reply into an existing thread — the dashboard and mobile analogue of
  * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
@@ -8546,6 +9035,28 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
     if (!clientMessageId.ok) {
       res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
+    const rawUploads = req.body?.uploads;
+    const uploads =
+      rawUploads === undefined ||
+      rawUploads === null ||
+      (Array.isArray(rawUploads) && rawUploads.length === 0)
+        ? null
+        : canonicalManifest(rawUploads);
+    if (uploads && !uploads.ok) {
+      res.status(400).json({
+        error: 'uploads must list 1 to 4 different upload ids',
+        code: 'uploads_invalid',
+      });
+      return;
+    }
+    const uploadIds = uploads?.ok ? uploads.ids : undefined;
+    if (uploadIds && !clientMessageId.value) {
+      res.status(400).json({
+        error: 'clientMessageId is required when sending uploads',
+        code: 'uploads_need_client_message_id',
+      });
       return;
     }
 
@@ -8587,6 +9098,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
         content,
         // Checked before the members are read, so held to the request as sent.
         wake: wakeRequestOf(req.body?.wake),
+        uploads: uploadIds,
       });
       if (lookup.kind === 'conflict') {
         res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
@@ -8625,6 +9137,40 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!uploadIds && clientMessageId.value) {
+      // A send key whose uploads were claimed, by a send that then stored
+      // nothing, still belongs to that send: one naming no uploads is another.
+      if (await sendKeyHasClaims(supabase, thread.id, clientMessageId.value)) {
+        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
+        return;
+      }
+    }
+    if (uploadIds && clientMessageId.value) {
+      // Claimed before the message is stored, so a message can only ever
+      // name uploads its own send holds. A send that never stores leaves its
+      // claims for the reconciler to hold, never to release.
+      const claimed = await claimUploadsForSend(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        userId: authReq.inkUserId,
+        workspaceId: authReq.inkWorkspaceId,
+        content,
+        uploadIds,
+        createdAt: new Date().toISOString(),
+      });
+      if (!claimed.ok) {
+        res.status(409).json(
+          claimed.reason === 'conflict'
+            ? { error: CLIENT_MESSAGE_CONFLICT }
+            : {
+                error: 'An attached file can no longer be sent; attach it again',
+                code: 'uploads_unavailable',
+              }
+        );
+        return;
+      }
+    }
+
     let result: Awaited<ReturnType<typeof handleSendToInbox>>;
     try {
       result = await handleSendToInbox(
@@ -8645,6 +9191,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
                   pcp: { wake: wakeRequestOf(replyWake.wake) },
                 }
               : {}),
+            ...(uploadIds ? { media: uploadIds.map((upload) => ({ upload })) } : {}),
           },
         },
         dataComposer,
@@ -8685,6 +9232,14 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     if (clientMessageId.value) {
       await recordDelivery(supabase, String(parsed.messageId), delivery);
     }
+    if (uploadIds && clientMessageId.value) {
+      await confirmUploadsForSend(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        uploadIds,
+        messageId: String(parsed.messageId),
+      });
+    }
 
     res.json({
       // The handler folds trigger-routing outcomes into its own `success`,
@@ -8708,6 +9263,21 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to send reply', error));
   }
 });
+
+// Photos and documents a person sends into a thread (routes/thread-uploads.ts).
+// Mounted here, after THREAD_WRITE_ROLES, which it shares with the reply above.
+router.use(
+  '/threads/uploads',
+  threadUploadsRouter({
+    db: () =>
+      createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      }),
+    root: uploadsRoot,
+    writeRoles: THREAD_WRITE_ROLES,
+    retentionMs: uploadsRetentionMs(),
+  })
+);
 
 /**
  * POST /api/admin/threads/reactions
@@ -9108,7 +9678,7 @@ function getWorkspaceRoot(): Promise<string> {
  * including anything a crafted evidence row points at — resolves to null
  * and 404s without confirming existence.
  */
-async function evidenceMediaRoots(): Promise<string[]> {
+export async function evidenceMediaRoots(): Promise<string[]> {
   const workspaceRoot = await getWorkspaceRoot();
   return [
     path.join(os.homedir(), '.ink', 'files'),
@@ -10103,6 +10673,36 @@ function normalizeApprovalOrigin(
   };
 }
 
+/**
+ * The canonical requester of an approval request: the identity the caller's
+ * agent token was signed for, if it is one of this user's identities, with
+ * that identity's own workspace. Anything else, a person's cookie, a token
+ * for another user's identity or a failed read, records no requester, and the
+ * request itself goes ahead exactly as before.
+ */
+async function signedApprovalRequester(
+  supabase: SupabaseClient,
+  authReq: AdminAuthRequest
+): Promise<{ sbId: string | null; workspaceId: string | null }> {
+  const none = { sbId: null, workspaceId: null };
+  if (!isUuid(authReq.inkTokenSbId)) return none;
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('id, workspace_id')
+    .eq('id', authReq.inkTokenSbId)
+    .eq('user_id', authReq.inkUserId)
+    .maybeSingle();
+  const row = data as { id: string; workspace_id: string | null } | null;
+  if (error || !row) {
+    logger.warn('Approval request recorded without a signed requester', {
+      tokenSbId: authReq.inkTokenSbId,
+      reason: error ? error.message : 'no identity of this user',
+    });
+    return none;
+  }
+  return { sbId: row.id, workspaceId: row.workspace_id };
+}
+
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -10156,12 +10756,30 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     const studioIdForInsert = studioId && UUID_RE.test(studioId) ? studioId : null;
     const sessionIdForInsert = sessionId && UUID_RE.test(sessionId) ? sessionId : null;
 
+    // Who asked, from the signed token only: its identity, when that names an
+    // identity of this same user, and that identity's own workspace. The
+    // scoped Approvals read lists only these (ink://designs/inkling-approvals-
+    // extension §A). The header slug above stays as requesting_agent_id, which
+    // the approval interceptor scopes by; it is never promoted to this.
+    const requester = await signedApprovalRequester(supabase, authReq);
+    if (!requester.sbId && requestingSlug !== 'unknown') {
+      // A request an SB made with a person's token, for instance after its
+      // runner token expired and ink chat fell back to the stored login. It
+      // works as before, but its inkling's Approvals view won't list it.
+      logger.warn('Approval request from an SB without a signed requester', {
+        requestingSlug,
+        tool,
+      });
+    }
+
     const { data, error } = await supabase
       .from('approval_requests')
       .insert({
         user_id: authReq.inkUserId,
         studio_id: studioIdForInsert,
         session_id: sessionIdForInsert,
+        sb_id: requester.sbId,
+        workspace_id: requester.workspaceId,
         requesting_agent_id: requestingSlug,
         tool,
         args: args || null,

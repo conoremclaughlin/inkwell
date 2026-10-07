@@ -53,7 +53,14 @@ describe('runAgentLoop hosts and their relay budgets', () => {
 
   it("the continuation spawn goes through the request builder WITH the decision's session args and delivery (Lumen, PR #577 final pass)", () => {
     expect(provider).toMatch(
-      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
+      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
+    );
+    // Keep the main-branch image delivery target coupled to the shared decision.
+    expect(provider).toContain(
+      'const contSpawn = continuationSpawnArgs(decision, turnMedia.length > 0);'
+    );
+    expect(provider).toMatch(
+      /const contSessionId =\s*contSpawn\.sessionArgs\.backendSessionId \?\? contSpawn\.sessionArgs\.backendSessionSeedId;\s*const contImages = ports\.contextImagesFor\?\.\(contSessionId\);/
     );
     expect(source).toContain('const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));');
     const builder = provider.slice(
@@ -93,7 +100,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       initialCapture + 1
     );
     const contSpawn = provider.search(
-      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
+      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(contCapture).toBeGreaterThan(0);
     expect(contSpawn).toBeGreaterThan(contCapture);
@@ -121,7 +128,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
     );
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/

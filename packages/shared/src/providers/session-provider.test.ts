@@ -142,6 +142,94 @@ describe('shared session provider composition', () => {
     expect(h.ports.state.id).toBe('session-a-seed-1');
   });
 
+  it('asks for images against each exact opening, resume, and rolled continuation session', async () => {
+    const h = harness();
+    const images = [{ path: '/context/tool.png', mimeType: 'image/png' }];
+    h.ports.contextImagesFor = vi.fn(() => images);
+    h.ports.noteImagesDelivered = vi.fn();
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    await t.runTurn('first tool result', { isContinuation: true });
+    h.ports.state.id = undefined;
+    h.ports.state.shape = undefined;
+    await t.runTurn('after eviction', { isContinuation: true });
+    expect(vi.mocked(h.ports.contextImagesFor).mock.calls.map(([id]) => id)).toEqual([
+      'session-a-seed-1',
+      'session-a-seed-1',
+      'session-a-seed-2',
+    ]);
+    for (const [request] of vi.mocked(h.ports.startTurn).mock.calls) {
+      expect(request.contextImages).toBe(images);
+    }
+    expect(h.ports.noteImagesDelivered).toHaveBeenLastCalledWith(
+      'session-a-seed-2',
+      expect.objectContaining({ success: true })
+    );
+  });
+
+  it('reports actual adapter delivery (including failure), and asks afresh after a missing resume', async () => {
+    const h = harness();
+    h.ports.state.id = 'missing';
+    const offered = [{ path: '/context/offered.png', mimeType: 'image/png' }];
+    const carried = [{ path: '/context/carried.png', mimeType: 'image/png' }];
+    h.ports.contextImagesFor = vi.fn(() => offered);
+    h.ports.noteImagesDelivered = vi.fn();
+    const failed = result({ success: false, resumeFailedNoSession: true });
+    const delivered = result({ contextImagesDelivered: carried });
+    vi.mocked(h.ports.startTurn)
+      .mockReturnValueOnce({ result: Promise.resolve(failed), abort: vi.fn() })
+      .mockReturnValueOnce({ result: Promise.resolve(delivered), abort: vi.fn() });
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    expect(vi.mocked(h.ports.contextImagesFor).mock.calls.map(([id]) => id)).toEqual([
+      'missing',
+      'session-a-seed-1',
+    ]);
+    expect(h.ports.noteImagesDelivered).toHaveBeenNthCalledWith(1, 'missing', failed);
+    expect(h.ports.noteImagesDelivered).toHaveBeenNthCalledWith(2, 'session-a-seed-1', delivered);
+    expect(vi.mocked(h.ports.startTurn).mock.calls[1][0].contextImages).toBe(offered);
+  });
+
+  it('asks for all context images on every stateless spawn without inventing a native id', async () => {
+    const h = harness('codex');
+    const images = [{ path: '/context/stateless.png', mimeType: 'image/png' }];
+    h.ports.contextImagesFor = vi.fn(() => images);
+    h.ports.noteImagesDelivered = vi.fn();
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    await t.runTurn('tool result', { isContinuation: true });
+    expect(vi.mocked(h.ports.contextImagesFor).mock.calls).toEqual([[undefined], [undefined]]);
+    for (const [request] of vi.mocked(h.ports.startTurn).mock.calls) {
+      expect(request.contextImages).toBe(images);
+      expect(request.backendSessionId).toBeUndefined();
+      expect(request.backendSessionSeedId).toBeUndefined();
+    }
+  });
+
+  it('carries the per-host provider-tool restriction on opening, reseed and continuation', async () => {
+    const h = harness();
+    h.ports.state.id = 'missing';
+    const spawnContext = h.ports.spawnContext;
+    h.ports.spawnContext = () => ({ ...spawnContext(), withholdProviderTools: true });
+    vi.mocked(h.ports.startTurn).mockReturnValueOnce({
+      result: Promise.resolve(result({ success: false, resumeFailedNoSession: true })),
+      abort: vi.fn(),
+    });
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    await t.runTurn('tool result', { isContinuation: true });
+    expect(h.ports.startTurn).toHaveBeenCalledTimes(3);
+    for (const [request] of vi.mocked(h.ports.startTurn).mock.calls) {
+      expect(request.withholdProviderTools).toBe(true);
+    }
+    const ordinary = harness('claude', 'ordinary');
+    const ordinaryTurn = ordinary.turn();
+    await ordinaryTurn.runTurn(ordinaryTurn.prompt, { isContinuation: false });
+    expect(
+      vi.mocked(ordinary.ports.startTurn).mock.calls[0][0].withholdProviderTools
+    ).toBeUndefined();
+  });
+
   it('records both failed-resume and reseed usage and delivers media to the replacement', async () => {
     const h = harness();
     h.ports.state.id = 'missing';

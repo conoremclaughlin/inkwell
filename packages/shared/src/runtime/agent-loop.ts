@@ -749,6 +749,21 @@ export interface AgentLoopInput {
    * is exactly the failure the live smoke test surfaced.
    */
   continueOnBlocked?: boolean;
+  /**
+   * Let the agent fix and retry when every call in an iteration was refused
+   * and at least one of them FAILED (an error nobody saw: a validation error,
+   * a thrown call), up to `maxIterations`. A deliberate refusal on its own (a
+   * denial, a policy block) still ends the turn, so a human who said no is not
+   * asked again.
+   *
+   * For an unwatched turn (`ink chat --non-interactive`, which is every
+   * server-spawned turn, an inkling's included). Without it, one invalid
+   * argument ended the turn on the FINAL relay, where the model can explain the
+   * error but can no longer call anything: an inkling's reply to its owner died
+   * on a `send_to_inbox` it had passed `sbSlug`, and the explanation was posted
+   * in its place (Oct 7). `continueOnBlocked` implies this.
+   */
+  continueOnFailure?: boolean;
 }
 
 /**
@@ -1172,8 +1187,14 @@ export async function runAgentLoop(
     // Everything was refused. Telling the agent so — once, and only where nobody
     // is watching the scrollback for it — is the difference between a clone that
     // routes around its envelope and one that hands back a preamble.
+    // An unwatched turn whose refused iteration hides a failure gets the same
+    // second chance, so the model can fix the argument the error names; a
+    // deliberate refusal alone still ends it (see `continueOnFailure`).
     const retryAfterRefusal =
-      reason === 'all-refused' && input.continueOnBlocked === true && iteration < maxIterations;
+      reason === 'all-refused' &&
+      iteration < maxIterations &&
+      (input.continueOnBlocked === true ||
+        (input.continueOnFailure === true && hasUnseenFailure(results)));
     if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {

@@ -181,7 +181,7 @@ export const TOOL_GROUPS: Record<string, string[]> = {
     'list_sessions',
     'end_session',
   ],
-  'group:read': ['read', 'grep', 'find', 'ls'],
+  'group:read': ['read', 'grep', 'find', 'ls', 'view_image'],
   'group:write': ['edit', 'write', 'bash'],
 };
 

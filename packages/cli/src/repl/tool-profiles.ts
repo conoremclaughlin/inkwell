@@ -4,6 +4,7 @@ export {
   PROFILE_IDS,
   isValidProfileId,
   applyProfile,
+  applyLaunchProfile,
   formatProfileList,
   type ToolProfileId,
   type ToolProfile,

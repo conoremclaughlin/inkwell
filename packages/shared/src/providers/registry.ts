@@ -64,3 +64,9 @@ export function promptTransportFor(name: string): 'stdin' | 'argv' {
   const factory = BACKENDS[name];
   return factory ? factory().promptTransport : 'argv';
 }
+
+/** Whether the adapter can embed tool-captured images; unknown means no. */
+export function acceptsContextImagesFor(name: string): boolean {
+  const factory = Object.prototype.hasOwnProperty.call(BACKENDS, name) ? BACKENDS[name] : undefined;
+  return factory ? factory().acceptsContextImages === true : false;
+}

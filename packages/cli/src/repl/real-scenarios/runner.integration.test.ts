@@ -62,7 +62,6 @@ async function inkRecall(query: string, limit: number): Promise<SurfacedMemory[]
         arguments: {
           query,
           sbSlug: 'wren',
-          includeShared: true,
           limit,
           recallMode: 'hybrid',
         },

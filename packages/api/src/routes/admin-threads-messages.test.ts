@@ -277,3 +277,85 @@ describe('GET /threads/messages names every author for the viewer', () => {
     expect(history.filter(([, m, c]) => m === 'eq' && c === 'user_id')).toEqual([]);
   });
 });
+
+describe('error text in an inkling conversation (task 935af241)', () => {
+  // A trigger-failure notice as it was written before its inkling wording:
+  // the raw error rides in its metadata.
+  const oldNotice = {
+    id: 'm-fail',
+    sender_kind: 'system',
+    sender_sb_id: null,
+    sender_user_id: null,
+    sender_agent_id: null,
+    content: 'Trigger to kindle-1 failed (timeout): …',
+    message_type: 'notification',
+    priority: 'high',
+    metadata: {
+      triggerFailure: true,
+      errorCategory: 'timeout',
+      errorSummary: 'Claude Code timeout',
+      errorDetail: 'Claude Code timeout: no output for 300s, process killed',
+    },
+    created_at: '2026-10-07T05:00:00Z',
+  };
+  const served = async () => {
+    const res = createRes();
+    await messages(createReq('user-a'), res);
+    expect(res._status).toBe(200);
+    return (res._json as { messages: Array<{ id: string; metadata: unknown }> }).messages;
+  };
+
+  it('never reaches the app from a system message, whatever wrote the row', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    tables.messages = [oldNotice];
+    const [notice] = await served();
+    expect(notice.metadata).toEqual({
+      triggerFailure: true,
+      errorCategory: 'timeout',
+      inklingNotice: true,
+    });
+  });
+
+  it("shows an old notice's developer line in plain words, and leaves every other message as written (Lumen, #771)", async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    const plainNotice = {
+      ...oldNotice,
+      id: 'm-new',
+      content: "Pip couldn't answer yet and is trying again. No need to send your message again.",
+      metadata: { triggerFailure: true, inklingNotice: true, errorCategory: 'timeout' },
+    };
+    const closed = {
+      ...oldNotice,
+      id: 'm-closed',
+      content: 'closed',
+      message_type: 'system',
+      metadata: { closed: true },
+    };
+    const person = {
+      ...oldNotice,
+      id: 'm-person',
+      sender_kind: 'user',
+      sender_user_id: 'user-a',
+      content: 'Trigger to kindle-1 failed: my own words',
+      metadata: null,
+    };
+    tables.messages = [person, closed, plainNotice, oldNotice];
+    const served_ = (await served()) as unknown as Array<{ id: string; content: string }>;
+    const byId = new Map(served_.map((m) => [m.id, m.content]));
+    expect(byId.get('m-fail')).toBe("Your inkling couldn't answer a message.");
+    expect(byId.get('m-new')).toBe(plainNotice.content);
+    expect(byId.get('m-closed')).toBe('closed');
+    expect(byId.get('m-person')).toBe('Trigger to kindle-1 failed: my own words');
+    expect(JSON.stringify(served_)).not.toContain('no output for 300s');
+  });
+
+  it('is served as stored outside an inkling conversation, and on a message that is not the system', async () => {
+    tables.thread = { ...tables.thread!, metadata: {} };
+    tables.messages = [oldNotice];
+    expect((await served())[0].metadata).toEqual(oldNotice.metadata);
+
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    tables.messages = [{ ...oldNotice, sender_kind: 'user', sender_user_id: 'user-a' }];
+    expect((await served())[0].metadata).toEqual(oldNotice.metadata);
+  });
+});

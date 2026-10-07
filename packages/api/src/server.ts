@@ -61,6 +61,7 @@ import {
   inTurnNote,
   replyChainWakeDue,
 } from './services/inklings/inkling-reply-chain';
+import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
 import {
   TriggerRetryScheduler,
   getTriggerAttempt,
@@ -74,6 +75,11 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { evidenceMediaRoots } from './routes/admin';
+import { defaultUploadsRoot, inkDataDir, prepareUploadsRoot } from './services/uploads/layout';
+import { maintainUploads } from './services/uploads/maintenance';
+import { uploadsRootNeighbours } from './services/uploads/placement';
+import { setUploadsRoot, uploadsRoot } from './services/uploads/runtime';
 import { inklingOwnerTestAllowlist } from './config/inkling-flags';
 import { logger } from './utils/logger';
 import { handleHangup } from './utils/hangup';
@@ -585,6 +591,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     logger.warn('ChannelGateway not available - response routing will fail');
   }
 
+  // Uploads stay off unless their root is inside ~/.ink and clear of the
+  // directories placement.ts lists. A placement check, not runner isolation
+  // (services/uploads/layout.ts).
+  const uploads = await prepareUploadsRoot(
+    env.INK_UPLOADS_DIR ?? defaultUploadsRoot(),
+    inkDataDir(),
+    uploadsRootNeighbours(await evidenceMediaRoots(), workingDirectory)
+  );
+  setUploadsRoot(uploads.ok ? uploads.rootReal : null);
+  if (uploads.ok) logger.info('Uploads root ready', { root: uploads.rootReal });
+  else logger.warn('Uploads are off', { reason: uploads.reason, detail: uploads.detail });
+
   // 6. Initialize heartbeat service for scheduled reminders
   // Useful for secondary/local dev servers where we want API/MCP without
   // participating in global reminder delivery.
@@ -894,6 +912,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         } catch (sweepErr) {
           logger.error('Lease sweep failed', {
             error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
+
+        // Uploads: orphan sweep, finishing removals, and the claim
+        // reconciler. Inside this gate, and gated again on the same flags.
+        try {
+          const report = await maintainUploads({
+            db: dataComposer!.getClient(),
+            root: uploadsRoot(),
+            now: Date.now,
+          });
+          const { skipped, ...counts } = report;
+          if (!skipped && Object.values(counts).some((count) => count > 0)) {
+            logger.info('Uploads maintenance complete', counts);
+          }
+        } catch (uploadsErr) {
+          logger.error('Uploads maintenance failed', {
+            error: uploadsErr instanceof Error ? uploadsErr.message : String(uploadsErr),
           });
         }
       },
@@ -1206,7 +1242,7 @@ Type: ${payload.triggerType}`;
 
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
-${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}"). Use send_to_inbox with threadKey to respond.` : 'Check your inbox for the full message using get_inbox.'}
+${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}", sbSlug: "${targetSlug}"). Use send_to_inbox with threadKey to respond.` : 'Check your inbox for the full message using get_inbox.'}
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
@@ -1233,6 +1269,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // caller-supplied payload.metadata. The inkling gate reads this
         // message to learn who sent it (Lumen's review of 8b9d7f50).
         triggerThreadMessageId: payload.threadMessageId,
+        triggerInboxMessageId: payload.inboxMessageId,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1776,6 +1813,30 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       });
     }
 
+    // A wake that may share a turn with the wakes queued beside it (spec
+    // trigger-pipe-in v7, 1.1): it points at a stored message, and is neither
+    // a force-spawn nor a strategy wake, whose turns are their own by design.
+    // SessionService keeps out anything that changes the launch itself.
+    request.metadata!.wakeCoalescible =
+      Boolean(payload.threadMessageId || payload.inboxMessageId) &&
+      payload.forceSpawn !== true &&
+      payload.metadata?.strategyTrigger !== true;
+
+    // An inkling's turn that ends without a word to its owner posts its
+    // closing text as its message (task 9edf62fe). Decided in the turn's own
+    // hooks, as that turn ends and before the next queued one starts: this
+    // handler's handleMessage can settle only once the queue behind it has
+    // drained (Lumen, #769).
+    if (payload.threadId && payload.threadMessageId && resolvedIdentityId) {
+      request.turnHooks = closingTextTurnHooks(dataComposer!, {
+        userId,
+        identityId: resolvedIdentityId,
+        threadId: payload.threadId,
+        threadKey: payload.threadKey,
+        threadMessageId: payload.threadMessageId,
+      });
+    }
+
     let result: SessionResult;
     try {
       result = await sessionService!.handleMessage(request);
@@ -1900,8 +1961,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       );
     }
 
-    await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
-    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`);
+    // A wake carried by another wake's turn was delivered by that turn.
+    await logInkmail('inkmail_deliver', payload, userId, {
+      deliveryMethod: result.wake ? 'coalesced' : 'spawn',
+    });
+    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`, {
+      ...(result.wake ? { coalescedInto: result.wake.coalescedInto } : {}),
+    });
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 

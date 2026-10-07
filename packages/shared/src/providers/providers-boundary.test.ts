@@ -41,9 +41,12 @@ function isNodeBuiltin(specifier: string): boolean {
  */
 function reachesAllowedFile(filePath: string, specifier: string): boolean {
   if (!specifier.startsWith('./') && !specifier.startsWith('../')) return false;
-  if (!specifier.endsWith('.js')) return false;
-  const target = resolve(dirname(filePath), `${specifier.slice(0, -'.js'.length)}.ts`);
-  if (target.endsWith('.test.ts') || !existsSync(target)) return false;
+  if (!/\.c?js$/.test(specifier)) return false;
+  const target = resolve(
+    dirname(filePath),
+    specifier.replace(/\.cjs$/, '.cts').replace(/\.js$/, '.ts')
+  );
+  if (/\.test\.c?ts$/.test(target) || !existsSync(target)) return false;
   return ALLOWED_SHARED_DIRS.some((dir) => dirname(target) === dir);
 }
 
@@ -96,7 +99,7 @@ function importViolations(filePath: string, sourceText: string): Violation[] {
 
 function providersSourceFiles(): string[] {
   return readdirSync(PROVIDERS_DIR)
-    .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))
+    .filter((name) => /\.c?ts$/.test(name) && !/\.test\.c?ts$/.test(name))
     .map((name) => join(PROVIDERS_DIR, name))
     .sort();
 }
@@ -147,7 +150,10 @@ function closureFiles(): string[] {
     if (seen.has(file)) continue;
     seen.add(file);
     for (const specifier of relativeSpecifiers(file, readFileSync(file, 'utf8'))) {
-      const target = resolve(dirname(file), specifier.replace(/\.js$/, '.ts'));
+      const target = resolve(
+        dirname(file),
+        specifier.replace(/\.cjs$/, '.cts').replace(/\.js$/, '.ts')
+      );
       if (existsSync(target)) queue.push(target);
     }
   }
@@ -165,6 +171,7 @@ describe('providers import checker, against known answers', () => {
       "import { spawn } from 'child_process';",
       "import type { BackendConfig } from './types.js';",
       "export * from './registry.js';",
+      "import { pdfExtractorModulePath } from './pdf-extractor-path.cjs';",
       "import { spawnBackend } from '../runner/spawn-backend.js';",
       "import { extractBackendTokenUsage } from '../runtime/token-usage.js';",
     ].join('\n');
@@ -203,6 +210,8 @@ describe('@inklabs/shared/providers keeps its closure', () => {
       expect.arrayContaining([
         'index.ts',
         'backend-runner.ts',
+        'pdf-extractor.ts',
+        'pdf-extractor-path.cts',
         'claude.ts',
         'codex.ts',
         'gemini.ts',
@@ -227,6 +236,8 @@ describe('@inklabs/shared/providers keeps its closure', () => {
     expect(reached).toEqual(
       expect.arrayContaining([
         'providers/backend-runner.ts',
+        'providers/pdf-extractor.ts',
+        'providers/pdf-extractor-path.cts',
         'runner/spawn-backend.ts',
         'runner/mcp-config.ts',
         'runtime/token-usage.ts',

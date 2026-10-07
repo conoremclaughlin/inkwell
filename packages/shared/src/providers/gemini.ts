@@ -175,6 +175,9 @@ export class GeminiAdapter implements BackendAdapter {
   }
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
+    if (config.withholdProviderTools) {
+      throw new Error("the gemini backend can't withhold its own tools");
+    }
     const identity = await createIdentityPromptFile(
       host.paths.tempDir,
       config.sbSlug,

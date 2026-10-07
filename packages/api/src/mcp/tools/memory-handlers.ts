@@ -363,6 +363,25 @@ const topicsSchema = z
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
+import {
+  actorOwnerSbId,
+  resolveMemoryActor,
+  resolveMemoryOwner,
+  sessionMemoryOwner,
+  type MemoryOwner,
+} from './memory-owner';
+
+/** A memory call refused because it has no owner to act for. */
+function memoryOwnerRefusal(error: string) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({ success: false, error }),
+      },
+    ],
+  };
+}
 
 export { buildKnowledgeSummary };
 
@@ -400,7 +419,9 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
   sbSlug: z
     .string()
     .optional()
-    .describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
+    .describe(
+      'The SB this memory belongs to (e.g., "wren"). Defaults to you. Every memory has an owner: there are no shared memories.'
+    ),
   contactId: z
     .string()
     .guid()
@@ -447,11 +468,11 @@ export const recallSchema = userIdentifierBaseSchema.extend({
   sbSlug: z
     .string()
     .optional()
-    .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
+    .describe('Whose memories to recall (e.g., "wren"). Defaults to you.'),
   includeShared: z
     .boolean()
     .optional()
-    .describe('Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'),
+    .describe('Deprecated and ignored: there are no shared memories.'),
   contactId: z
     .string()
     .guid()
@@ -803,7 +824,17 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
   const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
-  const sbSlug = getEffectiveSlug(params.sbSlug);
+  // Every memory has exactly one owner, a canonical identity
+  // (ink://specs/remove-shared-memories §3.1). One written with no slug and
+  // no identity behind the call used to be stored as "shared", and reached
+  // every SB of the user, inklings included.
+  const ownerResolution = await resolveMemoryOwner(
+    dataComposer.getClient(),
+    user.id,
+    params.sbSlug
+  );
+  if (!ownerResolution.ok) return memoryOwnerRefusal(ownerResolution.error);
+  const { sbSlug, sbId } = ownerResolution.owner;
 
   // Attach a session ID to the memory metadata for traceability. An explicit
   // sessionId from the caller wins: it knows which session it is.
@@ -878,6 +909,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     metadata,
     expiresAt: params.expiresAt ? new Date(params.expiresAt) : undefined,
     sbSlug,
+    sbId,
     contactId,
   });
 
@@ -921,6 +953,18 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
   const params = recallSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // Whose memories: the caller's own, by default and for any SB token. It
+  // used to apply no owner filter when sbSlug was omitted, so a recall with
+  // no slug returned every memory of every SB under the user
+  // (remove-shared-memories §3.3).
+  const ownerResolution = await resolveMemoryOwner(
+    dataComposer.getClient(),
+    user.id,
+    params.sbSlug
+  );
+  if (!ownerResolution.ok) return memoryOwnerRefusal(ownerResolution.error);
+  const owner = ownerResolution.owner;
+
   const contactId = resolveContactId(params);
 
   const searchOptions = {
@@ -930,8 +974,8 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
     topics: params.topics,
     limit: params.limit,
     includeExpired: params.includeExpired,
-    sbSlug: params.sbSlug,
-    includeShared: params.includeShared,
+    sbSlug: owner.sbSlug,
+    sbId: owner.sbId,
     contactId,
   };
 
@@ -942,7 +986,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
   );
 
   logger.info(`Recalled ${candidates.length} memories for user ${user.id}`, {
-    sbSlug: params.sbSlug,
+    sbSlug: owner.sbSlug,
   });
 
   return {
@@ -1096,7 +1140,19 @@ export async function handleForget(args: unknown, dataComposer: DataComposer) {
   const params = forgetSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  await dataComposer.repositories.memory.forget(params.memoryId, user.id);
+  // An SB forgets only its own memories; a person, any of theirs. An SB
+  // naming another SB's memory is told so, and nothing is deleted.
+  const actorResolution = await resolveMemoryActor(dataComposer.getClient(), user.id);
+  if (!actorResolution.ok) return memoryOwnerRefusal(actorResolution.error);
+  const ownerSbId = actorOwnerSbId(actorResolution.actor);
+  if (ownerSbId) {
+    const target = await dataComposer.repositories.memory.getMemory(params.memoryId);
+    if (!target || target.userId !== user.id || target.sbId !== ownerSbId) {
+      return memoryOwnerRefusal('No memory with that id is yours to forget.');
+    }
+  }
+
+  await dataComposer.repositories.memory.forget(params.memoryId, user.id, ownerSbId);
 
   logger.info(`Memory forgotten: ${params.memoryId} for user ${user.id}`);
 
@@ -1149,13 +1205,23 @@ export async function handleUpdateMemory(args: unknown, dataComposer: DataCompos
     };
   }
 
-  const memory = await dataComposer.repositories.memory.updateMemory(params.memoryId, user.id, {
-    content: params.content,
-    summary: params.summary,
-    salience: params.salience as Salience,
-    topics: params.topics,
-    metadata: params.metadata,
-  });
+  // An SB changes only its own memories; a person, any of theirs. Another
+  // SB's memory reads as not found, as it would to recall.
+  const actorResolution = await resolveMemoryActor(dataComposer.getClient(), user.id);
+  if (!actorResolution.ok) return memoryOwnerRefusal(actorResolution.error);
+
+  const memory = await dataComposer.repositories.memory.updateMemory(
+    params.memoryId,
+    user.id,
+    {
+      content: params.content,
+      summary: params.summary,
+      salience: params.salience as Salience,
+      topics: params.topics,
+      metadata: params.metadata,
+    },
+    actorOwnerSbId(actorResolution.actor)
+  );
 
   if (!memory) {
     return {
@@ -1588,8 +1654,13 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
 
   logger.info(`Session ended`, { sessionId: session.id, hasSummary: !!params.summary });
 
-  // If summary provided, also save it as a memory
-  if (params.summary) {
+  // If summary provided, also save it as a memory, owned by the session's SB
+  // with its contact scope. It used to be written with no owner, which made
+  // every session summary a shared memory (remove-shared-memories §2.1).
+  const summaryOwner = params.summary
+    ? await sessionMemoryOwner(dataComposer.getClient(), session)
+    : null;
+  if (params.summary && summaryOwner) {
     await dataComposer.repositories.memory.remember({
       userId: user.id,
       content: params.summary,
@@ -1597,6 +1668,13 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
       salience: 'high',
       topics: ['session-summary'],
       metadata: { sessionId: session.id, sbSlug: session.sbSlug },
+      sbSlug: summaryOwner.sbSlug,
+      sbId: summaryOwner.sbId,
+      contactId: session.contactId,
+    });
+  } else if (params.summary) {
+    logger.warn('Session summary not saved as a memory: the session has no SB to own it', {
+      sessionId: session.id,
     });
   }
 
@@ -2456,7 +2534,12 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       context: params.context,
     });
 
-    if (memoryContent) {
+    // Owned by the session's own SB, with its contact scope; a session with
+    // no SB writes no memory (remove-shared-memories §3.2).
+    const phaseOwner = memoryContent
+      ? await sessionMemoryOwner(dataComposer.getClient(), updated)
+      : null;
+    if (memoryContent && phaseOwner) {
       const memory = await dataComposer.repositories.memory.remember({
         userId: user.id,
         content: memoryContent,
@@ -2464,7 +2547,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         salience: 'high',
         topics: ['session-phase', params.phase.split(':')[0]],
         metadata: { sessionId, phase: params.phase },
-        sbSlug: params.sbSlug || updated.sbSlug,
+        sbSlug: phaseOwner.sbSlug,
+        sbId: phaseOwner.sbId,
+        contactId: updated.contactId,
       });
 
       result.memoryCreated = {
@@ -2477,6 +2562,8 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         phase: params.phase,
         memoryId: memory.id,
       });
+    } else if (memoryContent) {
+      result.memoryNotSaved = 'This session has no SB to own a memory, so none was saved.';
     }
   }
 
@@ -2544,7 +2631,15 @@ export async function handleGetMemoryHistory(args: unknown, dataComposer: DataCo
   const params = getMemoryHistorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const history = await dataComposer.repositories.memory.getMemoryHistory(params.memoryId, user.id);
+  // An SB sees only its own memories' history; a person sees all of theirs.
+  const actorResolution = await resolveMemoryActor(dataComposer.getClient(), user.id);
+  if (!actorResolution.ok) return memoryOwnerRefusal(actorResolution.error);
+
+  const history = await dataComposer.repositories.memory.getMemoryHistory(
+    params.memoryId,
+    user.id,
+    actorOwnerSbId(actorResolution.actor)
+  );
 
   return {
     content: [
@@ -2579,9 +2674,14 @@ export async function handleGetUserHistory(args: unknown, dataComposer: DataComp
   const params = getUserHistorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // An SB sees only its own memories' history; a person sees all of theirs.
+  const actorResolution = await resolveMemoryActor(dataComposer.getClient(), user.id);
+  if (!actorResolution.ok) return memoryOwnerRefusal(actorResolution.error);
+
   const history = await dataComposer.repositories.memory.getUserMemoryHistory(user.id, {
     limit: params.limit,
     changeType: params.changeType,
+    ownerSbId: actorOwnerSbId(actorResolution.actor),
   });
 
   return {
@@ -2615,7 +2715,15 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
   const params = restoreMemorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const memory = await dataComposer.repositories.memory.restoreMemory(params.historyId, user.id);
+  // An SB restores only its own memory's history; a person, any of theirs.
+  const actorResolution = await resolveMemoryActor(dataComposer.getClient(), user.id);
+  if (!actorResolution.ok) return memoryOwnerRefusal(actorResolution.error);
+
+  const memory = await dataComposer.repositories.memory.restoreMemory(
+    params.historyId,
+    user.id,
+    actorOwnerSbId(actorResolution.actor)
+  );
 
   if (!memory) {
     return {
@@ -2835,20 +2943,43 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     params.threadKey || mergedSessions.find((session) => !!session.threadKey)?.threadKey;
   const focusText = params.focusText || focus?.focus_summary || undefined;
 
-  const knowledgeMemoriesBase = includeMemories
-    ? await dataComposer.repositories.memory.getKnowledgeMemories(user.id, sbSlug, memoryLimit, 7, {
-        threadKey: inferredThreadKey || undefined,
-        focusText,
-      })
+  // Whose memories bootstrap shows: the caller's own, resolved like every
+  // other memory path. It used to read params.sbSlug alone, so a bootstrap
+  // with no slug, a bound token's included, read every SB's memories. With no
+  // owner it shows none (remove-shared-memories §3.3).
+  let memoryOwner: MemoryOwner | undefined;
+  if (includeMemories) {
+    const resolution = await resolveMemoryOwner(supabase, user.id, sbSlug);
+    if (resolution.ok) {
+      memoryOwner = resolution.owner;
+    } else {
+      logger.info('Bootstrap shows no memories: no owner to read them for', {
+        sbSlug: sbSlug || 'none',
+        reason: resolution.error,
+      });
+    }
+  }
+
+  const knowledgeMemoriesBase = memoryOwner
+    ? await dataComposer.repositories.memory.getKnowledgeMemories(
+        user.id,
+        memoryOwner,
+        memoryLimit,
+        7,
+        {
+          threadKey: inferredThreadKey || undefined,
+          focusText,
+        }
+      )
     : [];
 
   // Post-compact: merge in most recent memories regardless of salience
   // to restore context continuity after lossy compaction
   let knowledgeMemories = knowledgeMemoriesBase;
-  if (postCompact && includeMemories) {
+  if (postCompact && memoryOwner) {
     const recentMemories = await dataComposer.repositories.memory.getRecentMemories(
       user.id,
-      sbSlug,
+      memoryOwner,
       10
     );
     // Merge and dedupe — recent memories may already be in the knowledge set
@@ -2959,43 +3090,17 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Build agent info from dbIdentity
   const agentInfo = dbIdentity ? bootstrapAgentInfo(dbIdentity) : null;
 
-  // Build knowledge summary (or use cache for the text)
-  let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
-  let cachedSummary: string | null = null;
-
-  if (includeMemories && knowledgeMemories.length > 0) {
-    // Always build the full result (needed for topicIndex regardless of cache)
-    knowledgeSummaryResult = buildKnowledgeSummary(knowledgeMemories);
-
-    // Try cache for the summary text (avoid regenerating the formatted string)
-    try {
-      const cached = await dataComposer.repositories.memory.getCachedSummary(user.id, sbSlug);
-      if (cached) {
-        cachedSummary = cached.summaryText;
-      }
-    } catch {
-      // Cache miss or error — use freshly computed
-    }
-
-    if (!cachedSummary) {
-      // Cache the computed summary in background (don't block response)
-      dataComposer.repositories.memory
-        .setCachedSummary(
-          user.id,
-          sbSlug,
-          knowledgeSummaryResult.knowledgeSummary,
-          knowledgeMemories.length
-        )
-        .catch(() => {}); // Fire and forget
-    }
-  }
-
-  const usedCache = !!cachedSummary;
-  const knowledgeSummary = cachedSummary || knowledgeSummaryResult?.knowledgeSummary || '';
+  // Build the knowledge summary from the memories just read. It is always
+  // built fresh: memory_summary_cache only swapped in older text, and text
+  // cached before shared memories were removed can quote them
+  // (remove-shared-memories §3.3).
+  const knowledgeSummaryResult =
+    includeMemories && knowledgeMemories.length > 0
+      ? buildKnowledgeSummary(knowledgeMemories)
+      : null;
+  const knowledgeSummary = knowledgeSummaryResult?.knowledgeSummary || '';
   const topicIndex = knowledgeSummaryResult?.topicIndex || [];
-  // Only return memoryIds when using the freshly computed summary — cached summaries
-  // may have been built from a different memory set (different thread/focus/limit).
-  const knowledgeMemoryIds = usedCache ? [] : knowledgeSummaryResult?.memoryIds || [];
+  const knowledgeMemoryIds = knowledgeSummaryResult?.memoryIds || [];
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     sbSlug: sbSlug || 'none',
@@ -3003,7 +3108,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
     topicCount: topicIndex.length,
-    usedCache,
     memorySelectionContext: {
       threadKey: inferredThreadKey || null,
       hasFocusText: !!focusText,
@@ -3243,6 +3347,34 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
     };
   }
 
+  // Compacted memories belong to the session's own SB, with its contact
+  // scope. They used to be written with no owner, which made every compacted
+  // log a shared memory (remove-shared-memories §2.1).
+  const compactionOwner = await sessionMemoryOwner(dataComposer.getClient(), session);
+  if (!compactionOwner) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error:
+                'This session has no SB to own its compacted memories, so nothing was compacted.',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+  const compactedOwnership = {
+    sbSlug: compactionOwner.sbSlug,
+    sbId: compactionOwner.sbId,
+    contactId: session.contactId,
+  };
+
   // Get logs at or above minimum salience
   const logs = await dataComposer.repositories.memory.getSessionLogsBySalience(
     sessionId,
@@ -3297,6 +3429,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
       salience: 'critical',
       topics: ['session-compaction'],
       metadata: { sessionId, originalLogId: log.id, compactedAt: new Date().toISOString() },
+      ...compactedOwnership,
     });
     memoriesCreated.push({
       id: memory.id,
@@ -3320,6 +3453,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
       salience: 'high',
       topics: ['session-compaction'],
       metadata: { sessionId, originalLogId: log.id, compactedAt: new Date().toISOString() },
+      ...compactedOwnership,
     });
     memoriesCreated.push({
       id: memory.id,
@@ -3353,6 +3487,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
         logCount: bySalience.medium.length,
         compactedAt: new Date().toISOString(),
       },
+      ...compactedOwnership,
     });
     memoriesCreated.push({
       id: memory.id,

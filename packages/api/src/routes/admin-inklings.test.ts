@@ -82,6 +82,7 @@ interface Ctx {
   userId?: string;
   workspaceId?: string;
   params?: Record<string, string>;
+  query?: Record<string, string>;
 }
 
 function createReq(body: unknown, ctx: Ctx = {}): Request {
@@ -90,6 +91,7 @@ function createReq(body: unknown, ctx: Ctx = {}): Request {
     headers: {},
     cookies: {},
     params: ctx.params ?? {},
+    query: ctx.query ?? {},
     inkUserId: ctx.userId ?? ME,
     inkWorkspaceId: ctx.workspaceId ?? MY_WORKSPACE,
     inkWorkspaceRole: ctx.role ?? 'owner',
@@ -99,12 +101,18 @@ function createReq(body: unknown, ctx: Ctx = {}): Request {
 interface MockResponse extends Response {
   _status: number;
   _json: Record<string, unknown>;
+  _headers: Record<string, string>;
 }
 
 function createRes(): MockResponse {
   const res: Record<string, unknown> = {
     _status: 200,
     _json: null,
+    _headers: {},
+    setHeader(header: string, value: string) {
+      (res._headers as Record<string, string>)[header] = value;
+      return res;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -334,6 +342,143 @@ describe('GET /inklings', () => {
     } finally {
       turn.done();
     }
+  });
+});
+
+describe('GET /inklings/:id/profile', () => {
+  const profile = handler('get', '/inklings/:id/profile');
+
+  async function awakened(): Promise<string> {
+    const res = await call(awaken, { clientRequestId: REQUEST });
+    return (res._json.inkling as { id: string }).id;
+  }
+
+  it('answers with my inkling’s soul and own values only, uncached', async () => {
+    const id = await awakened();
+    Object.assign(db.rows('agent_identities').find((r) => r.id === id)!, {
+      soul: '# Soul',
+      values: ['care'],
+      heartbeat: 'operational instructions',
+      relationships: { someone: 'friend' },
+    });
+    const res = await call(profile, {}, { params: { id } });
+    expect(res._status).toBe(200);
+    expect(res._headers['Cache-Control']).toBe('no-store');
+    const body = res._json.profile as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      'createdAt',
+      'displayName',
+      'id',
+      'identityUpdatedAt',
+      'soul',
+      'values',
+    ]);
+    expect(body).toMatchObject({ id, soul: '# Soul', values: ['care'] });
+  });
+
+  it('is readable by every role in my workspace, for my own inkling', async () => {
+    const id = await awakened();
+    const res = await call(profile, {}, { params: { id }, role: 'viewer' });
+    expect(res._status).toBe(200);
+  });
+
+  it('is the same 404 for another person, another workspace, an agent, or a malformed id', async () => {
+    const id = await awakened();
+    const agent = seedOwnSb(db, { userId: ME, workspaceId: MY_WORKSPACE }, 'myra');
+    for (const ctx of [
+      { params: { id }, userId: SOMEONE_ELSE },
+      { params: { id }, workspaceId: OTHER_WORKSPACE },
+      { params: { id: agent.id as string } },
+      { params: { id: 'not-a-uuid' } },
+    ]) {
+      const res = await call(profile, {}, ctx);
+      expect(res._status).toBe(404);
+      expect(res._json).toEqual({ error: 'No inkling with that id' });
+    }
+  });
+});
+
+describe('GET /inklings/:id/approvals', () => {
+  const approvals = handler('get', '/inklings/:id/approvals');
+
+  async function awakened(): Promise<string> {
+    const res = await call(awaken, { clientRequestId: REQUEST });
+    return (res._json.inkling as { id: string }).id;
+  }
+
+  function seedRequest(sbId: string | null, over: Record<string, unknown> = {}) {
+    return db.seed('approval_requests', {
+      user_id: ME,
+      workspace_id: MY_WORKSPACE,
+      sb_id: sbId,
+      requesting_agent_id: 'header-slug',
+      tool: 'Bash',
+      args: '{"command":"secret"}',
+      reason: 'Tool requires explicit per-call confirmation by policy.',
+      status: 'granted',
+      granted_tools: ['Bash'],
+      granted_by: 'telegram:someone',
+      expires_at: '2099-01-01T00:00:00.000Z',
+      resolved_at: '2026-10-07T00:00:00.000Z',
+      ...over,
+    });
+  }
+
+  it("answers with my inkling's signed requests only, allowlisted and uncached", async () => {
+    const id = await awakened();
+    const mine = seedRequest(id);
+    seedRequest(null);
+    const res = await call(approvals, undefined, { params: { id } });
+    expect(res._status).toBe(200);
+    expect(res._headers['Cache-Control']).toBe('no-store');
+    const body = res._json as { approvals: Array<Record<string, unknown>>; nextBefore: unknown };
+    expect(body.approvals.map((a) => a.id)).toEqual([mine.id]);
+    expect(Object.keys(body.approvals[0]).sort()).toEqual([
+      'createdAt',
+      'expiresAt',
+      'id',
+      'purpose',
+      'resolvedAt',
+      'status',
+      'tool',
+    ]);
+    expect(body.nextBefore).toBeNull();
+  });
+
+  it('pages with limit and before from the query', async () => {
+    const id = await awakened();
+    seedRequest(id);
+    seedRequest(id);
+    const first = await call(approvals, undefined, { params: { id }, query: { limit: '1' } });
+    const firstBody = first._json as { approvals: unknown[]; nextBefore: string };
+    expect(firstBody.approvals).toHaveLength(1);
+    const second = await call(approvals, undefined, {
+      params: { id },
+      query: { limit: '1', before: firstBody.nextBefore },
+    });
+    expect((second._json as { approvals: unknown[] }).approvals).toHaveLength(1);
+  });
+
+  it('is the same uncached 404 for another person, another workspace, an agent, or a malformed id', async () => {
+    const id = await awakened();
+    const agent = seedOwnSb(db, { userId: ME, workspaceId: MY_WORKSPACE }, 'myra');
+    for (const ctx of [
+      { params: { id }, userId: SOMEONE_ELSE },
+      { params: { id }, workspaceId: OTHER_WORKSPACE },
+      { params: { id: agent.id as string } },
+      { params: { id: 'not-a-uuid' } },
+    ]) {
+      const res = await call(approvals, undefined, ctx);
+      expect(res._status).toBe(404);
+      expect(res._json).toEqual({ error: 'No inkling with that id' });
+      expect(res._headers['Cache-Control']).toBe('no-store');
+    }
+  });
+
+  it('answers a cursor it did not make with a 400', async () => {
+    const id = await awakened();
+    const res = await call(approvals, undefined, { params: { id }, query: { before: 'nope' } });
+    expect(res._status).toBe(400);
   });
 });
 

@@ -87,6 +87,21 @@ const REFUSED_MEMBERS: ReadonlySet<string> = new Set(['process', 'require']);
  */
 const HOST_BOUNDARY_EXCEPTIONS: ReadonlyArray<{ at: string; reason: string }> = [
   {
+    at: 'providers/pdf-extractor.ts (module) child_process.execFile',
+    reason:
+      'A bounded async PDF parser child, never a provider. Empty env, module-owned cwd, capped stdin/stdout, SIGKILL timeout; no session config or credentials.',
+  },
+  {
+    at: 'providers/pdf-extractor.ts (module) module.createRequire',
+    reason:
+      'Resolves only the fixed pdf-parse dependency relative to this module, never from a session checkout or the ambient cwd. The parser runs only in the bounded child.',
+  },
+  {
+    at: 'providers/pdf-extractor.ts extractPdfText process.execPath',
+    reason:
+      'The parser uses this Node executable, never a model binary or a PATH lookup. No host environment is passed to it.',
+  },
+  {
     at: 'runner/spawn-backend.ts (module) child_process.spawn',
     reason:
       'The one spawn the runner exists to make. It runs after preparation, with the env preparation produced.',
@@ -318,7 +333,10 @@ function preparationWalk(entry: string, root: string): Walk {
       true
     );
     for (const specifier of relativeSpecifiers(source)) {
-      const target = resolve(dirname(file), specifier.replace(/\.js$/, '.ts'));
+      const target = resolve(
+        dirname(file),
+        specifier.replace(/\.cjs$/, '.cts').replace(/\.js$/, '.ts')
+      );
       const from = relative(root, file);
       if (relative(root, target).startsWith('..')) {
         unfollowed.push(`${from} -> ${specifier} (outside the walk)`);
@@ -486,6 +504,8 @@ describe('the preparation path', () => {
         'providers/backend-runner.ts',
         'providers/registry.ts',
         'providers/claude.ts',
+        'providers/pdf-extractor.ts',
+        'providers/pdf-extractor-path.cts',
         'providers/codex.ts',
         'providers/gemini.ts',
         'providers/identity-prompt.ts',

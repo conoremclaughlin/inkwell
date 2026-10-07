@@ -163,9 +163,16 @@ describe('PR 639 recovery advice', () => {
 });
 
 describe('PR 639 resume-not-found recovery seed', () => {
-  async function recover(mintedId = 'reseeded-native-session') {
+  async function recover(
+    mintedId = 'reseeded-native-session',
+    imageTargets?: Array<string | undefined>
+  ) {
     const h = providerHarness();
     h.ports.mintId = () => mintedId;
+    h.ports.contextImagesFor = (id) => {
+      imageTargets?.push(id);
+      return [];
+    };
     h.measure();
     vi.mocked(h.ports.startTurn).mockReturnValueOnce({
       result: Promise.resolve({
@@ -182,6 +189,12 @@ describe('PR 639 resume-not-found recovery seed', () => {
     expect(h.ports.startTurn).toHaveBeenCalledTimes(2);
     return vi.mocked(h.ports.startTurn).mock.calls[1][0];
   }
+
+  it('asks for the images owed to the replacement session, not the dead one', async () => {
+    const imageTargets: Array<string | undefined> = [];
+    await recover('reseeded-native-session', imageTargets);
+    expect(imageTargets).toEqual(['stale-native-session', 'reseeded-native-session']);
+  });
 
   it('stamps the recovery retry envelope', async () => {
     const request = await recover();
@@ -214,5 +227,7 @@ it('the CLI supplies live native state and measurement to the tested shared comp
   expect(block).toContain('return activeBackendSessionId;');
   expect(block).toContain('activeBackendSessionId = value;');
   expect(block).toContain('measurement: providerContextMeasurement,');
+  expect(block).toContain('contextImagesFor,');
+  expect(block).toContain('noteImagesDelivered,');
   expect(block).toContain('buildPromptEnvelope(sbSlug, runtime, ledger, body, stamp)');
 });

@@ -20,6 +20,7 @@ import type {
   BackendHost,
   EffectiveConfigCheck,
   PreparedBackend,
+  TurnMedia,
 } from './types.js';
 
 export { INK_ENV_HEADERS };
@@ -54,6 +55,7 @@ export class CodexAdapter implements BackendAdapter {
   readonly binary = 'codex';
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
+  readonly acceptsContextImages = true;
 
   /**
    * Codex's own view of its merged MCP config, judged before the spawn
@@ -83,6 +85,9 @@ export class CodexAdapter implements BackendAdapter {
   }
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
+    if (config.withholdProviderTools) {
+      throw new Error("the codex backend can't withhold its own tools");
+    }
     const identity = await createIdentityPromptFile(
       host.paths.tempDir,
       config.sbSlug,
@@ -171,6 +176,7 @@ export class CodexAdapter implements BackendAdapter {
     // Preserve general behavior for non-exec prompt parts, but when promptParts
     // starts with `exec`, place passthrough args immediately after `exec`.
     const promptParts = config.promptParts || [];
+    let contextImagesDelivered: TurnMedia[] = [];
     if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
       // The prompt is data, and always follows one `--`: without it, prompt
       // text beginning with a dash reads as an option, and `--config=…` as a
@@ -192,12 +198,16 @@ export class CodexAdapter implements BackendAdapter {
       // path (Lumen, review 4900120086 — variadic `-i <FILE>...` swallows
       // the following positional prompt). Non-image media stays on the
       // prompt-text path (paths listed in the attachment block).
-      const imageMedia = (config.media ?? []).filter((m) => m.mimeType?.startsWith('image/'));
+      const imageMedia = [
+        ...(config.media ?? []).filter((m) => m.mimeType?.startsWith('image/')),
+        ...(config.contextImages ?? []),
+      ];
       for (const m of imageMedia) {
         args.push(`--image=${m.path}`);
       }
       args.push('--', ...passthroughPositionals);
       args.push(...promptParts.slice(1));
+      contextImagesDelivered = [...(config.contextImages ?? [])];
     } else {
       // Passthrough flags
       args.push(...config.passthroughArgs);
@@ -241,6 +251,7 @@ export class CodexAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
+      ...(contextImagesDelivered.length > 0 ? { contextImagesDelivered } : {}),
     };
   }
 }

@@ -1,18 +1,44 @@
-import { describe, expect, it } from 'vitest';
-import { readFileSync, rmSync } from 'fs';
+import { afterAll, describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
-import { buildIdentityPrompt } from './identity.js';
-import { createCliBackendHost } from './cli-host.js';
+import { buildIdentityPrompt, type BackendHost } from '@inklabs/shared/providers';
 import { decodeContextToken } from '@inklabs/shared';
 
-// These cases prepare as a launcher does: the CLI's own host, in the test
-// process's directory, attached to its terminal.
-const cliHost = createCliBackendHost();
-const LAUNCHER_DEFAULTS = { cwd: process.cwd(), cliAttached: true };
+// No ambient configuration, identity reads, skill discovery or real binaries.
+const root = mkdtempSync(join(tmpdir(), 'adapter-fixture-'));
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+writeFileSync(
+  join(root, '.mcp.json'),
+  JSON.stringify({
+    mcpServers: {
+      inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+    },
+  })
+);
+const cliHost: BackendHost = {
+  paths: {
+    inkFiles: join(root, '.ink', 'files'),
+    get studiosRoot() {
+      return process.env.INK_STUDIOS_ROOT || join(root, 'ink-studios-adapter-default');
+    },
+    tempDir: root,
+  },
+  ambientSession: () => ({}),
+  claudeSupportsPartialMessages: async () => false,
+  skillMcpServers: async () => [],
+  sessionEnv: async () => ({}),
+  baseEnv: async () => ({ HOME: root }),
+  inkwellMcpUrl: 'http://localhost:3001/mcp',
+  resolveBinary: async () => {
+    throw new Error('no subprocess in adapter tests');
+  },
+  warn: () => undefined,
+};
+const LAUNCHER_DEFAULTS = { cwd: root, cliAttached: true };
 
 describe('buildIdentityPrompt conditional bootstrap', () => {
   it('includes conditional self-healing instructions when no startup context is provided', () => {
@@ -136,7 +162,7 @@ describe('backend adapters session resume wiring', () => {
       expect(prepared.args).toContain('resume');
       expect(prepared.args).toContain('codex-session-123');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -173,7 +199,34 @@ describe('backend adapters session resume wiring', () => {
       expect(prepared.args).not.toContain('/tmp/doc.pdf');
       expect(prepared.args).not.toContain('-i');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
+    }
+  });
+
+  it('attaches images a tool put in context with the same flag, after the turn media', async () => {
+    const adapter = new CodexAdapter();
+    const prepared = await adapter.prepare(
+      {
+        ...LAUNCHER_DEFAULTS,
+        sbSlug: 'lumen',
+        model: undefined,
+        promptParts: ['exec', 'continue'],
+        passthroughArgs: [],
+        media: [{ path: '/tmp/photo.png', mimeType: 'image/png' }],
+        contextImages: [{ path: '/tmp/ink-tool-images-x/abc.jpg', mimeType: 'image/jpeg' }],
+      },
+      cliHost
+    );
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      const promptIndex = prepared.args.indexOf('continue');
+      expect(prepared.args.slice(execIndex + 1, promptIndex)).toEqual([
+        '--image=/tmp/photo.png',
+        '--image=/tmp/ink-tool-images-x/abc.jpg',
+        '--',
+      ]);
+    } finally {
+      await prepared.cleanup();
     }
   });
 
@@ -193,7 +246,7 @@ describe('backend adapters session resume wiring', () => {
       expect(prepared.args.slice(-3)).toEqual(['exec', '--', 'plain work']);
       expect(prepared.args.some((a) => a.startsWith('--image='))).toBe(false);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -220,7 +273,7 @@ describe('backend adapters session resume wiring', () => {
         // Data, so not part of the configuration the check is run with.
         expect(JSON.stringify(prepared.launchConfig)).not.toContain('4001');
       } finally {
-        prepared.cleanup();
+        await prepared.cleanup();
       }
     }
   });
@@ -248,7 +301,7 @@ describe('backend adapters session resume wiring', () => {
         'do work',
       ]);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -277,7 +330,7 @@ describe('backend adapters session resume wiring', () => {
         'do work',
       ]);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -306,7 +359,7 @@ describe('backend adapters session resume wiring', () => {
       expect(promptBody).toContain('### STARTUP TEST');
       expect(promptBody).toContain('Injected from bootstrap.');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -344,7 +397,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(prepared.args).toContain('--dangerously-bypass-approvals-and-sandbox');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -365,7 +418,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(prepared.args).toContain('--yolo');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -397,7 +450,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(codexPrep.args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     } finally {
-      codexPrep.cleanup();
+      await codexPrep.cleanup();
     }
 
     const gemini = new GeminiAdapter();
@@ -414,7 +467,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(geminiPrep.args).not.toContain('--yolo');
     } finally {
-      geminiPrep.cleanup();
+      await geminiPrep.cleanup();
     }
   });
 
@@ -445,7 +498,7 @@ describe('backend adapters session resume wiring', () => {
       expect(grantedDirs).toContain('/home/u/.ink/files/telegram');
       expect(grantedDirs).toContain('/tmp/uploads');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -479,7 +532,7 @@ describe('backend adapters session resume wiring', () => {
       // never be granted a new directory after spawn.
       expect(addDirPairs).toContain(process.env.INK_STUDIOS_ROOT);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
       rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
       if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
       else process.env.INK_STUDIOS_ROOT = prevRoot;
@@ -518,7 +571,7 @@ describe('backend adapters session resume wiring', () => {
             );
           }
         } finally {
-          prepared.cleanup();
+          await prepared.cleanup();
         }
       }
     } finally {
@@ -548,7 +601,7 @@ describe('backend adapters session resume wiring', () => {
           .filter(Boolean);
         expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
       } finally {
-        prepared.cleanup();
+        await prepared.cleanup();
       }
     } finally {
       rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
@@ -614,7 +667,7 @@ describe('backend adapters session resume wiring', () => {
       expect(prepared.env).toBeDefined();
       expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-def-456');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -634,7 +687,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(prepared.env?.INK_SESSION_ID).toBeUndefined();
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -656,7 +709,7 @@ describe('backend adapters session resume wiring', () => {
       expect(prepared.env).toBeDefined();
       expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-ghi-789');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -676,7 +729,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(prepared.env?.INK_SESSION_ID).toBeUndefined();
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -707,7 +760,7 @@ describe('backend adapters session resume wiring', () => {
         expect(prepared.env!.AGENT_ID).toBe(sbSlug);
         expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-shared');
       } finally {
-        if (cleanup) prepared.cleanup();
+        if (cleanup) await prepared.cleanup();
       }
     }
   });
@@ -731,7 +784,7 @@ describe('backend adapters session resume wiring', () => {
       expect(resumeFlagIndex).toBeGreaterThanOrEqual(0);
       expect(prepared.args[resumeFlagIndex + 1]).toBe('gemini-session-456');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -766,7 +819,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token!.runtime).toBe('claude');
       expect(token!.cliAttached).toBe(true);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -795,7 +848,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token!.runtime).toBe('codex');
       expect(token!.cliAttached).toBe(true);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -829,7 +882,7 @@ describe('backend adapters session resume wiring', () => {
       const authHeaderArg = prepared.args.find((a) => a.includes('env_http_headers.Authorization'));
       expect(authHeaderArg).toBeUndefined();
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -858,7 +911,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token!.runtime).toBe('gemini');
       expect(token!.cliAttached).toBe(true);
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 
@@ -889,7 +942,7 @@ describe('backend adapters session resume wiring', () => {
         try {
           expect(decodeContextToken(prepared.env.INK_CONTEXT)?.cliAttached).toBe(cliAttached);
         } finally {
-          prepared.cleanup();
+          await prepared.cleanup();
         }
       }
     }
@@ -925,7 +978,7 @@ describe('backend adapters session resume wiring', () => {
       expect(decoded.runtime).toBe('gemini');
       expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('sess-gemini-789');
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 });

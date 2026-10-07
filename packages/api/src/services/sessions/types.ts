@@ -7,7 +7,7 @@
 import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 import type { GroupState } from './stop-process';
-import type { InklingProvider } from '../inklings/inkling-runtime';
+import type { InkProvider } from './ink-provider';
 
 // ─── Channel Types ───
 
@@ -308,6 +308,21 @@ export interface SessionRequest {
      * gate reads the message to learn who really sent it.
      */
     triggerThreadMessageId?: string;
+    /**
+     * The stored inbox message that prompted this trigger, copied by the
+     * trigger handler from the payload's own inboxMessageId.
+     */
+    triggerInboxMessageId?: string;
+    /**
+     * Set by the trigger handler, and only there, on a wake that may run in
+     * one turn with the wakes queued beside it (spec trigger-pipe-in v7, 1.1):
+     * it points at a stored message and is neither a force-spawn nor a
+     * strategy trigger. SessionService still keeps out a wake whose metadata
+     * changes the launch (media, a task group, a sandbox container).
+     */
+    wakeCoalescible?: boolean;
+    /** On a merged turn's request: the source message id of every wake it carries. */
+    coalescedSources?: string[];
   };
 
   /**
@@ -317,6 +332,26 @@ export interface SessionRequest {
    * to the run's final text.
    */
   onTurnReply?: TurnReplyHandler;
+
+  /**
+   * Called around this request's own turn, whichever path runs it: directly,
+   * from the queue, or as the lead of wakes merged into one turn. See
+   * SessionTurnHooks.
+   */
+  turnHooks?: SessionTurnHooks;
+}
+
+/**
+ * A caller's view of one turn, in turn order. `start` runs before the turn
+ * begins and `end` runs with its result the moment it returns, before the next
+ * queued turn on the session starts. handleMessage's own promise can settle
+ * much later, once the queue behind it has drained, so a decision that must
+ * belong to this turn alone is made here (Lumen, #769). Neither can fail the
+ * turn: SessionService logs a throw and goes on.
+ */
+export interface SessionTurnHooks {
+  start(): Promise<void>;
+  end(result: SessionResult): Promise<void>;
 }
 
 export interface ChannelResponse {
@@ -432,6 +467,13 @@ export interface SessionResult {
       };
     };
   };
+  /**
+   * Present on a wake that ran inside another wake's turn (spec
+   * trigger-pipe-in v7, 1.5). The turn's outcome is this wake's too, but its
+   * replies were routed once, by the wake named here, so `responses` is empty
+   * and `finalTextResponse` is absent.
+   */
+  wake?: { coalescedInto: string };
 }
 
 // ─── Tool Call Tracking ───
@@ -445,6 +487,8 @@ export interface ToolCall {
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
+  /** The canonical identity (agent_identities.id). */
+  sbId?: string;
   sbSlug: string;
   name: string;
   /**
@@ -861,11 +905,18 @@ export interface ClaudeRunnerConfig {
   constitutionInjected?: boolean;
   /**
    * The provider InkRunner tells `ink chat` to run (`--backend`). Unset leaves
-   * the chat's own default, as every ordinary SB's spawn does. An inkling's
-   * turn always sets it (inklings/inkling-runtime.ts), so its provider never
-   * rests on that default.
+   * the chat's own default, as an ordinary SB whose identity names no provider
+   * gets. An inkling's turn always sets it (inklings/inkling-runtime.ts), and
+   * an ordinary SB's does when its identity names one (ink-provider.ts).
    */
-  inkProvider?: InklingProvider;
+  inkProvider?: InkProvider;
+  /**
+   * An inkling's turn only: the tool-policy file `ink chat` reads instead of
+   * the machine's (INK_TOOL_POLICY_PATH), with the `inkling` profile in place
+   * of `safe`, which denies the shell, file writes, waking another agent and
+   * send_response (task 0321ccf1). Unset for every other spawn.
+   */
+  inklingToolPolicyPath?: string;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts
@@ -985,6 +1036,15 @@ export interface RunnerResult {
 export type ClaudeRunnerResult = RunnerResult;
 
 export interface IRunner {
+  /**
+   * What this runner does with a person's uploads among a turn's attachments
+   * (services/uploads/runner-media.ts). `grant`: it gives its backend each
+   * upload's own directory for that spawn only, never the uploads root.
+   * `refuse`: session-service drops the uploads before the run and tells the
+   * turn. Required, so a new runner cannot compile without choosing.
+   */
+  readonly uploadMedia: 'grant' | 'refuse';
+
   /**
    * Run a message through a backend CLI.
    * Spawns process with --resume or equivalent as appropriate.

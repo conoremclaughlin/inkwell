@@ -17,6 +17,7 @@ export {
 } from './imitation-grammar.js';
 
 export * from './context-ledger.js';
+export type { ContextImage } from './context-image.js';
 export * from './hook-registry.js';
 export * from './builtin-hooks.js';
 

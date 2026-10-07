@@ -48,6 +48,46 @@ describe('isClientLocalTool', () => {
 // ─── handleClientLocalTool: list_context ────────────────────────
 
 describe('handleClientLocalTool: list_context', () => {
+  it('lists image cost without the host path, and evicts that cost by the entry ref', () => {
+    const ledger = new ContextLedger();
+    const image = {
+      ref: 'img:0123456789abcdef',
+      path: '/synthetic/cache/0123456789abcdef.png',
+      mimeType: 'image/png',
+      width: 1536,
+      height: 1024,
+      approxTokens: 2098,
+    };
+    const plain = ledger.addEntry('user', 'look');
+    const entry = ledger.addEntry('system', image.ref, 'local-tool', undefined, undefined, [image]);
+    const result = handleClientLocalTool(
+      'list_context',
+      { sort: 'largest', minTokens: 2000 },
+      ledger
+    );
+    const listed = parseResult(result);
+    expect(listed.entries).toHaveLength(1);
+    expect(listed.entries[0].tokens).toBe(entry.approxTokens);
+    expect(listed.entries[0].images).toEqual([
+      { image: image.ref, width: 1536, height: 1024, tokens: 2098 },
+    ]);
+    expect(listed.totalTokens).toBe(plain.approxTokens + entry.approxTokens);
+    expect(listed.bySource['local-tool'].tokens).toBe(entry.approxTokens);
+    expect(JSON.stringify(result)).not.toContain(image.path);
+    const onEvict = vi.fn();
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: [listed.entries[0].ref] }, ledger, undefined, {
+        onEvict,
+      })
+    );
+    expect(evicted.tokensFreed).toBe(entry.approxTokens);
+    expect(onEvict.mock.calls[0][0].refs[0].tokens).toBe(entry.approxTokens);
+    expect(ledger.listImages()).toEqual([]);
+    const after = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(after.totalTokens).toBe(plain.approxTokens);
+    expect(after.entries[0]).not.toHaveProperty('images');
+  });
+
   it('returns entry summary with metadata', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('system', 'Bootstrap identity context...', 'bootstrap');

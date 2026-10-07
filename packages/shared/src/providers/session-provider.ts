@@ -54,9 +54,16 @@ export interface SessionProviderPorts {
   measurement(): ProviderContextMeasurement | undefined;
   spawnContext(): Pick<
     BackendRunRequest,
-    'workingDirectory' | 'inkSessionId' | 'studioId' | 'host'
+    'workingDirectory' | 'inkSessionId' | 'studioId' | 'host' | 'withholdProviderTools'
   >;
   attachmentDirs(): string[] | undefined;
+  /** Images this exact provider session has not received; absent for non-image hosts. */
+  contextImagesFor?(targetSessionId: string | undefined): TurnMedia[] | undefined;
+  /** Record only the images the adapter actually carried, not those offered to it. */
+  noteImagesDelivered?(
+    targetSessionId: string | undefined,
+    result: Pick<BackendRunResult, 'success' | 'contextImagesDelivered'>
+  ): void;
   startTurn(request: BackendRunRequest): BackendTurnHandle;
   onEvent: NonNullable<BackendRunRequest['onEvent']>;
   beginSpawn(): void;
@@ -203,7 +210,8 @@ export function createSessionProviderTurn(
   /** The continuation spawn's request; the budget measures the same shape. */
   const continuationRequest = (
     prompt: string,
-    spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
+    spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false },
+    contextImages?: TurnMedia[]
   ): BackendRunRequest => ({
     backend: runtime.backend,
     sbSlug,
@@ -226,6 +234,7 @@ export function createSessionProviderTurn(
     // stateless adapters re-attach from `media` regardless.
     media: turnMedia.length > 0 ? turnMedia : undefined,
     ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+    ...(contextImages && contextImages.length > 0 ? { contextImages } : {}),
     cliAttached,
     ...ports.spawnContext(),
     // The session argument is the DECISION's, never derived from the live id:
@@ -262,6 +271,9 @@ export function createSessionProviderTurn(
     ctx: { isContinuation: boolean; signal?: AbortSignal }
   ): Promise<BackendTurnOutcome> => {
     if (!ctx.isContinuation) {
+      const openingSessionId =
+        seedProviderSessionId ?? (resumeProviderSession ? state.id : undefined);
+      const openingImages = ports.contextImagesFor?.(openingSessionId);
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = ports.contextGeneration();
       let runResult: BackendRunResult;
@@ -287,6 +299,7 @@ export function createSessionProviderTurn(
           // must reach the provider (heartbeat/reattach path).
           media: turnMedia.length > 0 ? turnMedia : undefined,
           ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+          ...(openingImages ? { contextImages: openingImages } : {}),
           // Seed a fresh provider session (first spawn) OR resume the live one
           // (subsequent turns). Tool-loop continuations always resume it.
           ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -305,6 +318,7 @@ export function createSessionProviderTurn(
           ports.endSpawn();
         }
       }
+      ports.noteImagesDelivered?.(openingSessionId, runResult);
       // Recorded here, not after the reseed branch: a failed resume that
       // reported usage still spent those tokens, and the retry below
       // REASSIGNS runResult — recording once at the end would silently drop
@@ -343,6 +357,7 @@ export function createSessionProviderTurn(
         const reseedStamp = formatContextStamp(
           turnContextOccupancy(ledger, runtime, ports.measurement())
         );
+        const reseedImages = ports.contextImagesFor?.(reseedId);
         ports.beginSpawn();
         try {
           const reseedTurn = ports.startTurn({
@@ -364,6 +379,7 @@ export function createSessionProviderTurn(
             // media so the full envelope carries the images too.
             media: turnMedia.length > 0 ? turnMedia : undefined,
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+            ...(reseedImages ? { contextImages: reseedImages } : {}),
             backendSessionSeedId: reseedId,
             cliAttached,
             ...ports.spawnContext(),
@@ -377,6 +393,7 @@ export function createSessionProviderTurn(
             ports.endSpawn();
           }
         }
+        ports.noteImagesDelivered?.(reseedId, runResult);
         ports.recordUsage(runResult.usage);
         ports.sampleContext(runResult.usage);
       }
@@ -431,16 +448,17 @@ export function createSessionProviderTurn(
     // rendered this body itself.
     turnDialogue.push({ role: 'runtime', text: body });
 
+    const contSpawn = continuationSpawnArgs(decision, turnMedia.length > 0);
+    const contSessionId =
+      contSpawn.sessionArgs.backendSessionId ?? contSpawn.sessionArgs.backendSessionSeedId;
+    const contImages = ports.contextImagesFor?.(contSessionId);
     let contResult: BackendRunResult;
     const ledgerIdBeforeSpawn = maxLedgerId();
     const generationBeforeSpawn = ports.contextGeneration();
     ports.beginSpawn();
     try {
       const contTurn = ports.startTurn(
-        continuationRequest(
-          continuationPrompt,
-          continuationSpawnArgs(decision, turnMedia.length > 0)
-        )
+        continuationRequest(continuationPrompt, contSpawn, contImages)
       );
       ports.onAbortHandle(contTurn.abort);
 
@@ -452,6 +470,7 @@ export function createSessionProviderTurn(
         ports.endSpawn();
       }
     }
+    ports.noteImagesDelivered?.(contSessionId, contResult);
 
     lastRunResult = contResult;
     ports.recordUsage(contResult.usage);

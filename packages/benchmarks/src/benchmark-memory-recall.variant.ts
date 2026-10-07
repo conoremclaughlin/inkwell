@@ -1,4 +1,8 @@
-import type { MemoryHybridChunkStrategy, MemorySearchOptions } from '@inklabs/api/benchmarks';
+import type {
+  MemoryHybridChunkStrategy,
+  MemoryOwnerFilter,
+  MemorySearchOptions,
+} from '@inklabs/api/benchmarks';
 import type { RecallMode } from './benchmark-memory-recall.types';
 
 export type BenchmarkRecallVariant =
@@ -277,14 +281,15 @@ export function buildBenchmarkRecallOptions(params: {
   mode: RecallMode;
   variant: BenchmarkRecallVariant;
   limit: number;
-  sbSlug: string;
+  /** The benchmark identity: recall matches rows on its canonical id. */
+  owner: MemoryOwnerFilter;
   topics: string[];
 }): MemorySearchOptions {
   const base: MemorySearchOptions = {
     recallMode: params.mode,
     limit: params.limit,
-    sbSlug: params.sbSlug,
-    includeShared: true,
+    sbSlug: params.owner.sbSlug,
+    sbId: params.owner.sbId,
     topics: params.topics,
   };
 

@@ -86,6 +86,13 @@ describe('InkRunner', () => {
       expect(named[idx + 1]).toBe('claude');
       expect(named.filter((arg: string) => arg === '--backend')).toHaveLength(1);
 
+      const codex = (runner as any).buildArgs('session-pv3', {
+        workingDirectory: '/tmp',
+        sbSlug: 'lumen',
+        inkProvider: 'codex',
+      });
+      expect(codex[codex.indexOf('--backend') + 1]).toBe('codex');
+
       // Every other spawn keeps the chat's own default, as before.
       const unnamed = (runner as any).buildArgs('session-pv2', {
         workingDirectory: '/tmp',

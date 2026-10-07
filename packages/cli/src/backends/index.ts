@@ -12,4 +12,5 @@ export {
   deprecatedBackendReason,
   getBackend,
   promptTransportFor,
+  acceptsContextImagesFor,
 } from '@inklabs/shared/providers';

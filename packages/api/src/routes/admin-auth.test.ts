@@ -371,6 +371,57 @@ describe('adminAuthMiddleware', () => {
       expect((req as any).inkUserId).toBe('user-mcp');
     });
 
+    it("keeps a runner token's signed identity for an approval request (Approvals step A)", async () => {
+      const sbId = '77777777-7777-4777-8777-777777777777';
+      mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+        type: 'mcp_access',
+        sub: 'user-mcp',
+        email: 'mcp@example.com',
+        scope: 'mcp:tools',
+        sbSlug: 'kindle-abc',
+        sbId,
+      });
+
+      const req = createMockReq({ method: 'POST', path: '/approval-requests' });
+      const next = vi.fn();
+      await middleware(req, createMockRes(), next);
+
+      expect(next).toHaveBeenCalled();
+      expect((req as any).inkUserId).toBe('user-mcp');
+      expect((req as any).inkTokenSbId).toBe(sbId);
+    });
+
+    it("reads an older runner token's identityId the same way", async () => {
+      const identityId = '66666666-6666-4666-8666-666666666666';
+      mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+        type: 'mcp_access',
+        sub: 'user-mcp',
+        email: 'mcp@example.com',
+        scope: 'mcp:tools',
+        identityId,
+      });
+
+      const req = createMockReq({ method: 'POST', path: '/approval-requests' });
+      await middleware(req, createMockRes(), vi.fn());
+
+      expect((req as any).inkTokenSbId).toBe(identityId);
+    });
+
+    it("gives a person's admin token no signed identity", async () => {
+      mockVerifyInkAccessToken.mockReturnValueOnce({
+        type: 'pcp_admin',
+        sub: 'user-admin',
+        email: 'admin@example.com',
+        scope: 'admin',
+      });
+
+      const req = createMockReq({ method: 'POST', path: '/approval-requests' });
+      (req as any).inkTokenSbId = 'left-over-from-a-reused-request';
+      await middleware(req, createMockRes(), vi.fn());
+
+      expect((req as any).inkTokenSbId).toBeUndefined();
+    });
+
     it('should accept mcp_access tokens for transcript list/export routes', async () => {
       mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
         type: 'mcp_access',

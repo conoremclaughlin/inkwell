@@ -22,10 +22,12 @@ import type {
   ChannelResponse,
   ChannelType,
   IRunner,
+  MediaAttachment,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
+import { uploadDirsToGrant } from '../uploads/runner-media.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { ceilingFromEnv } from './turn-ceiling.js';
@@ -51,15 +53,20 @@ interface GeminiUsageStats {
 }
 
 export class GeminiRunner implements IRunner {
+  readonly uploadMedia = 'grant' as const;
+
   async run(
     message: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
     const { backendSessionId, injectedContext, config } = options;
+    // Each attached upload's own directory, for this spawn only.
+    const uploadDirs = uploadDirsToGrant(options.mediaAttachments, !!config.container);
     const isResume = !!backendSessionId;
 
     // Build the message with injected context on first turn (same as Claude/Codex)
@@ -144,7 +151,13 @@ export class GeminiRunner implements IRunner {
       await ensureInkStudiosRoot();
 
       const effectivePolicyPath = containerPolicyPath || policyPath;
-      const args = this.buildArgs(fullMessage, config, effectivePolicyPath, backendSessionId);
+      const args = this.buildArgs(
+        fullMessage,
+        config,
+        effectivePolicyPath,
+        backendSessionId,
+        uploadDirs
+      );
       logger.info('Spawning Gemini CLI', {
         isResume,
         backendSessionId: backendSessionId || '(new)',
@@ -217,7 +230,8 @@ export class GeminiRunner implements IRunner {
     message: string,
     config: ClaudeRunnerConfig,
     policyPath?: string,
-    resumeSessionId?: string
+    resumeSessionId?: string,
+    uploadDirs: readonly string[] = []
   ): string[] {
     const args: string[] = ['-p', message, '-o', 'stream-json', '--yolo'];
 
@@ -226,6 +240,8 @@ export class GeminiRunner implements IRunner {
     // shapes, so studios minted mid-session stay editable (PR #544 r1 P1).
     // The run path ensures the directory exists first.
     args.push('--include-directories', inkStudiosRoot());
+    // Each attached upload's own directory (services/uploads/runner-media.ts).
+    for (const dir of uploadDirs) args.push('--include-directories', dir);
 
     if (resumeSessionId) {
       args.push('-r', resumeSessionId);

@@ -1,7 +1,11 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
+import {
+  createSupabaseClient,
+  MemoryRepository,
+  resolveBenchmarkOwner,
+} from '@inklabs/api/benchmarks';
 import { getBootstrapRelevanceDataset } from './benchmark-data/datasets';
 
 type Mode = 'baseline' | 'thread_aware';
@@ -149,6 +153,7 @@ async function main() {
 
   const supabase = createSupabaseClient();
   const repo = new MemoryRepository(supabase);
+  const benchmarkOwner = await resolveBenchmarkOwner(supabase, userId, BENCHMARK_AGENT_ID);
   const createdMemoryIds: string[] = [];
   const caseTargets: Record<string, string> = {};
   const modes: Mode[] = ['baseline', 'thread_aware'];
@@ -160,7 +165,8 @@ async function main() {
       // Intentionally create target first so baseline recency order is disadvantaged.
       const target = await repo.remember({
         userId,
-        sbSlug: BENCHMARK_AGENT_ID,
+        sbSlug: benchmarkOwner.sbSlug,
+        sbId: benchmarkOwner.sbId,
         content: testCase.targetContent,
         summary: `bootstrap target ${testCase.id}`,
         source: 'observation',
@@ -175,7 +181,8 @@ async function main() {
       for (let i = 0; i < testCase.distractors.length; i += 1) {
         const distractor = await repo.remember({
           userId,
-          sbSlug: BENCHMARK_AGENT_ID,
+          sbSlug: benchmarkOwner.sbSlug,
+          sbId: benchmarkOwner.sbId,
           content: testCase.distractors[i],
           summary: `bootstrap distractor ${testCase.id} #${i + 1}`,
           source: 'observation',
@@ -196,13 +203,7 @@ async function main() {
             ? { threadKey: testCase.threadKey, focusText: testCase.focusText }
             : {};
 
-        const results = await repo.getKnowledgeMemories(
-          userId,
-          BENCHMARK_AGENT_ID,
-          20,
-          30,
-          context
-        );
+        const results = await repo.getKnowledgeMemories(userId, benchmarkOwner, 20, 30, context);
         const filtered = results.filter((memory) =>
           memory.topics.some((topic) =>
             topic.includes(`${BENCHMARK_TOPIC}:${runId}:${testCase.id}`)

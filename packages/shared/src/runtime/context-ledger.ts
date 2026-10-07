@@ -1,4 +1,5 @@
 import { entryRefHash } from './entry-ref-hash.js';
+import type { ContextImage } from './context-image.js';
 
 export { entryRefHash } from './entry-ref-hash.js';
 
@@ -35,6 +36,15 @@ export interface LedgerEntry {
   eid?: number;
   /** Display-replay metadata (see LedgerReplayMeta). */
   replay?: LedgerReplayMeta;
+  /**
+   * Images this entry put in front of the model (a view_image result, or
+   * `read` on an image). They are part of the entry: counted in its
+   * approxTokens, delivered to every provider session seeded from this
+   * ledger, and gone when the entry is evicted or compacted. The content
+   * hash (ref) does not cover them — each image's own ref is already named in
+   * the entry's text.
+   */
+  images?: ContextImage[];
 }
 
 export interface LedgerBookmark {
@@ -106,20 +116,30 @@ export class ContextLedger {
     content: string,
     source?: string,
     eid?: number,
-    replay?: LedgerReplayMeta
+    replay?: LedgerReplayMeta,
+    images?: readonly ContextImage[]
   ): LedgerEntry {
+    const withImages = images && images.length > 0 ? [...images] : undefined;
     const entry: LedgerEntry = {
       id: this.entrySeq++,
       role,
       content,
       source,
       createdAt: new Date().toISOString(),
-      approxTokens: estimateTokens(content),
+      approxTokens:
+        estimateTokens(content) +
+        (withImages ?? []).reduce((sum, image) => sum + image.approxTokens, 0),
       ...(eid !== undefined ? { eid } : {}),
       ...(replay !== undefined ? { replay } : {}),
+      ...(withImages ? { images: withImages } : {}),
     };
     this.entries.push(entry);
     return entry;
+  }
+
+  /** Every image the ledger currently holds, in entry order. */
+  public listImages(): ContextImage[] {
+    return this.entries.flatMap((entry) => entry.images ?? []);
   }
 
   /**
@@ -446,6 +466,8 @@ export class ContextLedger {
     approxTokens: number;
     createdAt: string;
     preview: string;
+    /** The images this entry holds, by ref, with each one's share of approxTokens. */
+    images?: Array<{ image: string; width: number; height: number; tokens: number }>;
   }> {
     return this.entries.map((e) => ({
       id: e.id,
@@ -455,6 +477,16 @@ export class ContextLedger {
       approxTokens: e.approxTokens,
       createdAt: e.createdAt,
       preview: e.content.slice(0, 120) + (e.content.length > 120 ? '...' : ''),
+      ...(e.images
+        ? {
+            images: e.images.map((image) => ({
+              image: image.ref,
+              width: image.width,
+              height: image.height,
+              tokens: image.approxTokens,
+            })),
+          }
+        : {}),
     }));
   }
 }
