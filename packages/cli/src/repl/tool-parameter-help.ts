@@ -16,9 +16,11 @@
  *
  * So for an Inkwell call this looks the tool's parameters up once per process,
  * through `describe_tool`, and adds them to a validation error, or notes an
- * ignored key on a success. The lookup starts beside the call, so it adds no
- * wait to a call that needed no help. It never changes what is sent, and a
- * lookup that fails leaves the call's own result or error exactly as it was.
+ * ignored key on a success. The lookup starts beside the call, and either
+ * outcome waits for it at most `PARAMETER_LOOKUP_WAIT_MS`: on a tool's first
+ * use a call that needed no help can still wait up to that long. It never
+ * changes what is sent, and a lookup that fails, is slow or is not allowed
+ * leaves the call's own result or error exactly as it was.
  */
 
 import type { InkToolCallResult } from '../lib/ink-client.js';
@@ -29,8 +31,13 @@ export interface ToolParameters {
   names: string[];
   /** The ones the schema requires. */
   required: string[];
-  /** The schema refuses unknown keys (`additionalProperties: false`). */
-  strict: boolean;
+  /**
+   * What the schema does with a key it has no parameter for: refuses it
+   * (`additionalProperties: false`), drops it (no `additionalProperties`, a
+   * stripping object), or keeps it (`true` or a schema: passthrough or
+   * catchall), in which case nothing can be said about its effect.
+   */
+  extraKeys: 'refused' | 'dropped' | 'kept';
 }
 
 /** Looks a tool's parameters up; `undefined` when they can't be had. */
@@ -39,7 +46,7 @@ export type ToolParametersLookup = (tool: string) => Promise<ToolParameters | un
 /**
  * Read `describe_tool({ name })`'s answer: `{ tool: { parameters } }`, where
  * `parameters` is the JSON Schema the server also serves for tools/list.
- * Anything else, including a not-found, is `undefined`.
+ * Anything else, including a not-found or `{ success: false }`, is `undefined`.
  */
 export function parseDescribedParameters(described: unknown): ToolParameters | undefined {
   const tool = field(described, 'tool');
@@ -48,12 +55,13 @@ export function parseDescribedParameters(described: unknown): ToolParameters | u
   if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return undefined;
   const names = Object.keys(properties);
   const required = field(parameters, 'required');
+  const additional = field(parameters, 'additionalProperties');
   return {
     names,
     required: Array.isArray(required)
       ? required.filter((r): r is string => typeof r === 'string' && names.includes(r))
       : [],
-    strict: field(parameters, 'additionalProperties') === false,
+    extraKeys: additional === false ? 'refused' : additional === undefined ? 'dropped' : 'kept',
   };
 }
 
@@ -77,8 +85,9 @@ export function isValidationError(message: string): boolean {
 }
 
 /**
- * One lookup per tool per process. A failed lookup isn't cached, so a later
- * call can try again.
+ * One lookup per tool per process. A lookup that fails or does not parse (a
+ * not-found, a refusal, `{ success: false }`) isn't cached, so a later call can
+ * try again.
  */
 export function createToolParametersLookup(
   describe: (tool: string) => Promise<unknown>
@@ -87,33 +96,44 @@ export function createToolParametersLookup(
   return (tool) => {
     const hit = cache.get(tool);
     if (hit) return hit;
-    const pending = describe(tool).then(parseDescribedParameters, () => {
-      cache.delete(tool);
-      return undefined;
-    });
+    const forget = () => {
+      if (cache.get(tool) === pending) cache.delete(tool);
+    };
+    const pending: Promise<ToolParameters | undefined> = describe(tool).then(
+      (described) => {
+        const parameters = parseDescribedParameters(described);
+        if (!parameters) forget();
+        return parameters;
+      },
+      () => {
+        forget();
+        return undefined;
+      }
+    );
     cache.set(tool, pending);
     return pending;
   };
 }
 
 /**
- * How long a successful call waits for its tool's parameters before returning
- * without the ignored-key note. The lookup normally finishes first, since it
- * starts with the call; this only bounds a slow one.
+ * The longest either outcome of a call waits for its tool's parameters. The
+ * lookup starts with the call and is usually done first; this bounds a slow or
+ * hung one, so optional help never holds a finished call or its cancellation.
  */
-export const IGNORED_KEY_LOOKUP_WAIT_MS = 1500;
+export const PARAMETER_LOOKUP_WAIT_MS = 1500;
 
 /**
  * Run an Inkwell call, adding the tool's parameters to a validation error, or
  * an `ignoredParameters` note to a success whose arguments carried a key the
- * tool doesn't have. `args` are the model's own, before credential resolution.
+ * tool dropped. `args` are the model's own, before credential resolution.
+ * Pass no `lookup` when the caller may not look parameters up.
  */
 export async function callWithParameterHelp(
   tool: string,
   args: Record<string, unknown>,
   call: () => Promise<InkToolCallResult>,
   lookup: ToolParametersLookup | undefined,
-  waitMs: number = IGNORED_KEY_LOOKUP_WAIT_MS
+  waitMs: number = PARAMETER_LOOKUP_WAIT_MS
 ): Promise<InkToolCallResult> {
   if (!lookup) return call();
   const parameters = lookup(tool).catch(() => undefined);
@@ -124,7 +144,7 @@ export async function callWithParameterHelp(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!isValidationError(message)) throw error;
-    const known = await parameters;
+    const known = await settledWithin(parameters, waitMs);
     if (!known) throw error;
     const unknown = unknownKeys(args, known);
     const notParameters =
@@ -135,7 +155,10 @@ export async function callWithParameterHelp(
   }
 
   const known = await settledWithin(parameters, waitMs);
-  if (!known || known.strict || !isPlainObject(result)) return result;
+  // Only a schema that drops extra keys lets us say one had no effect; and a
+  // result that already carries the field keeps its own.
+  if (!known || known.extraKeys !== 'dropped' || !isPlainObject(result)) return result;
+  if ('ignoredParameters' in result) return result;
   const ignored = unknownKeys(args, known);
   if (ignored.length === 0) return result;
   return {

@@ -14,7 +14,7 @@ const described = (
   name: string,
   properties: string[],
   required: string[] = [],
-  strict = true
+  extra: 'refused' | 'dropped' | 'kept' = 'refused'
 ): Record<string, unknown> => ({
   success: true,
   tool: {
@@ -24,7 +24,8 @@ const described = (
       type: 'object',
       properties: Object.fromEntries(properties.map((p) => [p, { type: 'string' }])),
       ...(required.length > 0 ? { required } : {}),
-      ...(strict ? { additionalProperties: false } : {}),
+      ...(extra === 'refused' ? { additionalProperties: false } : {}),
+      ...(extra === 'kept' ? { additionalProperties: {} } : {}),
     },
   },
 });
@@ -40,7 +41,8 @@ const SAVE_IDENTITY = described(
   ['agentId', 'name', 'role', 'description'],
   ['agentId', 'name', 'role']
 );
-const SEND_LEGACY = described('send_legacy', ['content', 'senderSlug'], ['content'], false);
+const SEND_LEGACY = described('send_legacy', ['content', 'senderSlug'], ['content'], 'dropped');
+const PASS_THROUGH = described('pass_through', ['content'], [], 'kept');
 
 /** What the server's strict schema refusal looks like by the time InkClient throws it. */
 const refusal = (tool: string, detail: string) =>
@@ -61,13 +63,14 @@ async function thrown(promise: Promise<unknown>): Promise<Error> {
 }
 
 describe('parseDescribedParameters', () => {
-  it("reads describe_tool's schema: names in order, the required ones, and strictness", () => {
+  it("reads describe_tool's schema: names in order, the required ones, and what it does with extra keys", () => {
     expect(parseDescribedParameters(SEND_TO_INBOX)).toEqual({
       names: ['content', 'recipientSlug', 'threadKey', 'senderSlug'],
       required: ['content'],
-      strict: true,
+      extraKeys: 'refused',
     });
-    expect(parseDescribedParameters(SEND_LEGACY)?.strict).toBe(false);
+    expect(parseDescribedParameters(SEND_LEGACY)?.extraKeys).toBe('dropped');
+    expect(parseDescribedParameters(PASS_THROUGH)?.extraKeys).toBe('kept');
   });
 
   it('is undefined for a not-found, a bare object, or something that is not a schema', () => {
@@ -84,16 +87,16 @@ describe('the pieces', () => {
   const p: ToolParameters = {
     names: ['content', 'threadKey'],
     required: ['content'],
-    strict: true,
+    extraKeys: 'refused',
   };
 
   it('names each parameter and marks the required ones', () => {
     expect(describeParameters('send_to_inbox', p)).toBe(
       'Parameters of send_to_inbox: content (required), threadKey.'
     );
-    expect(describeParameters('get_timezone', { names: [], required: [], strict: true })).toBe(
-      'get_timezone takes no parameters.'
-    );
+    expect(
+      describeParameters('get_timezone', { names: [], required: [], extraKeys: 'refused' })
+    ).toBe('get_timezone takes no parameters.');
   });
 
   it('finds the keys the tool has no parameter for', () => {
@@ -156,6 +159,23 @@ describe('callWithParameterHelp — a validation error carries the real paramete
       'Parameters of save_identity: agentId (required), name (required), role (required), description.'
     );
     expect(error.message).not.toContain('Not parameters');
+  });
+
+  it('gives the refusal back as it was when the lookup hangs, after the same bounded wait', async () => {
+    const original = refusal('send_to_inbox', "Unrecognized key(s) in object: 'sbSlug'");
+    const hung = createToolParametersLookup(() => new Promise(() => {}));
+    const error = await thrown(
+      callWithParameterHelp(
+        'send_to_inbox',
+        { sbSlug: 'kin' },
+        async () => {
+          throw original;
+        },
+        hung,
+        5
+      )
+    );
+    expect(error).toBe(original);
   });
 
   it('leaves an error that is not a validation refusal exactly as it was', async () => {
@@ -228,6 +248,30 @@ describe('callWithParameterHelp — a success notes a key the tool ignored', () 
     ).toBe(cleanResult);
   });
 
+  it('claims nothing for a schema that keeps extra keys (passthrough or catchall)', async () => {
+    const result = { success: true };
+    expect(
+      await callWithParameterHelp(
+        'pass_through',
+        { content: 'Hi', extra: 1 },
+        async () => result,
+        lookupOf({ pass_through: PASS_THROUGH })
+      )
+    ).toBe(result);
+  });
+
+  it("never overwrites an ignoredParameters field the tool's own result carries", async () => {
+    const result = { success: true, ignoredParameters: 'the application’s own' };
+    expect(
+      await callWithParameterHelp(
+        'send_legacy',
+        { content: 'Hi', senderAgentId: 'system' },
+        async () => result,
+        lookupOf({ send_legacy: SEND_LEGACY })
+      )
+    ).toBe(result);
+  });
+
   it('returns the result untouched when the lookup is slower than the wait', async () => {
     const result = { success: true };
     const never = createToolParametersLookup(() => new Promise(() => {}));
@@ -251,6 +295,17 @@ describe('createToolParametersLookup', () => {
     await lookup('send_to_inbox');
     await lookup('send_to_inbox');
     expect(describe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not keep an answer that does not parse, such as { success: false }, so a later call can try again', async () => {
+    const describe = vi
+      .fn<(tool: string) => Promise<unknown>>()
+      .mockResolvedValueOnce({ success: false, error: 'blip' })
+      .mockResolvedValueOnce(SEND_TO_INBOX);
+    const lookup = createToolParametersLookup(describe);
+    expect(await lookup('send_to_inbox')).toBeUndefined();
+    expect((await lookup('send_to_inbox'))?.required).toEqual(['content']);
+    expect(describe).toHaveBeenCalledTimes(2);
   });
 
   it('does not keep a failed lookup, so a later call can try again', async () => {

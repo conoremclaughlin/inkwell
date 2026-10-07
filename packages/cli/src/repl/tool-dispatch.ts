@@ -91,6 +91,14 @@ export interface LocalToolDispatchDeps {
    * (tool-parameter-help.ts). Without it, Inkwell calls go out bare, as before.
    */
   toolParameters?: ToolParametersLookup;
+  /**
+   * Whether this caller's policy auto-allows `describe_tool` right now: allowed,
+   * and without spending a one-use grant (`inspectInkTool`, never
+   * `canCallInkTool`). The lookup is help the model didn't ask for, so it
+   * runs only on an explicit yes. Without one, Inkwell calls go out bare and
+   * no earlier answer is used either.
+   */
+  mayLookUpParameters?: () => boolean;
 }
 
 /** Strip the MCP namespace the model may emit; InkClient wants bare names. */
@@ -260,7 +268,7 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
       name,
       args,
       () => deps.callInk(name, deps.resolveCredentials(args)),
-      deps.toolParameters
+      deps.mayLookUpParameters?.() === true ? deps.toolParameters : undefined
     );
   };
 }

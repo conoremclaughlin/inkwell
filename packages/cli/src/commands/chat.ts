@@ -6610,6 +6610,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
             callPi: callPiTool,
             callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
             toolParameters: inkToolParameters,
+            // The clone's own policy, not the parent's: a clone that may not
+            // describe tools gets no parameter help, cached or fresh.
+            mayLookUpParameters: () => {
+              const decision = opts.policy.inspectInkTool('describe_tool', runtime.sessionId);
+              return decision.allowed && !decision.wouldConsumeGrant;
+            },
             resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
             // A clone asking what it can call gets its own narrower surface —
             // the same one its prompt described, not the parent's.
@@ -6995,6 +7001,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
             callPi: callPiTool,
             callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
             toolParameters: inkToolParameters,
+            // Help the model didn't ask for runs only where describe_tool is
+            // auto-allowed now, without spending a one-use grant.
+            mayLookUpParameters: () => {
+              const decision = toolPolicy.inspectInkTool('describe_tool', runtime.sessionId);
+              return decision.allowed && !decision.wouldConsumeGrant;
+            },
             // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
             // emits references; actual values are injected at the execution layer
             // so credentials never enter transcripts or context.

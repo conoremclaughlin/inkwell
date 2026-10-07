@@ -27,6 +27,16 @@ describe('Inkwell tool parameters in local routing', () => {
     expect(source.match(/toolParameters: inkToolParameters,/g)).toHaveLength(2);
   });
 
+  it("asks each dispatcher's own policy, without spending a grant, before any lookup", () => {
+    expect(source.match(/mayLookUpParameters: \(\) => \{/g)).toHaveLength(2);
+    expect(source).toMatch(
+      /mayLookUpParameters: \(\) => \{\s*const decision = opts\.policy\.inspectInkTool\('describe_tool', runtime\.sessionId\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
+    );
+    expect(source).toMatch(
+      /mayLookUpParameters: \(\) => \{\s*const decision = toolPolicy\.inspectInkTool\('describe_tool', runtime\.sessionId\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
+    );
+  });
+
   it.each(['parent', 'clone'] as const)(
     'tells the %s how to list the tools and read their parameters',
     (audience) => {
