@@ -5292,6 +5292,69 @@ export type Database = {
           },
         ];
       };
+      workspace_invitation_redemptions: {
+        Row: {
+          invitation_id: string;
+          membership_id: string | null;
+          redeemed_at: string;
+          user_id: string;
+        };
+        Insert: {
+          invitation_id: string;
+          membership_id?: string | null;
+          redeemed_at?: string;
+          user_id: string;
+        };
+        Update: {
+          invitation_id?: string;
+          membership_id?: string | null;
+          redeemed_at?: string;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
+      workspace_invitations: {
+        Row: {
+          created_at: string;
+          created_by: string;
+          expires_at: string;
+          id: string;
+          invitee_email: string | null;
+          kind: string;
+          max_uses: number | null;
+          revoked_at: string | null;
+          token_digest: string;
+          use_count: number;
+          workspace_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          created_by: string;
+          expires_at?: string;
+          id?: string;
+          invitee_email?: string | null;
+          kind: string;
+          max_uses?: number | null;
+          revoked_at?: string | null;
+          token_digest: string;
+          use_count?: number;
+          workspace_id: string;
+        };
+        Update: {
+          created_at?: string;
+          created_by?: string;
+          expires_at?: string;
+          id?: string;
+          invitee_email?: string | null;
+          kind?: string;
+          max_uses?: number | null;
+          revoked_at?: string | null;
+          token_digest?: string;
+          use_count?: number;
+          workspace_id?: string;
+        };
+        Relationships: [];
+      };
       workspace_members: {
         Row: {
           created_at: string | null;
@@ -5418,6 +5481,15 @@ export type Database = {
       };
     };
     Functions: {
+      accept_workspace_invitation: {
+        Args: {
+          p_email_ownership_confirmed: boolean;
+          p_token_digest: string;
+          p_user_email: string;
+          p_user_id: string;
+        };
+        Returns: Json;
+      };
       swap_memory_embedding: {
         Args: {
           p_memory_id: string;
