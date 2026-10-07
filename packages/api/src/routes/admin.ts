@@ -4442,6 +4442,26 @@ router.post('/inklings/:id/name', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/inklings/:id/profile → 200 { profile }
+ *
+ * One of the person's own inklings, read-only, for the app's profile: id,
+ * displayName, createdAt, identityUpdatedAt, soul (or null) and its own
+ * values (InklingService.profile). Nothing else from the identity row, and
+ * no fallback to /individuals. Every role may read its own; anything else
+ * is the same 404. Not cached by anything between.
+ */
+router.get('/inklings/:id/profile', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const profile = await (await inklingService()).profile(inklingScope(authReq), req.params.id);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ profile });
+  } catch (error) {
+    answerInklingError(res, "Failed to read the inkling's profile", error);
+  }
+});
+
+/**
  * POST /api/admin/inklings/:id/cancel → 200 { cancelled }
  *
  * Stops the inkling's running turn, with everything it started, if it has

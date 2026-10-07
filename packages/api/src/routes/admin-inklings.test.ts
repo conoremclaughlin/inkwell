@@ -99,12 +99,18 @@ function createReq(body: unknown, ctx: Ctx = {}): Request {
 interface MockResponse extends Response {
   _status: number;
   _json: Record<string, unknown>;
+  _headers: Record<string, string>;
 }
 
 function createRes(): MockResponse {
   const res: Record<string, unknown> = {
     _status: 200,
     _json: null,
+    _headers: {},
+    setHeader(header: string, value: string) {
+      (res._headers as Record<string, string>)[header] = value;
+      return res;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -333,6 +339,59 @@ describe('GET /inklings', () => {
       }
     } finally {
       turn.done();
+    }
+  });
+});
+
+describe('GET /inklings/:id/profile', () => {
+  const profile = handler('get', '/inklings/:id/profile');
+
+  async function awakened(): Promise<string> {
+    const res = await call(awaken, { clientRequestId: REQUEST });
+    return (res._json.inkling as { id: string }).id;
+  }
+
+  it('answers with my inkling’s soul and own values only, uncached', async () => {
+    const id = await awakened();
+    Object.assign(db.rows('agent_identities').find((r) => r.id === id)!, {
+      soul: '# Soul',
+      values: ['care'],
+      heartbeat: 'operational instructions',
+      relationships: { someone: 'friend' },
+    });
+    const res = await call(profile, {}, { params: { id } });
+    expect(res._status).toBe(200);
+    expect(res._headers['Cache-Control']).toBe('no-store');
+    const body = res._json.profile as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      'createdAt',
+      'displayName',
+      'id',
+      'identityUpdatedAt',
+      'soul',
+      'values',
+    ]);
+    expect(body).toMatchObject({ id, soul: '# Soul', values: ['care'] });
+  });
+
+  it('is readable by every role in my workspace, for my own inkling', async () => {
+    const id = await awakened();
+    const res = await call(profile, {}, { params: { id }, role: 'viewer' });
+    expect(res._status).toBe(200);
+  });
+
+  it('is the same 404 for another person, another workspace, an agent, or a malformed id', async () => {
+    const id = await awakened();
+    const agent = seedOwnSb(db, { userId: ME, workspaceId: MY_WORKSPACE }, 'myra');
+    for (const ctx of [
+      { params: { id }, userId: SOMEONE_ELSE },
+      { params: { id }, workspaceId: OTHER_WORKSPACE },
+      { params: { id: agent.id as string } },
+      { params: { id: 'not-a-uuid' } },
+    ]) {
+      const res = await call(profile, {}, ctx);
+      expect(res._status).toBe(404);
+      expect(res._json).toEqual({ error: 'No inkling with that id' });
     }
   });
 });

@@ -67,6 +67,28 @@ export interface Inkling {
   nameable: boolean;
 }
 
+/**
+ * The read-only profile the app shows for one of the person's own inklings:
+ * who it is (soul) and what it holds to (its own values), nothing else. Not
+ * the workspace's shared constitution, and never heartbeat, runtime config,
+ * backend, metadata, relationships, history or memories.
+ */
+export interface InklingProfile {
+  id: string;
+  /** Null until the person names it. */
+  displayName: string | null;
+  createdAt: string;
+  /**
+   * When the identity row last changed, for any reason (a rename included).
+   * Not when the soul was last written.
+   */
+  identityUpdatedAt: string;
+  /** Null when not written yet. */
+  soul: string | null;
+  /** This inkling's own values; empty when not written yet. */
+  values: string[];
+}
+
 export interface InklingScope {
   userId: string;
   workspaceId: string;
@@ -120,6 +142,25 @@ interface LineageRow {
 }
 
 const IDENTITY_COLUMNS = 'id, agent_id, name, workspace_id, metadata, created_at, updated_at';
+
+/** A profile's columns: the identity's own soul and values, never anything else on the row. */
+const PROFILE_COLUMNS = 'id, name, metadata, created_at, updated_at, soul, values';
+
+interface ProfileRow {
+  id: string;
+  name: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  soul: unknown;
+  values: unknown;
+}
+
+/** Only strings with something in them count as values. */
+function valuesFrom(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+}
 
 export function toInkling(row: IdentityRow): Inkling {
   return {
@@ -333,6 +374,40 @@ export class InklingService {
       sbId: identity.id,
     });
     return { inkling: toInkling(identity), replayed: false };
+  }
+
+  /**
+   * One of the person's own inklings, read-only: its id, name, when it was
+   * awakened, when its row last changed, its soul and its own values.
+   *
+   * The same reader as list: this person, this workspace, the inkling tag and
+   * a self-serve lineage, all required. A malformed id, an unknown one,
+   * another person's, another workspace's, an agent that isn't an inkling,
+   * and one without the lineage all get the same 404.
+   */
+  async profile(scope: InklingScope, inklingId: string): Promise<InklingProfile> {
+    const missing = () => new InklingError(404, 'No inkling with that id');
+    if (!isUuid(inklingId)) throw missing();
+    const { data, error } = await this.supabase
+      .from('agent_identities')
+      .select(PROFILE_COLUMNS)
+      .eq('id', inklingId)
+      .eq('user_id', scope.userId)
+      .eq('workspace_id', scope.workspaceId)
+      .eq('metadata->>client', INKLING_CLIENT)
+      .maybeSingle();
+    if (error) throw new Error(`Failed to read the inkling's profile: ${error.message}`);
+    const row = data as ProfileRow | null;
+    if (!row) throw missing();
+    if (!(await this.selfServeLineages(scope.userId, [row.id])).has(row.id)) throw missing();
+    return {
+      id: row.id,
+      displayName: row.metadata?.named === true ? row.name : null,
+      createdAt: row.created_at,
+      identityUpdatedAt: row.updated_at,
+      soul: typeof row.soul === 'string' && row.soul.trim() !== '' ? row.soul : null,
+      values: valuesFrom(row.values),
+    };
   }
 
   /**
