@@ -27,10 +27,10 @@ export function savedLoginStore(
 
 /**
  * Removes every saved login a person has, in both stores, whichever this
- * server uses. For account deletion: call it before deleting the users row.
- * That delete cascades to both tables, and the Vault rows' trigger deletes
- * their secrets, but only this also removes a Vault secret left by a write
- * that didn't land, which no row points at.
+ * server uses, without deleting the person. Account deletion doesn't need it:
+ * deleting the users row cascades to both tables, and every Vault secret the
+ * person owns goes with them, including one left by a write that didn't land
+ * (account-deletion/worker.integration.test.ts).
  */
 export async function deleteAllSavedLogins(db: Client, userId: string): Promise<void> {
   const { error } = await db.from('saved_logins_sealed').delete().eq('user_id', userId);
