@@ -16,6 +16,12 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 const UNIQUE_VIOLATION = '23505';
 
+/** Attempts at the starter set's read-then-write before giving up on a space that keeps changing. */
+const STARTER_SET_ATTEMPTS = 3;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+
 /** The value of `starter` that asks for the inkling starter set. */
 export const INKLING_STARTER = 'inkling';
 
@@ -164,23 +170,68 @@ export async function ensureOwnAboutPage(
  * replaced.
  *
  * "Never had it" means never written, which is null. The values are written
- * only where both values and process are null, in one conditional update, so
- * a space with documents of its own keeps them and a concurrent writer's are
- * never overwritten. A document someone emptied to an empty string counts as
- * written, and is never refilled. The person's About page follows the same
- * rule (ensureOwnAboutPage). Running it again changes nothing.
+ * only where both values and process are null, and with them the space is
+ * marked an inkling space (`metadata.starter`), the same mark creation gives
+ * it, so a person who joins later gets their own page as they would in a
+ * space made that way (Lumen, #786). A document someone emptied to an empty
+ * string counts as written, and is never refilled.
+ *
+ * The write is a compare-and-set on updated_at (set by update_workspaces_
+ * updated_at on every write), so the space's other metadata, read just
+ * before, is kept, and a write that lands in between is read again rather
+ * than overwritten.
+ *
+ * The person's About page is written only in a space marked an inkling space,
+ * by this or by its creation: a space with documents of its own gets no page
+ * it never asked for (Wren 570ed436, #786). Running it again changes nothing.
  */
 export async function ensureInklingStarterSet(
   supabase: SupabaseClient,
   workspaceId: string,
   userId: string
 ): Promise<void> {
-  const { error } = await supabase
-    .from('workspaces')
-    .update({ shared_values: INKLING_SPACE_VALUES })
-    .eq('id', workspaceId)
-    .is('shared_values', null)
-    .is('process', null);
-  if (error) throw new Error(`Failed to give the space its starter values: ${error.message}`);
-  await ensureOwnAboutPage(supabase, workspaceId, userId);
+  for (let attempt = 0; attempt < STARTER_SET_ATTEMPTS; attempt += 1) {
+    const { data: space, error: readError } = await supabase
+      .from('workspaces')
+      .select('metadata, shared_values, process, updated_at')
+      .eq('id', workspaceId)
+      .maybeSingle();
+    if (readError) throw new Error(`Failed to read the space: ${readError.message}`);
+    if (!space) return;
+
+    if (space.shared_values !== null || space.process !== null) {
+      // Documents of its own: only an inkling space's person gets a page.
+      if (isInklingStarterSpace(space.metadata)) {
+        await ensureOwnAboutPage(supabase, workspaceId, userId);
+      }
+      return;
+    }
+
+    const metadata = {
+      ...(isPlainObject(space.metadata) ? space.metadata : {}),
+      starter: INKLING_STARTER,
+    };
+    const write = supabase
+      .from('workspaces')
+      .update({ shared_values: INKLING_SPACE_VALUES, metadata })
+      .eq('id', workspaceId)
+      .is('shared_values', null)
+      .is('process', null);
+    // The column allows null; no row has one today, but a null stamp is
+    // compared as null, not as the string "null".
+    const { data: written, error: writeError } = await (
+      space.updated_at == null
+        ? write.is('updated_at', null)
+        : write.eq('updated_at', space.updated_at)
+    ).select('id');
+    if (writeError) {
+      throw new Error(`Failed to give the space its starter values: ${writeError.message}`);
+    }
+    if ((written ?? []).length > 0) {
+      await ensureOwnAboutPage(supabase, workspaceId, userId);
+      return;
+    }
+    // Changed since the read: read it again.
+  }
+  throw new Error('The space kept changing while its starter set was written');
 }

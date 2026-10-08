@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { FakePostgrest, type Row } from '../test/fake-postgrest';
+import { createInklingDb } from '../test/fake-inkling-db';
 import { WorkspacesRepository } from '../data/repositories/workspaces.repository';
 
 let db: FakePostgrest;
@@ -55,6 +56,7 @@ import {
   INKLING_SPACE_VALUES,
   INKLING_STARTER,
 } from '../services/inklings/starter-space';
+import { InklingService } from '../services/inklings/inkling-service';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -108,7 +110,7 @@ const pagesIn = (workspaceId: unknown) =>
 let personal: Row;
 
 beforeEach(() => {
-  db = new FakePostgrest();
+  db = createInklingDb();
   db.unique.user_identity = [
     {
       name: 'user_identity_user_workspace_key',
@@ -272,5 +274,38 @@ describe('listing spaces', () => {
     expect(res.body.workspaces.map((space: Row) => space.id)).toContain(
       res.body.defaultWorkspaceId
     );
+  });
+});
+
+describe('a space seeded at its first awakening (Lumen, #786)', () => {
+  it('gives a person who joins later their own page, as a space made as an inkling space does', async () => {
+    const created = await call(createWorkspace, {
+      body: { name: 'Friends', type: 'team', membershipMode: 'invite_only' },
+    });
+    expect(created.status).toBe(201);
+    const workspaceId = created.body.workspace.id as string;
+    const service = new InklingService(db as never, { ownerTestUserIds: new Set([OWNER]) });
+
+    await service.awaken(
+      { userId: OWNER, workspaceId, role: 'owner' },
+      'aaaaaaaa-1111-4111-8111-111111111111'
+    );
+
+    expect(db.rows('workspaces').find((row) => row.id === workspaceId)?.shared_values).toBe(
+      INKLING_SPACE_VALUES
+    );
+    expect(pagesIn(workspaceId).map((row) => row.user_id)).toEqual([OWNER]);
+    db.rpcHandlers.accept_workspace_invitation = () => ({
+      data: { status: 'joined', workspaceId, alreadyMember: false },
+      error: null,
+    });
+
+    const joined = await call(accept, { as: FRIEND, body: { code: 'ABCDE-FGHJK' } });
+
+    expect(joined.status).toBe(200);
+    expect(pagesIn(workspaceId)).toEqual([
+      expect.objectContaining({ user_id: OWNER, user_profile_md: ABOUT_YOU_TEMPLATE }),
+      expect.objectContaining({ user_id: FRIEND, user_profile_md: ABOUT_YOU_TEMPLATE }),
+    ]);
   });
 });

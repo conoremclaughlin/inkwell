@@ -27,8 +27,10 @@ import {
   ABOUT_YOU_TEMPLATE,
   INKLING_SOUL_TEMPLATE,
   INKLING_SPACE_VALUES,
+  ensureInklingStarterSet,
   inklingSoul,
 } from './starter-space';
+import { WorkspacesRepository } from '../../data/repositories/workspaces.repository';
 import { liveInklingTurns, trackInklingTurn } from './inkling-turns';
 import type { FakePostgrest, Row } from '../../test/fake-postgrest';
 
@@ -404,14 +406,15 @@ describe('awaken', () => {
     });
   });
 
-  it('touches identity, lineage and token tables and the space’s starter set: no thread, no message, no wake', async () => {
+  it('touches identity, lineage and token tables and reads its space: no thread, no message, no wake', async () => {
     await service.awaken(ME, REQUEST);
     const touched = [...new Set(db.log.map((e) => e.table))].sort();
+    // The space is read for its starter set; this fixture has no space row,
+    // so nothing more is written (starter-space.ts).
     expect(touched).toEqual([
       'agent_identities',
       'kindle_tokens',
       'redeem_kindle_token',
-      'user_identity',
       'workspaces',
     ]);
   });
@@ -538,6 +541,150 @@ describe('the space’s starter set at an awakening (starter-space.ts)', () => {
     expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values).toBe(
       INKLING_SPACE_VALUES
     );
+  });
+
+  it('gives no page in a space with values of its own that isn’t an inkling space (Lumen, #786)', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: 'OWN-VALUES',
+      process: null,
+      metadata: {},
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([]);
+  });
+
+  it('marks a space it seeds as an inkling space, keeping its other metadata', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+      metadata: { membershipMode: 'invite_only', color: 'blue' },
+      updated_at: '2026-10-07T00:00:00Z',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.metadata).toEqual({
+      membershipMode: 'invite_only',
+      color: 'blue',
+      starter: 'inkling',
+    });
+  });
+
+  it('gives the person a page in a space made as an inkling space, values and all', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: INKLING_SPACE_VALUES,
+      process: null,
+      metadata: { starter: 'inkling' },
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_id: ME.userId, user_profile_md: ABOUT_YOU_TEMPLATE }),
+    ]);
+  });
+
+  it('keeps a space’s mark when its owner updates other metadata (Lumen, #786)', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      metadata: { starter: 'inkling', membershipMode: 'invite_only' },
+      updated_at: '2026-10-07T00:00:00Z',
+    });
+
+    await new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+      metadata: { color: 'blue', starter: null },
+    });
+
+    expect(rowsOf('workspaces')[0]!.metadata).toEqual({
+      starter: 'inkling',
+      membershipMode: 'invite_only',
+      color: 'blue',
+    });
+  });
+
+  describe('a metadata write racing the seeding (Lumen, #786)', () => {
+    const unseeded = () =>
+      db.seed('workspaces', {
+        id: ME.workspaceId,
+        user_id: ME.userId,
+        shared_values: null,
+        process: null,
+        metadata: { membershipMode: 'invite_only' },
+        updated_at: '2026-10-07T00:00:00Z',
+      });
+
+    /** Runs `between` once, after the first read of `columns` from workspaces has answered. */
+    function afterFirstRead(columns: string, between: () => Promise<unknown>): void {
+      const from = db.from.bind(db);
+      let fired = false;
+      db.from = ((table: string) => {
+        const query = from(table);
+        if (table !== 'workspaces') return query;
+        const select = query.select.bind(query);
+        query.select = ((cols = '*') => {
+          select(cols);
+          if (cols === columns && !fired) {
+            fired = true;
+            const handle = query as unknown as { execute: () => Promise<unknown> };
+            const execute = handle.execute.bind(query);
+            handle.execute = async () => {
+              const answer = await execute();
+              await between();
+              return answer;
+            };
+          }
+          return query;
+        }) as typeof query.select;
+        return query;
+      }) as typeof db.from;
+    }
+
+    it('keeps a write that commits between the seeding’s read and its write', async () => {
+      unseeded();
+      afterFirstRead('metadata, shared_values, process, updated_at', () =>
+        new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+          metadata: { color: 'blue' },
+        })
+      );
+
+      await service.awaken(ME, REQUEST);
+
+      const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+      expect(space.metadata).toEqual({
+        membershipMode: 'invite_only',
+        color: 'blue',
+        starter: 'inkling',
+      });
+      expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    });
+
+    it('keeps the mark when the seeding commits between an update’s read and its write', async () => {
+      unseeded();
+      afterFirstRead('metadata, updated_at', () =>
+        ensureInklingStarterSet(db as never, ME.workspaceId, ME.userId)
+      );
+
+      await new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+        metadata: { color: 'blue' },
+      });
+
+      const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+      expect(space.metadata).toEqual({
+        membershipMode: 'invite_only',
+        color: 'blue',
+        starter: 'inkling',
+      });
+      expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    });
   });
 
   it('still wakes the inkling when the starter set can’t be written', async () => {

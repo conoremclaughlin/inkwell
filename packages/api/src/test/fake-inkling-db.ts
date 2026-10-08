@@ -55,10 +55,22 @@ export function createInklingDb(): FakePostgrest {
   ];
 
   let tokenCounter = 0;
+  let stampCounter = 0;
   const originalFrom = db.from.bind(db);
   // The token column's server-side default.
   db.from = (table: string) => {
     const query = originalFrom(table);
+    if (table === 'workspaces') {
+      // update_workspaces_updated_at: every write gives the row a new stamp,
+      // which is what a compare-and-set on updated_at relies on.
+      const update = query.update.bind(query);
+      query.update = (values: Row) =>
+        update({
+          ...values,
+          updated_at: `2026-10-08T00:00:${String(++stampCounter).padStart(2, '0')}Z`,
+        });
+      return query;
+    }
     if (table !== 'kindle_tokens') return query;
     const insert = query.insert.bind(query);
     query.insert = (values: Row | Row[]) =>
