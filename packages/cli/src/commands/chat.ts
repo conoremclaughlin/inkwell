@@ -2688,7 +2688,7 @@ export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }
     'describe_tool({}) lists every Inkwell tool; before calling one you have not used yet, call describe_tool({"name": "<tool>"}) for its exact parameters, which ones are required, and their names. Do not guess a parameter name.';
   const inkwell = forClone
     ? `Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, and more. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead. ${lookup}`
-    : `Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, and more. ${lookup}`;
+    : `Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, web_fetch (read a web page as text, no shell needed), and more. ${lookup}`;
 
   const codingTools = renderLocalToolGroup('coding', opts.audience);
   const clientLocal = renderLocalToolGroup('client-local', opts.audience);
