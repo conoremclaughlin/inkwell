@@ -424,6 +424,38 @@ describe('adminAuthMiddleware', () => {
       expect((req as any).inkUserId).toBe('user-mcp');
     });
 
+    it('never accepts an agent’s mcp_access token for saved logins', async () => {
+      // A token that verifies as mcp_access, whichever audience is asked.
+      mockVerifyInkAccessToken.mockImplementation((_token: string, type: string) =>
+        type === 'mcp_access'
+          ? { type: 'mcp_access', sub: 'user-mcp', email: 'mcp@example.com', scope: 'mcp:tools' }
+          : null
+      );
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+      for (const [method, path] of [
+        ['GET', '/vault/logins'],
+        ['POST', '/vault/logins'],
+        ['GET', '/vault/logins/login-1'],
+        ['POST', '/vault/logins/login-1/reveal'],
+        ['POST', '/vault/logins/login-1/code'],
+      ]) {
+        const req = createMockReq({ method, path });
+        const res = createMockRes();
+        const next = vi.fn();
+        await middleware(req, res, next);
+        expect(res._status).toBe(401);
+        expect(next).not.toHaveBeenCalled();
+        expect((req as any).inkUserId).toBeUndefined();
+      }
+      // The control: the same token passes on a route that admits it.
+      const req = createMockReq({ method: 'GET', path: '/sessions/synced' });
+      const next = vi.fn();
+      await middleware(req, createMockRes(), next);
+      expect(next).toHaveBeenCalled();
+      // clearAllMocks keeps an implementation; don't hand this one to the next test.
+      mockVerifyInkAccessToken.mockReset();
+    });
+
     it("keeps a runner token's signed identity for an approval request (Approvals step A)", async () => {
       const sbId = '77777777-7777-4777-8777-777777777777';
       mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({

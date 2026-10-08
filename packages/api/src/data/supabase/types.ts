@@ -3346,6 +3346,122 @@ export type Database = {
           },
         ];
       };
+      saved_login_secrets: {
+        Row: {
+          created_at: string;
+          secret_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          secret_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          secret_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'saved_login_secrets_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      saved_logins: {
+        Row: {
+          created_at: string;
+          id: string;
+          item_secret_id: string;
+          revision: number;
+          secret_secret_id: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          id: string;
+          item_secret_id: string;
+          revision?: number;
+          secret_secret_id: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          item_secret_id?: string;
+          revision?: number;
+          secret_secret_id?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'saved_logins_item_secret_fkey';
+            columns: ['item_secret_id'];
+            isOneToOne: true;
+            referencedRelation: 'saved_login_secrets';
+            referencedColumns: ['secret_id'];
+          },
+          {
+            foreignKeyName: 'saved_logins_secret_secret_fkey';
+            columns: ['secret_secret_id'];
+            isOneToOne: true;
+            referencedRelation: 'saved_login_secrets';
+            referencedColumns: ['secret_id'];
+          },
+          {
+            foreignKeyName: 'saved_logins_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      saved_logins_sealed: {
+        Row: {
+          created_at: string;
+          id: string;
+          item_sealed: string;
+          revision: number;
+          secret_sealed: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          id: string;
+          item_sealed: string;
+          revision?: number;
+          secret_sealed: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          item_sealed?: string;
+          revision?: number;
+          secret_sealed?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'saved_logins_sealed_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       scheduled_reminders: {
         Row: {
           created_at: string | null;
@@ -5512,6 +5628,18 @@ export type Database = {
         };
         Relationships: [];
       };
+      saved_logins_opened: {
+        Row: {
+          created_at: string | null;
+          id: string | null;
+          item_value: string | null;
+          revision: number | null;
+          secret_value: string | null;
+          updated_at: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
       accept_workspace_invitation: {
@@ -6101,6 +6229,13 @@ export type Database = {
           p_task_group_id: string;
         };
         Returns: Json;
+      };
+      create_saved_login_secret: {
+        Args: {
+          p_owner: string;
+          p_value: string;
+        };
+        Returns: string;
       };
       trigger_heartbeat: { Args: never; Returns: undefined };
     };
