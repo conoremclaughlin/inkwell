@@ -33,7 +33,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import http, { type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
-import type { LookupFunction } from 'node:net';
+import type { LookupFunction, Socket } from 'node:net';
 import type { Readable } from 'node:stream';
 import zlib from 'node:zlib';
 import {
@@ -83,15 +83,71 @@ export interface GuardedResponse {
   redirects: number;
 }
 
-/** The fetch was refused before it connected anywhere it shouldn't. */
-export class WebFetchRefusal extends Error {
+/**
+ * Why a fetch failed, in a fixed vocabulary. The audit log records this and
+ * never an exception's text, which can carry a URL and its query (Lumen,
+ * PR #792).
+ */
+export type WebFetchFailureReason =
+  | 'invalid-url'
+  | 'scheme'
+  | 'credentials'
+  | 'no-host'
+  | 'blocked-name'
+  | 'blocked-address'
+  | 'no-address'
+  | 'timeout'
+  | 'redirect-without-location'
+  | 'redirect-invalid'
+  | 'redirect-limit'
+  | 'redirect-loop'
+  | 'protocol-switch'
+  | 'unsupported-encoding'
+  | 'unreadable-body'
+  | 'network';
+
+/** A fetch that failed. The message is for the caller; `reason` is for the record. */
+export class WebFetchError extends Error {
+  /** The last URL the fetch reached, when it got as far as a hop. */
+  hopUrl?: string;
+
   constructor(
     message: string,
-    readonly range?: RefusedRange
+    readonly reason: WebFetchFailureReason,
+    /** A Node error code (ECONNREFUSED, CERT_HAS_EXPIRED…), for `network`. */
+    readonly code?: string
   ) {
     super(message);
+    this.name = 'WebFetchError';
+  }
+}
+
+/** The fetch was refused before it connected anywhere it shouldn't. */
+export class WebFetchRefusal extends WebFetchError {
+  constructor(
+    message: string,
+    reason: WebFetchFailureReason,
+    readonly range?: RefusedRange
+  ) {
+    super(message, reason);
     this.name = 'WebFetchRefusal';
   }
+}
+
+/** Any failure as a WebFetchError, a foreign one (a socket's, a resolver's) as `network`. */
+function asWebFetchError(error: unknown, hop: URL | undefined): WebFetchError {
+  const failure =
+    error instanceof WebFetchError
+      ? error
+      : new WebFetchError(
+          error instanceof Error ? error.message : String(error),
+          'network',
+          typeof (error as NodeJS.ErrnoException)?.code === 'string'
+            ? (error as NodeJS.ErrnoException).code
+            : undefined
+        );
+  if (hop && !failure.hopUrl) failure.hopUrl = hop.toString();
+  return failure;
 }
 
 const REQUEST_HEADERS = {
@@ -153,8 +209,8 @@ function pinnedLookup(hostname: string, pinned: ResolvedAddress[]): LookupFuncti
   }) as LookupFunction;
 }
 
-function refuse(message: string, range?: RefusedRange): never {
-  throw new WebFetchRefusal(message, range);
+function refuse(message: string, reason: WebFetchFailureReason, range?: RefusedRange): never {
+  throw new WebFetchRefusal(message, reason, range);
 }
 
 function parseHop(raw: string): URL {
@@ -162,21 +218,21 @@ function parseHop(raw: string): URL {
   try {
     url = new URL(raw);
   } catch {
-    refuse('Not a valid URL.');
+    refuse('Not a valid URL.', 'invalid-url');
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    refuse(`Only http and https URLs can be fetched, not ${url.protocol}`);
+    refuse(`Only http and https URLs can be fetched, not ${url.protocol}`, 'scheme');
   }
   if (url.username || url.password) {
-    refuse('URLs carrying a username or password are not fetched.');
+    refuse('URLs carrying a username or password are not fetched.', 'credentials');
   }
   return url;
 }
 
 /**
- * `work`, or the deadline if it comes first. The listener is removed when
- * `work` settles, so a deadline that fires on a later hop never rejects a
- * promise nobody is waiting on (an unhandled rejection ends the process).
+ * `work`, or the deadline if it comes first. When the deadline wins, `work`
+ * still has its rejection handled here, so a failure it reaches later is
+ * never an unhandled rejection (which would end the process).
  */
 function untilDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason);
@@ -199,24 +255,29 @@ function untilDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 /** Resolve and check one hop's host. Throws WebFetchRefusal when refused. */
 export async function checkedAddresses(
   hostname: string,
-  network: GuardNetwork,
-  signal: AbortSignal
+  network: GuardNetwork
 ): Promise<ResolvedAddress[]> {
   const host = normalizeHostname(hostname);
-  if (!host) refuse('The URL has no host.');
+  if (!host) refuse('The URL has no host.', 'no-host');
   const literal = isIP(host);
   if (!literal && isBlockedHostname(host)) {
-    refuse(`${host} is a local or internal name and is not fetched.`);
+    refuse(`${host} is a local or internal name and is not fetched.`, 'blocked-name');
   }
   const answers: ResolvedAddress[] = literal
     ? [{ address: host, family: literal === 6 ? 6 : 4 }]
-    : await untilDeadline(network.resolve(host), signal);
-  if (answers.length === 0) throw new Error(`${host} did not resolve to any address.`);
+    : await network.resolve(host);
+  if (answers.length === 0) {
+    throw new WebFetchError(`${host} did not resolve to any address.`, 'no-address');
+  }
   for (const { address } of answers) {
     const range = network.refusalFor(address);
     if (range) {
       const verb = literal ? 'is' : 'resolves to';
-      refuse(`${host} ${verb} ${describeRange(range)} and is not fetched.`, range);
+      refuse(
+        `${host} ${verb} ${describeRange(range)} and is not fetched.`,
+        'blocked-address',
+        range
+      );
     }
   }
   return preferIpv4(answers);
@@ -250,6 +311,20 @@ function requestOnce(
       agent.destroy();
       reject(error);
     });
+    // A 101 never reaches the response callback: Node hands the socket to
+    // 'upgrade' listeners, and with none the request just waits (Lumen, PR
+    // #792). There is nothing to read from a switched protocol.
+    request.on('upgrade', (response: IncomingMessage, socket: Socket) => {
+      socket.destroy();
+      response.destroy();
+      agent.destroy();
+      reject(
+        new WebFetchError(
+          `The server answered ${response.statusCode} Switching Protocols, which web_fetch does not follow.`,
+          'protocol-switch'
+        )
+      );
+    });
     request.end();
   });
 }
@@ -263,7 +338,12 @@ function decoded(response: IncomingMessage): Readable {
   if (encoding === 'gzip' || encoding === 'x-gzip') decoder = zlib.createGunzip();
   else if (encoding === 'deflate') decoder = zlib.createInflate();
   else if (encoding === 'br') decoder = zlib.createBrotliDecompress();
-  else throw new Error(`The response used an unsupported content-encoding: ${encoding}`);
+  else {
+    throw new WebFetchError(
+      `The response used an unsupported content-encoding: ${encoding.slice(0, 40)}`,
+      'unsupported-encoding'
+    );
+  }
   response.on('error', (error) => decoder.destroy(error));
   return response.pipe(decoder);
 }
@@ -272,11 +352,12 @@ async function readCapped(
   response: IncomingMessage,
   maxBytes: number
 ): Promise<{ body: Buffer; truncated: boolean }> {
-  const stream = decoded(response);
+  let stream: Readable = response;
   const chunks: Buffer[] = [];
   let total = 0;
   let truncated = false;
   try {
+    stream = decoded(response);
     for await (const chunk of stream) {
       const buffer = chunk as Buffer;
       const room = maxBytes - total;
@@ -299,9 +380,9 @@ async function readCapped(
 }
 
 /**
- * GET `rawUrl` under the guard. Refusals throw WebFetchRefusal; a timeout,
- * a connection failure or a redirect problem throws an ordinary Error. Any
- * status that isn't a followed redirect is returned, 4xx and 5xx included.
+ * GET `rawUrl` under the guard. Every failure throws a WebFetchError with a
+ * fixed `reason` and the last hop it reached; a refusal is a WebFetchRefusal.
+ * Any status that isn't a followed redirect is returned, 4xx and 5xx included.
  */
 export async function guardedGet(
   rawUrl: string,
@@ -311,36 +392,70 @@ export async function guardedGet(
   const network = { ...DEFAULT_NETWORK, ...options.network };
   const controller = new AbortController();
   const timer = setTimeout(
-    () => controller.abort(new Error(`web_fetch timed out after ${limits.timeoutMs}ms`)),
+    () =>
+      controller.abort(
+        new WebFetchError(`web_fetch timed out after ${limits.timeoutMs}ms`, 'timeout')
+      ),
     limits.timeoutMs
   );
   const { signal } = controller;
+  const progress: { hop?: URL } = {};
+  try {
+    // The deadline is raced here, around everything, so no state a hop gets
+    // stuck in (a lookup that never answers, a protocol switch) outlives it.
+    return await untilDeadline(followHops(rawUrl, limits, network, signal, progress), signal);
+  } catch (error) {
+    throw asWebFetchError(error, progress.hop);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
+async function followHops(
+  rawUrl: string,
+  limits: GuardLimits,
+  network: GuardNetwork,
+  signal: AbortSignal,
+  progress: { hop?: URL }
+): Promise<GuardedResponse> {
   let current = parseHop(rawUrl);
   const visited = new Set([current.toString()]);
   let redirects = 0;
   try {
     for (;;) {
-      const pinned = await checkedAddresses(current.hostname, network, signal);
+      progress.hop = current;
+      const pinned = await checkedAddresses(current.hostname, network);
+      // A lookup that answers after the deadline must not start a connection.
+      signal.throwIfAborted();
       const { response, agent } = await requestOnce(current, pinned, signal);
       try {
         const status = response.statusCode ?? 0;
         const location = response.headers.location;
         if (REDIRECT_STATUSES.has(status)) {
           response.destroy();
-          if (!location) throw new Error(`Redirect (${status}) without a Location header.`);
+          if (!location) {
+            throw new WebFetchError(
+              `Redirect (${status}) without a Location header.`,
+              'redirect-without-location'
+            );
+          }
           redirects += 1;
           if (redirects > limits.maxRedirects) {
-            throw new Error(`Too many redirects (limit ${limits.maxRedirects}).`);
+            throw new WebFetchError(
+              `Too many redirects (limit ${limits.maxRedirects}).`,
+              'redirect-limit'
+            );
           }
           let next: URL;
           try {
             next = new URL(location, current);
           } catch {
-            throw new Error(`Redirect (${status}) to an invalid URL.`);
+            throw new WebFetchError(`Redirect (${status}) to an invalid URL.`, 'redirect-invalid');
           }
           next = parseHop(next.toString());
-          if (visited.has(next.toString())) throw new Error('Redirect loop.');
+          if (visited.has(next.toString())) {
+            throw new WebFetchError('Redirect loop.', 'redirect-loop');
+          }
           visited.add(next.toString());
           current = next;
           continue;
@@ -360,9 +475,7 @@ export async function guardedGet(
     }
   } catch (error) {
     // An abort surfaces as the stream's AbortError; report the deadline.
-    if (signal.aborted && !(error instanceof WebFetchRefusal)) throw signal.reason;
-    throw error;
-  } finally {
-    clearTimeout(timer);
+    const failure = signal.aborted && !(error instanceof WebFetchRefusal) ? signal.reason : error;
+    throw asWebFetchError(failure, current);
   }
 }

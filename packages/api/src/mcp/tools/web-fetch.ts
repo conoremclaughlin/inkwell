@@ -18,9 +18,10 @@
  * - Fetched text goes back inside wrapWebFetchContent's untrusted-data
  *   boundary, with the page title inside it too, since a page writes its own
  *   title.
- * - Every fetch, refusal and failure is written to the audit log by origin
- *   and path. A query string can carry a token, and the log keeps what it's
- *   given.
+ * - Every fetch, refusal and failure is written to the audit log as origin
+ *   and path, with a failure's fixed reason and the last hop it reached, and
+ *   never an exception's text. A query string can carry a token, an error
+ *   message can carry a URL, and the log keeps what it's given (Lumen, PR #792).
  */
 
 import { z } from 'zod';
@@ -30,6 +31,7 @@ import { getPermissionsService } from '../../services/permissions';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { fetchPage } from '../../services/web-fetch/fetch-page';
 import {
+  WebFetchError,
   WebFetchRefusal,
   type GuardLimits,
   type GuardNetwork,
@@ -40,6 +42,7 @@ import { wrapWebFetchContent } from './secure-web-fetch';
 export const WEB_FETCH_DEFAULT_MAX_CHARS = 20_000;
 export const WEB_FETCH_MAX_CHARS = 50_000;
 const TITLE_MAX_CHARS = 300;
+const NODE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export const webFetchSchema = userIdentifierBaseSchema.extend({
   url: z.string().min(1).max(4096).describe('The http or https URL to fetch.'),
@@ -100,18 +103,28 @@ export async function handleWebFetch(
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const audit = getAuditService();
   const target = auditTarget(params.url);
-  const record = (status: 'blocked' | 'error', summary: string) => {
+  // A failure is recorded by its reason, never by an exception's text.
+  const record = (status: 'blocked' | 'error', summary: string, metadata: object) => {
     audit
-      .logNetworkRequest('web_fetch', target, status, { userId: user.id, responseSummary: summary })
+      .log({
+        userId: user.id,
+        action: 'web_fetch',
+        category: 'network',
+        target,
+        responseStatus: status,
+        responseSummary: summary,
+        metadata: { ...metadata },
+      })
       .catch(() => undefined);
   };
 
   if (!(await getPermissionsService().isEnabled(user.id, 'web_fetch', true))) {
-    record('blocked', 'The web_fetch permission is off for this account.');
+    record('blocked', 'Refused: permission-off', { reason: 'permission-off' });
     return mcpResponse(
       {
         success: false,
         refused: true,
+        reason: 'permission-off',
         url: params.url,
         error: 'web_fetch is turned off for this account.',
       },
@@ -131,13 +144,23 @@ export async function handleWebFetch(
       deps
     );
   } catch (error) {
+    const failure = error instanceof WebFetchError ? error : undefined;
     const refused = error instanceof WebFetchRefusal;
+    const reason = failure?.reason ?? 'network';
+    const range = refused ? (error as WebFetchRefusal).range : undefined;
+    // Node's codes are a fixed vocabulary; anything else shaped like text is dropped.
+    const code = failure?.code && NODE_ERROR_CODE.test(failure.code) ? failure.code : undefined;
+    const summary = [refused ? 'Refused:' : 'Failed:', reason, range, code].filter(Boolean);
+    record(refused ? 'blocked' : 'error', summary.join(' '), {
+      reason,
+      ...(range ? { range } : {}),
+      ...(code ? { code } : {}),
+      ...(failure?.hopUrl ? { finalTarget: auditTarget(failure.hopUrl) } : {}),
+    });
+    if (refused) logger.warn('web_fetch refused', { target, reason, range });
+    // The caller gets the message: it asked for this URL, query and all.
     const message = error instanceof Error ? error.message : String(error);
-    record(refused ? 'blocked' : 'error', message);
-    if (refused) {
-      logger.warn('web_fetch refused', { target, range: (error as WebFetchRefusal).range });
-    }
-    return mcpResponse({ success: false, refused, url: params.url, error: message }, true);
+    return mcpResponse({ success: false, refused, reason, url: params.url, error: message }, true);
   }
 
   const title = page.title ? page.title.slice(0, TITLE_MAX_CHARS) : undefined;

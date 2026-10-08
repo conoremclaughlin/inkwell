@@ -30,6 +30,8 @@ type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 interface TestServer {
   port: number;
   hits: IncomingMessage[];
+  /** TCP connections accepted, whether or not a request followed. */
+  connections: () => number;
   close: () => Promise<void>;
 }
 
@@ -42,7 +44,9 @@ async function startServer(host: '127.0.0.1' | '::1', handler: Handler, port = 0
     hits.push(req);
     handler(req, res);
   });
+  let connections = 0;
   server.on('connection', (socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
   });
@@ -51,6 +55,7 @@ async function startServer(host: '127.0.0.1' | '::1', handler: Handler, port = 0
   const started: TestServer = {
     port: (server.address() as AddressInfo).port,
     hits,
+    connections: () => connections,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -450,6 +455,56 @@ describe('guardedGet caps size and time', () => {
     ).rejects.toThrow('timed out after 400ms');
   });
 
+  it('settles promptly when a server answers 101 Switching Protocols (Lumen, PR #792)', async () => {
+    const sockets = new Set<net.Socket>();
+    const raw = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.once('data', () =>
+        socket.write(
+          'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+        )
+      );
+    });
+    raw.listen(0, '127.0.0.1');
+    await once(raw, 'listening');
+    try {
+      const port = (raw.address() as AddressInfo).port;
+      const outcome = guardedGet(`http://127.0.0.1:${port}/`, {
+        network: { refusalFor: exempt127 },
+        limits: { timeoutMs: 300 },
+      }).then(
+        () => 'resolved',
+        (error: Error) => error.message
+      );
+      const pending = new Promise((resolve) => setTimeout(() => resolve('still pending'), 2_000));
+      const result = await Promise.race([outcome, pending]);
+      expect(result).toContain('101');
+      // The server's end of the upgraded socket is closed, not left open.
+      await expect
+        .poll(() => [...sockets].every((socket) => socket.destroyed || socket.readableEnded))
+        .toBe(true);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => raw.close(() => resolve()));
+    }
+  });
+
+  it('starts no connection when the lookup answers after the deadline', async () => {
+    const server = await startServer('127.0.0.1', ok);
+    const resolve: GuardNetwork['resolve'] = () =>
+      new Promise((answer) => setTimeout(() => answer([{ address: '127.0.0.1', family: 4 }]), 300));
+    await expect(
+      guardedGet(`http://late.test:${server.port}/`, {
+        network: { resolve, refusalFor: exempt127 },
+        limits: { timeoutMs: 100 },
+      })
+    ).rejects.toMatchObject({ reason: 'timeout' });
+    // Wait past the late answer, then check no connection was even opened.
+    await new Promise((settle) => setTimeout(settle, 600));
+    expect(server.connections()).toBe(0);
+    expect(server.hits).toHaveLength(0);
+  });
+
   it('gives up at the deadline when the lookup hangs', async () => {
     const resolve: GuardNetwork['resolve'] = () => new Promise(() => undefined);
     await expect(
@@ -457,7 +512,55 @@ describe('guardedGet caps size and time', () => {
         network: { resolve },
         limits: { timeoutMs: 200 },
       })
-    ).rejects.toThrow('timed out after 200ms');
+    ).rejects.toMatchObject({
+      message: 'web_fetch timed out after 200ms',
+      reason: 'timeout',
+      // The hop never reached its own catch; the guard still knows where it was.
+      hopUrl: 'http://slow-dns.test/',
+    });
+  });
+});
+
+describe('guardedGet names every failure', () => {
+  it('gives a deadline its reason and the hop it was on', async () => {
+    const server = await startServer('127.0.0.1', (req, res) => {
+      if (req.url === '/start') {
+        res.writeHead(302, { location: '/slow?token=x' });
+        res.end();
+      }
+      // /slow never answers
+    });
+    await expect(
+      guardedGet(`http://127.0.0.1:${server.port}/start`, {
+        network: { refusalFor: exempt127 },
+        limits: { timeoutMs: 300 },
+      })
+    ).rejects.toMatchObject({
+      reason: 'timeout',
+      hopUrl: `http://127.0.0.1:${server.port}/slow?token=x`,
+    });
+  });
+
+  it("gives a socket failure Node's code", async () => {
+    await expect(
+      guardedGet('http://127.0.0.1:1/', { network: { refusalFor: exempt127 } })
+    ).rejects.toMatchObject({ name: 'WebFetchError', reason: 'network', code: 'ECONNREFUSED' });
+  });
+
+  it('gives redirect, upgrade and refusal failures their own reasons', async () => {
+    const server = await startServer('127.0.0.1', (req, res) => {
+      res.writeHead(302, { location: req.url === '/a' ? '/b' : '/a' });
+      res.end();
+    });
+    await expect(
+      guardedGet(`http://127.0.0.1:${server.port}/a`, { network: { refusalFor: exempt127 } })
+    ).rejects.toMatchObject({ reason: 'redirect-loop' });
+    await expect(guardedGet('ftp://example.com/')).rejects.toMatchObject({ reason: 'scheme' });
+    await expect(guardedGet('http://localhost/')).rejects.toMatchObject({ reason: 'blocked-name' });
+    await expect(guardedGet('http://10.0.0.1/')).rejects.toMatchObject({
+      reason: 'blocked-address',
+      range: 'private',
+    });
   });
 });
 

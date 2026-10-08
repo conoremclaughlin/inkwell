@@ -37,6 +37,7 @@ vi.mock('../../services/user-resolver', async (importOriginal) => ({
 import type { DataComposer } from '../../data/composer';
 import { refusalFor } from '../../services/web-fetch/address-policy';
 import { installDialFence, type DialFence } from '../../test/dial-fence';
+import { logger } from '../../utils/logger';
 import { auditTarget, handleWebFetch, webFetchSchema } from './web-fetch';
 
 const composer = {} as DataComposer;
@@ -95,12 +96,15 @@ describe('web_fetch honours the account permission', () => {
     expect(body.error).toBe('web_fetch is turned off for this account.');
     expect(hits).toHaveLength(0);
     expect(mocks.isEnabled).toHaveBeenCalledWith(USER_ID, 'web_fetch', true);
-    expect(mocks.logNetworkRequest).toHaveBeenCalledWith(
-      'web_fetch',
-      `${base}/`,
-      'blocked',
-      expect.objectContaining({ userId: USER_ID })
-    );
+    expect(mocks.log).toHaveBeenCalledWith({
+      userId: USER_ID,
+      action: 'web_fetch',
+      category: 'network',
+      target: `${base}/`,
+      responseStatus: 'blocked',
+      responseSummary: 'Refused: permission-off',
+      metadata: { reason: 'permission-off' },
+    });
   });
 
   it('fetches nothing when the permission cannot be read', async () => {
@@ -180,30 +184,140 @@ describe('web_fetch reports refusals', () => {
       await handleWebFetch({ url: `${base}/x?token=hunter2` }, composer)
     );
     expect(isError).toBe(true);
-    expect(body).toMatchObject({ success: false, refused: true });
+    expect(body).toMatchObject({ success: false, refused: true, reason: 'blocked-address' });
     expect(body.error).toBe('127.0.0.1 is a loopback address and is not fetched.');
     expect(hits).toHaveLength(0);
-    expect(mocks.logNetworkRequest).toHaveBeenCalledWith(
-      'web_fetch',
-      `${base}/x`,
-      'blocked',
-      expect.objectContaining({ userId: USER_ID })
+    expect(mocks.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: `${base}/x`,
+        responseStatus: 'blocked',
+        responseSummary: 'Refused: blocked-address loopback',
+        metadata: { reason: 'blocked-address', range: 'loopback', finalTarget: `${base}/x` },
+      })
     );
   });
 
-  it('reports a failure that is not a refusal as an error', async () => {
-    const base = await serve((_req, res) => {
-      res.writeHead(200, { 'content-type': 'application/pdf' });
-      res.end('%PDF');
+  it('records a failure by reason and the hop it reached, after a redirect too', async () => {
+    const base = await serve((req, res) => {
+      if (req.url?.startsWith('/start')) {
+        res.writeHead(302, { location: '/files/doc.pdf?token=hunter2' });
+        res.end();
+      } else {
+        res.writeHead(200, { 'content-type': 'application/pdf' });
+        res.end('%PDF');
+      }
     });
-    const { body } = parse(await handleWebFetch({ url: base }, composer, { network }));
-    expect(body).toMatchObject({ success: false, refused: false });
-    expect(mocks.logNetworkRequest).toHaveBeenCalledWith(
-      'web_fetch',
-      `${base}/`,
-      'error',
-      expect.anything()
+    const { body } = parse(await handleWebFetch({ url: `${base}/start` }, composer, { network }));
+    expect(body).toMatchObject({ success: false, refused: false, reason: 'unreadable-body' });
+    expect(body.error).toBe('The response is application/pdf, which web_fetch does not read.');
+    expect(mocks.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: `${base}/start`,
+        responseStatus: 'error',
+        responseSummary: 'Failed: unreadable-body',
+        metadata: { reason: 'unreadable-body', finalTarget: `${base}/files/doc.pdf` },
+      })
     );
+  });
+
+  it("records a connection failure by Node's code", async () => {
+    // Port 1 on loopback: nothing listens, so the connection is refused.
+    await handleWebFetch({ url: 'http://127.0.0.1:1/' }, composer, { network });
+    expect(mocks.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        responseStatus: 'error',
+        responseSummary: 'Failed: network ECONNREFUSED',
+        metadata: {
+          reason: 'network',
+          code: 'ECONNREFUSED',
+          finalTarget: 'http://127.0.0.1:1/',
+        },
+      })
+    );
+  });
+});
+
+describe('web_fetch never records a query string', () => {
+  // Every path the handler records, each URL carrying a sentinel of its own,
+  // so a leak names the path it came through. Lumen found the binary-body
+  // error carrying the whole final URL into audit_log (PR #792).
+  it('keeps every sentinel out of the audit log and the server log, on every path', async () => {
+    const logSpies = (['debug', 'info', 'warn', 'error'] as const).map((level) =>
+      vi.spyOn(logger, level)
+    );
+    const base = await serve((req, res) => {
+      const path = (req.url ?? '').split('?')[0];
+      if (path === '/bin') {
+        res.writeHead(200, { 'content-type': 'image/png' });
+        res.end('\x89PNG');
+      } else if (path === '/hop-to-bin') {
+        res.writeHead(302, { location: '/bin?second=SENTINEL_BIN_REDIRECTED' });
+        res.end();
+      } else if (path === '/loop') {
+        res.writeHead(302, { location: req.url });
+        res.end();
+      } else if (path === '/zstd') {
+        res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'zstd' });
+        res.end('x');
+      } else if (path === '/missing') {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('gone');
+      } else if (path === '/hop-to-ok') {
+        res.writeHead(302, { location: '/ok?second=SENTINEL_OK_REDIRECTED' });
+        res.end();
+      } else if (path === '/hop-to-loopback') {
+        res.writeHead(302, { location: 'http://[::1]:1/?second=SENTINEL_REFUSED_HOP' });
+        res.end();
+      } else if (path === '/never') {
+        // never answers
+      } else {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('ok');
+      }
+    });
+    const cases = [
+      `${base}/bin?token=SENTINEL_BIN_DIRECT`,
+      `${base}/hop-to-bin?token=SENTINEL_BIN_FIRST`,
+      `${base}/loop?token=SENTINEL_LOOP`,
+      `${base}/zstd?token=SENTINEL_ENCODING`,
+      `${base}/missing?token=SENTINEL_NOT_FOUND`,
+      `${base}/hop-to-ok?token=SENTINEL_OK_FIRST#SENTINEL_FRAGMENT`,
+      `${base}/hop-to-loopback?token=SENTINEL_REFUSED_FIRST`,
+      `${base}/never?token=SENTINEL_TIMEOUT`,
+      `http://127.0.0.1:1/?token=SENTINEL_CONNECT_FAILS`,
+    ];
+    const responses: string[] = [];
+    for (const url of cases) {
+      const result = await handleWebFetch({ url }, composer, {
+        network,
+        limits: { timeoutMs: 300 },
+      });
+      responses.push(result.content[0].text);
+    }
+
+    const sentinels = cases.map((url) => /SENTINEL_[A-Z_]+/.exec(url)![0]);
+    // Control: each URL really went through the handler and came back to the caller.
+    for (const [index, sentinel] of sentinels.entries()) {
+      expect(responses[index]).toContain(sentinel);
+    }
+    const recorded = JSON.stringify([
+      mocks.log.mock.calls,
+      mocks.logNetworkRequest.mock.calls,
+      ...logSpies.map((spy) => spy.mock.calls),
+    ]);
+    const everySentinel = [
+      ...sentinels,
+      'SENTINEL_BIN_REDIRECTED',
+      'SENTINEL_OK_REDIRECTED',
+      'SENTINEL_REFUSED_HOP',
+      'SENTINEL_FRAGMENT',
+    ];
+    expect(everySentinel.filter((sentinel) => recorded.includes(sentinel))).toEqual([]);
+    // And something was recorded for every case.
+    expect(mocks.log.mock.calls.length + mocks.logNetworkRequest.mock.calls.length).toBe(
+      cases.length
+    );
+    for (const spy of logSpies) spy.mockRestore();
   });
 });
 

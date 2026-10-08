@@ -82,7 +82,9 @@ describe('fetchPage', () => {
       res.writeHead(200, { 'content-type': 'image/png' });
       res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     });
-    await expect(page(base)).rejects.toThrow('returned image/png, which web_fetch does not read');
+    await expect(page(base)).rejects.toThrow(
+      'The response is image/png, which web_fetch does not read'
+    );
   });
 
   it('refuses an undeclared body that looks binary', async () => {

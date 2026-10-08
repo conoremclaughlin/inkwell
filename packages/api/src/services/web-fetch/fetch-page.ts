@@ -16,7 +16,7 @@ import {
   type ExtractMode,
   type ExtractedContent,
 } from './extract';
-import { guardedGet, type GuardLimits, type GuardNetwork } from './guarded-get';
+import { guardedGet, WebFetchError, type GuardLimits, type GuardNetwork } from './guarded-get';
 
 /** An error page's body is context, not content: this much is plenty. */
 export const ERROR_BODY_MAX_CHARS = 4_000;
@@ -70,9 +70,12 @@ export async function fetchPage(
   const readable =
     isTextMediaType(contentType) && !(contentType === '' && looksBinary(response.body));
   if (ok && !readable) {
-    throw new Error(
-      `${response.finalUrl} returned ${contentType || 'an undeclared binary body'}, which web_fetch does not read.`
+    const failure = new WebFetchError(
+      `The response is ${contentType || 'an undeclared binary body'}, which web_fetch does not read.`,
+      'unreadable-body'
     );
+    failure.hopUrl = response.finalUrl;
+    throw failure;
   }
 
   const extracted: ExtractedContent = readable
