@@ -50,9 +50,12 @@ function conversation(
     marked?: boolean;
     workspaceId?: string;
     members?: Array<{ sb?: string; user?: string }>;
+    /** The thread's id, where the order of ids matters to a test. */
+    id?: string;
   } = {}
 ): Row {
   const thread = db.seed('inbox_threads', {
+    ...(options.id ? { id: options.id } : {}),
     thread_key: key,
     workspace_id: options.workspaceId ?? SPACE,
     status: options.status ?? 'open',
@@ -64,6 +67,8 @@ function conversation(
       thread_id: thread.id,
       sb_id: member.sb ?? null,
       user_id: member.user ?? null,
+      // Generated in the table: 'sb:<uuid>' or 'user:<uuid>'.
+      principal_key: member.sb ? `sb:${member.sb}` : `user:${member.user}`,
     });
   }
   return thread;
@@ -154,6 +159,60 @@ describe('which conversation a beat lands in', () => {
     }
     const found = await findInklingConversation(client(), inkling);
     expect(found?.threadKey).toBe('chat:conversation-140');
+  });
+
+  describe('under the server’s row cap, every read is whole (Lumen, #791)', () => {
+    /** An id that sorts by `n`, so a test decides which rows come back first. */
+    const ordered = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const at = (n: number) => new Date(Date.parse('2026-10-01T00:00:00.000Z') + n * 60_000);
+
+    it('finds its one open conversation behind 1,000 closed ones', async () => {
+      db.maxRows = 1000;
+      for (let i = 0; i < 1000; i += 1) {
+        conversation(`chat:closed-${i}`, {
+          id: ordered(i),
+          status: 'closed',
+          updatedAt: at(i).toISOString(),
+        });
+      }
+      conversation('chat:open', { id: ordered(1000), updatedAt: at(1000).toISOString() });
+
+      const found = await findInklingConversation(client(), inkling);
+      expect(found?.threadKey).toBe('chat:open');
+    });
+
+    it('picks the newest of 1,001 open conversations, the last of them included', async () => {
+      db.maxRows = 1000;
+      for (let i = 0; i <= 1000; i += 1) {
+        conversation(`chat:conversation-${i}`, { id: ordered(i), updatedAt: at(i).toISOString() });
+      }
+
+      const found = await findInklingConversation(client(), inkling);
+      expect(found?.threadKey).toBe('chat:conversation-1000');
+    });
+
+    it('never takes a group for a one-to-one because its members came back short', async () => {
+      // The group sorts first, and its first two members are the inkling and
+      // its owner: a read cut at two rows would show exactly the pair.
+      db.maxRows = 2;
+      conversation('chat:group', {
+        id: ordered(1),
+        updatedAt: at(2).toISOString(),
+        members: [{ sb: INKLING_ID }, { user: OWNER }, { user: SOMEONE_ELSE }],
+      });
+      conversation('chat:own', { id: ordered(2), updatedAt: at(1).toISOString() });
+
+      const found = await findInklingConversation(client(), inkling);
+      expect(found?.threadKey).toBe('chat:own');
+
+      const reminder = String(heartbeatReminder().id);
+      await expect(
+        isOwnersHeartbeat(client(), { reminderId: reminder, threadKey: 'chat:group', inkling })
+      ).resolves.toBe('no');
+      await expect(
+        isOwnersHeartbeat(client(), { reminderId: reminder, threadKey: 'chat:own', inkling })
+      ).resolves.toBe('yes');
+    });
   });
 
   it('a failed read is an error, never "no conversation"', async () => {

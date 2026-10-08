@@ -44,6 +44,9 @@ import {
 /** Thread ids per `in` list when reading an inkling's conversations. */
 const THREAD_PAGE = 100;
 
+/** Rows asked for per request on a paged read. */
+const READ_PAGE = 500;
+
 /** Whether a due reminder is an inkling's heartbeat, which only this module delivers. */
 export function isInklingHeartbeatReminder(
   reminder: Pick<DueReminder, 'delivery_channel'>
@@ -97,53 +100,93 @@ function isOwnConversation(thread: ThreadRow, members: MemberRow[], inkling: Ink
   );
 }
 
+/** A page of rows, or why it couldn't be read. */
+type Page<T> = PromiseLike<{ data: T[] | null; error: { message: string } | null }>;
+
+/**
+ * Every row a read matches, in pages of READ_PAGE, the read ordered so the
+ * pages never overlap. Only an empty page ends it: a short one can be the
+ * server's row cap (PostgREST's max_rows), not the end (Lumen, #791). A read
+ * that comes back short of its rows would show a group with a member
+ * missing, which can look like a one-to-one conversation.
+ */
+async function readAll<T>(page: (from: number, to: number) => Page<T>): Promise<T[]> {
+  const rows: T[] = [];
+  for (;;) {
+    const { data, error } = await page(rows.length, rows.length + READ_PAGE - 1);
+    if (error) throw new Error(error.message);
+    const got = data ?? [];
+    if (got.length === 0) return rows;
+    if (got.length > READ_PAGE) throw new Error('A paged read came back larger than its page');
+    rows.push(...got);
+  }
+}
+
+/** Every member of these threads, read whole. */
+function readMembers(supabase: SupabaseClient, threadIds: string[]): Promise<MemberRow[]> {
+  return readAll<MemberRow>((from, to) =>
+    supabase
+      .from('inbox_thread_participants')
+      .select('thread_id, sb_id, user_id')
+      .in('thread_id', threadIds)
+      .order('thread_id')
+      .order('principal_key')
+      .range(from, to)
+  );
+}
+
 /**
  * The inkling's own conversation with its owner, the most recently active
  * one (a send bumps the thread's updated_at), or null when it has none.
- * Throws when a read fails.
+ * Every read is whole: its memberships, the threads they name, and their
+ * members. Throws when a read fails.
  */
 export async function findInklingConversation(
   supabase: SupabaseClient,
   inkling: Inkling
 ): Promise<InklingConversation | null> {
-  const { data: memberships, error: membershipError } = await supabase
-    .from('inbox_thread_participants')
-    .select('thread_id')
-    .eq('sb_id', inkling.id);
-  if (membershipError) {
-    throw new Error(`Failed to read the inkling's conversations: ${membershipError.message}`);
+  let memberships: Array<{ thread_id: string }>;
+  try {
+    memberships = await readAll<{ thread_id: string }>((from, to) =>
+      supabase
+        .from('inbox_thread_participants')
+        .select('thread_id')
+        .eq('sb_id', inkling.id)
+        .order('thread_id')
+        .range(from, to)
+    );
+  } catch (error) {
+    throw new Error(`Failed to read the inkling's conversations: ${(error as Error).message}`);
   }
-  const threadIds = [
-    ...new Set(((memberships ?? []) as Array<{ thread_id: string }>).map((m) => m.thread_id)),
-  ];
+  const threadIds = [...new Set(memberships.map((m) => m.thread_id))];
 
   let newest: { thread: ThreadRow; at: number } | null = null;
   for (let start = 0; start < threadIds.length; start += THREAD_PAGE) {
     const page = threadIds.slice(start, start + THREAD_PAGE);
-    const { data: threadRows, error: threadError } = await supabase
-      .from('inbox_threads')
-      .select('id, thread_key, status, metadata, updated_at')
-      .in('id', page)
-      .eq('workspace_id', inkling.workspaceId);
-    if (threadError) {
-      throw new Error(`Failed to read the inkling's conversations: ${threadError.message}`);
+    let threads: ThreadRow[];
+    let members: MemberRow[] = [];
+    try {
+      threads = (
+        await readAll<ThreadRow>((from, to) =>
+          supabase
+            .from('inbox_threads')
+            .select('id, thread_key, status, metadata, updated_at')
+            .in('id', page)
+            .eq('workspace_id', inkling.workspaceId)
+            .order('id')
+            .range(from, to)
+        )
+      ).filter((t) => t.metadata?.[INKLING_CONVERSATION_MARK] === true && t.status !== 'closed');
+      if (threads.length > 0) {
+        members = await readMembers(
+          supabase,
+          threads.map((t) => t.id)
+        );
+      }
+    } catch (error) {
+      throw new Error(`Failed to read the inkling's conversations: ${(error as Error).message}`);
     }
-    const marked = ((threadRows ?? []) as ThreadRow[]).filter(
-      (t) => t.metadata?.[INKLING_CONVERSATION_MARK] === true && t.status !== 'closed'
-    );
-    if (marked.length === 0) continue;
-    const { data: memberRows, error: memberError } = await supabase
-      .from('inbox_thread_participants')
-      .select('thread_id, sb_id, user_id')
-      .in(
-        'thread_id',
-        marked.map((t) => t.id)
-      );
-    if (memberError) {
-      throw new Error(`Failed to read the conversations' members: ${memberError.message}`);
-    }
-    const members = (memberRows ?? []) as MemberRow[];
-    for (const thread of marked) {
+    for (const thread of threads) {
       const own = members.filter((m) => m.thread_id === thread.id);
       if (!isOwnConversation(thread, own, inkling)) continue;
       const at = Date.parse(thread.updated_at ?? '') || 0;
@@ -213,12 +256,13 @@ export async function isOwnersHeartbeat(
   if (threadError) return 'unreadable';
   const thread = threadRow as ThreadRow | null;
   if (!thread) return 'no';
-  const { data: memberRows, error: memberError } = await supabase
-    .from('inbox_thread_participants')
-    .select('thread_id, sb_id, user_id')
-    .eq('thread_id', thread.id);
-  if (memberError) return 'unreadable';
-  return isOwnConversation(thread, (memberRows ?? []) as MemberRow[], inkling) ? 'yes' : 'no';
+  let members: MemberRow[];
+  try {
+    members = await readMembers(supabase, [thread.id]);
+  } catch {
+    return 'unreadable';
+  }
+  return isOwnConversation(thread, members, inkling) ? 'yes' : 'no';
 }
 
 /** "Thursday, October 8 at 9:00 AM" in the zone, or in UTC when the zone is not one. */
