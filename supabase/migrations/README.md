@@ -67,8 +67,11 @@ ever names the endpoint: a password can sit in the userinfo, in a `?password=`
 parameter, or in keyword/value form, so the connection string is never printed.
 
 If the stack is not running, start it from the root checkout with
-`supabase start`. Do not reach for `yarn supabase:local:setup` for that: it
-runs `supabase db reset` and discards every row of live data.
+`yarn supabase:start`, which loads the Vault root key `supabase/config.toml`
+asks for (`scripts/lib/supabase-root-key.sh`); a plain `supabase start`
+leaves the database restarting without it. Do not reach for
+`yarn supabase:local:setup` for that: it runs `supabase db reset` and
+discards every row of live data.
 
 `db:migrate:pending` applies every file the ledger lacks, in version order,
 one transaction each, and `yarn dev` and `yarn prod:direct` run it from the
