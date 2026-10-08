@@ -753,7 +753,9 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .string()
     .guid()
     .optional()
-    .describe('Optional product workspace scope for shared document resolution'),
+    .describe(
+      'Optional check, never a choice: the server derives the workspace from the identity, and refuses a workspaceId that names a different one'
+    ),
   includeRecentMemories: z
     .boolean()
     .optional()
@@ -3092,22 +3094,30 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     }
   }
 
-  // Resolve workspace scope for shared docs:
-  // 1) explicit workspaceId param
-  // 2) the identity's own workspace, else the oldest personal one — the same
-  //    rule context-builder applies (constitution-workspace.ts)
-  // A withheld identity (missing though bound, or ambiguous) resolves to no
-  // workspace, and its caller is given no shared documents: falling back
-  // would hand it another workspace's (Lumen, #781).
-  const resolvedWorkspaceId =
-    params.workspaceId ||
-    (identityLookup.withheld
-      ? undefined
-      : await constitutionWorkspaceId(
-          supabase,
-          user.id,
-          (dbIdentity?.workspace_id as string | null | undefined) ?? null
-        ));
+  // The workspace whose shared documents the identity is given: its own
+  // workspace, else the oldest personal one, the rule context-builder applies
+  // (constitution-workspace.ts). A withheld identity (missing though bound, or
+  // ambiguous) resolves to no workspace, and its caller is given no shared
+  // documents: falling back would hand it another workspace's (Lumen, #781).
+  const resolvedWorkspaceId = identityLookup.withheld
+    ? undefined
+    : await constitutionWorkspaceId(
+        supabase,
+        user.id,
+        (dbIdentity?.workspace_id as string | null | undefined) ?? null
+      );
+
+  // An explicit workspaceId is a check, never a choice. The documents are read
+  // for any member, so a choice would hand an SB the values of every group its
+  // person belongs to, and would reach past a withheld identity (Lumen, #784).
+  if (params.workspaceId && params.workspaceId !== resolvedWorkspaceId) {
+    throw new Error(
+      `Bootstrap cannot read workspace ${params.workspaceId}: ` +
+        (resolvedWorkspaceId
+          ? `this identity's documents come from ${resolvedWorkspaceId}`
+          : 'this identity is given no workspace documents')
+    );
+  }
 
   // Read for any member of the workspace, not only its owner.
   const dbWorkspaceSharedDocs = resolvedWorkspaceId

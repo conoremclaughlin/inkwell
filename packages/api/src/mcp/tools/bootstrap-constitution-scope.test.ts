@@ -8,6 +8,10 @@
  * rule fall back to the oldest personal workspace, and a workspace with no
  * process took the unscoped ~/.ink copy. These pin both, plus the cases on
  * either side of them. The probe this follows is Lumen's.
+ *
+ * Lumen's review of #784 found a third: once the documents were read for any
+ * member, an explicit workspaceId could take an identity into another group
+ * its person belongs to, or past a withheld identity.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -114,10 +118,14 @@ afterEach(async () => {
   await rm(base, { recursive: true, force: true });
 });
 
-async function bootstrap(context: { sbId?: string; sbSlug?: string }, sbSlug = 'probe') {
+async function bootstrap(
+  context: { sbId?: string; sbSlug?: string },
+  sbSlug = 'probe',
+  args: { workspaceId?: string } = {}
+) {
   const result = await runWithRequestContext({ userId: USER, ...context }, () =>
     handleBootstrap(
-      { userId: USER, sbSlug, identityBasePath: base, includeRecentMemories: false },
+      { userId: USER, sbSlug, identityBasePath: base, includeRecentMemories: false, ...args },
       dc
     )
   );
@@ -309,6 +317,54 @@ describe('bootstrap shared documents', () => {
     // workspace check (resolveCallerWorkspace) already requires membership.
     db.rows('workspace_members').splice(db.rows('workspace_members').indexOf(member), 1);
     await expect(bootstrap({ sbId: SB, sbSlug: 'probe' })).rejects.toThrow(/not a member/);
+  });
+
+  describe('an explicit workspaceId', () => {
+    const OTHER_GROUP = '77777777-7777-4777-8777-777777777777';
+
+    /** A group someone else owns, with the person as a member. */
+    function seedOtherGroup(): void {
+      db.seed('workspaces', {
+        id: OTHER_GROUP,
+        user_id: '66666666-6666-4666-8666-666666666666',
+        type: 'team',
+        archived_at: null,
+        shared_values: 'OTHER-GROUP-VALUES',
+        process: 'OTHER-GROUP-PROCESS',
+      });
+      db.seed('workspace_members', { workspace_id: OTHER_GROUP, user_id: USER, role: 'member' });
+    }
+
+    // Lumen's probe on #784.
+    it('cannot take a bound identity into another group its person belongs to', async () => {
+      seedOtherGroup();
+
+      await expect(
+        bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', { workspaceId: OTHER_GROUP })
+      ).rejects.toThrow(/this identity's documents come from/);
+    });
+
+    it('cannot reach past a withheld identity to the personal workspace', async () => {
+      db.rows('agent_identities').splice(0);
+
+      await expect(
+        bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', { workspaceId: PERSONAL })
+      ).rejects.toThrow(/given no workspace documents/);
+    });
+
+    it("control: naming the identity's own workspace is accepted and changes nothing", async () => {
+      seedOtherGroup();
+
+      const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', {
+        workspaceId: SPACE,
+      });
+
+      expect(identityFiles).toMatchObject({
+        values: 'SPACE-VALUES',
+        process: null,
+        user: 'SPACE-ABOUT',
+      });
+    });
   });
 
   it("refuses a token bound to one identity when bootstrap names another's slug", async () => {

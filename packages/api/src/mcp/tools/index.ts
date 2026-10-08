@@ -2513,7 +2513,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .guid()
           .optional()
-          .describe('Optional product workspace scope for shared document resolution'),
+          .describe(
+            'Optional check, never a choice: the server derives the workspace from the identity, and refuses a workspaceId that names a different one'
+          ),
         includeRecentMemories: z
           .boolean()
           .optional()
