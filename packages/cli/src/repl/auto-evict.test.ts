@@ -134,6 +134,8 @@ describe('the tombstone never claims a write happened when it did not, and never
     'grep',
     'find',
     'ls',
+    'web_fetch',
+    'mcp__inkwell__web_fetch',
   ])('%s is read-side', (tool) => {
     expect(isWriteSideTool(tool)).toBe(false);
   });

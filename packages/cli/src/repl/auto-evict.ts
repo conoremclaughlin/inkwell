@@ -133,6 +133,8 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'get_mini_app_balance',
   'list_mini_app_balances',
   'get_mini_app_debts',
+  // A GET of a public page: fetching it again changes nothing here.
+  'web_fetch',
 ]);
 
 /** `mcp__inkwell__list_emails` → `list_emails`; a bare name is unchanged. */
