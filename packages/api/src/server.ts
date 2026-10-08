@@ -63,6 +63,10 @@ import {
 } from './services/inklings/inkling-reply-chain';
 import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
 import {
+  deliverInklingHeartbeat,
+  isInklingHeartbeatReminder,
+} from './services/inklings/inkling-heartbeat';
+import {
   TriggerRetryScheduler,
   getTriggerAttempt,
   BackendFailureError,
@@ -109,7 +113,15 @@ import {
 } from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
-import { startLaunchTracking } from './services/sessions/launched-processes';
+import {
+  recordingServerInstance,
+  startLaunchTracking,
+} from './services/sessions/launched-processes';
+import { closeDeletionsInProgress } from './services/account-deletion/worker';
+import { configureDeletionWorker, nudgeDeletionWorker } from './services/account-deletion/runtime';
+import { cancelInklingTurns } from './services/inklings/inkling-turns';
+import { inklingsRoot } from './services/inklings/inkling-folder';
+import { homedir } from 'os';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -193,6 +205,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // here on (launched-processes.ts). A restart signals only the server, and the
   // next message to such a session would start a second backend beside it.
   await startLaunchTracking(dataComposer.getClient(), env.MCP_HTTP_PORT);
+  // Also before any input: an account whose deletion is under way takes no
+  // new work in this server, whichever server runs the deletion
+  // (ink://specs/account-deletion §3).
+  const closingAccounts = await closeDeletionsInProgress(dataComposer.getClient());
+  if (closingAccounts > 0) logger.info('Account deletions in progress', { closingAccounts });
   logger.info('Data layer ready');
 
   // 2. Create SessionService (stateless, queries DB per-request)
@@ -697,6 +714,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
+    // An inkling's heartbeat lands in its own conversation in the app, under
+    // the heartbeat's admission to the inkling turn gate: never this generic
+    // path, whose channel cascade and send_response prompt are an external
+    // channel's.
+    if (isInklingHeartbeatReminder(reminder)) {
+      if (!dataComposer) {
+        return { status: 'failed', error: 'No database to deliver an inkling heartbeat with' };
+      }
+      return deliverInklingHeartbeat(
+        {
+          supabase: dataComposer.getClient(),
+          handleMessage: (request) => sessionService!.handleMessage(request),
+        },
+        reminder,
+        deliveryContext
+      );
+    }
+
     // Resolve agent from reminder's sb_id, fall back to server default
     let reminderSlug = sbSlug;
     if (reminder.sb_id && dataComposer) {
@@ -880,6 +915,35 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     : null;
 
   if (heartbeatServiceEnabled) {
+    // Account deletion runs only here, in the server that owns background
+    // work (ink://specs/account-deletion §2): on each heartbeat, and when a
+    // request is made.
+    configureDeletionWorker({
+      db: dataComposer!.getClient(),
+      deleteAuthUser: async (authUid) => {
+        const { error } = await dataComposer!.getClient().auth.admin.deleteUser(authUid);
+        if (!error) return 'deleted';
+        if (/not.?found/i.test(error.message) || error.status === 404) return 'absent';
+        throw new Error(`Could not delete the sign-in: ${error.message}`);
+      },
+      stopTurns: (sbIds) => {
+        for (const sbId of sbIds) cancelInklingTurns(sbId);
+      },
+      serverInstance: recordingServerInstance,
+      roots: {
+        inklings: inklingsRoot(),
+        claudeProjects: path.join(homedir(), '.claude', 'projects'),
+        codexSessions: path.join(
+          process.env.CODEX_HOME || path.join(homedir(), '.codex'),
+          'sessions'
+        ),
+      },
+      uploadsRoot: uploadsRoot(),
+      drainTimeoutMs: 60_000,
+      sweep: { after: null },
+      now: Date.now,
+    });
+    void nudgeDeletionWorker();
     const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
     const sweepOverflowService = new StudioOverflowService(
       dataComposer!.repositories.studios,
@@ -932,6 +996,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             error: uploadsErr instanceof Error ? uploadsErr.message : String(uploadsErr),
           });
         }
+
+        // Account deletions: each pending one as far as it goes now.
+        await nudgeDeletionWorker();
       },
     });
     logger.info(

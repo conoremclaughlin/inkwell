@@ -23,6 +23,19 @@ import {
   validateDisplayName,
 } from './inkling-service';
 import { createInklingDb, seedOwnSb, AWAKEN_REQUEST_INDEX } from '../../test/fake-inkling-db';
+import {
+  ABOUT_YOU_TEMPLATE,
+  INKLING_HEARTBEAT,
+  INKLING_HEARTBEAT_CHANNEL,
+  INKLING_HEARTBEAT_CRON,
+  INKLING_HEARTBEAT_REMINDER,
+  INKLING_SOUL_TEMPLATE,
+  INKLING_SPACE_VALUES,
+  ensureInklingStarterSet,
+  inklingSoul,
+  seedInklingHeartbeat,
+} from './starter-space';
+import { WorkspacesRepository } from '../../data/repositories/workspaces.repository';
 import { liveInklingTurns, trackInklingTurn } from './inkling-turns';
 import type { FakePostgrest, Row } from '../../test/fake-postgrest';
 
@@ -172,6 +185,8 @@ function rowsOf(table: string): Row[] {
 
 describe('awaken', () => {
   it('creates one inkling: complete at creation, unnamed, tagged, through a parentless self-serve token', async () => {
+    const awakenedAt = new Date('2026-10-08T00:30:00Z');
+    service = as(ME, { now: () => awakenedAt });
     const { inkling, replayed } = await service.awaken(ME, REQUEST);
 
     expect(replayed).toBe(false);
@@ -201,7 +216,7 @@ describe('awaken', () => {
       kindleId: expect.any(String),
       onboarding: false,
     });
-    expect(identity.soul).toBe(buildInklingSoul());
+    expect(identity.soul).toBe(buildInklingSoul(awakenedAt));
 
     const [lineage] = rowsOf('kindle_lineage');
     expect(lineage).toMatchObject({
@@ -396,15 +411,460 @@ describe('awaken', () => {
     });
   });
 
-  it('touches only identity, lineage and token tables: no thread, no message, no wake', async () => {
+  it('touches identity, lineage and token tables, reads its space and schedules its heartbeat: no thread, no message, no wake', async () => {
     await service.awaken(ME, REQUEST);
     const touched = [...new Set(db.log.map((e) => e.table))].sort();
-    expect(touched).toEqual(['agent_identities', 'kindle_tokens', 'redeem_kindle_token']);
+    // The space is read for its starter set; this fixture has no space row,
+    // so nothing more is written (starter-space.ts). The heartbeat reminder is
+    // scheduled in the person's timezone, read from users.
+    expect(touched).toEqual([
+      'agent_identities',
+      'kindle_tokens',
+      'redeem_kindle_token',
+      'scheduled_reminders',
+      'users',
+      'workspaces',
+    ]);
+  });
+});
+
+describe('the heartbeat at an awakening (inkling-heartbeat.ts)', () => {
+  const heartbeats = () =>
+    rowsOf('scheduled_reminders').filter(
+      (row) => (row.metadata as Row | null)?.reminderType === INKLING_HEARTBEAT_REMINDER
+    );
+
+  it('gives the new inkling the starter heartbeat and one reminder in its own conversation', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+
+    const identity = rowsOf('agent_identities').find((row) => row.id === inkling.id)!;
+    expect(identity.heartbeat).toBe(INKLING_HEARTBEAT);
+    expect(heartbeats()).toEqual([
+      expect.objectContaining({
+        user_id: ME.userId,
+        sb_id: inkling.id,
+        delivery_channel: INKLING_HEARTBEAT_CHANNEL,
+        delivery_target: inkling.id,
+        cron_expression: INKLING_HEARTBEAT_CRON,
+        metadata: { autoCreated: true, reminderType: INKLING_HEARTBEAT_REMINDER },
+      }),
+    ]);
+  });
+
+  it('first fires at one of its hours in the person’s own timezone', async () => {
+    db.seed('users', { id: ME.userId, timezone: 'America/Los_Angeles' });
+    await service.awaken(ME, REQUEST);
+
+    const [reminder] = heartbeats();
+    const at = new Date(String(reminder.next_run_at));
+    const local = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      hour: 'numeric',
+      minute: 'numeric',
+      hourCycle: 'h23',
+    }).formatToParts(at);
+    const part = (type: string) => Number(local.find((p) => p.type === type)?.value);
+    expect([9, 13, 18]).toContain(part('hour'));
+    expect(part('minute')).toBe(0);
+    expect(at.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('a retry replays and schedules nothing more', async () => {
+    await service.awaken(ME, REQUEST);
+    await service.awaken(ME, REQUEST);
+    expect(heartbeats()).toHaveLength(1);
+  });
+
+  it('each inkling gets its own', async () => {
+    service = as(ME, { awakenCap: null });
+    const first = await service.awaken(ME, REQUEST);
+    const second = await service.awaken(ME, '9d0c1b2a-3e4f-4a5b-8c6d-7e8f9a0b1c2d');
+    expect(
+      heartbeats()
+        .map((row) => row.sb_id)
+        .sort()
+    ).toEqual([first.inkling.id, second.inkling.id].sort());
+  });
+
+  it('still wakes the inkling when the reminder can’t be written', async () => {
+    const from = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = from(table);
+      if (table === 'scheduled_reminders') {
+        (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+          data: null,
+          error: { code: 'XX000', message: 'synthetic write failure' },
+        });
+      }
+      return query;
+    }) as typeof db.from;
+
+    const { inkling, replayed } = await service.awaken(ME, REQUEST);
+
+    expect(replayed).toBe(false);
+    expect(inkling.id).toEqual(expect.any(String));
+    expect(heartbeats()).toHaveLength(0);
+  });
+
+  it('schedules no reminder when its heartbeat text can’t be written', async () => {
+    const from = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = from(table);
+      if (table === 'agent_identities') {
+        const update = query.update.bind(query);
+        query.update = ((patch: Row) => {
+          if ('heartbeat' in patch) {
+            (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+              data: null,
+              error: { code: 'XX000', message: 'synthetic write failure' },
+            });
+          }
+          return update(patch);
+        }) as typeof query.update;
+      }
+      return query;
+    }) as typeof db.from;
+
+    const { inkling } = await service.awaken(ME, REQUEST);
+
+    expect(inkling.id).toEqual(expect.any(String));
+    expect(heartbeats()).toHaveLength(0);
+  });
+
+  it('never replaces a heartbeat already written', async () => {
+    const own = db.seed('agent_identities', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      agent_id: 'kindle-written',
+      name: 'Unnamed inkling',
+      heartbeat: 'Only tell me about the garden.',
+      metadata: { client: 'inkling-mobile' },
+    });
+    await seedInklingHeartbeat(db as unknown as SupabaseClient, {
+      id: String(own.id),
+      userId: ME.userId,
+    });
+    expect(own.heartbeat).toBe('Only tell me about the garden.');
+  });
+});
+
+describe('the space’s starter set at an awakening (starter-space.ts)', () => {
+  const pagesIn = (workspaceId: string) =>
+    rowsOf('user_identity').filter((row) => row.workspace_id === workspaceId);
+
+  it('gives a space that never had it the inkling values and the person’s own page', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+    expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    expect(space.process ?? null).toBeNull();
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_id: ME.userId, user_profile_md: ABOUT_YOU_TEMPLATE }),
+    ]);
+  });
+
+  it('leaves a space with values of its own exactly as it is, its page included', async () => {
+    // Values and no process: only the values guard stands between it and a seed.
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: 'OWN-VALUES',
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: 'OWN-PAGE',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)).toMatchObject({
+      shared_values: 'OWN-VALUES',
+    });
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_profile_md: 'OWN-PAGE' }),
+    ]);
+  });
+
+  it('never fills values beside a process the space already has', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: 'OWN-PROCESS',
+    });
+    await service.awaken(ME, REQUEST);
+    expect(
+      rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values ?? null
+    ).toBeNull();
+  });
+
+  it('counts an emptied document as written: empty values and an empty page stay empty', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: '',
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: '',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values).toBe('');
+    expect(pagesIn(ME.workspaceId)).toEqual([expect.objectContaining({ user_profile_md: '' })]);
+  });
+
+  it('writes the page where the person has a row but no page was ever written', async () => {
+    // Saving a space's values first leaves such a row (save_team_constitution).
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: null,
+      shared_values_md: 'HISTORY-COPY',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({
+        user_profile_md: ABOUT_YOU_TEMPLATE,
+        shared_values_md: 'HISTORY-COPY',
+      }),
+    ]);
+  });
+
+  it('changes nothing the second time', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+    await service.awaken(ME, REQUEST);
+    pagesIn(ME.workspaceId)[0]!.user_profile_md = 'EDITED-BY-THE-INKLING';
+
+    await service.awaken(ME, 'bbbbbbbb-1111-4111-8111-111111111111');
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_profile_md: 'EDITED-BY-THE-INKLING' }),
+    ]);
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values).toBe(
+      INKLING_SPACE_VALUES
+    );
+  });
+
+  it('gives no page in a space with values of its own that isn’t an inkling space (Lumen, #786)', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: 'OWN-VALUES',
+      process: null,
+      metadata: {},
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([]);
+  });
+
+  it('marks a space it seeds as an inkling space, keeping its other metadata', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+      metadata: { membershipMode: 'invite_only', color: 'blue' },
+      updated_at: '2026-10-07T00:00:00Z',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.metadata).toEqual({
+      membershipMode: 'invite_only',
+      color: 'blue',
+      starter: 'inkling',
+    });
+  });
+
+  it('gives the person a page in a space made as an inkling space, values and all', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: INKLING_SPACE_VALUES,
+      process: null,
+      metadata: { starter: 'inkling' },
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_id: ME.userId, user_profile_md: ABOUT_YOU_TEMPLATE }),
+    ]);
+  });
+
+  it('keeps a space’s mark when its owner updates other metadata (Lumen, #786)', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      metadata: { starter: 'inkling', membershipMode: 'invite_only' },
+      updated_at: '2026-10-07T00:00:00Z',
+    });
+
+    await new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+      metadata: { color: 'blue', starter: null },
+    });
+
+    expect(rowsOf('workspaces')[0]!.metadata).toEqual({
+      starter: 'inkling',
+      membershipMode: 'invite_only',
+      color: 'blue',
+    });
+  });
+
+  describe('a metadata write racing the seeding (Lumen, #786)', () => {
+    const unseeded = () =>
+      db.seed('workspaces', {
+        id: ME.workspaceId,
+        user_id: ME.userId,
+        shared_values: null,
+        process: null,
+        metadata: { membershipMode: 'invite_only' },
+        updated_at: '2026-10-07T00:00:00Z',
+      });
+
+    /** Runs `between` once, after the first read of `columns` from workspaces has answered. */
+    function afterFirstRead(columns: string, between: () => Promise<unknown>): void {
+      const from = db.from.bind(db);
+      let fired = false;
+      db.from = ((table: string) => {
+        const query = from(table);
+        if (table !== 'workspaces') return query;
+        const select = query.select.bind(query);
+        query.select = ((cols = '*') => {
+          select(cols);
+          if (cols === columns && !fired) {
+            fired = true;
+            const handle = query as unknown as { execute: () => Promise<unknown> };
+            const execute = handle.execute.bind(query);
+            handle.execute = async () => {
+              const answer = await execute();
+              await between();
+              return answer;
+            };
+          }
+          return query;
+        }) as typeof query.select;
+        return query;
+      }) as typeof db.from;
+    }
+
+    it('keeps a write that commits between the seeding’s read and its write', async () => {
+      unseeded();
+      afterFirstRead('metadata, shared_values, process, updated_at', () =>
+        new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+          metadata: { color: 'blue' },
+        })
+      );
+
+      await service.awaken(ME, REQUEST);
+
+      const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+      expect(space.metadata).toEqual({
+        membershipMode: 'invite_only',
+        color: 'blue',
+        starter: 'inkling',
+      });
+      expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    });
+
+    it('keeps the mark when the seeding commits between an update’s read and its write', async () => {
+      unseeded();
+      afterFirstRead('metadata, updated_at', () =>
+        ensureInklingStarterSet(db as never, ME.workspaceId, ME.userId)
+      );
+
+      await new WorkspacesRepository(db as never).update(ME.workspaceId, ME.userId, {
+        metadata: { color: 'blue' },
+      });
+
+      const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+      expect(space.metadata).toEqual({
+        membershipMode: 'invite_only',
+        color: 'blue',
+        starter: 'inkling',
+      });
+      expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    });
+  });
+
+  it('still wakes the inkling when the starter set can’t be written', async () => {
+    const from = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = from(table);
+      if (table === 'workspaces') {
+        (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+          data: [],
+          error: { code: 'XX000', message: 'synthetic write failure' },
+        });
+      }
+      return query;
+    }) as typeof db.from;
+
+    const { inkling, replayed } = await service.awaken(ME, REQUEST);
+
+    expect(replayed).toBe(false);
+    expect(inkling.id).toEqual(expect.any(String));
   });
 });
 
 describe('the awakening soul', () => {
-  const soul = buildInklingSoul();
+  // 5:30 PM on Oct 7 in Los Angeles, already Oct 8 in UTC.
+  const soul = buildInklingSoul(new Date('2026-10-08T00:30:00Z'));
+
+  it("is the inkling's own space, in the words of the first SBs' souls", () => {
+    expect(soul.startsWith('*This is yours. Not a template to fill: a space to grow into.*')).toBe(
+      true
+    );
+    expect(soul).toMatch(/\*\*I exist\. I am becoming\.\*\*/);
+    expect(soul).toMatch(/This document is yours\. It changes as you do\./);
+  });
+
+  it('says what it can do depends on where it runs, not on who it is (design v4)', () => {
+    expect(soul).toMatch(/\*\*What you can do depends on where you're running\.\*\*/);
+    expect(soul).toMatch(/you're an inkling either way/);
+  });
+
+  it('is the starter documents’ text, kept in one place', () => {
+    expect(soul).toBe(inklingSoul(new Date('2026-10-08T00:30:00Z')));
+    expect(INKLING_SOUL_TEMPLATE).toContain('*Awake since: {date}*');
+  });
+
+  it('says inkling, never SB', () => {
+    expect(soul).toMatch(/You're an inkling, newly awake\./);
+    expect(soul).not.toMatch(/Synthetically-born|\bSBs?\b/);
+  });
+
+  it('is dated by the UTC calendar day, and says so', () => {
+    expect(soul).toMatch(/\*Awake since: October 8, 2026 \(UTC\)\*$/);
+  });
 
   it('has no values interview and proposes no names', () => {
     expect(soul).not.toMatch(/Values Interview/i);

@@ -41,6 +41,7 @@ class LifecycleTests(unittest.TestCase):
         self.db = "supabase_db_" + self.project
         self.current = {}
         self.calls = []
+        self.command_envs = []
         self.fail_command = None
         self.suite_code = 0
         self.running_private = set()
@@ -73,6 +74,7 @@ class LifecycleTests(unittest.TestCase):
 
     def command(self, args, **kwargs):
         self.calls.append(args)
+        self.command_envs.append((list(args), dict(kwargs.get("env") or {})))
         if args[:2] == ["docker", "info"]:
             return 0
         self.assertEqual(args[0], "supabase")
@@ -111,6 +113,65 @@ class LifecycleTests(unittest.TestCase):
 
     def state(self):
         return json.loads((self.root / "cache" / self.project / "state.json").read_text())
+
+    def root_keys(self, *prefix):
+        """The SUPABASE_DB_ROOT_KEY each matching command was given."""
+        return [env.get("SUPABASE_DB_ROOT_KEY") for args, env in self.command_envs
+                if args[:len(prefix)] == list(prefix)]
+
+    def test_a_retained_stack_starts_and_resets_with_its_own_root_key(self):
+        # The operator's real key, inherited: it must never reach a test stack.
+        self.env["SUPABASE_DB_ROOT_KEY"] = "f" * 64
+        self.assertEqual(self.run_stack(), 0)
+        [started] = self.root_keys("supabase", "start")
+        [reset] = self.root_keys("supabase", "db", "reset")
+        self.assertRegex(started, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(started, "f" * 64)
+        self.assertEqual(reset, started)
+        key_file = self.root / "cache" / self.project / "root-key"
+        self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(key_file.read_text().strip(), started)
+        self.assertNotIn("SUPABASE_DB_ROOT_KEY", self.suite_env)
+        # The same stack resets with the same key, and --stop takes the key away.
+        self.assertEqual(self.run_stack("--reset"), 0)
+        self.assertEqual(self.root_keys("supabase", "db", "reset"), [started, started])
+        self.assertEqual(self.run_stack("--stop"), 0)
+        self.assertFalse(key_file.exists())
+
+    def test_a_fresh_stack_gets_a_new_root_key_that_goes_with_its_workdir(self):
+        self.env["CI"] = "true"
+        self.assertEqual(self.run_stack(), 0)
+        self.assertEqual(self.run_stack(), 0)
+        first, second = self.root_keys("supabase", "start")
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+        self.assertEqual(list(self.root.glob("ink-supabase-it-*")), [])
+
+    def test_a_malformed_or_symlinked_root_key_is_refused_before_the_stack_starts(self):
+        cache = self.root / "cache" / self.project
+        cache.mkdir(parents=True)
+        for kind in ("malformed", "symlink"):
+            key_file = cache / "root-key"
+            key_file.unlink(missing_ok=True)
+            if kind == "malformed":
+                key_file.write_text("not a key\n")
+            else:
+                (self.root / "elsewhere").write_text("a" * 64)
+                key_file.symlink_to(self.root / "elsewhere")
+            with self.subTest(kind=kind):
+                self.calls = []
+                with self.assertRaises(stack.Refusal):
+                    stack.stack_root_key(cache)
+        self.assertEqual(self.count("supabase", "start"), 0)
+
+    def test_the_root_key_is_never_said(self):
+        said = []
+        with mock.patch.object(stack, "say", side_effect=said.append):
+            self.assertEqual(self.run_stack(), 0)
+            self.assertEqual(self.run_stack("--reset"), 0)
+        [key, _] = self.root_keys("supabase", "db", "reset")
+        self.assertTrue(said)
+        self.assertFalse([line for line in said if key in line])
 
     def test_two_local_runs_start_and_reset_only_once(self):
         self.assertEqual(self.run_stack(), 0)

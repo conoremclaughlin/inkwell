@@ -7,7 +7,7 @@
 
 import type { ToolMode, ToolPolicyScopeRef, ToolPolicyState } from './tool-policy.js';
 
-export type ToolProfileId = 'minimal' | 'safe' | 'collaborative' | 'full' | 'inkling';
+export type ToolProfileId = 'minimal' | 'safe' | 'collaborative' | 'full' | 'tools' | 'inkling';
 
 export interface ToolProfile {
   label: string;
@@ -29,6 +29,44 @@ export interface ToolProfile {
    */
   withholdProviderTools?: true;
 }
+
+/**
+ * The tools execution tier (task 0321ccf1; the server's
+ * config/execution-tier.ts). The same for any SB a server runs on it. Denied
+ * outright, so no grant in the policy file can open them: the shell, which
+ * is not confined to the working directory; view_image, whose roots include
+ * the shared ~/.ink/files (Lumen, #773: another account's image was
+ * reachable); file edits and writes; trigger_agent; and send_response, which
+ * a turn answering in its own conversation thread never needs. Its reply,
+ * send_to_inbox, stays allowed: whom it may reach, and whether it wakes them,
+ * is the server's own authorization, never this profile's (an inkling's owner
+ * and thread rules are enforced there). The Pi reads (read, grep, find,
+ * ls) stay allowed too, and validatePathArgs keeps them inside the working
+ * directory: the SB's own folder, where the server runs this tier. Media a
+ * person sends reaches the turn through ink chat's own attachment encoding,
+ * not through view_image. The server also runs it against a policy file of
+ * its own, so the machine's grants are never read at all; these denials hold
+ * either way.
+ *
+ * The provider's own tools are withheld as well. Claude Code's native Read
+ * was opened for any attachment it can't show inline, a document among
+ * them, on a spawn also granted the shared ~/.ink/files and the studios
+ * root, whose checkouts carry .env.local files (lane 2, measured on
+ * a0db3e57). Its reach is Claude Code's read policy, not this folder.
+ *
+ * No allow list: one would narrow every tool to the names on it.
+ */
+const TOOLS_TIER: ToolProfile = {
+  label: 'Tools only',
+  description:
+    "The tools execution tier: no shell, no file edits or writes, no shared-image reads, no trigger_agent or send_response; send_to_inbox stays, under the server's own authorization.",
+  mode: 'backend',
+  safeSpecs: ['group:ink-safe'],
+  allowSpecs: [],
+  promptSpecs: [],
+  denySpecs: ['group:write', 'view_image', 'trigger_agent', 'send_response'],
+  withholdProviderTools: true,
+};
 
 export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
   minimal: {
@@ -67,42 +105,22 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
     promptSpecs: [],
     denySpecs: [],
   },
+  tools: TOOLS_TIER,
   /**
-   * An inkling's own turn (task 0321ccf1). Denied outright, so no grant in
-   * the policy file can open them: the shell, which is not confined to the
-   * working directory; view_image, whose roots include the shared
-   * ~/.ink/files (Lumen, #773: another account's image was reachable);
-   * file edits and writes; waking another agent; and send_response, which
-   * an inkling, answering in its conversation thread, never needs. Its
-   * reply, send_to_inbox, stays allowed, as do the Pi reads (read, grep,
-   * find, ls), which validatePathArgs keeps inside its own folder. Media a
-   * person sends reaches the turn through ink chat's own attachment
-   * encoding, not through view_image. The server also runs it against a
-   * policy file of its own, so the machine's grants are never read at all;
-   * these denials hold either way.
-   *
-   * The provider's own tools are withheld as well. Claude Code's native Read
-   * was opened for any attachment it can't show inline, a document among
-   * them, on a spawn also granted the shared ~/.ink/files and the studios
-   * root, whose checkouts carry .env.local files (lane 2, measured on
-   * a0db3e57). Its reach is Claude Code's read policy, not this folder.
-   *
-   * No allow list: one would narrow every tool to the names on it.
+   * The tools tier's former name, kept for one release so a server built
+   * before the rename, which names it, still gets the same bounds.
    */
-  inkling: {
-    label: 'Inkling',
-    description:
-      "An inkling's turn: no shell, no file edits or writes, no shared-image reads, never wakes another agent; it replies in its own conversation.",
-    mode: 'backend',
-    safeSpecs: ['group:ink-safe'],
-    allowSpecs: [],
-    promptSpecs: [],
-    denySpecs: ['group:write', 'view_image', 'trigger_agent', 'send_response'],
-    withholdProviderTools: true,
-  },
+  inkling: TOOLS_TIER,
 };
 
-export const PROFILE_IDS: ToolProfileId[] = ['minimal', 'safe', 'collaborative', 'full', 'inkling'];
+export const PROFILE_IDS: ToolProfileId[] = [
+  'minimal',
+  'safe',
+  'collaborative',
+  'full',
+  'tools',
+  'inkling',
+];
 
 export function isValidProfileId(id: string): id is ToolProfileId {
   return PROFILE_IDS.includes(id as ToolProfileId);

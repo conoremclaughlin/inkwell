@@ -141,6 +141,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   db = createInklingDb();
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+  // The cap the fixture was written for (DEFAULT_AWAKEN_CAP), whatever the
+  // checkout's .env.local sets: a server configured for 5 answered the third
+  // awakening 201, and this test read that as the contract breaking.
+  vi.stubEnv('INKLING_AWAKEN_CAP', '2');
   // The send handler's stand-in: store, then report one recipient stamped and woken.
   mockHandleSendToInbox.mockImplementation(
     async (

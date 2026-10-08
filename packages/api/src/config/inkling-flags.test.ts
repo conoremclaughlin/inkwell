@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AWAKEN_CAP,
+  inklingAccountToolAllowlist,
   inklingAwakenCap,
   inklingOwnerTestAllowlist,
   inklingOwnerTestUserIds,
@@ -103,5 +104,32 @@ describe('inklingAwakenCap', () => {
     for (const raw of ['0', '-3', '2.5', 'many', 'Infinity']) {
       expect(inklingAwakenCap({ INKLING_AWAKEN_CAP: raw })).toBe(2);
     }
+  });
+});
+
+describe('inklingAccountToolAllowlist', () => {
+  it('is none when INK_INKLING_ACCOUNT_TOOLS is unset or blank', () => {
+    expect(inklingAccountToolAllowlist({}).tools.size).toBe(0);
+    expect(inklingAccountToolAllowlist({ INK_INKLING_ACCOUNT_TOOLS: ' , ' }).tools.size).toBe(0);
+  });
+
+  it('names exactly the tools listed', () => {
+    const { tools, malformed } = inklingAccountToolAllowlist({
+      INK_INKLING_ACCOUNT_TOOLS: ' list_email_labels , list_calendar_events',
+    });
+    expect([...tools].sort()).toEqual(['list_calendar_events', 'list_email_labels']);
+    expect(malformed).toEqual([]);
+  });
+
+  it('has no wildcard, and leaves out what is not a tool name, saying where', () => {
+    const { tools, malformed } = inklingAccountToolAllowlist({
+      INK_INKLING_ACCOUNT_TOOLS: '*,list_emails,Send_Email,send email,get_email',
+    });
+    expect([...tools].sort()).toEqual(['get_email', 'list_emails']);
+    expect(malformed).toEqual([
+      'INK_INKLING_ACCOUNT_TOOLS entry 1',
+      'INK_INKLING_ACCOUNT_TOOLS entry 3',
+      'INK_INKLING_ACCOUNT_TOOLS entry 4',
+    ]);
   });
 });

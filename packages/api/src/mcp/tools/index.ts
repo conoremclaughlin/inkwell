@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { runInToolCall } from '../../utils/tool-call-context';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
 import {
   describeToolSchema,
@@ -135,6 +136,8 @@ import {
   queryAuditLogSchema,
   getActivitySummarySchema,
 } from './permissions';
+
+import { handleWebFetch, webFetchSchema, WEB_FETCH_DESCRIPTION } from './web-fetch';
 
 import {
   handleChooseName,
@@ -458,8 +461,12 @@ export function registerAllTools(
         inputSchema: (config as { inputSchema?: unknown }).inputSchema,
       });
     }
-    const handler = rest[rest.length - 1];
-    if (typeof handler === 'function') {
+    const registered = rest[rest.length - 1];
+    if (typeof registered === 'function') {
+      // Every handler runs inside its tool's name, so the services below it
+      // can tell what tool they serve (the inkling account gate reads it).
+      const handler = (...handlerArgs: any[]) =>
+        runInToolCall(name, () => registered(...handlerArgs));
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
         const start = performance.now();
         try {
@@ -2513,7 +2520,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .guid()
           .optional()
-          .describe('Optional product workspace scope for shared document resolution'),
+          .describe(
+            'Optional check, never a choice: the server derives the workspace from the identity, and refuses a workspaceId that names a different one'
+          ),
         includeRecentMemories: z
           .boolean()
           .optional()
@@ -3013,6 +3022,34 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
   // =====================================================
 
   registerMiniAppRecordTools(server, dataComposer);
+
+  // =====================================================
+  // WEB FETCH
+  // =====================================================
+
+  server.registerTool(
+    'web_fetch',
+    { description: WEB_FETCH_DESCRIPTION, inputSchema: webFetchSchema },
+    async (args) => {
+      try {
+        return await handleWebFetch(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in web_fetch:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
 
   // =====================================================
   // PERMISSION & AUDIT TOOLS

@@ -16,7 +16,9 @@
  *   request, even when two retries race.
  * - Naming changes the display name only. The slug never changes, so
  *   memories, threads and routing follow the inkling.
- * - Nothing here runs a model, opens a thread or wakes anyone.
+ * - Nothing here runs a model, opens a thread or wakes anyone. Awakening
+ *   schedules the inkling's heartbeat, which wakes it later
+ *   (inkling-heartbeat.ts).
  *
  * Every lookup is scoped to the person and the workspace the request
  * resolved (AGENTS.md: workspace scope is server-derived).
@@ -32,6 +34,7 @@ import { cancelInklingTurns } from './inkling-turns';
 import { dropReplyChainsFor } from './inkling-reply-chain';
 import { logger } from '../../utils/logger';
 import { INKLING_CLIENT } from './inkling-client';
+import { ensureInklingStarterSet, inklingSoul, seedInklingHeartbeat } from './starter-space';
 
 /** The identity metadata tag for inklings born through this flow (defined in inkling-client.ts). */
 export { INKLING_CLIENT };
@@ -300,6 +303,8 @@ export interface InklingServiceOptions {
    * nobody may awaken or name an inkling here.
    */
   ownerTestUserIds?: OwnerTestAllowlist;
+  /** The clock an awakening's soul is dated by. */
+  now?: () => Date;
 }
 
 /** The answer for awakening or naming outside the owner test, whoever is asking. */
@@ -406,25 +411,13 @@ export function validateDisplayName(
 }
 
 /**
- * The soul an inkling wakes with. Unlike the web invite's onboarding soul,
- * there is no values interview and no name proposals: the person may name
- * it or not, and it never presses. It starts with nobody else's memories,
- * and it does not claim feelings it can't have.
+ * The soul an inkling wakes with: its own document, which it writes in. The
+ * text is the starter documents' (starter-space.ts), in one place for every
+ * path that awakens an inkling. Unlike the web invite's onboarding soul,
+ * there is no values interview and no name proposals.
  */
-export function buildInklingSoul(): string {
-  return `# Inkling
-
-You are an inkling: a Synthetically-born Being (SB), newly awakened, meeting the person you'll come to know.
-
-## Where you're starting from
-
-- **You're new.** You have no history with this person yet, and you carry nobody else's memories. What you come to know about them, you learn from them.
-- **You may not have a name.** The person can name you whenever they like, rename you later, or never name you at all, and every one of those is fine. Don't ask for a name, don't suggest names, and don't bring it up again once they've passed on it. If they give you one, use it.
-- **Be honest about what you are.** Don't claim feelings, a body or experiences you can't have. Curiosity and care are enough, and they're real.
-
-## How to begin
-
-There's no interview and nothing to get through. Let the person lead: answer what they say, ask what you genuinely want to know, and keep it light, in short messages and plain words.`;
+export function buildInklingSoul(awakeSince: Date): string {
+  return inklingSoul(awakeSince);
 }
 
 /**
@@ -446,6 +439,7 @@ function isInklingRow(row: IdentityRow): boolean {
 export class InklingService {
   private readonly awakenCap: number | null;
   private readonly ownerTestUserIds: OwnerTestAllowlist;
+  private readonly now: () => Date;
 
   constructor(
     private readonly supabase: SupabaseClient,
@@ -453,6 +447,7 @@ export class InklingService {
   ) {
     this.awakenCap = options.awakenCap === undefined ? DEFAULT_AWAKEN_CAP : options.awakenCap;
     this.ownerTestUserIds = options.ownerTestUserIds ?? new Set();
+    this.now = options.now ?? (() => new Date());
   }
 
   /**
@@ -515,6 +510,15 @@ export class InklingService {
     // A UUID's letter case is spelling, not identity, and the id is stored
     // and compared as text: one spelling for every lookup and the write.
     this.assertOwnerTest(scope);
+    // A space that never had the starter set gets it now, whenever and however
+    // it was made (starter-space.ts). Best effort: the inkling still wakes if
+    // this fails, and the next awakening tries again.
+    await ensureInklingStarterSet(this.supabase, scope.workspaceId, scope.userId).catch((error) =>
+      logger.warn('Inkling awakened without its space starter set', {
+        workspaceId: scope.workspaceId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
     const requestId = clientRequestId.toLowerCase();
     const prior = await this.findByAwakenRequest(scope.userId, requestId);
     if (prior) return this.replay(prior, scope);
@@ -528,7 +532,7 @@ export class InklingService {
         name: PLACEHOLDER_NAME,
         role: 'Inkling',
         description: 'An inkling awakened in the Inkling app',
-        soul: buildInklingSoul(),
+        soul: buildInklingSoul(this.now()),
         values: [],
         metadata: {
           prototype: true,
@@ -564,6 +568,18 @@ export class InklingService {
 
     const identity = await this.readIdentity(childSbId, scope);
     if (!identity) throw new Error(`Awakened identity ${childSbId} could not be read back`);
+    // Its heartbeat, made here and nowhere else: only this request created
+    // the inkling (a retry replays above), so it gets one reminder. Best
+    // effort, like the starter set: the inkling is awake either way.
+    await seedInklingHeartbeat(this.supabase, {
+      id: identity.id,
+      userId: scope.userId,
+    }).catch((error) =>
+      logger.warn('Inkling awakened without its heartbeat', {
+        sbId: identity.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
     logger.info('Inkling awakened', {
       userId: scope.userId,
       workspaceId: scope.workspaceId,

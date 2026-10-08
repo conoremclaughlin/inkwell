@@ -1,0 +1,375 @@
+/**
+ * Which workspace's shared documents bootstrap hands an identity, against a
+ * filter-evaluating fake database (no network, no real DB).
+ *
+ * Lumen's review of #781 found two ways an identity was still handed another
+ * workspace's documents after bootstrap adopted context-builder's rule: a
+ * same-named identity in a second workspace made the slug lookup fail and the
+ * rule fall back to the oldest personal workspace, and a workspace with no
+ * process took the unscoped ~/.ink copy. These pin both, plus the cases on
+ * either side of them. The probe this follows is Lumen's.
+ *
+ * Lumen's review of #784 found a third: once the documents were read for any
+ * member, an explicit workspaceId could take an identity into another group
+ * its person belongs to, or past a withheld identity.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { DataComposer } from '../../data/composer';
+import { FakePostgrest } from '../../test/fake-postgrest';
+import {
+  clearPinnedAgent,
+  clearSessionContext,
+  runWithRequestContext,
+} from '../../utils/request-context';
+
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock('../../skills/cloud-service', () => ({
+  getCloudSkillsService: () => ({ loadUserSkills: async () => [] }),
+}));
+
+import { handleBootstrap } from './memory-handlers';
+
+const USER = '11111111-1111-4111-8111-111111111111';
+const PERSONAL = '22222222-2222-4222-8222-222222222222';
+const SPACE = '33333333-3333-4333-8333-333333333333';
+const SB = '44444444-4444-4444-8444-444444444444';
+const PEER = '55555555-5555-4555-8555-555555555555';
+
+let db: FakePostgrest;
+let dc: DataComposer;
+let base: string;
+
+interface Docs {
+  values: string | null;
+  process: string | null;
+  user: string | null;
+  soul: string | null;
+}
+
+beforeEach(async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(() => {
+      throw new Error('No network in this test');
+    })
+  );
+  base = await mkdtemp(join(tmpdir(), 'bootstrap-scope-'));
+  db = new FakePostgrest();
+  db.seed('users', { id: USER, timezone: 'America/Los_Angeles' });
+  db.seed('workspaces', {
+    id: PERSONAL,
+    user_id: USER,
+    type: 'personal',
+    slug: 'personal',
+    archived_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    shared_values: 'PERSONAL-VALUES',
+    process: 'PERSONAL-PROCESS',
+  });
+  db.seed('workspaces', {
+    id: SPACE,
+    user_id: USER,
+    type: 'personal',
+    slug: 'space',
+    archived_at: null,
+    created_at: '2026-10-01T00:00:00Z',
+    shared_values: 'SPACE-VALUES',
+    process: null,
+  });
+  for (const id of [PERSONAL, SPACE]) {
+    db.seed('workspace_members', { workspace_id: id, user_id: USER, role: 'owner' });
+  }
+  db.seed('agent_identities', {
+    id: SB,
+    user_id: USER,
+    workspace_id: SPACE,
+    agent_id: 'probe',
+    name: 'Probe',
+    role: 'Synthetic fixture',
+    soul: 'SPACE-SOUL',
+  });
+  db.seed('user_identity', {
+    user_id: USER,
+    workspace_id: PERSONAL,
+    user_profile_md: 'PERSONAL-ABOUT',
+  });
+  db.seed('user_identity', { user_id: USER, workspace_id: SPACE, user_profile_md: 'SPACE-ABOUT' });
+  dc = {
+    getClient: () => db,
+    repositories: {
+      users: { findById: async () => db.rows('users')[0] },
+      projects: { findAllByWorkspace: async () => [] },
+      sessionFocus: { findLatestByUser: async () => null },
+      memory: { getActiveSessions: async () => [] },
+    },
+  } as unknown as DataComposer;
+});
+
+afterEach(async () => {
+  clearPinnedAgent();
+  clearSessionContext();
+  vi.unstubAllGlobals();
+  await rm(base, { recursive: true, force: true });
+});
+
+async function bootstrap(
+  context: { sbId?: string; sbSlug?: string },
+  sbSlug = 'probe',
+  args: { workspaceId?: string } = {}
+) {
+  const result = await runWithRequestContext({ userId: USER, ...context }, () =>
+    handleBootstrap(
+      { userId: USER, sbSlug, identityBasePath: base, includeRecentMemories: false, ...args },
+      dc
+    )
+  );
+  return JSON.parse(result.content[0].text) as { identityFiles: Docs };
+}
+
+async function writeSharedFiles(): Promise<void> {
+  await mkdir(join(base, 'shared'));
+  await writeFile(join(base, 'shared', 'VALUES.md'), 'UNSCOPED-FILE-VALUES');
+  await writeFile(join(base, 'shared', 'PROCESS.md'), 'UNSCOPED-FILE-PROCESS');
+  await writeFile(join(base, 'shared', 'USER.md'), 'UNSCOPED-FILE-USER');
+}
+
+describe('bootstrap shared documents', () => {
+  it("control: a bound identity gets its own workspace's documents", async () => {
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+    expect(identityFiles).toMatchObject({
+      values: 'SPACE-VALUES',
+      process: null,
+      user: 'SPACE-ABOUT',
+      soul: 'SPACE-SOUL',
+    });
+  });
+
+  it('a bound identity keeps its own workspace when another workspace has the same slug', async () => {
+    db.seed('agent_identities', {
+      id: PEER,
+      user_id: USER,
+      workspace_id: PERSONAL,
+      agent_id: 'probe',
+      name: 'Peer',
+      soul: 'PEER-SOUL',
+    });
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect(identityFiles).toMatchObject({
+      values: 'SPACE-VALUES',
+      process: null,
+      user: 'SPACE-ABOUT',
+      soul: 'SPACE-SOUL',
+    });
+  });
+
+  it('an unbound slug that names identities in two workspaces is given neither', async () => {
+    db.seed('agent_identities', {
+      id: PEER,
+      user_id: USER,
+      workspace_id: PERSONAL,
+      agent_id: 'probe',
+      name: 'Peer',
+      soul: 'PEER-SOUL',
+    });
+    await writeSharedFiles();
+
+    const { identityFiles } = await bootstrap({});
+
+    expect(identityFiles.values).toBeNull();
+    expect(identityFiles.process).toBeNull();
+    expect(identityFiles.user).toBeNull();
+    expect(identityFiles.soul).not.toBe('PEER-SOUL');
+  });
+
+  it('a workspace without a process is not filled from the unscoped ~/.ink copies', async () => {
+    await writeSharedFiles();
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect(identityFiles.process).toBeNull();
+    expect(identityFiles.values).toBe('SPACE-VALUES');
+    expect(identityFiles.user).toBe('SPACE-ABOUT');
+  });
+
+  it('a workspace with no documents at all is given none, from the files or anywhere else', async () => {
+    const space = db.rows('workspaces').find((row) => row.id === SPACE)!;
+    space.shared_values = null;
+    const about = db.rows('user_identity').find((row) => row.workspace_id === SPACE)!;
+    about.user_profile_md = null;
+    db.seed('user_identity', {
+      user_id: USER,
+      workspace_id: null,
+      user_profile_md: 'UNSCOPED-ROW-USER',
+      shared_values_md: 'UNSCOPED-ROW-VALUES',
+      process_md: 'UNSCOPED-ROW-PROCESS',
+    });
+    await writeSharedFiles();
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect(identityFiles.values).toBeNull();
+    expect(identityFiles.process).toBeNull();
+    expect(identityFiles.user).toBeNull();
+  });
+
+  it('carries the SB’s own values and relationships in its identity document, not the shared values', async () => {
+    const sb = db.rows('agent_identities').find((row) => row.id === SB)!;
+    sb.description = 'PROBE-DESCRIPTION';
+    sb.values = ['OWN-VALUE'];
+    sb.relationships = { wren: 'OWN-RELATIONSHIP' };
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+    const self = (identityFiles as Docs & { self: string | null }).self;
+
+    expect(self).toBe(
+      'PROBE-DESCRIPTION\n\n## My values\n\n- OWN-VALUE\n\n## My relationships\n\n- **wren:** OWN-RELATIONSHIP'
+    );
+    expect(identityFiles.values).toBe('SPACE-VALUES');
+  });
+
+  it('appends own values to a local IDENTITY.md when the record has no description, never replacing it', async () => {
+    const sb = db.rows('agent_identities').find((row) => row.id === SB)!;
+    sb.description = null;
+    sb.values = ['OWN-VALUE'];
+    await mkdir(join(base, 'individuals', 'probe'), { recursive: true });
+    await writeFile(join(base, 'individuals', 'probe', 'IDENTITY.md'), 'LOCAL-IDENTITY-TEXT');
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect((identityFiles as Docs & { self: string | null }).self).toBe(
+      'LOCAL-IDENTITY-TEXT\n\n## My values\n\n- OWN-VALUE'
+    );
+  });
+
+  it('withholds the documents of a bound identity that is gone, and puts no same-named peer in its place', async () => {
+    db.rows('agent_identities').splice(0);
+    db.seed('agent_identities', {
+      id: PEER,
+      user_id: USER,
+      workspace_id: PERSONAL,
+      agent_id: 'probe',
+      name: 'Peer',
+      soul: 'PEER-SOUL',
+    });
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect(identityFiles.soul).not.toBe('PEER-SOUL');
+    expect(identityFiles.values).toBeNull();
+    expect(identityFiles.process).toBeNull();
+    expect(identityFiles.user).toBeNull();
+  });
+
+  describe('a failed identity read', () => {
+    /** Fails bootstrap's full identity reads; every other read still answers. */
+    function faultIdentityReads(): void {
+      const from = db.from.bind(db);
+      db.from = ((table: string) => {
+        const query = from(table);
+        const select = query.select.bind(query);
+        query.select = ((columns = '*') => {
+          select(columns);
+          if (table === 'agent_identities' && columns === '*') {
+            (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+              data: [],
+              error: { code: 'XX000', message: 'synthetic identity read failure' },
+            });
+          }
+          return query;
+        }) as typeof query.select;
+        return query;
+      }) as typeof db.from;
+    }
+
+    it('refuses a bound bootstrap rather than falling back to the personal workspace', async () => {
+      faultIdentityReads();
+      await expect(bootstrap({ sbId: SB, sbSlug: 'probe' })).rejects.toThrow(
+        /Failed to read the bound identity/
+      );
+    });
+
+    it('refuses an unbound bootstrap rather than falling back to the personal workspace', async () => {
+      faultIdentityReads();
+      await expect(bootstrap({})).rejects.toThrow(/Failed to resolve identity probe/);
+    });
+  });
+
+  it('gives a member of a space someone else owns that space’s values, and nobody outside it', async () => {
+    const OTHER_OWNER = '66666666-6666-4666-8666-666666666666';
+    const space = db.rows('workspaces').find((row) => row.id === SPACE)!;
+    space.user_id = OTHER_OWNER;
+    const member = db.rows('workspace_members').find((row) => row.workspace_id === SPACE)!;
+    member.role = 'member';
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+    expect(identityFiles.values).toBe('SPACE-VALUES');
+    expect(identityFiles.user).toBe('SPACE-ABOUT');
+
+    // Outside it, bootstrap refuses before any document is read: the caller's
+    // workspace check (resolveCallerWorkspace) already requires membership.
+    db.rows('workspace_members').splice(db.rows('workspace_members').indexOf(member), 1);
+    await expect(bootstrap({ sbId: SB, sbSlug: 'probe' })).rejects.toThrow(/not a member/);
+  });
+
+  describe('an explicit workspaceId', () => {
+    const OTHER_GROUP = '77777777-7777-4777-8777-777777777777';
+
+    /** A group someone else owns, with the person as a member. */
+    function seedOtherGroup(): void {
+      db.seed('workspaces', {
+        id: OTHER_GROUP,
+        user_id: '66666666-6666-4666-8666-666666666666',
+        type: 'team',
+        archived_at: null,
+        shared_values: 'OTHER-GROUP-VALUES',
+        process: 'OTHER-GROUP-PROCESS',
+      });
+      db.seed('workspace_members', { workspace_id: OTHER_GROUP, user_id: USER, role: 'member' });
+    }
+
+    // Lumen's probe on #784.
+    it('cannot take a bound identity into another group its person belongs to', async () => {
+      seedOtherGroup();
+
+      await expect(
+        bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', { workspaceId: OTHER_GROUP })
+      ).rejects.toThrow(/this identity's documents come from/);
+    });
+
+    it('cannot reach past a withheld identity to the personal workspace', async () => {
+      db.rows('agent_identities').splice(0);
+
+      await expect(
+        bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', { workspaceId: PERSONAL })
+      ).rejects.toThrow(/given no workspace documents/);
+    });
+
+    it("control: naming the identity's own workspace is accepted and changes nothing", async () => {
+      seedOtherGroup();
+
+      const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' }, 'probe', {
+        workspaceId: SPACE,
+      });
+
+      expect(identityFiles).toMatchObject({
+        values: 'SPACE-VALUES',
+        process: null,
+        user: 'SPACE-ABOUT',
+      });
+    });
+  });
+
+  it("refuses a token bound to one identity when bootstrap names another's slug", async () => {
+    await expect(bootstrap({ sbId: SB }, 'someone-else')).rejects.toThrow(
+      /Agent identity mismatch/
+    );
+  });
+});

@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${INK_ENV_FILE:-${ROOT_DIR}/.env.local}"
+# shellcheck source=lib/supabase-root-key.sh
+source "${ROOT_DIR}/scripts/lib/supabase-root-key.sh"
 
 require_cmd() {
   local cmd="$1"
@@ -72,6 +74,9 @@ if [[ ! -f "${ENV_FILE}" ]]; then
     echo "[supabase-setup] Created empty ${ENV_FILE}"
   fi
 fi
+
+# Vault's root key for this stack (supabase/config.toml, [db] root_key).
+load_supabase_root_key || exit 1
 
 echo "[supabase-setup] Starting local Supabase..."
 supabase start --workdir "${ROOT_DIR}" >/dev/null

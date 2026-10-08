@@ -339,6 +339,15 @@ export interface SessionRequest {
    * SessionTurnHooks.
    */
   turnHooks?: SessionTurnHooks;
+
+  /**
+   * An inkling's own heartbeat firing: the reminder it fires for. Set by the
+   * reminder delivery alone (inkling-heartbeat.ts), in this process; never
+   * metadata, which other paths fill from what a caller sent. The inkling
+   * turn gate still reads the stored reminder and conversation before it
+   * admits the turn (isOwnersHeartbeat).
+   */
+  inklingHeartbeat?: { reminderId: string };
 }
 
 /**
@@ -911,12 +920,19 @@ export interface ClaudeRunnerConfig {
    */
   inkProvider?: InkProvider;
   /**
-   * An inkling's turn only: the tool-policy file `ink chat` reads instead of
-   * the machine's (INK_TOOL_POLICY_PATH), with the `inkling` profile in place
-   * of `safe`, which denies the shell, file writes, waking another agent and
-   * send_response (task 0321ccf1). Unset for every other spawn.
+   * The execution tier this server's configuration gives the turn
+   * (config/execution-tier.ts). InkRunner runs `tools` under the `tools`
+   * profile, against `toolPolicyPath`, with no provider tools; `full`, or
+   * unset, under `safe`. Other runners never receive `tools`: the session
+   * service refuses that turn before it spawns.
    */
-  inklingToolPolicyPath?: string;
+  executionTier?: 'tools' | 'full';
+  /**
+   * The tools tier only: the tool-policy file `ink chat` reads instead of the
+   * machine's (INK_TOOL_POLICY_PATH), so this machine's grants never reach
+   * the turn (task 0321ccf1).
+   */
+  toolPolicyPath?: string;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts

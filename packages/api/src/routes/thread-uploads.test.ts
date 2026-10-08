@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createHash, randomUUID } from 'crypto';
+import { EventEmitter } from 'events';
 import { chmodSync, existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -27,6 +28,7 @@ import { prepareUploadsRoot, uploadDirPath, uploadFilePath } from '../services/u
 import { removeUploadBytes, writeUploadFile } from '../services/uploads/files';
 import { claimRowsFor } from '../services/uploads/claims';
 import { ACCOUNT_SLOTS, GLOBAL_SLOTS, PENDING_SLOTS } from '../services/uploads/slots';
+import { accountGate, spaceGate } from '../services/account-deletion/gate';
 
 const ADA = '0a0a0a0a-0000-4000-8000-0000000000aa';
 const SAM = '0b0b0b0b-0000-4000-8000-0000000000bb';
@@ -127,10 +129,13 @@ function call(
     query?: Row;
     params?: Row;
     body?: unknown;
+    /** The response, so a test can close it while the handler runs. */
+    onResponse?: (res: EventEmitter) => void;
   }
 ): Promise<Sent> {
   const sent: Sent = { status: 0, body: undefined, headers: {} };
-  const res = {
+  // A real response is an event emitter: a request's lease ends on 'close'.
+  const res = Object.assign(new EventEmitter(), {
     headersSent: false,
     status(code: number) {
       sent.status = code;
@@ -150,7 +155,8 @@ function call(
       this.headersSent = true;
       return this;
     },
-  };
+  });
+  input.onResponse?.(res);
   const req = {
     inkUserId: input.userId ?? ADA,
     inkWorkspaceId: input.workspaceId ?? WS,
@@ -306,6 +312,68 @@ describe('POST /threads/uploads', () => {
   });
 });
 
+describe('POST /threads/uploads while its account or space is being deleted', () => {
+  afterEach(() => {
+    accountGate.forget(ADA);
+    spaceGate.forget(WS);
+  });
+
+  it('refuses with 409, storing nothing, once either gate is closed', async () => {
+    accountGate.close(ADA);
+    expect((await upload()).status).toBe(409);
+    accountGate.forget(ADA);
+    spaceGate.close(WS);
+    expect((await upload()).status).toBe(409);
+    expect(db.rows('thread_uploads')).toHaveLength(0);
+    expect(accountGate.inFlightCount(ADA)).toBe(0);
+    expect(spaceGate.inFlightCount(WS)).toBe(0);
+  });
+
+  it('holds both gates through its last filesystem step, though its response closed first (Lumen, #783)', async () => {
+    let reached!: () => void;
+    let resume!: () => void;
+    const atWrite = new Promise<void>((r) => (reached = r));
+    const held = new Promise<void>((r) => (resume = r));
+    const write: typeof writeUploadFile = async (...args) => {
+      reached();
+      await held;
+      return writeUploadFile(...args);
+    };
+    let response!: EventEmitter;
+    const running = call(
+      postUpload,
+      deps({ files: { write, read: vi.fn(), remove: removeUploadBytes } }),
+      {
+        body: JPEG,
+        onResponse: (r) => (response = r),
+      }
+    );
+    await atWrite;
+    accountGate.close(ADA);
+    spaceGate.close(WS);
+    // The client goes away before a byte is written.
+    response.emit('close');
+    expect(await accountGate.waitDrained(ADA, 5)).toBe(false);
+    expect(await spaceGate.waitDrained(WS, 5)).toBe(false);
+
+    resume();
+    expect((await running).status).toBe(201);
+    expect(await accountGate.waitDrained(ADA, 5)).toBe(true);
+    expect(await spaceGate.waitDrained(WS, 5)).toBe(true);
+  });
+
+  it('releases both gates when the upload fails', async () => {
+    const write: typeof writeUploadFile = async () => {
+      throw new Error('disk gone');
+    };
+    await expect(
+      upload(JPEG, { files: { write, read: vi.fn(), remove: removeUploadBytes } })
+    ).rejects.toThrow('disk gone');
+    expect(accountGate.inFlightCount(ADA)).toBe(0);
+    expect(spaceGate.inFlightCount(WS)).toBe(0);
+  });
+});
+
 describe('GET /threads/uploads/:id', () => {
   const get = (
     id: string,
@@ -414,6 +482,10 @@ describe('threadUploadsRouter', () => {
     ) => void;
     const sent: Sent = { status: 0, body: undefined, headers: {} };
     const res = {
+      // A real response is an event emitter; the account lease listens for 'close'.
+      once() {
+        return this;
+      },
       status(code: number) {
         sent.status = code;
         return this;

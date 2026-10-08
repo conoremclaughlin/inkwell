@@ -24,6 +24,7 @@ import {
   type LoadedMiniApp,
 } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
+import { jsonBodyErrors } from '../routes/json-body-errors';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
@@ -45,6 +46,10 @@ import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { getHeartbeatTickHealth } from '../services/heartbeat';
 import { InkAuthProvider } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
+import {
+  ACCOUNT_BEING_DELETED,
+  leaseAccountForRequest,
+} from '../services/account-deletion/request-lease';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -513,6 +518,22 @@ export class MCPServer {
         return;
       }
 
+      // An account being deleted takes no new requests, and one admitted
+      // before the close holds its gate until its response has closed
+      // (ink://specs/account-deletion §3).
+      if (
+        userData &&
+        !leaseAccountForRequest(res, userData.userId, (r) =>
+          r.status(403).json({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: ACCOUNT_BEING_DELETED },
+            id: null,
+          })
+        )
+      ) {
+        return;
+      }
+
       // Use request-scoped context (AsyncLocalStorage) instead of global state
       // to prevent identity leaking across concurrent stateless requests.
       const ctx = userData
@@ -895,6 +916,7 @@ export class MCPServer {
         });
         return;
       }
+      if (!leaseAccountForRequest(res, userData.userId)) return;
 
       const requestedSlug =
         typeof req.body?.sbSlug === 'string' ? req.body.sbSlug.trim().toLowerCase() : '';
@@ -1036,6 +1058,8 @@ export class MCPServer {
     // Admin & Agent routes
     // ============================================================================
     app.use(express.json());
+    // A body no parser could read answers 4xx without repeating it (routes/json-body-errors.ts).
+    app.use(jsonBodyErrors);
     app.use(requireCookieCsrfHeader);
     app.use(cookieParser());
     app.use('/api/admin', adminRouter);

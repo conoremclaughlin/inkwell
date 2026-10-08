@@ -144,6 +144,28 @@ describe('formatInjectedContext — constitution', () => {
     expect(out).not.toContain('## Values');
     expect(out).not.toContain('## Process');
     expect(out).not.toContain('## About Your Human');
+    expect(out).not.toContain('## My values');
+    expect(out).not.toContain('## My relationships');
+  });
+
+  it("renders the SB's own values and relationships, once, and leaves them to bootstrap when it is called", () => {
+    const ctx = baseContext({
+      agent: {
+        ...baseContext().agent,
+        values: ['OWN-VALUE'],
+        relationships: { wren: 'OWN-RELATIONSHIP' },
+      },
+      constitution: { values: 'SHARED-VALUES' },
+    });
+
+    const out = formatInjectedContext(ctx);
+    expect(out).toContain('## My values\n\n- OWN-VALUE');
+    expect(out).toContain('## My relationships\n\n- **wren:** OWN-RELATIONSHIP');
+    expect(out.match(/OWN-VALUE/g)).toHaveLength(1);
+
+    const selfHydrating = formatInjectedContext(ctx, { childCallsBootstrap: true });
+    expect(selfHydrating).not.toContain('OWN-VALUE');
+    expect(selfHydrating).not.toContain('OWN-RELATIONSHIP');
   });
 });
 
@@ -172,6 +194,7 @@ describe('ContextBuilder.buildContext — constitution', () => {
       contacts: [],
       memories: [],
       projects: [],
+      workspace_members: [{ workspace_id: 'ws-1', user_id: USER_ID, role: 'owner' }],
       workspaces: [
         {
           id: 'ws-1',
@@ -530,6 +553,10 @@ describe('ContextBuilder.buildContext — workspace scoping', () => {
       contacts: [],
       memories: [],
       projects: [],
+      workspace_members: [
+        { workspace_id: 'ws-personal', user_id: USER_ID, role: 'owner' },
+        { workspace_id: 'ws-team', user_id: USER_ID, role: 'owner' },
+      ],
       workspaces: [
         {
           id: 'ws-personal',
@@ -576,5 +603,146 @@ describe('ContextBuilder.buildContext — workspace scoping', () => {
     expect(ctx.constitution?.process).toBe('TEAM-PROCESS');
     // The personal row was updated more recently — an unscoped query picks it.
     expect(ctx.constitution?.user).toBe('TEAM-USER-DOC');
+  });
+});
+
+describe("ContextBuilder.buildContext — an SB's own values follow its canonical owner", () => {
+  const OWN = '22222222-2222-4222-8222-222222222222';
+  const PEER = '33333333-3333-4333-8333-333333333333';
+  const MISSING = '44444444-4444-4444-8444-444444444444';
+
+  /** Two same-slug identities; the peer was updated more recently, so a slug fallback picks it. */
+  async function prompt(sbId: string | undefined): Promise<string> {
+    const supabase = makeFakeSupabase({
+      agent_identities: [
+        {
+          id: OWN,
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          workspace_id: 'ws-own',
+          values: ['OWN-VALUE'],
+          capabilities: [],
+          relationships: { wren: 'OWN-RELATIONSHIP' },
+          updated_at: '2026-10-01T00:00:00Z',
+        },
+        {
+          id: PEER,
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          workspace_id: 'ws-peer',
+          values: ['PEER-VALUE'],
+          capabilities: [],
+          relationships: { other: 'PEER-PRIVATE-RELATIONSHIP' },
+          updated_at: '2026-10-02T00:00:00Z',
+        },
+      ],
+      users: [{ id: USER_ID, timezone: 'UTC', preferences: {} }],
+      contacts: [],
+      memories: [],
+      projects: [],
+      workspaces: [],
+      user_identity: [],
+    });
+    const ctx = await new ContextBuilder(supabase).buildContext(
+      USER_ID,
+      'aster',
+      makeSession({ sbId })
+    );
+    return formatInjectedContext(ctx);
+  }
+
+  it('control: the session’s own identity shows its values and relationships', async () => {
+    const out = await prompt(OWN);
+    expect(out).toContain('OWN-VALUE');
+    expect(out).toContain('OWN-RELATIONSHIP');
+    expect(out).not.toContain('PEER-PRIVATE-RELATIONSHIP');
+  });
+
+  it('shows no peer’s values when the session’s identity is missing', async () => {
+    const out = await prompt(MISSING);
+    expect(out).not.toContain('PEER-VALUE');
+    expect(out).not.toContain('PEER-PRIVATE-RELATIONSHIP');
+  });
+
+  it('shows no peer’s values when an unbound slug names two identities', async () => {
+    const out = await prompt(undefined);
+    expect(out).not.toContain('PEER-VALUE');
+    expect(out).not.toContain('PEER-PRIVATE-RELATIONSHIP');
+  });
+});
+
+describe("ContextBuilder.buildContext — a group's values reach every member's SB", () => {
+  const OWNER_ID = '99999999-9999-4999-8999-999999999999';
+
+  /** A group owned by someone else, holding this person's SB. */
+  async function constitutionFor(memberRows: Row[]) {
+    const supabase = makeFakeSupabase({
+      agent_identities: [
+        {
+          id: 'sb-in-group',
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          values: [],
+          capabilities: [],
+          relationships: {},
+          workspace_id: 'ws-group',
+          updated_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+      users: [{ id: USER_ID, timezone: 'UTC', preferences: {} }],
+      contacts: [],
+      memories: [],
+      projects: [],
+      workspace_members: memberRows,
+      workspaces: [
+        {
+          id: 'ws-group',
+          user_id: OWNER_ID,
+          type: 'team',
+          archived_at: null,
+          shared_values: 'GROUP-VALUES',
+          process: null,
+          created_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+      user_identity: [
+        {
+          user_id: USER_ID,
+          workspace_id: 'ws-group',
+          user_profile_md: 'MEMBER-OWN-PAGE',
+          shared_values_md: null,
+          process_md: null,
+          updated_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+    });
+    const ctx = await new ContextBuilder(supabase).buildContext(
+      USER_ID,
+      'aster',
+      makeSession({ sbId: 'sb-in-group' })
+    );
+    return ctx.constitution;
+  }
+
+  it('gives a member who is not the owner the group’s values and their own page', async () => {
+    const constitution = await constitutionFor([
+      { workspace_id: 'ws-group', user_id: OWNER_ID, role: 'owner' },
+      { workspace_id: 'ws-group', user_id: USER_ID, role: 'member' },
+    ]);
+    expect(constitution?.values).toBe('GROUP-VALUES');
+    expect(constitution?.user).toBe('MEMBER-OWN-PAGE');
+  });
+
+  it('gives a person who is not in the group none of its values', async () => {
+    const constitution = await constitutionFor([
+      { workspace_id: 'ws-group', user_id: OWNER_ID, role: 'owner' },
+    ]);
+    expect(constitution?.values).toBeUndefined();
   });
 });

@@ -58,6 +58,14 @@ vi.mock('../../utils/logger', () => ({
   },
 }));
 
+// The account is resolved by its sign-in (services/account-deletion/
+// principal.ts, tested against a real database); here it answers with the
+// account each test sets up.
+const mockResolvePrincipal = vi.fn();
+vi.mock('../../services/account-deletion/principal', () => ({
+  resolveAccountForPrincipal: (...args: unknown[]) => mockResolvePrincipal(...args),
+}));
+
 // ---------------------------------------------------------------------------
 // Import after mocks
 // ---------------------------------------------------------------------------
@@ -92,6 +100,7 @@ function mockSuccessfulAuth() {
   });
 
   currentUserChain = mockChain({ id: 'user-123', email: 'test@example.com' });
+  mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'user-123', created: false });
 }
 
 /** Run the full auth flow through to auth code exchange, returning the tokens */
@@ -234,11 +243,18 @@ describe('InkAuthProvider', () => {
         return mockChain();
       });
 
+      mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'new-user-123', created: true });
+
       const result = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
       });
 
+      expect(mockResolvePrincipal).toHaveBeenCalledWith(expect.anything(), {
+        authUid: undefined,
+        email: 'new@example.com',
+        create: true,
+      });
       expect(result).toHaveProperty('code');
       expect(result).toHaveProperty('redirectUri');
     });
@@ -249,8 +265,11 @@ describe('InkAuthProvider', () => {
         data: { user: { email: 'unknown@example.com' } },
         error: null,
       });
-      // Mock returns PGRST116 for both SELECT and INSERT (chain is shared)
-      currentUserChain = mockChain(null, { code: 'PGRST116' });
+      mockResolvePrincipal.mockResolvedValue({
+        ok: false,
+        status: 500,
+        reason: 'Account lookup failed: synthetic',
+      });
 
       const result = await provider.handleAuthCallback({
         pendingId,
@@ -259,7 +278,7 @@ describe('InkAuthProvider', () => {
 
       expect(result).toEqual({
         error: 'server_error',
-        error_description: 'Failed to create user account',
+        error_description: 'User lookup failed',
       });
     });
 

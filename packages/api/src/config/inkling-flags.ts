@@ -87,6 +87,35 @@ export function inklingTurnTimeoutMs(source: EnvSource = process.env): number | 
   return value > 0 ? value : undefined;
 }
 
+const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * The tools that may use an inkling owner's connected accounts (Google
+ * today: Gmail, Calendar, Docs, Drive, Sheets) during an inkling's turn.
+ *
+ * INK_INKLING_ACCOUNT_TOOLS lists them by tool name, comma-separated, e.g.
+ * `list_email_labels,list_calendar_events`. Unset or blank is none, which
+ * is the default: an inkling's turn gets no connected-account token at all
+ * until someone names the tools it may use. There is no wildcard, and an
+ * entry that isn't a tool name is left out, so a typo can only shrink the
+ * list, never widen it. `malformed` says where each one was, never its
+ * value.
+ */
+export function inklingAccountToolAllowlist(source: EnvSource = process.env): {
+  tools: ReadonlySet<string>;
+  malformed: string[];
+} {
+  const tools = new Set<string>();
+  const malformed: string[] = [];
+  (source.INK_INKLING_ACCOUNT_TOOLS ?? '').split(',').forEach((raw, i) => {
+    const name = raw.trim();
+    if (name === '') return;
+    if (TOOL_NAME.test(name)) tools.add(name);
+    else malformed.push(`INK_INKLING_ACCOUNT_TOOLS entry ${i + 1}`);
+  });
+  return { tools, malformed };
+}
+
 /**
  * How many inklings one person may awaken: INKLING_AWAKEN_CAP, else 2.
  * The cap is counted inside redeem_kindle_token under a per-person lock, so

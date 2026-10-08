@@ -46,6 +46,14 @@ vi.mock('@supabase/supabase-js', () => ({
 // Mocks for data layer
 // ---------------------------------------------------------------------------
 
+// The account is resolved by its sign-in (services/account-deletion/
+// principal.ts, tested against a real database); here it answers with the
+// row each test's lookup names.
+const mockResolvePrincipal = vi.fn();
+vi.mock('../services/account-deletion/principal', () => ({
+  resolveAccountForPrincipal: (...args: unknown[]) => mockResolvePrincipal(...args),
+}));
+
 const mockFindById = vi.fn();
 const mockFindByIdWithRole = vi.fn();
 const mockGetMemberRole = vi.fn();
@@ -111,6 +119,7 @@ vi.mock('../utils/request-context', () => ({
 // ---------------------------------------------------------------------------
 
 import router from './admin';
+import { accountGate } from '../services/account-deletion/gate';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -157,6 +166,10 @@ function createMockRes(): MockResponse {
     _json: null,
     _cookies: {} as Record<string, { value: string; options: Record<string, unknown> }>,
     _clearedCookies: {} as Record<string, { options: Record<string, unknown> }>,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -185,13 +198,38 @@ function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
   userChain.update = vi.fn(() => userChain);
   userChain.eq = vi.fn(() => userChain);
   userChain.single = vi.fn(() => Promise.resolve({ data: inkUser, error: null }));
+  userChain.maybeSingle = vi.fn(() => Promise.resolve({ data: inkUser, error: null }));
 
   mockSupabaseFrom.mockImplementation((table: string) => {
     if (table === 'users') return userChain;
     return userChain; // fallback
   });
+  mockResolvePrincipal.mockResolvedValue({ ok: true, userId: inkUser.id, created: false });
 
   return userChain;
+}
+
+/**
+ * Every account a token names exists unless a test says otherwise: the users
+ * read tiers 1 and 2 make answers with the row for the id it is asked about.
+ */
+function mockAccountsExist() {
+  mockSupabaseFrom.mockImplementation((table: string) => {
+    const chain: Record<string, any> = {};
+    let id = '';
+    chain.select = vi.fn(() => chain);
+    chain.eq = vi.fn((_column: string, value: string) => {
+      id = value;
+      return chain;
+    });
+    const row = () => ({
+      data: table === 'users' ? { id, telegram_id: null, whatsapp_id: null } : null,
+      error: null,
+    });
+    chain.maybeSingle = vi.fn(() => Promise.resolve(row()));
+    chain.single = vi.fn(() => Promise.resolve(row()));
+    return chain;
+  });
 }
 
 /** Standard workspace mock that returns a personal workspace */
@@ -215,6 +253,7 @@ describe('adminAuthMiddleware', () => {
     capturedRunContext = null;
     middleware = getMiddleware();
     mockDefaultWorkspace();
+    mockAccountsExist();
   });
 
   // =========================================================================
@@ -288,6 +327,45 @@ describe('adminAuthMiddleware', () => {
       expect(mockGetUser).not.toHaveBeenCalled();
       // Should NOT issue new cookies
       expect(Object.keys(res._cookies)).toHaveLength(0);
+    });
+
+    it('refuses an account that is being deleted, at every tier, and holds its gate while a request runs', async () => {
+      mockVerifyInkAccessToken.mockReturnValue({
+        type: 'pcp_admin',
+        sub: 'user-closing',
+        email: 'closing@example.com',
+        scope: 'admin',
+      });
+
+      // Open: the request holds the account's gate until its response closes.
+      const listeners: Array<() => void> = [];
+      const open = createMockRes();
+      (open as unknown as { once: (event: string, fn: () => void) => void }).once = (
+        event: string,
+        fn: () => void
+      ) => {
+        if (event === 'close') listeners.push(fn);
+      };
+      const next = vi.fn();
+      await middleware(createMockReq(), open, next);
+      expect(next).toHaveBeenCalled();
+      expect(accountGate.inFlightCount('user-closing')).toBe(1);
+      for (const fn of listeners) fn();
+      expect(accountGate.inFlightCount('user-closing')).toBe(0);
+
+      // Closed: answered 403, and nothing behind the middleware runs.
+      accountGate.close('user-closing');
+      try {
+        const res = createMockRes();
+        const refusedNext = vi.fn();
+        await middleware(createMockReq(), res, refusedNext);
+        expect(res._status).toBe(403);
+        expect(res._json).toEqual({ error: 'This account is being deleted' });
+        expect(refusedNext).not.toHaveBeenCalled();
+        expect(accountGate.inFlightCount('user-closing')).toBe(0);
+      } finally {
+        accountGate.forget('user-closing');
+      }
     });
 
     it('should set inkUserId and email from JWT claims', async () => {
@@ -369,6 +447,38 @@ describe('adminAuthMiddleware', () => {
       expect(next).toHaveBeenCalled();
       expect(mockGetUser).not.toHaveBeenCalled();
       expect((req as any).inkUserId).toBe('user-mcp');
+    });
+
+    it('never accepts an agent’s mcp_access token for saved logins', async () => {
+      // A token that verifies as mcp_access, whichever audience is asked.
+      mockVerifyInkAccessToken.mockImplementation((_token: string, type: string) =>
+        type === 'mcp_access'
+          ? { type: 'mcp_access', sub: 'user-mcp', email: 'mcp@example.com', scope: 'mcp:tools' }
+          : null
+      );
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+      for (const [method, path] of [
+        ['GET', '/vault/logins'],
+        ['POST', '/vault/logins'],
+        ['GET', '/vault/logins/login-1'],
+        ['POST', '/vault/logins/login-1/reveal'],
+        ['POST', '/vault/logins/login-1/code'],
+      ]) {
+        const req = createMockReq({ method, path });
+        const res = createMockRes();
+        const next = vi.fn();
+        await middleware(req, res, next);
+        expect(res._status).toBe(401);
+        expect(next).not.toHaveBeenCalled();
+        expect((req as any).inkUserId).toBeUndefined();
+      }
+      // The control: the same token passes on a route that admits it.
+      const req = createMockReq({ method: 'GET', path: '/sessions/synced' });
+      const next = vi.fn();
+      await middleware(req, createMockRes(), next);
+      expect(next).toHaveBeenCalled();
+      // clearAllMocks keeps an implementation; don't hand this one to the next test.
+      mockVerifyInkAccessToken.mockReset();
     });
 
     it("keeps a runner token's signed identity for an approval request (Approvals step A)", async () => {
@@ -462,6 +572,92 @@ describe('adminAuthMiddleware', () => {
       expect(exportNext).toHaveBeenCalled();
       expect(mockGetUser).not.toHaveBeenCalled();
       expect((exportReq as any).inkUserId).toBe('user-mcp');
+    });
+  });
+
+  // =========================================================================
+  // An account deleted after its token was signed (task 7ee3c7be)
+  // =========================================================================
+
+  describe('an account that is gone', () => {
+    /** The users read answers with no row, or fails, for whichever id it is asked about. */
+    function accountsRead(answer: { data: null; error: { message: string } | null }) {
+      const chain: Record<string, any> = {};
+      chain.select = vi.fn(() => chain);
+      chain.eq = vi.fn(() => chain);
+      chain.maybeSingle = vi.fn(() => Promise.resolve(answer));
+      chain.single = vi.fn(() => Promise.resolve(answer));
+      mockSupabaseFrom.mockImplementation(() => chain);
+      return chain;
+    }
+    const nothingProvisioned = () => {
+      expect(mockEnsurePersonalWorkspace).not.toHaveBeenCalled();
+      expect(mockFindByIdWithRole).not.toHaveBeenCalled();
+      expect(mockFindRawById).not.toHaveBeenCalled();
+    };
+    const adminToken = (sub: string) =>
+      mockVerifyInkAccessToken.mockReturnValue({
+        type: 'pcp_admin',
+        sub,
+        email: 'gone@example.com',
+        scope: 'admin',
+      });
+
+    it('refuses a signed token whose account is gone with 401, before any workspace is looked up or made, with or without a space named', async () => {
+      accountsRead({ data: null, error: null });
+      adminToken('user-gone');
+      for (const headers of [
+        { authorization: 'Bearer test-token' },
+        { authorization: 'Bearer test-token', 'x-ink-workspace-id': 'workspace-1' },
+      ]) {
+        const res = createMockRes();
+        const next = vi.fn();
+        await middleware(createMockReq({ headers }), res, next);
+        expect(res._status).toBe(401);
+        expect(res._json).toEqual({ error: 'Account not found' });
+        expect(next).not.toHaveBeenCalled();
+      }
+      nothingProvisioned();
+      // The gate was never closed for it, as after a restart: the read decides.
+      expect(accountGate.isClosed('user-gone')).toBe(false);
+    });
+
+    it('refuses a refresh cookie whose account is gone the same way', async () => {
+      accountsRead({ data: null, error: null });
+      mockVerifyInkAccessToken.mockReturnValue(null);
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'new-access-jwt',
+        userId: 'user-gone',
+        email: 'gone@example.com',
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+      await middleware(
+        createMockReq({ cookies: { 'pcp-admin-refresh': 'ink-rt-left' } }),
+        res,
+        next
+      );
+      expect(res._status).toBe(401);
+      expect(next).not.toHaveBeenCalled();
+      nothingProvisioned();
+    });
+
+    it('refuses with 503 when the account cannot be read, never letting the request through', async () => {
+      accountsRead({ data: null, error: { message: 'connection reset' } });
+      adminToken('user-unread');
+      const res = createMockRes();
+      const next = vi.fn();
+      await middleware(createMockReq(), res, next);
+      expect(res._status).toBe(503);
+      expect(next).not.toHaveBeenCalled();
+      nothingProvisioned();
+    });
+
+    it('reads the account once for a signed token and reuses the row for trusted access', async () => {
+      adminToken('user-123');
+      await middleware(createMockReq(), createMockRes(), vi.fn());
+      const usersReads = mockSupabaseFrom.mock.calls.filter(([table]) => table === 'users');
+      expect(usersReads).toHaveLength(1);
     });
   });
 
@@ -584,7 +780,7 @@ describe('adminAuthMiddleware', () => {
         data: { user: { email: 'tier3@example.com' } },
         error: null,
       });
-      mockSupabaseUserLookup({
+      const usersChain = mockSupabaseUserLookup({
         id: 'user-tier3',
         telegram_id: null,
         whatsapp_id: null,
@@ -626,6 +822,8 @@ describe('adminAuthMiddleware', () => {
         { type: 'pcp_admin', sub: 'user-tier3', email: 'tier3@example.com', scope: 'admin' },
         3600
       );
+      // Its account was resolved from the database already: no second read.
+      expect(usersChain.maybeSingle).not.toHaveBeenCalled();
 
       // Should create refresh token with dashboard client
       expect(mockCreateRefreshToken).toHaveBeenCalledWith(
@@ -689,10 +887,16 @@ describe('adminAuthMiddleware', () => {
       const res = createMockRes();
       const next = vi.fn();
 
+      mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'new-user', created: true });
+
       await middleware(req, res, next);
 
       expect(next).toHaveBeenCalled();
-      expect(chain.insert).toHaveBeenCalled();
+      expect(mockResolvePrincipal).toHaveBeenCalledWith(expect.anything(), {
+        authUid: undefined,
+        email: 'new@example.com',
+        create: true,
+      });
     });
 
     it('should still call next() even if cookie creation fails', async () => {

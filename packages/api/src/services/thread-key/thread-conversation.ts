@@ -57,8 +57,8 @@ export function withLastMessage<Q>(query: Q): Q {
 
 export interface ThreadLastMessage {
   id: string;
-  /** The author's principal kind (spec inkmail-thread-scope §3). */
-  senderKind: 'sb' | 'user' | 'system';
+  /** The author's principal kind (spec inkmail-thread-scope §3), or a deleted account. */
+  senderKind: 'sb' | 'user' | 'system' | 'deleted_account';
   /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
   /** Named for the viewer: the SB's slug, a person's name, or 'system'. */
@@ -98,6 +98,16 @@ export function lastMessageUserIds(embed: unknown): string[] {
   return row?.sender_kind === 'user' && row.sender_user_id ? [row.sender_user_id] : [];
 }
 
+/** How a message from a deleted account is named, wherever it is shown. */
+export const DELETED_ACCOUNT_SENDER_NAME = 'Deleted account';
+
+/** The name of a sender that isn't a person: an SB's slug, a deleted account, or the system. */
+export function senderNameOfKind(kind: string, slug: string | null): string {
+  if (kind === 'sb') return slug ?? 'an SB';
+  if (kind === 'deleted_account') return DELETED_ACCOUNT_SENDER_NAME;
+  return 'system';
+}
+
 /**
  * The `last_message` embed as the list carries it. PostgREST answers a
  * to-many embed as an array; an empty one (no deliverable message yet) is
@@ -112,14 +122,16 @@ export function toLastMessage(
   const row = lastMessageRow(embed);
   if (!row) return null;
   const senderKind: ThreadLastMessage['senderKind'] =
-    row.sender_kind === 'sb' || row.sender_kind === 'user' ? row.sender_kind : 'system';
+    row.sender_kind === 'sb' || row.sender_kind === 'user' || row.sender_kind === 'deleted_account'
+      ? row.sender_kind
+      : 'system';
   const person =
     senderKind === 'user' && row.sender_user_id ? describePerson(row.sender_user_id) : null;
   return {
     id: row.id,
     senderKind,
     senderSlug: row.sender_agent_id ?? senderKind,
-    senderName: person?.name ?? (senderKind === 'sb' ? (row.sender_agent_id ?? 'an SB') : 'system'),
+    senderName: person?.name ?? senderNameOfKind(senderKind, row.sender_agent_id),
     isOwn: person?.isOwn ?? false,
     messageType: row.message_type,
     preview: previewText(row.content ?? ''),

@@ -7,10 +7,12 @@
  *
  * The creation half (inkling-thread-gate.ts) keeps an inkling's
  * conversations between it and its owner. This half refuses everything
- * else that could wake it: an SB's or the system's send, a heartbeat, a
- * reminder, a strategy, a channel message, and every turn while the owner
- * test is off. Only a person's message, on the owner's own account, wakes
- * an inkling born under the test.
+ * else that could wake it: an SB's or the system's send, another SB's
+ * heartbeat or any other reminder, a strategy, a channel message, and every
+ * turn while the owner test is off. Only a person's message, on the owner's
+ * own account, wakes an inkling born under the test, and the inkling's own
+ * heartbeat, firing in its conversation with that owner
+ * (inkling-heartbeat.ts, isOwnersHeartbeat).
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -20,8 +22,9 @@ import { INKLING_CLIENT } from './inkling-service';
 /**
  * What the SB a turn is for is, as far as the database can say:
  * - 'inkling', with its row;
- * - 'other', positively not an inkling: its row says so, or no identity
- *   row exists at all;
+ * - 'other', positively not an inkling: its row says so (with its id and
+ *   the client it names, which the execution tier reads), or no identity
+ *   row exists at all (both null);
  * - 'unknown', when its canonical identity could not be established.
  *   `transient` is true when a read failed, false when nothing names one
  *   identity (an ambiguous slug, an id that names no row).
@@ -29,8 +32,20 @@ import { INKLING_CLIENT } from './inkling-service';
  * the whole gate.
  */
 export type InklingIdentity =
-  | { kind: 'inkling'; id: string; userId: string; metadata: Record<string, unknown> }
-  | { kind: 'other' }
+  | {
+      kind: 'inkling';
+      id: string;
+      userId: string;
+      /**
+       * Its space: the only space whose conversations it takes part in, since
+       * a thread participant's identity must belong to the thread's space
+       * (inbox_thread_participants_sb_workspace_fkey). Null for a legacy
+       * workspace-less row.
+       */
+      workspaceId: string | null;
+      metadata: Record<string, unknown>;
+    }
+  | { kind: 'other'; id: string | null; client: string | null }
   | { kind: 'unknown'; transient: boolean };
 
 /**
@@ -45,18 +60,28 @@ export async function classifyIdentityById(
 ): Promise<InklingIdentity> {
   const { data, error } = await supabase
     .from('agent_identities')
-    .select('id, user_id, metadata')
+    .select('id, user_id, workspace_id, metadata')
     .eq('id', sbId)
     .maybeSingle();
   if (error) return { kind: 'unknown', transient: true };
   const row = data as {
     id: string;
     user_id: string;
+    workspace_id: string | null;
     metadata: Record<string, unknown> | null;
   } | null;
   if (!row) return { kind: 'unknown', transient: false };
-  if (row.metadata?.client !== INKLING_CLIENT) return { kind: 'other' };
-  return { kind: 'inkling', id: row.id, userId: row.user_id, metadata: row.metadata ?? {} };
+  if (row.metadata?.client !== INKLING_CLIENT) {
+    const client = row.metadata?.client;
+    return { kind: 'other', id: row.id, client: typeof client === 'string' ? client : null };
+  }
+  return {
+    kind: 'inkling',
+    id: row.id,
+    userId: row.user_id,
+    workspaceId: row.workspace_id ?? null,
+    metadata: row.metadata ?? {},
+  };
 }
 
 /**
@@ -107,7 +132,10 @@ export interface InklingTurnInput {
   identity: InklingIdentity;
   /** The account the turn runs for. */
   userId: string;
-  /** isOwnersOwnMessage, for an inkling's turn. */
+  /**
+   * isOwnersOwnMessage for an inkling's turn, or isOwnersHeartbeat for its
+   * own heartbeat: either way, proof the wake is its owner's.
+   */
   ownerMessage: OwnerMessageProof;
 }
 
@@ -145,7 +173,9 @@ export function inklingTurnRefusal(
     return { reason: 'the message that woke it could not be read', retryable: true };
   }
   if (input.ownerMessage !== 'yes') {
-    return refuse('an inkling wakes only for a stored message its owner sent in its conversation');
+    return refuse(
+      'an inkling wakes only for a stored message its owner sent in its conversation, or its own heartbeat there'
+    );
   }
   return null;
 }

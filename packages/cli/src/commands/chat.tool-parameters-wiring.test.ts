@@ -46,4 +46,8 @@ describe('Inkwell tool parameters in local routing', () => {
       expect(text).not.toMatch(/bootstrap, etc\./);
     }
   );
+
+  it('names web_fetch to the parent, so reading a page needs no shell', () => {
+    expect(buildLocalToolInstruction({ audience: 'parent' })).toContain('web_fetch');
+  });
 });

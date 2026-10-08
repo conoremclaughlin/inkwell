@@ -225,7 +225,7 @@ describe('HostedInkSessionRunner', () => {
     expect(process.cwd()).toBe(cwd);
   });
 
-  it('carries the named provider and inkling restrictions without changing the next session', async () => {
+  it('carries the named provider and tools-tier restrictions without changing the next session', async () => {
     const seen: HostedInkSessionInput[] = [];
     const hosted = runner(async (input, ports) => {
       seen.push(input);
@@ -234,7 +234,8 @@ describe('HostedInkSessionRunner', () => {
     await hosted.run('inkling', {
       config: config({
         inkProvider: 'claude',
-        inklingToolPolicyPath: '/isolated/inkling-policy.json',
+        executionTier: 'tools',
+        toolPolicyPath: '/isolated/inkling-policy.json',
         maxTurns: 7,
         effort: 'high',
         channel: 'agent',
@@ -246,8 +247,8 @@ describe('HostedInkSessionRunner', () => {
       maxTurns: 7,
       effort: 'high',
       toolRouting: 'local',
-      profile: 'inkling',
-      requireProfile: 'inkling',
+      profile: 'tools',
+      requireProfile: 'tools',
       toolPolicyPath: '/isolated/inkling-policy.json',
       withholdProviderTools: true,
       away: true,

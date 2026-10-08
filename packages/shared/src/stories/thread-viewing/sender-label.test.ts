@@ -51,4 +51,10 @@ describe('senderLabel', () => {
     };
     expect(senderLabel(withHint)).toBe('wren');
   });
+
+  it('reads an older payload from a deleted account, which names nobody, as "Deleted account"', () => {
+    expect(senderLabel({ senderKind: 'deleted_account', senderSlug: 'deleted_account' })).toBe(
+      'Deleted account'
+    );
+  });
 });

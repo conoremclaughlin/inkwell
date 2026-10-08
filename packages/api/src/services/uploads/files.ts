@@ -20,11 +20,12 @@
 
 import { webcrypto } from 'crypto';
 import { constants as fsConstants } from 'fs';
-import { chmod, lstat, mkdir, open, rename, rmdir, unlink } from 'fs/promises';
+import { chmod, lstat, mkdir, open, readdir, rename, rm, rmdir, unlink } from 'fs/promises';
 import { isAbsolute, join, relative, sep } from 'path';
 import { readContainedFile } from '../../channels/agent-media.js';
 import { MAX_UPLOAD_BYTES } from './sniff.js';
 import {
+  isCanonicalId,
   isWithin,
   stagingFilePath,
   uploadDirPath,
@@ -226,6 +227,59 @@ export async function removeUploadBytes(
     return { gone: true };
   } catch (error) {
     return { gone: false, reason: 'failed', detail: (error as Error).message };
+  }
+}
+
+export type RemoveFolderResult =
+  | { gone: true }
+  | { gone: false; reason: 'bad-account' | 'symlinked' | 'failed'; detail?: string };
+
+/**
+ * Remove an account's whole folder, `<root>/<userId>`, for account deletion
+ * (account.ts), once every one of its rows is `removed`. By then it should
+ * hold only emptied workspace directories; anything else in it is bytes no
+ * row names (a writer that crashed after its row was finished) and goes
+ * with the account. A link inside is removed as a link, never followed; the
+ * folder itself being a link is refused. `gone` is checked afterwards, as
+ * for one upload.
+ */
+export async function removeAccountFolder(
+  rootReal: string,
+  userId: string
+): Promise<RemoveFolderResult> {
+  if (!isCanonicalId(userId)) return { gone: false, reason: 'bad-account' };
+  const dir = join(rootReal, userId);
+  const below = relative(rootReal, dir);
+  if (below === '' || below.startsWith('..') || isAbsolute(below)) {
+    return { gone: false, reason: 'bad-account' };
+  }
+  try {
+    const st = await lstat(dir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (st) {
+      if (st.isSymbolicLink() || !st.isDirectory()) return { gone: false, reason: 'symlinked' };
+      await openTree(dir);
+      await rm(dir, { recursive: true });
+    }
+    if (await exists(dir)) {
+      return { gone: false, reason: 'failed', detail: 'still present after removal' };
+    }
+    return { gone: true };
+  } catch (error) {
+    return { gone: false, reason: 'failed', detail: (error as Error).message };
+  }
+}
+
+/**
+ * Make every real directory in a tree writable by its owner (they are 0500
+ * once an upload is in place), so it can be removed. Links are not followed.
+ */
+async function openTree(dir: string): Promise<void> {
+  await chmod(dir, 0o700);
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) await openTree(join(dir, entry.name));
   }
 }
 

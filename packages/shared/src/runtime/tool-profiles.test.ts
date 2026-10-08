@@ -28,53 +28,68 @@ function withMachineGrants(): ToolPolicyState {
 
 describe('shared launch profiles', () => {
   it('keeps all profiles discoverable, including inkling', () => {
-    expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full', 'inkling']);
+    expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full', 'tools', 'inkling']);
     expect(PROFILE_IDS).toEqual(Object.keys(TOOL_PROFILES));
     expect(isValidProfileId('inkling')).toBe(true);
     expect(formatProfileList('inkling')).toContain('inkling (active)');
   });
 
-  it('keeps inkling denials above inherited grants without narrowing its other tools', () => {
-    const policy = withMachineGrants();
-    expect(policy.snapshot().scopes?.global?.permanentGrants).toContain('bash');
-    expect(policy.canCallInkTool('bash').allowed).toBe(true);
-    expect(applyLaunchProfile(policy, 'inkling')).toMatchObject({
-      ok: true,
-      withholdProviderTools: true,
-    });
-    for (const tool of ['bash', 'edit', 'write', 'view_image', 'trigger_agent', 'send_response']) {
-      expect(policy.canCallInkTool(tool), tool).toMatchObject({
-        allowed: false,
-        promptable: false,
+  it.each(['tools', 'inkling'])(
+    'keeps %s denials above inherited grants without narrowing other tools',
+    (profile) => {
+      const policy = withMachineGrants();
+      expect(policy.snapshot().scopes?.global?.permanentGrants).toContain('bash');
+      expect(policy.canCallInkTool('bash').allowed).toBe(true);
+      expect(applyLaunchProfile(policy, profile)).toMatchObject({
+        ok: true,
+        withholdProviderTools: true,
       });
-      expect(policy.canCallInkTool(`  ${tool.toUpperCase()}  `), tool).toMatchObject({
-        allowed: false,
-        promptable: false,
-      });
+      for (const tool of [
+        'bash',
+        'edit',
+        'write',
+        'view_image',
+        'trigger_agent',
+        'send_response',
+      ]) {
+        expect(policy.canCallInkTool(tool), tool).toMatchObject({
+          allowed: false,
+          promptable: false,
+        });
+        expect(policy.canCallInkTool(`  ${tool.toUpperCase()}  `), tool).toMatchObject({
+          allowed: false,
+          promptable: false,
+        });
+      }
+      for (const tool of [
+        'send_to_inbox',
+        'read',
+        'grep',
+        'find',
+        'ls',
+        'recall',
+        'remember',
+        'list_emails',
+      ]) {
+        expect(policy.canCallInkTool(tool).allowed, tool).toBe(true);
+      }
+      expect(policy.snapshot().scopes?.global?.permanentGrants).toContain('bash');
+      expect(policy.listAllowTools()).toEqual([]);
     }
-    for (const tool of [
-      'send_to_inbox',
-      'read',
-      'grep',
-      'find',
-      'ls',
-      'recall',
-      'remember',
-      'list_emails',
-    ]) {
-      expect(policy.canCallInkTool(tool).allowed, tool).toBe(true);
-    }
-    expect(policy.snapshot().scopes?.global?.permanentGrants).toContain('bash');
-    expect(policy.listAllowTools()).toEqual([]);
-  });
+  );
 
-  it.each(PROFILE_IDS)('only inkling requests provider withholding (%s)', (id) => {
-    expect(applyLaunchProfile(new ToolPolicyState('backend'), id)).toMatchObject({
-      ok: true,
-      withholdProviderTools: id === 'inkling',
-    });
-    expect(TOOL_PROFILES[id].withholdProviderTools === true).toBe(id === 'inkling');
-  });
+  it.each(PROFILE_IDS)(
+    'only tools and its inkling alias request provider withholding (%s)',
+    (id) => {
+      expect(applyLaunchProfile(new ToolPolicyState('backend'), id)).toMatchObject({
+        ok: true,
+        withholdProviderTools: id === 'tools' || id === 'inkling',
+      });
+      expect(TOOL_PROFILES[id].withholdProviderTools === true).toBe(
+        id === 'tools' || id === 'inkling'
+      );
+    }
+  );
 
   it('refuses an unknown launch profile without mutating policy or persisting', () => {
     const onChange = vi.fn();
@@ -82,7 +97,8 @@ describe('shared launch profiles', () => {
     const before = policy.snapshot();
     expect(applyLaunchProfile(policy, 'inklnig')).toEqual({
       ok: false,
-      message: 'Unknown profile: inklnig. Valid: minimal, safe, collaborative, full, inkling',
+      message:
+        'Unknown profile: inklnig. Valid: minimal, safe, collaborative, full, tools, inkling',
     });
     expect(policy.snapshot()).toEqual(before);
     expect(onChange).not.toHaveBeenCalled();
