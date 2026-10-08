@@ -102,14 +102,14 @@ export async function maintainUploads(deps: MaintenanceDeps): Promise<Maintenanc
   return report;
 }
 
-interface RowForRemoval {
+export interface RowForRemoval {
   id: string;
   user_id: string;
   workspace_id: string;
   content_type: string;
 }
 
-function locationOf(row: RowForRemoval): UploadLocation | null {
+export function locationOf(row: RowForRemoval): UploadLocation | null {
   const ext = extForContentType(row.content_type);
   return ext ? { userId: row.user_id, workspaceId: row.workspace_id, uploadId: row.id, ext } : null;
 }

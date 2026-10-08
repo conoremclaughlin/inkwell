@@ -124,6 +124,12 @@ jobs:
       - name: Integration-DB harness Kong keepalive step
         run: sh scripts/test-disable-kong-upstream-keepalive.test.sh
 
+      # The local stack's Vault root key: the loader, the `yarn supabase:start`
+      # wrapper and the setup script. Stubs on PATH, no Docker, and a random
+      # key made by the test.
+      - name: Local stack Vault root key
+        run: bash scripts/supabase-root-key.test.sh
+
       - name: Integration stack lifecycle (mock-only)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py

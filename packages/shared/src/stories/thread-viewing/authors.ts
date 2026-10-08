@@ -20,6 +20,17 @@ export const SYSTEM: ConversationAuthor = {
   isOwn: false,
 };
 
+/**
+ * A message whose author's account was deleted: the content stays and it
+ * names no one (ink://specs/account-deletion, Q-A).
+ */
+export const DELETED_ACCOUNT: ConversationAuthor = {
+  kind: 'user',
+  id: 'deleted_account',
+  name: 'Deleted account',
+  isOwn: false,
+};
+
 export function sbAuthor(sbSlug: string, nameFor: NameFor): ConversationAuthor {
   return { kind: 'sb', id: sbSlug, name: nameFor(sbSlug), isOwn: false };
 }
@@ -30,6 +41,8 @@ export function authorOf(message: ThreadMessage, nameFor: NameFor): Conversation
   switch (message.senderKind) {
     case 'system':
       return SYSTEM;
+    case 'deleted_account':
+      return DELETED_ACCOUNT;
     case 'user':
       return message.isOwn
         ? YOU
@@ -95,5 +108,6 @@ export function nameLookup(
 export function creatorLabel(createdBySlug: string, nameFor: NameFor): string {
   if (createdBySlug === 'user') return 'a person';
   if (createdBySlug === 'system') return 'the system';
+  if (createdBySlug === 'deleted_account') return 'a deleted account';
   return nameFor(createdBySlug);
 }

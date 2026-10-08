@@ -30,7 +30,7 @@
 #     database at all (CI's job), one refusal line shared with apply, and
 #     without psql on the PATH; psql is asked for by apply, pending and status
 #   - a stopped stack, or a missing psql, is refused before psql; the hint
-#     names `supabase start`, never the setup script that resets the database
+#     names `yarn supabase:start`, never the setup script that resets the database
 #   - `status` counts pending files and rows applied from other checkouts
 #   - migration-status.mjs reads the CLI table: a local-only row is pending
 #     (exit 10), a remote-only row is not, a valid empty table is clean,
@@ -512,11 +512,11 @@ out_scan=$(cd "$tc" && sh "$script" scan supabase/migrations/20260201000000_comm
 reset_log
 out=$(cd "$repo" && STUB_NO_STACK=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'supabase start' &&
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'yarn supabase:start' &&
   ! echo "$out" | grep -q 'start it with: yarn supabase:local:setup'; then
-  ok "a stopped stack is refused before psql; the hint is supabase start, not the resetting setup script"
+  ok "a stopped stack is refused before psql; the hint is yarn supabase:start, not the resetting setup script"
 else
-  bad "a stopped stack is refused before psql; the hint is supabase start, not the resetting setup script" "exit $rc: $out"
+  bad "a stopped stack is refused before psql; the hint is yarn supabase:start, not the resetting setup script" "exit $rc: $out"
 fi
 
 reset_log

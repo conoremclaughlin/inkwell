@@ -1187,7 +1187,7 @@ describe('SessionService', () => {
         const failing = [
           ...(extra.failReads ?? []),
           ...(extra.readError
-            ? [{ table: 'agent_identities', columns: 'id, user_id, metadata' }]
+            ? [{ table: 'agent_identities', columns: 'id, user_id, workspace_id, metadata' }]
             : []),
         ];
         for (const { table, columns } of failing) {

@@ -48,6 +48,13 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({ handleSendToInbox: vi.fn() }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
 
 // Mutable so individual tests can run the routes "in production".
+// The account is resolved by its sign-in (services/account-deletion/
+// principal.ts, tested against a real database).
+const mockResolvePrincipal = vi.fn();
+vi.mock('../services/account-deletion/principal', () => ({
+  resolveAccountForPrincipal: (...args: unknown[]) => mockResolvePrincipal(...args),
+}));
+
 const envState = vi.hoisted(() => ({ dev: true, mcpBaseUrl: undefined as string | undefined }));
 
 vi.mock('../config/env', async () => ({
@@ -126,6 +133,10 @@ function createRes(): MockResponse {
   const res: Record<string, unknown> = {
     _status: 200,
     _json: null,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -148,6 +159,7 @@ function mockUsersTable(user: Record<string, unknown> | null) {
   chain.eq = vi.fn(() => chain);
   chain.single = vi.fn(() => Promise.resolve({ data: user, error: null }));
   mockSupabaseFrom.mockImplementation(() => chain);
+  if (user) mockResolvePrincipal.mockResolvedValue({ ok: true, userId: user.id, created: false });
   return chain;
 }
 
@@ -241,12 +253,17 @@ describe('POST /auth/mobile-login', () => {
       .mockResolvedValueOnce({ data: null, error: null })
       .mockResolvedValueOnce({ data: { id: 'ink-new' }, error: null });
     mockSupabaseFrom.mockImplementation(() => chain);
+    mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'ink-new', created: true });
 
     const res = createRes();
     await login(createReq({ email: 'new@b.co', password: 'right' }), res);
 
     expect(res._status).toBe(200);
-    expect(chain.insert).toHaveBeenCalledWith(expect.objectContaining({ email: 'new@b.co' }));
+    expect(mockResolvePrincipal).toHaveBeenCalledWith(expect.anything(), {
+      authUid: 'sb-user',
+      email: 'new@b.co',
+      create: true,
+    });
     expect((res._json as { userId: string }).userId).toBe('ink-new');
   });
 

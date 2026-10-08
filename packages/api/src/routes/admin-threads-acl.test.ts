@@ -93,6 +93,10 @@ function response() {
   return {
     _status: 200,
     _json: null as unknown,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       this._status = code;
       return this;

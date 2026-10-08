@@ -215,7 +215,7 @@ connect() {
     need_cli
     url=$(db_url)
     [ -n "$url" ] ||
-      die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
+      die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: yarn supabase:start   (NOT yarn supabase:local:setup, which resets the database)"
   fi
 }
 
@@ -421,7 +421,7 @@ case "$mode" in
       expect_origin=$(safe_origin "$expect") ||
         die "the runtime's SUPABASE_URL is not a parseable URL, so no stack can be proven to be its own; nothing applied (the value is not shown)"
       stack=$(supabase status --workdir "$root" -o env 2>/dev/null) ||
-        die "the local Supabase stack is not running (supabase status failed). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database). Nothing applied."
+        die "the local Supabase stack is not running (supabase status failed). Start it from the root checkout with: yarn supabase:start   (NOT yarn supabase:local:setup, which resets the database). Nothing applied."
       actual=$(status_value "$stack" API_URL)
       url=$(status_value "$stack" DB_URL)
       [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $expect_origin; nothing applied"

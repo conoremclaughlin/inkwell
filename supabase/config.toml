@@ -10,6 +10,13 @@ max_rows = 1000
 [db]
 port = 54322
 major_version = 15
+# Vault's root key. Without this line every local stack uses the Supabase
+# CLI's built-in key, the same on every machine, and Vault protects nothing.
+# Start the root checkout's stack with `yarn supabase:start`, which reads the
+# key from ~/.ink/secrets/supabase-db-root-key (scripts/lib/supabase-root-key.sh);
+# a plain `supabase start` with SUPABASE_DB_ROOT_KEY unset leaves the database
+# restarting. The integration harness and CI give each test stack its own.
+root_key = "env(SUPABASE_DB_ROOT_KEY)"
 
 [studio]
 enabled = true

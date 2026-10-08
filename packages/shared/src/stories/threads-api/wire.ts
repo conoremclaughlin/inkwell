@@ -45,8 +45,12 @@ export interface SpineGroup {
 
 export interface ThreadLastMessage {
   id: string;
-  /** The author's principal kind (spec inkmail-thread-scope §3). */
-  senderKind: 'sb' | 'user' | 'system';
+  /**
+   * The author's principal kind (spec inkmail-thread-scope §3).
+   * 'deleted_account': its author's account was deleted; the content stays,
+   * and it names no one (ink://specs/account-deletion, Q-A).
+   */
+  senderKind: 'sb' | 'user' | 'system' | 'deleted_account';
   /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
   /** Named for this viewer on the server: SB slug, person's name, or 'system'. */
@@ -120,8 +124,11 @@ export interface StudioHistoryItem {
 
 export interface ThreadMessage {
   id: string;
-  /** The author is a principal (spec inkmail-thread-scope §3). */
-  senderKind: 'sb' | 'user' | 'system';
+  /**
+   * The author is a principal (spec inkmail-thread-scope §3), or
+   * 'deleted_account' once its account was deleted.
+   */
+  senderKind: 'sb' | 'user' | 'system' | 'deleted_account';
   /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
   senderSbId?: string | null;
