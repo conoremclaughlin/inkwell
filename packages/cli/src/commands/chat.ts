@@ -1,4 +1,8 @@
-import { runSessionAgentTurn, type SessionProviderPorts } from '@inklabs/shared/providers';
+import {
+  runSessionAgentTurn,
+  SessionStream,
+  type SessionProviderPorts,
+} from '@inklabs/shared/providers';
 export { isResumeFailedNoSession } from '@inklabs/shared/runtime';
 import { occupancyTokens, promptTokensOf, relayBudgetBytes } from '@inklabs/shared/runtime';
 export {
@@ -13,12 +17,10 @@ export {
 } from '@inklabs/shared/runtime';
 import {
   envelopeShapeKey,
-  spawnDialogueText,
   turnContextOccupancy,
   buildSessionPrompt,
   formatBootstrapContext,
   renderActiveSkills,
-  type ReseedDialogueEntry,
 } from '@inklabs/shared/runtime';
 export {
   buildDeltaPrompt,
@@ -36,6 +38,7 @@ export {
 import {
   compactForLedger,
   SerialInputDrain,
+  SessionUsage,
   SessionTurnCoordinator,
   bootstrapSessionIdentity,
   type PreparedSessionTurn,
@@ -82,7 +85,7 @@ import { acceptsContextImagesFor, promptTransportFor } from '../backends/index.j
 import { createCliBackendHost } from '../backends/cli-host.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
-import { backendSendTarget, localDeliveredSend, turnReplyEvent } from '../repl/turn-reply.js';
+import { localDeliveredSend, turnReplyEvent } from '../repl/turn-reply.js';
 import {
   CloneRegistry,
   formatCloneLine,
@@ -133,8 +136,6 @@ import {
   runCompaction,
   type CompactionOutcome,
 } from '../repl/compaction.js';
-import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
-import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
@@ -163,11 +164,7 @@ import {
 } from '../repl/attachments.js';
 import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
-import {
-  formatBackendTokenUsage,
-  type BackendTokenUsage,
-  type BackendModelUsage,
-} from '../repl/token-usage.js';
+import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
@@ -257,13 +254,10 @@ import {
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   MAX_TOOL_CALLS_PER_ITERATION,
-  findImitatedToolResults,
-  isPotentialImitationPrefix,
   runAgentLoop,
   runHeadlessSession,
   runSessionToolBatch,
   type SessionTurnInput,
-  stripLocalToolBlocks,
   type AgentLoopResult,
   type BackendTurnOutcome,
   type LocalToolCall,
@@ -289,7 +283,6 @@ import {
   RUN_TURN_EPOCH_ENV,
   TURN_REPLY_TOKEN_ENV,
   verifyDelegationToken,
-  type TurnSend,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
 
@@ -2770,270 +2763,45 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // ── Live paragraph streaming (Ink TUI only) ──
-  // Assistant text renders as it flows: partial-message deltas accumulate in a
-  // fence-aware paragraph buffer and each completed paragraph is appended to
-  // scrollback immediately — the first with the agent label, the rest as
-  // continuations (invalidated whenever another writer interleaves). The
-  // completed-message `text` event flushes the tail (or renders the whole
-  // message when the backend emitted no deltas), and the final response add
-  // dedupes against the streamed message so nothing prints twice. Local tool
-  // routing: ```ink-tool blocks arrive as one held unit and are stripped
-  // before display. All state lives in StreamedTurnRenderer (unit-tested).
-  const streamRenderer = new StreamedTurnRenderer(
-    (text) => (runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text),
-    {
-      // Same detector the loop cuts with, applied live — otherwise the
-      // fabricated frame is on screen (and in the observer feed) before the
-      // loop ever sees the finished text (#569; Lumen, PR #575 round 1).
-      guard: (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
-    }
-  );
-
-  // The observer-facing preview is guarded like the screen: cut at an
-  // imitated frame judged over the whole spawn, with a trailing line that
-  // could still become one held across blocks (preview-guard.ts).
-  const previewGuard = new ImitationPreviewGuard(
-    (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
-    (line) => runtime.toolRouting === 'local' && isPotentialImitationPrefix(line)
-  );
-  // The model's own output this turn, spawn by spawn, imitated frames cut —
-  // what a mid-turn reseed hands back so the rebuilt session remembers its
-  // own half of the turn (buildMidTurnReseedBody, #572). Reset per turn;
-  // muted from an imitated frame to the next spawn, like the renderer.
-  // This turn's dialogue with the runtime, in order: what the model said, and
-  // each continuation the runtime sent back. A mid-turn reseed replays it so
-  // the rebuilt session remembers its own half of the turn — assistant text
-  // alone was not enough (Lumen, PR #577): ordinary tool results survive in
-  // the ledger only as 500-char previews placed BEFORE the requests that
-  // earned them, and client-local results (list_context, evict_context) are
-  // deliberately not in the ledger at all, so a two-iteration turn lost the
-  // first iteration's results while the note claimed they followed.
-  let turnDialogue: ReseedDialogueEntry[] = [];
-  let turnDialogueMuted = false;
-  // The assistant text the last completed outer turn stored, or null when it
-  // stored none (aborted, failed before the ledger write). The non-interactive
-  // loop reads it after each turn to report that turn's reply (turn_reply).
-  let lastTurnAssistantText: string | null = null;
-  // The send_response calls the current outer turn made that delivered, for
-  // its turn_reply line. Backend-routed calls are held by id from tool-use
-  // until their tool-result says whether they failed.
-  let turnSends: TurnSend[] = [];
-  const pendingBackendSends = new Map<string, TurnSend>();
-  // This spawn's assistant text, UNCUT, and the dialogue entry it is written
-  // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
-  // earlier block (`Looking.\nuser`) is retracted when a later block reveals
-  // it was the start of a frame — a per-block cut could not take back what
-  // it had already recorded (Lumen, PR #577 round 2).
-  let spawnSaid = '';
-  let spawnEntryIndex = -1;
-  const beginSpawn = (): void => {
-    streamRenderer.beginSpawn();
-    previewGuard.beginSpawn();
-    turnDialogueMuted = false;
-    spawnSaid = '';
-    spawnEntryIndex = -1;
-  };
-  /**
-   * The spawn's stream ended: render whatever the renderer was holding, and
-   * publish a preview line the guard held that never became a frame.
-   */
-  const endSpawn = (): void => {
-    renderStreamedLines(streamRenderer.endSpawn());
-    const held = previewGuard.endSpawn();
-    if (held.trim()) {
-      runtime.log.append({
-        type: 'backend_text',
-        preview: compactForLedger(held, 200),
-      });
-    }
-  };
-
-  const renderStreamedLines = (lines: StreamedLine[]): void => {
-    if (!inkRepl) return; // legacy readline path keeps the buffered final render
-    for (const line of lines) {
-      inkRepl.addMessage(
-        'assistant',
-        line.text,
-        line.continuation ? { continuation: true } : { label: sbSlug }
-      );
-    }
-  };
-
-  // Bridge normalized backend stream events onto the live feed. Backend tool
-  // calls (the provider calling MCP tools mid-turn) now surface in real time —
-  // before stream-json the feed was silent during a backend-routed generation.
-  // Totals for THIS process, summed across every backend invocation it makes.
-  // One ink run invokes the provider repeatedly — once per outer turn (server
-  // default maxTurns=5) and again for each tool-loop continuation — so the last
-  // result covers only the final invocation. Reporting that as the run's usage
-  // undercounts every invocation but the last (Lumen, PR #494 round 2).
-  const runUsageTotals = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-  };
-
-  // Called at every backend result inside runTurnForLoop — the single boundary
-  // all invocations flow through since the runAgentLoop extraction (#489).
-  // A failed attempt that still reported usage counts: those tokens were spent.
-  //
-  // SUMMED, not diffed — and that is a deliberate, verified choice. Reading the
-  // Claude Code 2.1.233 binary suggests otherwise: its resume path can restore
-  // `lastModelUsage` into the cost ledger, and the result builder serializes
-  // `usage`/`modelUsage` from that ledger, which reads like every result is a
-  // running total that must be checkpointed and diffed.
-  //
-  // It is not, on this path. The save-on-exit that would populate that ledger
-  // is installed by the interactive React cost/status hook, and `-p` never
-  // mounts it — so a print-mode resume has nothing to restore. Confirmed
-  // black-box on 2.1.233 with three sequential `-p --resume` turns: costs came
-  // back $0.0176 / $0.0030 / $0.0029, each its own invocation, and the session
-  // transcript contained neither `modelUsage` nor `lastModelUsage`.
-  //
-  // This is provider-version behavior, not a contract. If a future version
-  // starts emitting running totals here, the symptom is session costs and
-  // tokens growing quadratically — at which point this needs per-native-session
-  // checkpoint/diff, the way SessionRepository.updateTokenUsage already does
-  // for Codex. (Wren's experiment + Lumen's binary analysis, PR #500.)
-  // Per-model totals for this run, accumulated key by key exactly as the
-  // backend reported them. Carries the backend's own costUSD, which is what
-  // makes spend answerable in dollars without a price table on our side.
-  const runModelUsage: Record<string, BackendModelUsage> = {};
-
-  const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
-    if (!usage) return;
-    runUsageTotals.inputTokens += usage.inputTokens || 0;
-    runUsageTotals.outputTokens += usage.outputTokens || 0;
-    runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
-    runUsageTotals.cacheWriteTokens += usage.cacheWriteTokens || 0;
-    for (const [model, entry] of Object.entries(usage.modelUsage || {})) {
-      const prior = runModelUsage[model];
-      runModelUsage[model] = {
-        inputTokens: (prior?.inputTokens || 0) + entry.inputTokens,
-        outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
-        cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
-        cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
-        // Cost completeness, not just cost. Summing only the known parts and
-        // publishing the subtotal as the total under-reports invisibly; a
-        // first contribution that reports cost starts complete, and any
-        // unknown contribution after that marks the running figure partial.
-        ...(() => {
-          const priorCost = prior?.costUSD;
-          const entryCost = entry.costUSD;
-          if (priorCost === undefined && entryCost === undefined) return {};
-          const partial =
-            prior?.costPartial === true ||
-            (prior !== undefined && priorCost === undefined) ||
-            entryCost === undefined;
-          return {
-            costUSD: (priorCost ?? 0) + (entryCost ?? 0),
-            ...(partial ? { costPartial: true } : {}),
-          };
-        })(),
-        ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
-      };
-    }
-  };
-
-  // The model reported by the provider during THIS process. Deliberately
-  // separate from runtime.model (what was REQUESTED) and runtime.detectedModel
-  // (which can be hydrated from a previous process's transcript on reattach) —
-  // neither is evidence of what served this run. Stays undefined when the
-  // provider reported nothing, so the field is omitted rather than guessed.
-  let currentRunModel: string | undefined;
-
-  const handleBackendEvent = (evt: BackendTurnEvent): void => {
-    if (evt.kind === 'tool-use') {
-      const sendTarget = backendSendTarget(evt.name, evt.input);
-      if (sendTarget && evt.id) pendingBackendSends.set(evt.id, sendTarget);
-      // Surface the call in the live feed as the agent's own — one dim line,
-      // same shape as the replay's 🛠 rows.
-      printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
-      runtime.log.append({
-        type: 'backend_tool',
-        name: evt.name,
-        status: 'running',
-        ...(evt.id ? { toolUseId: evt.id } : {}),
-      });
-      // Legacy line for the server runner's invocation tracking only — not
-      // observer-facing, no eid contract.
-      emitStreamEvent({
-        type: 'tool_call',
-        toolName: evt.name,
-        status: 'running',
-        layer: 'backend',
-        ...(evt.id ? { toolUseId: evt.id } : {}),
-      });
-    } else if (evt.kind === 'tool-result') {
-      const sendTarget = evt.id ? pendingBackendSends.get(evt.id) : undefined;
-      if (sendTarget) {
-        pendingBackendSends.delete(evt.id!);
-        if (!evt.isError) turnSends.push(sendTarget);
+  // One session-owned stream composition for CLI and hosted execution. The
+  // host only renders guarded lines, mirrors progress and applies model windows.
+  const sessionStream = new SessionStream({
+    toolRouting: () => runtime.toolRouting,
+    append: (entry) => runtime.log.append(entry),
+    render: (lines) => {
+      if (!inkRepl) return; // readline retains the buffered final render
+      for (const line of lines) {
+        inkRepl.addMessage(
+          'assistant',
+          line.text,
+          line.continuation ? { continuation: true } : { label: sbSlug }
+        );
       }
-      runtime.log.append({
-        type: 'backend_tool',
-        status: evt.isError ? 'error' : 'done',
-        ...(evt.id ? { toolUseId: evt.id } : {}),
-      });
-    } else if (evt.kind === 'text-delta') {
-      renderStreamedLines(streamRenderer.pushDelta(evt.text));
-    } else if (evt.kind === 'text' && evt.text.trim()) {
-      // This preview is mirrored live to observers. Under local routing the
-      // loop discards everything from an imitated results frame on; so does
-      // the preview — judged against the whole spawn so far, not this block
-      // alone, and holding back a trailing line that could still become a
-      // header (a frame split across blocks; Lumen, PR #575 round 2). The
-      // full text is in the protocol_violation entry the loop records —
-      // nothing is lost, only not republished.
-      const guarded = previewGuard.onBlock(evt.text);
-      if (guarded.publish.trim() || guarded.imitationDiscarded) {
-        runtime.log.append({
-          type: 'backend_text',
-          preview: compactForLedger(guarded.publish, 200),
-          ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
-        });
-      }
-      if (!turnDialogueMuted) {
-        spawnSaid += evt.text;
-        const said = spawnDialogueText(spawnSaid, guarded);
-        if (spawnEntryIndex === -1) {
-          if (said.trim()) {
-            turnDialogue.push({ role: 'assistant', text: said });
-            spawnEntryIndex = turnDialogue.length - 1;
-          }
-        } else {
-          turnDialogue[spawnEntryIndex] = { role: 'assistant', text: said };
-        }
-        if (guarded.imitationDiscarded) turnDialogueMuted = true;
-      }
-      renderStreamedLines(
-        streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
-      );
-    } else if (evt.kind === 'model') {
-      // Recorded unconditionally: an event that merely CONFIRMS the requested
-      // model is still this run's evidence of what served it, even though the
-      // window/transcript work below is skipped for it.
-      currentRunModel = evt.model;
-      if (evt.model !== runtime.detectedModel && evt.model !== runtime.model) {
-        // The provider announced the model actually serving the session — the
-        // ground truth for the context window. Re-resolve unless the user
-        // pinned a model explicitly (then their pin already drove resolution —
-        // an init that merely CONFIRMS the pin is skipped entirely, so pinned
-        // spawns don't re-append model_detected every process).
-        const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
+    },
+    toolStarted: (name) => printEvent(chalk.dim(`🛠 ${sbSlug} · ${name} …`)),
+    progress: emitStreamEvent,
+    modelReported: (model) => {
+      if (model !== runtime.detectedModel && model !== runtime.model) {
+        const { windowChanged } = applyDetectedModel(runtime, model, contextBudgetAuto);
         if (windowChanged) {
           printEvent(
             chalk.dim(
-              `⚙ ${evt.model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
+              `⚙ ${model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
             )
           );
           emitStatusLaneIfChanged(true);
         }
       }
-    }
-  };
+    },
+  });
+  const streamRenderer = sessionStream.renderer;
+  const handleBackendEvent = (event: BackendTurnEvent): void => sessionStream.handle(event);
+  const beginSpawn = (): void => sessionStream.beginSpawn();
+  const endSpawn = (): void => sessionStream.endSpawn();
+  const runUsage = new SessionUsage();
+  const recordRunUsage = (usage: BackendTokenUsage | undefined): void => runUsage.record(usage);
+  // Only a committed successful ordinary turn may become a reply.
+  let lastTurnAssistantText: string | null = null;
 
   const ledger = new ContextLedger();
   const sessionSignal = createSignalSink();
@@ -5715,7 +5483,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           .then((outcome) => outcome.approved),
       onResult: (result: ToolCallResult) => {
         const delivered = localDeliveredSend(result);
-        if (delivered) turnSends.push(delivered);
+        if (delivered) sessionStream.sends.push(delivered);
         if (result.status === 'blocked' || result.status === 'denied') {
           printEvent(
             chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
@@ -6004,7 +5772,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       sbSlug,
       cliAttached,
       passthroughArgs,
-      dialogue: turnDialogue,
+      dialogue: sessionStream.dialogue,
       mintId: randomUUID,
       append: (entry) => runtime.log.append(entry),
       buildEnvelope: (body, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, body, stamp),
@@ -6302,9 +6070,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     onReplyReady?: () => void
   ) => {
     if (!raw.trim()) return;
-    streamRenderer.reset();
-    turnDialogue = [];
-    turnDialogueMuted = false;
+    sessionStream.resetTurn();
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
     // list rides the same turn (injected as prompt content by adapters that
@@ -6649,8 +6415,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       label: string | undefined
     ): Promise<void> => {
       lastTurnAssistantText = null;
-      turnSends = [];
-      pendingBackendSends.clear();
+      sessionStream.resetSends();
       let reported = false;
       const report = () => {
         if (reported || !turnReplyToken) return;
@@ -6661,7 +6426,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               turn,
               label: label || 'user',
               assistantText: lastTurnAssistantText,
-              sends: turnSends,
+              sends: sessionStream.sends,
               token: turnReplyToken,
             })
           )
@@ -6736,16 +6501,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // what made ink sessions report a few hundred input tokens across
           // hundreds of messages. Context stays the ledger's own figure, which
           // was already the right measure and is not the billed sum.
-          inputTokens: runUsageTotals.inputTokens,
-          outputTokens: runUsageTotals.outputTokens,
-          cacheReadTokens: runUsageTotals.cacheReadTokens,
-          cacheWriteTokens: runUsageTotals.cacheWriteTokens,
+          inputTokens: runUsage.totals.inputTokens,
+          outputTokens: runUsage.totals.outputTokens,
+          cacheReadTokens: runUsage.totals.cacheReadTokens,
+          cacheWriteTokens: runUsage.totals.cacheWriteTokens,
         },
         // Only what the provider reported during THIS process. Requested and
         // transcript-hydrated models are excluded — reporting either would
         // attribute usage to a model that may not have served the run.
-        ...(currentRunModel ? { model: currentRunModel } : {}),
-        ...(Object.keys(runModelUsage).length > 0 ? { modelUsage: runModelUsage } : {}),
+        ...(sessionStream.currentModel ? { model: sessionStream.currentModel } : {}),
+        ...(Object.keys(runUsage.models).length > 0 ? { modelUsage: runUsage.models } : {}),
         ...(isBackendFailure ? { backendFailure: true } : {}),
       })
     );

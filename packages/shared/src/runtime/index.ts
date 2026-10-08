@@ -48,3 +48,4 @@ export { bootstrapSessionIdentity, type SessionBootstrapPorts } from './session-
 
 export * from './headless-session.js';
 export * from './session-tool-batch.js';
+export * from './session-usage.js';
