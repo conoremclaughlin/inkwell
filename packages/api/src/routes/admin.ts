@@ -88,6 +88,7 @@ import {
   lastMessageUserIds,
   MESSAGES_PAGE_SIZE,
   olderThan,
+  senderNameOfKind,
   toLastMessage,
   withLastMessage,
 } from '../services/thread-key/thread-conversation';
@@ -161,7 +162,7 @@ import { resolveAccountForPrincipal } from '../services/account-deletion/princip
 import { leaseAccountForRequest } from '../services/account-deletion/request-lease';
 import { deletionIneligibility } from '../services/account-deletion/eligibility';
 import { nudgeDeletionWorker } from '../services/account-deletion/runtime';
-import { spaceGate } from '../services/account-deletion/gate';
+import { accountGate, spaceGate } from '../services/account-deletion/gate';
 import { removeSpaceUploads } from '../services/uploads/account';
 import { cancelInklingTurns } from '../services/inklings/inkling-turns';
 
@@ -2336,6 +2337,27 @@ interface OwnedSpace {
   user_id: string;
 }
 
+/**
+ * Whether a space takes no one new: it is being deleted, or its owner's
+ * account is. A join in between would make the owner's account "own a space
+ * with other members" after its deletion had begun (ink://specs/account-
+ * deletion §8). delete_account also locks the owner's spaces before it
+ * checks their members, so a join racing it waits and then fails.
+ */
+async function spaceClosingForDeletion(
+  supabase: SupabaseClient<Database>,
+  workspaceId: string
+): Promise<boolean> {
+  if (spaceGate.isClosed(workspaceId)) return true;
+  const { data, error } = await supabase
+    .from('workspaces')
+    .select('user_id')
+    .eq('id', workspaceId)
+    .maybeSingle();
+  if (error) throw error;
+  return !!data && accountGate.isClosed(data.user_id);
+}
+
 /** The space, when the signed-in person owns it and it isn't their personal space. */
 async function ownedDeletableSpace(
   supabase: SupabaseClient<Database>,
@@ -2414,12 +2436,16 @@ router.get('/workspaces/:workspaceId/deletion-preview', async (req: Request, res
   }
 });
 
+/** How long Delete space waits for work in the space to finish before answering 409. */
+export const SPACE_DRAIN_WAIT_MS = 30_000;
+
 /**
  * DELETE /api/admin/workspaces/:workspaceId
  * Body: { confirmSlug } — the space's slug, as the confirmation shows it.
  *   → 200 { deleted: true }
- *   → 503 { error } while work in the space is still finishing: the space
- *     stays closed, and asking again resumes
+ *   → 409 { error } while work in the space is still finishing after
+ *     SPACE_DRAIN_WAIT_MS: the space stays closed, and asking again resumes
+ *   → 503 { error } while its files are still being removed, likewise
  *
  * Closes the space first (archived, and its gate closed, so no upload,
  * member or invitation enters it), stops and waits for work in it, removes
@@ -2451,16 +2477,20 @@ router.delete('/workspaces/:workspaceId', async (req: Request, res: Response) =>
       .is('archived_at', null);
     if (archiveError) throw archiveError;
 
-    // 2. Drain: stop turns of identities in the space, and wait for uploads
-    //    into it to finish.
+    // 2. Drain. Every turn of an inkling in the space, and every upload into
+    //    it, holds the space's gate until it has finished (a thread's
+    //    participants all belong to its space, so these are all the turns
+    //    its conversations have). Stop is only a signal: the space goes once
+    //    the gate is empty, and while anything is still live after the wait
+    //    the request is refused and the space stays closed, to try again.
     const { data: identities, error: identitiesError } = await supabase
       .from('agent_identities')
       .select('id')
       .eq('workspace_id', space.id);
     if (identitiesError) throw identitiesError;
     for (const identity of identities ?? []) cancelInklingTurns(identity.id);
-    if (!(await spaceGate.waitDrained(space.id, 30_000))) {
-      res.status(503).json({ error: 'Work in this space is still finishing; try again shortly' });
+    if (!(await spaceGate.waitDrained(space.id, SPACE_DRAIN_WAIT_MS))) {
+      res.status(409).json({ error: 'Work in this space is still finishing; try again shortly' });
       return;
     }
 
@@ -2500,7 +2530,7 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
     const workspaceRepo = dataComposer.repositories.workspaces;
     const usersRepo = dataComposer.repositories.users;
     const workspaceId = req.params.workspaceId;
-    if (spaceGate.isClosed(workspaceId)) {
+    if (await spaceClosingForDeletion(dataComposer.getClient(), workspaceId)) {
       res.status(409).json({ error: 'This space is being deleted' });
       return;
     }
@@ -2668,7 +2698,9 @@ router.patch('/workspaces/:workspaceId', async (req: Request, res: Response) => 
 router.post('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    if (spaceGate.isClosed(req.params.workspaceId)) {
+    if (
+      await spaceClosingForDeletion((await getDataComposer()).getClient(), req.params.workspaceId)
+    ) {
       res.status(409).json({ error: 'This space is being deleted' });
       return;
     }
@@ -2914,6 +2946,17 @@ router.post('/invitations/accept', async (req: Request, res: Response) => {
       return;
     }
     const supabase = (await getDataComposer()).getClient();
+    // No one joins a space that is being deleted, or whose owner's account is.
+    const { data: invited, error: invitedError } = await supabase
+      .from('workspace_invitations')
+      .select('workspace_id')
+      .eq('token_digest', invitationDigest(code))
+      .maybeSingle();
+    if (invitedError) throw new Error(invitedError.message);
+    if (invited && (await spaceClosingForDeletion(supabase, invited.workspace_id))) {
+      res.status(404).json(INVITATION_UNAVAILABLE);
+      return;
+    }
     const { data, error } = await supabase.rpc('accept_workspace_invitation', {
       p_token_digest: invitationDigest(code),
       p_user_id: authReq.inkUserId,
@@ -5565,8 +5608,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
             if (m.sender_kind === 'user' && m.sender_user_id) {
               return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
             }
-            if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
-            return 'system';
+            return senderNameOfKind(m.sender_kind, m.sender_agent_id);
           };
 
           for (const t of threadRows) {
@@ -8783,8 +8825,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       if (m.sender_kind === 'user' && m.sender_user_id) {
         return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
       }
-      if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
-      return 'system';
+      return senderNameOfKind(m.sender_kind, m.sender_agent_id);
     };
 
     // Reactions (spec inkling-reactions), `mine` for this viewer. Shown in

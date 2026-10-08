@@ -141,9 +141,9 @@ ALTER TABLE public.inbox_threads VALIDATE CONSTRAINT inbox_threads_closer_princi
 -- be deleted is decided by the server code; the checks below repeat that
 -- decision where the rows are, so nothing is removed if it changed.
 --
--- The users row and then the account's identities are locked first, so an
--- insert that names any of them waits for this transaction and then fails
--- its key check.
+-- The users row, then the account's identities, then its own spaces are
+-- locked first, so an insert that names any of them (a message, a thread, a
+-- membership) waits for this transaction and then fails its key check.
 
 -- search_path is public, not empty: the identity and memory archive
 -- triggers this delete fires name their history tables unqualified, and a
@@ -187,8 +187,14 @@ BEGIN
     SELECT id FROM public.agent_identities WHERE user_id = p_user_id ORDER BY id FOR UPDATE
   ) locked;
 
-  SELECT coalesce(array_agg(id), '{}'::uuid[]) INTO v_ws
-  FROM public.workspaces WHERE user_id = p_user_id;
+  -- Its own spaces are locked before their members are checked: a join is a
+  -- membership insert, whose key check on the space waits for this lock, and
+  -- once the space is gone fails. So no one can join between the check and
+  -- the delete.
+  SELECT coalesce(array_agg(id ORDER BY id), '{}'::uuid[]) INTO v_ws
+  FROM (
+    SELECT id FROM public.workspaces WHERE user_id = p_user_id ORDER BY id FOR UPDATE
+  ) locked_spaces;
 
   -- Who may be deleted, checked again where the rows are.
   IF EXISTS (

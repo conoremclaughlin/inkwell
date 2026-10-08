@@ -918,6 +918,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       },
       uploadsRoot: uploadsRoot(),
       drainTimeoutMs: 60_000,
+      sweep: { after: null },
       now: Date.now,
     });
     void nudgeDeletionWorker();

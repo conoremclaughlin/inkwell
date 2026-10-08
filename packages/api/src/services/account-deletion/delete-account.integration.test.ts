@@ -470,3 +470,133 @@ describe('delete_account and a racing insert', () => {
     }
   });
 });
+
+async function backendPid(c: Client): Promise<number> {
+  return (await c.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+}
+
+/**
+ * Resolves once backend `waiterPid` is waiting on a lock that `holderPid`
+ * holds. Pids are read beforehand: a connection whose statement is blocked
+ * answers nothing else until it finishes.
+ */
+async function blockedBy(waiterPid: number, holderPid: number): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    const { rows } = await db.query<{ blocked: boolean }>(
+      'SELECT $2::int = ANY (pg_blocking_pids($1::int)) AS blocked',
+      [waiterPid, holderPid]
+    );
+    if (rows[0].blocked) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`backend ${waiterPid} never waited on ${holderPid}`);
+}
+
+function settle(query: Promise<unknown>) {
+  const state: { settled?: 'ok' | 'failed'; code?: string; done: Promise<void> } = {
+    done: Promise.resolve(),
+  };
+  state.done = query.then(
+    () => {
+      state.settled = 'ok';
+    },
+    (error: { code?: string }) => {
+      state.settled = 'failed';
+      state.code = error.code;
+    }
+  );
+  return state;
+}
+
+describe('delete_account and a join to a space it removes', () => {
+  it("holds a membership insert into the account's own space from before its member check, and then the join fails (Lumen, #783)", async () => {
+    const lee = await account('lee');
+    const max = await account('max');
+    const { id: space } = await one<{ id: string }>(
+      `INSERT INTO workspaces (user_id, name, slug, type) VALUES ($1, 'Garden', $2, 'team') RETURNING id`,
+      [lee.id, `garden-${run}`]
+    );
+    await db.query(
+      `INSERT INTO audit_log (user_id, action, category) VALUES ($1, 'sign_in', 'auth')`,
+      [lee.id]
+    );
+    await requestAt(lee.id, 'files_removed');
+
+    const holding = await connect();
+    const deleting = await connect();
+    const joining = await connect();
+    const [deletingPid, holdingPid, joiningPid] = [
+      await backendPid(deleting),
+      await backendPid(holding),
+      await backendPid(joining),
+    ];
+    try {
+      // Holding the account's audit row stops delete_account after its
+      // checks, at the audit update, with its locks taken.
+      await holding.query('BEGIN');
+      await holding.query(`SELECT 1 FROM audit_log WHERE user_id = $1 FOR UPDATE`, [lee.id]);
+      const deletion = settle(deleting.query(`SELECT delete_account($1)`, [lee.id]));
+      await blockedBy(deletingPid, holdingPid);
+
+      // Someone joins the space now, after the member check found no one.
+      const join = settle(
+        joining.query(
+          `INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')`,
+          [space, max.id]
+        )
+      );
+      // The join waits on the deletion's lock on the space, not on the audit row.
+      await blockedBy(joiningPid, deletingPid);
+      expect(join.settled).toBeUndefined();
+
+      await holding.query('COMMIT');
+      await deletion.done;
+      await join.done;
+      expect(deletion.settled).toBe('ok');
+      expect(join.settled).toBe('failed');
+      // The join never landed, so no member of a shared space was removed with it.
+      expect(join.code).toBe('23503');
+      expect(await count(`SELECT count(*) AS n FROM workspaces WHERE id = $1`, [space])).toBe(0);
+    } finally {
+      await holding.end();
+      await deleting.end();
+      await joining.end();
+    }
+  });
+});
+
+describe("a conversation's participants all belong to its space", () => {
+  it("refuses an inkling of another space as a participant, so a space's turns are its own inklings' (Lumen, #783)", async () => {
+    const nia = await account('nia');
+    const oz = await account('oz');
+    const { id: space } = await one<{ id: string }>(
+      `INSERT INTO workspaces (user_id, name, slug, type) VALUES ($1, 'Studio', $2, 'team') RETURNING id`,
+      [nia.id, `studio-${run}`]
+    );
+    const t = await thread(space, { userId: nia.id });
+    const participate = (workspaceId: string, sbId: string) =>
+      db.query(
+        `INSERT INTO inbox_thread_participants (thread_id, workspace_id, sb_id) VALUES ($1, $2, $3)`,
+        [t, workspaceId, sbId]
+      );
+
+    // Oz's inkling lives in Oz's personal space: not a participant here,
+    // whichever space the row names.
+    await expect(participate(space, oz.inkling)).rejects.toMatchObject({ code: '23503' });
+    await expect(participate(oz.personal, oz.inkling)).rejects.toMatchObject({ code: '23503' });
+
+    // An inkling of this space is.
+    const { id: local } = await one<{ id: string }>(
+      `INSERT INTO agent_identities (user_id, workspace_id, agent_id, name, role, metadata)
+       VALUES ($1, $2, $3, 'Wick', 'Inkling', '{"client":"inkling-mobile"}') RETURNING id`,
+      [nia.id, space, `inkling-studio-${run}`]
+    );
+    await participate(space, local);
+    expect(
+      await count(
+        `SELECT count(*) AS n FROM inbox_thread_participants WHERE thread_id = $1 AND sb_id IS NOT NULL`,
+        [t]
+      )
+    ).toBe(1);
+  });
+});

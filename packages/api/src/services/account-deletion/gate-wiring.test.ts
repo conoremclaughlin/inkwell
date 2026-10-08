@@ -21,9 +21,14 @@ describe('the account gate is entered at every seam', () => {
       'accountLeases.push(accountGate.enter(inklingIdentity.userId))',
       processStart
     );
+    const space = service.indexOf(
+      'accountLeases.push(spaceGate.enter(inklingIdentity.workspaceId))',
+      processStart
+    );
     const folder = service.indexOf('ensureInklingFolder(', processStart);
     expect(enter).toBeGreaterThan(processStart);
-    expect(folder).toBeGreaterThan(enter);
+    expect(space).toBeGreaterThan(enter);
+    expect(folder).toBeGreaterThan(space);
 
     const run = service.indexOf('private async runTurn(');
     const process = service.indexOf(
@@ -80,12 +85,23 @@ describe('the account gate is entered at every seam', () => {
     }
   });
 
-  it("an upload enters its space's gate before its first await", () => {
+  it("an upload holds its account's and its space's gates from before its first await until the handler has finished", () => {
     const uploads = src('routes/thread-uploads.ts');
     const handler = uploads.indexOf('export async function postUpload(');
-    const enter = uploads.indexOf('spaceGate.enter(auth.inkWorkspaceId)', handler);
+    const account = uploads.indexOf('leases.push(accountGate.enter(auth.inkUserId))', handler);
+    const space = uploads.indexOf('leases.push(spaceGate.enter(auth.inkWorkspaceId))', handler);
     const firstAwait = uploads.indexOf('await ', handler);
-    expect(enter).toBeGreaterThan(handler);
-    expect(firstAwait).toBeGreaterThan(enter);
+    const receive = uploads.indexOf('await receiveUpload(deps, req, res);', handler);
+    const finallyAt = uploads.indexOf('} finally {', receive);
+    const release = uploads.indexOf('for (const lease of leases) lease.release();', finallyAt);
+    const body = uploads.indexOf('async function receiveUpload(', handler);
+    expect(account).toBeGreaterThan(handler);
+    expect(space).toBeGreaterThan(account);
+    expect(firstAwait).toBe(receive);
+    expect(finallyAt).toBeGreaterThan(receive);
+    expect(release).toBeGreaterThan(finallyAt);
+    expect(body).toBeGreaterThan(release);
+    // The lease is the handler's, never tied to the response closing.
+    expect(uploads.slice(handler)).not.toMatch(/res\.once\('close'[^\n]*release/);
   });
 });

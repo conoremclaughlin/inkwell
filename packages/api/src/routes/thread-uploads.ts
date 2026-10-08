@@ -37,7 +37,12 @@ import {
 import { uploadResponseHeaders } from '../services/uploads/headers';
 import { isCanonicalId, type UploadLocation } from '../services/uploads/layout';
 import { insertWithSlots } from '../services/uploads/slots';
-import { GateClosedError, spaceGate } from '../services/account-deletion/gate';
+import {
+  accountGate,
+  GateClosedError,
+  spaceGate,
+  type GateLease,
+} from '../services/account-deletion/gate';
 import { extForContentType, MAX_UPLOAD_BYTES, sniffUploadType } from '../services/uploads/sniff';
 import {
   beginRemoval,
@@ -92,11 +97,37 @@ async function findThread(
   return (data as { id: string } | null) ?? null;
 }
 
+/**
+ * The account's and the space's work gates, held by the upload itself from
+ * before its first await until after its last filesystem step, in a
+ * `finally` (ink://specs/account-deletion §3, §8). The request's own lease
+ * ends when its response closes, which a disconnect can bring before the
+ * bytes are written; this one does not end until the handler has.
+ */
 export async function postUpload(
   deps: ThreadUploadsDeps,
   req: Request,
   res: Response
 ): Promise<void> {
+  const auth = req as SignedIn;
+  const leases: GateLease[] = [];
+  try {
+    leases.push(accountGate.enter(auth.inkUserId));
+    leases.push(spaceGate.enter(auth.inkWorkspaceId));
+  } catch (error) {
+    for (const lease of leases) lease.release();
+    if (!(error instanceof GateClosedError)) throw error;
+    res.status(409).json({ error: 'This account or space is being deleted' });
+    return;
+  }
+  try {
+    await receiveUpload(deps, req, res);
+  } finally {
+    for (const lease of leases) lease.release();
+  }
+}
+
+async function receiveUpload(deps: ThreadUploadsDeps, req: Request, res: Response): Promise<void> {
   const root = deps.root();
   if (!root) {
     res.status(503).json({ error: 'Uploads are not available on this server' });
@@ -105,18 +136,6 @@ export async function postUpload(
   const auth = req as SignedIn;
   if (!deps.writeRoles.has(auth.inkWorkspaceRole)) {
     res.status(403).json({ error: 'Your role in this space cannot send messages' });
-    return;
-  }
-  // The space's gate, held until this response has closed: a space being
-  // deleted takes no new upload, and its deletion waits for this one before
-  // it removes the space's files (ink://specs/account-deletion §8). The
-  // account's own gate is held by the auth middleware already.
-  try {
-    const spaceLease = spaceGate.enter(auth.inkWorkspaceId);
-    res.once('close', () => spaceLease.release());
-  } catch (error) {
-    if (!(error instanceof GateClosedError)) throw error;
-    res.status(409).json({ error: 'This space is being deleted' });
     return;
   }
   const key = typeof req.query.key === 'string' ? req.query.key.trim() : '';

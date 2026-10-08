@@ -16,16 +16,23 @@
  *
  * What the worker does with the request is tested against a real database
  * (services/account-deletion/worker.integration.test.ts).
+ *
+ * DELETE /workspaces/:workspaceId: Delete space waits for every turn and
+ * upload inside the space's gate before it removes anything, and answers 409,
+ * deleting nothing, while one is still running after the wait.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createHash } from 'crypto';
+import { FakePostgrest } from '../test/fake-postgrest';
+import { spaceGate } from '../services/account-deletion/gate';
 
 const mockSupabaseFrom = vi.fn();
 const mockListUsers = vi.fn();
 const mockIneligibility = vi.fn();
 const mockNudge = vi.fn();
+const mockRemoveSpaceUploads = vi.fn();
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
@@ -41,6 +48,9 @@ vi.mock('@supabase/supabase-js', () => ({
 
 vi.mock('../services/account-deletion/eligibility', () => ({
   deletionIneligibility: (...args: unknown[]) => mockIneligibility(...args),
+}));
+vi.mock('../services/uploads/account', () => ({
+  removeSpaceUploads: (...args: unknown[]) => mockRemoveSpaceUploads(...args),
 }));
 vi.mock('../services/account-deletion/runtime', () => ({
   nudgeDeletionWorker: () => mockNudge(),
@@ -73,11 +83,11 @@ vi.mock('../utils/request-context', () => ({
   runWithRequestContext: (_context: Record<string, unknown>, fn: () => void) => fn(),
 }));
 
-import router from './admin';
+import router, { SPACE_DRAIN_WAIT_MS } from './admin';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 
-function getRouteHandler(method: 'post', path: string): Handler {
+function getRouteHandler(method: 'post' | 'delete', path: string): Handler {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const layer = (router as any).stack.find(
     (entry: any) => entry.route?.path === path && entry.route?.methods?.[method]
@@ -291,5 +301,87 @@ describe('POST /account/deletion', () => {
       expect(res._status).toBe(500);
       expect(res._json).not.toHaveProperty('deletion');
     }
+  });
+});
+
+describe('DELETE /workspaces/:workspaceId', () => {
+  const OWNER = 'ink-user-1';
+  const SPACE = 'space-book-club';
+  const deleteSpace = getRouteHandler('delete', '/workspaces/:workspaceId');
+  let db: FakePostgrest;
+
+  beforeEach(() => {
+    db = new FakePostgrest();
+    db.seed('workspaces', {
+      id: SPACE,
+      user_id: OWNER,
+      name: 'Book club',
+      slug: 'book-club',
+      type: 'team',
+      archived_at: null,
+    });
+    db.seed('agent_identities', { id: 'inkling-fern', workspace_id: SPACE, user_id: OWNER });
+    mockSupabaseFrom.mockImplementation((table: string) => db.from(table));
+    mockRemoveSpaceUploads.mockResolvedValue({ complete: true, removed: 0 });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    spaceGate.forget(SPACE);
+  });
+
+  const ask = async () => {
+    const res = createRes();
+    await deleteSpace(
+      {
+        ...authedReq(OWNER),
+        params: { workspaceId: SPACE },
+        body: { confirmSlug: 'book-club' },
+      } as unknown as Request,
+      res
+    );
+    return res;
+  };
+
+  it('answers 409 and removes nothing while a turn in the space is still running, then deletes once it has ended', async () => {
+    vi.useFakeTimers();
+    // A turn in the space holds its gate until its end hook has run
+    // (session-service.ts), as an upload into it does (thread-uploads.ts).
+    const turn = spaceGate.enter(SPACE);
+    const first = ask();
+    await vi.advanceTimersByTimeAsync(SPACE_DRAIN_WAIT_MS);
+    const refused = await first;
+    expect(refused._status).toBe(409);
+    expect(mockRemoveSpaceUploads).not.toHaveBeenCalled();
+    expect(db.rows('workspaces')).toHaveLength(1);
+    // Closed, so nothing new enters it while it waits to be asked again.
+    expect(spaceGate.isClosed(SPACE)).toBe(true);
+    expect(db.rows('workspaces')[0].archived_at).not.toBeNull();
+    expect(() => spaceGate.enter(SPACE)).toThrow();
+
+    turn.release();
+    const deleted = await ask();
+    expect(deleted._status).toBe(200);
+    expect(deleted._json).toEqual({ deleted: true });
+    expect(mockRemoveSpaceUploads).toHaveBeenCalledTimes(1);
+    expect(db.rows('workspaces')).toHaveLength(0);
+  });
+
+  it('waits for a turn that ends during the wait, and removes nothing until it has', async () => {
+    vi.useFakeTimers();
+    const turn = spaceGate.enter(SPACE);
+    let inFlightAtRemoval = -1;
+    mockRemoveSpaceUploads.mockImplementation(async () => {
+      inFlightAtRemoval = spaceGate.inFlightCount(SPACE);
+      return { complete: true, removed: 0 };
+    });
+    const asked = ask();
+    await vi.advanceTimersByTimeAsync(SPACE_DRAIN_WAIT_MS / 2);
+    expect(mockRemoveSpaceUploads).not.toHaveBeenCalled();
+    turn.release();
+    const res = await asked;
+    expect(res._status).toBe(200);
+    expect(inFlightAtRemoval).toBe(0);
+    expect(db.rows('workspaces')).toHaveLength(0);
   });
 });

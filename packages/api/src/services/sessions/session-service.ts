@@ -48,7 +48,12 @@ import {
   admitStateWrite,
 } from './active-runs.js';
 import { launchHoldFor, reserveLaunch } from './launched-processes.js';
-import { accountGate, GateClosedError, type GateLease } from '../account-deletion/gate.js';
+import {
+  accountGate,
+  GateClosedError,
+  spaceGate,
+  type GateLease,
+} from '../account-deletion/gate.js';
 import { uploadMediaForRunner } from '../uploads/runner-media.js';
 import { uploadsRoot } from '../uploads/runtime.js';
 import {
@@ -2713,11 +2718,17 @@ export class SessionService implements ISessionService {
         // touches a file and held through its end (runTurn): a deletion
         // either sees this turn and waits for it, or this turn sees the
         // account closed and starts nothing (ink://specs/account-deletion §3).
+        // Its space's gate too: the space of every conversation it takes part
+        // in, so deleting that space waits for this turn to finish
+        // (ink://specs/account-deletion §8).
         try {
           accountLeases.push(accountGate.enter(inklingIdentity.userId));
+          if (inklingIdentity.workspaceId) {
+            accountLeases.push(spaceGate.enter(inklingIdentity.workspaceId));
+          }
         } catch (error) {
           if (error instanceof GateClosedError) {
-            return refuseInklingTurn('this account is being deleted');
+            return refuseInklingTurn('its account or space is being deleted');
           }
           throw error;
         }
