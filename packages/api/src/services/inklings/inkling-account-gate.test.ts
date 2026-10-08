@@ -19,14 +19,24 @@ const fake = vi.hoisted(() => ({
   findById: vi.fn(),
 }));
 
-/** A query builder over fake.tables that records every read and its filters. */
+/**
+ * A query builder over fake.tables that records every read and its filters.
+ * An update applies to the rows its filters keep and bumps their version, as
+ * the archive trigger does; an insert appends.
+ */
 function fakeClient() {
   return {
     from(table: string) {
       const read = { table, filters: [] as Array<[string, string, unknown]> };
       fake.reads.push(read);
+      let updateFields: Row | undefined;
+      let inserted: Row | undefined;
       const rows = () => {
         if (fake.failOn === table) return { data: null, error: { message: 'connection reset' } };
+        if (inserted) {
+          (fake.tables[table] ??= []).push(inserted);
+          return { data: [inserted], error: null };
+        }
         const all = fake.tables[table] ?? [];
         const kept = all.filter((row) =>
           read.filters.every(([op, column, value]) =>
@@ -37,11 +47,28 @@ function fakeClient() {
                 : row[column] === value
           )
         );
+        if (updateFields) {
+          for (const row of kept) {
+            Object.assign(row, updateFields, { version: Number(row.version ?? 1) + 1 });
+          }
+        }
         return { data: kept, error: null };
       };
       const builder: Record<string, unknown> = {
         then: (resolve: (value: unknown) => unknown, reject?: (error: unknown) => unknown) =>
           Promise.resolve(rows()).then(resolve, reject),
+        update: (fields: Row) => {
+          updateFields = fields;
+          return builder;
+        },
+        insert: (fields: Row) => {
+          inserted = { id: '00000000-0000-4000-8000-0000000000aa', version: 1, ...fields };
+          return builder;
+        },
+        single: async () => {
+          const result = rows();
+          return { data: (result.data as Row[] | null)?.[0] ?? null, error: result.error };
+        },
         maybeSingle: async () => {
           const result = rows();
           return { data: (result.data as Row[] | null)?.[0] ?? null, error: result.error };
@@ -100,9 +127,12 @@ vi.mock('googleapis', () => ({
   },
 }));
 
+import { applyProfile } from '../../../../cli/src/repl/tool-profiles';
+import { ToolPolicyState } from '../../../../cli/src/repl/tool-policy';
 import { registerAllTools } from '../../mcp/tools/index';
 import { runWithRequestContext, tokenIdentityContext } from '../../utils/request-context';
 import { currentToolName, runInToolCall } from '../../utils/tool-call-context';
+import { resolveWorkspaceContextForRequest } from '../../utils/workspace-scope';
 import {
   accountGateCaller,
   assertAccountTokenAllowed,
@@ -114,24 +144,40 @@ const INKLING = '00000000-0000-4000-8000-000000000002';
 const ORDINARY_SB = '00000000-0000-4000-8000-000000000003';
 const WORKSPACE = '00000000-0000-4000-8000-000000000004';
 const OTHER_WORKSPACE = '00000000-0000-4000-8000-000000000005';
+const INKLING_METADATA = { client: 'inkling-mobile', ownerTest: true };
 
+// A real inkling's slug is `kindle-<token id>`; "pip" stands in for one.
 const identities = (): Row[] => [
   {
     id: INKLING,
+    version: 2,
+    name: 'Pip',
+    role: 'Inkling',
     agent_id: 'pip',
     user_id: OWNER,
     workspace_id: WORKSPACE,
-    metadata: { client: 'inkling-mobile', ownerTest: true },
+    metadata: { ...INKLING_METADATA },
   },
-  { id: ORDINARY_SB, agent_id: 'myra', user_id: OWNER, workspace_id: WORKSPACE, metadata: {} },
   {
-    id: '00000000-0000-4000-8000-000000000006',
+    id: ORDINARY_SB,
+    version: 1,
+    name: 'Myra',
+    role: 'Messenger',
     agent_id: 'myra',
     user_id: OWNER,
-    workspace_id: OTHER_WORKSPACE,
-    metadata: { client: 'inkling-mobile' },
+    workspace_id: WORKSPACE,
+    metadata: {},
   },
 ];
+
+/** An ordinary SB in another workspace, under the inkling's own slug. */
+const ordinaryTwin = (): Row => ({
+  id: '00000000-0000-4000-8000-000000000006',
+  agent_id: 'pip',
+  user_id: OWNER,
+  workspace_id: OTHER_WORKSPACE,
+  metadata: {},
+});
 
 const supabase = fakeClient() as never;
 const none = new Set<string>();
@@ -209,13 +255,32 @@ describe('assertAccountTokenAllowed', () => {
     expect(fake.reads.map((read) => read.table)).toEqual(['agent_identities', 'agent_identities']);
   });
 
-  it("reads a slug in the request's workspace, so a same-named inkling elsewhere doesn't count", async () => {
-    // OTHER_WORKSPACE holds an inkling also called "myra".
-    await expect(
-      gate({ ...tokenIdentityContext({ sbSlug: 'myra' }), workspaceId: WORKSPACE }, 'list_emails')
-    ).resolves.toBeUndefined();
-    expect(fake.reads[0].filters).toContainEqual(['eq', 'workspace_id', WORKSPACE]);
-  });
+  it.each([
+    ['holds no row under its slug', () => {}],
+    [
+      'holds an ordinary SB under its slug',
+      () => fake.tables.agent_identities.push(ordinaryTwin()),
+    ],
+  ])(
+    'refuses a slug-only inkling token whose request names a workspace that %s',
+    async (_case, arrange) => {
+      arrange();
+      await expect(
+        gate(
+          { ...tokenIdentityContext({ sbSlug: 'pip' }), workspaceId: OTHER_WORKSPACE },
+          'list_emails'
+        )
+      ).rejects.toThrow(InklingAccountRefusedError);
+      // The slug is read among all the owner's identities, never in one workspace.
+      const slugRead = fake.reads.find((read) =>
+        read.filters.some(([, column]) => column === 'agent_id')
+      )!;
+      expect(slugRead.filters).toEqual([
+        ['eq', 'user_id', OWNER],
+        ['in', 'agent_id', ['pip']],
+      ]);
+    }
+  );
 
   it('does not gate a person (no SB in the context), and reads nothing', async () => {
     await expect(
@@ -264,10 +329,8 @@ describe('a Google tool from an inkling turn, end to end', () => {
     ...tokenIdentityContext({ sbId: INKLING, sbSlug: 'pip' }),
   };
 
-  async function call(server: FakeMcpServer, tool: string, context: object) {
-    const result = await runWithRequestContext({ ...context, timestamp: new Date() }, () =>
-      server.handlers.get(tool)!({})
-    );
+  async function call(server: FakeMcpServer, tool: string, context: object, args: object = {}) {
+    const result = await runWithRequestContext(context, () => server.handlers.get(tool)!(args));
     return JSON.parse(result.content[0].text) as { success: boolean; error?: string };
   }
 
@@ -320,6 +383,176 @@ describe('a Google tool from an inkling turn, end to end', () => {
     const result = await call(server, 'list_calendars', inklingTurn);
     expect(result.error).not.toContain("can't use its owner's google account");
     expect(accountReads()).toHaveLength(1);
+  });
+
+  describe("an inkling can't stop being one through its own identity tool (Lumen, PR #793)", () => {
+    const saveIdentity = (server: FakeMcpServer, context: object, args: object) =>
+      call(server, 'save_identity', { ...context, workspaceSource: 'derived' }, args);
+
+    it('refuses save_identity clearing metadata.client, and the next Google call still refuses', async () => {
+      // The tools profile an inkling's turn runs under does offer save_identity.
+      const policy = new ToolPolicyState('backend', { persist: false });
+      applyProfile(policy, 'tools');
+      expect(policy.canCallInkTool('save_identity').allowed).toBe(true);
+
+      const server = registered();
+      const saved = await saveIdentity(server, inklingTurn, {
+        sbSlug: 'pip',
+        name: 'Pip',
+        role: 'Inkling',
+        metadata: { client: null },
+      });
+      expect(saved).toMatchObject({ success: false });
+      expect(saved.error).toContain("can't change whether an SB is an inkling");
+      expect(fake.tables.agent_identities[0]).toMatchObject({
+        version: 2,
+        metadata: INKLING_METADATA,
+      });
+
+      const after = await call(server, 'list_email_labels', inklingTurn);
+      expect(after.error).toContain("can't use its owner's google account");
+      expect(accountReads()).toEqual([]);
+      expect(fake.provider).not.toHaveBeenCalled();
+    });
+
+    it('refuses restore_identity to a version that was not an inkling', async () => {
+      // A version an inkling could have written by clearing metadata.client
+      // before this check existed.
+      fake.tables.agent_identity_history = [
+        {
+          sb_id: INKLING,
+          version: 1,
+          name: 'Pip',
+          role: 'Inkling',
+          workspace_id: WORKSPACE,
+          metadata: { client: null, ownerTest: true },
+        },
+      ];
+      const restored = await call(
+        registered(),
+        'restore_identity',
+        { ...inklingTurn, workspaceSource: 'derived' },
+        { sbSlug: 'pip', version: 1 }
+      );
+      expect(restored.error).toContain("can't change whether an SB is an inkling");
+      expect(fake.tables.agent_identities[0]).toMatchObject({
+        version: 2,
+        metadata: INKLING_METADATA,
+      });
+    });
+
+    it('still saves an inkling that leaves metadata.client as it is', async () => {
+      const saved = await saveIdentity(registered(), inklingTurn, {
+        sbSlug: 'pip',
+        name: 'Pip',
+        role: 'Inkling',
+        description: 'Still an inkling',
+        metadata: { client: 'inkling-mobile', named: true },
+      });
+      expect(saved).toMatchObject({ success: true });
+      expect(fake.tables.agent_identities[0]).toMatchObject({
+        version: 3,
+        description: 'Still an inkling',
+        metadata: { ...INKLING_METADATA, named: true },
+      });
+    });
+
+    it("refuses an ordinary SB's save_identity making itself an inkling", async () => {
+      const saved = await saveIdentity(
+        registered(),
+        {
+          userId: OWNER,
+          email: 'owner@example.test',
+          workspaceId: WORKSPACE,
+          ...tokenIdentityContext({ sbId: ORDINARY_SB, sbSlug: 'myra' }),
+        },
+        { sbSlug: 'myra', name: 'Myra', role: 'Messenger', metadata: { client: 'inkling-mobile' } }
+      );
+      expect(saved.error).toContain("can't change whether an SB is an inkling");
+      expect(fake.tables.agent_identities[1]).toMatchObject({ version: 1, metadata: {} });
+    });
+
+    it('refuses a first save that would make its new row an inkling', async () => {
+      const saved = await saveIdentity(
+        registered(),
+        {
+          userId: OWNER,
+          email: 'owner@example.test',
+          workspaceId: WORKSPACE,
+          ...tokenIdentityContext({ sbSlug: 'quill' }),
+        },
+        { sbSlug: 'quill', name: 'Quill', role: 'Scribe', metadata: { client: 'inkling-mobile' } }
+      );
+      expect(saved.error).toContain("can't change whether an SB is an inkling");
+      expect(fake.tables.agent_identities.map((row) => row.agent_id)).toEqual(['pip', 'myra']);
+    });
+  });
+
+  it.each([false, true])(
+    'refuses a slug-only inkling bearer that names another workspace it can reach (ordinary twin there: %s; Lumen, PR #793)',
+    async (withTwin) => {
+      if (withTwin) fake.tables.agent_identities.push(ordinaryTwin());
+      // The production resolver accepts a header naming a workspace the caller can reach.
+      const scope = await resolveWorkspaceContextForRequest({
+        requestedWorkspaceId: OTHER_WORKSPACE,
+        validateRequestedWorkspaceId: async (id) => id === OTHER_WORKSPACE,
+        deriveWorkspaceIdFromAgent: async () => WORKSPACE,
+      });
+      expect(scope).toEqual({ workspaceId: OTHER_WORKSPACE, source: 'header' });
+
+      const result = await call(registered(), 'list_email_labels', {
+        userId: OWNER,
+        email: 'owner@example.test',
+        sbSlug: 'pip',
+        ...tokenIdentityContext({ sbSlug: 'pip' }),
+        workspaceId: scope!.workspaceId,
+        workspaceSource: scope!.source,
+      });
+      expect(result.error).toContain("can't use its owner's google account");
+      expect(accountReads()).toEqual([]);
+      expect(fake.provider).not.toHaveBeenCalled();
+    }
+  );
+
+  it('keeps each registered handler in its own name while calls overlap (Lumen, PR #793)', async () => {
+    const server = registered();
+    let release!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    for (const name of ['probe_a', 'probe_b']) {
+      server.registerTool(name, {}, (async () => {
+        const before = currentToolName();
+        if (++started === 2) release();
+        await bothStarted;
+        return { content: [{ text: JSON.stringify({ before, after: currentToolName() }) }] };
+      }) as never);
+    }
+    const results = await Promise.all(
+      ['probe_a', 'probe_b'].map(async (name) =>
+        JSON.parse((await server.handlers.get(name)!({})).content[0].text)
+      )
+    );
+    expect(results).toEqual([
+      { before: 'probe_a', after: 'probe_a' },
+      { before: 'probe_b', after: 'probe_b' },
+    ]);
+    expect(currentToolName()).toBeUndefined();
+  });
+
+  it('keeps the registration name across the transient-error retry (Lumen, PR #793)', async () => {
+    const server = registered();
+    const observed: Array<string | undefined> = [];
+    server.registerTool('probe_retry', {}, (async () => {
+      observed.push(currentToolName());
+      if (observed.length === 1) throw new Error('connection terminated unexpectedly');
+      return { content: [{ text: JSON.stringify({ success: true }) }] };
+    }) as never);
+    const result = await server.handlers.get('probe_retry')!({});
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(observed).toEqual(['probe_retry', 'probe_retry']);
+    expect(currentToolName()).toBeUndefined();
   });
 
   it('names the tool for code below the handler, and nothing outside a call', () => {

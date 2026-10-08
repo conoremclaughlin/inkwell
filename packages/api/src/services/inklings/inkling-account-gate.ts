@@ -21,10 +21,13 @@
  * - the SB the bearer token was minted for (tokenSbId, signed);
  * - the SB the context names (sbId, which may come from the caller's
  *   session rather than the token);
- * - the slugs beside them, looked up among the account owner's identities
- *   in the request's workspace.
+ * - the slugs beside them, looked up among all of the account owner's
+ *   identities, in every workspace.
  * Any one being an inkling is enough. No SB at all (a person, or work
  * outside a request) is not gated. A failed identity read refuses.
+ *
+ * Being an inkling is read from metadata.client, which no identity write can
+ * change (assertInklingStatusKept in identity-handlers.ts).
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -51,7 +54,6 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface AccountGateCaller {
   sbIds: string[];
   sbSlugs: string[];
-  workspaceId?: string;
 }
 
 export function accountGateCaller(
@@ -64,7 +66,6 @@ export function accountGateCaller(
   return {
     sbIds: ids.filter((id) => UUID.test(id)).map((id) => id.toLowerCase()),
     sbSlugs: unique([context?.tokenSlug, context?.sbSlug]),
-    workspaceId: context?.workspaceId,
   };
 }
 
@@ -76,9 +77,15 @@ interface IdentityRow {
 /**
  * The inklings among the caller's SBs. UUIDs and slugs are both read: a
  * token minted with a slug alone, beside a context naming another SB by
- * UUID, must not pass on the UUID. A slug is read among the account owner's
- * identities, in the request's workspace when it has one (a slug is unique
- * only within a workspace).
+ * UUID, must not pass on the UUID.
+ *
+ * A slug is read among all of the account owner's identities, never only in
+ * the request's workspace. A slug-only token is bound to no workspace, and
+ * the caller picks the request's workspace with a header from any it can
+ * reach, so reading the slug there let an inkling's token pass from a
+ * workspace where its slug is missing or names an ordinary SB (Lumen,
+ * PR #793). An inkling's slug is `kindle-<token id>` and never renamed, so an
+ * ordinary SB elsewhere doesn't share it by chance.
  */
 async function callingInklings(
   supabase: SupabaseClient,
@@ -90,13 +97,13 @@ async function callingInklings(
     reads.push(supabase.from('agent_identities').select('id, metadata').in('id', caller.sbIds));
   }
   if (caller.sbSlugs.length > 0) {
-    let bySlug = supabase
-      .from('agent_identities')
-      .select('id, metadata')
-      .eq('user_id', ownerUserId)
-      .in('agent_id', caller.sbSlugs);
-    if (caller.workspaceId) bySlug = bySlug.eq('workspace_id', caller.workspaceId);
-    reads.push(bySlug);
+    reads.push(
+      supabase
+        .from('agent_identities')
+        .select('id, metadata')
+        .eq('user_id', ownerUserId)
+        .in('agent_id', caller.sbSlugs)
+    );
   }
   const rows: IdentityRow[] = [];
   for (const { data, error } of await Promise.all(reads)) {
