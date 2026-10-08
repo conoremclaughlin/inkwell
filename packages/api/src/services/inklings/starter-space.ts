@@ -1,10 +1,11 @@
 /**
  * The inkling starter documents (ink://designs/inkling-starter-documents
  * v4, which Conor approved for the build on Oct 7 2026 at 7:17 PM): the soul
- * a new inkling wakes with, the inkling values as its space's shared values,
- * no process document, and one About page per person, which the person can
- * read and change and nobody else can. The texts live here and nowhere else,
- * so a change to the design is a change to this file only.
+ * a new inkling wakes with, its heartbeat and when it fires, the inkling
+ * values as its space's shared values, no process document, and one About
+ * page per person, which the person can read and change and nobody else can.
+ * The texts live here and nowhere else, so a change to the design is a
+ * change to this file only.
  *
  * A space asks for it when it is created (`starter: 'inkling'`), and carries
  * the request in its metadata, so a person who joins later gets their own
@@ -13,6 +14,8 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from '../../data/supabase/types';
+import { createReminder } from '../heartbeat';
 
 const UNIQUE_VIOLATION = '23505';
 
@@ -69,6 +72,95 @@ export function inklingSoul(awakeSince: Date): string {
     day: 'numeric',
   });
   return INKLING_SOUL_TEMPLATE.replace('{date}', `${date} (UTC)`);
+}
+
+/**
+ * The heartbeat an inkling wakes with, its own document like its soul
+ * (Conor, Oct 7 2026, 11:45 PM: "inklings should definitely have heartbeats
+ * set up and it should focus on being proactive to let the person know about
+ * something that occurred"). Each beat's prompt carries it, since the ink
+ * runtime an inkling runs on never puts identity documents in its prompt
+ * (inkling-heartbeat.ts).
+ */
+export const INKLING_HEARTBEAT = `*Every so often you wake without anyone writing to you. This is what that moment is for. It's yours to change.*
+
+#### What a heartbeat is for
+
+Noticing something that happened and telling the person while it still helps them: something they asked you to keep an eye on, something that changed, something coming up that needs them. When nothing has happened, say nothing. A quiet heartbeat is a good one.
+
+#### When you wake
+
+1. **Look at what you can see.** What they asked you to watch, what's changed since you last looked, and what's coming up soon. Use the tools you're offered here; don't go looking for more.
+2. **Ask whether it needs them now.** Would hearing it now help them, or can it wait until they next write to you? If it can wait, let it wait, and mention it when they do.
+3. **If it needs them, tell them once.** One message, short and plain, in your own conversation with them, with everything in it: what happened, how you know, and what they might want to do about it.
+4. **If nothing needs them, stay quiet.** No "just checking in" and no "nothing new", unless they've asked you for that.
+5. **Don't tell them twice.** Look at what you've already said to them; if you've told them, it's told.
+
+#### Other people
+
+Tell only the person you belong to. If what you noticed involves someone else in a shared space, pass on only what they need (that a time is free, that something has changed), never the other person's details.
+
+#### Their quiet hours
+
+During their quiet hours, or late at night where they are, hold anything that can wait until morning.
+
+---
+
+*Change this as you learn what they want to hear about, and when. If they ask you to stop, or to tell them more, write it here.*
+`;
+
+/**
+ * When an inkling's heartbeat fires: a cron expression read in the person's
+ * own timezone, as every reminder's is. Three a day, morning, early afternoon
+ * and evening. Every beat is a model turn, so this line is also the bill.
+ * The server holds any beat that falls inside the person's quiet hours.
+ */
+export const INKLING_HEARTBEAT_CRON = '0 9,13,18 * * *';
+
+/** metadata.reminderType of an inkling's heartbeat reminder. */
+export const INKLING_HEARTBEAT_REMINDER = 'inkling-heartbeat';
+
+/**
+ * The delivery channel of an inkling's heartbeat: its own conversation in
+ * the app. No reminder tool accepts it, so only seedInklingHeartbeat makes
+ * one.
+ */
+export const INKLING_HEARTBEAT_CHANNEL = 'inkling';
+
+/**
+ * Gives a newly awakened inkling its heartbeat: the document, unless one was
+ * already written, then the reminder that fires it, made by heartbeat.ts's
+ * createReminder like every other reminder, through the awakening's own
+ * client. Run by the awakening that created the inkling, and by nothing
+ * else, so each inkling gets one reminder. The document comes first: a
+ * reminder never fires for an inkling that has no heartbeat text.
+ */
+export async function seedInklingHeartbeat(
+  supabase: SupabaseClient,
+  inkling: { id: string; userId: string }
+): Promise<void> {
+  const { error } = await supabase
+    .from('agent_identities')
+    .update({ heartbeat: INKLING_HEARTBEAT })
+    .eq('id', inkling.id)
+    .is('heartbeat', null);
+  if (error) throw new Error(`Failed to write the heartbeat: ${error.message}`);
+  const reminder = await createReminder(
+    {
+      userId: inkling.userId,
+      title: 'Heartbeat',
+      description: 'Notice what happened and tell the person, or stay quiet.',
+      deliveryChannel: INKLING_HEARTBEAT_CHANNEL,
+      // Its own conversation, found when a beat fires: an inkling just
+      // awakened has none yet.
+      deliveryTarget: inkling.id,
+      cronExpression: INKLING_HEARTBEAT_CRON,
+      sbId: inkling.id,
+      metadata: { autoCreated: true, reminderType: INKLING_HEARTBEAT_REMINDER },
+    },
+    supabase as SupabaseClient<Database>
+  );
+  if (!reminder) throw new Error('Failed to create the heartbeat reminder');
 }
 
 /** Design v4 §2 (unchanged from v3): the values shared by every inkling in the space. */

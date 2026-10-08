@@ -16,7 +16,9 @@
  *   request, even when two retries race.
  * - Naming changes the display name only. The slug never changes, so
  *   memories, threads and routing follow the inkling.
- * - Nothing here runs a model, opens a thread or wakes anyone.
+ * - Nothing here runs a model, opens a thread or wakes anyone. Awakening
+ *   schedules the inkling's heartbeat, which wakes it later
+ *   (inkling-heartbeat.ts).
  *
  * Every lookup is scoped to the person and the workspace the request
  * resolved (AGENTS.md: workspace scope is server-derived).
@@ -32,7 +34,7 @@ import { cancelInklingTurns } from './inkling-turns';
 import { dropReplyChainsFor } from './inkling-reply-chain';
 import { logger } from '../../utils/logger';
 import { INKLING_CLIENT } from './inkling-client';
-import { ensureInklingStarterSet, inklingSoul } from './starter-space';
+import { ensureInklingStarterSet, inklingSoul, seedInklingHeartbeat } from './starter-space';
 
 /** The identity metadata tag for inklings born through this flow (defined in inkling-client.ts). */
 export { INKLING_CLIENT };
@@ -566,6 +568,18 @@ export class InklingService {
 
     const identity = await this.readIdentity(childSbId, scope);
     if (!identity) throw new Error(`Awakened identity ${childSbId} could not be read back`);
+    // Its heartbeat, made here and nowhere else: only this request created
+    // the inkling (a retry replays above), so it gets one reminder. Best
+    // effort, like the starter set: the inkling is awake either way.
+    await seedInklingHeartbeat(this.supabase, {
+      id: identity.id,
+      userId: scope.userId,
+    }).catch((error) =>
+      logger.warn('Inkling awakened without its heartbeat', {
+        sbId: identity.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
     logger.info('Inkling awakened', {
       userId: scope.userId,
       workspaceId: scope.workspaceId,

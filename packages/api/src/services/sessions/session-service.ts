@@ -128,6 +128,7 @@ import {
 } from '../../config/execution-tier.js';
 import { INKLING_CLIENT } from '../inklings/inkling-client.js';
 import { isUuid } from '../inklings/inkling-service.js';
+import { isOwnersHeartbeat } from '../inklings/inkling-heartbeat.js';
 
 /**
  * Configuration for SessionService.
@@ -2675,15 +2676,24 @@ export class SessionService implements ISessionService {
       };
       const ownerTestUserIds = inklingOwnerTestUserIds();
       // Only the inkling's own owner can have sent the message that wakes
-      // it. Whether that owner is in the test at all is the refusal's call.
+      // it, or it is the inkling's own heartbeat firing in its conversation
+      // with that owner (inkling-heartbeat.ts), which only the reminder
+      // delivery marks. Whether that owner is in the test at all is the
+      // refusal's call.
       const ownerMessage =
-        inklingIdentity.kind === 'inkling'
-          ? await isOwnersOwnMessage(this.supabase, {
-              threadMessageId: metadata?.triggerThreadMessageId,
-              inklingId: inklingIdentity.id,
-              ownerUserId: inklingIdentity.userId,
-            })
-          : 'no';
+        inklingIdentity.kind !== 'inkling'
+          ? 'no'
+          : request.inklingHeartbeat
+            ? await isOwnersHeartbeat(this.supabase, {
+                reminderId: request.inklingHeartbeat.reminderId,
+                threadKey: metadata?.threadKey,
+                inkling: inklingIdentity,
+              })
+            : await isOwnersOwnMessage(this.supabase, {
+                threadMessageId: metadata?.triggerThreadMessageId,
+                inklingId: inklingIdentity.id,
+                ownerUserId: inklingIdentity.userId,
+              });
       const inklingRefusal = inklingTurnRefusal(
         { identity: inklingIdentity, userId, ownerMessage },
         ownerTestUserIds

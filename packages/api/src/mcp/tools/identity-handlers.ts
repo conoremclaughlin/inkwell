@@ -21,6 +21,7 @@ import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/use
 import { ensureDefaultReminders } from '../../services/heartbeat';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 import { nameOf } from '../../services/identity-name';
+import { INKLING_CLIENT } from '../../services/inklings/inkling-client';
 
 // =====================================================
 // SCHEMAS
@@ -209,11 +210,47 @@ function metadataObject(value: Json | undefined): Record<string, Json | undefine
   return value;
 }
 
+const isInklingMetadata = (metadata: Json | null | undefined): boolean =>
+  !!metadata &&
+  typeof metadata === 'object' &&
+  !Array.isArray(metadata) &&
+  metadata.client === INKLING_CLIENT;
+
+/**
+ * Whether an SB is an inkling is settled when it is awakened, and an identity
+ * write never changes it, in either direction. The inkling account gate, the
+ * turn and thread gates and the execution tier all read metadata.client, and
+ * an inkling may call save_identity on its own row: before this check,
+ * `metadata: { client: null }` took it out of every one of them (Lumen,
+ * PR #793).
+ */
+function assertInklingStatusKept(
+  before: Json | null | undefined,
+  after: Json | null | undefined
+): void {
+  if (isInklingMetadata(before) === isInklingMetadata(after)) return;
+  throw new Error(
+    "An identity write can't change whether an SB is an inkling (metadata.client): " +
+      'that is settled when the inkling is awakened.'
+  );
+}
+
+/** A first save. It can't make the new row an inkling either. */
+async function insertIdentity(
+  supabase: ReturnType<DataComposer['getClient']>,
+  fields: TablesInsert<'agent_identities'>
+) {
+  assertInklingStatusKept(null, fields.metadata);
+  return supabase.from('agent_identities').insert(fields).select().single();
+}
+
 /**
  * A merge from a stale read can still drop an operator's intervening metadata
  * edit. The archive trigger increments version on every metadata change, so
  * compare-and-swap the row and rebuild from a fresh snapshot on conflict.
  * Never retry as an unguarded write, or switch to another identity/scope.
+ * Every build is checked against the snapshot its compare-and-swap is pinned
+ * to, so no write moves the row in or out of being an inkling.
  */
 async function updateIdentityWithRetry(
   supabase: ReturnType<DataComposer['getClient']>,
@@ -222,9 +259,11 @@ async function updateIdentityWithRetry(
 ) {
   let current = initial;
   for (let attempt = 0; attempt < 3; attempt++) {
+    const fields = buildFields(current);
+    if (fields.metadata !== undefined) assertInklingStatusKept(current.metadata, fields.metadata);
     let update = supabase
       .from('agent_identities')
-      .update(buildFields(current))
+      .update(fields)
       .eq('id', initial.id)
       .eq('user_id', initial.user_id);
     update =
@@ -439,7 +478,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   // keyed on a NULL-able column cannot express "update the existing row".
   const { data, error } = existing
     ? await updateIdentityWithRetry(supabase, existing, buildIdentityFields)
-    : await supabase.from('agent_identities').insert(buildIdentityFields(null)).select().single();
+    : await insertIdentity(supabase, buildIdentityFields(null));
 
   if (error) {
     logger.error('Failed to save identity', { error, sbSlug });

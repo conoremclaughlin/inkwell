@@ -32,6 +32,7 @@ class FakeQuery {
   private filters: Array<(r: Row) => boolean> = [];
   private sorts: Array<{ col: string; ascending: boolean }> = [];
   private limitN?: number;
+  private offset = 0;
 
   constructor(
     private rows: Row[],
@@ -79,6 +80,12 @@ class FakeQuery {
   }
   limit(n: number) {
     this.limitN = n;
+    return this;
+  }
+  /** Rows `from` through `to`, inclusive, as PostgREST's Range header asks. */
+  range(from: number, to: number) {
+    this.offset = from;
+    this.limitN = to - from + 1;
     return this;
   }
   gte(col: string, val: unknown) {
@@ -133,6 +140,7 @@ class FakeQuery {
         return ascending ? av.localeCompare(bv) : bv.localeCompare(av);
       });
     }
+    if (this.offset > 0) matched = matched.slice(this.offset);
     if (this.limitN !== undefined) matched = matched.slice(0, this.limitN);
     return matched.map((r) => ({ ...r }));
   }
