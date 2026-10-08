@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { FakePostgrest } from '../../test/fake-postgrest';
 import {
   WorkspacesRepository,
-  keepingMembershipMode,
+  keepingFixedMetadata,
 } from '../../data/repositories/workspaces.repository';
 import { handleAddWorkspaceMember, handleUpdateWorkspace } from './workspace-handlers';
 
@@ -112,12 +112,12 @@ describe('editing a group’s metadata', () => {
   });
 });
 
-describe('keepingMembershipMode', () => {
+describe('keepingFixedMetadata', () => {
   it('keeps the mode as created, whatever the new metadata says', () => {
-    expect(keepingMembershipMode({ membershipMode: 'invite_only' }, null)).toEqual({
+    expect(keepingFixedMetadata({ membershipMode: 'invite_only' }, null)).toEqual({
       membershipMode: 'invite_only',
     });
-    expect(keepingMembershipMode(null, { membershipMode: 'invite_only', a: 1 })).toEqual({ a: 1 });
-    expect(keepingMembershipMode(undefined, null)).toBeNull();
+    expect(keepingFixedMetadata(null, { membershipMode: 'invite_only', a: 1 })).toEqual({ a: 1 });
+    expect(keepingFixedMetadata(undefined, null)).toBeNull();
   });
 });

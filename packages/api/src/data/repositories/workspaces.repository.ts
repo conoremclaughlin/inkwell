@@ -75,18 +75,34 @@ const isPlainObject = (value: unknown): value is Record<string, Json | undefined
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /**
- * Metadata as an update would leave it, with the group's membership mode as it
- * was when the group was created: an invite-only group stays invite-only, and
- * no group becomes invite-only later. Every other key is the caller's to set.
+ * The metadata keys a space is given when it is made and never changes after:
+ * its membership mode (an invite-only group stays invite-only, and no group
+ * becomes invite-only later) and its starter (an inkling space stays one,
+ * which is what gives each person who joins their own About page).
  */
-export function keepingMembershipMode(current: unknown, next: Json): Json {
-  const mode = isPlainObject(current) ? current.membershipMode : undefined;
-  if (!isPlainObject(next)) {
-    return mode === undefined ? next : { membershipMode: mode };
+const FIXED_METADATA_KEYS = ['membershipMode', 'starter'] as const;
+
+/**
+ * Metadata as an update would leave it, with the fixed keys as they were:
+ * whatever the caller sends for them is dropped, and what the space had is
+ * kept. Every other key is the caller's to set.
+ */
+export function keepingFixedMetadata(current: unknown, next: Json): Json {
+  const fixed: Record<string, unknown> = {};
+  for (const key of FIXED_METADATA_KEYS) {
+    const value = isPlainObject(current) ? current[key] : undefined;
+    if (value !== undefined) fixed[key] = value;
   }
-  const { membershipMode: _ignored, ...rest } = next;
-  return (mode === undefined ? rest : { ...rest, membershipMode: mode }) as Json;
+  if (!isPlainObject(next)) {
+    return Object.keys(fixed).length === 0 ? next : (fixed as Json);
+  }
+  const rest: Record<string, unknown> = { ...next };
+  for (const key of FIXED_METADATA_KEYS) delete rest[key];
+  return { ...rest, ...fixed } as Json;
 }
+
+/** Attempts at a read-then-write before it gives up on a space that keeps changing. */
+const COMPARE_AND_SET_ATTEMPTS = 3;
 
 export class WorkspacesRepository {
   constructor(private client: SupabaseClient<Database>) {}
@@ -297,32 +313,56 @@ export class WorkspacesRepository {
     if (input.type !== undefined) updateData.type = input.type;
     if (input.description !== undefined) updateData.description = input.description;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
-    if (input.metadata !== undefined) {
+    if (input.metadata === undefined) {
+      const { data, error } = await this.client
+        .from('workspaces')
+        .update(updateData)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(`Failed to update workspace: ${error.message}`);
+      }
+      return this.mapContainerRow(data as Record<string, unknown>);
+    }
+
+    // Metadata is read, merged and written back as a compare-and-set on
+    // updated_at (set by update_workspaces_updated_at on every write), so a
+    // write that lands between the read and this one, such as an awakening
+    // marking the space an inkling space, is read again and kept rather than
+    // overwritten by a stale copy.
+    for (let attempt = 0; attempt < COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
       const { data: current, error: readError } = await this.client
         .from('workspaces')
-        .select('metadata')
+        .select('metadata, updated_at')
         .eq('id', id)
         .eq('user_id', userId)
         .maybeSingle();
       if (readError) {
         throw new Error(`Failed to update workspace: ${readError.message}`);
       }
-      updateData.metadata = keepingMembershipMode(current?.metadata, input.metadata);
+      if (!current) throw new Error('Failed to update workspace: not found');
+
+      const write = this.client
+        .from('workspaces')
+        .update({ ...updateData, metadata: keepingFixedMetadata(current.metadata, input.metadata) })
+        .eq('id', id)
+        .eq('user_id', userId);
+      // The column allows null: a null stamp is compared as null.
+      const { data, error } = await (
+        current.updated_at == null
+          ? write.is('updated_at', null)
+          : write.eq('updated_at', current.updated_at)
+      ).select();
+      if (error) {
+        throw new Error(`Failed to update workspace: ${error.message}`);
+      }
+      const written = (data ?? [])[0];
+      if (written) return this.mapContainerRow(written as Record<string, unknown>);
+      // Changed since the read: read it again.
     }
-
-    const { data, error } = await this.client
-      .from('workspaces')
-      .update(updateData)
-      .eq('id', id)
-      .eq('user_id', userId)
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to update workspace: ${error.message}`);
-    }
-
-    return this.mapContainerRow(data as Record<string, unknown>);
+    throw new Error('Failed to update workspace: it kept changing while this update was made');
   }
 
   async ensurePersonalWorkspace(userId: string): Promise<Workspace> {
