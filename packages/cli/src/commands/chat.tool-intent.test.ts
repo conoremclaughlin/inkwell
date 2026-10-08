@@ -40,7 +40,18 @@ describe('chat tool-intent boundary', () => {
     const tree = ts.createSourceFile('chat.ts', source, ts.ScriptTarget.Latest, true);
     const committers: string[] = [];
     const outcomes: string[] = [];
+    const batchLogs: string[] = [];
     function visit(node: ts.Node) {
+      if (ts.isCallExpression(node) && node.expression.getText(tree) === 'runSessionToolBatch') {
+        const options = node.arguments[1];
+        expect(ts.isObjectLiteralExpression(options)).toBe(true);
+        if (ts.isObjectLiteralExpression(options)) {
+          const property = options.properties.find((p) => p.name?.getText(tree) === 'log');
+          expect(property && ts.isPropertyAssignment(property)).toBe(true);
+          if (property && ts.isPropertyAssignment(property))
+            batchLogs.push(property.initializer.getText(tree));
+        }
+      }
       if (ts.isCallExpression(node) && node.expression.getText(tree) === 'executeToolCalls') {
         const options = node.arguments[1];
         expect(ts.isObjectLiteralExpression(options)).toBe(true);
@@ -73,15 +84,17 @@ describe('chat tool-intent boundary', () => {
       ts.forEachChild(node, visit);
     }
     visit(tree);
-    expect(committers).toEqual([
-      'toolIntentCommitter(opts.log)',
-      'toolIntentCommitter(runtime.log)',
-    ]);
-    expect(outcomes).toEqual([
-      "'clone_tool_call'",
-      "'local_tool_call'",
-      "'local_tool_call'",
-      "'local_tool_call'",
-    ]);
+    expect(committers).toEqual(['toolIntentCommitter(opts.log)']);
+    expect(outcomes).toEqual(["'clone_tool_call'"]);
+    expect(batchLogs).toEqual(['runtime.log']);
+    const shared = readFileSync(
+      new URL('../../../shared/src/runtime/session-tool-batch.ts', import.meta.url),
+      'utf8'
+    );
+    expect(shared).toContain('commitIntent: createToolIntentCommitter(ports.log)');
+    expect(shared).toContain("type: 'local_tool_call'");
+    expect(shared).toContain('invocationId: result.invocationId');
+    expect(shared).toContain('dispatchState: result.dispatchState');
+    expect(shared.match(/ports\.log\.append\(\{ \.\.\.common,/g)).toHaveLength(3);
   });
 });
