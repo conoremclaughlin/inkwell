@@ -21,6 +21,7 @@ import {
   getDesktopGoogleCredentialStore,
   type DesktopGoogleCredentialStore,
 } from './google-desktop-credentials';
+import { assertAccountTokenAllowed } from './inklings/inkling-account-gate';
 import { TOKEN_REFRESH_WINDOW_MS } from './oauth-refresh-window';
 
 // OAuth provider configurations
@@ -133,6 +134,8 @@ export interface OAuthServiceOptions {
   /** Credential sources in the order they are tried; defaults to GOOGLE_CREDENTIAL_SOURCES. */
   sources?: GoogleCredentialSource[];
   desktopStore?: DesktopGoogleCredentialStore;
+  /** Runs before any token is handed out; defaults to the inkling account gate. */
+  accountGate?: typeof assertAccountTokenAllowed;
 }
 
 /** A user's email stays valid for a minute — the binding key for desktop files. */
@@ -142,12 +145,14 @@ class OAuthService {
   private supabase: SupabaseClient;
   private readonly sources: GoogleCredentialSource[];
   private readonly desktopStore: DesktopGoogleCredentialStore;
+  private readonly accountGate: typeof assertAccountTokenAllowed;
   private readonly userEmails = new Map<string, { email: string | null; at: number }>();
 
   constructor(options: OAuthServiceOptions = {}) {
     this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     this.sources = options.sources ?? parseGoogleCredentialSources(env.GOOGLE_CREDENTIAL_SOURCES);
     this.desktopStore = options.desktopStore ?? getDesktopGoogleCredentialStore();
+    this.accountGate = options.accountGate ?? assertAccountTokenAllowed;
   }
 
   /** The credential sources this service tries for Google, in order. */
@@ -754,6 +759,9 @@ class OAuthService {
     provider: string,
     workspaceId?: string | null
   ): Promise<string> {
+    // An inkling's turn gets no token unless its tool is turned on for
+    // inklings, checked before any account is read (inkling-account-gate.ts).
+    await this.accountGate(this.supabase, provider, userId);
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     if (!this.usesDesktopSource(provider)) {
       const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);

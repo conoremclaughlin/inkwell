@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { runInToolCall } from '../../utils/tool-call-context';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
 import {
   describeToolSchema,
@@ -458,8 +459,12 @@ export function registerAllTools(
         inputSchema: (config as { inputSchema?: unknown }).inputSchema,
       });
     }
-    const handler = rest[rest.length - 1];
-    if (typeof handler === 'function') {
+    const registered = rest[rest.length - 1];
+    if (typeof registered === 'function') {
+      // Every handler runs inside its tool's name, so the services below it
+      // can tell what tool they serve (the inkling account gate reads it).
+      const handler = (...handlerArgs: any[]) =>
+        runInToolCall(name, () => registered(...handlerArgs));
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
         const start = performance.now();
         try {
