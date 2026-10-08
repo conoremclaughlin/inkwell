@@ -85,6 +85,20 @@ describe('authenticators', () => {
     expect(authenticatorFrom(`otpauth://totp/x?secret=${'A'.repeat(17)}`)).toBeNull();
   });
 
+  it('reads a long run of padding in linear time', () => {
+    // /=+$/ backtracks on every position of a run of `=` that doesn't end the
+    // text: 40,000 of them took 2.4 s, so this took about a minute.
+    expect(base32Bytes(`${sha1}${'='.repeat(200_000)}x`)).toBeNull();
+    expect(base32Bytes(`${sha1}${'='.repeat(200_000)}`)).toEqual(
+      Buffer.from('12345678901234567890')
+    );
+  });
+
+  it('refuses anything longer than an otpauth address could need, before reading it', () => {
+    expect(authenticatorFrom(`${sha1}${' '.repeat(4096)}`)).toBeNull();
+    expect(authenticatorFrom(`${sha1}${' '.repeat(100)}`)).not.toBeNull();
+  });
+
   it('refuses what isn’t an authenticator', () => {
     for (const input of [
       '',

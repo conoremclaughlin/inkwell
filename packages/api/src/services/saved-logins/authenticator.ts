@@ -18,6 +18,19 @@ export interface Authenticator {
 }
 
 const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+/** Longer than any setup key or otpauth address, and refused before it is read. */
+const MAX_INPUT = 2048;
+
+/**
+ * The text without its trailing `=` padding. A loop, not /=+$/: that regex
+ * backtracks from every `=` in a run that doesn't end the text, which is
+ * quadratic, and the text is whatever a person sent.
+ */
+function withoutPadding(text: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === '=') end -= 1;
+  return text.slice(0, end);
+}
 
 /**
  * Bytes of a base32 secret, ignoring case, spaces, dashes and padding; null if
@@ -26,7 +39,7 @@ const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
  * dropped to make it fit.
  */
 export function base32Bytes(input: string): Buffer | null {
-  const clean = input.toUpperCase().replace(/[\s-]/g, '').replace(/=+$/, '');
+  const clean = withoutPadding(input.toUpperCase().replace(/[\s-]/g, ''));
   if (!clean || /[^A-Z2-7]/.test(clean)) return null;
   if (![0, 2, 4, 5, 7].includes(clean.length % 8)) return null;
   let bits = 0;
@@ -50,6 +63,7 @@ export function base32Bytes(input: string): Buffer | null {
  * a secret under 80 bits, or settings outside what authenticator apps use.
  */
 export function authenticatorFrom(input: string): Authenticator | null {
+  if (input.length > MAX_INPUT) return null;
   const text = input.trim();
   let secret = text;
   let algorithm: TotpAlgorithm = 'SHA1';
@@ -77,7 +91,7 @@ export function authenticatorFrom(input: string): Authenticator | null {
   const bytes = base32Bytes(secret);
   if (!bytes || bytes.length < 10) return null;
   return {
-    secret: secret.toUpperCase().replace(/[\s-]/g, '').replace(/=+$/, ''),
+    secret: withoutPadding(secret.toUpperCase().replace(/[\s-]/g, '')),
     algorithm,
     digits,
     period,
