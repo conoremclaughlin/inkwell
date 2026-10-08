@@ -254,7 +254,10 @@ describe('web_fetch never records a query string', () => {
         res.writeHead(302, { location: '/bin?second=SENTINEL_BIN_REDIRECTED' });
         res.end();
       } else if (path === '/loop') {
-        res.writeHead(302, { location: req.url });
+        // Back to itself with its query, from a fixed path: a redirect to
+        // req.url as it arrived reads to CodeQL as an open redirect (#115).
+        const query = (req.url ?? '').split('?')[1] ?? '';
+        res.writeHead(302, { location: `/loop?${query}` });
         res.end();
       } else if (path === '/zstd') {
         res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'zstd' });
