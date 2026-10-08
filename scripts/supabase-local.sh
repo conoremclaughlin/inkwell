@@ -4,6 +4,7 @@
 #
 #   yarn supabase:start            # supabase start
 #   yarn supabase:local db reset   # any command that (re)creates the database
+#   yarn supabase:local db diff --local --schema public   # its shadow database too
 #
 # A plain `supabase start` no longer works here: supabase/config.toml takes
 # the root key from SUPABASE_DB_ROOT_KEY, and without it the database

@@ -20,11 +20,37 @@ supabase_root_key_file() {
   printf '%s' "${SUPABASE_DB_ROOT_KEY_FILE:-${HOME}/.ink/secrets/supabase-db-root-key}"
 }
 
+# The file's access control list entries, one per line; nothing if it has
+# none; a failure if they can't be read. An ACL grants access the mode bits
+# don't show, and on macOS an `@` for extended attributes takes the place of
+# the `+` that marks one in `ls -l`, so the list itself is read.
+supabase_root_key_acl() {
+  local file="$1" listing
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    listing="$(ls -le "${file}")" || return 1
+    printf '%s\n' "${listing}" | sed -n '2,$p'
+  elif command -v getfacl >/dev/null 2>&1; then
+    getfacl --absolute-names --skip-base --omit-header "${file}" 2>/dev/null || return 1
+  else
+    # Without getfacl, GNU ls marks an extended ACL with a `+` after the mode.
+    listing="$(ls -ld "${file}")" || return 1
+    if [[ "${listing:10:1}" == "+" ]]; then echo "an access control list"; fi
+  fi
+}
+
+supabase_root_key_acl_repair() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    printf 'chmod -N "%s"' "$1"
+  else
+    printf 'setfacl -b "%s"' "$1"
+  fi
+}
+
 # Exports SUPABASE_DB_ROOT_KEY from the file, or says what is wrong with the
 # file, naming it, and returns 1. An inherited SUPABASE_DB_ROOT_KEY is never
 # used: the file is the one source.
 load_supabase_root_key() {
-  local file mode key
+  local file mode acl key
   file="$(supabase_root_key_file)"
   unset SUPABASE_DB_ROOT_KEY
   if [[ -L "${file}" ]]; then
@@ -43,6 +69,14 @@ load_supabase_root_key() {
   mode="$(ls -l "${file}" | cut -c5-10)"
   if [[ "${mode}" != "------" ]]; then
     echo "[supabase] The Vault root key file ${file} can be read by others; run: chmod 600 \"${file}\"" >&2
+    return 1
+  fi
+  if ! acl="$(supabase_root_key_acl "${file}")"; then
+    echo "[supabase] Could not read the access control list of the Vault root key file ${file}." >&2
+    return 1
+  fi
+  if [[ -n "${acl}" ]]; then
+    echo "[supabase] The Vault root key file ${file} has an access control list, which can let others read it whatever its mode; remove it with: $(supabase_root_key_acl_repair "${file}")" >&2
     return 1
   fi
   key="$(tr -d '[:space:]' < "${file}")"

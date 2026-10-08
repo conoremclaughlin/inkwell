@@ -156,10 +156,12 @@ unless `--include-all` is given. `db:migrate` has no such rule.
 
 The one place order is enforced is a build from an empty database, which runs
 every file in name order. A file stamped earlier than one it depends on fails
-there and nowhere else. The check is a shadow build (Docker, about 30 seconds):
+there and nowhere else. The check is a shadow build (Docker, about 30 seconds),
+run through the wrapper because the shadow database is started with the Vault
+root key `supabase/config.toml` asks for:
 
 ```bash
-supabase db diff --local --schema public
+yarn supabase:local db diff --local --schema public
 ```
 
 It applies all files in order to a throwaway database and prints the schema
