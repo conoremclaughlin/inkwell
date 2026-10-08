@@ -43,9 +43,11 @@ using `jq`) and prompts you to restart Docker Desktop.
   restart it:
   ```bash
   supabase stop
-  supabase start
+  yarn supabase:start
   ```
-  (Data is preserved — `supabase start` reuses the named volumes.)
+  (Data is preserved: a start reuses the named volumes. `yarn supabase:start`
+  loads the Vault root key a plain `supabase start` no longer has; see
+  `scripts/lib/supabase-root-key.sh`.)
 - **Don't lower `max-size` below ~10m.** Debug logs around a real outage
   are useful; overly aggressive rotation hides them.
 - If a single container is growing by gigabytes/day, rotation alone

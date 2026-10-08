@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -273,6 +274,38 @@ def prepare(root, workdir, config, until=None):
         say("Rehearsal: applying migrations before " + until + " (" + str(withheld) + " withheld)")
 
 
+ROOT_KEY_FILE = "root-key"
+
+
+def stack_root_key(workdir):
+    """This test stack's own Vault root key (supabase/config.toml, [db] root_key).
+
+    config.toml reads the key from SUPABASE_DB_ROOT_KEY, and a stack started
+    without one keeps restarting its database. Each stack gets a random key,
+    kept beside its state (mode 600) so a retained stack starts and resets
+    with the same one. An inherited SUPABASE_DB_ROOT_KEY is never used, so the
+    root checkout's real key never reaches a test container. Never printed.
+    """
+    path = workdir / ROOT_KEY_FILE
+    if path.is_symlink():
+        raise Refusal("Refusing a symlinked test stack root key.")
+    if path.exists():
+        key = path.read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise Refusal("The test stack's root key file is malformed; use --stop, then retry.")
+        return key
+    key = secrets.token_hex(32)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(key + "\n")
+    return key
+
+
+def stack_env(env, workdir):
+    """The environment for a command that (re)creates the stack's database."""
+    return dict(env, SUPABASE_DB_ROOT_KEY=stack_root_key(workdir))
+
+
 def read_state(path):
     if not path.exists():
         return None
@@ -425,7 +458,7 @@ def manage(root, harness, args, env):
             if state:
                 shutil.rmtree(cache / "supabase")
                 state_path.unlink()
-                for name in (BASELINE_FILE, "run.json"):
+                for name in (BASELINE_FILE, "run.json", ROOT_KEY_FILE):
                     (cache / name).unlink(missing_ok=True)
             return 0
         config = configuration(root, project, ports)
@@ -469,7 +502,7 @@ def manage(root, harness, args, env):
                 say("Starting test stack " + project)
                 started = True
                 subprocess.check_call(["supabase", "start", "--workdir", str(workdir), "--exclude", exclude],
-                                      stdout=subprocess.DEVNULL, pass_fds=lock_fds)
+                                      stdout=subprocess.DEVNULL, pass_fds=lock_fds, env=stack_env(env, workdir))
                 ready = True
             else:
                 say("Reusing test stack " + project + " (no container recreation)")
@@ -488,7 +521,7 @@ def manage(root, harness, args, env):
                 say("Resetting test DB (migrations + seed)")
                 try:
                     subprocess.check_call(["supabase", "db", "reset", "--workdir", str(workdir), "--local"],
-                                          stdout=subprocess.DEVNULL, pass_fds=lock_fds)
+                                          stdout=subprocess.DEVNULL, pass_fds=lock_fds, env=stack_env(env, workdir))
                 finally:
                     # Reset recreates Postgres. Even a failed reset can replace
                     # its ID; retain ownership, but never a ready fingerprint.
@@ -515,6 +548,8 @@ def manage(root, harness, args, env):
                              INTEGRATION_MIGRATIONS_DIR=str(root / "supabase" / "migrations"),
                              INTEGRATION_MANAGED_API_PORT=str(ports[0]),
                              INTEGRATION_MANAGED_DB_PORT=str(ports[1]))
+            # The suite never needs a root key, the stack's or the operator's.
+            suite_env.pop("SUPABASE_DB_ROOT_KEY", None)
             marker["phase"] = "testing"
             write_state(marker_path, marker)
             say("Run focused DB tests sparingly; fixture cleanup does not repair schema drift. Use --reset if needed.")
