@@ -54,6 +54,10 @@ describe('classifyAddress', () => {
     ['::1', 'loopback'],
     ['[::1]', 'loopback'],
     ['::7f00:1', 'reserved'],
+    // The same IPv4-compatible block written with a dotted quad. ipaddr.js
+    // reads these as IPv4-mapped, which would make ::8.8.8.8 public.
+    ['::127.0.0.1', 'reserved'],
+    ['::8.8.8.8', 'reserved'],
     ['100::1', 'reserved'],
     ['2001::1', 'reserved'],
     ['2001:2::1', 'reserved'],
