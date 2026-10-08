@@ -62,3 +62,10 @@ export * from './local-tool-catalog.js';
 export * from './tool-dispatch.js';
 
 export * from './credential-resolver.js';
+
+export * from './session-tools.js';
+export * from './local-tool-instruction.js';
+export * from './backend-tool-passthrough.js';
+
+export * from './clone-registry.js';
+export * from './clone-policy.js';

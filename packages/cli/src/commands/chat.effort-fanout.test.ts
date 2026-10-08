@@ -21,7 +21,11 @@ const compactionSource = readFileSync(
   join(here, '../../../shared/src/providers/session-compaction.ts'),
   'utf8'
 );
-const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource;
+const cloneSource = readFileSync(
+  join(here, '../../../shared/src/node-host/session-clones.ts'),
+  'utf8'
+);
+const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource + '\n' + cloneSource;
 
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
@@ -58,6 +62,8 @@ describe('effort reaches every backend spawn in chat.ts', () => {
     expect(cliSource).toMatch(/sbSlug,\s*cliAttached,\s*passthroughArgs,/);
     expect(cliSource).toContain('startTurn: startBackendTurn');
     expect(cliSource).toContain('provider: providerPorts,');
+    expect(cliSource).toMatch(/createSessionClones\(\{\s*runtime,/);
+    expect(cloneSource).toContain('const cloneEffort = runtime.effort;');
     expect(cliSource).toContain('await runSessionAgentTurn(');
     expect(cliSource).toMatch(/createSessionCompaction\(\{\s*runtime,\s*ledger,\s*sessionContext,/);
     expect(cliSource).toMatch(/sessionEvictedEntries,\s*sbSlug,\s*cliAttached,/);

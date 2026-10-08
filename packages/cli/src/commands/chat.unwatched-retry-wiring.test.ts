@@ -12,7 +12,10 @@ import { dirname, join } from 'path';
  * owner was lost on Oct 7, and it is the same for every SB on ink.
  */
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'chat.ts'), 'utf8');
+const source =
+  readFileSync(join(here, 'chat.ts'), 'utf8') +
+  '\n' +
+  readFileSync(join(here, '../../../shared/src/node-host/session-clones.ts'), 'utf8');
 
 const parentComposition = readFileSync(
   join(here, '../../../shared/src/providers/session-agent-turn.ts'),

@@ -100,7 +100,7 @@ describe('envelopeShapeKey', () => {
  * from chat.ts forwards the override.
  */
 describe('every backend turn forwards the override', () => {
-  const chatSource =
+  let chatSource =
     readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'chat.ts'), 'utf-8') +
     '\n' +
     readFileSync(
@@ -110,6 +110,16 @@ describe('every backend turn forwards the override', () => {
       ),
       'utf8'
     );
+
+  const cloneSource = readFileSync(
+    join(
+      dirname(fileURLToPath(import.meta.url)),
+      '../../../shared/src/node-host/session-clones.ts'
+    ),
+    'utf8'
+  );
+
+  chatSource += '\n' + cloneSource;
 
   /** The balanced-brace object literal passed to a `<fn>({ ... })` call. */
   const callArguments = (source: string, index: number): string => {

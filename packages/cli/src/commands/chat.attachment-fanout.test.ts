@@ -25,7 +25,11 @@ const compactionSource = readFileSync(
   join(here, '../../../shared/src/providers/session-compaction.ts'),
   'utf8'
 );
-const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource;
+const cloneSource = readFileSync(
+  join(here, '../../../shared/src/node-host/session-clones.ts'),
+  'utf8'
+);
+const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource + '\n' + cloneSource;
 
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {

@@ -27,18 +27,25 @@ describe('production chat signal binding', () => {
     const headlessCalls: ts.CallExpression[] = [];
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node)) {
-        if (
-          node.expression.getText(ast) === 'handleClientLocalTool' &&
-          node.arguments[2]?.getText(ast) === 'ledger'
-        )
-          parentCalls.push(node);
+        if (node.expression.getText(ast) === 'createSessionTools') parentCalls.push(node);
         if (node.expression.getText(ast) === 'runHeadlessSession') headlessCalls.push(node);
       }
       ts.forEachChild(node, visit);
     };
     visit(chat!);
     expect(parentCalls).toHaveLength(1);
-    expect(parentCalls[0]!.arguments[3]?.getText(ast)).toBe('sessionSignal');
+    const parentPorts = parentCalls[0]!.arguments[0] as ts.ObjectLiteralExpression;
+    const sink = parentPorts.properties.find((p) => p.name?.getText(ast) === 'signalState');
+    expect(sink && ts.isPropertyAssignment(sink) && sink.initializer.getText(ast)).toBe(
+      'sessionSignal'
+    );
+    const parentSource = readFileSync(
+      new URL('../../../shared/src/runtime/session-tools.ts', import.meta.url),
+      'utf8'
+    );
+    expect(parentSource).toMatch(
+      /handleClientLocalTool\(tool, args, ports\.ledger, ports\.signalState,/
+    );
     expect(headlessCalls).toHaveLength(1);
     const ports = headlessCalls[0]!.arguments[1]!;
     expect(ts.isObjectLiteralExpression(ports)).toBe(true);

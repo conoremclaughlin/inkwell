@@ -28,10 +28,14 @@ const compaction = readFileSync(
 );
 
 describe('chat.ts provider-sample wiring', () => {
-  const cloneStart = source.indexOf('const cloneRunTurn = async (');
-  const cloneEnd = source.indexOf('\n    };\n', cloneStart);
-  const cloneTurn = source.slice(cloneStart, cloneEnd);
-  const parent = source.slice(0, cloneStart) + source.slice(cloneEnd);
+  const cloneSource = readFileSync(
+    join(here, '../../../shared/src/node-host/session-clones.ts'),
+    'utf8'
+  );
+  const cloneStart = cloneSource.indexOf('const cloneRunTurn = async (');
+  const cloneEnd = cloneSource.indexOf('\n    };\n', cloneStart);
+  const cloneTurn = cloneSource.slice(cloneStart, cloneEnd);
+  const parent = source;
 
   it("samples usage where each of the parent's spawn results lands — right after it is recorded, before the loop goes on", () => {
     const sites = [...provider.matchAll(/ports\.recordUsage\((\w+)\.usage\);\n\s*(\S[^\n]*)/g)];
@@ -45,7 +49,7 @@ describe('chat.ts provider-sample wiring', () => {
 
   it("a clone's turn is costed but never sampled — its window is not the parent's", () => {
     expect(cloneStart).toBeGreaterThan(0);
-    expect(cloneTurn).toContain('recordRunUsage(result.usage)');
+    expect(cloneTurn).toContain('ports.recordUsage(result.usage)');
     expect(cloneTurn).not.toContain('sampleProviderContext');
   });
 

@@ -12,7 +12,9 @@ import { dirname, join } from 'path';
  * wiring a unit test cannot reach.
  */
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'chat.ts'), 'utf8');
+const cli = readFileSync(join(here, 'chat.ts'), 'utf8');
+const clones = readFileSync(join(here, '../../../shared/src/node-host/session-clones.ts'), 'utf8');
+const source = cli + '\n' + clones;
 const provider = readFileSync(
   join(here, '../../../shared/src/providers/session-provider.ts'),
   'utf8'
@@ -35,6 +37,9 @@ const noteSpawn = provider.slice(
 describe('runAgentLoop hosts and their relay budgets', () => {
   it('there are exactly two production hosts: the parent turn and the clone', () => {
     expect(loopCalls).toHaveLength(2);
+    expect(cli).toMatch(
+      /createSessionClones\(\{[\s\S]*?registry: cloneRegistry,\s*sessionContext,/
+    );
     expect(source.match(/await runSessionAgentTurn\(/g)).toHaveLength(1);
     expect(source).not.toContain('createSessionProviderTurn(');
     expect(parentComposition).toContain('backend: { runTurn: providerTurn.runTurn }');
@@ -71,7 +76,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(provider).toMatch(
       /const contSessionId =\s*contSpawn\.sessionArgs\.backendSessionId \?\? contSpawn\.sessionArgs\.backendSessionSeedId;\s*const contImages = ports\.contextImagesFor\?\.\(contSessionId\);/
     );
-    expect(source).toContain('const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));');
+    expect(source).toContain('const turn = ports.startTurn(cloneRequest(prompt, sessionArgs));');
     const builder = provider.slice(
       provider.indexOf('const continuationRequest = ('),
       provider.indexOf('const relayOccupancy =')
@@ -136,9 +141,9 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     // these pins ensure both real executors share that same session object.
     const wraps =
       source.match(
-        /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
+        /const settleContextMutation = sessionContext\.beginMutation\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
       ) ?? [];
-    expect(wraps).toHaveLength(1); // Clone stays local; parent delegates the whole batch.
+    expect(wraps).toHaveLength(1); // Clone and parent share one mutation state across the extracted compositions.
     expect(source).toContain('beginContextMutation: beginContextMutationFor,');
     const batch = readFileSync(
       join(here, '../../../shared/src/runtime/session-tool-batch.ts'),
@@ -153,7 +158,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
-      /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
+      /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = ports\.startTurn\(cloneRequest\(prompt, sessionArgs\)\);/
     );
     expect(provider).toMatch(
       /if \(\s*ports\.mutationsInFlight\(\) > 0 \|\|\s*statelessGenerationAtReport !== ports\.contextGeneration\(\)\s*\) \{\s*return undefined;/
