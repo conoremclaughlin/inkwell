@@ -44,11 +44,18 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
   router.post('/lifecycle', async (req: Request, res: Response) => {
     try {
       // Authenticate using same JWT as MCP requests
-      const userData = authProvider.verifyAccessToken(req.headers.authorization);
-      if (!userData) {
-        res.status(401).json({ success: false, error: 'Authentication required' });
+      const verdict = await authProvider.verifyAccessToken(req.headers.authorization);
+      if (!verdict.ok) {
+        res.status(verdict.status).json({
+          success: false,
+          error:
+            verdict.status === 503
+              ? 'Could not check the token; try again'
+              : 'Authentication required',
+        });
         return;
       }
+      const userData = verdict.token;
 
       const {
         sessionId,

@@ -22,6 +22,30 @@ import {
 } from '../../auth/ink-tokens';
 import { resolveAccountForPrincipal } from '../../services/account-deletion/principal';
 import { accountGate } from '../../services/account-deletion/gate';
+import { tokenIdentityState } from '../../auth/token-identity';
+
+/** A signed, unexpired `mcp_access` token's claims. */
+export interface VerifiedAccessToken {
+  userId: string;
+  email: string;
+  sbSlug?: string;
+  sbId?: string;
+  /** Signed runner binding — authenticated, unlike the x-ink-context header. */
+  sessionId?: string;
+  contactId?: string;
+  /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
+  expiresAt?: number;
+}
+
+/**
+ * A request's bearer token, judged:
+ * - `ok`: signed, unexpired, and any SB it names still exists;
+ * - 401: missing, invalid or expired, or naming an SB with no identity row;
+ * - 503: the SB it names couldn't be read, so the request can't be judged.
+ */
+export type AccessTokenVerdict =
+  | { ok: true; token: VerifiedAccessToken }
+  | { ok: false; status: 401 | 503 };
 
 /**
  * Carry an SB binding across the rename on a pending-auth JWT.
@@ -278,22 +302,15 @@ export class InkAuthProvider {
       }
     }
 
-    // Resolve canonical identity UUID when agent_id is provided
+    // A login that names an SB binds that SB's UUID, or is refused. A slug is
+    // unique only within a workspace, and a refresh record bound by slug alone
+    // outlives its SB: mcp_tokens_sb_id_fkey deletes only the records that
+    // carry sb_id (PR #795).
     let sbId: string | undefined;
     if (codeData.sbSlug) {
-      const { data: identity } = await this.supabase
-        .from('agent_identities')
-        .select('id')
-        .eq('user_id', codeData.userId)
-        .eq('agent_id', codeData.sbSlug)
-        .maybeSingle();
-      sbId = identity?.id;
-      if (!sbId) {
-        logger.warn('No agent_identities record found for token binding', {
-          userId: codeData.userId,
-          sbSlug: codeData.sbSlug,
-        });
-      }
+      const binding = await this.resolveLoginSb(codeData.userId, codeData.sbSlug);
+      if (!binding.ok) return binding.error;
+      sbId = binding.sbId;
     }
 
     // Create refresh token in database (with optional identity binding)
@@ -349,6 +366,60 @@ export class InkAuthProvider {
     };
   }
 
+  /**
+   * The one identity a login's SB slug names among its account's SBs. Reads up
+   * to two rows, so that none and more than one are told apart from a failed
+   * read: the first two refuse the login, and a failed read is a server error
+   * the client can retry. Never throws.
+   */
+  private async resolveLoginSb(
+    userId: string,
+    sbSlug: string
+  ): Promise<{ ok: true; sbId: string } | { ok: false; error: OAuthErrorResponse }> {
+    let rows: Array<{ id: string }> | null = null;
+    let failure: string | null = null;
+    try {
+      const result = await this.supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', sbSlug)
+        .limit(2);
+      rows = result.data;
+      failure = result.error?.message ?? null;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    if (failure !== null) {
+      logger.error('Could not read the SB a login names', { userId, sbSlug, error: failure });
+      return {
+        ok: false,
+        error: { error: 'server_error', error_description: 'Identity lookup failed' },
+      };
+    }
+    if (!rows || rows.length === 0) {
+      logger.warn('Refused a login naming an SB its account does not have', { userId, sbSlug });
+      return {
+        ok: false,
+        error: { error: 'invalid_grant', error_description: 'This account has no SB of that name' },
+      };
+    }
+    if (rows.length > 1) {
+      logger.warn('Refused a login naming an SB slug held by more than one identity', {
+        userId,
+        sbSlug,
+      });
+      return {
+        ok: false,
+        error: {
+          error: 'invalid_grant',
+          error_description: 'More than one SB on this account has that name',
+        },
+      };
+    }
+    return { ok: true, sbId: rows[0].id };
+  }
+
   // --------------------------------------------------------------------------
   // Token exchange: refresh_token (POST /token)
   // --------------------------------------------------------------------------
@@ -390,17 +461,30 @@ export class InkAuthProvider {
   // Token verification (for /mcp endpoint auth)
   // --------------------------------------------------------------------------
 
-  verifyAccessToken(authHeader: string | undefined): {
-    userId: string;
-    email: string;
-    sbSlug?: string;
-    sbId?: string;
-    /** Signed runner binding — authenticated, unlike the x-ink-context header. */
-    sessionId?: string;
-    contactId?: string;
-    /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
-    expiresAt?: number;
-  } | null {
+  /**
+   * Every server path that takes an `mcp_access` token checks it here: the
+   * signature and expiry, and then that the SB it names still exists. A
+   * deleted space takes its SBs' identity rows with it, and its tokens are
+   * refused from their next request (token-identity.ts, task 3f7f6a8f).
+   */
+  async verifyAccessToken(authHeader: string | undefined): Promise<AccessTokenVerdict> {
+    const token = this.verifyAccessTokenSignature(authHeader);
+    if (!token) return { ok: false, status: 401 };
+    const state = await tokenIdentityState(this.supabase, {
+      userId: token.userId,
+      sbId: token.sbId,
+      sbSlug: token.sbSlug,
+    });
+    if (state === 'gone') return { ok: false, status: 401 };
+    if (state === 'unreadable') return { ok: false, status: 503 };
+    return { ok: true, token };
+  }
+
+  /**
+   * The signature and expiry alone, with no database read. A request is
+   * never authorised on this: use verifyAccessToken.
+   */
+  verifyAccessTokenSignature(authHeader: string | undefined): VerifiedAccessToken | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 

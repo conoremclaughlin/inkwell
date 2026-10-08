@@ -22,7 +22,11 @@ function getEventsHandler(router: any): (req: unknown, res: unknown) => Promise<
 
 // ── Mocks ──
 function makeAuthProvider(result: { userId: string; sbId?: string } | null) {
-  return { verifyAccessToken: vi.fn().mockReturnValue(result) };
+  return {
+    verifyAccessToken: vi
+      .fn()
+      .mockResolvedValue(result ? { ok: true, token: result } : { ok: false, status: 401 }),
+  };
 }
 
 function makeDataComposer(

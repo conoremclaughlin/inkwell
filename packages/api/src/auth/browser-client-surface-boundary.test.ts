@@ -66,27 +66,27 @@ const adminToken = () =>
   );
 
 // ---------------------------------------------------------------------------
-// Door 1: InkAuthProvider.verifyAccessToken
+// Door 1: InkAuthProvider.verifyAccessTokenSignature (verifyAccessToken's first step)
 // ---------------------------------------------------------------------------
 
-describe('door 1 — InkAuthProvider.verifyAccessToken', () => {
+describe('door 1 — InkAuthProvider.verifyAccessTokenSignature', () => {
   const provider = new InkAuthProvider();
 
   it('refuses a browser_client token', () => {
-    expect(provider.verifyAccessToken(`Bearer ${browserToken()}`)).toBeNull();
+    expect(provider.verifyAccessTokenSignature(`Bearer ${browserToken()}`)).toBeNull();
   });
 
   it('CONTROL: accepts an mcp_access token', () => {
     // Without this the refusal above would also pass against a verifier that
     // rejects everything — which is what a bad JWT_SECRET in the harness
     // would produce.
-    const payload = provider.verifyAccessToken(`Bearer ${mcpToken()}`);
+    const payload = provider.verifyAccessTokenSignature(`Bearer ${mcpToken()}`);
     expect(payload).not.toBeNull();
     expect(payload!.userId).toBe(USER_ID);
   });
 
   it('refuses a pcp_admin token too, so the door is type-pinned in both directions', () => {
-    expect(provider.verifyAccessToken(`Bearer ${adminToken()}`)).toBeNull();
+    expect(provider.verifyAccessTokenSignature(`Bearer ${adminToken()}`)).toBeNull();
   });
 });
 
@@ -298,7 +298,7 @@ describe('bearer-verification census', () => {
     // `verifyAccessToken(` also matches its own definition in the provider,
     // which is correct: that file is a call site's worth of decision-making.
     const pattern =
-      /(?:^|[^A-Za-z])(?:verifyAccessToken|verifyInkAccessToken|verifyBrowserClientToken)\s*\(|auth\.getUser\s*\(/;
+      /(?:^|[^A-Za-z])(?:verifyAccessToken|verifyAccessTokenSignature|verifyInkAccessToken|verifyBrowserClientToken)\s*\(|auth\.getUser\s*\(/;
 
     const found = walk(srcRoot)
       .filter((file) =>

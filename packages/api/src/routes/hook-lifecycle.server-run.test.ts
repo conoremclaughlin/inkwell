@@ -37,7 +37,7 @@ import type { Server } from 'http';
 vi.mock('../mcp/auth/ink-auth-provider', () => ({
   InkAuthProvider: class {
     verifyAccessToken(header?: string) {
-      return header ? { userId: 'user-1' } : null;
+      return header ? { ok: true, token: { userId: 'user-1' } } : { ok: false, status: 401 };
     }
   },
 }));
