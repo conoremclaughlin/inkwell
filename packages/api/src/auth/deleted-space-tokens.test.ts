@@ -164,6 +164,17 @@ describe('tokenIdentityState', () => {
     );
   });
 
+  it('says unreadable, and does not throw, when the read itself throws', async () => {
+    const throwing = {
+      from: () => {
+        throw new Error('socket closed');
+      },
+    } as never;
+    await expect(tokenIdentityState(throwing, { userId: OWNER, sbId: SB })).resolves.toBe(
+      'unreadable'
+    );
+  });
+
   it('says unreadable, never live, when the read fails', async () => {
     db.failOn = 'agent_identities';
     await expect(tokenIdentityState(supabase, { userId: OWNER, sbId: SB })).resolves.toBe(

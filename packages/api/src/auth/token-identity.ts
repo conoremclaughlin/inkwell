@@ -46,20 +46,31 @@ export async function tokenIdentityState(
   const sbSlug = claims.sbSlug?.trim();
   if (!sbId && !sbSlug) return 'none';
 
-  const query = sbId
-    ? supabase.from('agent_identities').select('id').eq('id', sbId).limit(1)
-    : supabase
-        .from('agent_identities')
-        .select('id')
-        .eq('user_id', claims.userId)
-        .eq('agent_id', sbSlug!)
-        .limit(1);
-  const { data, error } = await query;
-  if (error) {
+  // Never throws: a read that throws is as unreadable as one that returns an
+  // error, and the seams answer it with a 503. A rejection here would escape
+  // a route with no try/catch and leave the request hanging.
+  let data: unknown[] | null = null;
+  let failure: string | null = null;
+  try {
+    const query = sbId
+      ? supabase.from('agent_identities').select('id').eq('id', sbId).limit(1)
+      : supabase
+          .from('agent_identities')
+          .select('id')
+          .eq('user_id', claims.userId)
+          .eq('agent_id', sbSlug!)
+          .limit(1);
+    const result = await query;
+    data = result.data;
+    failure = result.error?.message ?? null;
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  }
+  if (failure !== null) {
     logger.error('Could not read the SB a token names; refusing to treat it as live', {
       userId: claims.userId,
       by: sbId ? 'id' : 'slug',
-      error: error.message,
+      error: failure,
     });
     return 'unreadable';
   }

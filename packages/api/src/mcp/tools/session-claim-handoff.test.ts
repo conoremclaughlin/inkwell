@@ -55,8 +55,19 @@ vi.mock('../../channels/agent-gateway', () => ({
   })),
 }));
 
+// The provider's one read is the identity check (auth/token-identity.ts):
+// every SB a runner token names here exists, so it finds a row.
 vi.mock('@supabase/supabase-js', () => ({
-  createClient: vi.fn(() => ({ auth: {}, from: vi.fn() })),
+  createClient: vi.fn(() => ({
+    auth: {},
+    from: vi.fn(() => {
+      const read: Record<string, unknown> = {};
+      read.select = () => read;
+      read.eq = () => read;
+      read.limit = async () => ({ data: [{ id: 'identity' }], error: null });
+      return read;
+    }),
+  })),
 }));
 
 // User lookup is database work; the identity under test rides the token.
