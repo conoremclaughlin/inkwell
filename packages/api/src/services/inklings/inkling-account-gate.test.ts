@@ -129,6 +129,7 @@ vi.mock('googleapis', () => ({
 
 import { applyProfile } from '../../../../cli/src/repl/tool-profiles';
 import { ToolPolicyState } from '../../../../cli/src/repl/tool-policy';
+import { executionTierFor } from '../../config/execution-tier';
 import { registerAllTools } from '../../mcp/tools/index';
 import { runWithRequestContext, tokenIdentityContext } from '../../utils/request-context';
 import { currentToolName, runInToolCall } from '../../utils/tool-call-context';
@@ -138,6 +139,8 @@ import {
   assertAccountTokenAllowed,
   InklingAccountRefusedError,
 } from './inkling-account-gate';
+import { INKLING_CLIENT } from './inkling-client';
+import { classifyIdentityById, inklingTurnRefusal } from './inkling-turn-gate';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
 const INKLING = '00000000-0000-4000-8000-000000000002';
@@ -413,6 +416,31 @@ describe('a Google tool from an inkling turn, end to end', () => {
       expect(after.error).toContain("can't use its owner's google account");
       expect(accountReads()).toEqual([]);
       expect(fake.provider).not.toHaveBeenCalled();
+    });
+
+    it('leaves the execution tier and the owner-turn gate where they were (Lumen, PR #793)', async () => {
+      // The same marker decides both. At 656d80af this save cleared it, the
+      // classifier returned "other", the tier fell to `full` and the
+      // owner-turn gate stopped refusing.
+      const saved = await saveIdentity(registered(), inklingTurn, {
+        sbSlug: 'pip',
+        name: 'Pip',
+        role: 'Inkling',
+        metadata: { client: null },
+      });
+
+      const after = await classifyIdentityById(supabase, INKLING);
+      expect(after).toMatchObject({ kind: 'inkling', id: INKLING });
+      // SessionService hands an inkling to the tier resolver as its client.
+      const client = after.kind === 'inkling' ? INKLING_CLIENT : null;
+      expect(executionTierFor({ sbId: INKLING, client }, {})).toEqual({
+        tier: 'tools',
+        from: 'client',
+      });
+      expect(
+        inklingTurnRefusal({ identity: after, userId: OWNER, ownerMessage: 'no' }, new Set())
+      ).not.toBeNull();
+      expect(saved.success).toBe(false);
     });
 
     it('refuses restore_identity to a version that was not an inkling', async () => {
