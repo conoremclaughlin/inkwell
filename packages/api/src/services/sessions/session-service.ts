@@ -261,6 +261,19 @@ function routePatternSpecificity(pattern: string): number {
 }
 
 /**
+ * The conversation a queued wake's reply belongs to: its thread, or the
+ * conversation it arrived in when it names none.
+ */
+function wakeDestination(pending: { request: SessionRequest }): string | undefined {
+  const threadKey = pending.request.metadata?.threadKey;
+  return typeof threadKey === 'string' && threadKey.length > 0
+    ? `thread:${threadKey}`
+    : pending.request.conversationId
+      ? `conversation:${pending.request.conversationId}`
+      : undefined;
+}
+
+/**
  * The routing options a message resolves its session with.
  *
  * A message resolves twice when it queues behind a running turn: once on
@@ -2248,23 +2261,61 @@ export class SessionService implements ISessionService {
       }
       if (members.length === 0) return;
 
-      const lead = members[0];
-      const { userId, sbSlug } = lead.pending.request;
+      const first = members[0];
+      const { userId, sbSlug } = first.pending.request;
       let mergeable = members.length > 1;
       let stamped = new Set<string>();
+      // Who shares the turn, and who runs alone right after it.
+      let merging = members;
+      let alone: typeof members = [];
       if (mergeable) {
         try {
-          // An inkling's gate reads each wake's own source, so its turns stay
-          // apart, and so do those of an identity that cannot be read.
-          const identity = await this.classifyTurnIdentity(userId, sbSlug, lead.session.sbId);
-          mergeable = identity.kind === 'other';
-          if (mergeable) stamped = await this.leaseTurnEpochs(lead.session.id, userId);
+          const identity = await this.classifyTurnIdentity(userId, sbSlug, first.session.sbId);
+          // With no client nothing can prove a wake's source, so an inkling's
+          // wakes fall to the branch below and stay apart.
+          const supabase = this.supabase;
+          if (identity.kind === 'inkling' && supabase) {
+            // An inkling's gate reads each wake's own source, so each is proven
+            // here exactly as processMessage proves it. Only its owner's own
+            // messages may share a turn, and one of them leads it, so the
+            // merged turn's gate reads an owner's message too. Every other
+            // wake runs alone and meets the gate there: refused, or refused to
+            // be retried when its source could not be read.
+            const proofs = await Promise.all(
+              members.map(({ pending }) => {
+                const source = pending.request.metadata?.triggerThreadMessageId;
+                return isOwnersOwnMessage(supabase, {
+                  threadMessageId: typeof source === 'string' ? source : undefined,
+                  inklingId: identity.id,
+                  ownerUserId: identity.userId,
+                });
+              })
+            );
+            const proven = members.filter((_, index) => proofs[index] === 'yes');
+            // And only wakes bound for the lead's conversation: a merged turn
+            // has one reply destination, its lead's turn hooks, so a wake from
+            // another conversation would have its closing reply land in the
+            // lead's, or be dropped (Lumen, #780 P1).
+            const destination = proven.length > 0 ? wakeDestination(proven[0].pending) : undefined;
+            const shared = proven.filter(({ pending }) => wakeDestination(pending) === destination);
+            mergeable = destination !== undefined && shared.length > 1;
+            if (mergeable) {
+              merging = shared;
+              alone = members.filter((member) => !shared.includes(member));
+            }
+          } else {
+            // An identity that cannot be read keeps its wakes apart.
+            mergeable = identity.kind === 'other';
+          }
+          if (mergeable) stamped = await this.leaseTurnEpochs(first.session.id, userId);
         } catch (error) {
           logger.warn('Running queued wakes one by one; their merge could not be checked', {
             lockKey,
             error: serializeError(error),
           });
           mergeable = false;
+          merging = members;
+          alone = [];
         }
       }
 
@@ -2279,38 +2330,50 @@ export class SessionService implements ISessionService {
         if (rest.length > 0) {
           this.pendingQueues.set(lockKey, [...rest, ...(this.pendingQueues.get(lockKey) ?? [])]);
         }
-        handled.add(lead.pending);
+        handled.add(first.pending);
         queueContinued = true;
-        await this.runQueuedTurn(lockKey, lead.pending, lead.session);
+        await this.runQueuedTurn(lockKey, first.pending, first.session);
         return;
       }
 
+      // The wakes that may not share it run alone right after the turn, in
+      // queue order, and are not offered for merging again.
+      if (alone.length > 0) {
+        const back = alone.map(({ pending }) => {
+          pending.noMerge = true;
+          handled.add(pending);
+          return pending;
+        });
+        this.pendingQueues.set(lockKey, [...back, ...(this.pendingQueues.get(lockKey) ?? [])]);
+      }
+      const lead = merging[0];
+
       // The epoch its members' routing actually left on the lease (wake-batch.ts).
       const epoch = batchTurnEpoch(
-        members.map(({ pending }) => pending.turnEpochCandidate),
+        merging.map(({ pending }) => pending.turnEpochCandidate),
         stamped
       );
-      const sources = members.map(({ pending }) => coalescibleWakeSource(pending)!);
+      const sources = merging.map(({ pending }) => coalescibleWakeSource(pending)!);
       const request: SessionRequest = {
         ...lead.pending.request,
         sender: {
           ...lead.pending.request.sender,
-          name: [...new Set(members.map(({ pending }) => pending.request.sender.name))].join(', '),
+          name: [...new Set(merging.map(({ pending }) => pending.request.sender.name))].join(', '),
         },
-        content: mergedWakeContent(members.map(({ pending }) => pending.request.content)),
+        content: mergedWakeContent(merging.map(({ pending }) => pending.request.content)),
         metadata: { ...lead.pending.request.metadata, coalescedSources: sources },
       };
       logger.info('Running queued wakes as one turn', {
         lockKey,
         sources,
-        epochOfMember: members.findIndex(({ pending }) => pending.turnEpochCandidate === epoch),
+        epochOfMember: merging.findIndex(({ pending }) => pending.turnEpochCandidate === epoch),
       });
 
       let result: SessionResult;
       try {
-        result = await this.runTurn(request, members[members.length - 1].session, epoch);
+        result = await this.runTurn(request, merging[merging.length - 1].session, epoch);
       } catch (error) {
-        for (const { pending } of members) reject(pending, error);
+        for (const { pending } of merging) reject(pending, error);
         this.flushQueueOnNonRetryableError(
           lockKey,
           error instanceof Error ? error.message : String(error)
@@ -2321,7 +2384,7 @@ export class SessionService implements ISessionService {
       // are told which wake carried them, so nothing is routed twice.
       handled.add(lead.pending);
       lead.pending.resolve({ ...result, admitted: true });
-      for (const { pending } of members.slice(1)) {
+      for (const { pending } of merging.slice(1)) {
         handled.add(pending);
         pending.resolve({
           ...result,
@@ -2632,8 +2695,8 @@ export class SessionService implements ISessionService {
         // There is no count of turns: Conor dropped the turn cap on Oct 4
         // 2026 (5:00 PM). Usage limits will be monthly token allowances
         // (ink://specs/inkling-model-access, task 2a00148f); until then a turn
-        // is bounded by the owner test above, Stop, the fence and its one
-        // outer cycle.
+        // is bounded by the owner test above, Stop, the fence and its
+        // runtimeConfig's outer cycles, as any SB's is.
         inklingTurn = true;
         inklingSbId = inklingIdentity.id;
         // Its turn runs in its own folder, never the Inkwell checkout or the
@@ -2773,15 +2836,16 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
-      // An inkling turn is one outer cycle per admitted message, whatever its
-      // dashboard says: an execution boundary, not a product quota, and not a
-      // claim of one provider call (a cycle's tool loop may make several).
-      // Further continuations would need their own admission.
-      ...(inklingTurn
-        ? { maxTurns: 1 }
-        : runtimeMaxTurns !== undefined
-          ? { maxTurns: runtimeMaxTurns }
-          : {}),
+      // An inkling's outer cycles follow its runtimeConfig as any SB's do
+      // (Conor, Oct 7: no inkling-only limits beyond a source flag). It used
+      // to be pinned to one. Cycles 2..N are continuation prompts on the same
+      // admitted message, never another message (chat.ts --non-interactive),
+      // so they stay inside that message's owner test, the process group's
+      // Stop and the fence. A wake sets turnHooks, not onTurnReply, so a
+      // cycle's text is not forwarded as it ends: explicit tool sends post
+      // during the run, and the closing-text fallback runs once around the
+      // whole turn (Lumen, #780).
+      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
       ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
       // .ink/identity.json preferences or Commander defaults. An inkling's
