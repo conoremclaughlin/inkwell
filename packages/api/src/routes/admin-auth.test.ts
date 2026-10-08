@@ -46,6 +46,14 @@ vi.mock('@supabase/supabase-js', () => ({
 // Mocks for data layer
 // ---------------------------------------------------------------------------
 
+// The account is resolved by its sign-in (services/account-deletion/
+// principal.ts, tested against a real database); here it answers with the
+// row each test's lookup names.
+const mockResolvePrincipal = vi.fn();
+vi.mock('../services/account-deletion/principal', () => ({
+  resolveAccountForPrincipal: (...args: unknown[]) => mockResolvePrincipal(...args),
+}));
+
 const mockFindById = vi.fn();
 const mockFindByIdWithRole = vi.fn();
 const mockGetMemberRole = vi.fn();
@@ -111,6 +119,7 @@ vi.mock('../utils/request-context', () => ({
 // ---------------------------------------------------------------------------
 
 import router from './admin';
+import { accountGate } from '../services/account-deletion/gate';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -157,6 +166,10 @@ function createMockRes(): MockResponse {
     _json: null,
     _cookies: {} as Record<string, { value: string; options: Record<string, unknown> }>,
     _clearedCookies: {} as Record<string, { options: Record<string, unknown> }>,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -190,6 +203,7 @@ function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
     if (table === 'users') return userChain;
     return userChain; // fallback
   });
+  mockResolvePrincipal.mockResolvedValue({ ok: true, userId: inkUser.id, created: false });
 
   return userChain;
 }
@@ -288,6 +302,45 @@ describe('adminAuthMiddleware', () => {
       expect(mockGetUser).not.toHaveBeenCalled();
       // Should NOT issue new cookies
       expect(Object.keys(res._cookies)).toHaveLength(0);
+    });
+
+    it('refuses an account that is being deleted, at every tier, and holds its gate while a request runs', async () => {
+      mockVerifyInkAccessToken.mockReturnValue({
+        type: 'pcp_admin',
+        sub: 'user-closing',
+        email: 'closing@example.com',
+        scope: 'admin',
+      });
+
+      // Open: the request holds the account's gate until its response closes.
+      const listeners: Array<() => void> = [];
+      const open = createMockRes();
+      (open as unknown as { once: (event: string, fn: () => void) => void }).once = (
+        event: string,
+        fn: () => void
+      ) => {
+        if (event === 'close') listeners.push(fn);
+      };
+      const next = vi.fn();
+      await middleware(createMockReq(), open, next);
+      expect(next).toHaveBeenCalled();
+      expect(accountGate.inFlightCount('user-closing')).toBe(1);
+      for (const fn of listeners) fn();
+      expect(accountGate.inFlightCount('user-closing')).toBe(0);
+
+      // Closed: answered 403, and nothing behind the middleware runs.
+      accountGate.close('user-closing');
+      try {
+        const res = createMockRes();
+        const refusedNext = vi.fn();
+        await middleware(createMockReq(), res, refusedNext);
+        expect(res._status).toBe(403);
+        expect(res._json).toEqual({ error: 'This account is being deleted' });
+        expect(refusedNext).not.toHaveBeenCalled();
+        expect(accountGate.inFlightCount('user-closing')).toBe(0);
+      } finally {
+        accountGate.forget('user-closing');
+      }
     });
 
     it('should set inkUserId and email from JWT claims', async () => {
@@ -721,10 +774,16 @@ describe('adminAuthMiddleware', () => {
       const res = createMockRes();
       const next = vi.fn();
 
+      mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'new-user', created: true });
+
       await middleware(req, res, next);
 
       expect(next).toHaveBeenCalled();
-      expect(chain.insert).toHaveBeenCalled();
+      expect(mockResolvePrincipal).toHaveBeenCalledWith(expect.anything(), {
+        authUid: undefined,
+        email: 'new@example.com',
+        create: true,
+      });
     });
 
     it('should still call next() even if cookie creation fails', async () => {

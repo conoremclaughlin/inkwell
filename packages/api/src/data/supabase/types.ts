@@ -53,18 +53,36 @@ export type Database = {
     Tables: {
       account_deletion_requests: {
         Row: {
+          auth_uid: string | null;
           completed_at: string | null;
+          email_sha256: string | null;
+          inventory: Json | null;
+          outcomes: Json;
           requested_at: string;
+          started_at: string | null;
+          step: string;
           user_id: string;
         };
         Insert: {
+          auth_uid?: string | null;
           completed_at?: string | null;
+          email_sha256?: string | null;
+          inventory?: Json | null;
+          outcomes?: Json;
           requested_at?: string;
+          started_at?: string | null;
+          step?: string;
           user_id: string;
         };
         Update: {
+          auth_uid?: string | null;
           completed_at?: string | null;
+          email_sha256?: string | null;
+          inventory?: Json | null;
+          outcomes?: Json;
           requested_at?: string;
+          started_at?: string | null;
+          step?: string;
           user_id?: string;
         };
         Relationships: [];
@@ -5291,6 +5309,7 @@ export type Database = {
       };
       users: {
         Row: {
+          auth_uid: string | null;
           created_at: string | null;
           discord_id: string | null;
           email: string | null;
@@ -5309,6 +5328,7 @@ export type Database = {
           whatsapp_id: string | null;
         };
         Insert: {
+          auth_uid?: string | null;
           created_at?: string | null;
           discord_id?: string | null;
           email?: string | null;
@@ -5327,6 +5347,7 @@ export type Database = {
           whatsapp_id?: string | null;
         };
         Update: {
+          auth_uid?: string | null;
           created_at?: string | null;
           discord_id?: string | null;
           email?: string | null;

@@ -7,7 +7,7 @@
  * message reads "You"; another person's message carries their name.
  */
 export interface SenderLike {
-  /** 'sb', 'user' or 'system'; any other value reads as an SB's slug. */
+  /** 'sb', 'user', 'system' or 'deleted_account'; any other value reads as an SB's slug. */
   senderKind?: string | null;
   senderSlug?: string | null;
   senderName?: string | null;
@@ -20,5 +20,6 @@ export function senderLabel(m: SenderLike): string {
   // Older payloads name nobody: fall back to what the kind says.
   if (m.senderKind === 'user') return 'a workspace member';
   if (m.senderKind === 'system') return 'system';
+  if (m.senderKind === 'deleted_account') return 'Deleted account';
   return m.senderSlug ?? 'system';
 }
