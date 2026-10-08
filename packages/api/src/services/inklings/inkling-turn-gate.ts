@@ -20,8 +20,9 @@ import { INKLING_CLIENT } from './inkling-service';
 /**
  * What the SB a turn is for is, as far as the database can say:
  * - 'inkling', with its row;
- * - 'other', positively not an inkling: its row says so, or no identity
- *   row exists at all;
+ * - 'other', positively not an inkling: its row says so (with its id and
+ *   the client it names, which the execution tier reads), or no identity
+ *   row exists at all (both null);
  * - 'unknown', when its canonical identity could not be established.
  *   `transient` is true when a read failed, false when nothing names one
  *   identity (an ambiguous slug, an id that names no row).
@@ -30,7 +31,7 @@ import { INKLING_CLIENT } from './inkling-service';
  */
 export type InklingIdentity =
   | { kind: 'inkling'; id: string; userId: string; metadata: Record<string, unknown> }
-  | { kind: 'other' }
+  | { kind: 'other'; id: string | null; client: string | null }
   | { kind: 'unknown'; transient: boolean };
 
 /**
@@ -55,7 +56,10 @@ export async function classifyIdentityById(
     metadata: Record<string, unknown> | null;
   } | null;
   if (!row) return { kind: 'unknown', transient: false };
-  if (row.metadata?.client !== INKLING_CLIENT) return { kind: 'other' };
+  if (row.metadata?.client !== INKLING_CLIENT) {
+    const client = row.metadata?.client;
+    return { kind: 'other', id: row.id, client: typeof client === 'string' ? client : null };
+  }
   return { kind: 'inkling', id: row.id, userId: row.user_id, metadata: row.metadata ?? {} };
 }
 

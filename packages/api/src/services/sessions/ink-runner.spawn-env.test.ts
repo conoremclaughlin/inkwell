@@ -149,7 +149,7 @@ describe('InkRunner child environment (Phase 0)', () => {
   });
 });
 
-describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => {
+describe('a turn on the tools tier runs on its own tool policy (task 0321ccf1)', () => {
   async function launch(config: Record<string, unknown>) {
     const env = await launchOnce(config);
     const [, args] = spawnMock.mock.calls[0] as [string, string[]];
@@ -164,30 +164,45 @@ describe("an inkling's turn runs on its own tool policy (task 0321ccf1)", () => 
   }
   const POLICY = '/home/synthetic/.ink/inklings/.tool-policy/0a1b2c3d.json';
 
-  it('names the inkling profile and its own policy file, over any the server holds', async () => {
+  it('names the tools profile and its own policy file, over any the server holds, for any SB', async () => {
     vi.stubEnv('INK_TOOL_POLICY_PATH', '/home/synthetic/.ink/security/tool-policy.json');
-    const launched = await launch({
-      workingDirectory: '/tmp',
-      sbSlug: 'kindle-0a1b2c3d',
-      inklingToolPolicyPath: POLICY,
-    });
-    // Required, not merely named: a CLI without --require-profile refuses it
-    // as unknown, where it would take --profile inkling and carry on (Lumen, #773).
-    expect(launched.required).toBe('inkling');
-    expect(launched.profile).toBeNull();
-    expect(launched.away).toBe(true);
-    expect(launched.env.INK_TOOL_POLICY_PATH).toBe(POLICY);
-    // Named too, though the profile implies it: a CLI that takes the profile
-    // but predates the option refuses it, rather than opening the provider's
-    // native Read for a document.
-    expect(launched.noProviderTools).toBe(true);
+    for (const sbSlug of ['kindle-0a1b2c3d', 'myra']) {
+      spawnMock.mockClear();
+      const launched = await launch({
+        workingDirectory: '/tmp',
+        sbSlug,
+        executionTier: 'tools',
+        toolPolicyPath: POLICY,
+      });
+      // Required, not merely named: a CLI that doesn't know the profile
+      // refuses it, where --profile would warn and carry on (Lumen, #773).
+      expect(launched.required, sbSlug).toBe('tools');
+      expect(launched.profile, sbSlug).toBeNull();
+      expect(launched.away, sbSlug).toBe(true);
+      expect(launched.env.INK_TOOL_POLICY_PATH, sbSlug).toBe(POLICY);
+      // Named too, though the profile implies it: a CLI that takes the
+      // profile but not the option refuses it, rather than opening the
+      // provider's native Read for a document.
+      expect(launched.noProviderTools, sbSlug).toBe(true);
+    }
   });
 
-  it('leaves every other spawn on the safe profile and the policy it already had', async () => {
-    const launched = await launch({ workingDirectory: '/tmp', sbSlug: 'myra' });
-    expect(launched.profile).toBe('safe');
-    expect(launched.required).toBeNull();
-    expect(launched.noProviderTools).toBe(false);
-    expect('INK_TOOL_POLICY_PATH' in launched.env).toBe(false);
+  it('runs the full tier, or no tier named, on the safe profile and the policy it already had', async () => {
+    for (const tier of [{ executionTier: 'full', toolPolicyPath: POLICY }, {}]) {
+      spawnMock.mockClear();
+      const launched = await launch({ workingDirectory: '/tmp', sbSlug: 'myra', ...tier });
+      expect(launched.profile).toBe('safe');
+      expect(launched.required).toBeNull();
+      expect(launched.noProviderTools).toBe(false);
+      expect('INK_TOOL_POLICY_PATH' in launched.env).toBe(false);
+    }
+  });
+
+  it('starts nothing on the tools tier without a policy of its own', async () => {
+    const result = await new InkRunner().run('hello', {
+      config: { workingDirectory: '/tmp', sbSlug: 'myra', executionTier: 'tools' } as never,
+    });
+    expect(result.success).toBe(false);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 });

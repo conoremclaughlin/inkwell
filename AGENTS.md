@@ -755,6 +755,7 @@ Optional:
 - `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
 - `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
+- `INK_EXECUTION_TIER` - the deployment's execution tier, which decides the tools a turn is offered for any SB: `tools` (Inkwell's tools and reads in the SB's own folder; no shell, file writes or provider tools, on ink only) or `full` (the `safe` profile and this machine's tool policy). Default `full`. `INK_EXECUTION_TIER_CLIENTS` (`<identity client>=<tier>`, default `inkling-mobile=tools`) and `INK_EXECUTION_TIER_SBS` (`<identity uuid>=<tier>`) take precedence, the SB's first. A value that doesn't parse runs the turn `tools`. See `packages/api/src/config/execution-tier.ts`.
 
 ## Testing
 

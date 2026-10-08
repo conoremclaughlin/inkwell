@@ -10312,7 +10312,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
-      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full|inkling')
+      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full|tools')
       .option(
         '--require-profile <name>',
         'Apply a security profile and refuse to start without it (server spawns)'

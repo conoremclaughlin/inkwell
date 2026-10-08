@@ -65,7 +65,7 @@ describe("an inkling's turn reads only its own folder (task 0321ccf1)", () => {
     const policy = new ToolPolicyState('backend', { policyPath, persist: false });
     policy.setContext({ sbSlug: 'kindle-0a1b2c3d' });
     policy.setMutationScope('agent');
-    expect(applyLaunchProfile(policy, 'inkling')).toMatchObject({
+    expect(applyLaunchProfile(policy, 'tools')).toMatchObject({
       ok: true,
       withholdProviderTools: true,
     });

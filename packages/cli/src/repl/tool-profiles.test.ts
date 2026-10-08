@@ -20,7 +20,7 @@ function makePolicy(): ToolPolicyState {
 describe('tool-profiles', () => {
   describe('TOOL_PROFILES', () => {
     it('defines all expected profiles', () => {
-      expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full', 'inkling']);
+      expect(PROFILE_IDS).toEqual(['minimal', 'safe', 'collaborative', 'full', 'tools', 'inkling']);
     });
 
     it('each profile has required fields', () => {
@@ -285,7 +285,7 @@ describe('tool-profiles', () => {
   });
 });
 
-describe('the inkling profile (task 0321ccf1)', () => {
+describe('the tools profile, the tools execution tier (task 0321ccf1)', () => {
   // A policy file shaped like this machine's on 2026-10-07: the global scope
   // permanently grants the shell and both comms tools to every agent.
   function withMachineGrants(): { policy: ToolPolicyState; dir: string } {
@@ -309,12 +309,16 @@ describe('the inkling profile (task 0321ccf1)', () => {
     return { policy, dir };
   }
 
+  it('is the same definition under its former name, for a server built before the rename', () => {
+    expect(TOOL_PROFILES.inkling).toBe(TOOL_PROFILES.tools);
+  });
+
   it('denies the shell, file edits and writes, shared-image reads, waking an agent and send_response, whatever is granted', () => {
     const { policy, dir } = withMachineGrants();
     try {
       // The control: before the profile, the machine's grant opens the shell.
       expect(policy.canCallInkTool('bash').allowed).toBe(true);
-      expect(applyProfile(policy, 'inkling').success).toBe(true);
+      expect(applyProfile(policy, 'tools').success).toBe(true);
       for (const tool of [
         'bash',
         'edit',
@@ -336,7 +340,7 @@ describe('the inkling profile (task 0321ccf1)', () => {
   it('keeps its reply, its reads and its other tools, with no narrowing allow list', () => {
     const { policy, dir } = withMachineGrants();
     try {
-      applyProfile(policy, 'inkling');
+      applyProfile(policy, 'tools');
       for (const tool of [
         'send_to_inbox',
         'read',
@@ -357,14 +361,15 @@ describe('the inkling profile (task 0321ccf1)', () => {
 describe('a launch profile (task 0321ccf1)', () => {
   it('applies a known profile, and refuses an unknown one without applying anything', () => {
     const policy = makePolicy();
-    expect(applyLaunchProfile(policy, 'inkling')).toMatchObject({ ok: true });
+    expect(applyLaunchProfile(policy, 'tools')).toMatchObject({ ok: true });
     expect(policy.canCallInkTool('bash').allowed).toBe(false);
 
     const untouched = makePolicy();
     const refused = applyLaunchProfile(untouched, 'inklnig');
     expect(refused).toEqual({
       ok: false,
-      message: 'Unknown profile: inklnig. Valid: minimal, safe, collaborative, full, inkling',
+      message:
+        'Unknown profile: inklnig. Valid: minimal, safe, collaborative, full, tools, inkling',
     });
     expect(untouched.canCallInkTool('bash').allowed).toBe(true);
   });
@@ -387,10 +392,10 @@ describe('a launch profile (task 0321ccf1)', () => {
     expect(source.slice(conflict, conflict + 300)).toMatch(/process\.exit\(78\)/);
   });
 
-  it('names the inkling as the one profile that withholds the provider tools', () => {
+  it('names the tools tier, under either name, as the one profile that withholds the provider tools', () => {
     const withholding = PROFILE_IDS.filter((id) => TOOL_PROFILES[id].withholdProviderTools);
-    expect(withholding).toEqual(['inkling']);
-    expect(applyLaunchProfile(makePolicy(), 'inkling')).toMatchObject({
+    expect(withholding).toEqual(['tools', 'inkling']);
+    expect(applyLaunchProfile(makePolicy(), 'tools')).toMatchObject({
       ok: true,
       withholdProviderTools: true,
     });
