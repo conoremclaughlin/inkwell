@@ -2075,6 +2075,12 @@ router.get('/workspaces', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaces;
+    // The space a request with no workspace header is scoped to, so a client
+    // that has switched elsewhere still knows the person's own space without
+    // guessing it by name or kind. Ensured before the list is read: a request
+    // scoped to a group can be the one that creates it, and the list must
+    // carry the space it names (Lumen, #784).
+    const defaultWorkspace = await workspaceRepo.ensurePersonalWorkspace(authReq.inkUserId);
     const workspaces = await workspaceRepo.listMembershipsByUser(authReq.inkUserId, {
       includeArchived: false,
     });
@@ -2083,10 +2089,6 @@ router.get('/workspaces', async (req: Request, res: Response) => {
       (workspace) => workspace.id === authReq.inkWorkspaceId
     );
     const currentWorkspaceRole = currentWorkspaceMembership?.role || authReq.inkWorkspaceRole;
-    // The space a request with no workspace header is scoped to, so a client
-    // that has switched elsewhere still knows the person's own space without
-    // guessing it by name or kind.
-    const defaultWorkspace = await workspaceRepo.ensurePersonalWorkspace(authReq.inkUserId);
 
     res.json({
       currentWorkspaceId: authReq.inkWorkspaceId,

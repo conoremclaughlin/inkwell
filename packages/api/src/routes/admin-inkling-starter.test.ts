@@ -255,4 +255,22 @@ describe('listing spaces', () => {
     expect(res.body.currentWorkspaceId).toBe(family);
     expect(res.body.defaultWorkspaceId).toBe(personal.id);
   });
+
+  // Lumen's probe on #784.
+  it('lists the space it names when the listing is what creates it', async () => {
+    const created = await call(createWorkspace, {
+      body: { name: 'Family', type: 'team', membershipMode: 'invite_only', starter: 'inkling' },
+    });
+    const family = created.body.workspace.id as string;
+    // A renamed personal slug leaves no space for ensurePersonalWorkspace to find.
+    personal.slug = 'renamed-personal';
+
+    const res = await call(listWorkspaces, { selected: family });
+
+    expect(res.status).toBe(200);
+    expect(res.body.defaultWorkspaceId).not.toBe(personal.id);
+    expect(res.body.workspaces.map((space: Row) => space.id)).toContain(
+      res.body.defaultWorkspaceId
+    );
+  });
 });
