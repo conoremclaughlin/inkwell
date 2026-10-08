@@ -756,6 +756,7 @@ Optional:
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
 - `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 - `INK_EXECUTION_TIER` - the deployment's execution tier, which decides the tools a turn is offered for any SB: `tools` (Inkwell's tools and reads in the SB's own folder; no shell, file writes or provider tools, on ink only) or `full` (the `safe` profile and this machine's tool policy). Default `full`. `INK_EXECUTION_TIER_CLIENTS` (`<identity client>=<tier>`, default `inkling-mobile=tools`) and `INK_EXECUTION_TIER_SBS` (`<identity uuid>=<tier>`) take precedence, the SB's first. A value that doesn't parse runs the turn `tools`. See `packages/api/src/config/execution-tier.ts`.
+- `INK_INKLING_ACCOUNT_TOOLS` - the tools that may use an inkling owner's connected accounts (Google today: Gmail, Calendar, Docs, Drive, Sheets) during the inkling's turn, by tool name, comma-separated (`list_email_labels,list_calendar_events`). Unset is none: the server refuses an inkling's turn any connected-account token, before the account is read, whatever its execution tier. No wildcard; an entry that isn't a tool name is left out. See `packages/api/src/services/inklings/inkling-account-gate.ts`.
 
 ## Testing
 

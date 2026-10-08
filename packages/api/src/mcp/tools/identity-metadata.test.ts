@@ -205,6 +205,22 @@ describe('identity metadata preservation', () => {
     expect(db._queryBuilder.insert).not.toHaveBeenCalled();
   });
 
+  it('re-checks inkling status against the snapshot a compare-and-swap conflict re-reads (Lumen, PR #793)', async () => {
+    // Not an inkling at the first read, so client: null looks harmless; an
+    // inkling by the time the conflict re-reads it.
+    db._queueReturnData(row);
+    db._queueReturnData(null, conflict);
+    db._queueReturnData({
+      ...row,
+      metadata: { ...metadata, client: 'inkling-mobile' },
+      version: 8,
+    });
+    await expect(
+      handleSaveIdentity({ ...args, metadata: { client: null } }, composer())
+    ).rejects.toThrow("can't change whether an SB is an inkling");
+    expect(db._queryBuilder.update).toHaveBeenCalledTimes(1);
+  });
+
   it('does not retry database failures as conflicts', async () => {
     db._queueReturnData(row);
     db._queueReturnData(null, { code: '42501', message: 'permission denied' });
