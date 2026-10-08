@@ -45,7 +45,7 @@ const page = (url: string, maxChars = 20_000, extractMode: 'markdown' | 'text' =
   fetchPage({ url, extractMode, maxChars }, { network });
 
 describe('fetchPage', () => {
-  it('reads an HTML page to markdown, with its title', async () => {
+  it('reads an HTML page to markdown by Readability, with its title', async () => {
     const base = await serve((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(
@@ -57,14 +57,25 @@ describe('fetchPage', () => {
       ok: true,
       status: 200,
       contentType: 'text/html',
-      extractor: 'html',
+      extractor: 'readability',
       title: 'Docs',
-      text: '# Hello\n\nWorld',
+      // Readability renders an <h1> inside the content it keeps as an <h2>.
+      text: '## Hello\n\nWorld',
       truncated: false,
       bodyTruncated: false,
       redirects: 0,
       finalUrl: `${base}/docs`,
     });
+  });
+
+  it('reads an error page with the scan alone, never Readability', async () => {
+    const base = await serve((_req, res) => {
+      res.writeHead(404, { 'content-type': 'text/html' });
+      res.end('<html><head><title>Gone</title></head><body><h1>Not here</h1></body></html>');
+    });
+    const result = await page(`${base}/gone`);
+    expect(result).toMatchObject({ ok: false, status: 404, extractor: 'html', title: 'Gone' });
+    expect(result.text).toBe('# Not here');
   });
 
   it('cuts the text at maxChars and says so, never splitting a surrogate pair', async () => {
