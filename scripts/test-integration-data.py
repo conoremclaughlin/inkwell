@@ -154,12 +154,12 @@ class DataTests(unittest.TestCase):
         # two (#671), the wake-source breaker's one (T1), thread_links
         # (thread:thread-links), the message reactions table
         # (inkling-reactions), the two workspace-invitation tables, the two
-        # thread-upload tables and the two saved-login tables join through
+        # thread-upload tables and the three saved-login tables join through
         # created-at windows, not this base list, so a rehearsal cut before
         # them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 90)
+        self.assertEqual(len(names), 91)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -238,7 +238,7 @@ class DataTests(unittest.TestCase):
         deletions = ("account_deletion_requests",)
         invitations = ("workspace_invitation_redemptions", "workspace_invitations")
         uploads = ("thread_upload_claims", "thread_uploads")
-        vault_logins = ("saved_logins",)
+        vault_logins = ("saved_login_secrets", "saved_logins")
         sealed_logins = ("saved_logins_sealed",)
         created = (companion + revocation + breaker + links + reactions + launches + deletions
                    + invitations + uploads + vault_logins + sealed_logins)
@@ -349,7 +349,7 @@ class DataTests(unittest.TestCase):
 
     def test_created_window_tables_are_missing_only_before_their_migration(self):
         created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
-        self.assertEqual(len(created), 17)
+        self.assertEqual(len(created), 18)
         # A full-schema stack carries them and cleanup truncates them ...
         self.clean()
         truncate = self.mutations()[0]

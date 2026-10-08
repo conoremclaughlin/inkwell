@@ -1,11 +1,11 @@
 /**
  * Saved logins through the real routes, over the in-memory FakePostgrest,
- * once for each store (services/saved-logins). For Supabase Vault the fake
- * stands in for the database's half: create_saved_login_secret keeps the value
- * as given, and the decrypted view is a plain table. That proves what the
- * server sends and how it reads each answer, not the SQL; Vault's encryption,
- * the foreign keys and the trigger are proved against a real database in
- * services/saved-logins/vault-store.integration.test.ts.
+ * once for each store (services/saved-logins). For Supabase Vault,
+ * test/fake-vault-db.ts stands in for the database's half: values are kept as
+ * given, and the opened view is computed from the tables at each read. That
+ * proves what the server sends and how it reads each answer, not the SQL;
+ * Vault's encryption, the foreign keys and the triggers are proved against a
+ * real database in services/saved-logins/vault-store.integration.test.ts.
  *
  * The people, sites and secrets are invented. The sealing key is a fresh
  * random one per test.
@@ -14,8 +14,9 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { FakePostgrest, type Row } from '../test/fake-postgrest';
+import { FakeVaultDb, OPENED, OWNERS } from '../test/fake-vault-db';
 
-let db: FakePostgrest;
+let db: FakeVaultDb;
 
 vi.mock('../data/composer', () => ({
   getDataComposer: vi.fn(async () => ({ getClient: () => db })),
@@ -46,7 +47,6 @@ const SAM = '22222222-2222-4222-8222-222222222222';
 const PASSWORD = 'correct horse battery staple FAKE-7Q2';
 // RFC 6238's SHA-1 secret, "12345678901234567890", in base32.
 const SETUP_KEY = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
-const SECRETS = 'saved_login_vault_secrets';
 
 async function call(
   handler: Handler,
@@ -94,14 +94,6 @@ async function saveOne(body: Row = {}, as = ADA): Promise<string> {
   return (res.body.login as Row).id as string;
 }
 
-/** The fake's stand-in for create_saved_login_secret and the decrypted view. */
-function installFakeVault() {
-  db.rpcHandlers.create_saved_login_secret = (args) => {
-    const row = db.seed(SECRETS, { owner_tag: `saved_login:${args.p_owner}`, value: args.p_value });
-    return { data: row.id, error: null };
-  };
-}
-
 /** Runs `before` as the next update of `table` is about to be sent. */
 function beforeUpdate(table: string, before: () => void) {
   const real = db.from.bind(db);
@@ -136,11 +128,11 @@ const STORES: StoreCase[] = [
     table: 'saved_logins',
     use() {
       vi.stubEnv('SAVED_LOGINS_STORE', '');
-      installFakeVault();
     },
     snapshot(id) {
       const row = db.rows('saved_logins').find((r) => r.id === id)!;
-      const value = (secretId: unknown) => db.rows(SECRETS).find((s) => s.id === secretId)?.value;
+      const value = (secretId: unknown) =>
+        db.rows(OWNERS).find((s) => s.secret_id === secretId)?.value;
       return [
         row.item_secret_id,
         row.secret_secret_id,
@@ -150,7 +142,7 @@ const STORES: StoreCase[] = [
       ];
     },
     spoil() {
-      for (const secret of db.rows(SECRETS)) {
+      for (const secret of db.rows(OWNERS)) {
         secret.value = JSON.stringify({
           for: bindingFor(ADA, randomUUID(), 'secret'),
           value: { password: 'elsewhere', authenticator: null },
@@ -186,7 +178,7 @@ const STORES: StoreCase[] = [
 ];
 
 beforeEach(() => {
-  db = new FakePostgrest();
+  db = new FakeVaultDb();
   for (const level of ['info', 'warn', 'error', 'debug'] as const) {
     vi.mocked(logger[level]).mockClear();
   }
@@ -243,7 +235,7 @@ describe.each(STORES)('with the $kind store', (store) => {
         expect(res).toMatchObject({ status: 400, body: { code: 'invalid_login' } });
       }
       expect(db.rows(store.table)).toHaveLength(0);
-      expect(db.rows(SECRETS)).toHaveLength(0);
+      expect(db.rows(OWNERS)).toHaveLength(0);
     });
   });
 
@@ -405,7 +397,7 @@ describe.each(STORES)('with the $kind store', (store) => {
 
     it('refuses an edit that loses a race with another write', async () => {
       const id = await saveOne();
-      const secretsBefore = db.rows(SECRETS).length;
+      const secretsBefore = db.rows(OWNERS).length;
       // The other write lands between this edit's read and its write.
       beforeUpdate(store.table, () => {
         db.rows(store.table)[0]!.revision = 7;
@@ -415,7 +407,7 @@ describe.each(STORES)('with the $kind store', (store) => {
       db.from = FakePostgrest.prototype.from.bind(db);
       expect((await call(reveal, { params: { id } })).body).toEqual({ password: PASSWORD });
       // What the losing edit made for Vault is deleted again.
-      expect(db.rows(SECRETS)).toHaveLength(secretsBefore);
+      expect(db.rows(OWNERS)).toHaveLength(secretsBefore);
     });
 
     it('when a half won’t open, refuses and writes nothing', async () => {
@@ -440,7 +432,7 @@ describe.each(STORES)('with the $kind store', (store) => {
     it('when the write fails, changes nothing', async () => {
       const id = await saveOne();
       const before = store.snapshot(id);
-      const secretsBefore = db.rows(SECRETS).length;
+      const secretsBefore = db.rows(OWNERS).length;
       beforeUpdate(store.table, () => {
         throw new Error('connection lost');
       });
@@ -455,7 +447,7 @@ describe.each(STORES)('with the $kind store', (store) => {
       });
       db.from = FakePostgrest.prototype.from.bind(db);
       expect(store.snapshot(id)).toEqual(before);
-      expect(db.rows(SECRETS)).toHaveLength(secretsBefore);
+      expect(db.rows(OWNERS)).toHaveLength(secretsBefore);
     });
   });
 
@@ -518,7 +510,7 @@ describe.each(STORES)('with the $kind store', (store) => {
       const own =
         store.kind === 'sealed'
           ? ['saved_logins_sealed']
-          : ['saved_logins', SECRETS, 'create_saved_login_secret'];
+          : ['saved_logins', OPENED, 'create_saved_login_secret'];
       expect([...touched].sort()).toEqual(own.sort());
     });
 
@@ -568,7 +560,7 @@ describe.each(STORES)('with the $kind store', (store) => {
         ).not.toThrow();
       } else {
         const row = db.rows('saved_logins')[0]!;
-        db.rows(SECRETS).find((s) => s.id === row.secret_secret_id)!.value =
+        db.rows(OWNERS).find((s) => s.secret_id === row.secret_secret_id)!.value =
           `{"for":"${bindingFor(ADA, id, 'secret')}","value":{"password":"${PASSWORD}"`;
       }
       const res = await call(reveal, { params: { id } });
@@ -585,7 +577,6 @@ describe.each(STORES)('with the $kind store', (store) => {
 describe('which store', () => {
   it('is unavailable with an unknown store, and stores nothing', async () => {
     vi.stubEnv('SAVED_LOGINS_STORE', 'plaintext');
-    installFakeVault();
     for (const handler of [list, create]) {
       const res = await call(handler, { body: { name: 'x', password: PASSWORD } });
       expect(res).toMatchObject({ status: 503, body: { code: 'vault_unavailable' } });
@@ -606,7 +597,6 @@ describe('which store', () => {
   it('keeps each store’s logins apart: switching moves nothing', async () => {
     vi.stubEnv('SAVED_LOGINS_STORE', '');
     vi.stubEnv('SAVED_LOGINS_SEALING_KEY', randomBytes(32).toString('base64'));
-    installFakeVault();
     await saveOne({ name: 'In Vault' });
     vi.stubEnv('SAVED_LOGINS_STORE', 'sealed');
     expect((await call(list)).body).toEqual({ logins: [] });
@@ -629,10 +619,12 @@ describe('the Supabase Vault store', () => {
     for (const plain of [PASSWORD, SETUP_KEY, 'ada@example.test', 'Example Mail', 'mail.example']) {
       expect(stored).not.toContain(plain);
     }
-    // Each half names its owner, its login and which half it is.
-    const secrets = db.rows(SECRETS);
-    expect(secrets.map((s) => s.owner_tag)).toEqual([`saved_login:${ADA}`, `saved_login:${ADA}`]);
-    const item = JSON.parse(secrets.find((s) => s.id === row!.item_secret_id)!.value as string);
+    // Each half is owned by its person, and names its owner, its login and which half it is.
+    const owners = db.rows(OWNERS);
+    expect(owners.map((s) => s.user_id)).toEqual([ADA, ADA]);
+    const item = JSON.parse(
+      owners.find((s) => s.secret_id === row!.item_secret_id)!.value as string
+    );
     expect(item).toEqual({
       for: bindingFor(ADA, id, 'item'),
       value: {
@@ -641,7 +633,9 @@ describe('the Supabase Vault store', () => {
         username: 'ada@example.test',
       },
     });
-    const secret = JSON.parse(secrets.find((s) => s.id === row!.secret_secret_id)!.value as string);
+    const secret = JSON.parse(
+      owners.find((s) => s.secret_id === row!.secret_secret_id)!.value as string
+    );
     expect(secret.for).toBe(bindingFor(ADA, id, 'secret'));
   });
 
@@ -659,6 +653,50 @@ describe('the Supabase Vault store', () => {
     expect(updates[0]!.filters).toEqual([`id=${id}`, `user_id=${ADA}`, 'revision=1']);
   });
 
+  it('reads a login and its halves in one statement, so an edit can’t land between', async () => {
+    const id = await saveOne();
+    await saveOne({ name: 'Second' });
+    // A concurrent edit that lands between any two of a read's queries: it
+    // points the login at new secrets and deletes the old ones.
+    const real = db.from.bind(db);
+    let queries = 0;
+    db.from = (name: string) => {
+      queries += 1;
+      if (queries === 2) {
+        const row = db.rows('saved_logins').find((r) => r.id === id)!;
+        const old = [row.item_secret_id, row.secret_secret_id];
+        row.item_secret_id = db.seed(OWNERS, {
+          secret_id: randomUUID(),
+          user_id: ADA,
+          value: JSON.stringify({
+            for: bindingFor(ADA, id, 'item'),
+            value: { name: 'Edited', url: null, username: null },
+          }),
+        }).secret_id;
+        row.secret_secret_id = db.seed(OWNERS, {
+          secret_id: randomUUID(),
+          user_id: ADA,
+          value: JSON.stringify({
+            for: bindingFor(ADA, id, 'secret'),
+            value: { password: 'edited', authenticator: null },
+          }),
+        }).secret_id;
+        row.revision = 2;
+        db.tables[OWNERS] = db.rows(OWNERS).filter((s) => !old.includes(s.secret_id));
+      }
+      return real(name);
+    };
+    const res = await call(reveal, { params: { id } });
+    expect(res).toMatchObject({ status: 200, body: { password: PASSWORD } });
+    expect(queries).toBe(1);
+    // Listing reads each page in one statement too.
+    queries = 0;
+    const before = db.log.length;
+    db.from = real;
+    expect((await call(list)).status).toBe(200);
+    expect(db.log.slice(before).map((e) => e.table)).toEqual([OPENED, OPENED]);
+  });
+
   it('when the second secret can’t be made, deletes the first and saves nothing', async () => {
     let made = 0;
     const real = db.rpcHandlers.create_saved_login_secret!;
@@ -670,7 +708,7 @@ describe('the Supabase Vault store', () => {
     const res = await call(create, { body: { name: 'x', password: PASSWORD } });
     expect(res.status).toBe(500);
     expect(db.rows('saved_logins')).toHaveLength(0);
-    expect(db.rows(SECRETS)).toHaveLength(0);
+    expect(db.rows(OWNERS)).toHaveLength(0);
   });
 
   it('when the row can’t be written, deletes the secrets made for it', async () => {
@@ -686,7 +724,7 @@ describe('the Supabase Vault store', () => {
     };
     const res = await call(create, { body: { name: 'x', password: PASSWORD } });
     expect(res.status).toBe(500);
-    expect(db.rows(SECRETS)).toHaveLength(0);
+    expect(db.rows(OWNERS)).toHaveLength(0);
   });
 
   it('keeps secrets it couldn’t delete, logging only how many', async () => {
@@ -698,7 +736,7 @@ describe('the Supabase Vault store', () => {
           throw new Error('connection lost');
         };
       }
-      if (name === SECRETS) {
+      if (name === OWNERS) {
         query.delete = () => {
           throw new Error(`refused: ${PASSWORD}`);
         };
@@ -707,19 +745,11 @@ describe('the Supabase Vault store', () => {
     };
     const res = await call(create, { body: { name: 'x', password: PASSWORD } });
     expect(res.status).toBe(500);
-    expect(db.rows(SECRETS)).toHaveLength(2);
+    expect(db.rows(OWNERS)).toHaveLength(2);
     expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
       'Saved logins: kept secrets from a write that did not land',
       { count: 2, reason: 'Error' }
     );
     expect(logged()).not.toContain(PASSWORD);
-  });
-
-  it('reads many secrets a bounded number at a time', async () => {
-    for (let i = 0; i < 230; i++) await saveOne({ name: `site ${String(i).padStart(3, '0')}` });
-    db.maxInList = 100;
-    const res = await call(list);
-    expect(res.status).toBe(200);
-    expect((res.body.logins as Row[]).length).toBe(230);
   });
 });

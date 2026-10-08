@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { FakePostgrest } from '../../test/fake-postgrest';
+import { FakeVaultDb, OWNERS } from '../../test/fake-vault-db';
 import { deleteAllSavedLogins, savedLoginStore } from './index';
 import { parseHalf, type Client } from './store';
 
@@ -27,19 +27,12 @@ describe('parseHalf', () => {
 });
 
 describe('deleteAllSavedLogins', () => {
-  let db: FakePostgrest;
+  let db: FakeVaultDb;
   const ADA = randomUUID();
   const SAM = randomUUID();
 
   beforeEach(() => {
-    db = new FakePostgrest();
-    db.rpcHandlers.create_saved_login_secret = (args) => {
-      const row = db.seed('saved_login_vault_secrets', {
-        owner_tag: `saved_login:${args.p_owner}`,
-        value: args.p_value,
-      });
-      return { data: row.id, error: null };
-    };
+    db = new FakeVaultDb();
   });
 
   it('removes the person’s logins in both stores and their leftover Vault secrets, and no one else’s', async () => {
@@ -59,15 +52,11 @@ describe('deleteAllSavedLogins', () => {
     for (const table of ['saved_logins', 'saved_logins_sealed']) {
       expect(db.rows(table).map((r) => r.user_id)).toEqual([SAM]);
     }
-    // Every secret tagged for the person goes, the leftover included. (The
-    // fake has no trigger or foreign keys; vault-store.integration.test.ts
-    // proves the real ones.)
-    expect(
-      db.rows('saved_login_vault_secrets').filter((s) => s.owner_tag === `saved_login:${ADA}`)
-    ).toHaveLength(0);
-    expect(
-      db.rows('saved_login_vault_secrets').filter((s) => s.owner_tag === `saved_login:${SAM}`)
-    ).toHaveLength(2);
+    // Every secret the person owns goes, the leftover included. (The fake has
+    // no trigger or foreign keys; vault-store.integration.test.ts proves the
+    // real ones.)
+    expect(db.rows(OWNERS).filter((s) => s.user_id === ADA)).toHaveLength(0);
+    expect(db.rows(OWNERS).filter((s) => s.user_id === SAM)).toHaveLength(2);
   });
 
   it('stops at the first failure rather than reporting success', async () => {

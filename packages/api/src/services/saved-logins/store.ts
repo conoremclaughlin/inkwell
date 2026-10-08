@@ -119,13 +119,17 @@ export function storedLogin(row: {
  */
 export async function allOwnRows<Row extends { id: string }>(
   db: Client,
-  table: 'saved_logins' | 'saved_logins_sealed',
-  userId: string
+  table: 'saved_logins_opened' | 'saved_logins_sealed',
+  userId: string,
+  columns = '*'
 ): Promise<Row[] | null> {
   const rows: Row[] = [];
   let after: string | null = null;
+  // The generated types can't follow one query across a table and a view;
+  // the caller types the rows.
+  const untyped = db as unknown as SupabaseClient;
   for (;;) {
-    let query = db.from(table).select('*').eq('user_id', userId);
+    let query = untyped.from(table).select(columns).eq('user_id', userId);
     if (after !== null) query = query.gt('id', after);
     const { data, error } = await query.order('id', { ascending: true }).limit(PAGE);
     if (error) throw new Error(error.message);

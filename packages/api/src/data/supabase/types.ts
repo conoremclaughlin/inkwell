@@ -3328,6 +3328,32 @@ export type Database = {
           },
         ];
       };
+      saved_login_secrets: {
+        Row: {
+          created_at: string;
+          secret_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          secret_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          secret_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'saved_login_secrets_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       saved_logins: {
         Row: {
           created_at: string;
@@ -3357,6 +3383,20 @@ export type Database = {
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'saved_logins_item_secret_fkey';
+            columns: ['item_secret_id'];
+            isOneToOne: true;
+            referencedRelation: 'saved_login_secrets';
+            referencedColumns: ['secret_id'];
+          },
+          {
+            foreignKeyName: 'saved_logins_secret_secret_fkey';
+            columns: ['secret_secret_id'];
+            isOneToOne: true;
+            referencedRelation: 'saved_login_secrets';
+            referencedColumns: ['secret_id'];
+          },
           {
             foreignKeyName: 'saved_logins_user_id_fkey';
             columns: ['user_id'];
@@ -5567,11 +5607,15 @@ export type Database = {
         };
         Relationships: [];
       };
-      saved_login_vault_secrets: {
+      saved_logins_opened: {
         Row: {
+          created_at: string | null;
           id: string | null;
-          owner_tag: string | null;
-          value: string | null;
+          item_value: string | null;
+          revision: number | null;
+          secret_value: string | null;
+          updated_at: string | null;
+          user_id: string | null;
         };
         Relationships: [];
       };

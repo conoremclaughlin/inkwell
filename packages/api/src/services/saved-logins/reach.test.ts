@@ -24,16 +24,21 @@ const ROOTS = ['api/src', 'cli/src', 'shared/src', 'channel-plugin', 'openclaw-p
 const ALLOWED = [
   'api/src/services/saved-logins/',
   'api/src/routes/admin-vault.ts',
-  'api/src/routes/admin-vault.test.ts',
   // Generated database types list every table, view and function.
   'api/src/data/supabase/types.ts',
+  // A test double for the Vault store's database half.
+  'api/src/test/fake-vault-db.ts',
 ];
+
+/** Tests exercise the routes in-process; nothing at runtime runs them. */
+const isTest = (relative: string) => /\.test\.tsx?$/.test(relative);
 
 const NAMES = [
   'services/saved-logins',
   './saved-logins',
   'saved_logins',
-  'saved_login_vault_secrets',
+  'saved_login_secrets',
+  'saved_logins_opened',
   'create_saved_login_secret',
   'decrypted_secrets',
   'vault.secrets',
@@ -64,7 +69,7 @@ describe('who can reach a saved login', () => {
     const reached: string[] = [];
     for (const file of files) {
       const relative = path.relative(PACKAGES, file).split(path.sep).join('/');
-      if (ALLOWED.some((allowed) => relative.startsWith(allowed))) continue;
+      if (isTest(relative) || ALLOWED.some((allowed) => relative.startsWith(allowed))) continue;
       const text = await readFile(file, 'utf8');
       for (const name of NAMES) {
         // routes/admin.ts mounts the router; that is the one sanctioned import.
