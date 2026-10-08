@@ -47,3 +47,4 @@ export * from './tool-profiles.js';
 export { bootstrapSessionIdentity, type SessionBootstrapPorts } from './session-bootstrap.js';
 
 export * from './headless-session.js';
+export * from './session-tool-batch.js';

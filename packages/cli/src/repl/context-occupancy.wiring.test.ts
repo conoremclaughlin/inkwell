@@ -219,7 +219,7 @@ describe('PR 639 resume-not-found recovery seed', () => {
 
 it('the CLI supplies live native state and measurement to the tested shared composition', () => {
   const source = readFileSync(new URL('../commands/chat.ts', import.meta.url), 'utf8');
-  const start = source.indexOf('const providerTurn = createSessionProviderTurn(');
+  const start = source.indexOf('const providerPorts: SessionProviderPorts = {');
   const end = source.indexOf('startTurn: startBackendTurn,', start);
   expect(start).toBeGreaterThan(0);
   expect(end).toBeGreaterThan(start);

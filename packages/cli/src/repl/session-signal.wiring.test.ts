@@ -18,7 +18,7 @@ describe('production chat signal binding', () => {
     const binding = declarations.find((node) => node.name.getText(ast) === 'sessionSignal');
     expect(binding?.initializer?.getText(ast)).toBe('createSignalSink()');
     const parentCalls: ts.CallExpression[] = [];
-    const statusReads: ts.CallExpression[] = [];
+    const headlessCalls: ts.CallExpression[] = [];
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node)) {
         if (
@@ -26,23 +26,28 @@ describe('production chat signal binding', () => {
           node.arguments[2]?.getText(ast) === 'ledger'
         )
           parentCalls.push(node);
-        if (
-          node.expression.getText(ast) === 'sessionSignal.get' ||
-          node.expression.getText(ast) === 'sessionSignal.clear'
-        )
-          statusReads.push(node);
+        if (node.expression.getText(ast) === 'runHeadlessSession') headlessCalls.push(node);
       }
       ts.forEachChild(node, visit);
     };
     visit(chat!);
     expect(parentCalls).toHaveLength(1);
     expect(parentCalls[0]!.arguments[3]?.getText(ast)).toBe('sessionSignal');
-    expect(
-      statusReads.filter((call) => call.expression.getText(ast) === 'sessionSignal.get')
-    ).toHaveLength(3);
-    expect(
-      statusReads.filter((call) => call.expression.getText(ast) === 'sessionSignal.clear')
-    ).toHaveLength(2);
+    expect(headlessCalls).toHaveLength(1);
+    const ports = headlessCalls[0]!.arguments[1]!;
+    expect(ts.isObjectLiteralExpression(ports)).toBe(true);
+    const signalProperty = (ports as ts.ObjectLiteralExpression).properties.find(
+      (node) => node.name?.getText(ast) === 'sessionSignal'
+    );
+    expect(signalProperty && ts.isShorthandPropertyAssignment(signalProperty)).toBe(true);
+    // The shared function, not a second CLI loop, owns reads/clears. Its tests
+    // exercise stale-signal clearing and independence between concurrent runs.
+    const shared = readFileSync(
+      new URL('../../../shared/src/runtime/headless-session.ts', import.meta.url),
+      'utf8'
+    );
+    expect(shared).toContain('ports.sessionSignal.clear()');
+    expect(shared).toContain('ports.sessionSignal.get()');
     expect(source).not.toMatch(/\b(?:globalSignalSink|getLastSignal|clearLastSignal)\b/);
   });
 });

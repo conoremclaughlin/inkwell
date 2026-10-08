@@ -133,7 +133,6 @@ import {
   runCompaction,
   type CompactionOutcome,
 } from '../repl/compaction.js';
-import { localToolLedgerLine } from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -199,7 +198,11 @@ import {
   isValidProfileId,
 } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
-import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
+import {
+  bareToolName,
+  createLocalToolDispatcher,
+  impossibleCallRefusal,
+} from '../repl/tool-dispatch.js';
 import { createToolParametersLookup } from '../repl/tool-parameter-help.js';
 import {
   imagesToDeliver,
@@ -258,6 +261,7 @@ import {
   isPotentialImitationPrefix,
   runAgentLoop,
   runHeadlessSession,
+  runSessionToolBatch,
   type SessionTurnInput,
   stripLocalToolBlocks,
   type AgentLoopResult,
@@ -5615,271 +5619,195 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // supplied its own identity, which is what lets the prompt say *who* asked.
     const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
     const abortSignal = ctx?.signal;
-    const iterationResults: ToolResultRecord[] = [];
-    const settleContextMutation = beginContextMutationFor(calls);
-    try {
-      await executeToolCalls(calls, {
-        policy: toolPolicy,
-        commitIntent: toolIntentCommitter(runtime.log),
-        signal: abortSignal,
-        // Every result's images are taken out before anything below reads it:
-        // the preview, the transcript, the ledger and the relay all see the
-        // descriptor, and the bytes reach the model as an image block.
-        callTool: withImageCapture(
-          createLocalToolDispatcher({
-            cwd: process.cwd(),
-            callPi: callPiTool,
-            callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
-            toolParameters: inkToolParameters,
-            // Help the model didn't ask for runs only where describe_tool is
-            // auto-allowed now, without spending a one-use grant.
-            mayLookUpParameters: () => {
-              const decision = toolPolicy.inspectInkTool('describe_tool', runtime.sessionId);
-              return decision.allowed && !decision.wouldConsumeGrant;
-            },
-            // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
-            // emits references; actual values are injected at the execution layer
-            // so credentials never enter transcripts or context.
-            resolveCredentials: (args) => {
-              const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-                args,
-                buildResolverEnv()
-              );
-              if (resolutions.length > 0 && runtime.verbose) {
-                const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-                printLine(
-                  chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
-                );
-              }
-              return resolvedArgs;
-            },
-            audience: 'parent',
-            isHardDenied: (tool) => {
-              const decision = toolPolicy.inspectInkTool(bareToolName(tool), runtime.sessionId);
-              return !decision.allowed && !decision.promptable;
-            },
-            head: (tool, args, ctx) => {
-              // spawn_agent is NOT a client-local policy bypass. Unlike ledger
-              // tools it costs backend time and fans out authority, so it reaches
-              // here only after executeToolCalls has cleared it through policy.
-              if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
-                return runSpawnAgent(args, { signal: abortSignal });
-              }
-              if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
-                return runCollectAgents(args);
-              }
-              // The agent compacting its own window needs the host (summarizer
-              // turn, transcript event, provider-session roll) — answered here,
-              // before the generic client-local handler refuses it.
-              if (bareToolName(tool) === 'compact_context') {
-                return runSbCompaction(args, ctx);
-              }
-              // Client-local tools (context management) are handled in-process.
-              // An eviction's persistent refs arrive on the hook, not in the
-              // result the model reads — see EvictionHooks (#571).
-              if (isClientLocalTool(tool)) {
-                return handleClientLocalTool(tool, args, ledger, sessionSignal, {
-                  providerUsage: () => providerContextMeasurement(),
-                  onEvict: (eviction) =>
-                    recordEviction(
-                      'sb',
-                      compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
-                      eviction.tokensFreed,
-                      eviction.refs
-                    ),
-                });
-              }
-              return null;
-            },
-          }),
-          { cacheDir: toolImageCacheDir, delivery: parentImageDelivery }
-        ),
-        sessionId: runtime.sessionId,
-        promptForApproval: (tool, reason, args) =>
-          approvalCoordinator
-            .request({
-              tool,
-              args: args ?? {},
-              reason,
-              sessionId: runtime.sessionId,
-              origin: approvalOrigin,
-              signal: abortSignal,
-            })
-            .then((outcome) => outcome.approved),
-        onResult: (result: ToolCallResult) => {
-          const delivered = localDeliveredSend(result);
-          if (delivered) turnSends.push(delivered);
-          if (result.status === 'blocked' || result.status === 'denied') {
-            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-            printEvent(
-              chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
+    return runSessionToolBatch(calls, {
+      ledger,
+      log: runtime.log,
+      mintInvocationId: randomUUID,
+      impossibleCallRefusal,
+      beginContextMutation: beginContextMutationFor,
+      isHandoffTool: isCloneHandoffTool,
+      takeImages: takeCapturedImages,
+      policy: toolPolicy,
+      signal: abortSignal,
+      // Every result's images are taken out before anything below reads it:
+      // the preview, the transcript, the ledger and the relay all see the
+      // descriptor, and the bytes reach the model as an image block.
+      callTool: withImageCapture(
+        createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
+          toolParameters: inkToolParameters,
+          // Help the model didn't ask for runs only where describe_tool is
+          // auto-allowed now, without spending a one-use grant.
+          mayLookUpParameters: () => {
+            const decision = toolPolicy.inspectInkTool('describe_tool', runtime.sessionId);
+            return decision.allowed && !decision.wouldConsumeGrant;
+          },
+          // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+          // emits references; actual values are injected at the execution layer
+          // so credentials never enter transcripts or context.
+          resolveCredentials: (args) => {
+            const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+              args,
+              buildResolverEnv()
             );
-            runtime.log.append({
-              type: 'local_tool_call',
-              invocationId: result.invocationId,
-              dispatchState: result.dispatchState,
-              tool: result.tool,
-              args: result.args,
-              status: result.status,
-              reason: result.reason,
-            });
-            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-            iterationResults.push({
-              tool: result.tool,
-              result: result.reason,
-              status: result.status,
-            });
-          } else if (result.status === 'executed' || result.status === 'approved') {
-            const resultJson = JSON.stringify(result.result);
+            if (resolutions.length > 0 && runtime.verbose) {
+              const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+              printLine(
+                chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+              );
+            }
+            return resolvedArgs;
+          },
+          audience: 'parent',
+          isHardDenied: (tool) => {
+            const decision = toolPolicy.inspectInkTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args, ctx) => {
+            // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+            // tools it costs backend time and fans out authority, so it reaches
+            // here only after executeToolCalls has cleared it through policy.
+            if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+              return runSpawnAgent(args, { signal: abortSignal });
+            }
+            if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+              return runCollectAgents(args);
+            }
+            // The agent compacting its own window needs the host (summarizer
+            // turn, transcript event, provider-session roll) — answered here,
+            // before the generic client-local handler refuses it.
+            if (bareToolName(tool) === 'compact_context') {
+              return runSbCompaction(args, ctx);
+            }
+            // Client-local tools (context management) are handled in-process.
+            // An eviction's persistent refs arrive on the hook, not in the
+            // result the model reads — see EvictionHooks (#571).
+            if (isClientLocalTool(tool)) {
+              return handleClientLocalTool(tool, args, ledger, sessionSignal, {
+                providerUsage: () => providerContextMeasurement(),
+                onEvict: (eviction) =>
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                    eviction.tokensFreed,
+                    eviction.refs
+                  ),
+              });
+            }
+            return null;
+          },
+        }),
+        { cacheDir: toolImageCacheDir, delivery: parentImageDelivery }
+      ),
+      sessionId: runtime.sessionId,
+      promptForApproval: (tool, reason, args) =>
+        approvalCoordinator
+          .request({
+            tool,
+            args: args ?? {},
+            reason,
+            sessionId: runtime.sessionId,
+            origin: approvalOrigin,
+            signal: abortSignal,
+          })
+          .then((outcome) => outcome.approved),
+      onResult: (result: ToolCallResult) => {
+        const delivered = localDeliveredSend(result);
+        if (delivered) turnSends.push(delivered);
+        if (result.status === 'blocked' || result.status === 'denied') {
+          printEvent(
+            chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
+          );
+        } else if (result.status === 'executed' || result.status === 'approved') {
+          const resultJson = JSON.stringify(result.result);
 
-            // Format context-management and signal tools with friendly output
-            if (result.tool === 'evict_context') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                // The eviction itself was persisted from the onEvict hook at
-                // execution time (recordEviction); this is display only.
-                printEvent(
-                  chalk.dim(
-                    `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
-                  )
-                );
-              }
-            } else if (result.tool === 'list_context') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                const sources = parsed.bySource
-                  ? Object.entries(
-                      parsed.bySource as Record<string, { count: number; tokens: number }>
-                    )
-                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                      .join(' ')
-                  : '';
-                printEvent(
-                  chalk.dim(
-                    `📋 ${sbSlug} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
-                      sources ? ` · ${sources}` : ''
-                    }`
-                  )
-                );
-              }
-            } else if (result.tool === 'signal_status') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                const signal = parsed.signal as { status: string; reason?: string } | undefined;
-                if (signal) {
-                  const icon =
-                    signal.status === 'completed'
-                      ? '✅'
-                      : signal.status === 'blocked'
-                        ? '🚫'
-                        : '➡️';
-                  printEvent(
-                    chalk.dim(
-                      `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
-                    )
-                  );
-                }
-              }
-            } else {
-              // One dim line, attributed to the agent, result truncated —
-              // the Ctrl+T inspector holds a 2KB result slice per call and
-              // the transcript keeps the complete payload.
-              const resultPreview = compactForLedger(resultJson, 160);
+          // Format context-management and signal tools with friendly output
+          if (result.tool === 'evict_context') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              // The eviction itself was persisted from the onEvict hook at
+              // execution time (recordEviction); this is display only.
               printEvent(
                 chalk.dim(
-                  `🛠 ${sbSlug} · ${result.tool} (${result.status})${
-                    resultPreview ? ` — ${resultPreview}` : ''
+                  `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
+                )
+              );
+            }
+          } else if (result.tool === 'list_context') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              const sources = parsed.bySource
+                ? Object.entries(
+                    parsed.bySource as Record<string, { count: number; tokens: number }>
+                  )
+                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                    .join(' ')
+                : '';
+              printEvent(
+                chalk.dim(
+                  `📋 ${sbSlug} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                    sources ? ` · ${sources}` : ''
                   }`
                 )
               );
             }
-            runtime.log.append({
-              type: 'local_tool_call',
-              invocationId: result.invocationId,
-              dispatchState: result.dispatchState,
-              tool: result.tool,
-              args: result.args,
-              status: result.status,
-              result: result.result,
-            });
-            // Context-management tools (list_context, evict_context) must NOT
-            // persist their results back into the ledger — doing so pollutes the
-            // context they're managing and reintroduces evicted content.
-            //
-            // spawn_agent and collect_agents are excluded for the same reason
-            // from the other direction: they write their OWN dedicated handoff
-            // entry, so the generic append would duplicate every clone summary
-            // and undo the one-entry-per-fan-out guarantee that justifies clones
-            // at all.
-            if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
-              // The images this call put in context belong to its entry: they
-              // count toward it, re-seed with it and go when it is evicted.
-              // Named after the 500-character cut so the line always says
-              // which picture a re-seed's labelled image block is.
-              const images = takeCapturedImages(result.result);
-              ledger.addEntry(
-                'system',
-                // A resolved failure is recorded as one (Lumen, PR #584 round 4).
-                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500) +
-                  (images.length > 0
-                    ? ` [${images.map((image) => `${image.ref} ${image.width}x${image.height}`).join(', ')} attached]`
-                    : ''),
-                'local-tool',
-                undefined,
-                undefined,
-                images
-              );
+          } else if (result.tool === 'signal_status') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              const signal = parsed.signal as { status: string; reason?: string } | undefined;
+              if (signal) {
+                const icon =
+                  signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
+                printEvent(
+                  chalk.dim(
+                    `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
+                  )
+                );
+              }
             }
-            iterationResults.push({
-              tool: result.tool,
-              result: result.result,
-              status: result.status,
-              args: result.args,
-            });
-          } else if (result.status === 'error') {
-            const msg = `Local tool error (${result.tool}): ${result.error}`;
+          } else {
+            // One dim line, attributed to the agent, result truncated —
+            // the Ctrl+T inspector holds a 2KB result slice per call and
+            // the transcript keeps the complete payload.
+            const resultPreview = compactForLedger(resultJson, 160);
             printEvent(
-              chalk.red(
-                `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
+              chalk.dim(
+                `🛠 ${sbSlug} · ${result.tool} (${result.status})${
+                  resultPreview ? ` — ${resultPreview}` : ''
+                }`
               )
             );
-            runtime.log.append({
-              type: 'local_tool_call',
-              invocationId: result.invocationId,
-              dispatchState: result.dispatchState,
-              tool: result.tool,
-              args: result.args,
-              status: 'error',
-              error: result.error,
-            });
-            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-            iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
           }
+        } else if (result.status === 'error') {
+          printEvent(
+            chalk.red(
+              `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
+            )
+          );
+        }
 
-          // Headless liveness + progress: one compact NDJSON line per tool as
-          // it completes. Input is capped and results are omitted (can be large
-          // or sensitive). send_response is intentionally NOT streamed here —
-          // that tool already routes server-side, so re-emitting it as a
-          // response line would risk double delivery.
-          const streamArgs = result.args ? JSON.stringify(result.args) : '';
-          emitStreamEvent({
-            type: 'tool_call',
-            toolName: result.tool,
-            status: result.status,
-            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
-          });
-        },
-      });
-    } finally {
-      settleContextMutation();
-    }
-    return iterationResults;
+        // Headless liveness + progress: one compact NDJSON line per tool as
+        // it completes. Input is capped and results are omitted (can be large
+        // or sensitive). send_response is intentionally NOT streamed here —
+        // that tool already routes server-side, so re-emitting it as a
+        // response line would risk double delivery.
+        const streamArgs = result.args ? JSON.stringify(result.args) : '';
+        emitStreamEvent({
+          type: 'tool_call',
+          toolName: result.tool,
+          status: result.status,
+          ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+        });
+      },
+    });
   };
 
   const executeUserTurn = async (

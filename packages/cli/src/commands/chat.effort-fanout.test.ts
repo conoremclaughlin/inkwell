@@ -50,9 +50,11 @@ describe('effort reaches every backend spawn in chat.ts', () => {
   const calls = spawnCallArgs(chatSource);
 
   it('wires the shared provider composition to the same runtime and attachment', () => {
-    expect(cliSource).toMatch(/createSessionProviderTurn\(\s*\{\s*runtime,/);
+    expect(cliSource).toMatch(/const providerPorts: SessionProviderPorts = \{\s*runtime,/);
     expect(cliSource).toMatch(/sbSlug,\s*cliAttached,\s*passthroughArgs,/);
     expect(cliSource).toContain('startTurn: startBackendTurn');
+    expect(cliSource).toContain('provider: providerPorts,');
+    expect(cliSource).toContain('await runSessionAgentTurn(');
   });
 
   it('finds the spawn sites (delivery, reseed, continuation, compaction, clone)', () => {

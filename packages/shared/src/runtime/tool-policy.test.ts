@@ -84,7 +84,8 @@ describe('host-independent Ink policy', () => {
     expect(applyProfile(policy, profile).success).toBe(true);
     expect(policy.getMode()).toBe(TOOL_PROFILES[profile].mode);
     const writing = policy.canCallInkTool('write');
-    if (profile === 'minimal' || profile === 'inkling') expect(writing.allowed).toBe(false);
+    if (profile === 'minimal' || profile === 'inkling' || profile === 'tools')
+      expect(writing.allowed).toBe(false);
     else if (profile === 'safe')
       expect(writing).toMatchObject({ allowed: false, promptable: true });
     else expect(writing.allowed).toBe(true);
