@@ -247,14 +247,15 @@ function localTime(at: Date, timezone: string): { text: string; timezone: string
 export function inklingHeartbeatPrompt(input: {
   sbSlug: string;
   threadKey: string;
-  heartbeat: string | null;
+  /** Its document as stored: null (or absent) when never written. */
+  heartbeat: string | null | undefined;
   now: Date;
   timezone: string;
   quietUntil?: string;
 }): string {
   const { sbSlug, threadKey } = input;
   const time = localTime(input.now, input.timezone);
-  const document = input.heartbeat === null ? INKLING_HEARTBEAT : input.heartbeat.trim();
+  const document = typeof input.heartbeat === 'string' ? input.heartbeat.trim() : INKLING_HEARTBEAT;
   const lines = [
     '[HEARTBEAT]',
     `Nobody wrote to you: this is your heartbeat. For the person you're with it's ${time.text} (${time.timezone}).`,

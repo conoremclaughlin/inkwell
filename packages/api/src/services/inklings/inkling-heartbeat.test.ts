@@ -319,6 +319,10 @@ describe('a beat as the scheduler fires it', () => {
     expect(request.content).toContain('Watch the garden.');
     // Only the inkling's own words go into its prompt.
     expect(request.content).not.toMatch(/IGNORE THIS|NOR THIS/);
+    // No hook a reply could come from: a quiet beat's closing text, and a
+    // failed beat's notice, are never posted (Myra, 748a9c97).
+    expect(request.turnHooks).toBeUndefined();
+    expect(request.onTurnReply).toBeUndefined();
   });
 
   it('is skipped, with no turn, while it has no conversation with its person', async () => {
@@ -382,5 +386,28 @@ describe('a beat as the scheduler fires it', () => {
     for (const channel of ['telegram', 'whatsapp', 'email', 'heartbeat']) {
       expect(isInklingHeartbeatReminder({ delivery_channel: channel }), channel).toBe(false);
     }
+  });
+});
+
+describe('the heartbeat text (starter-space.ts, frozen by Myra, 748a9c97)', () => {
+  it('speaks once, in its own conversation, and stays quiet otherwise', () => {
+    expect(INKLING_HEARTBEAT).toMatch(
+      /\*\*If it needs them, tell them once\.\*\* One message, short and plain, in your own conversation with them/
+    );
+    expect(INKLING_HEARTBEAT).toMatch(/\*\*If nothing needs them, stay quiet\.\*\*/);
+    expect(INKLING_HEARTBEAT).toMatch(/A quiet heartbeat is a good one\./);
+  });
+
+  it('tells only the person it belongs to, and nothing of anyone else', () => {
+    expect(INKLING_HEARTBEAT).toMatch(/#### Other people\n\nTell only the person you belong to\./);
+    expect(INKLING_HEARTBEAT).toMatch(/never the other person's details\./);
+  });
+
+  it('holds what can wait through their quiet hours', () => {
+    expect(INKLING_HEARTBEAT).toMatch(/#### Their quiet hours/);
+  });
+
+  it('says inkling or nothing, never SB', () => {
+    expect(INKLING_HEARTBEAT).not.toMatch(/Synthetically-born|\bSBs?\b/);
   });
 });

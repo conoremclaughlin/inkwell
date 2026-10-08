@@ -10,6 +10,8 @@ import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { deliverInklingHeartbeat } from '../inklings/inkling-heartbeat.js';
+import type { DueReminder, HeartbeatDeliveryOutcome } from '../heartbeat.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
 import { configureLaunchRecording, holdSurvivors, resetLaunchHolds } from './launched-processes.js';
@@ -37,6 +39,7 @@ import type {
   InjectedContext,
   ClaudeRunnerConfig,
   ClaudeRunnerResult,
+  SessionResult,
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
 import { InkRunner } from './ink-runner.js';
@@ -1125,6 +1128,11 @@ describe('SessionService', () => {
           scopeReadFaults?: number;
           /** More tables, or a table's rows in place of the default ones. */
           tables?: Record<string, Row[]>;
+          /**
+           * Runs the delivery in place of handing the service `request`: the
+           * caller drives the built service over the same tables.
+           */
+          drive?: (service: SessionService, supabase: never) => Promise<SessionResult>;
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -1240,6 +1248,7 @@ describe('SessionService', () => {
               } as never)
         );
         lastService = service;
+        if (extra.drive) return extra.drive(service, supabase);
         return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
       };
       let lastService: SessionService;
@@ -1463,6 +1472,62 @@ describe('SessionService', () => {
           expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
           expect(result.classification?.retryable).toBe(true);
           expectNothingRan();
+        });
+
+        describe('a beat posts nothing of its own (Myra, 748a9c97)', () => {
+          /**
+           * The scheduler's delivery, run through this service over the same
+           * tables: it finds the conversation, the gate admits the beat, and
+           * the runner's outcome is all that comes back.
+           */
+          const fireBeat = async () => {
+            let outcome: HeartbeatDeliveryOutcome | undefined;
+            await turn(INKLING, {}, OWNER, {
+              ...tablesWith(),
+              drive: async (service, supabase) => {
+                outcome = await deliverInklingHeartbeat(
+                  { supabase, handleMessage: (request) => service.handleMessage(request) },
+                  reminder() as unknown as DueReminder
+                );
+                return { success: true } as SessionResult;
+              },
+            });
+            return outcome!;
+          };
+          const threadMessages = () => lastTables.inbox_thread_messages.length;
+
+          it('a quiet beat that ends without sending posts nothing: its closing text stays in the log', async () => {
+            vi.mocked(mockInkRunner.run).mockResolvedValueOnce(
+              createMockClaudeResult({ finalTextResponse: 'Nothing new to tell them.' })
+            );
+            const before = THREAD_TABLES.inbox_thread_messages.length;
+            const outcome = await fireBeat();
+            expect(outcome).toEqual({ status: 'delivered' });
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const [prompt] = vi.mocked(mockInkRunner.run).mock.calls[0] as unknown as [string];
+            expect(prompt).toContain(`Your conversation with them is "${KEY}"`);
+            expect(threadMessages()).toBe(before);
+          });
+
+          it('a beat that fails posts nothing: there was no message to answer', async () => {
+            const before = THREAD_TABLES.inbox_thread_messages.length;
+            vi.mocked(mockInkRunner.run).mockResolvedValueOnce(
+              createMockClaudeResult({
+                success: false,
+                error: 'provider unavailable',
+                finalTextResponse: 'I could not finish.',
+              })
+            );
+            const failed = await fireBeat();
+            expect(failed.status).toBe('failed');
+            expect(threadMessages()).toBe(before);
+
+            vi.mocked(mockInkRunner.run).mockClear();
+            vi.mocked(mockInkRunner.run).mockRejectedValueOnce(new Error('ink exited 1'));
+            const crashed = await fireBeat();
+            expect(crashed.status).toBe('failed');
+            expect(threadMessages()).toBe(before);
+          });
         });
 
         it('another SB’s turn never reads a reminder: the mark means nothing to it', async () => {
