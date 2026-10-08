@@ -15,21 +15,7 @@ import {
   type TurnSend,
 } from '@inklabs/shared';
 
-export const CONTINUATION_PROMPT =
-  'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.';
-
-/**
- * Text written in a continuation turn used to go nowhere unless it happened to
- * be the run's last. Now it goes to the user, so the SB is told: otherwise its
- * notes to itself ("nothing more I can do, closing the turn") arrive on the
- * user's phone as messages.
- */
-const FORWARDED_NOTE =
-  ' Text you write in this turn is sent to the user as a message, so write only what is meant for them; if there is nothing new for them, call signal_status without writing text.';
-
-export function continuationPrompt(repliesForwarded: boolean): string {
-  return repliesForwarded ? CONTINUATION_PROMPT + FORWARDED_NOTE : CONTINUATION_PROMPT;
-}
+export { CONTINUATION_PROMPT, continuationPrompt } from '@inklabs/shared/runtime';
 
 export function turnReplyEvent(input: {
   turn: number;

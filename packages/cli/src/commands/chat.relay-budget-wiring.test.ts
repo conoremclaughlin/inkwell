@@ -18,9 +18,15 @@ const provider = readFileSync(
   'utf8'
 );
 
-const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\},\s*\{/g)].map(
-  (m) => m[1]!
+const parentComposition = readFileSync(
+  join(here, '../../../shared/src/providers/session-agent-turn.ts'),
+  'utf8'
 );
+const loopCalls = [
+  ...`${source}\n${parentComposition}`.matchAll(
+    /await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\},\s*\{/g
+  ),
+].map((m) => m[1]!);
 const noteSpawn = provider.slice(
   provider.indexOf('const noteSpawn = ('),
   provider.indexOf('/** The continuation spawn')
@@ -29,6 +35,9 @@ const noteSpawn = provider.slice(
 describe('runAgentLoop hosts and their relay budgets', () => {
   it('there are exactly two production hosts: the parent turn and the clone', () => {
     expect(loopCalls).toHaveLength(2);
+    expect(source.match(/await runSessionAgentTurn\(/g)).toHaveLength(1);
+    expect(source).not.toContain('createSessionProviderTurn(');
+    expect(parentComposition).toContain('backend: { runTurn: providerTurn.runTurn }');
   });
 
   it('every host supplies a live relay budget — none takes the static default', () => {

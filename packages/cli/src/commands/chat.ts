@@ -1,4 +1,4 @@
-import { createSessionProviderTurn } from '@inklabs/shared/providers';
+import { runSessionAgentTurn, type SessionProviderPorts } from '@inklabs/shared/providers';
 export { isResumeFailedNoSession } from '@inklabs/shared/runtime';
 import { occupancyTokens, promptTokensOf, relayBudgetBytes } from '@inklabs/shared/runtime';
 export {
@@ -82,12 +82,7 @@ import { acceptsContextImagesFor, promptTransportFor } from '../backends/index.j
 import { createCliBackendHost } from '../backends/cli-host.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
-import {
-  backendSendTarget,
-  continuationPrompt,
-  localDeliveredSend,
-  turnReplyEvent,
-} from '../repl/turn-reply.js';
+import { backendSendTarget, localDeliveredSend, turnReplyEvent } from '../repl/turn-reply.js';
 import {
   CloneRegistry,
   formatCloneLine,
@@ -262,6 +257,8 @@ import {
   findImitatedToolResults,
   isPotentialImitationPrefix,
   runAgentLoop,
+  runHeadlessSession,
+  type SessionTurnInput,
   stripLocalToolBlocks,
   type AgentLoopResult,
   type BackendTurnOutcome,
@@ -6059,145 +6056,137 @@ export async function runChat(options: ChatOptions): Promise<void> {
       inkRepl?.setAbortHandler(null);
     };
 
-    const providerTurn = createSessionProviderTurn(
-      {
-        runtime,
-        state: {
-          get id() {
-            return activeBackendSessionId;
-          },
-          set id(value) {
-            activeBackendSessionId = value;
-          },
-          get shape() {
-            return activeBackendSessionShape;
-          },
-          set shape(value) {
-            activeBackendSessionShape = value;
-          },
+    const providerPorts: SessionProviderPorts = {
+      runtime,
+      state: {
+        get id() {
+          return activeBackendSessionId;
         },
-        ledger,
-        sbSlug,
-        cliAttached,
-        passthroughArgs,
-        dialogue: turnDialogue,
-        mintId: randomUUID,
-        append: (entry) => runtime.log.append(entry),
-        buildEnvelope: (body, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, body, stamp),
-        measurement: providerContextMeasurement,
-        spawnContext: providerSpawnContext,
-        contextImagesFor,
-        noteImagesDelivered,
-        attachmentDirs: () =>
-          sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        startTurn: startBackendTurn,
-        onEvent: handleBackendEvent,
-        beginSpawn,
-        endSpawn,
-        onAbortHandle: (abort) => {
-          currentTurnAbort = abort;
+        set id(value) {
+          activeBackendSessionId = value;
         },
-        onInitialSettled: () => {
-          turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
-          stopWaiting();
+        get shape() {
+          return activeBackendSessionShape;
         },
-        onInitialResult: (runResult) => {
-          sbDebugLog(
-            'chat',
-            'backend_turn_result',
-            {
-              backend: runtime.backend,
-              sessionId: runtime.sessionId || null,
-              success: runResult.success,
-              exitCode: runResult.exitCode,
-              durationMs: runResult.durationMs,
-              command: runResult.command,
-              stderrPreview: runResult.stderr.slice(0, 500),
-            },
-            debugFile ? { force: true, file: debugFile } : undefined
-          );
-
-          if (runResult.success) {
-            consecutiveBackendFailures = 0;
-          } else {
-            consecutiveBackendFailures += 1;
-          }
-
-          // Log backend CLI turn completion to activity stream. Use 'ink' as the
-          // runner label (not the LLM backend like 'claude') so the mission feed
-          // shows the correct execution layer. Continuations are the same logical
-          // turn and deliberately do NOT log again.
-          if (runtime.sessionId) {
-            const turnStatus = runResult.success ? 'completed' : 'failed';
-            const cliErrorClassification = !runResult.success
-              ? classifyError({
-                  errorText: runResult.stderr || runResult.stdout,
-                  backend: runtime.backend,
-                  exitCode: runResult.exitCode,
-                })
-              : null;
-
-            const runnerLabel = 'ink';
-            inkClient
-              .callTool('log_activity', {
-                sbSlug,
-                type: runResult.success ? 'agent_complete' : 'error',
-                subtype: `backend_cli:${runnerLabel}`,
-                content: runResult.success
-                  ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
-                  : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
-                sessionId: runtime.sessionId,
-                status: turnStatus,
-                payload: {
-                  backend: runnerLabel,
-                  exitCode: runResult.exitCode,
-                  durationMs: turnDurationSeconds * 1000,
-                  studioId: runtime.studioId,
-                  ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
-                  ...(cliErrorClassification
-                    ? {
-                        errorCategory: cliErrorClassification.category,
-                        errorSummary: cliErrorClassification.summary,
-                        retryable: cliErrorClassification.retryable,
-                      }
-                    : {}),
-                  ...(runResult.usage ? { usage: runResult.usage } : {}),
-                },
-              })
-              .catch(() => undefined);
-          }
+        set shape(value) {
+          activeBackendSessionShape = value;
         },
-        recordUsage: recordRunUsage,
-        sampleContext: sampleProviderContext,
-        contextGeneration: () => contextGeneration,
-        mutationsInFlight: () => mutationsInFlight,
-        notice: (reason) =>
-          printEvent(
-            reason === 'resume-missing'
-              ? chalk.yellow(
-                  '  ⛁ provider session not found on resume — re-seeding a fresh native session'
-                )
-              : chalk.dim(
-                  '  ⛁ provider session rolled mid-turn — re-seeding a fresh native session'
-                )
-          ),
       },
-      raw,
-      turnMedia,
-      prepared
-    );
+      ledger,
+      sbSlug,
+      cliAttached,
+      passthroughArgs,
+      dialogue: turnDialogue,
+      mintId: randomUUID,
+      append: (entry) => runtime.log.append(entry),
+      buildEnvelope: (body, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, body, stamp),
+      measurement: providerContextMeasurement,
+      spawnContext: providerSpawnContext,
+      contextImagesFor,
+      noteImagesDelivered,
+      attachmentDirs: () => (sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined),
+      startTurn: startBackendTurn,
+      onEvent: handleBackendEvent,
+      beginSpawn,
+      endSpawn,
+      onAbortHandle: (abort) => {
+        currentTurnAbort = abort;
+      },
+      onInitialSettled: () => {
+        turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
+        stopWaiting();
+      },
+      onInitialResult: (runResult) => {
+        sbDebugLog(
+          'chat',
+          'backend_turn_result',
+          {
+            backend: runtime.backend,
+            sessionId: runtime.sessionId || null,
+            success: runResult.success,
+            exitCode: runResult.exitCode,
+            durationMs: runResult.durationMs,
+            command: runResult.command,
+            stderrPreview: runResult.stderr.slice(0, 500),
+          },
+          debugFile ? { force: true, file: debugFile } : undefined
+        );
+
+        if (runResult.success) {
+          consecutiveBackendFailures = 0;
+        } else {
+          consecutiveBackendFailures += 1;
+        }
+
+        // Log backend CLI turn completion to activity stream. Use 'ink' as the
+        // runner label (not the LLM backend like 'claude') so the mission feed
+        // shows the correct execution layer. Continuations are the same logical
+        // turn and deliberately do NOT log again.
+        if (runtime.sessionId) {
+          const turnStatus = runResult.success ? 'completed' : 'failed';
+          const cliErrorClassification = !runResult.success
+            ? classifyError({
+                errorText: runResult.stderr || runResult.stdout,
+                backend: runtime.backend,
+                exitCode: runResult.exitCode,
+              })
+            : null;
+
+          const runnerLabel = 'ink';
+          inkClient
+            .callTool('log_activity', {
+              sbSlug,
+              type: runResult.success ? 'agent_complete' : 'error',
+              subtype: `backend_cli:${runnerLabel}`,
+              content: runResult.success
+                ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+                : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
+              sessionId: runtime.sessionId,
+              status: turnStatus,
+              payload: {
+                backend: runnerLabel,
+                exitCode: runResult.exitCode,
+                durationMs: turnDurationSeconds * 1000,
+                studioId: runtime.studioId,
+                ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
+                ...(cliErrorClassification
+                  ? {
+                      errorCategory: cliErrorClassification.category,
+                      errorSummary: cliErrorClassification.summary,
+                      retryable: cliErrorClassification.retryable,
+                    }
+                  : {}),
+                ...(runResult.usage ? { usage: runResult.usage } : {}),
+              },
+            })
+            .catch(() => undefined);
+        }
+      },
+      recordUsage: recordRunUsage,
+      sampleContext: sampleProviderContext,
+      contextGeneration: () => contextGeneration,
+      mutationsInFlight: () => mutationsInFlight,
+      notice: (reason) =>
+        printEvent(
+          reason === 'resume-missing'
+            ? chalk.yellow(
+                '  ⛁ provider session not found on resume — re-seeding a fresh native session'
+              )
+            : chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
+        ),
+    };
 
     process.on('SIGINT', onSigintDuringTurn);
     inkRepl?.setAbortHandler(abortCurrentTurn);
 
-    let loopResult: AgentLoopResult;
+    let execution: Awaited<ReturnType<typeof runSessionAgentTurn>>;
     try {
-      loopResult = await runAgentLoop(
+      execution = await runSessionAgentTurn(
         {
-          prompt: providerTurn.prompt,
-          toolRouting: runtime.toolRouting,
+          raw,
+          turnMedia,
+          prepared,
           signal: turnAbort.signal,
-          relayBudgetBytes: () => relayBudgetBytes(runtime, providerTurn.relayOccupancy()),
           // Nobody watches a non-interactive turn, so a call that failed (an
           // invalid argument, say) gets a retry instead of ending the turn on
           // the FINAL relay. A deliberate refusal still ends it.
@@ -6229,7 +6218,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               return verdict.ok ? { calls: verdict.calls } : { rejected: verdict.reason };
             },
           },
-          backend: { runTurn: providerTurn.runTurn },
+          provider: providerPorts,
+          rollProviderSession,
           observe: {
             recordToolCall: (r) => {
               const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
@@ -6285,23 +6275,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
       disarmTurnCancellation();
     }
 
-    // The loop tells the model when it has written fake results; when it
-    // could not (the correction itself came back imitated, or the backend
-    // failed before one could be sent), the native session still holds the
-    // fabrication unremarked. Resuming it would hand the next turn fake
-    // evidence as history. Roll it — the next turn reseeds from the ledger,
-    // which only ever held the sanitized text. The marker keeps a later
-    // process from recovering the poisoned id (findLastBackendSession).
-    if (loopResult.protocolViolations.some((v) => !v.corrected) && activeBackendSessionId) {
-      rollProviderSession(
-        'uncorrected-protocol-violation',
-        'an imitated results frame went uncorrected'
-      );
-    }
-
     return {
-      loop: loopResult,
-      backend: providerTurn.lastRunResult,
+      ...execution,
       value: { turnDurationSeconds },
     };
   };
@@ -6742,7 +6717,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const runTurnAndReport = async (
       turn: number,
       raw: string,
-      source: 'user' | 'system',
+      source: SessionTurnInput['source'],
       label: string | undefined
     ): Promise<void> => {
       lastTurnAssistantText = null;
@@ -6769,63 +6744,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // reached the committed callback. Never duplicate a successfully sent one.
       report();
     };
-    const repliesForwarded = Boolean(turnReplyToken);
-    sessionSignal.clear();
-    await runTurnAndReport(1, message, messageLabel ? 'system' : 'user', messageLabel);
-    // Actual completed outer turns — reported instead of the configured cap,
-    // which lies whenever signal_status halts the loop early.
-    let turnsCompleted = 1;
-
-    // Check for signal or failure after turn 1
-    let exitReason: string | undefined;
-    const signal1 = sessionSignal.get();
-    if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
-      exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
-    }
-    if (!exitReason && consecutiveBackendFailures > 0) {
-      exitReason = 'backend_failure';
-    }
-
-    // Turns 2..N: continuation prompts — the SB signals when it's done
-    if (!exitReason) {
-      for (let turn = 2; turn <= maxTurns; turn++) {
-        sessionSignal.clear();
-        await runTurnAndReport(
-          turn,
-          continuationPrompt(repliesForwarded),
-          'system',
-          'continuation'
-        );
-        turnsCompleted += 1;
-
-        const signal = sessionSignal.get();
-        if (signal?.status === 'completed' || signal?.status === 'blocked') {
-          exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
-          break;
-        }
-        if (consecutiveBackendFailures >= 2) {
-          exitReason = 'backend_failure';
-          break;
-        }
+    const { turnsCompleted, exitReason, finalSignal, phase } = await runHeadlessSession(
+      { message, messageLabel, maxTurns, repliesForwarded: Boolean(turnReplyToken) },
+      {
+        sessionSignal,
+        consecutiveBackendFailures: () => consecutiveBackendFailures,
+        runTurn: (turn, input) =>
+          runTurnAndReport(turn, input.raw, input.source, input.displayLabel),
       }
-    }
+    );
 
     if (pollTimer) clearInterval(pollTimer);
     stopEventStream?.();
     const summary = summarizeForSessionEnd(ledger);
 
     const isBackendFailure = exitReason === 'backend_failure';
-
-    // Map the signal to a session phase. Don't end the session — leave it
-    // resumable so the user or another SB can attach and follow up.
-    const finalSignal = sessionSignal.get();
-    const phase = isBackendFailure
-      ? 'blocked:backend-error'
-      : finalSignal?.status === 'blocked'
-        ? 'blocked:needs-input'
-        : finalSignal?.status === 'completed'
-          ? 'idle:completed'
-          : 'idle:awaiting-input';
 
     if (runtime.sessionId) {
       await inkClient
