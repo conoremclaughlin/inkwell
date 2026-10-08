@@ -58,6 +58,8 @@ export interface CreateWorkspaceInput {
   type?: WorkspaceType;
   description?: string;
   metadata?: Json;
+  /** The space's shared values, written in the same insert as the space. */
+  sharedValues?: string;
 }
 
 export interface UpdateWorkspaceInput {
@@ -157,6 +159,7 @@ export class WorkspacesRepository {
       type: input.type || 'personal',
       description: input.description,
       metadata: input.metadata || {},
+      ...(input.sharedValues !== undefined ? { shared_values: input.sharedValues } : {}),
     };
 
     const { data, error } = await this.client
