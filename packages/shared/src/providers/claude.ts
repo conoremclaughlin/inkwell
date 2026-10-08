@@ -638,8 +638,8 @@ export class ClaudeAdapter implements BackendAdapter {
     });
 
     // Injected turns switch stdin to stream-json: one JSONL user message
-    // whose content is the prompt text plus base64 image blocks. Text-only
-    // turns and non-delivery spawns keep the plain-stdin path. Either way
+    // whose content is the prompt text plus injected image or document blocks.
+    // Turns with no injected blocks keep the plain-stdin path. Either way
     // the prompt carries the rejection note when something wasn't delivered.
     let stdinData = promptText;
     if (injecting && promptText) {

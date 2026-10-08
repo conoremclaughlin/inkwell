@@ -1766,6 +1766,20 @@ describe('SessionService', () => {
         });
 
         describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const launchPid = process.pid + 1;
+          let processProbe: ReturnType<typeof vi.spyOn>;
+          beforeEach(() => {
+            // 4242 is a fixture, not an unused OS pid. On CI that pid can
+            // belong to a live process, correctly keeping the row open.
+            // Model the kernel here; never send signals to either fixture.
+            processProbe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+              if (signal !== 0) throw new Error('this test permits liveness probes only');
+              if (pid === process.pid) return true;
+              if (pid === launchPid)
+                throw Object.assign(new Error('synthetic exit'), { code: 'ESRCH' });
+              throw new Error('unexpected process probe');
+            });
+          });
           const fromSystem = { sender: { id: 'system', name: 'x' } };
           const launchSession = { backend: 'ink', id: 'launch-session' };
           const fakeStore = () => ({
@@ -1786,10 +1800,11 @@ describe('SessionService', () => {
               }
             ) => {
               envs.push(options.config.launchEnv);
-              options.config.onSpawned?.({ pid: 4242 });
+              options.config.onSpawned?.({ pid: launchPid });
               return result;
             }) as never);
           afterEach(() => {
+            processProbe.mockRestore();
             configureLaunchRecording(undefined);
             resetLaunchHolds();
           });
@@ -1810,7 +1825,7 @@ describe('SessionService', () => {
             await vi.waitFor(() =>
               expect(store.attach).toHaveBeenCalledWith(
                 'row-1',
-                expect.objectContaining({ pid: 4242 })
+                expect.objectContaining({ pid: launchPid })
               )
             );
             await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));

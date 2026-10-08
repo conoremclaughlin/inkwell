@@ -66,10 +66,10 @@ describe('an upload attached to an ink chat turn', () => {
     for (const above of [root, join(root, U), join(root, U, W)]) expect(dirs).not.toContain(above);
   });
 
-  it('is read by ink chat itself and inlined, with no allowed-roots refusal', () => {
+  it('is read by ink chat itself and inlined, with no allowed-roots refusal', async () => {
     const media = [{ path: photo, mimeType: 'image/jpeg' }];
     const { candidates } = classifyMedia(media);
-    const encoded = encodeMediaBlocks(candidates);
+    const encoded = await encodeMediaBlocks(candidates);
     expect(encoded.rejected).toEqual([]);
     expect(encoded.injected).toEqual(media);
     expect(encoded.blocks[0]).toMatchObject({
