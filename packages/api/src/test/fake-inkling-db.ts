@@ -40,6 +40,10 @@ export function createInklingDb(): FakePostgrest {
     },
   ];
   db.unique.kindle_tokens = [{ name: 'kindle_tokens_token_key', key: (r) => String(r.token) }];
+  // One page per person per space, as the real index has it.
+  db.unique.user_identity = [
+    { name: 'user_identity_user_workspace_key', key: (r) => `${r.user_id}|${r.workspace_id}` },
+  ];
   db.unique.inbox_thread_messages = [
     {
       name: CLIENT_MESSAGE_INDEX,

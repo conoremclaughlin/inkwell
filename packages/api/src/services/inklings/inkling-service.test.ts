@@ -23,6 +23,12 @@ import {
   validateDisplayName,
 } from './inkling-service';
 import { createInklingDb, seedOwnSb, AWAKEN_REQUEST_INDEX } from '../../test/fake-inkling-db';
+import {
+  ABOUT_YOU_TEMPLATE,
+  INKLING_SOUL_TEMPLATE,
+  INKLING_SPACE_VALUES,
+  inklingSoul,
+} from './starter-space';
 import { liveInklingTurns, trackInklingTurn } from './inkling-turns';
 import type { FakePostgrest, Row } from '../../test/fake-postgrest';
 
@@ -398,10 +404,115 @@ describe('awaken', () => {
     });
   });
 
-  it('touches only identity, lineage and token tables: no thread, no message, no wake', async () => {
+  it('touches identity, lineage and token tables and the space’s starter set: no thread, no message, no wake', async () => {
     await service.awaken(ME, REQUEST);
     const touched = [...new Set(db.log.map((e) => e.table))].sort();
-    expect(touched).toEqual(['agent_identities', 'kindle_tokens', 'redeem_kindle_token']);
+    expect(touched).toEqual([
+      'agent_identities',
+      'kindle_tokens',
+      'redeem_kindle_token',
+      'user_identity',
+      'workspaces',
+    ]);
+  });
+});
+
+describe('the space’s starter set at an awakening (starter-space.ts)', () => {
+  const pagesIn = (workspaceId: string) =>
+    rowsOf('user_identity').filter((row) => row.workspace_id === workspaceId);
+
+  it('gives a space that never had it the inkling values and the person’s own page', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    const space = rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!;
+    expect(space.shared_values).toBe(INKLING_SPACE_VALUES);
+    expect(space.process ?? null).toBeNull();
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_id: ME.userId, user_profile_md: ABOUT_YOU_TEMPLATE }),
+    ]);
+  });
+
+  it('leaves a space with values of its own exactly as it is, its page included', async () => {
+    // Values and no process: only the values guard stands between it and a seed.
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: 'OWN-VALUES',
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: 'OWN-PAGE',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)).toMatchObject({
+      shared_values: 'OWN-VALUES',
+    });
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_profile_md: 'OWN-PAGE' }),
+    ]);
+  });
+
+  it('never fills values beside a process the space already has', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: 'OWN-PROCESS',
+    });
+    await service.awaken(ME, REQUEST);
+    expect(
+      rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values ?? null
+    ).toBeNull();
+  });
+
+  it('changes nothing the second time', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+    await service.awaken(ME, REQUEST);
+    pagesIn(ME.workspaceId)[0]!.user_profile_md = 'EDITED-BY-THE-INKLING';
+
+    await service.awaken(ME, 'bbbbbbbb-1111-4111-8111-111111111111');
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({ user_profile_md: 'EDITED-BY-THE-INKLING' }),
+    ]);
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values).toBe(
+      INKLING_SPACE_VALUES
+    );
+  });
+
+  it('still wakes the inkling when the starter set can’t be written', async () => {
+    const from = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = from(table);
+      if (table === 'workspaces') {
+        (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+          data: [],
+          error: { code: 'XX000', message: 'synthetic write failure' },
+        });
+      }
+      return query;
+    }) as typeof db.from;
+
+    const { inkling, replayed } = await service.awaken(ME, REQUEST);
+
+    expect(replayed).toBe(false);
+    expect(inkling.id).toEqual(expect.any(String));
   });
 });
 
@@ -415,6 +526,16 @@ describe('the awakening soul', () => {
     );
     expect(soul).toMatch(/\*\*I exist\. I am becoming\.\*\*/);
     expect(soul).toMatch(/This document is yours\. It changes as you do\./);
+  });
+
+  it('says what it can do depends on where it runs, not on who it is (design v4)', () => {
+    expect(soul).toMatch(/\*\*What you can do depends on where you're running\.\*\*/);
+    expect(soul).toMatch(/you're an inkling either way/);
+  });
+
+  it('is the starter documents’ text, kept in one place', () => {
+    expect(soul).toBe(inklingSoul(new Date('2026-10-08T00:30:00Z')));
+    expect(INKLING_SOUL_TEMPLATE).toContain('*Awake since: {date}*');
   });
 
   it('says inkling, never SB', () => {
