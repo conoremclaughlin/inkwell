@@ -339,6 +339,15 @@ export interface SessionRequest {
    * SessionTurnHooks.
    */
   turnHooks?: SessionTurnHooks;
+
+  /**
+   * An inkling's own heartbeat firing: the reminder it fires for. Set by the
+   * reminder delivery alone (inkling-heartbeat.ts), in this process; never
+   * metadata, which other paths fill from what a caller sent. The inkling
+   * turn gate still reads the stored reminder and conversation before it
+   * admits the turn (isOwnersHeartbeat).
+   */
+  inklingHeartbeat?: { reminderId: string };
 }
 
 /**

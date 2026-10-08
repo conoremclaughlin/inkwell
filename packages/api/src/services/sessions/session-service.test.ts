@@ -1123,6 +1123,8 @@ describe('SessionService', () => {
            * routing scope read, `select('id')`) fail, then reads recover.
            */
           scopeReadFaults?: number;
+          /** More tables, or a table's rows in place of the default ones. */
+          tables?: Record<string, Row[]>;
         } = {}
       ) => {
         vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
@@ -1144,6 +1146,7 @@ describe('SessionService', () => {
           ],
           studios: [],
           ...THREAD_TABLES,
+          ...extra.tables,
         };
         lastTables = tables;
         const supabase = makeFakeSupabase(tables);
@@ -1301,6 +1304,171 @@ describe('SessionService', () => {
         expect(result.classification?.retryable).toBe(false);
         expect(mockInkRunner.run).not.toHaveBeenCalled();
         expect(turnsCounted()).toBeUndefined();
+      });
+
+      describe("the inkling's own heartbeat (inkling-heartbeat.ts)", () => {
+        const WORKSPACE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const KEY = 'chat:conversation-1';
+        const inSpace = { row: { workspace_id: WORKSPACE } };
+        const reminder = (overrides: Row = {}): Row => ({
+          id: 'rem-1',
+          user_id: OWNER,
+          sb_id: SB,
+          status: 'active',
+          delivery_channel: 'inkling',
+          metadata: { autoCreated: true, reminderType: 'inkling-heartbeat' },
+          ...overrides,
+        });
+        /** Its one-to-one conversation with its owner, in its space. */
+        const conversation = (
+          overrides: { thread?: Row; members?: Row[] } = {}
+        ): Record<string, Row[]> => ({
+          inbox_threads: [
+            {
+              id: 'conv-1',
+              thread_key: KEY,
+              workspace_id: WORKSPACE,
+              status: 'open',
+              metadata: { inklingConversation: true },
+              ...overrides.thread,
+            },
+          ],
+          inbox_thread_participants: [
+            ...THREAD_TABLES.inbox_thread_participants,
+            ...(overrides.members ?? [
+              { thread_id: 'conv-1', sb_id: SB, user_id: null },
+              { thread_id: 'conv-1', sb_id: null, user_id: OWNER },
+            ]),
+          ],
+        });
+        /** A beat as the reminder delivery builds it: the in-process admission, never metadata. */
+        const beat = (request: Record<string, unknown> = {}) => ({
+          channel: 'heartbeat',
+          sender: { id: 'system', name: 'heartbeat' },
+          metadata: { triggerType: 'heartbeat', chatType: 'direct', threadKey: KEY },
+          inklingHeartbeat: { reminderId: 'rem-1' },
+          ...request,
+        });
+        const tablesWith = (
+          rows: Row[] = [reminder()],
+          talk: Record<string, Row[]> = conversation()
+        ) => ({ ...inSpace, tables: { scheduled_reminders: rows, ...talk } });
+
+        it('wakes it in its own conversation with its owner', async () => {
+          const result = await turn(INKLING, beat(), OWNER, tablesWith());
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+        });
+
+        it('is admitted only by the in-process mark: the same claim in metadata is refused', async () => {
+          const { inklingHeartbeat, metadata } = beat();
+          const result = await turn(
+            INKLING,
+            beat({ inklingHeartbeat: undefined, metadata: { ...metadata, inklingHeartbeat } }),
+            OWNER,
+            tablesWith()
+          );
+          expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+          expectNothingRan();
+        });
+
+        it('is refused for any reminder but its own heartbeat', async () => {
+          const OTHER_SB = '7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a';
+          for (const [label, row] of [
+            ['another SB’s', reminder({ sb_id: OTHER_SB })],
+            ['another account’s', reminder({ user_id: SECOND })],
+            ['a paused one', reminder({ status: 'paused' })],
+            ['a Telegram one', reminder({ delivery_channel: 'telegram' })],
+            ['a daily check-in', reminder({ metadata: { reminderType: 'daily-checkin' } })],
+            ['one that names nothing', reminder({ metadata: null })],
+          ] as const) {
+            vi.mocked(mockInkRunner.run).mockClear();
+            const result = await turn(INKLING, beat(), OWNER, tablesWith([row]));
+            expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+            expectNothingRan();
+          }
+          // And one the database has no row for.
+          const missing = await turn(INKLING, beat(), OWNER, tablesWith([]));
+          expect(missing.errorCode).toBe('INKLING_TURN_REFUSED');
+        });
+
+        it('is refused anywhere but its one-to-one conversation with its owner', async () => {
+          const OTHER_INKLING = '6c5b4a3f-2e1d-4c0b-9a8f-7e6d5c4b3a29';
+          const cases: Array<[string, Record<string, Row[]>]> = [
+            ['a closed one', conversation({ thread: { status: 'closed' } })],
+            [
+              'one never marked an inkling conversation',
+              conversation({ thread: { metadata: {} } }),
+            ],
+            ['one in another space', conversation({ thread: { workspace_id: OTHER_INKLING } })],
+            [
+              'a group',
+              conversation({
+                members: [
+                  { thread_id: 'conv-1', sb_id: SB, user_id: null },
+                  { thread_id: 'conv-1', sb_id: OTHER_INKLING, user_id: null },
+                  { thread_id: 'conv-1', sb_id: null, user_id: OWNER },
+                ],
+              }),
+            ],
+            [
+              'one with another person in it',
+              conversation({
+                members: [
+                  { thread_id: 'conv-1', sb_id: SB, user_id: null },
+                  { thread_id: 'conv-1', sb_id: null, user_id: OWNER },
+                  { thread_id: 'conv-1', sb_id: null, user_id: SECOND },
+                ],
+              }),
+            ],
+            [
+              'one its owner has left',
+              conversation({ members: [{ thread_id: 'conv-1', sb_id: SB, user_id: null }] }),
+            ],
+            ['none', { inbox_threads: [] }],
+          ];
+          for (const [label, talk] of cases) {
+            vi.mocked(mockInkRunner.run).mockClear();
+            const result = await turn(INKLING, beat(), OWNER, tablesWith([reminder()], talk));
+            expect(result.errorCode, label).toBe('INKLING_TURN_REFUSED');
+            expectNothingRan();
+          }
+          const unnamed = await turn(
+            INKLING,
+            beat({ metadata: { triggerType: 'heartbeat' } }),
+            OWNER,
+            tablesWith()
+          );
+          expect(unnamed.errorCode).toBe('INKLING_TURN_REFUSED');
+        });
+
+        it('keeps the owner test whole: off, or an inkling born outside it, is refused', async () => {
+          const off = await turn(INKLING, beat(), '', tablesWith());
+          expect(off.errorCode).toBe('INKLING_TURN_REFUSED');
+          const unborn = await turn({ ...INKLING, ownerTest: false }, beat(), OWNER, tablesWith());
+          expect(unborn.errorCode).toBe('INKLING_TURN_REFUSED');
+          expectNothingRan();
+        });
+
+        it('a reminder that cannot be read is refused to be retried', async () => {
+          const result = await turn(INKLING, beat(), OWNER, {
+            ...tablesWith(),
+            failReads: [
+              {
+                table: 'scheduled_reminders',
+                columns: 'id, user_id, sb_id, status, delivery_channel, metadata',
+              },
+            ],
+          });
+          expect(result.errorCode).toBe('INKLING_TURN_REFUSED');
+          expect(result.classification?.retryable).toBe(true);
+          expectNothingRan();
+        });
+
+        it('another SB’s turn never reads a reminder: the mark means nothing to it', async () => {
+          const result = await turn({}, beat(), OWNER, tablesWith([]));
+          expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+        });
       });
 
       describe("Lumen's review of 8b9d7f50: no way around the gate", () => {
