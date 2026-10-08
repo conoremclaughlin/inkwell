@@ -56,6 +56,7 @@ function fixture(n = 20) {
     cliAttached: false,
     contextBudgetAuto: () => true,
     append,
+    flush: vi.fn(async () => {}),
     spawnContext: () => ({
       workingDirectory: '/synthetic/studio',
       inkSessionId: 'test-session',
@@ -225,7 +226,12 @@ describe('createSessionCompaction', () => {
       const abort = vi.fn(() =>
         resolve({ ...f.ok, success: false, exitCode: 143, stderr: 'aborted' })
       );
+      let launched!: () => void;
+      const didLaunch = new Promise<void>((resolve) => {
+        launched = resolve;
+      });
       f.startTurn.mockImplementation(() => {
+        launched();
         if (when === 'during-launch') controller.abort();
         return { result, abort };
       });
@@ -235,6 +241,7 @@ describe('createSessionCompaction', () => {
         signal: controller.signal,
       });
       expect(f.compaction.isInFlight()).toBe(true);
+      await didLaunch;
       if (when === 'after-launch') controller.abort();
       expect(await running).toMatchObject({
         ok: false,
@@ -331,5 +338,48 @@ describe('createSessionCompaction', () => {
     expect(f.startTurn).not.toHaveBeenCalled();
     expect(f.ledger.listEntries()).toHaveLength(2);
     expect(f.state.provider.id).toBeUndefined();
+  });
+});
+
+describe('summarizer queued history barrier', () => {
+  it.each(['release', 'reject', 'abort'] as const)('honors %s before launching', async (action) => {
+    const f = fixture();
+    let release!: () => void;
+    let reject!: (error: Error) => void;
+    const gate = new Promise<void>((resolve, fail) => {
+      release = resolve;
+      reject = fail;
+    });
+    let atFlush!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      atFlush = resolve;
+    });
+    vi.mocked(f.ports.flush).mockImplementation(() => {
+      atFlush();
+      return gate;
+    });
+    const stop = new AbortController();
+    const running = f.compaction.compactContextNow({
+      actor: 'sb',
+      reason: 'test',
+      signal: stop.signal,
+    });
+    expect(await Promise.race([reached.then(() => 'flush'), running.then(() => 'returned')])).toBe(
+      'flush'
+    );
+    expect(f.startTurn).not.toHaveBeenCalled();
+    if (action === 'reject') reject(new Error('synthetic queued write failure'));
+    else {
+      if (action === 'abort') stop.abort();
+      release();
+    }
+    const out = await running;
+    expect(out.ok).toBe(action === 'release');
+    expect(f.startTurn).toHaveBeenCalledTimes(action === 'release' ? 1 : 0);
+    if (action !== 'release') {
+      expect(f.events).toEqual([]);
+      expect(f.ledger.listEntries()).toHaveLength(20);
+      expect(f.state.provider.id).toBe('native-test');
+    }
   });
 });

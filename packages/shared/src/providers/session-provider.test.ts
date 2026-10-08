@@ -22,7 +22,7 @@ const result = (over: Partial<BackendRunResult> = {}): BackendRunResult => ({
   durationMs: 3,
   command: 'fake provider',
   childExited: true,
-  usage: { inputTokens: 10, outputTokens: 2 },
+  usage: { backend: 'claude', source: 'json', inputTokens: 10, outputTokens: 2 },
   ...over,
 });
 function harness(backend = 'claude', session = 'session-a') {
@@ -49,6 +49,7 @@ function harness(backend = 'claude', session = 'session-a') {
     dialogue: [],
     mintId: () => `${session}-seed-${++mint}`,
     append: (entry) => events.push(entry),
+    flush: vi.fn(async () => {}),
     buildEnvelope: (body, stamp) =>
       buildSessionPrompt('echo', ports.runtime, ports.ledger, body, 'local tools', stamp),
     measurement: () => undefined,
@@ -236,24 +237,38 @@ describe('shared session provider composition', () => {
     vi.mocked(h.ports.startTurn)
       .mockReturnValueOnce({
         result: Promise.resolve(
-          result({ success: false, stderr: 'Session not found', usage: { inputTokens: 4 } })
+          result({
+            success: false,
+            stderr: 'Session not found',
+            usage: { backend: 'claude', source: 'json', inputTokens: 4 },
+          })
         ),
         abort: vi.fn(),
       })
       .mockReturnValueOnce({
-        result: Promise.resolve(result({ usage: { inputTokens: 8 } })),
+        result: Promise.resolve(
+          result({ usage: { backend: 'claude', source: 'json', inputTokens: 8 } })
+        ),
         abort: vi.fn(),
       });
     const t = h.turn();
     await t.runTurn(t.prompt, { isContinuation: false });
-    expect(h.ports.recordUsage).toHaveBeenNthCalledWith(1, { inputTokens: 4 });
-    expect(h.ports.recordUsage).toHaveBeenNthCalledWith(2, { inputTokens: 8 });
+    expect(h.ports.recordUsage).toHaveBeenNthCalledWith(1, {
+      backend: 'claude',
+      source: 'json',
+      inputTokens: 4,
+    });
+    expect(h.ports.recordUsage).toHaveBeenNthCalledWith(2, {
+      backend: 'claude',
+      source: 'json',
+      inputTokens: 8,
+    });
     expect(h.ports.startTurn).toHaveBeenLastCalledWith(
       expect.objectContaining({ backendSessionSeedId: 'session-a-seed-1', deliverMedia: true })
     );
     expect(vi.mocked(h.ports.startTurn).mock.calls[1][0].prompt).toContain('identity bootstrap');
     expect(h.ports.notice).toHaveBeenCalledWith('resume-missing');
-    expect(t.lastRunResult.usage).toEqual({ inputTokens: 8 });
+    expect(t.lastRunResult.usage).toEqual({ backend: 'claude', source: 'json', inputTokens: 8 });
   });
 
   it.each([
@@ -323,7 +338,12 @@ describe('shared session provider composition', () => {
     expect(outcome.success).toBe(false);
     expect(h.ports.startTurn).toHaveBeenCalledTimes(1);
     expect(h.ports.endSpawn).toHaveBeenCalledTimes(1);
-    expect(h.ports.recordUsage).toHaveBeenCalledWith({ inputTokens: 10, outputTokens: 2 });
+    expect(h.ports.recordUsage).toHaveBeenCalledWith({
+      backend: 'claude',
+      source: 'json',
+      inputTokens: 10,
+      outputTokens: 2,
+    });
     expect(h.ports.state.id).toBe('missing');
     expect(h.events).toEqual([]);
     expect(h.ports.notice).not.toHaveBeenCalled();
@@ -443,4 +463,84 @@ describe('shared session provider composition', () => {
     expect(final?.execution.loop.assistantDisplayText).toBe('The file says hello.');
     expect(h.events.at(-1)).toMatchObject({ type: 'assistant', content: 'The file says hello.' });
   });
+});
+
+describe('queued session log before provider dispatch', () => {
+  const paths = [
+    'seed',
+    'resume',
+    'stateless',
+    'continuation',
+    'rolled',
+    'missing-resume',
+  ] as const;
+  it.each(paths)('%s waits for queued writes, then launches', async (path) => {
+    await checkBarrier(path, 'release');
+  });
+  it.each(paths)('%s never launches after a write failure', async (path) => {
+    await checkBarrier(path, 'reject');
+  });
+  it.each(paths)('%s observes Stop after its flush wait', async (path) => {
+    await checkBarrier(path, 'abort');
+  });
+  async function checkBarrier(
+    path: (typeof paths)[number],
+    action: 'release' | 'reject' | 'abort'
+  ) {
+    const h = harness(path === 'stateless' ? 'codex' : 'claude');
+    if (path === 'resume' || path === 'missing-resume') h.ports.state.id = 'recovered';
+    const t = h.turn();
+    const continuation = path === 'continuation' || path === 'rolled';
+    if (continuation) await t.runTurn(t.prompt, { isContinuation: false });
+    if (path === 'rolled') h.ports.state.id = undefined;
+    if (path === 'missing-resume') {
+      vi.mocked(h.ports.startTurn).mockReturnValueOnce({
+        result: Promise.resolve(result({ success: false, resumeFailedNoSession: true })),
+        abort: vi.fn(),
+      });
+    }
+    const priorLaunches = continuation || path === 'missing-resume' ? 1 : 0;
+    let release!: () => void;
+    let reject!: (error: Error) => void;
+    const gate = new Promise<void>((resolve, fail) => {
+      release = resolve;
+      reject = fail;
+    });
+    let atFlush!: () => void;
+    const reachedFlush = new Promise<void>((resolve) => {
+      atFlush = resolve;
+    });
+    vi.mocked(h.ports.flush).mockImplementation(() => {
+      atFlush();
+      return gate;
+    });
+    if (path === 'missing-resume') vi.mocked(h.ports.flush).mockResolvedValueOnce();
+    const stop = new AbortController();
+    const running = t.runTurn(t.prompt, { isContinuation: continuation, signal: stop.signal });
+    expect(
+      await Promise.race([reachedFlush.then(() => 'flush'), running.then(() => 'returned')])
+    ).toBe('flush');
+    expect(h.ports.startTurn).toHaveBeenCalledTimes(priorLaunches);
+    expect(h.ports.beginSpawn).toHaveBeenCalledTimes(priorLaunches);
+    if (path === 'seed' || path === 'rolled' || path === 'missing-resume') {
+      expect(h.events.at(-1)).toMatchObject({ type: 'backend_session', id: h.ports.state.id });
+    }
+    if (action === 'reject') {
+      const failed = expect(running).rejects.toThrow('synthetic queued write failure');
+      reject(new Error('synthetic queued write failure'));
+      await failed;
+    } else if (action === 'abort') {
+      const failed = expect(running).rejects.toThrow('synthetic stop');
+      stop.abort(new Error('synthetic stop'));
+      release();
+      await failed;
+    } else {
+      release();
+      await running;
+    }
+    const launched = priorLaunches + (action === 'release' ? 1 : 0);
+    expect(h.ports.startTurn).toHaveBeenCalledTimes(launched);
+    expect(h.ports.beginSpawn).toHaveBeenCalledTimes(launched);
+    expect(h.ports.endSpawn).toHaveBeenCalledTimes(launched);
+  }
 });

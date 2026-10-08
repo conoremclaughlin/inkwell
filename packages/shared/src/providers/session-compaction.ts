@@ -1,7 +1,7 @@
 /** The existing CLI eviction/trim/compaction composition, shared without host I/O.
- * Append has the existing synchronous ordering contract. Hosts with queued
- * sinks must flush before subsequent provider/tool dispatch and fail closed
- * on a write error; this module does not add a durability guarantee.
+ * Append reserves an event synchronously. The summarizer flushes queued writes
+ * before launching; later ordinary dispatch does the same. A flush is not fsync,
+ * and an append alone is not a durability guarantee.
  */
 import {
   runCompaction,
@@ -39,6 +39,7 @@ export interface SessionCompactionPorts {
   cliAttached: boolean;
   contextBudgetAuto(): boolean;
   append(event: Record<string, unknown>): number;
+  flush(): Promise<void>;
   spawnContext(): Pick<
     BackendRunRequest,
     'workingDirectory' | 'inkSessionId' | 'studioId' | 'host' | 'withholdProviderTools'
@@ -188,6 +189,9 @@ export function createSessionCompaction(ports: SessionCompactionPorts) {
         summarize: async (chunk, signal) => {
           // A handle, not a bare promise: the turn's Ctrl+C reaches this
           // spawn (it used to run on to its idle timeout).
+          signal?.throwIfAborted();
+          await ports.flush();
+          signal?.throwIfAborted();
           const summarizer = ports.startTurn({
             backend: runtime.backend,
             sbSlug,

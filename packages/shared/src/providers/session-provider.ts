@@ -50,6 +50,8 @@ export interface SessionProviderPorts {
   dialogue: ReseedDialogueEntry[];
   mintId(): string;
   append(entry: Record<string, unknown>): number;
+  /** Confirm queued history/seed writes before every provider launch. Not fsync. */
+  flush(): Promise<void>;
   buildEnvelope(body: string, stamp?: string): string;
   measurement(): ProviderContextMeasurement | undefined;
   spawnContext(): Pick<
@@ -266,6 +268,12 @@ export function createSessionProviderTurn(
     return statelessPromptTokens + addedBytes;
   };
 
+  const beforeDispatch = async (signal?: AbortSignal): Promise<void> => {
+    signal?.throwIfAborted();
+    await ports.flush();
+    signal?.throwIfAborted();
+  };
+
   const runTurnForLoop = async (
     body: string,
     ctx: { isContinuation: boolean; signal?: AbortSignal }
@@ -277,6 +285,7 @@ export function createSessionProviderTurn(
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = ports.contextGeneration();
       let runResult: BackendRunResult;
+      await beforeDispatch(ctx.signal);
       ports.beginSpawn();
       try {
         const turn = ports.startTurn({
@@ -358,6 +367,7 @@ export function createSessionProviderTurn(
           turnContextOccupancy(ledger, runtime, ports.measurement())
         );
         const reseedImages = ports.contextImagesFor?.(reseedId);
+        await beforeDispatch(ctx.signal);
         ports.beginSpawn();
         try {
           const reseedTurn = ports.startTurn({
@@ -455,6 +465,7 @@ export function createSessionProviderTurn(
     let contResult: BackendRunResult;
     const ledgerIdBeforeSpawn = maxLedgerId();
     const generationBeforeSpawn = ports.contextGeneration();
+    await beforeDispatch(ctx.signal);
     ports.beginSpawn();
     try {
       const contTurn = ports.startTurn(

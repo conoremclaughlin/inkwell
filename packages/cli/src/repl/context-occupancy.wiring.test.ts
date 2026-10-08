@@ -57,6 +57,7 @@ function providerHarness(backend = 'claude') {
     dialogue: [],
     mintId: () => 'reseeded-native-session',
     append: () => 0,
+    flush: vi.fn(async () => {}),
     buildEnvelope: (body, stamp) => buildPromptEnvelope('echo', ports.runtime, ledger, body, stamp),
     measurement: () => context.measurement(),
     spawnContext: () => ({ workingDirectory: '/synthetic/studio' }),

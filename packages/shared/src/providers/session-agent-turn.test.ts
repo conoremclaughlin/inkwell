@@ -23,7 +23,7 @@ const result = (text: string, over: Partial<BackendRunResult> = {}): BackendRunR
   durationMs: 3,
   command: 'scripted provider, no process',
   childExited: true,
-  usage: { inputTokens: 10, outputTokens: 2 },
+  usage: { backend: 'claude', source: 'json', inputTokens: 10, outputTokens: 2 },
   ...over,
 });
 
@@ -50,6 +50,7 @@ function harness(results: BackendRunResult[], session = 'one') {
     dialogue: [],
     mintId: () => `${session}-seed-${++seed}`,
     append: (event) => events.push(event),
+    flush: vi.fn(async () => {}),
     buildEnvelope: (body, stamp) =>
       buildSessionPrompt('echo', provider.runtime, provider.ledger, body, 'local tools', stamp),
     measurement: () => undefined,
@@ -84,7 +85,7 @@ function harness(results: BackendRunResult[], session = 'one') {
     ui: { printLine: vi.fn(), printEvent: vi.fn(), startWaiting: () => vi.fn() },
     tools: {
       screen: vi.fn((calls) => ({ calls })),
-      execute: vi.fn(async (calls) => {
+      execute: vi.fn<SessionAgentTurnPorts['tools']['execute']>(async (calls) => {
         order.push('tool');
         return calls.map((call) => ({ ...call, status: 'executed', result: 'fixture contents' }));
       }),

@@ -103,7 +103,9 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     const initialCapture = provider.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
     const initialSpawn = provider.indexOf('const turn = ports.startTurn({', initialCapture);
     expect(initialCapture).toBeGreaterThan(0);
-    expect(initialSpawn - initialCapture).toBeLessThan(200);
+    expect(provider.slice(initialCapture, initialSpawn).replace(/\s+/g, ' ').trim()).toBe(
+      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); let runResult: BackendRunResult; await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
+    );
     const contCapture = provider.indexOf(
       'const ledgerIdBeforeSpawn = maxLedgerId();',
       initialCapture + 1
@@ -113,7 +115,9 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     );
     expect(contCapture).toBeGreaterThan(0);
     expect(contSpawn).toBeGreaterThan(contCapture);
-    expect(contSpawn - contCapture).toBeLessThan(200);
+    expect(provider.slice(contCapture, contSpawn).replace(/\s+/g, ' ').trim()).toBe(
+      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
+    );
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
       /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
@@ -143,10 +147,10 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(batch).toMatch(/const settleMutation = ports\.beginContextMutation\(calls\);\s*try \{/);
     expect(batch).toMatch(/finally \{\s*settleMutation\(\);\s*\}/);
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
     );
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
       /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
