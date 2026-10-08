@@ -52,3 +52,11 @@ export * from './session-usage.js';
 export * from './context-limits.js';
 export * from './context-pressure.js';
 export * from './session-context-state.js';
+
+export * from './tool-result.js';
+export * from './coding-tool-names.js';
+export * from './clone-capabilities.js';
+export * from './spawn-agent.js';
+export * from './tool-parameter-help.js';
+export * from './local-tool-catalog.js';
+export * from './tool-dispatch.js';

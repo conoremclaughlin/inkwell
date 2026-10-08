@@ -30,7 +30,8 @@ import {
   type ImageInfo,
 } from './tool-images.js';
 
-export const VIEW_IMAGE_TOOL = 'view_image';
+import { VIEW_IMAGE_TOOL } from '@inklabs/shared/runtime';
+export { VIEW_IMAGE_TOOL } from '@inklabs/shared/runtime';
 
 /**
  * Largest file this tool will open: 20 MB. Enough for any screenshot or photo

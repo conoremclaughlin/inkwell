@@ -29,17 +29,10 @@ interface PiAgentTool {
   ) => Promise<PiToolResult>;
 }
 
-const PI_TOOL_NAMES = new Set(['read', 'edit', 'write', 'bash', 'grep', 'find', 'ls']);
+export { isPiTool, getPiToolNames } from '@inklabs/shared/runtime';
 
 let cachedTools: Map<string, PiAgentTool> | null = null;
 let cachedCwd: string | null = null;
-
-/**
- * Check if a tool name is a Pi coding tool.
- */
-export function isPiTool(toolName: string): boolean {
-  return PI_TOOL_NAMES.has(toolName);
-}
 
 /**
  * Initialize Pi coding tools for a working directory.
@@ -162,13 +155,6 @@ export async function callPiTool(
     text: textContent,
     success: true,
   };
-}
-
-/**
- * Get the list of available Pi tool names (for system prompt injection).
- */
-export function getPiToolNames(): string[] {
-  return [...PI_TOOL_NAMES];
 }
 
 /**

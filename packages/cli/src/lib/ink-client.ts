@@ -3,9 +3,8 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { getValidAccessToken } from '../auth/tokens.js';
 
-export interface InkToolCallResult {
-  [key: string]: unknown;
-}
+import type { InkToolCallResult } from '@inklabs/shared/runtime';
+export type { InkToolCallResult } from '@inklabs/shared/runtime';
 
 export interface InkAuthConfig {
   userId?: string;
