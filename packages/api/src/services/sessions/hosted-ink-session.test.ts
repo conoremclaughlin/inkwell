@@ -1,10 +1,11 @@
+import type { BackendRunResult } from '@inklabs/shared/providers';
 /**
  * The in-process ink runner's side of the boundary (hosted-ink-session.ts):
  * what it refuses, what it hands the composition, and what it reports, with a
  * fake composition and fake provider launches. This is contract evidence, not
  * parity or a live run: the real composition is bound separately (pr:701).
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import {
   HOSTED_INK_REFUSALS,
   HostedInkSessionRunner,
@@ -39,14 +40,23 @@ class RefusedByHost extends Error {}
 function launch() {
   let settle!: (value: { childExited: boolean }) => void;
   let fail!: (error: unknown) => void;
-  const result = new Promise<{ childExited: boolean }>((resolve, reject) => {
-    settle = resolve;
+  const result = new Promise<BackendRunResult>((resolve, reject) => {
+    settle = (value) =>
+      resolve({
+        success: true,
+        stdout: '',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 1,
+        command: 'fixture',
+        ...value,
+      });
     fail = reject;
   });
   result.catch(() => undefined);
-  const handle: ProviderTurnHandle & { abort: ReturnType<typeof vi.fn> } = {
+  const handle: ProviderTurnHandle & { abort: Mock<() => void> } = {
     result,
-    abort: vi.fn(),
+    abort: vi.fn<() => void>(),
   };
   return { handle, settle, fail };
 }
@@ -62,6 +72,8 @@ function dependencies(over: Partial<HostedInkTurnDependencies> = {}): HostedInkT
     isHostedRefusal: (error) => error instanceof RefusedByHost,
     // SessionLog's shape: append returns the entry's eid synchronously.
     sessionLog: {
+      path: '/fixture/session.jsonl',
+      seed: vi.fn(),
       append: vi.fn(() => 7),
       flush: vi.fn(async () => {}),
       read: vi.fn(async () => []),

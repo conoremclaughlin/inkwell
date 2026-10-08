@@ -1,3 +1,4 @@
+import type { BackendRunResult, SessionProviderPorts } from '@inklabs/shared/providers';
 /**
  * An `ink` session's turn run inside this server by the shared session
  * composition, instead of by an `ink chat` subprocess (spec:live-agent-surfaces;
@@ -34,6 +35,7 @@
  * process.env or the working directory.
  */
 
+import { formatInjectedContext } from './context-builder.js';
 import { STOP_GIVE_UP_MS, STOP_GRACE_MS } from './stop-process.js';
 import { inkSessionOptions, type InkSessionOptions } from './ink-session-options.js';
 import type {
@@ -44,6 +46,7 @@ import type {
   RunnerResult,
   RunnerTurnReply,
   ToolCall,
+  InjectedContext,
 } from './types.js';
 
 /** One provider launch the composition asks for: the shared BackendRunRequest, without its host. */
@@ -53,7 +56,7 @@ export type ProviderTurnRequest = { readonly inkSessionId: string } & Readonly<
 
 /** What the runner needs from a launch: its settlement, and a way to stop it. */
 export interface ProviderTurnHandle {
-  readonly result: Promise<{ readonly childExited: boolean }>;
+  readonly result: Promise<BackendRunResult>;
   abort(): void;
 }
 
@@ -72,6 +75,8 @@ export interface ProviderTurnHandle {
  * The composition writes the log; the runner never does.
  */
 export interface HostedSessionLog {
+  readonly path: string;
+  seed(maxEid: number): void;
   append(event: Record<string, unknown>): number;
   flush(): Promise<void>;
   read(): Promise<ReadonlyArray<Record<string, unknown>>>;
@@ -103,7 +108,11 @@ export interface HostedInkSessionPorts {
     ): Promise<unknown>;
   };
   /** Each provider launch, through the server host and the runner's accounting. */
-  readonly provider: { startTurn(request: ProviderTurnRequest): ProviderTurnHandle };
+  readonly provider: {
+    startTurn(request: ProviderTurnRequest): ProviderTurnHandle;
+    /** Explicit host of this admitted run. Missing composition context refuses execution. */
+    context?: ReturnType<SessionProviderPorts['spawnContext']>;
+  };
   readonly sessionLog: HostedSessionLog;
   /** Observes each outer turn's reply; it does not send it. */
   readonly output: { onReply?(reply: RunnerTurnReply): Promise<void> };
@@ -140,6 +149,7 @@ export interface HostedInkTurnDependencies {
   /** Whether a launch's rejection is the host withholding credentials, so no child started. */
   isHostedRefusal(error: unknown): boolean;
   readonly sessionLog: HostedSessionLog;
+  readonly providerContext?: ReturnType<SessionProviderPorts['spawnContext']>;
   /** The run's deadline, in this process's clock: finite, and still ahead. */
   readonly deadlineAt: number;
 }
@@ -420,9 +430,10 @@ export function parseHostedInkSbIds(value: string | undefined): ReadonlySet<stri
 }
 
 export class HostedInkSessionRunner implements IRunner {
-  // As constructed by the server it refuses every turn (no executor), so it
-  // takes no uploads; session-service drops them and tells the turn.
-  readonly uploadMedia = 'refuse' as const;
+  // Only a bound composition can accept the service's authenticated upload grants.
+  get uploadMedia(): 'grant' | 'refuse' {
+    return this.options.execute && this.options.forTurn ? 'grant' : 'refuse';
+  }
 
   private readonly settleMs: number;
   private readonly prepareMs: number;
@@ -436,6 +447,7 @@ export class HostedInkSessionRunner implements IRunner {
     message: string,
     options: {
       backendSessionId?: string;
+      injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
       mediaAttachments?: MediaAttachment[];
     }
@@ -465,7 +477,12 @@ export class HostedInkSessionRunner implements IRunner {
     try {
       // Preparation starts nothing, so a Stop abandons it at once.
       const prepared = await settleWithin(
-        () => forTurn({ sessionId, turnEpoch, config: Object.freeze({ ...config }) }),
+        () =>
+          forTurn({
+            sessionId,
+            turnEpoch,
+            config: Object.freeze({ ...config, signal: lifetime.signal }),
+          }),
         lifetime,
         { maxMs: this.prepareMs, afterCloseMs: 0 }
       );
@@ -500,7 +517,10 @@ export class HostedInkSessionRunner implements IRunner {
         ...(config.sbSlug ? { sbSlug: config.sbSlug } : {}),
         ...(config.studioId ? { studioId: config.studioId } : {}),
         workingDirectory: config.workingDirectory,
-        message,
+        message:
+          options.injectedContext && !options.backendSessionId
+            ? `${formatInjectedContext(options.injectedContext, { childCallsBootstrap: true })}\n\n---\n\n${message}`
+            : message,
         attachments: Object.freeze(
           (options.mediaAttachments ?? [])
             .filter((attachment) => typeof attachment.path === 'string')
@@ -523,9 +543,15 @@ export class HostedInkSessionRunner implements IRunner {
             lifetime.retired ? retiredRejection() : deps.inkwell.callTool(name, args, opts),
         }),
         provider: Object.freeze({
+          ...(deps.providerContext ? { context: Object.freeze({ ...deps.providerContext }) } : {}),
           startTurn: (request: ProviderTurnRequest) => launches.start(request),
         }),
         sessionLog: Object.freeze({
+          path: deps.sessionLog.path,
+          seed: (maxEid: number) => {
+            if (lifetime.retired) throw new HostedTurnRetired();
+            deps.sessionLog.seed(maxEid);
+          },
           append: (event: Record<string, unknown>) => {
             if (lifetime.retired) throw new HostedTurnRetired();
             return deps.sessionLog.append(event);

@@ -21,6 +21,7 @@ export function inkSessionOptions(config: Readonly<ClaudeRunnerConfig>) {
     ...(config.inkProvider ? { backend: config.inkProvider } : {}),
     ...(config.model ? { model: config.model } : {}),
     ...(config.effort ? { effort: config.effort } : {}),
+    ...(config.systemPrompt ? { systemPromptOverride: config.systemPrompt } : {}),
     maxTurns: clampMaxTurns(config.maxTurns),
     toolRouting: config.toolRouting ?? 'local',
     profile: toolsOnly ? ('tools' as const) : ('safe' as const),
