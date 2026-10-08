@@ -1,6 +1,8 @@
 import {
   runSessionAgentTurn,
   SessionStream,
+  applyModelSelection,
+  applyDetectedModel,
   type SessionProviderPorts,
 } from '@inklabs/shared/providers';
 export { isResumeFailedNoSession } from '@inklabs/shared/runtime';
@@ -39,6 +41,8 @@ import {
   compactForLedger,
   SerialInputDrain,
   SessionUsage,
+  SessionContextState,
+  CONTEXT_MUTATING_TOOL_NAMES,
   SessionTurnCoordinator,
   bootstrapSessionIdentity,
   type PreparedSessionTurn,
@@ -184,7 +188,6 @@ import {
   type ProviderContextMeasurement,
   type SignalSink,
 } from '../repl/context-tools.js';
-import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
 import { assessContextPressure } from '../repl/context-pressure.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
@@ -2031,74 +2034,7 @@ export function findLastDetectedModel(transcriptPath: string, backend: string): 
  * compaction deferral protects large histories until the truth arrives
  * (Lumen, PR #477 round 2 — finding 2).
  */
-export function applyModelSelection(
-  runtime: ChatRuntime,
-  next: string | undefined,
-  contextBudgetAuto: boolean
-): void {
-  runtime.model = next;
-  runtime.detectedModel = undefined;
-  runtime.log.append({
-    type: 'model_detection_reset',
-    backend: runtime.backend,
-  });
-  runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
-  if (contextBudgetAuto) {
-    applyBudgetForWindow(runtime, runtime.backendTokenWindow);
-  }
-}
-
-/**
- * Apply a provider-REPORTED model (the stream's init event): remember it,
- * persist it for cross-process recovery, and re-resolve the window/budget.
- * When the packing budget changes, a `context_budget_changed` boundary is
- * appended so a native session seeded at the OLD packing width is never
- * resumed-by-recovery in a later process — a one-turn process can seed at
- * 170K, detect Fable 5, and exit before the in-process shape drift gets a
- * next turn to reseed; without the boundary, the next process would restore
- * the 850K budget, recover the narrow-seeded session id, and delta into it
- * forever, stranding the omitted history (Lumen, PR #477 round 3).
- * findLastBackendSession treats the boundary like compaction/evict/trim
- * markers: recovery is refused and the next turn seeds fresh at the new
- * width (a post-detection reseed writes a new backend_session marker, which
- * re-establishes recovery).
- */
-export function applyDetectedModel(
-  runtime: ChatRuntime,
-  model: string,
-  contextBudgetAuto: boolean
-): { windowChanged: boolean } {
-  runtime.detectedModel = model;
-  runtime.log.append({
-    type: 'model_detected',
-    backend: runtime.backend,
-    model,
-  });
-  const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? model);
-  if (window === runtime.backendTokenWindow) return { windowChanged: false };
-  runtime.backendTokenWindow = window;
-  if (contextBudgetAuto) {
-    applyBudgetForWindow(runtime, window);
-  }
-  return { windowChanged: true };
-}
-
-/**
- * Recompute the AUTO working budget for a window and, when it actually
- * changes, append the `context_budget_changed` boundary that severs
- * cross-process recovery of native sessions seeded at the old packing width.
- */
-function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
-  const previous = runtime.maxContextTokens;
-  runtime.maxContextTokens = defaultContextBudget(window, promptTransportFor(runtime.backend));
-  if (runtime.maxContextTokens !== previous) {
-    runtime.log.append({
-      type: 'context_budget_changed',
-      from: previous,
-      to: runtime.maxContextTokens,
-    });
-  }
-}
+export { applyModelSelection, applyDetectedModel } from '@inklabs/shared/providers';
 
 const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 
@@ -2112,13 +2048,7 @@ export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
  * describes the next envelope, so the stateless count is dropped to unknown
  * (the floor) until the next report (Lumen, PR #576 round 12).
  */
-export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
-  'write',
-  'edit',
-  'multi_edit',
-  'apply_patch',
-  'bash',
-]);
+export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set(CONTEXT_MUTATING_TOOL_NAMES);
 
 /** CLI compatibility: instruction discovery stays at the host boundary. */
 export function buildPromptEnvelope(
@@ -2861,48 +2791,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * taken where each spawn's result lands — before the loop runs that turn's
    * tools, so a list_context in the same turn already sees it (finding 1).
    */
-  const providerSample = new ProviderSampleTracker();
-  const providerScope = (): ProviderSampleScope => ({
-    backend: runtime.backend,
-    model: runtime.detectedModel || runtime.model,
-    backendSessionId: activeBackendSessionId,
-    // The LIVE envelope, not the session's adopted baseline: a stateless
-    // provider never has a baseline, so its samples outlived every envelope
-    // change (Lumen, PR #583 round 2).
-    envelopeShape: envelopeShapeKey(runtime),
+  const sessionContext = new SessionContextState({
+    runtime: () => runtime,
+    append: (entry) => runtime.log.append(entry),
+    rolled: (note) => printEvent(chalk.yellow(`  ⛁ provider session rolled — ${note}`)),
   });
-  const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
-    if (!usage) return;
-    const scope = providerScope();
-    const at = new Date().toISOString();
-    providerSample.record(usage, scope, at);
-    // Persisted so the NEXT process — a one-turn Myra run exits right after
-    // this — budgets against it on its first pre-turn check instead of
-    // flying blind until its own spawn reports (Lumen, PR #583 round 2).
-    // A report with no usable measurement is persisted too, as a tombstone:
-    // live it hides the previous sample, and replay must not resurrect it
-    // (Lumen, round 3).
-    const parts = usage.contextParts;
-    runtime.log.append(
-      usage.contextTokens !== undefined && usage.contextTokens > 0
-        ? {
-            type: 'provider_sample',
-            at,
-            ...scope,
-            contextTokens: usage.contextTokens,
-            ...(parts?.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
-            ...(parts?.cacheReadTokens !== undefined
-              ? { cacheReadTokens: parts.cacheReadTokens }
-              : {}),
-            ...(parts?.cacheWriteTokens !== undefined
-              ? { cacheWriteTokens: parts.cacheWriteTokens }
-              : {}),
-          }
-        : { type: 'provider_sample', at, ...scope, unknown: true }
-    );
-  };
   const providerContextMeasurement = (): ProviderContextMeasurement | undefined =>
-    providerSample.measurement(providerScope());
+    sessionContext.measurement();
+  const sampleProviderContext = (usage: BackendTokenUsage | undefined): void =>
+    sessionContext.sampleUsage(usage);
+
   let lastDelegation: DelegationState | undefined;
   let forceQuitAfterTurn = false;
   let readyForAutoRun = false;
@@ -3219,67 +3117,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // shape but never derives paths from its own cwd or caller input.
   emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.log.path });
 
-  // ── Provider session reuse (claude only) — Stage 2 ──
-  // One provider-native session id per ink session, reused across turns AND
-  // across processes. Seeded on the first backend spawn, resumed thereafter,
-  // and reset at every ink-owned context-boundary change (compaction, trim,
-  // eviction). Recovered from the reattached transcript below so a fresh
-  // process (e.g. the next Myra heartbeat, which reattaches the same inkClient
-  // session) RESUMES the same native session — the jsonl accumulates one
-  // coherent thread instead of fragmenting into a new file per message. ink
-  // owns compaction; the provider never runs its own.
-  let activeBackendSessionId: string | undefined;
-  // Signature of the envelope's static shape at the time the session was seeded
-  // (backend, model, tool mode/routing, strict flag, skills, thread key,
-  // identity context). When it drifts mid-session — /backend, /model,
-  // /tool-routing, /skill-use, /skill-clear, /refresh, profile changes — the
-  // resumed native session would be stale, so runUserTurn invalidates and
-  // reseeds. Subsumes the backend check (backend is part of the shape).
-  let activeBackendSessionShape: string | undefined;
-  /**
-   * The session-wide CONTEXT GENERATION: bumped before any local tool that can
-   * change what a stateless provider discovers on its next fresh spawn runs —
-   * by the parent or by any clone, and before execution so an error after a
-   * side effect still counts. A stateless count is trusted only while the
-   * generation it was reported in is the current one (Lumen, PR #576 round 13).
-   */
-  let contextGeneration = 0;
-  /**
-   * Mutations still running. A stateless spawn that starts and returns while
-   * one is in flight would record the post-start generation and trust it after
-   * the mutation lands, so occupancy is rejected while any is in flight and the
-   * generation advances AGAIN on settlement (Lumen, PR #576 round 14).
-   */
-  let mutationsInFlight = 0;
-  /** Returns the settle callback the caller must run in `finally`. */
-  const beginContextMutationFor = (calls: ReadonlyArray<{ tool: string }>): (() => void) => {
-    if (!calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) return () => {};
-    contextGeneration += 1;
-    mutationsInFlight += 1;
-    return () => {
-      mutationsInFlight -= 1;
-      contextGeneration += 1;
-    };
-  };
-  /**
-   * Drop the native session so the next spawn seeds a fresh one from the
-   * ledger. The marker keeps a later process from recovering the dropped id
-   * (findLastBackendSession); the provider sample goes with it — it measured
-   * a window that no longer exists.
-   */
-  const rollProviderSession = (reason: string, note: string): void => {
-    if (activeBackendSessionId !== undefined) {
-      runtime.log.append({
-        type: 'backend_session_invalidated',
-        id: activeBackendSessionId,
-        reason,
-      });
-    }
-    activeBackendSessionId = undefined;
-    activeBackendSessionShape = undefined;
-    providerSample.clear();
-    printEvent(chalk.yellow(`  ⛁ provider session rolled — ${note}`));
-  };
+  // The same context-generation fence is shared by parent and clone calls.
+  const beginContextMutationFor = (calls: ReadonlyArray<{ tool: string }>): (() => void) =>
+    sessionContext.beginMutation(calls);
+  const rollProviderSession = (reason: string, note: string): void =>
+    sessionContext.roll(reason, note);
 
   // ── Images a tool put in context (view_image, `read` on an image) ──
   // The bytes never ride the text relay (tool-images.ts). They live on the
@@ -3337,7 +3179,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Replayed under the scope it was taken in; measurement() decides
       // whether that is still the live window.
       const s = hydrated.providerSample;
-      providerSample.record(
+      sessionContext.sample.record(
         {
           backend: s.scope.backend,
           source: 'json',
@@ -3383,7 +3225,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // resumes rather than spuriously reseeding on startup-timing drift.
       const recovered = findLastBackendSession(existingTranscript);
       if (recovered && recovered.routing === runtime.toolRouting) {
-        activeBackendSessionId = recovered.id;
+        sessionContext.provider.id = recovered.id;
       }
     }
     // Continue the event-id sequence from where the file left off
@@ -3770,13 +3612,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // post-eviction ledger; otherwise a resumed native session would still hold
     // the evicted content. findLastBackendSession clears cross-process
     // recovery on the matching markers.
-    activeBackendSessionId = undefined;
-    activeBackendSessionShape = undefined;
     // A stateless provider re-packs the ledger on every spawn, so a reading
     // taken before the eviction describes a window that no longer exists —
     // and its scope (no session id) would otherwise still match (Lumen, PR
     // #583 round 2). Trims route through here too.
-    providerSample.clear();
+    sessionContext.clearProvider();
   };
 
   const trimContextToPercent = async (
@@ -3927,9 +3767,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // before the provider ever would). Mid-turn, the next continuation
         // re-seeds (decideContinuationSession). Only when the ledger actually
         // changed: a refusal or a failed marker leaves the session alone.
-        activeBackendSessionId = undefined;
-        activeBackendSessionShape = undefined;
-        providerSample.clear();
+        sessionContext.clearProvider();
       }
       return outcome;
     } finally {
@@ -3955,7 +3793,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ledgerThreshold: threshold,
       providerTokens: providerContextMeasurement()?.contextTokens,
       providerThreshold: Math.floor(runtime.maxContextTokens * AUTO_COMPACT_THRESHOLD_PCT),
-      hasProviderSession: activeBackendSessionId !== undefined,
+      hasProviderSession: sessionContext.provider.id !== undefined,
       format: formatTokenCount,
     });
     if (pressure.action === 'none') return;
@@ -3991,7 +3829,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // A compaction that could not shrink the ledger (a protected tail, a
     // summarizer failure) must still roll a native session the provider says
     // is over the window, or the next spawn resumes the same oversize session.
-    if (!outcome.ok && pressure.providerOver && activeBackendSessionId !== undefined) {
+    if (!outcome.ok && pressure.providerOver && sessionContext.provider.id !== undefined) {
       rollProviderSession(
         'provider-context-over-budget',
         `compaction did not shrink the ledger; ${pressure.reason}`
@@ -4778,7 +4616,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : [...cloneHistory, body].join(CLONE_HISTORY_SEPARATOR);
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
-      const generationBeforeSpawn = contextGeneration;
+      const generationBeforeSpawn = sessionContext.generation;
       const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
@@ -4869,7 +4707,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               // it was reported in — its own mutators and a concurrent parent's
               // both bump it (Lumen, PR #576 round 13).
               cloneCanReuseSession ||
-                (mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration)
+                (sessionContext.mutationsInFlight === 0 &&
+                  cloneGenerationAtReport === sessionContext.generation)
                 ? cloneOccupancyTokens
                 : undefined
             ),
@@ -5754,20 +5593,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const providerPorts: SessionProviderPorts = {
       runtime,
-      state: {
-        get id() {
-          return activeBackendSessionId;
-        },
-        set id(value) {
-          activeBackendSessionId = value;
-        },
-        get shape() {
-          return activeBackendSessionShape;
-        },
-        set shape(value) {
-          activeBackendSessionShape = value;
-        },
-      },
+      state: sessionContext.provider,
       ledger,
       sbSlug,
       cliAttached,
@@ -5860,8 +5686,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
       },
       recordUsage: recordRunUsage,
       sampleContext: sampleProviderContext,
-      contextGeneration: () => contextGeneration,
-      mutationsInFlight: () => mutationsInFlight,
+      contextGeneration: () => sessionContext.generation,
+      mutationsInFlight: () => sessionContext.mutationsInFlight,
       notice: (reason) =>
         printEvent(
           reason === 'resume-missing'
@@ -8052,7 +7878,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ledger,
             runtime.maxContextTokens,
             lastUsageTotal,
-            providerSample.latest()?.usage,
+            sessionContext.sample.latest()?.usage,
             runtime.backendTokenWindow
           );
           lastUsageTotal = usage.total;

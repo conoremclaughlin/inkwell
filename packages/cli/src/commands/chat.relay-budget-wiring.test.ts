@@ -49,8 +49,8 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
     expect(parent).toContain('providerTurn.relayOccupancy()');
-    expect(source).toContain('contextGeneration: () => contextGeneration');
-    expect(source).toContain('mutationsInFlight: () => mutationsInFlight');
+    expect(source).toContain('contextGeneration: () => sessionContext.generation');
+    expect(source).toContain('mutationsInFlight: () => sessionContext.mutationsInFlight');
     expect(clone).toBeDefined();
     expect(provider).toMatch(
       /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(\s*ports\.mutationsInFlight\(\) > 0 \|\|\s*statelessGenerationAtReport !== ports\.contextGeneration\(\)\s*\) \{\s*return undefined;\s*\}\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
@@ -126,8 +126,10 @@ describe('runAgentLoop hosts and their relay budgets', () => {
 
   it('a session-wide context generation covers the whole mutation lifetime — bumped before a mutating call runs and again when it settles, in both executors, with no count trusted while one is in flight (Lumen, rounds 13–14)', () => {
     expect(source).toMatch(
-      /const beginContextMutationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): \(\(\) => void\) => \{\s*if \(!calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\) return \(\) => \{\};\s*contextGeneration \+= 1;\s*mutationsInFlight \+= 1;\s*return \(\) => \{\s*mutationsInFlight -= 1;\s*contextGeneration \+= 1;\s*\};/
+      /const beginContextMutationFor = [\s\S]*?sessionContext\.beginMutation\(calls\);/
     );
+    // Lifetime accounting is exercised directly in session-context-state.test;
+    // these pins ensure both real executors share that same session object.
     const wraps =
       source.match(
         /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
@@ -147,13 +149,13 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
-      /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
+      /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
     );
     expect(provider).toMatch(
       /if \(\s*ports\.mutationsInFlight\(\) > 0 \|\|\s*statelessGenerationAtReport !== ports\.contextGeneration\(\)\s*\) \{\s*return undefined;/
     );
     expect(source).toMatch(
-      /cloneCanReuseSession \|\|\s*\(mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration\)\s*\? cloneOccupancyTokens\s*: undefined/
+      /cloneCanReuseSession \|\|\s*\(sessionContext\.mutationsInFlight === 0 &&\s*cloneGenerationAtReport === sessionContext\.generation\)\s*\? cloneOccupancyTokens\s*: undefined/
     );
     expect(source).not.toMatch(/statelessPromptTokens = undefined;\s*\}\s*iterationResults\.push/);
   });

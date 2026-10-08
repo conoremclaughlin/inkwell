@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildPromptEnvelope } from '../commands/chat';
 import { ContextLedger } from './context-ledger';
-import { ProviderSampleTracker } from './provider-sample';
 import {
   computeContextOccupancy,
   formatContextStamp,
@@ -13,7 +12,7 @@ import {
   type SessionProviderPorts,
   type BackendRunResult,
 } from '@inklabs/shared/providers';
-import { envelopeShapeKey, turnContextOccupancy } from '@inklabs/shared/runtime';
+import { SessionContextState, turnContextOccupancy } from '@inklabs/shared/runtime';
 
 // The old regression sliced chat.ts and executed its source text. The real
 // composition is now importable: exercise it directly with a fake launch port,
@@ -22,7 +21,12 @@ import { envelopeShapeKey, turnContextOccupancy } from '@inklabs/shared/runtime'
 function providerHarness(backend = 'claude') {
   const ledger = new ContextLedger();
   ledger.addEntry('user', 'synthetic user input', 'repl');
-  const tracker = new ProviderSampleTracker();
+  const context = new SessionContextState({
+    runtime: () => ports.runtime,
+    append: () => 0,
+    rolled: () => {},
+  });
+  context.provider.id = 'stale-native-session';
   const ok: BackendRunResult = {
     success: true,
     stdout: 'reply',
@@ -45,7 +49,7 @@ function providerHarness(backend = 'claude') {
       strictTools: false,
       activeSkills: [],
     },
-    state: { id: 'stale-native-session' },
+    state: context.provider,
     ledger,
     sbSlug: 'echo',
     cliAttached: false,
@@ -54,13 +58,7 @@ function providerHarness(backend = 'claude') {
     mintId: () => 'reseeded-native-session',
     append: () => 0,
     buildEnvelope: (body, stamp) => buildPromptEnvelope('echo', ports.runtime, ledger, body, stamp),
-    measurement: () =>
-      tracker.measurement({
-        backend,
-        model: ports.runtime.model,
-        backendSessionId: ports.state.id,
-        envelopeShape: envelopeShapeKey(ports.runtime),
-      }),
+    measurement: () => context.measurement(),
     spawnContext: () => ({ workingDirectory: '/synthetic/studio' }),
     attachmentDirs: () => [],
     startTurn: vi.fn(() => ({ result: Promise.resolve(ok), abort: () => {} })),
@@ -76,23 +74,14 @@ function providerHarness(backend = 'claude') {
     mutationsInFlight: () => 0,
     notice: () => {},
   };
-  const measure = () =>
-    tracker.record(
-      { contextTokens: 1500 },
-      {
-        backend,
-        model: ports.runtime.model,
-        backendSessionId: ports.state.id,
-        envelopeShape: envelopeShapeKey(ports.runtime),
-      }
-    );
+  const measure = () => context.sampleUsage({ backend, source: 'json', contextTokens: 1500 });
   const turn = () =>
     createSessionProviderTurn(ports, 'synthetic user input', [], {
       input: { raw: 'synthetic user input', source: 'user' },
       occupancy: turnContextOccupancy(ledger, ports.runtime, ports.measurement()),
       promptHooks: { injected: 0, injectedEntries: [], evicted: 0, blocked: false },
     });
-  return { ports, measure, turn, ok };
+  return { ports, measure, turn, ok, context };
 }
 
 describe('PR 639 recovery advice', () => {
@@ -114,18 +103,23 @@ describe('PR 639 recovery advice', () => {
       source.indexOf('  const trimContextToPercent = async (')
     );
     // Pin the production mutation, not a mock of what we think it does.
-    expect(writer).toContain('activeBackendSessionId = undefined;');
-    expect(writer).toContain('activeBackendSessionShape = undefined;');
-    expect(writer).toContain('providerSample.clear();');
+    expect(writer).toContain('sessionContext.clearProvider();');
+    const h = providerHarness();
+    h.measure();
+    expect(h.context.measurement()).toBeDefined();
     const ledger = new ContextLedger();
     ledger.addEntry('system', 'stub', 'ink');
     let notified = false;
     handleClientLocalTool('evict_context', { source: 'ink' }, ledger, undefined, {
       onEvict: ({ refs }) => {
         notified = refs.length === 1;
+        h.context.clearProvider();
       },
     });
     expect(notified).toBe(true);
+    expect(h.context.provider.id).toBeUndefined();
+    expect(h.context.provider.shape).toBeUndefined();
+    expect(h.context.measurement()).toBeUndefined();
   });
 
   it('does not claim compaction is the exclusive way to clear provider excess', () => {
@@ -224,8 +218,8 @@ it('the CLI supplies live native state and measurement to the tested shared comp
   expect(start).toBeGreaterThan(0);
   expect(end).toBeGreaterThan(start);
   const block = source.slice(start, end);
-  expect(block).toContain('return activeBackendSessionId;');
-  expect(block).toContain('activeBackendSessionId = value;');
+  expect(block).toContain('state: sessionContext.provider,');
+  expect(source).toContain('sessionContext.measurement()');
   expect(block).toContain('measurement: providerContextMeasurement,');
   expect(block).toContain('contextImagesFor,');
   expect(block).toContain('noteImagesDelivered,');

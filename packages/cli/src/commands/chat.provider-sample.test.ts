@@ -17,6 +17,11 @@ const provider = readFileSync(
   'utf8'
 );
 
+const context = readFileSync(
+  join(here, '../../../shared/src/runtime/session-context-state.ts'),
+  'utf8'
+);
+
 describe('chat.ts provider-sample wiring', () => {
   const cloneStart = source.indexOf('const cloneRunTurn = async (');
   const cloneEnd = source.indexOf('\n    };\n', cloneStart);
@@ -47,26 +52,28 @@ describe('chat.ts provider-sample wiring', () => {
   it('provider-only excess rolls the native session; a compaction that did not shrink the ledger rolls it too', () => {
     const rolls = source.match(/rollProviderSession\(\s*'provider-context-over-budget'/g) ?? [];
     expect(rolls.length).toBe(2);
-    expect(source).toContain('hasProviderSession: activeBackendSessionId !== undefined');
+    expect(source).toContain('hasProviderSession: sessionContext.provider.id !== undefined');
     expect(source).toMatch(
-      /if \(!outcome\.ok && pressure\.providerOver && activeBackendSessionId !== undefined\)/
+      /if \(!outcome\.ok && pressure\.providerOver && sessionContext\.provider\.id !== undefined\)/
     );
   });
 
   it('the sample is scoped to the LIVE envelope key, so stateless providers are scoped too', () => {
-    const scope = source.slice(
-      source.indexOf('const providerScope = ('),
-      source.indexOf('const sampleProviderContext = (')
+    const scope = context.slice(
+      context.indexOf('scope(): ProviderSampleScope'),
+      context.indexOf('sampleUsage(')
     );
+    expect(source).toContain('runtime: () => runtime');
     expect(scope).toContain('envelopeShape: envelopeShapeKey(runtime)');
     expect(scope).not.toContain('activeBackendSessionShape');
   });
 
   it('every sample is persisted, and the next process replays it', () => {
-    const sampler = source.slice(
-      source.indexOf('const sampleProviderContext = ('),
-      source.indexOf('const providerContextMeasurement = (')
+    const sampler = context.slice(
+      context.indexOf('sampleUsage('),
+      context.indexOf('measurement():')
     );
+    expect(source).toContain('sessionContext.sampleUsage(usage)');
     expect(sampler).toContain("type: 'provider_sample'");
     // A report with no usable measurement is persisted as a tombstone too,
     // so replay cannot resurrect the sample it hid live (Lumen, round 3).
@@ -79,15 +86,18 @@ describe('chat.ts provider-sample wiring', () => {
       source.indexOf('const recordEviction = ('),
       source.indexOf('const trimContextToPercent = async (')
     );
-    expect(eviction).toContain('providerSample.clear();');
+    expect(eviction).toContain('sessionContext.clearProvider();');
   });
 
   it('every path that rolls the session also drops the sample it measured', () => {
-    const helper = source.slice(
-      source.indexOf('const rollProviderSession = '),
-      source.indexOf('printEvent(chalk.yellow(`  ⛁ provider session rolled')
+    expect(source).toContain('sessionContext.roll(reason, note)');
+    expect(context).toContain('this.clearProvider();');
+    const helper = context.slice(
+      context.indexOf('clearProvider(): void'),
+      context.indexOf('roll(reason:')
     );
-    expect(helper).toContain('providerSample.clear();');
-    expect(helper).toContain('activeBackendSessionId = undefined;');
+    expect(helper).toContain('this.sample.clear();');
+    expect(helper).toContain('this.provider.id = undefined;');
+    expect(helper).toContain('this.provider.shape = undefined;');
   });
 });
