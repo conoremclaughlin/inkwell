@@ -89,8 +89,10 @@ vi.mock('./auth/ink-auth-provider', () => {
   class MockInkAuthProvider {
     // The mock answers with the token's claims or null, as the provider's
     // signature check does; this wraps it in the verdict the routes read.
+    // A test can also hand back a verdict itself, e.g. a 503.
     verifyAccessToken = async (header?: string) => {
       const token = await mockVerifyAccessToken(header);
+      if (token && typeof token === 'object' && 'ok' in token) return token;
       return token ? { ok: true, token } : { ok: false, status: 401 };
     };
     createPendingAuth = vi.fn(() => 'pending-id');
@@ -434,6 +436,34 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       }
     };
     await Promise.all(Array.from({ length: 12 }, (_, i) => check(i)));
+  });
+
+  describe('a token whose SB is gone, or cannot be read (task 3f7f6a8f)', () => {
+    // The provider's verdict comes from deleted-space-tokens.test.ts; this is
+    // what the /mcp route does with it.
+    it('challenges with 401 invalid_token when the SB the token names is gone', async () => {
+      if (serverUnavailableError) return;
+      mockVerifyAccessToken.mockResolvedValue({ ok: false, status: 401 });
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer gone' });
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get('www-authenticate')).toContain('error="invalid_token"');
+      expect(JSON.parse(res.body).error.message).toBe('Invalid or expired access token');
+    });
+
+    it('answers 503, without an OAuth challenge, when the SB cannot be read', async () => {
+      if (serverUnavailableError) return;
+      mockVerifyAccessToken.mockResolvedValue({ ok: false, status: 503 });
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer unreadable',
+      });
+
+      expect(res.status).toBe(503);
+      expect(res.headers.get('www-authenticate')).toBeNull();
+      expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: '2.0', error: { code: -32001 } });
+    });
   });
 
   it('should challenge unauthenticated initialize requests when OAuth is required', async () => {
