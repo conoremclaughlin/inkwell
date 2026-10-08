@@ -24,6 +24,7 @@ import {
   type LoadedMiniApp,
 } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
+import { jsonBodyErrors } from '../routes/json-body-errors';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
@@ -1036,6 +1037,8 @@ export class MCPServer {
     // Admin & Agent routes
     // ============================================================================
     app.use(express.json());
+    // A body no parser could read answers 4xx without repeating it (routes/json-body-errors.ts).
+    app.use(jsonBodyErrors);
     app.use(requireCookieCsrfHeader);
     app.use(cookieParser());
     app.use('/api/admin', adminRouter);
