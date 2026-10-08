@@ -12,8 +12,11 @@
  * and then converts with regular expressions; two of those expressions
  * (`<a…>[\s\S]*?</a>` and `[ \t]+\n`) take quadratic time on a page built to
  * defeat them, and this server is one thread. Here a single scan does both
- * jobs and every step is linear in the page. OpenClaw's Readability pass and
- * its provider fallbacks are not ported; a page is read by the scan alone.
+ * jobs and every step is linear in the page. OpenClaw's Readability pass is
+ * readability.ts, which runs it in a worker thread on the page as
+ * stripHiddenHtml leaves it; this scan converts what Readability keeps, and
+ * reads the whole page when Readability doesn't. OpenClaw's provider
+ * fallbacks are not ported.
  */
 
 export type ExtractMode = 'markdown' | 'text';
@@ -21,8 +24,11 @@ export type ExtractMode = 'markdown' | 'text';
 export interface ExtractedContent {
   text: string;
   title?: string;
-  /** How the body was read: html, markdown, json, or text (as it came). */
-  extractor: 'html' | 'markdown' | 'json' | 'text';
+  /**
+   * How the body was read: readability (its main content, by Readability),
+   * html (the whole page, by the scan), markdown, json, or text (as it came).
+   */
+  extractor: 'readability' | 'html' | 'markdown' | 'json' | 'text';
 }
 
 // ============== Charset ==============
@@ -565,6 +571,101 @@ export function htmlToReadable(html: string, mode: ExtractMode): { text: string;
   if (markdown && preDepth > 0) emit(`\n${FENCE}\n`);
 
   return { text: tidyScanned(stripInvisibleUnicode(parts.join(''))), title };
+}
+
+/**
+ * The page's HTML with every hidden element removed, by the scan's own rules,
+ * before Readability sees it (readability.ts). Readability drops style
+ * attributes as it cleans, so a `display:none` block it kept would reach the
+ * converter with nothing left to mark it hidden. OpenClaw runs its sanitizer
+ * first for the same reason; this is the scan above, emitting markup instead
+ * of text, so it stays linear and the rules stay in one place.
+ *
+ * Kept as written: visible tags and text, entities undecoded, and the <title>
+ * and visible <textarea> elements. Removed: hidden elements and everything in
+ * them, comments and declarations, scripts, styles and the other raw-text
+ * elements, and an unterminated tag at the end.
+ */
+export function stripHiddenHtml(html: string): string {
+  const parts: string[] = [];
+  const dropStack: string[] = [];
+  const dropCounts = new Map<string, number>();
+  const pushDropped = (name: string) => {
+    dropStack.push(name);
+    dropCounts.set(name, (dropCounts.get(name) ?? 0) + 1);
+  };
+  const closeDropped = (name: string) => {
+    if (!dropCounts.get(name)) return;
+    for (const removed of dropStack.splice(dropStack.lastIndexOf(name))) {
+      dropCounts.set(removed, (dropCounts.get(removed) ?? 1) - 1);
+    }
+  };
+  const emit = (markup: string) => {
+    if (dropStack.length === 0 && markup) parts.push(markup);
+  };
+
+  let cursor = 0;
+  const length = html.length;
+  while (cursor < length) {
+    const open = html.indexOf('<', cursor);
+    if (open < 0) {
+      emit(html.slice(cursor));
+      break;
+    }
+    if (open > cursor) emit(html.slice(cursor, open));
+
+    if (html.startsWith('<!--', open)) {
+      const end = html.indexOf('-->', open + 4);
+      cursor = end < 0 ? length : end + 3;
+      continue;
+    }
+    const next = html.charCodeAt(open + 1);
+    if (next === 33 /* ! */ || next === 63 /* ? */) {
+      const end = html.indexOf('>', open + 2);
+      cursor = end < 0 ? length : end + 1;
+      continue;
+    }
+    const startsTag =
+      isAsciiLetter(next) || (next === 47 /* / */ && isAsciiLetter(html.charCodeAt(open + 2)));
+    if (!startsTag) {
+      emit('<');
+      cursor = open + 1;
+      continue;
+    }
+    const end = findTagEnd(html, open);
+    if (end < 0) break;
+    cursor = end + 1;
+    const tag = parseTag(html.slice(open + 1, end));
+    if (!tag) continue;
+
+    if (!tag.closing && RAW_TEXT_ELEMENTS.has(tag.name)) {
+      const ending = rawTextEnd(tag.name);
+      ending.lastIndex = cursor;
+      const found = ending.exec(html);
+      const contentEnd = found ? found.index : length;
+      const close = found ? html.indexOf('>', found.index) : -1;
+      const elementEnd = close < 0 ? length : close + 1;
+      const kept =
+        tag.name === 'title' || (tag.name === 'textarea' && !isHiddenElement(tag.name, tag.attrs));
+      if (kept) emit(`${html.slice(open, cursor)}${html.slice(cursor, contentEnd)}</${tag.name}>`);
+      cursor = elementEnd;
+      continue;
+    }
+
+    if (dropStack.length > 0) {
+      if (tag.closing) closeDropped(tag.name);
+      else if (!tag.selfClosing && !VOID_ELEMENTS.has(tag.name)) pushDropped(tag.name);
+      continue;
+    }
+
+    if (!tag.closing && isHiddenElement(tag.name, tag.attrs)) {
+      if (!tag.selfClosing && !VOID_ELEMENTS.has(tag.name)) pushDropped(tag.name);
+      continue;
+    }
+
+    emit(html.slice(open, cursor));
+  }
+  return parts.join('');
 }
 
 // ============== By content type ==============
