@@ -29,10 +29,7 @@
  * - Nested objects/arrays are walked recursively
  */
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-
-const execFileAsync = promisify(execFile);
+import { readHostKeychainCredentials } from '@inklabs/shared/node-host';
 
 import { resolveCredentialRefs as resolveSharedCredentials } from '@inklabs/shared/runtime';
 export type { CredentialResolution, ResolveResult } from '@inklabs/shared/runtime';
@@ -46,7 +43,6 @@ export function resolveCredentialRefs(
 
 // ─── Keychain Integration ──────────────────────────────────────
 
-const SERVICE_PREFIX = 'ink:';
 let keychainCache: Record<string, string> | null = null;
 
 /**
@@ -58,40 +54,11 @@ let keychainCache: Record<string, string> | null = null;
  * an empty map (credentials fall back to process.env only).
  */
 export async function loadKeychainCredentials(): Promise<Record<string, string>> {
-  const cache: Record<string, string> = {};
-  if (process.platform !== 'darwin') {
-    keychainCache = cache;
-    return cache;
-  }
-
-  try {
-    const { stdout } = await execFileAsync('security', ['dump-keychain']);
-    const entries = stdout.split(/^keychain:/gm);
-
-    for (const entry of entries) {
-      if (!entry.includes('class: "genp"')) continue;
-      const svcMatch = entry.match(/"svce"<blob>="([^"]+)"/);
-      if (!svcMatch || !svcMatch[1].startsWith(SERVICE_PREFIX)) continue;
-      const name = svcMatch[1].slice(SERVICE_PREFIX.length);
-
-      try {
-        const { stdout: pw } = await execFileAsync('security', [
-          'find-generic-password',
-          '-s',
-          svcMatch[1],
-          '-w',
-        ]);
-        cache[name] = pw.trimEnd();
-      } catch {
-        // Individual credential retrieval failed — skip it
-      }
-    }
-  } catch {
-    // Keychain inaccessible — proceed with empty cache
-  }
-
-  keychainCache = cache;
-  return cache;
+  keychainCache = await readHostKeychainCredentials({
+    platform: process.platform,
+    env: process.env,
+  });
+  return keychainCache;
 }
 
 /**

@@ -1,3 +1,4 @@
+import { sanitizeArgsForApproval } from '@inklabs/shared/runtime';
 import { createSessionClones } from '@inklabs/shared/node-host';
 import { createSessionToolHost } from '@inklabs/shared/node-host';
 import { homedir, tmpdir } from 'os';
@@ -1713,30 +1714,6 @@ function pickLatestSession(
     const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
     return bms - ams;
   })[0];
-}
-
-function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): string {
-  const policyName = tool.replace(/^mcp__inkwell__/, '');
-  switch (policyName) {
-    case 'bash':
-      return typeof args.command === 'string' ? args.command.slice(0, 500) : '';
-    case 'write':
-    case 'edit': {
-      const path = (args.path ?? args.file_path ?? args.filePath) as string | undefined;
-      return path ? path.slice(0, 200) : '';
-    }
-    case 'read':
-    case 'ls':
-    case 'grep':
-    case 'find': {
-      const path = (args.path ?? args.file_path ?? args.filePath ?? args.pattern) as
-        | string
-        | undefined;
-      return path ? path.slice(0, 200) : '';
-    }
-    default:
-      return '';
-  }
 }
 
 async function promptForToolApproval(

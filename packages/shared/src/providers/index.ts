@@ -28,3 +28,6 @@ export * from './session-agent-turn.js';
 export * from './session-stream.js';
 export * from './session-model.js';
 export * from './session-compaction.js';
+
+export * from './skill-mcp-parser.js';
+export * from './pdf-extractor.js';

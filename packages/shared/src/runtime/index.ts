@@ -69,3 +69,6 @@ export * from './backend-tool-passthrough.js';
 
 export * from './clone-registry.js';
 export * from './clone-policy.js';
+
+export * from './mcp-result.js';
+export * from './approval-sanitize.js';
