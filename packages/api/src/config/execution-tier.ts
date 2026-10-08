@@ -5,9 +5,12 @@
  * tools are available and the setting we put on the deployment").
  *
  * - `tools`: Inkwell's tools, and reads inside the SB's own folder. No shell,
- *   no file edits or writes, no shared-image reads, no waking another agent,
- *   no send_response, no tools of the model provider's own, and none of this
- *   machine's tool grants. It runs only on ink, which enforces it.
+ *   no file edits or writes, no shared-image reads, no trigger_agent, no
+ *   send_response, no tools of the model provider's own, and none of this
+ *   machine's tool grants. It runs only on ink, which enforces it. These are
+ *   limits on the turn's local tools only: send_to_inbox stays, and whom it
+ *   may reach or wake is the server's own authorization, the same for any
+ *   SB on any tier (an inkling's owner and thread rules among it).
  * - `full`: what a self-hosted SB has on this machine: the `safe` profile,
  *   the machine's tool policy, and the SB's own tool-routing setting.
  *
@@ -27,7 +30,10 @@
  * test can pass its own source.
  *
  * Anything that doesn't parse fails closed: a malformed variable makes the
- * turn `tools`, and `problem` says which variable, never its value.
+ * turn `tools`, and `problem` says which variable, never its value. A map
+ * that is present but names no one (`,` or `, ,`) is malformed too, never an
+ * empty map: an empty client map would drop the inkling default (Lumen,
+ * #787). Blank or whitespace alone is unset.
  */
 
 type EnvSource = Record<string, string | undefined>;
@@ -79,7 +85,8 @@ function parseMap(raw: string, keyShape: RegExp): Map<string, ExecutionTier> | n
     if (map.has(key) && map.get(key) !== tier) return null;
     map.set(key, tier);
   }
-  return map;
+  // Present but naming no one is a mistake, not a request to clear the map.
+  return map.size > 0 ? map : null;
 }
 
 function present(raw: string | undefined): raw is string {
@@ -137,5 +144,5 @@ export function executionTierPrompt(tier: ExecutionTier): string {
   return `
 
 ### Your environment
-This server runs your turns on its tools tier. You have Inkwell's tools, and you can read files in your own folder. There is no shell, you can't edit or write files, and you can't wake another agent. Reply in your conversation with \`send_to_inbox\`. When something needs more than these tools, say so plainly rather than looking for another way.`;
+This server runs your turns on its tools tier. You have Inkwell's tools, and you can read files in your own folder. There is no shell, and you can't edit or write files. Reply in your conversation with \`send_to_inbox\`. When something needs more than these tools, say so plainly rather than looking for another way.`;
 }

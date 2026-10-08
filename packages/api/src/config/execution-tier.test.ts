@@ -67,6 +67,24 @@ describe('executionTierFor', () => {
     }
   });
 
+  it('refuses a map that is present but names no one, rather than dropping the inkling default (Lumen, #787)', () => {
+    for (const raw of [',', ', ,', ',\n,']) {
+      // The inkling the client default protects stays protected.
+      expect(
+        executionTierFor(inkling, { INK_EXECUTION_TIER_CLIENTS: raw }),
+        JSON.stringify(raw)
+      ).toEqual({ tier: 'tools', from: 'malformed', problem: 'INK_EXECUTION_TIER_CLIENTS' });
+      expect(
+        executionTierFor(ordinary, { INK_EXECUTION_TIER_SBS: raw }),
+        JSON.stringify(raw)
+      ).toEqual({
+        tier: 'tools',
+        from: 'malformed',
+        problem: 'INK_EXECUTION_TIER_SBS',
+      });
+    }
+  });
+
   it('treats a blank setting as unset', () => {
     expect(
       executionTierFor(inkling, {
@@ -83,5 +101,9 @@ describe('executionTierPrompt', () => {
     expect(executionTierPrompt('tools')).toContain('### Your environment');
     expect(executionTierPrompt('tools')).toContain('send_to_inbox');
     expect(executionTierPrompt('full')).toBe('');
+  });
+
+  it("claims only the local limits: send_to_inbox can still wake others, under the server's authorization (Lumen, #787)", () => {
+    expect(executionTierPrompt('tools')).not.toMatch(/wake/i);
   });
 });

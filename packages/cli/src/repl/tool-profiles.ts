@@ -36,10 +36,12 @@ export interface ToolProfile {
  * outright, so no grant in the policy file can open them: the shell, which
  * is not confined to the working directory; view_image, whose roots include
  * the shared ~/.ink/files (Lumen, #773: another account's image was
- * reachable); file edits and writes; waking another agent; and
- * send_response, which a turn answering in its own conversation thread never
- * needs. Its reply, send_to_inbox, stays allowed, as do the Pi reads (read,
- * grep, find, ls), which validatePathArgs keeps inside the working
+ * reachable); file edits and writes; trigger_agent; and send_response, which
+ * a turn answering in its own conversation thread never needs. Its reply,
+ * send_to_inbox, stays allowed: whom it may reach, and whether it wakes them,
+ * is the server's own authorization, never this profile's (an inkling's owner
+ * and thread rules are enforced there). The Pi reads (read, grep, find,
+ * ls) stay allowed too, and validatePathArgs keeps them inside the working
  * directory: the SB's own folder, where the server runs this tier. Media a
  * person sends reaches the turn through ink chat's own attachment encoding,
  * not through view_image. The server also runs it against a policy file of
@@ -57,7 +59,7 @@ export interface ToolProfile {
 const TOOLS_TIER: ToolProfile = {
   label: 'Tools only',
   description:
-    'The tools execution tier: no shell, no file edits or writes, no shared-image reads, never wakes another agent; it replies in its own conversation.',
+    "The tools execution tier: no shell, no file edits or writes, no shared-image reads, no trigger_agent or send_response; send_to_inbox stays, under the server's own authorization.",
   mode: 'backend',
   safeSpecs: ['group:ink-safe'],
   allowSpecs: [],
