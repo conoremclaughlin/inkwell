@@ -126,6 +126,39 @@ describe('selectInkRunner', () => {
 });
 
 describe('HostedInkSessionRunner', () => {
+  it('contains an awaited execution failure to its session without stopping a concurrent sibling', async () => {
+    const failedLaunch = launch();
+    const siblingLaunch = launch();
+    failedLaunch.handle.abort.mockImplementation(() => failedLaunch.settle({ childExited: true }));
+    const failedDeps = dependencies({ startProviderTurn: () => failedLaunch.handle });
+    const siblingDeps = dependencies({ startProviderTurn: () => siblingLaunch.handle });
+    const host = new HostedInkSessionRunner({
+      forTurn: ({ sessionId }) => (sessionId === 'failed-session' ? failedDeps : siblingDeps),
+      execute: async (input, ports) => {
+        const child = ports.provider.startTurn({ inkSessionId: input.sessionId });
+        if (input.sessionId === 'failed-session') throw new Error('synthetic session failure');
+        await child.result;
+        ports.sessionLog.append({ type: 'assistant', content: 'sibling reply' });
+        await ports.sessionLog.flush();
+        return { success: true, responses: [], finalTextResponse: 'sibling reply' };
+      },
+    });
+    const sibling = host.run('work', { config: config({ inkSessionId: 'sibling-session' }) });
+    const failed = await host.run('fail', { config: config({ inkSessionId: 'failed-session' }) });
+    expect(failed).toMatchObject({ success: false, error: 'synthetic session failure' });
+    expect(failedLaunch.handle.abort).toHaveBeenCalledOnce();
+    expect(siblingLaunch.handle.abort).not.toHaveBeenCalled();
+    siblingLaunch.settle({ childExited: true });
+    expect(await sibling).toMatchObject({ success: true, finalTextResponse: 'sibling reply' });
+    expect(failedDeps.sessionLog.append).not.toHaveBeenCalled();
+    expect(siblingDeps.sessionLog.append).toHaveBeenCalledExactlyOnceWith({
+      type: 'assistant',
+      content: 'sibling reply',
+    });
+    // This is cooperative asynchronous failure containment, not a claim to
+    // survive a busy loop, an unobserved rejection, or process-wide OOM.
+  });
+
   it('refuses, starting nothing, while no composition or dependencies are bound', async () => {
     const forTurn = vi.fn(() => dependencies());
     for (const options of [{}, { forTurn }, { execute: succeed }]) {

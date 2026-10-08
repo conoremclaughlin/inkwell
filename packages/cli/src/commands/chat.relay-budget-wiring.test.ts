@@ -132,7 +132,14 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       source.match(
         /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
       ) ?? [];
-    expect(wraps).toHaveLength(2);
+    expect(wraps).toHaveLength(1); // Clone stays local; parent delegates the whole batch.
+    expect(source).toContain('beginContextMutation: beginContextMutationFor,');
+    const batch = readFileSync(
+      join(here, '../../../shared/src/runtime/session-tool-batch.ts'),
+      'utf8'
+    );
+    expect(batch).toMatch(/const settleMutation = ports\.beginContextMutation\(calls\);\s*try \{/);
+    expect(batch).toMatch(/finally \{\s*settleMutation\(\);\s*\}/);
     expect(provider).toMatch(
       /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
     );
