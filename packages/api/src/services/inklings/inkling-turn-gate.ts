@@ -7,10 +7,12 @@
  *
  * The creation half (inkling-thread-gate.ts) keeps an inkling's
  * conversations between it and its owner. This half refuses everything
- * else that could wake it: an SB's or the system's send, a heartbeat, a
- * reminder, a strategy, a channel message, and every turn while the owner
- * test is off. Only a person's message, on the owner's own account, wakes
- * an inkling born under the test.
+ * else that could wake it: an SB's or the system's send, another SB's
+ * heartbeat or any other reminder, a strategy, a channel message, and every
+ * turn while the owner test is off. Only a person's message, on the owner's
+ * own account, wakes an inkling born under the test, and the inkling's own
+ * heartbeat, firing in its conversation with that owner
+ * (inkling-heartbeat.ts, isOwnersHeartbeat).
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -130,7 +132,10 @@ export interface InklingTurnInput {
   identity: InklingIdentity;
   /** The account the turn runs for. */
   userId: string;
-  /** isOwnersOwnMessage, for an inkling's turn. */
+  /**
+   * isOwnersOwnMessage for an inkling's turn, or isOwnersHeartbeat for its
+   * own heartbeat: either way, proof the wake is its owner's.
+   */
   ownerMessage: OwnerMessageProof;
 }
 
@@ -168,7 +173,9 @@ export function inklingTurnRefusal(
     return { reason: 'the message that woke it could not be read', retryable: true };
   }
   if (input.ownerMessage !== 'yes') {
-    return refuse('an inkling wakes only for a stored message its owner sent in its conversation');
+    return refuse(
+      'an inkling wakes only for a stored message its owner sent in its conversation, or its own heartbeat there'
+    );
   }
   return null;
 }

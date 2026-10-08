@@ -63,6 +63,10 @@ import {
 } from './services/inklings/inkling-reply-chain';
 import { closingTextTurnHooks } from './services/inklings/inkling-closing-text';
 import {
+  deliverInklingHeartbeat,
+  isInklingHeartbeatReminder,
+} from './services/inklings/inkling-heartbeat';
+import {
   TriggerRetryScheduler,
   getTriggerAttempt,
   BackendFailureError,
@@ -708,6 +712,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
           error: err instanceof Error ? err.message : String(err),
         };
       }
+    }
+
+    // An inkling's heartbeat lands in its own conversation in the app, under
+    // the heartbeat's admission to the inkling turn gate: never this generic
+    // path, whose channel cascade and send_response prompt are an external
+    // channel's.
+    if (isInklingHeartbeatReminder(reminder)) {
+      if (!dataComposer) {
+        return { status: 'failed', error: 'No database to deliver an inkling heartbeat with' };
+      }
+      return deliverInklingHeartbeat(
+        {
+          supabase: dataComposer.getClient(),
+          handleMessage: (request) => sessionService!.handleMessage(request),
+        },
+        reminder,
+        deliveryContext
+      );
     }
 
     // Resolve agent from reminder's sb_id, fall back to server default

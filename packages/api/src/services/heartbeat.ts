@@ -1135,10 +1135,13 @@ async function quietHoursNow(
 /**
  * Get user's timezone from database
  */
-async function getUserTimezone(userId: string): Promise<string> {
-  if (!supabase) return 'UTC';
+async function getUserTimezone(
+  userId: string,
+  client: SupabaseClient<Database> | null = supabase
+): Promise<string> {
+  if (!client) return 'UTC';
 
-  const { data } = await supabase.from('users').select('timezone').eq('id', userId).single();
+  const { data } = await client.from('users').select('timezone').eq('id', userId).single();
 
   return data?.timezone || 'UTC';
 }
@@ -1239,27 +1242,33 @@ function calculateNextRun(cronExpr: string, fromTime: Date, timezone?: string): 
 }
 
 /**
- * Create a new reminder
+ * Create a new reminder. `client` is the caller's own service-role client,
+ * for a caller that writes everything else it does through one (an inkling's
+ * awakening); without it, this module's.
  */
-export async function createReminder(params: {
-  userId: string;
-  title: string;
-  description?: string;
-  deliveryChannel: string;
-  deliveryTarget: string;
-  cronExpression?: string;
-  runAt?: Date;
-  maxRuns?: number;
-  sbId?: string;
-  studioHint?: string;
-  metadata?: Json;
-}): Promise<{ id: string } | null> {
-  if (!supabase) {
+export async function createReminder(
+  params: {
+    userId: string;
+    title: string;
+    description?: string;
+    deliveryChannel: string;
+    deliveryTarget: string;
+    cronExpression?: string;
+    runAt?: Date;
+    maxRuns?: number;
+    sbId?: string;
+    studioHint?: string;
+    metadata?: Json;
+  },
+  client?: SupabaseClient<Database>
+): Promise<{ id: string } | null> {
+  if (!client && !supabase) {
     supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
   }
+  const db = (client ?? supabase) as SupabaseClient<Database>;
 
   // Get user's timezone for cron interpretation
-  const userTimezone = await getUserTimezone(params.userId);
+  const userTimezone = await getUserTimezone(params.userId, db);
 
   const nextRunAt =
     params.runAt ||
@@ -1267,7 +1276,7 @@ export async function createReminder(params: {
       ? calculateNextRun(params.cronExpression, new Date(), userTimezone)
       : new Date());
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from('scheduled_reminders')
     .insert({
       user_id: params.userId,
