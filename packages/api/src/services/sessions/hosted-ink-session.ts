@@ -35,6 +35,7 @@
  */
 
 import { STOP_GIVE_UP_MS, STOP_GRACE_MS } from './stop-process.js';
+import { inkSessionOptions, type InkSessionOptions } from './ink-session-options.js';
 import type {
   ChannelResponse,
   ClaudeRunnerConfig,
@@ -88,15 +89,7 @@ export interface HostedInkSessionInput {
   readonly message: string;
   readonly attachments: ReadonlyArray<{ readonly path: string; readonly mimeType?: string }>;
   /** The knobs InkRunner passes `ink chat` as flags today. */
-  readonly options: Readonly<{
-    model?: string;
-    effort?: string;
-    maxTurns?: number;
-    toolRouting: 'backend' | 'local';
-    profile: 'safe';
-    away: true;
-    messageLabel: string;
-  }>;
+  readonly options: InkSessionOptions;
 }
 
 /** What the server supplies the composition for one turn. */
@@ -518,15 +511,7 @@ export class HostedInkSessionRunner implements IRunner {
               })
             )
         ),
-        options: Object.freeze({
-          ...(config.model ? { model: config.model } : {}),
-          ...(config.effort ? { effort: config.effort } : {}),
-          ...(config.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
-          toolRouting: config.toolRouting ?? 'local',
-          profile: 'safe' as const,
-          away: true as const,
-          messageLabel: config.channel || 'server',
-        }),
+        options: inkSessionOptions(config),
       });
       // Every port refuses once the turn has ended, so nothing the composition
       // still holds can act for a finished turn.

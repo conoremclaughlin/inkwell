@@ -210,6 +210,7 @@ describe('HostedInkSessionRunner', () => {
         maxTurns: 3,
         toolRouting: 'local',
         profile: 'safe',
+        withholdProviderTools: false,
         away: true,
         messageLabel: 'telegram',
       },
@@ -222,6 +223,63 @@ describe('HostedInkSessionRunner', () => {
     expect(onTurnReply).not.toHaveBeenCalled();
     expect(JSON.stringify(process.env)).toBe(before);
     expect(process.cwd()).toBe(cwd);
+  });
+
+  it('carries the named provider and inkling restrictions without changing the next session', async () => {
+    const seen: HostedInkSessionInput[] = [];
+    const hosted = runner(async (input, ports) => {
+      seen.push(input);
+      return succeed(input, ports);
+    });
+    await hosted.run('inkling', {
+      config: config({
+        inkProvider: 'claude',
+        inklingToolPolicyPath: '/isolated/inkling-policy.json',
+        maxTurns: 7,
+        effort: 'high',
+        channel: 'agent',
+      }),
+    });
+    await hosted.run('ordinary SB', { config: config({ inkProvider: 'codex' }) });
+    expect(seen[0].options).toEqual({
+      backend: 'claude',
+      maxTurns: 7,
+      effort: 'high',
+      toolRouting: 'local',
+      profile: 'inkling',
+      requireProfile: 'inkling',
+      toolPolicyPath: '/isolated/inkling-policy.json',
+      withholdProviderTools: true,
+      away: true,
+      messageLabel: 'agent',
+    });
+    expect(seen[1].options).toEqual({
+      backend: 'codex',
+      maxTurns: 5,
+      toolRouting: 'local',
+      profile: 'safe',
+      withholdProviderTools: false,
+      away: true,
+      messageLabel: 'server',
+    });
+  });
+
+  it.each([
+    [undefined, 5],
+    [Number.NaN, 5],
+    [Number.POSITIVE_INFINITY, 5],
+    [0, 1],
+    [-3, 1],
+    [99, 25],
+    [7.6, 8],
+  ])('uses the existing outer-turn bound for %s: %s', async (maxTurns, expected) => {
+    let seen: HostedInkSessionInput | undefined;
+    await runner(async (input, ports) => {
+      seen = input;
+      return succeed(input, ports);
+    }).run('hello', { config: config({ maxTurns }) });
+    expect(seen!.options.maxTurns).toBe(expected);
+    expect(seen!.options).not.toHaveProperty('backend');
   });
 
   it('asks the caller’s admission before each launch', async () => {
