@@ -21,7 +21,11 @@ const providerSource = readFileSync(
   'utf8'
 );
 // Scan the remaining CLI spawns AND the extracted delivery/reseed/continuation sites.
-const chatSource = cliSource + '\n' + providerSource;
+const compactionSource = readFileSync(
+  join(here, '../../../shared/src/providers/session-compaction.ts'),
+  'utf8'
+);
+const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource;
 
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
@@ -56,6 +60,8 @@ describe('attachment reaches every backend spawn in chat.ts', () => {
     expect(cliSource).toContain('startTurn: startBackendTurn');
     expect(cliSource).toContain('provider: providerPorts,');
     expect(cliSource).toContain('await runSessionAgentTurn(');
+    expect(cliSource).toMatch(/createSessionCompaction\(\{\s*runtime,\s*ledger,\s*sessionContext,/);
+    expect(cliSource).toMatch(/sessionEvictedEntries,\s*sbSlug,\s*cliAttached,/);
   });
 
   it('derives attachment once, from the run mode', () => {

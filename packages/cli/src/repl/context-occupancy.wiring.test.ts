@@ -98,9 +98,14 @@ describe('PR 639 recovery advice', () => {
 
   it('control: production eviction resets a native session even for a tiny stub', () => {
     const source = readFileSync(new URL('../commands/chat.ts', import.meta.url), 'utf8');
-    const writer = source.slice(
-      source.indexOf('  const recordEviction = ('),
-      source.indexOf('  const trimContextToPercent = async (')
+    const compaction = readFileSync(
+      new URL('../../../shared/src/providers/session-compaction.ts', import.meta.url),
+      'utf8'
+    );
+    expect(source).toMatch(/createSessionCompaction\(\{\s*runtime,\s*ledger,\s*sessionContext,/);
+    const writer = compaction.slice(
+      compaction.indexOf('  const recordEviction = ('),
+      compaction.indexOf('  const trimContextToPercent = async (')
     );
     // Pin the production mutation, not a mock of what we think it does.
     expect(writer).toContain('sessionContext.clearProvider();');

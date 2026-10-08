@@ -27,3 +27,4 @@ export * from './session-provider.js';
 export * from './session-agent-turn.js';
 export * from './session-stream.js';
 export * from './session-model.js';
+export * from './session-compaction.js';

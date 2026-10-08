@@ -22,6 +22,11 @@ const context = readFileSync(
   'utf8'
 );
 
+const compaction = readFileSync(
+  join(here, '../../../shared/src/providers/session-compaction.ts'),
+  'utf8'
+);
+
 describe('chat.ts provider-sample wiring', () => {
   const cloneStart = source.indexOf('const cloneRunTurn = async (');
   const cloneEnd = source.indexOf('\n    };\n', cloneStart);
@@ -50,10 +55,11 @@ describe('chat.ts provider-sample wiring', () => {
   });
 
   it('provider-only excess rolls the native session; a compaction that did not shrink the ledger rolls it too', () => {
-    const rolls = source.match(/rollProviderSession\(\s*'provider-context-over-budget'/g) ?? [];
+    const rolls =
+      compaction.match(/sessionContext\.roll\(\s*'provider-context-over-budget'/g) ?? [];
     expect(rolls.length).toBe(2);
-    expect(source).toContain('hasProviderSession: sessionContext.provider.id !== undefined');
-    expect(source).toMatch(
+    expect(compaction).toContain('hasProviderSession: sessionContext.provider.id !== undefined');
+    expect(compaction).toMatch(
       /if \(!outcome\.ok && pressure\.providerOver && sessionContext\.provider\.id !== undefined\)/
     );
   });
@@ -82,10 +88,11 @@ describe('chat.ts provider-sample wiring', () => {
   });
 
   it('an eviction (and so a trim) drops the sample', () => {
-    const eviction = source.slice(
-      source.indexOf('const recordEviction = ('),
-      source.indexOf('const trimContextToPercent = async (')
+    const eviction = compaction.slice(
+      compaction.indexOf('const recordEviction = ('),
+      compaction.indexOf('const trimContextToPercent = async (')
     );
+    expect(source).toMatch(/createSessionCompaction\(\{\s*runtime,\s*ledger,\s*sessionContext,/);
     expect(eviction).toContain('sessionContext.clearProvider();');
   });
 
