@@ -2795,6 +2795,53 @@ async function latestFocusInWorkspace(
 }
 
 /**
+ * The identity row bootstrap describes. A request bound to an identity names
+ * it by id, and that row is the answer: a same-named identity in another of
+ * the person's workspaces must not stand in for it (Lumen, #781). Unbound,
+ * the slug must name one workspace-scoped identity the person owns, the rule
+ * resolveCallerSb applies, with a lone legacy row (no workspace) accepted as
+ * before. Several is ambiguous: no row, and the caller is told nothing it
+ * would have to guess.
+ */
+async function bootstrapIdentity(
+  dataComposer: DataComposer,
+  userId: string,
+  sbSlug: string,
+  boundSbId: string | undefined
+): Promise<{ row: Record<string, unknown> | null; ambiguous: boolean }> {
+  const client = dataComposer.getClient();
+  if (boundSbId) {
+    const { data: bound } = await client
+      .from('agent_identities')
+      .select('*')
+      .eq('id', boundSbId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (bound) {
+      if (bound.agent_id !== sbSlug) {
+        throw new Error(
+          `Agent identity mismatch: token is ${String(bound.agent_id)}, bootstrap names ${sbSlug}`
+        );
+      }
+      return { row: bound as Record<string, unknown>, ambiguous: false };
+    }
+    // The bound identity is gone: the slug rule decides, as resolveCallerSb's does.
+  }
+
+  const { data } = await client
+    .from('agent_identities')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('agent_id', sbSlug);
+  const rows = (data || []) as Array<Record<string, unknown>>;
+  const scoped = rows.filter((row) => typeof row.workspace_id === 'string');
+  if (scoped.length === 1) return { row: scoped[0], ambiguous: false };
+  if (scoped.length > 1) return { row: null, ambiguous: true };
+  if (rows.length === 1) return { row: rows[0], ambiguous: false };
+  return { row: null, ambiguous: rows.length > 1 };
+}
+
+/**
  * Who bootstrap tells the calling SB it is. An inkling that hasn't been named
  * yet gets a null name and a plain statement of that, never its stored
  * placeholder: its first act on waking is to call bootstrap.
@@ -2868,24 +2915,20 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   } | null = null;
 
   if (sbSlug) {
-    // Load constitution from local filesystem (fallback for DB)
-    // Agent-specific: ~/.ink/individuals/{sbSlug}/ (identity, heartbeat, soul)
-    // Shared: ~/.ink/shared/ (values, user, process)
-    const [valuesContent, userContent, processContent, selfContent, heartbeatContent, soulContent] =
-      await Promise.all([
-        safeReadFile(path.join(basePath, 'shared', 'VALUES.md')),
-        safeReadFile(path.join(basePath, 'shared', 'USER.md')),
-        safeReadFile(path.join(basePath, 'shared', 'PROCESS.md')),
-        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'IDENTITY.md')),
-        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'HEARTBEAT.md')),
-        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'SOUL.md')),
-      ]);
+    // Load the agent's own documents from the local filesystem (fallback for
+    // DB): ~/.ink/individuals/{sbSlug}/ (identity, heartbeat, soul). Values,
+    // user and process are workspace documents, read only from the database.
+    const [selfContent, heartbeatContent, soulContent] = await Promise.all([
+      safeReadFile(path.join(basePath, 'individuals', sbSlug, 'IDENTITY.md')),
+      safeReadFile(path.join(basePath, 'individuals', sbSlug, 'HEARTBEAT.md')),
+      safeReadFile(path.join(basePath, 'individuals', sbSlug, 'SOUL.md')),
+    ]);
 
     identityFiles = {
       sbSlug,
-      values: valuesContent,
-      user: userContent,
-      process: processContent,
+      values: null,
+      user: null,
+      process: null,
       self: selfContent,
       heartbeat: heartbeatContent,
       soul: soulContent,
@@ -2901,56 +2944,57 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
   const callerWorkspace = resolveCallerWorkspace(dataComposer.getClient(), user.id);
 
-  const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
-    await Promise.all([
-      // Active projects
-      callerWorkspace.then(({ workspaceId }) =>
-        dataComposer.repositories.projects.findAllByWorkspace(workspaceId, 'active')
-      ),
-      // Current focus, from the same workspace as the projects
-      callerWorkspace.then(({ workspaceId }) =>
-        latestFocusInWorkspace(dataComposer, user.id, workspaceId)
-      ),
-      // All active sessions (filter by sbSlug if provided) — client picks the right one
-      dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
-      // Database identity (for cloud agents, includes metadata, heartbeat, soul).
-      // Keep `metadata` in this select: bootstrapAgentInfo and nameOf read
-      // metadata.named, and without it an unnamed inkling would be told its
-      // placeholder name again (review 3ce682bd).
-      sbSlug
-        ? dataComposer
-            .getClient()
-            .from('agent_identities')
-            .select('*')
-            .eq('user_id', user.id)
-            .eq('agent_id', sbSlug)
-            .single()
-            .then(({ data }) => data)
-        : Promise.resolve(null),
-      // User timezone for timestamp conversion
-      dataComposer
-        .getClient()
-        .from('users')
-        .select('timezone')
-        .eq('id', user.id)
-        .single()
-        .then(({ data }) => data?.timezone || 'UTC'),
-      // User's installed skills (local + cloud merged)
-      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-        logger.warn('Failed to load user skills:', err);
-        return [];
-      }),
-      // Live sibling identities — structural facts for all agents under this user.
-      // Agents cross-reference this with their personal `relationships` notes.
-      supabase
-        .from('agent_identities')
-        // `metadata` is what nameOf reads: an unnamed inkling is listed with
-        // no name, never as its placeholder.
-        .select('agent_id, name, role, backend, session_scope, capabilities, description, metadata')
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: true })
-        .then(({ data }) => data || []),
-    ]);
+  const [
+    projects,
+    focus,
+    activeSessions,
+    identityLookup,
+    userTimezone,
+    userSkills,
+    siblingIdentities,
+  ] = await Promise.all([
+    // Active projects
+    callerWorkspace.then(({ workspaceId }) =>
+      dataComposer.repositories.projects.findAllByWorkspace(workspaceId, 'active')
+    ),
+    // Current focus, from the same workspace as the projects
+    callerWorkspace.then(({ workspaceId }) =>
+      latestFocusInWorkspace(dataComposer, user.id, workspaceId)
+    ),
+    // All active sessions (filter by sbSlug if provided) — client picks the right one
+    dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
+    // Database identity (for cloud agents, includes metadata, heartbeat, soul).
+    // Keep `metadata` in the row: bootstrapAgentInfo and nameOf read
+    // metadata.named, and without it an unnamed inkling would be told its
+    // placeholder name again (review 3ce682bd).
+    sbSlug
+      ? bootstrapIdentity(dataComposer, user.id, sbSlug, getRequestContext()?.sbId)
+      : Promise.resolve({ row: null, ambiguous: false }),
+    // User timezone for timestamp conversion
+    dataComposer
+      .getClient()
+      .from('users')
+      .select('timezone')
+      .eq('id', user.id)
+      .single()
+      .then(({ data }) => data?.timezone || 'UTC'),
+    // User's installed skills (local + cloud merged)
+    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+      logger.warn('Failed to load user skills:', err);
+      return [];
+    }),
+    // Live sibling identities — structural facts for all agents under this user.
+    // Agents cross-reference this with their personal `relationships` notes.
+    supabase
+      .from('agent_identities')
+      // `metadata` is what nameOf reads: an unnamed inkling is listed with
+      // no name, never as its placeholder.
+      .select('agent_id, name, role, backend, session_scope, capabilities, description, metadata')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: true })
+      .then(({ data }) => data || []),
+  ]);
+  const dbIdentity = identityLookup.row;
 
   // Ensure the caller's own session is always in the activeSessions list.
   // getActiveSessions is capped to 10 by started_at — a long-running session
@@ -3027,13 +3071,18 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // 1) explicit workspaceId param
   // 2) the identity's own workspace, else the oldest personal one — the same
   //    rule context-builder applies (constitution-workspace.ts)
+  // A slug that names identities in several workspaces resolves to none of
+  // them, and its caller is given no shared documents: falling back would
+  // hand it another workspace's (Lumen, #781).
   const resolvedWorkspaceId =
     params.workspaceId ||
-    (await constitutionWorkspaceId(
-      supabase,
-      user.id,
-      (dbIdentity?.workspace_id as string | null | undefined) ?? null
-    ));
+    (identityLookup.ambiguous
+      ? undefined
+      : await constitutionWorkspaceId(
+          supabase,
+          user.id,
+          (dbIdentity?.workspace_id as string | null | undefined) ?? null
+        ));
 
   const { data: dbWorkspaceSharedDocs } = resolvedWorkspaceId
     ? await supabase
@@ -3044,17 +3093,17 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         .maybeSingle()
     : { data: null };
 
-  const legacyUserIdentityQuery = supabase
-    .from('user_identity')
-    .select('user_profile_md, shared_values_md, process_md')
-    .eq('user_id', user.id);
+  // Shared documents come from the resolved workspace and nowhere else, the
+  // rule context-builder follows: neither an unscoped user_identity row nor a
+  // ~/.ink copy fills a workspace that has no process (Lumen, #781).
   const { data: dbUserIdentity } = resolvedWorkspaceId
-    ? await legacyUserIdentityQuery.eq('workspace_id', resolvedWorkspaceId).maybeSingle()
-    : await legacyUserIdentityQuery
-        .is('workspace_id', null)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+    ? await supabase
+        .from('user_identity')
+        .select('user_profile_md, shared_values_md, process_md')
+        .eq('user_id', user.id)
+        .eq('workspace_id', resolvedWorkspaceId)
+        .maybeSingle()
+    : { data: null };
 
   // Compute reflection status from identity metadata
   const identityMetadata = dbIdentity?.metadata as Record<string, unknown> | null;
@@ -3091,23 +3140,21 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // dbIdentity has: name, role, description, heartbeat, soul (per-agent docs)
   // dbWorkspaceSharedDocs has: shared_values/process (workspace-level docs)
   // dbUserIdentity has: shared_values_md/process_md (legacy fallback)
-  // identityFiles has: values, user, process, self, heartbeat, soul (filesystem fallback)
+  // identityFiles has: self, heartbeat, soul (per-agent filesystem fallback)
   const mergedIdentity = identityFiles
     ? {
         ...identityFiles,
-        // Override local files with Supabase content if available
         values:
           (dbWorkspaceSharedDocs?.shared_values as string | null) ||
           (dbUserIdentity?.shared_values_md as string | null) ||
-          identityFiles.values,
+          null,
         process:
           (dbWorkspaceSharedDocs?.process as string | null) ||
           (dbUserIdentity?.process_md as string | null) ||
-          identityFiles.process,
-        // USER.md lives in the database; the filesystem copy is a stale cache
-        // that usually does not exist at all. Without this the doc describing
-        // the human never reached any session.
-        user: (dbUserIdentity?.user_profile_md as string | null) || identityFiles.user,
+          null,
+        // USER.md lives in the database. Without this the doc describing the
+        // human never reached any session.
+        user: (dbUserIdentity?.user_profile_md as string | null) || null,
         self: (dbIdentity?.description as string | null) || identityFiles.self,
         heartbeat: (dbIdentity?.heartbeat as string | null) || identityFiles.heartbeat,
         soul: (dbIdentity?.soul as string | null) || identityFiles.soul,
