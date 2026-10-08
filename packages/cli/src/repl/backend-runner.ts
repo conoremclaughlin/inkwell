@@ -114,7 +114,7 @@ export interface BackendTurnHandle {
 /**
  * Set once, for the life of this process, by a chat whose provider must have
  * no tools of its own: `ink chat --no-provider-tools`, or a profile that
- * implies it (the inkling profile, task 0321ccf1). Nothing clears it. Every
+ * implies it (the tools profile, task 0321ccf1). Nothing clears it. Every
  * spawn this process makes passes startBackendTurn, the parent's turns,
  * continuations, reseeds, resumes, clones and compaction alike, so the
  * restriction is applied here rather than threaded through each caller, and

@@ -121,6 +121,13 @@ import {
 import { inklingRuntime } from '../inklings/inkling-runtime.js';
 import { inkProviderFor, type InkProvider } from './ink-provider.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
+import {
+  executionTierFor,
+  executionTierPrompt,
+  type TierSubject,
+} from '../../config/execution-tier.js';
+import { INKLING_CLIENT } from '../inklings/inkling-client.js';
+import { isUuid } from '../inklings/inkling-service.js';
 
 /**
  * Configuration for SessionService.
@@ -2623,6 +2630,9 @@ export class SessionService implements ISessionService {
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
+    // Who the execution tier is decided for (config/execution-tier.ts): the
+    // canonical identity and the client it names, once they are read.
+    let tierSubject: TierSubject = { sbId: session.sbId, client: null };
     if (this.supabase) {
       // SB-level default from agent_identities
       const { data: identity } = session.sbId
@@ -2680,6 +2690,14 @@ export class SessionService implements ISessionService {
       );
       if (inklingRefusal) {
         return refuseInklingTurn(inklingRefusal.reason, inklingRefusal.retryable);
+      }
+      if (inklingIdentity.kind === 'inkling') {
+        tierSubject = { sbId: inklingIdentity.id, client: INKLING_CLIENT };
+      } else if (inklingIdentity.kind === 'other') {
+        tierSubject = {
+          sbId: inklingIdentity.id ?? session.sbId,
+          client: inklingIdentity.client,
+        };
       }
 
       if (inklingIdentity.kind === 'inkling') {
@@ -2805,6 +2823,54 @@ export class SessionService implements ISessionService {
       inkProvider = choice.provider;
     }
 
+    // The execution tier decides which tools this turn is offered, from this
+    // server's configuration alone, the same way for any SB
+    // (config/execution-tier.ts, task 0321ccf1). `tools` runs only on ink,
+    // which enforces it, in the SB's own folder, against a tool policy of its
+    // own: never in a checkout, whose files its reads would reach, and never
+    // under this machine's grants. A turn the tier can't be enforced for is
+    // refused here, before anything is spawned.
+    const tierDecision = executionTierFor(tierSubject);
+    if (tierDecision.problem) {
+      logger.error('[ExecutionTier] A setting could not be read; the turn runs tools-only', {
+        variable: tierDecision.problem,
+        sbSlug,
+        sbId: tierSubject.sbId,
+      });
+    }
+    const executionTier = tierDecision.tier;
+    let toolPolicyPath: string | undefined;
+    if (executionTier === 'tools') {
+      const refuseTier = (reason: string): SessionResult => {
+        const summary = `Turn refused: ${reason}`;
+        logger.warn('[ExecutionTier] Turn refused', { sbSlug, sbId: tierSubject.sbId, reason });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: summary,
+          errorCode: 'EXECUTION_TIER_UNENFORCEABLE',
+          classification: { category: 'config', summary, retryable: false },
+        };
+      };
+      if (resolvedBackend !== 'ink') {
+        return refuseTier(
+          `this server runs it tools-only, which only ink enforces, and its runtime is ${resolvedBackend}`
+        );
+      }
+      const tierSbId = tierSubject.sbId;
+      if (!tierSbId || !isUuid(tierSbId)) {
+        return refuseTier('this server runs it tools-only, which needs its identity id');
+      }
+      const root = this.config.inklingsRoot ?? inklingsRoot();
+      resolvedWorkingDirectory = await ensureInklingFolder(tierSbId, root);
+      toolPolicyPath = inklingToolPolicyPath(tierSbId, root);
+    }
+
     // A Claude session in a studio gets its profile at launch, from the row
     // (design v5, phase A). A row that cannot be read, or is gone, fails the
     // launch here rather than letting it start without the profile it was
@@ -2848,18 +2914,19 @@ export class SessionService implements ISessionService {
       ...(inklingTurn ? inklingRunBounds(inklingTurnTimeoutMs()) : {}),
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
-      appendSystemPrompt: buildIdentityPrompt(
-        sbSlug,
-        injectedContext.agent.unnamed ? null : injectedContext.agent.name,
-        injectedContext.agent.soul,
-        injectedContext.user.timezone,
-        injectedContext.agent.heartbeat,
-        {
-          inkSessionId: session.id,
-          studioId: session.studioId || undefined,
-          threadKey: session.threadKey || undefined,
-        }
-      ),
+      appendSystemPrompt:
+        buildIdentityPrompt(
+          sbSlug,
+          injectedContext.agent.unnamed ? null : injectedContext.agent.name,
+          injectedContext.agent.soul,
+          injectedContext.user.timezone,
+          injectedContext.agent.heartbeat,
+          {
+            inkSessionId: session.id,
+            studioId: session.studioId || undefined,
+            threadKey: session.threadKey || undefined,
+          }
+        ) + executionTierPrompt(executionTier),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       ...(inkAccessToken ? { inkAccessToken } : {}),
@@ -2881,20 +2948,12 @@ export class SessionService implements ISessionService {
       ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
       ...(request.onTurnReply ? { onTurnReply: request.onTurnReply } : {}),
       // Always explicit — a headless boundary must never depend on worktree
-      // .ink/identity.json preferences or Commander defaults. An inkling's
-      // tools are always ink-owned: a dashboard setting must not hand its
-      // provider's native tools to the turn.
-      toolRouting: inklingTurn ? 'local' : runtimeToolRouting,
-      // An inkling's tools are bounded by its own profile and policy file,
-      // never by this machine's grants (task 0321ccf1).
-      ...(inklingTurn && inklingSbId
-        ? {
-            inklingToolPolicyPath: inklingToolPolicyPath(
-              inklingSbId,
-              this.config.inklingsRoot ?? inklingsRoot()
-            ),
-          }
-        : {}),
+      // .ink/identity.json preferences or Commander defaults. On the tools
+      // tier the tools are always ink-owned: a dashboard setting must not
+      // hand the provider's native tools to the turn.
+      toolRouting: executionTier === 'tools' ? 'local' : runtimeToolRouting,
+      executionTier,
+      ...(toolPolicyPath ? { toolPolicyPath } : {}),
       ...(inkProvider ? { inkProvider } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       ...(launchPermissions ? { launchPermissions } : {}),
@@ -5778,11 +5837,11 @@ export class SessionService implements ISessionService {
     sbSlug: string,
     sbId: string | null | undefined
   ): Promise<InklingIdentity> {
-    if (!this.supabase) return { kind: 'other' };
+    if (!this.supabase) return { kind: 'other', id: null, client: null };
     let canonical = sbId ?? null;
     if (!canonical) {
       const scope = await this.resolveIdentityScope(userId, sbSlug);
-      if (scope.absent) return { kind: 'other' };
+      if (scope.absent) return { kind: 'other', id: null, client: null };
       if (!scope.id) return { kind: 'unknown', transient: scope.unreadable === true };
       canonical = scope.id;
     }

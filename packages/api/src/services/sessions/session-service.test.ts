@@ -1393,22 +1393,94 @@ describe('SessionService', () => {
           expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
         });
 
-        it("gives an inkling's turn its own tool policy, beside the inklings' folders, and no other SB's turn one (task 0321ccf1)", async () => {
-          await turn(INKLING, fromOwner, OWNER);
-          expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
-          expect(configPassedToRunner()).toMatchObject({
-            inklingToolPolicyPath: join(inklingsRoot, '.tool-policy', `${SB}.json`),
-          });
-          // Beside its folder, never inside it: nothing its turn reaches can write it.
-          const policy = (configPassedToRunner() as { inklingToolPolicyPath: string })
-            .inklingToolPolicyPath;
-          expect(policy.startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
+        describe('the execution tier decides its tools, from server config, for any SB (task 0321ccf1)', () => {
+          const POLICY = () => join(inklingsRoot, '.tool-policy', `${SB}.json`);
+          const promptPassed = (runner = mockInkRunner) =>
+            String(
+              (configPassedToRunner(runner) as { appendSystemPrompt?: string }).appendSystemPrompt
+            );
 
-          await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
-          expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
-          expect(configPassedToRunner(mockClaudeRunner)).not.toHaveProperty(
-            'inklingToolPolicyPath'
-          );
+          it('runs an inkling on the tools tier by the client default: its own policy, beside the folders, local routing and the environment note', async () => {
+            await turn({ ...INKLING, runtimeConfig: { toolRouting: 'backend' } }, fromOwner, OWNER);
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            expect(configPassedToRunner()).toMatchObject({
+              executionTier: 'tools',
+              toolPolicyPath: POLICY(),
+              toolRouting: 'local',
+            });
+            // Beside its folder, never inside it: nothing its turn reaches can write it.
+            expect(POLICY().startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
+            expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+            expect(promptPassed()).toContain('### Your environment');
+          });
+
+          it('runs an ordinary SB on the full tier by default, with no policy of its own and no note', async () => {
+            await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+            expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+            const config = configPassedToRunner(mockClaudeRunner);
+            expect(config).toMatchObject({ executionTier: 'full' });
+            expect(config).not.toHaveProperty('toolPolicyPath');
+            expect(promptPassed(mockClaudeRunner)).not.toContain('### Your environment');
+          });
+
+          it('gives an inkling named full in the config what any SB on full has: the safe profile, no policy file, its own routing', async () => {
+            vi.stubEnv('INK_EXECUTION_TIER_SBS', `${SB}=full`);
+            await turn({ ...INKLING, runtimeConfig: { toolRouting: 'backend' } }, fromOwner, OWNER);
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const config = configPassedToRunner();
+            expect(config).toMatchObject({ executionTier: 'full', toolRouting: 'backend' });
+            expect(config).not.toHaveProperty('toolPolicyPath');
+            expect(promptPassed()).not.toContain('### Your environment');
+            // Its turn is still an inkling's: its folder, its owner test.
+            expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+          });
+
+          it('runs an ordinary SB on ink tools-only when the deployment is, in its own folder', async () => {
+            vi.stubEnv('INK_EXECUTION_TIER', 'tools');
+            await turn(
+              { runtimeConfig: { toolRouting: 'backend' } },
+              { sender: { id: 'system', name: 'heartbeat' } },
+              OWNER,
+              { session: { backend: 'ink' } }
+            );
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            expect(configPassedToRunner()).toMatchObject({
+              executionTier: 'tools',
+              toolPolicyPath: POLICY(),
+              toolRouting: 'local',
+            });
+            expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
+            expect(promptPassed()).toContain('### Your environment');
+          });
+
+          it("decides by any identity's client, not only an inkling's", async () => {
+            vi.stubEnv('INK_EXECUTION_TIER_CLIENTS', 'telegram-bridge=tools');
+            await turn(
+              { client: 'telegram-bridge' },
+              { sender: { id: 'system', name: 'heartbeat' } },
+              OWNER,
+              { session: { backend: 'ink' } }
+            );
+            expect(configPassedToRunner()).toMatchObject({
+              executionTier: 'tools',
+              toolPolicyPath: POLICY(),
+            });
+          });
+
+          it('refuses a tools-tier turn on a runtime that cannot enforce it, before anything runs', async () => {
+            vi.stubEnv('INK_EXECUTION_TIER', 'tools');
+            const result = await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+            expect(result.errorCode).toBe('EXECUTION_TIER_UNENFORCEABLE');
+            expect(result.classification?.retryable).toBe(false);
+            expectNothingRan();
+          });
+
+          it('fails closed to tools when a tier setting is malformed', async () => {
+            vi.stubEnv('INK_EXECUTION_TIER_SBS', `${SB}=everything`);
+            const result = await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+            expect(result.errorCode).toBe('EXECUTION_TIER_UNENFORCEABLE');
+            expectNothingRan();
+          });
         });
 
         it('with no sbId, the inkling is found by account and slug, and the gate applies', async () => {

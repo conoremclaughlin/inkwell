@@ -400,22 +400,24 @@ export class InkRunner implements IRunner {
     // 'local' (ink-owned, provider withheld).
     args.push('--tool-routing', config.toolRouting ?? 'local');
 
-    // Use the safe profile with away mode for non-interactive spawns.
-    // Safe profile allows read tools freely but requires approval for
-    // write/comms tools. Away mode routes approval prompts to the user's
-    // inbox (2FA) instead of auto-denying. An inkling's turn runs the
-    // inkling profile instead, against its own policy file (task 0321ccf1):
-    // the shell, file writes, shared-image reads, waking another agent and
-    // send_response are denied outright, and the machine's grants are never
-    // read. It names the profile with --require-profile, which a CLI built
-    // before that option refuses as unknown before anything runs (Lumen,
-    // #773): an old CLI would take --profile inkling, warn and carry on.
-    // --no-provider-tools does the same for the provider's own tools: Claude
-    // Code's native Read, which a document attachment opened, reaching past
-    // the inkling's folder. The profile implies it, so this is for the CLI
-    // built between the two, which takes the profile and not the option.
-    if (config.inklingToolPolicyPath) {
-      args.push('--require-profile', 'inkling', '--no-provider-tools', '--away');
+    // The full tier runs the safe profile with away mode, as every
+    // non-interactive spawn did. Safe allows read tools freely but requires
+    // approval for write/comms tools; away mode routes approval prompts to
+    // the user's inbox (2FA) instead of auto-denying. The tools tier runs the
+    // tools profile instead, against a policy file of its own (task
+    // 0321ccf1): the shell, file writes, shared-image reads, waking another
+    // agent and send_response are denied outright, and the machine's grants
+    // are never read. It names the profile with --require-profile, which a
+    // CLI that doesn't know the profile refuses before anything runs (Lumen,
+    // #773): --profile would warn and carry on. --no-provider-tools withholds
+    // the provider's own tools, Claude Code's native Read among them. The
+    // profile implies it; the option is for a CLI that takes the one and not
+    // the other.
+    if (config.executionTier === 'tools') {
+      if (!config.toolPolicyPath) {
+        throw new Error('The tools tier needs a tool policy of its own');
+      }
+      args.push('--require-profile', 'tools', '--no-provider-tools', '--away');
     } else {
       args.push('--profile', 'safe', '--away');
     }
@@ -524,9 +526,9 @@ export class InkRunner implements IRunner {
       // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
       // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
       ...(config.inkAccessToken ? { INK_ACCESS_TOKEN: config.inkAccessToken } : {}),
-      // An inkling's own tool policy, never the machine's (task 0321ccf1).
-      ...(config.inklingToolPolicyPath
-        ? { INK_TOOL_POLICY_PATH: config.inklingToolPolicyPath }
+      // The tools tier's own tool policy, never the machine's (task 0321ccf1).
+      ...(config.executionTier === 'tools' && config.toolPolicyPath
+        ? { INK_TOOL_POLICY_PATH: config.toolPolicyPath }
         : {}),
       // The run's own epoch. The chat's turn signal names it on every
       // lifecycle request; without it the chat claimed a fresh epoch at each

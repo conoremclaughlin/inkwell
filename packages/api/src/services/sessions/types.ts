@@ -911,12 +911,19 @@ export interface ClaudeRunnerConfig {
    */
   inkProvider?: InkProvider;
   /**
-   * An inkling's turn only: the tool-policy file `ink chat` reads instead of
-   * the machine's (INK_TOOL_POLICY_PATH), with the `inkling` profile in place
-   * of `safe`, which denies the shell, file writes, waking another agent and
-   * send_response (task 0321ccf1). Unset for every other spawn.
+   * The execution tier this server's configuration gives the turn
+   * (config/execution-tier.ts). InkRunner runs `tools` under the `tools`
+   * profile, against `toolPolicyPath`, with no provider tools; `full`, or
+   * unset, under `safe`. Other runners never receive `tools`: the session
+   * service refuses that turn before it spawns.
    */
-  inklingToolPolicyPath?: string;
+  executionTier?: 'tools' | 'full';
+  /**
+   * The tools tier only: the tool-policy file `ink chat` reads instead of the
+   * machine's (INK_TOOL_POLICY_PATH), so this machine's grants never reach
+   * the turn (task 0321ccf1).
+   */
+  toolPolicyPath?: string;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts
