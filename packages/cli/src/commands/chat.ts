@@ -157,6 +157,7 @@ import {
 } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
+import { createToolParametersLookup } from '../repl/tool-parameter-help.js';
 import {
   imagesToDeliver,
   processImageCacheDir,
@@ -2680,9 +2681,14 @@ export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }
     '',
   ].join('\n');
 
+  // Only names are listed here: a native MCP session is handed every schema,
+  // this runtime is not, so the parameters live behind describe_tool. Say so,
+  // or the model guesses field names (Oct 7: `sbSlug` on send_to_inbox).
+  const lookup =
+    'describe_tool({}) lists every Inkwell tool; before calling one you have not used yet, call describe_tool({"name": "<tool>"}) for its exact parameters, which ones are required, and their names. Do not guess a parameter name.';
   const inkwell = forClone
-    ? 'Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, etc. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead.'
-    : 'Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.';
+    ? `Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, and more. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead. ${lookup}`
+    : `Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, and more. ${lookup}`;
 
   const codingTools = renderLocalToolGroup('coding', opts.audience);
   const clientLocal = renderLocalToolGroup('client-local', opts.audience);
@@ -3580,6 +3586,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         runtime: 'ink',
       }),
   });
+  // One lookup of each Inkwell tool's parameters per process, shared by every
+  // dispatcher this run builds (tool-parameter-help.ts): a validation error
+  // then names the real parameters, and a success notes an ignored key.
+  const inkToolParameters = createToolParametersLookup((tool) =>
+    inkClient.callTool('describe_tool', { name: tool })
+  );
   let autoAttachedLatest = false;
   let contextBudgetAuto = !options.maxContextTokens;
   const initialBackend = options.backend || 'claude';
@@ -6597,6 +6609,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
             cwd: process.cwd(),
             callPi: callPiTool,
             callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
+            toolParameters: inkToolParameters,
+            // The clone's own policy, not the parent's: a clone that may not
+            // describe tools gets no parameter help, cached or fresh.
+            mayLookUpParameters: () => {
+              const decision = opts.policy.inspectInkTool('describe_tool', runtime.sessionId);
+              return decision.allowed && !decision.wouldConsumeGrant;
+            },
             resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
             // A clone asking what it can call gets its own narrower surface —
             // the same one its prompt described, not the parent's.
@@ -6981,6 +7000,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
             cwd: process.cwd(),
             callPi: callPiTool,
             callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
+            toolParameters: inkToolParameters,
+            // Help the model didn't ask for runs only where describe_tool is
+            // auto-allowed now, without spending a one-use grant.
+            mayLookUpParameters: () => {
+              const decision = toolPolicy.inspectInkTool('describe_tool', runtime.sessionId);
+              return decision.allowed && !decision.wouldConsumeGrant;
+            },
             // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
             // emits references; actual values are injected at the execution layer
             // so credentials never enter transcripts or context.
