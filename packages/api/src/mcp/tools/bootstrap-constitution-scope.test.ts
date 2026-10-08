@@ -227,6 +227,59 @@ describe('bootstrap shared documents', () => {
     expect(identityFiles.values).toBe('SPACE-VALUES');
   });
 
+  it('withholds the documents of a bound identity that is gone, and puts no same-named peer in its place', async () => {
+    db.rows('agent_identities').splice(0);
+    db.seed('agent_identities', {
+      id: PEER,
+      user_id: USER,
+      workspace_id: PERSONAL,
+      agent_id: 'probe',
+      name: 'Peer',
+      soul: 'PEER-SOUL',
+    });
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect(identityFiles.soul).not.toBe('PEER-SOUL');
+    expect(identityFiles.values).toBeNull();
+    expect(identityFiles.process).toBeNull();
+    expect(identityFiles.user).toBeNull();
+  });
+
+  describe('a failed identity read', () => {
+    /** Fails bootstrap's full identity reads; every other read still answers. */
+    function faultIdentityReads(): void {
+      const from = db.from.bind(db);
+      db.from = ((table: string) => {
+        const query = from(table);
+        const select = query.select.bind(query);
+        query.select = ((columns = '*') => {
+          select(columns);
+          if (table === 'agent_identities' && columns === '*') {
+            (query as unknown as { execute: () => Promise<unknown> }).execute = async () => ({
+              data: [],
+              error: { code: 'XX000', message: 'synthetic identity read failure' },
+            });
+          }
+          return query;
+        }) as typeof query.select;
+        return query;
+      }) as typeof db.from;
+    }
+
+    it('refuses a bound bootstrap rather than falling back to the personal workspace', async () => {
+      faultIdentityReads();
+      await expect(bootstrap({ sbId: SB, sbSlug: 'probe' })).rejects.toThrow(
+        /Failed to read the bound identity/
+      );
+    });
+
+    it('refuses an unbound bootstrap rather than falling back to the personal workspace', async () => {
+      faultIdentityReads();
+      await expect(bootstrap({})).rejects.toThrow(/Failed to resolve identity probe/);
+    });
+  });
+
   it("refuses a token bound to one identity when bootstrap names another's slug", async () => {
     await expect(bootstrap({ sbId: SB }, 'someone-else')).rejects.toThrow(
       /Agent identity mismatch/

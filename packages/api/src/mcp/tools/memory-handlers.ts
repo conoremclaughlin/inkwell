@@ -2796,50 +2796,71 @@ async function latestFocusInWorkspace(
 }
 
 /**
- * The identity row bootstrap describes. A request bound to an identity names
- * it by id, and that row is the answer: a same-named identity in another of
- * the person's workspaces must not stand in for it (Lumen, #781). Unbound,
- * the slug must name one workspace-scoped identity the person owns, the rule
- * resolveCallerSb applies, with a lone legacy row (no workspace) accepted as
- * before. Several is ambiguous: no row, and the caller is told nothing it
- * would have to guess.
+ * The identity row bootstrap describes, or `withheld` when nothing may stand
+ * in for it.
+ *
+ * A request bound to an identity names it by id, and that row is the answer.
+ * When the row is not there, nothing replaces it: not a same-named identity
+ * in another of the person's workspaces, and not the personal workspace's
+ * documents (Lumen, #781). resolveCallerSb falls through to the slug when a
+ * bound identity is gone; that is not safe for the documents an SB is told
+ * are its own.
+ *
+ * Unbound, the slug must name one workspace-scoped identity the person owns,
+ * with a lone legacy row (no workspace) accepted as before. Several is
+ * ambiguous and withheld. A slug with no record at all is not withheld: the
+ * caller gets the person's own documents, as it always has.
+ *
+ * A failed read throws. A lookup that could not be made says nothing about
+ * which identity this is, so it must not become a fallback.
  */
 async function bootstrapIdentity(
   dataComposer: DataComposer,
   userId: string,
   sbSlug: string,
   boundSbId: string | undefined
-): Promise<{ row: Record<string, unknown> | null; ambiguous: boolean }> {
+): Promise<{ row: Record<string, unknown> | null; withheld: boolean }> {
   const client = dataComposer.getClient();
   if (boundSbId) {
-    const { data: bound } = await client
+    const { data: bound, error } = await client
       .from('agent_identities')
       .select('*')
       .eq('id', boundSbId)
       .eq('user_id', userId)
       .maybeSingle();
-    if (bound) {
-      if (bound.agent_id !== sbSlug) {
-        throw new Error(
-          `Agent identity mismatch: token is ${String(bound.agent_id)}, bootstrap names ${sbSlug}`
-        );
-      }
-      return { row: bound as Record<string, unknown>, ambiguous: false };
+    if (error) {
+      throw new Error(`Failed to read the bound identity ${boundSbId}: ${error.message}`);
     }
-    // The bound identity is gone: the slug rule decides, as resolveCallerSb's does.
+    if (!bound) {
+      logger.warn('Bootstrap withheld identity documents: the bound identity is missing', {
+        userId,
+        sbSlug,
+        boundSbId,
+      });
+      return { row: null, withheld: true };
+    }
+    if (bound.agent_id !== sbSlug) {
+      throw new Error(
+        `Agent identity mismatch: token is ${String(bound.agent_id)}, bootstrap names ${sbSlug}`
+      );
+    }
+    return { row: bound as Record<string, unknown>, withheld: false };
   }
 
-  const { data } = await client
+  const { data, error } = await client
     .from('agent_identities')
     .select('*')
     .eq('user_id', userId)
     .eq('agent_id', sbSlug);
+  if (error) {
+    throw new Error(`Failed to resolve identity ${sbSlug}: ${error.message}`);
+  }
   const rows = (data || []) as Array<Record<string, unknown>>;
   const scoped = rows.filter((row) => typeof row.workspace_id === 'string');
-  if (scoped.length === 1) return { row: scoped[0], ambiguous: false };
-  if (scoped.length > 1) return { row: null, ambiguous: true };
-  if (rows.length === 1) return { row: rows[0], ambiguous: false };
-  return { row: null, ambiguous: rows.length > 1 };
+  if (scoped.length === 1) return { row: scoped[0], withheld: false };
+  if (scoped.length > 1) return { row: null, withheld: true };
+  if (rows.length === 1) return { row: rows[0], withheld: false };
+  return { row: null, withheld: rows.length > 1 };
 }
 
 /**
@@ -2970,7 +2991,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     // placeholder name again (review 3ce682bd).
     sbSlug
       ? bootstrapIdentity(dataComposer, user.id, sbSlug, getRequestContext()?.sbId)
-      : Promise.resolve({ row: null, ambiguous: false }),
+      : Promise.resolve({ row: null, withheld: false }),
     // User timezone for timestamp conversion
     dataComposer
       .getClient()
@@ -3072,12 +3093,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // 1) explicit workspaceId param
   // 2) the identity's own workspace, else the oldest personal one — the same
   //    rule context-builder applies (constitution-workspace.ts)
-  // A slug that names identities in several workspaces resolves to none of
-  // them, and its caller is given no shared documents: falling back would
-  // hand it another workspace's (Lumen, #781).
+  // A withheld identity (missing though bound, or ambiguous) resolves to no
+  // workspace, and its caller is given no shared documents: falling back
+  // would hand it another workspace's (Lumen, #781).
   const resolvedWorkspaceId =
     params.workspaceId ||
-    (identityLookup.ambiguous
+    (identityLookup.withheld
       ? undefined
       : await constitutionWorkspaceId(
           supabase,
@@ -3094,9 +3115,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         .maybeSingle()
     : { data: null };
 
-  // Shared documents come from the resolved workspace and nowhere else, the
-  // rule context-builder follows: neither an unscoped user_identity row nor a
-  // ~/.ink copy fills a workspace that has no process (Lumen, #781).
+  // Shared documents come from the resolved workspace and nowhere else:
+  // neither an unscoped user_identity row nor a ~/.ink copy fills a workspace
+  // that has no process (Lumen, #781). context-builder still falls back to an
+  // unscoped user_identity row when its workspace has none.
   const { data: dbUserIdentity } = resolvedWorkspaceId
     ? await supabase
         .from('user_identity')
