@@ -3178,8 +3178,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         // USER.md lives in the database. Without this the doc describing the
         // human never reached any session.
         user: (dbUserIdentity?.user_profile_md as string | null) || null,
-        // The description, then the SB's own values and relationships.
-        self: (dbIdentity ? identityDocument(dbIdentity) : null) || identityFiles.self,
+        // The description (or the local IDENTITY.md where there is none),
+        // then the SB's own values and relationships.
+        self: identityDocument(
+          (dbIdentity?.description as string | null) || identityFiles.self,
+          dbIdentity ?? {}
+        ),
         heartbeat: (dbIdentity?.heartbeat as string | null) || identityFiles.heartbeat,
         soul: (dbIdentity?.soul as string | null) || identityFiles.soul,
       }

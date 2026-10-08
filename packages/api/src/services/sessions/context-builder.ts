@@ -160,21 +160,32 @@ export class ContextBuilder implements IContextBuilder {
     // Memories are read for the session's canonical owner, which waits on
     // the identity read (remove-shared-memories §3.3).
     const identityRead = this.getAgentIdentity(userId, sbSlug, session.sbId);
-    const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      identityRead,
-      this.getUser(userId),
-      this.getContacts(userId),
-      identityRead
-        .then((identity) => this.memoryOwnerId(userId, sbSlug, session, identity))
-        .then((ownerId) =>
-          ownerId ? this.getKnowledgeMemories(userId, sbSlug, ownerId, session) : []
+    const ownerRead = identityRead.then((identity) =>
+      this.memoryOwnerId(userId, sbSlug, session, identity)
+    );
+    const [sbIdentity, ownerId, user, contacts, recentMemories, activeProjects] = await Promise.all(
+      [
+        identityRead,
+        ownerRead,
+        this.getUser(userId),
+        this.getContacts(userId),
+        ownerRead.then((owner) =>
+          owner ? this.getKnowledgeMemories(userId, sbSlug, owner, session) : []
         ),
-      this.getActiveProjects(userId),
-    ]);
+        this.getActiveProjects(userId),
+      ]
+    );
 
     if (!sbIdentity) {
       throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
+
+    // The SB's own values and relationships are as personal as its memories,
+    // so they follow the same owner: getAgentIdentity may fall back to a
+    // same-slug peer for prompt text, and that peer's relationships are not
+    // this session's to read (Lumen, #781).
+    const agent =
+      ownerId === sbIdentity.sbId ? sbIdentity : { ...sbIdentity, values: [], relationships: {} };
 
     if (!user) {
       throw new Error(`User not found: ${userId}`);
@@ -188,7 +199,7 @@ export class ContextBuilder implements IContextBuilder {
     const filteredRecentMemories = recentMemories.filter((m) => !isLowValueRecentMemory(m));
 
     const context: InjectedContext = {
-      agent: sbIdentity,
+      agent,
       user: userContext,
       temporal,
       constitution,

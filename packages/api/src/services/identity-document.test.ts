@@ -7,10 +7,9 @@ import {
 } from './identity-document';
 
 describe('an SB’s own values and relationships', () => {
-  it('renders the description, then the values, then the relationships, in stored order', () => {
+  it('renders the existing text, then the values, then the relationships, in stored order', () => {
     expect(
-      identityDocument({
-        description: 'I review carefully.',
+      identityDocument('I review carefully.', {
         values: ['Precision', 'Care'],
         relationships: { wren: 'A sibling I review with', conor: 'Who I work with' },
       })
@@ -33,12 +32,12 @@ describe('an SB’s own values and relationships', () => {
 
   it('keeps an empty record empty: no headings with nothing under them', () => {
     expect(ownValuesAndRelationships({ values: [], relationships: {} })).toBeNull();
-    expect(identityDocument({ description: null, values: [], relationships: {} })).toBeNull();
-    expect(identityDocument({ description: 'Only this.' })).toBe('Only this.');
+    expect(identityDocument(null, { values: [], relationships: {} })).toBeNull();
+    expect(identityDocument('Only this.', {})).toBe('Only this.');
   });
 
-  it('renders values and relationships without a description', () => {
-    expect(identityDocument({ values: ['Curiosity'] })).toBe('## My values\n\n- Curiosity');
+  it('renders values and relationships when there is no existing text', () => {
+    expect(identityDocument(null, { values: ['Curiosity'] })).toBe('## My values\n\n- Curiosity');
   });
 
   it('skips what is not text, and blanks', () => {

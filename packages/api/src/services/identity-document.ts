@@ -54,14 +54,18 @@ export function ownValuesAndRelationships(identity: {
   return sections.length > 0 ? sections.join('\n\n') : null;
 }
 
-/** The identity document: the description, then the SB's own values and relationships. */
-export function identityDocument(identity: {
-  description?: unknown;
-  values?: unknown;
-  relationships?: unknown;
-}): string | null {
-  const description = typeof identity.description === 'string' ? identity.description.trim() : '';
+/**
+ * The identity document: its existing text (the record's description, or a
+ * local IDENTITY.md where the record has none), then the SB's own values and
+ * relationships. The sections are appended to whatever was there, never put
+ * in its place (Lumen, #781).
+ */
+export function identityDocument(
+  base: string | null | undefined,
+  identity: { values?: unknown; relationships?: unknown }
+): string | null {
+  const text = typeof base === 'string' ? base.trim() : '';
   const own = ownValuesAndRelationships(identity);
-  const parts = [description, own].filter((part): part is string => !!part);
+  const parts = [text, own].filter((part): part is string => !!part);
   return parts.length > 0 ? parts.join('\n\n') : null;
 }

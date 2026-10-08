@@ -227,6 +227,20 @@ describe('bootstrap shared documents', () => {
     expect(identityFiles.values).toBe('SPACE-VALUES');
   });
 
+  it('appends own values to a local IDENTITY.md when the record has no description, never replacing it', async () => {
+    const sb = db.rows('agent_identities').find((row) => row.id === SB)!;
+    sb.description = null;
+    sb.values = ['OWN-VALUE'];
+    await mkdir(join(base, 'individuals', 'probe'), { recursive: true });
+    await writeFile(join(base, 'individuals', 'probe', 'IDENTITY.md'), 'LOCAL-IDENTITY-TEXT');
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+
+    expect((identityFiles as Docs & { self: string | null }).self).toBe(
+      'LOCAL-IDENTITY-TEXT\n\n## My values\n\n- OWN-VALUE'
+    );
+  });
+
   it('withholds the documents of a bound identity that is gone, and puts no same-named peer in its place', async () => {
     db.rows('agent_identities').splice(0);
     db.seed('agent_identities', {
