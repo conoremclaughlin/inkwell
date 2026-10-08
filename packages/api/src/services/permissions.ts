@@ -53,7 +53,9 @@ export class PermissionsService {
   private definitionsCache: Map<PermissionId, PermissionDefinition> | null = null;
 
   constructor() {
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
   }
 
   /**
@@ -127,6 +129,44 @@ export class PermissionsService {
     }
 
     return { userId, permissions, enabled, disabled };
+  }
+
+  /**
+   * Whether a permission is on for a user, for a caller that enforces it.
+   *
+   * getEffectivePermissions reads a failed override query as "no overrides".
+   * That is harmless for a display and wrong for an enforcer, where a
+   * database error would quietly undo an explicit "off". This reads only the
+   * one override and the one definition, and throws when either read fails.
+   * With no live override the definition's default decides, and `fallback`
+   * stands in when there is no definition row: the rows live in the database
+   * alone, and neither the migrations nor the seed create them.
+   */
+  async isEnabled(userId: string, permissionId: PermissionId, fallback: boolean): Promise<boolean> {
+    const override = await this.supabase
+      .from('user_permissions')
+      .select('enabled, expires_at')
+      .eq('user_id', userId)
+      .eq('permission_id', permissionId)
+      .maybeSingle();
+    if (override.error) {
+      throw new Error(`Could not read the ${permissionId} permission: ${override.error.message}`);
+    }
+    const row = override.data;
+    if (row && (row.expires_at === null || new Date(row.expires_at).getTime() > Date.now())) {
+      return row.enabled;
+    }
+    const definition = await this.supabase
+      .from('permission_definitions')
+      .select('default_enabled')
+      .eq('id', permissionId)
+      .maybeSingle();
+    if (definition.error) {
+      throw new Error(
+        `Could not read the ${permissionId} permission's default: ${definition.error.message}`
+      );
+    }
+    return definition.data ? definition.data.default_enabled : fallback;
   }
 
   /**
