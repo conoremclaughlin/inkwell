@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { getDataComposer } from '../../data/composer';
 import { claudeProjectDirName } from './files';
 import { accountGate } from './gate';
-import { advanceDeletion, type DeletionDeps } from './worker';
+import { advanceDeletion, nextSweep, SWEEP_SIZE, type DeletionDeps } from './worker';
 
 const run = randomUUID().slice(0, 8);
 let base: string;
@@ -181,5 +181,30 @@ describe('the deletion worker', () => {
     expect(existsSync(join(outside, 'keep.txt'))).toBe(true);
     const db = await client();
     expect((await db.from('users').select('id').eq('id', oli.userId)).data).toHaveLength(1);
+  });
+});
+
+describe('the sweep against a real database', () => {
+  it('reads past a full instant by (requested_at, user_id), with the filters PostgREST is sent (Lumen, #783 r2)', async () => {
+    const db = await client();
+    // One instant with more requests than a sweep takes, microseconds and
+    // all, after anything another suite left pending.
+    const at = '2100-01-01T00:00:00.123456+00:00';
+    const ids = Array.from({ length: SWEEP_SIZE + 1 }, () => randomUUID());
+    const { error } = await db
+      .from('account_deletion_requests')
+      .insert(ids.map((user_id) => ({ user_id, requested_at: at })));
+    if (error) throw new Error(`requests: ${error.message}`);
+    try {
+      const sweepDeps: DeletionDeps = { ...(await deps()), sweep: { after: null } };
+      const seen = new Set<string>();
+      for (let i = 0; i < 50; i++) {
+        for (const row of await nextSweep(sweepDeps)) seen.add(row.user_id);
+        if (sweepDeps.sweep?.after === null) break;
+      }
+      expect(ids.filter((userId) => !seen.has(userId))).toEqual([]);
+    } finally {
+      await db.from('account_deletion_requests').delete().in('user_id', ids);
+    }
   });
 });
