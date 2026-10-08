@@ -23,6 +23,8 @@ import type { Memory } from '../../data/models/memory.js';
 import { logger } from '../../utils/logger.js';
 import { resolveSbIdResult } from '../../auth/resolve-identity.js';
 import { isUnnamed } from '../identity-name.js';
+import { constitutionWorkspaceId } from '../constitution-workspace.js';
+import { ownValuesAndRelationships } from '../identity-document.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
 const HIGH_MEMORY_LIMIT = 10;
@@ -158,21 +160,32 @@ export class ContextBuilder implements IContextBuilder {
     // Memories are read for the session's canonical owner, which waits on
     // the identity read (remove-shared-memories §3.3).
     const identityRead = this.getAgentIdentity(userId, sbSlug, session.sbId);
-    const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      identityRead,
-      this.getUser(userId),
-      this.getContacts(userId),
-      identityRead
-        .then((identity) => this.memoryOwnerId(userId, sbSlug, session, identity))
-        .then((ownerId) =>
-          ownerId ? this.getKnowledgeMemories(userId, sbSlug, ownerId, session) : []
+    const ownerRead = identityRead.then((identity) =>
+      this.memoryOwnerId(userId, sbSlug, session, identity)
+    );
+    const [sbIdentity, ownerId, user, contacts, recentMemories, activeProjects] = await Promise.all(
+      [
+        identityRead,
+        ownerRead,
+        this.getUser(userId),
+        this.getContacts(userId),
+        ownerRead.then((owner) =>
+          owner ? this.getKnowledgeMemories(userId, sbSlug, owner, session) : []
         ),
-      this.getActiveProjects(userId),
-    ]);
+        this.getActiveProjects(userId),
+      ]
+    );
 
     if (!sbIdentity) {
       throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
+
+    // The SB's own values and relationships are as personal as its memories,
+    // so they follow the same owner: getAgentIdentity may fall back to a
+    // same-slug peer for prompt text, and that peer's relationships are not
+    // this session's to read (Lumen, #781).
+    const agent =
+      ownerId === sbIdentity.sbId ? sbIdentity : { ...sbIdentity, values: [], relationships: {} };
 
     if (!user) {
       throw new Error(`User not found: ${userId}`);
@@ -186,7 +199,7 @@ export class ContextBuilder implements IContextBuilder {
     const filteredRecentMemories = recentMemories.filter((m) => !isLowValueRecentMemory(m));
 
     const context: InjectedContext = {
-      agent: sbIdentity,
+      agent,
       user: userContext,
       temporal,
       constitution,
@@ -473,20 +486,7 @@ export class ContextBuilder implements IContextBuilder {
     agentWorkspaceId?: string
   ): Promise<ConstitutionDocs | undefined> {
     try {
-      let workspaceId = agentWorkspaceId;
-
-      if (!workspaceId) {
-        const { data: personalWorkspace } = await this.supabase
-          .from('workspaces')
-          .select('id')
-          .eq('user_id', userId)
-          .eq('type', 'personal')
-          .is('archived_at', null)
-          .order('created_at', { ascending: true })
-          .limit(1)
-          .maybeSingle();
-        workspaceId = personalWorkspace?.id || undefined;
-      }
+      const workspaceId = await constitutionWorkspaceId(this.supabase, userId, agentWorkspaceId);
 
       const { data: workspace } = workspaceId
         ? await this.supabase
@@ -623,6 +623,11 @@ ${context.agent.description ? `\n${context.agent.description}` : ''}`);
     sections.push(`### Soul
 ${context.agent.soul}`);
   }
+
+  // The SB's own values and relationships (identity-document.ts). A child
+  // that calls bootstrap gets them in bootstrap's identity document.
+  const own = includeBootstrapDerived ? ownValuesAndRelationships(context.agent) : null;
+  if (own) sections.push(own);
 
   // Constitution — the shared docs a session-start hook would otherwise load.
   // Antigravity has no such hook, so without these the agent gets no team
