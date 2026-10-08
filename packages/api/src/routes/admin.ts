@@ -11,6 +11,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
 import { connectorsRouter } from './admin-connectors';
+import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
@@ -1831,6 +1832,9 @@ router.use(adminAuthMiddleware);
 
 // The app's view of its Google connection (routes/admin-connectors.ts).
 router.use('/connectors', connectorsRouter);
+
+// Saved logins, a person's own (routes/admin-vault.ts).
+router.use('/vault', vaultRouter);
 
 /**
  * Where a phone could reach this server, in the order it should try them.
