@@ -31,23 +31,29 @@ import rateLimit from 'express-rate-limit';
  * userId in the body — a token that can address any user is a token that
  * turns one leaked secret into an alerting channel for the whole system.
  */
-function resolveAlertUser(
+async function resolveAlertUser(
   req: Request,
   authProvider: InkAuthProvider
-): { userId: string; via: 'token' | 'bearer' } | null {
+): Promise<{ userId: string; via: 'token' | 'bearer' } | { status: 401 | 503 }> {
   const provided = req.header('x-ink-alert-token');
   if (provided && secretsMatch(provided, env.ALERT_INGEST_TOKEN)) {
     if (!env.ALERT_INGEST_USER_ID) {
       logger.error('ALERT_INGEST_TOKEN is set but ALERT_INGEST_USER_ID is not — refusing ingest');
-      return null;
+      return { status: 401 };
     }
     return { userId: env.ALERT_INGEST_USER_ID, via: 'token' };
   }
 
-  const userData = authProvider.verifyAccessToken(req.headers.authorization);
-  if (userData) return { userId: userData.userId, via: 'bearer' };
+  const verdict = await authProvider.verifyAccessToken(req.headers.authorization);
+  return verdict.ok ? { userId: verdict.token.userId, via: 'bearer' } : { status: verdict.status };
+}
 
-  return null;
+/** The 401, or the 503 when the token's SB couldn't be read. */
+function refuseAlertCaller(res: Response, status: 401 | 503): void {
+  res.status(status).json({
+    success: false,
+    error: status === 503 ? 'Could not check the token; try again' : 'Authentication required',
+  });
 }
 
 /**
@@ -81,7 +87,9 @@ function makeReadThrottle(authProvider: InkAuthProvider) {
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     keyGenerator: (req: Request): string => {
-      const userData = authProvider.verifyAccessToken(req.headers.authorization);
+      // The signature alone, with no read: this only keys the throttle, and
+      // the handler still judges the token (and its SB) itself.
+      const userData = authProvider.verifyAccessTokenSignature(req.headers.authorization);
       // Unauthenticated callers are charged by address alone. The handler
       // still does its own 401; this only decides whether to keep reading.
       const ip = req.ip ?? 'unknown';
@@ -100,9 +108,9 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
   const dispatch = new AlertDispatchService(dataComposer);
 
   router.post('/', async (req: Request, res: Response) => {
-    const actor = resolveAlertUser(req, authProvider);
-    if (!actor) {
-      res.status(401).json({ success: false, error: 'Authentication required' });
+    const actor = await resolveAlertUser(req, authProvider);
+    if ('status' in actor) {
+      refuseAlertCaller(res, actor.status);
       return;
     }
 
@@ -135,9 +143,9 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
   });
 
   router.post('/checkin', async (req: Request, res: Response) => {
-    const actor = resolveAlertUser(req, authProvider);
-    if (!actor) {
-      res.status(401).json({ success: false, error: 'Authentication required' });
+    const actor = await resolveAlertUser(req, authProvider);
+    if ('status' in actor) {
+      refuseAlertCaller(res, actor.status);
       return;
     }
 
@@ -173,11 +181,12 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
   });
 
   router.get('/', throttleReads, async (req: Request, res: Response) => {
-    const userData = authProvider.verifyAccessToken(req.headers.authorization);
-    if (!userData) {
-      res.status(401).json({ success: false, error: 'Authentication required' });
+    const verdict = await authProvider.verifyAccessToken(req.headers.authorization);
+    if (!verdict.ok) {
+      refuseAlertCaller(res, verdict.status);
       return;
     }
+    const userData = verdict.token;
 
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const openOnly = req.query.open === 'true';
@@ -202,11 +211,12 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
   });
 
   router.get('/sources', throttleReads, async (req: Request, res: Response) => {
-    const userData = authProvider.verifyAccessToken(req.headers.authorization);
-    if (!userData) {
-      res.status(401).json({ success: false, error: 'Authentication required' });
+    const verdict = await authProvider.verifyAccessToken(req.headers.authorization);
+    if (!verdict.ok) {
+      refuseAlertCaller(res, verdict.status);
       return;
     }
+    const userData = verdict.token;
 
     const { data, error } = await dataComposer
       .getClient()

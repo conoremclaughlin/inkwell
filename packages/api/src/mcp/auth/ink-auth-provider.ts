@@ -22,6 +22,30 @@ import {
 } from '../../auth/ink-tokens';
 import { resolveAccountForPrincipal } from '../../services/account-deletion/principal';
 import { accountGate } from '../../services/account-deletion/gate';
+import { tokenIdentityState } from '../../auth/token-identity';
+
+/** A signed, unexpired `mcp_access` token's claims. */
+export interface VerifiedAccessToken {
+  userId: string;
+  email: string;
+  sbSlug?: string;
+  sbId?: string;
+  /** Signed runner binding — authenticated, unlike the x-ink-context header. */
+  sessionId?: string;
+  contactId?: string;
+  /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
+  expiresAt?: number;
+}
+
+/**
+ * A request's bearer token, judged:
+ * - `ok`: signed, unexpired, and any SB it names still exists;
+ * - 401: missing, invalid or expired, or naming an SB with no identity row;
+ * - 503: the SB it names couldn't be read, so the request can't be judged.
+ */
+export type AccessTokenVerdict =
+  | { ok: true; token: VerifiedAccessToken }
+  | { ok: false; status: 401 | 503 };
 
 /**
  * Carry an SB binding across the rename on a pending-auth JWT.
@@ -390,17 +414,30 @@ export class InkAuthProvider {
   // Token verification (for /mcp endpoint auth)
   // --------------------------------------------------------------------------
 
-  verifyAccessToken(authHeader: string | undefined): {
-    userId: string;
-    email: string;
-    sbSlug?: string;
-    sbId?: string;
-    /** Signed runner binding — authenticated, unlike the x-ink-context header. */
-    sessionId?: string;
-    contactId?: string;
-    /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
-    expiresAt?: number;
-  } | null {
+  /**
+   * Every server path that takes an `mcp_access` token checks it here: the
+   * signature and expiry, and then that the SB it names still exists. A
+   * deleted space takes its SBs' identity rows with it, and its tokens are
+   * refused from their next request (token-identity.ts, task 3f7f6a8f).
+   */
+  async verifyAccessToken(authHeader: string | undefined): Promise<AccessTokenVerdict> {
+    const token = this.verifyAccessTokenSignature(authHeader);
+    if (!token) return { ok: false, status: 401 };
+    const state = await tokenIdentityState(this.supabase, {
+      userId: token.userId,
+      sbId: token.sbId,
+      sbSlug: token.sbSlug,
+    });
+    if (state === 'gone') return { ok: false, status: 401 };
+    if (state === 'unreadable') return { ok: false, status: 503 };
+    return { ok: true, token };
+  }
+
+  /**
+   * The signature and expiry alone, with no database read. A request is
+   * never authorised on this: use verifyAccessToken.
+   */
+  verifyAccessTokenSignature(authHeader: string | undefined): VerifiedAccessToken | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
