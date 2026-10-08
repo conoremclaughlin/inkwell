@@ -364,7 +364,10 @@ const topicsSchema = z
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
-import { constitutionWorkspaceId } from '../../services/constitution-workspace';
+import {
+  constitutionWorkspaceId,
+  workspaceSharedDocs,
+} from '../../services/constitution-workspace';
 import { identityDocument } from '../../services/identity-document';
 import { presenceRefused } from '../../services/inklings/poll-gate';
 import {
@@ -3106,14 +3109,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
           (dbIdentity?.workspace_id as string | null | undefined) ?? null
         ));
 
-  const { data: dbWorkspaceSharedDocs } = resolvedWorkspaceId
-    ? await supabase
-        .from('workspaces')
-        .select('shared_values, process')
-        .eq('id', resolvedWorkspaceId)
-        .eq('user_id', user.id)
-        .maybeSingle()
-    : { data: null };
+  // Read for any member of the workspace, not only its owner.
+  const dbWorkspaceSharedDocs = resolvedWorkspaceId
+    ? await workspaceSharedDocs(supabase, resolvedWorkspaceId, user.id)
+    : null;
 
   // Shared documents come from the resolved workspace and nowhere else:
   // neither an unscoped user_identity row nor a ~/.ink copy fills a workspace

@@ -194,6 +194,7 @@ describe('ContextBuilder.buildContext — constitution', () => {
       contacts: [],
       memories: [],
       projects: [],
+      workspace_members: [{ workspace_id: 'ws-1', user_id: USER_ID, role: 'owner' }],
       workspaces: [
         {
           id: 'ws-1',
@@ -552,6 +553,10 @@ describe('ContextBuilder.buildContext — workspace scoping', () => {
       contacts: [],
       memories: [],
       projects: [],
+      workspace_members: [
+        { workspace_id: 'ws-personal', user_id: USER_ID, role: 'owner' },
+        { workspace_id: 'ws-team', user_id: USER_ID, role: 'owner' },
+      ],
       workspaces: [
         {
           id: 'ws-personal',
@@ -667,5 +672,77 @@ describe("ContextBuilder.buildContext — an SB's own values follow its canonica
     const out = await prompt(undefined);
     expect(out).not.toContain('PEER-VALUE');
     expect(out).not.toContain('PEER-PRIVATE-RELATIONSHIP');
+  });
+});
+
+describe("ContextBuilder.buildContext — a group's values reach every member's SB", () => {
+  const OWNER_ID = '99999999-9999-4999-8999-999999999999';
+
+  /** A group owned by someone else, holding this person's SB. */
+  async function constitutionFor(memberRows: Row[]) {
+    const supabase = makeFakeSupabase({
+      agent_identities: [
+        {
+          id: 'sb-in-group',
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          values: [],
+          capabilities: [],
+          relationships: {},
+          workspace_id: 'ws-group',
+          updated_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+      users: [{ id: USER_ID, timezone: 'UTC', preferences: {} }],
+      contacts: [],
+      memories: [],
+      projects: [],
+      workspace_members: memberRows,
+      workspaces: [
+        {
+          id: 'ws-group',
+          user_id: OWNER_ID,
+          type: 'team',
+          archived_at: null,
+          shared_values: 'GROUP-VALUES',
+          process: null,
+          created_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+      user_identity: [
+        {
+          user_id: USER_ID,
+          workspace_id: 'ws-group',
+          user_profile_md: 'MEMBER-OWN-PAGE',
+          shared_values_md: null,
+          process_md: null,
+          updated_at: '2026-10-01T00:00:00Z',
+        },
+      ],
+    });
+    const ctx = await new ContextBuilder(supabase).buildContext(
+      USER_ID,
+      'aster',
+      makeSession({ sbId: 'sb-in-group' })
+    );
+    return ctx.constitution;
+  }
+
+  it('gives a member who is not the owner the group’s values and their own page', async () => {
+    const constitution = await constitutionFor([
+      { workspace_id: 'ws-group', user_id: OWNER_ID, role: 'owner' },
+      { workspace_id: 'ws-group', user_id: USER_ID, role: 'member' },
+    ]);
+    expect(constitution?.values).toBe('GROUP-VALUES');
+    expect(constitution?.user).toBe('MEMBER-OWN-PAGE');
+  });
+
+  it('gives a person who is not in the group none of its values', async () => {
+    const constitution = await constitutionFor([
+      { workspace_id: 'ws-group', user_id: OWNER_ID, role: 'owner' },
+    ]);
+    expect(constitution?.values).toBeUndefined();
   });
 });

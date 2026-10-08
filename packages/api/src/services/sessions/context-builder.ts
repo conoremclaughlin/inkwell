@@ -23,7 +23,7 @@ import type { Memory } from '../../data/models/memory.js';
 import { logger } from '../../utils/logger.js';
 import { resolveSbIdResult } from '../../auth/resolve-identity.js';
 import { isUnnamed } from '../identity-name.js';
-import { constitutionWorkspaceId } from '../constitution-workspace.js';
+import { constitutionWorkspaceId, workspaceSharedDocs } from '../constitution-workspace.js';
 import { ownValuesAndRelationships } from '../identity-document.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
@@ -488,14 +488,10 @@ export class ContextBuilder implements IContextBuilder {
     try {
       const workspaceId = await constitutionWorkspaceId(this.supabase, userId, agentWorkspaceId);
 
-      const { data: workspace } = workspaceId
-        ? await this.supabase
-            .from('workspaces')
-            .select('shared_values, process')
-            .eq('id', workspaceId)
-            .eq('user_id', userId)
-            .maybeSingle()
-        : { data: null };
+      // Read for any member of the workspace, not only its owner.
+      const workspace = workspaceId
+        ? await workspaceSharedDocs(this.supabase, workspaceId, userId)
+        : null;
 
       // Scope the legacy row to the same workspace. Reading it unscoped would
       // hand this agent whichever row happened to be updated most recently.

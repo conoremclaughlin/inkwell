@@ -294,6 +294,23 @@ describe('bootstrap shared documents', () => {
     });
   });
 
+  it('gives a member of a space someone else owns that space’s values, and nobody outside it', async () => {
+    const OTHER_OWNER = '66666666-6666-4666-8666-666666666666';
+    const space = db.rows('workspaces').find((row) => row.id === SPACE)!;
+    space.user_id = OTHER_OWNER;
+    const member = db.rows('workspace_members').find((row) => row.workspace_id === SPACE)!;
+    member.role = 'member';
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+    expect(identityFiles.values).toBe('SPACE-VALUES');
+    expect(identityFiles.user).toBe('SPACE-ABOUT');
+
+    // Outside it, bootstrap refuses before any document is read: the caller's
+    // workspace check (resolveCallerWorkspace) already requires membership.
+    db.rows('workspace_members').splice(db.rows('workspace_members').indexOf(member), 1);
+    await expect(bootstrap({ sbId: SB, sbSlug: 'probe' })).rejects.toThrow(/not a member/);
+  });
+
   it("refuses a token bound to one identity when bootstrap names another's slug", async () => {
     await expect(bootstrap({ sbId: SB }, 'someone-else')).rejects.toThrow(
       /Agent identity mismatch/
