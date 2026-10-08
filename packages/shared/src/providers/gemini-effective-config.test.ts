@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { buildGeminiSettings, GeminiAdapter, GEMINI_NO_HOME_REFUSAL } from './gemini.js';
@@ -44,6 +44,27 @@ const check = (overrides: Partial<EffectiveConfigCheck> = {}): EffectiveConfigCh
 });
 
 const adapter = new GeminiAdapter();
+
+describe('buildGeminiSettings launcher compatibility', () => {
+  it('leaves configured alias routing alone when no explicit-session contract was requested', async () => {
+    const alias = {
+      type: 'http',
+      url: 'http://localhost:3001/mcp',
+      headers: { 'X-Ink-Context': 'synthetic-launcher-context', 'X-Team': 'synthetic-team' },
+    };
+    const path = join(cwd, '.mcp.json');
+    const source = JSON.stringify({ mcpServers: { alias } });
+    writeFileSync(path, source);
+    const system = await buildGeminiSettings(join(root, 'tmp'), cwd, 'synthetic-context-token');
+    try {
+      expect(system).not.toBeNull();
+      expect(JSON.parse(readFileSync(system!.path, 'utf8')).mcpServers.alias).toEqual(alias);
+      expect(readFileSync(path, 'utf8')).toBe(source);
+    } finally {
+      await system?.cleanup();
+    }
+  });
+});
 
 describe('GeminiAdapter.checkEffectiveConfig', () => {
   it('admits a spawn with no settings files', async () => {

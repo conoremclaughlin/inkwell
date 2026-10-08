@@ -70,21 +70,34 @@ export async function buildGeminiSettings(
 
   mcpServers = pinIsolatedPlaywright(mcpServers as Record<string, PlaywrightServerShape>).servers;
 
+  // A named-session spawn owns routing even when it names no session or
+  // studio. Strip stale headers on EVERY copied server, not only the
+  // canonical entry: an alias may point at the same Inkwell endpoint. The
+  // system-file check trusts our routing, so sanitation must happen before
+  // we inject it. Only the generated copy changes, never .mcp.json.
+  if (explicitSession) {
+    for (const [key, server] of Object.entries(mcpServers)) {
+      if (!server || typeof server !== 'object' || Array.isArray(server)) continue;
+      const config = server as Record<string, unknown>;
+      const headers = config.headers;
+      if (!headers || typeof headers !== 'object' || Array.isArray(headers)) continue;
+      mcpServers[key] = {
+        ...config,
+        headers: Object.fromEntries(
+          Object.entries(headers).filter(
+            ([name]) =>
+              !['x-ink-session-id', 'x-ink-studio-id', 'x-ink-context'].includes(name.toLowerCase())
+          )
+        ),
+      };
+    }
+  }
+
   // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
   // Only the canonical Inkwell server is a header-injection target.
   const serverKey = 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
   const existingHeaders = { ...((serverConfig.headers || {}) as Record<string, string>) };
-  // A caller that named the session owns the routing: a session or studio
-  // header the project config carries would otherwise survive whenever the
-  // caller named none (BackendConfig.explicitSession).
-  if (explicitSession) {
-    for (const name of Object.keys(existingHeaders)) {
-      if (['x-ink-session-id', 'x-ink-studio-id', 'x-ink-context'].includes(name.toLowerCase())) {
-        delete existingHeaders[name];
-      }
-    }
-  }
   mcpServers[serverKey] = {
     ...serverConfig,
     type: serverConfig.type || 'http',

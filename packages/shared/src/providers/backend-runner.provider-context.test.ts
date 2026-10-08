@@ -240,6 +240,31 @@ describe('a provider spawned with no session or studio named', () => {
               'x-ink-context': 'stale-configured-context',
             },
           },
+          // The same Inkwell server under another name, and an unrelated
+          // server: neither may retain another session's routing.
+          'inkwell-alias': {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+            headers: {
+              'X-Ink-Session-Id': 'stale-configured-alias',
+              'X-Ink-Studio-Id': 'stale-configured-studio',
+              'X-Ink-Context': 'stale-configured-context',
+              'X-Team': 'synthetic-team',
+            },
+          },
+          other: {
+            type: 'http',
+            url: 'https://mcp.example.com/',
+            headers: {
+              'x-ink-context': 'stale-configured-foreign',
+              Authorization: 'Bearer synthetic-other-token',
+            },
+          },
+          'routing-only': {
+            type: 'http',
+            url: 'https://mcp.example.com/only',
+            headers: { 'x-ink-session-id': 'stale-configured-only' },
+          },
         },
       })
     );
@@ -289,6 +314,44 @@ describe('a provider spawned with no session or studio named', () => {
     expect(headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
     expect(headers['x-ink-studio-id']).toBe('${INK_STUDIO_ID}');
     expect(JSON.stringify(spawned[0])).not.toContain('stale-configured');
+  });
+
+  it('codex: unnamed routing stays absent rather than coming from the host', async () => {
+    expect(await runBackendTurn(unnamed('codex'))).toMatchObject({ success: true });
+    expect(spawned).toHaveLength(1);
+    const child = spawned[0]!;
+    expect(child.env).not.toHaveProperty('INK_SESSION_ID');
+    expect(child.env).not.toHaveProperty('INK_STUDIO_ID');
+    expect(decodeContextToken(child.env.INK_CONTEXT)).toMatchObject({
+      sessionId: '',
+      studioId: '',
+      cliAttached: false,
+    });
+    expect(child.args).not.toContain('mcp_servers.inkwell.http_headers={}');
+    expect(JSON.stringify(child)).not.toContain('host-own');
+    expect(JSON.stringify(child)).not.toContain('routing-in-session-env');
+  });
+
+  it('gemini: only the canonical entry gets the named routing; other headers and source stay intact', async () => {
+    writeStaleProjectConfig();
+    const sourcePath = join(studio, '.mcp.json');
+    const source = readFileSync(sourcePath, 'utf8');
+    expect(await runBackendTurn(hosted('gemini'))).toMatchObject({ success: true });
+    expect(spawned).toHaveLength(1);
+    const child = spawned[0]!;
+    const servers = JSON.parse(child.geminiSettings!).mcpServers;
+    expect(servers.inkwell.headers['x-ink-session-id']).toBe('sess-hosted');
+    expect(servers.inkwell.headers['x-ink-studio-id']).toBe('studio-hosted');
+    expect(decodeContextToken(servers.inkwell.headers['x-ink-context'])).toMatchObject({
+      sessionId: 'sess-hosted',
+      studioId: 'studio-hosted',
+      cliAttached: false,
+    });
+    expect(servers['inkwell-alias'].headers).toEqual({ 'X-Team': 'synthetic-team' });
+    expect(servers.other.headers).toEqual({ Authorization: 'Bearer synthetic-other-token' });
+    expect(servers['routing-only'].headers ?? {}).toEqual({});
+    expect(JSON.stringify(child)).not.toContain('stale-configured');
+    expect(readFileSync(sourcePath, 'utf8')).toBe(source);
   });
 
   it('gemini: its settings carry no session or studio the caller did not name', async () => {
