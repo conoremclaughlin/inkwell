@@ -24,6 +24,7 @@ import { logger } from '../../utils/logger.js';
 import { resolveSbIdResult } from '../../auth/resolve-identity.js';
 import { isUnnamed } from '../identity-name.js';
 import { constitutionWorkspaceId } from '../constitution-workspace.js';
+import { ownValuesAndRelationships } from '../identity-document.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
 const HIGH_MEMORY_LIMIT = 10;
@@ -611,6 +612,11 @@ ${context.agent.description ? `\n${context.agent.description}` : ''}`);
     sections.push(`### Soul
 ${context.agent.soul}`);
   }
+
+  // The SB's own values and relationships (identity-document.ts). A child
+  // that calls bootstrap gets them in bootstrap's identity document.
+  const own = includeBootstrapDerived ? ownValuesAndRelationships(context.agent) : null;
+  if (own) sections.push(own);
 
   // Constitution — the shared docs a session-start hook would otherwise load.
   // Antigravity has no such hook, so without these the agent gets no team

@@ -365,6 +365,7 @@ import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
 import { constitutionWorkspaceId } from '../../services/constitution-workspace';
+import { identityDocument } from '../../services/identity-document';
 import { presenceRefused } from '../../services/inklings/poll-gate';
 import {
   actorOwnerSbId,
@@ -3155,7 +3156,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         // USER.md lives in the database. Without this the doc describing the
         // human never reached any session.
         user: (dbUserIdentity?.user_profile_md as string | null) || null,
-        self: (dbIdentity?.description as string | null) || identityFiles.self,
+        // The description, then the SB's own values and relationships.
+        self: (dbIdentity ? identityDocument(dbIdentity) : null) || identityFiles.self,
         heartbeat: (dbIdentity?.heartbeat as string | null) || identityFiles.heartbeat,
         soul: (dbIdentity?.soul as string | null) || identityFiles.soul,
       }

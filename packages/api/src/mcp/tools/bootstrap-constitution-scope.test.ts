@@ -212,6 +212,21 @@ describe('bootstrap shared documents', () => {
     expect(identityFiles.user).toBeNull();
   });
 
+  it('carries the SB’s own values and relationships in its identity document, not the shared values', async () => {
+    const sb = db.rows('agent_identities').find((row) => row.id === SB)!;
+    sb.description = 'PROBE-DESCRIPTION';
+    sb.values = ['OWN-VALUE'];
+    sb.relationships = { wren: 'OWN-RELATIONSHIP' };
+
+    const { identityFiles } = await bootstrap({ sbId: SB, sbSlug: 'probe' });
+    const self = (identityFiles as Docs & { self: string | null }).self;
+
+    expect(self).toBe(
+      'PROBE-DESCRIPTION\n\n## My values\n\n- OWN-VALUE\n\n## My relationships\n\n- **wren:** OWN-RELATIONSHIP'
+    );
+    expect(identityFiles.values).toBe('SPACE-VALUES');
+  });
+
   it("refuses a token bound to one identity when bootstrap names another's slug", async () => {
     await expect(bootstrap({ sbId: SB }, 'someone-else')).rejects.toThrow(
       /Agent identity mismatch/

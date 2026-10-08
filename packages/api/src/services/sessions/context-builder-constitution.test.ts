@@ -144,6 +144,28 @@ describe('formatInjectedContext — constitution', () => {
     expect(out).not.toContain('## Values');
     expect(out).not.toContain('## Process');
     expect(out).not.toContain('## About Your Human');
+    expect(out).not.toContain('## My values');
+    expect(out).not.toContain('## My relationships');
+  });
+
+  it("renders the SB's own values and relationships, once, and leaves them to bootstrap when it is called", () => {
+    const ctx = baseContext({
+      agent: {
+        ...baseContext().agent,
+        values: ['OWN-VALUE'],
+        relationships: { wren: 'OWN-RELATIONSHIP' },
+      },
+      constitution: { values: 'SHARED-VALUES' },
+    });
+
+    const out = formatInjectedContext(ctx);
+    expect(out).toContain('## My values\n\n- OWN-VALUE');
+    expect(out).toContain('## My relationships\n\n- **wren:** OWN-RELATIONSHIP');
+    expect(out.match(/OWN-VALUE/g)).toHaveLength(1);
+
+    const selfHydrating = formatInjectedContext(ctx, { childCallsBootstrap: true });
+    expect(selfHydrating).not.toContain('OWN-VALUE');
+    expect(selfHydrating).not.toContain('OWN-RELATIONSHIP');
   });
 });
 
