@@ -85,6 +85,7 @@ import {
 import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 import { SEND_LINKS_MAX, resolveSendLinks, writeSendLinks } from './thread-link-handlers.js';
 import { linkReaderForPrincipal } from './thread-link-views.js';
+import { pollReaderRefusal } from '../../services/inklings/poll-gate.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1879,7 +1880,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       // different user must read as not-found, never as a scope source.
       const { data: sessionRow, error: sessionErr } = await supabase
         .from('sessions')
-        .select('id, agent_id')
+        .select('id, agent_id, sb_id')
         .eq('id', callerSessionId)
         .eq('user_id', resolved.user.id)
         .maybeSingle();
@@ -1897,7 +1898,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       } else if (sbSlug && sbSlug !== sessionSlug) {
         failClosedReason = `sbSlug '${sbSlug}' does not match session agent '${sessionSlug}'`;
       } else {
-        sbSlug = sessionSlug;
+        // An inkling's mail is never delivered to a polling client: its turns
+        // run on the spawn path, where its owner test and profile live. Read
+        // from the session's canonical identity; one that cannot be read, or
+        // a session with none, fails closed like every other scope here.
+        const pollRefusal = await pollReaderRefusal(supabase, sessionRow.sb_id);
+        if (pollRefusal) failClosedReason = pollRefusal;
+        else sbSlug = sessionSlug;
       }
     }
     if (failClosedReason) {

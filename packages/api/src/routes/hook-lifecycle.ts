@@ -17,6 +17,7 @@ import { StudioLeaseService } from '../services/studio-lease.service';
 import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
 import { workspaceOfSb } from '../services/principals';
+import { presenceRefused } from '../services/inklings/poll-gate';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
 
@@ -178,7 +179,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         lifecycle?: string;
         workingDir?: string;
         cliAttached?: boolean;
-        cliPollAt?: string;
+        cliPollAt?: string | null;
         cliTurnAt?: string | null;
         cliTurnStoppedAt?: string | null;
         alias?: string | null;
@@ -187,6 +188,16 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (workingDir) updates.workingDir = workingDir;
       if (cliAttached !== undefined) updates.cliAttached = cliAttached;
       if (cliPollAt) updates.cliPollAt = cliPollAt;
+      // An inkling's session is never marked attached or polling, so no client
+      // looks live to the trigger handler (poll-gate.ts). A refused stamp
+      // clears both flags rather than leaving an earlier one standing.
+      if (
+        (updates.cliAttached === true || updates.cliPollAt !== undefined) &&
+        (await presenceRefused(dataComposer.getClient(), session.sbId))
+      ) {
+        updates.cliAttached = false;
+        updates.cliPollAt = null;
+      }
       const sessionKeyInput = sessionKey !== undefined ? sessionKey : alias;
       if (sessionKeyInput !== undefined) {
         const normalised = normaliseSessionKey(sessionKeyInput);

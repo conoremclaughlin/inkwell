@@ -1839,7 +1839,7 @@ export class MemoryRepository {
       headlineUpdatedAt?: Date;
       workingDir?: string;
       cliAttached?: boolean;
-      cliPollAt?: string;
+      cliPollAt?: string | null;
       cliTurnAt?: string | null;
       cliTurnStoppedAt?: string | null;
       alias?: string | null;

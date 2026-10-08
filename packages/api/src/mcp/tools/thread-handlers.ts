@@ -38,6 +38,7 @@ import { readTieRemainder } from './tie-completion.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 import { threadLinkHeader } from './thread-link-views.js';
+import { pollReaderRefusal } from '../../services/inklings/poll-gate.js';
 import {
   REACTIONS_ARE_NOT_APPROVAL,
   ReactionRefusedError,
@@ -642,6 +643,29 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   // The caller's identity fixes the workspace the thread is looked up in.
   const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
+
+  // A polling client never reads as an inkling, by its canonical identity,
+  // before the thread is looked up or any pointer moves (poll-gate.ts). An
+  // inkling's own turn reads without channelPoll and is unaffected.
+  if (channelPoll) {
+    const pollRefusal = await pollReaderRefusal(supabase, caller.sbId);
+    if (pollRefusal) {
+      logger.warn('channel_poll_unscoped', {
+        sbSlug,
+        threadKey,
+        hint: `channelPoll refused (${pollRefusal}) — returning empty (fail-closed)`,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({ success: true, threadKey, messages: [], refused: pollRefusal }),
+          },
+        ],
+      };
+    }
+  }
+
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
