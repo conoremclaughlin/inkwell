@@ -36,7 +36,7 @@ const RANGE_PHRASES: Record<RefusedRange, string> = {
   unspecified: 'an unspecified address',
   loopback: 'a loopback address',
   private: 'a private-network address',
-  'link-local': 'a link-local address, where cloud metadata services live',
+  'link-local': 'a link-local address (where cloud metadata services live)',
   shared: 'a shared (carrier-grade NAT) address',
   'unique-local': 'a unique-local IPv6 address',
   multicast: 'a multicast address',
