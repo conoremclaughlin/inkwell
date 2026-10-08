@@ -74,8 +74,13 @@ export interface DeletionDeps {
 }
 
 export interface SweepCursor {
-  /** The `requested_at` of the last request the previous sweep took, or null to start at the oldest. */
-  after: string | null;
+  /**
+   * The last request the previous sweep took, by (requested_at, user_id), or
+   * null to start at the oldest. Both: requested_at alone isn't a total order,
+   * and a cursor on it skips the rest of the instant it stopped in (Lumen,
+   * #783 r2: the 21st of 21 same-time requests was never visited).
+   */
+  after: { requestedAt: string; userId: string } | null;
 }
 
 /** How many requests one sweep advances. */
@@ -116,26 +121,54 @@ export async function closeDeletionsInProgress(db: SupabaseClient<Database>): Pr
 }
 
 /**
- * Advance up to SWEEP_SIZE pending requests as far as each goes, in request
- * order from where the last sweep stopped. A sweep that reaches the newest
- * request sends the next one back to the oldest.
+ * The next SWEEP_SIZE pending requests in (requested_at, user_id) order,
+ * after where the last sweep stopped: the rest of the instant it stopped in,
+ * then the instants after it. A sweep that comes back short sends the next
+ * one back to the oldest.
+ */
+export async function nextSweep(deps: DeletionDeps): Promise<Array<{ user_id: string }>> {
+  const pending = () =>
+    deps.db
+      .from('account_deletion_requests')
+      .select('user_id, requested_at')
+      .is('completed_at', null);
+  const after = deps.sweep?.after ?? null;
+  const taken: Array<{ user_id: string; requested_at: string }> = [];
+  if (after) {
+    const { data, error } = await pending()
+      .eq('requested_at', after.requestedAt)
+      .gt('user_id', after.userId)
+      .order('user_id', { ascending: true })
+      .limit(SWEEP_SIZE);
+    if (error) throw new Error(`Could not read deletion requests: ${error.message}`);
+    taken.push(...(data ?? []));
+  }
+  if (taken.length < SWEEP_SIZE) {
+    let later = pending()
+      .order('requested_at', { ascending: true })
+      .order('user_id', { ascending: true })
+      .limit(SWEEP_SIZE - taken.length);
+    if (after) later = later.gt('requested_at', after.requestedAt);
+    const { data, error } = await later;
+    if (error) throw new Error(`Could not read deletion requests: ${error.message}`);
+    taken.push(...(data ?? []));
+  }
+  if (deps.sweep) {
+    const last = taken[taken.length - 1];
+    deps.sweep.after =
+      taken.length === SWEEP_SIZE ? { requestedAt: last.requested_at, userId: last.user_id } : null;
+  }
+  return taken;
+}
+
+/**
+ * Advance up to SWEEP_SIZE pending requests as far as each goes, from where
+ * the last sweep stopped (nextSweep).
  */
 export async function processDeletions(deps: DeletionDeps): Promise<Advance[]> {
-  let query = deps.db
-    .from('account_deletion_requests')
-    .select('user_id, requested_at')
-    .is('completed_at', null)
-    .order('requested_at', { ascending: true })
-    .limit(SWEEP_SIZE);
-  if (deps.sweep?.after) query = query.gt('requested_at', deps.sweep.after);
-  const { data, error } = await query;
-  if (error) throw new Error(`Could not read deletion requests: ${error.message}`);
-  if (deps.sweep) {
-    const rows = data ?? [];
-    deps.sweep.after = rows.length === SWEEP_SIZE ? rows[rows.length - 1].requested_at : null;
-  }
+  const sweep = await nextSweep(deps);
   const results: Advance[] = [];
-  for (const row of data ?? []) {
+  for (const row of sweep) {
     try {
       results.push(await advanceDeletion(deps, row.user_id));
     } catch (err) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ThreadMessage } from '../threads-api/index.js';
-import { nameLookup, toConversationMessage } from './authors.js';
+import { authorOf, creatorLabel, nameLookup, toConversationMessage } from './authors.js';
 
 const names = nameLookup([
   { sbSlug: 'wren', name: 'Wren' },
@@ -99,5 +99,22 @@ describe('toConversationMessage', () => {
       toConversationMessage(message({ priority: 'whenever' }), names).priority
     ).toBeUndefined();
     expect(toConversationMessage(message({ priority: 'urgent' }), names).priority).toBe('urgent');
+  });
+});
+
+describe('a message whose author deleted their account (ink://specs/account-deletion, Q-A)', () => {
+  // Nothing about a deleted author can be looked up; asking is a bug.
+  const noLookup = () => {
+    throw new Error('a deleted author has no identity to name');
+  };
+
+  it('reads "Deleted account", never the kind as a slug (Lumen, #783)', () => {
+    expect(
+      authorOf(message({ senderKind: 'deleted_account', senderSlug: 'deleted_account' }), noLookup)
+    ).toEqual({ kind: 'user', id: 'deleted_account', name: 'Deleted account', isOwn: false });
+  });
+
+  it('names a thread a deleted account started without looking anyone up', () => {
+    expect(creatorLabel('deleted_account', noLookup)).toBe('a deleted account');
   });
 });
