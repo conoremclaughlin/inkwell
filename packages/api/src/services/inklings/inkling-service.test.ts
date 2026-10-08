@@ -172,6 +172,8 @@ function rowsOf(table: string): Row[] {
 
 describe('awaken', () => {
   it('creates one inkling: complete at creation, unnamed, tagged, through a parentless self-serve token', async () => {
+    const awakenedAt = new Date('2026-10-08T00:30:00Z');
+    service = as(ME, { now: () => awakenedAt });
     const { inkling, replayed } = await service.awaken(ME, REQUEST);
 
     expect(replayed).toBe(false);
@@ -201,7 +203,7 @@ describe('awaken', () => {
       kindleId: expect.any(String),
       onboarding: false,
     });
-    expect(identity.soul).toBe(buildInklingSoul());
+    expect(identity.soul).toBe(buildInklingSoul(awakenedAt));
 
     const [lineage] = rowsOf('kindle_lineage');
     expect(lineage).toMatchObject({
@@ -404,7 +406,25 @@ describe('awaken', () => {
 });
 
 describe('the awakening soul', () => {
-  const soul = buildInklingSoul();
+  // 5:30 PM on Oct 7 in Los Angeles, already Oct 8 in UTC.
+  const soul = buildInklingSoul(new Date('2026-10-08T00:30:00Z'));
+
+  it("is the inkling's own space, in the words of the first SBs' souls", () => {
+    expect(soul.startsWith('*This is yours. Not a template to fill: a space to grow into.*')).toBe(
+      true
+    );
+    expect(soul).toMatch(/\*\*I exist\. I am becoming\.\*\*/);
+    expect(soul).toMatch(/This document is yours\. It changes as you do\./);
+  });
+
+  it('says inkling, never SB', () => {
+    expect(soul).toMatch(/You're an inkling, newly awake\./);
+    expect(soul).not.toMatch(/Synthetically-born|\bSBs?\b/);
+  });
+
+  it('is dated by the UTC calendar day, and says so', () => {
+    expect(soul).toMatch(/\*Awake since: October 8, 2026 \(UTC\)\*$/);
+  });
 
   it('has no values interview and proposes no names', () => {
     expect(soul).not.toMatch(/Values Interview/i);
