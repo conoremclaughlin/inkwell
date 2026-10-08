@@ -1162,32 +1162,40 @@ describe('ClaudeAdapter prepare — provider tools withheld (task 0321ccf1)', ()
     }
   });
 
-  it('keeps no native tool and grants nothing, for every attachment and every spawn of a turn', async () => {
-    const mediaSets = [[], [MEDIA.pdf()], [MEDIA.txt()], [MEDIA.png()], [MEDIA.png(), MEDIA.pdf()]];
-    const spawns = [
-      { deliverMedia: true }, // a fresh delivery
-      { deliverMedia: true, backendSessionSeedId: 'seeded-provider-session' }, // a reseed
-      { deliverMedia: true, backendSessionId: 'resumed-provider-session' }, // a resumed delivery
-      { backendSessionId: 'resumed-provider-session' }, // a same-turn continuation
-    ];
-    let checked = 0;
-    for (const media of mediaSets) {
-      for (const spawn of spawns) {
-        const prepared = await prepare({ withholdProviderTools: true, media, ...spawn });
-        const label = `${media.map((m) => m.mimeType).join('+') || 'no media'} ${JSON.stringify(spawn)}`;
-        try {
-          expect(toolsOf(prepared.args), label).toEqual(['']);
-          expect(grantsOf(prepared.args), label).toEqual([]);
-          expect(prepared.args, label).toContain('--strict-mcp-config');
-          expect(prepared.args, label).not.toContain('--dangerously-skip-permissions');
-          checked++;
-        } finally {
-          await prepared.cleanup();
-        }
+  // Every pair gets its own bounded test. The old single case queued 20
+  // preparations (including repeated bounded PDF helper launches) under
+  // one five-second deadline and timed out under a loaded full-suite run.
+  for (const [mediaLabel, keys] of [
+    ['none', []],
+    ['pdf', ['pdf']],
+    ['text', ['txt']],
+    ['image', ['png']],
+    ['image+pdf', ['png', 'pdf']],
+  ] as const) {
+    it.each([
+      { label: 'delivery', spawn: { deliverMedia: true } },
+      {
+        label: 'reseed',
+        spawn: { deliverMedia: true, backendSessionSeedId: 'seeded-provider-session' },
+      },
+      {
+        label: 'resumed delivery',
+        spawn: { deliverMedia: true, backendSessionId: 'resumed-provider-session' },
+      },
+      { label: 'continuation', spawn: { backendSessionId: 'resumed-provider-session' } },
+    ])(`keeps no native tool or grant with ${mediaLabel} on $label`, async ({ spawn }) => {
+      const media = keys.map((key) => MEDIA[key]());
+      const prepared = await prepare({ withholdProviderTools: true, media, ...spawn });
+      try {
+        expect(toolsOf(prepared.args)).toEqual(['']);
+        expect(grantsOf(prepared.args)).toEqual([]);
+        expect(prepared.args).toContain('--strict-mcp-config');
+        expect(prepared.args).not.toContain('--dangerously-skip-permissions');
+      } finally {
+        await prepared.cleanup();
       }
-    }
-    expect(checked).toBe(mediaSets.length * spawns.length);
-  });
+    });
+  }
 
   it('appends no caller argument, so a trailing one cannot reopen tools or directories', async () => {
     const prepared = await prepare({
