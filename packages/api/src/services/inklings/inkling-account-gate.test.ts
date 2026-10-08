@@ -608,13 +608,13 @@ describe('a Google tool from an inkling turn, end to end', () => {
     });
     const verifier = Object.create(InkAuthProvider.prototype) as InkAuthProvider;
     const server = registered();
-    const verified = verifier.verifyAccessToken(`Bearer ${token}`)!;
+    const verified = verifier.verifyAccessTokenSignature(`Bearer ${token}`)!;
     expect(verified).toMatchObject({ userId: OWNER, sbId: INKLING, sbSlug: 'pip' });
 
     // A deleted space takes its identities with it (ON DELETE CASCADE); the
     // owner's account, and the token already issued, remain.
     fake.tables.agent_identities = fake.tables.agent_identities.filter((row) => row.id !== INKLING);
-    const stillVerified = verifier.verifyAccessToken(`Bearer ${token}`)!;
+    const stillVerified = verifier.verifyAccessTokenSignature(`Bearer ${token}`)!;
     expect(stillVerified).toMatchObject({ userId: OWNER, sbId: INKLING });
     const scope = await resolveWorkspaceContextForRequest({
       requestedWorkspaceId: OTHER_WORKSPACE,

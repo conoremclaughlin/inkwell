@@ -87,7 +87,12 @@ vi.mock('../mini-apps', () => ({
 
 vi.mock('./auth/ink-auth-provider', () => {
   class MockInkAuthProvider {
-    verifyAccessToken = mockVerifyAccessToken;
+    // The mock answers with the token's claims or null, as the provider's
+    // signature check does; this wraps it in the verdict the routes read.
+    verifyAccessToken = async (header?: string) => {
+      const token = await mockVerifyAccessToken(header);
+      return token ? { ok: true, token } : { ok: false, status: 401 };
+    };
     createPendingAuth = vi.fn(() => 'pending-id');
     handleAuthCallback = vi.fn(async () => ({ error: 'invalid_request' }));
     exchangeAuthorizationCode = vi.fn(async () => ({ error: 'invalid_grant' }));

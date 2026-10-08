@@ -702,7 +702,7 @@ describe('InkAuthProvider', () => {
   // verifyAccessToken
   // =========================================================================
 
-  describe('verifyAccessToken', () => {
+  describe('verifyAccessTokenSignature', () => {
     it('should return user info for valid self-signed JWT', () => {
       const token = jwt.sign(
         { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
@@ -710,7 +710,7 @@ describe('InkAuthProvider', () => {
         { expiresIn: '30d' }
       );
 
-      const result = provider.verifyAccessToken(`Bearer ${token}`);
+      const result = provider.verifyAccessTokenSignature(`Bearer ${token}`);
       expect(result).toEqual({
         userId: 'user-123',
         email: 'test@example.com',
@@ -719,12 +719,12 @@ describe('InkAuthProvider', () => {
     });
 
     it('should return null for missing auth header', () => {
-      const result = provider.verifyAccessToken(undefined);
+      const result = provider.verifyAccessTokenSignature(undefined);
       expect(result).toBeNull();
     });
 
     it('should return null for non-Bearer auth header', () => {
-      const result = provider.verifyAccessToken('Basic abc123');
+      const result = provider.verifyAccessTokenSignature('Basic abc123');
       expect(result).toBeNull();
     });
 
@@ -735,7 +735,7 @@ describe('InkAuthProvider', () => {
         { expiresIn: 0 }
       );
 
-      const result = provider.verifyAccessToken(`Bearer ${token}`);
+      const result = provider.verifyAccessTokenSignature(`Bearer ${token}`);
       expect(result).toBeNull();
     });
 
@@ -744,7 +744,7 @@ describe('InkAuthProvider', () => {
         expiresIn: '1h',
       });
 
-      const result = provider.verifyAccessToken(`Bearer ${token}`);
+      const result = provider.verifyAccessTokenSignature(`Bearer ${token}`);
       expect(result).toBeNull();
     });
 
@@ -755,7 +755,7 @@ describe('InkAuthProvider', () => {
         { expiresIn: '30d' }
       );
 
-      const result = provider.verifyAccessToken(`Bearer ${token}`);
+      const result = provider.verifyAccessTokenSignature(`Bearer ${token}`);
       expect(result).toBeNull();
     });
 
@@ -766,7 +766,7 @@ describe('InkAuthProvider', () => {
         { expiresIn: '30d' }
       );
 
-      provider.verifyAccessToken(`Bearer ${token}`);
+      provider.verifyAccessTokenSignature(`Bearer ${token}`);
       expect(mockGetUser).not.toHaveBeenCalled();
     });
   });
@@ -842,7 +842,7 @@ describe('InkAuthProvider', () => {
       expect(refreshResult.refresh_token).toBe(tokens.refresh_token);
 
       // Step 5: Verify the access token
-      const verified = provider.verifyAccessToken(`Bearer ${refreshResult.access_token}`);
+      const verified = provider.verifyAccessTokenSignature(`Bearer ${refreshResult.access_token}`);
       expect(verified).toEqual({
         userId: 'user-123',
         email: 'test@example.com',

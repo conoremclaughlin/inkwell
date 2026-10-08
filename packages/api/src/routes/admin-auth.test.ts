@@ -212,6 +212,8 @@ function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
 /**
  * Every account a token names exists unless a test says otherwise: the users
  * read tiers 1 and 2 make answers with the row for the id it is asked about.
+ * So does every SB a runner token names: the identity read (token-identity.ts)
+ * finds a row.
  */
 function mockAccountsExist() {
   mockSupabaseFrom.mockImplementation((table: string) => {
@@ -228,6 +230,9 @@ function mockAccountsExist() {
     });
     chain.maybeSingle = vi.fn(() => Promise.resolve(row()));
     chain.single = vi.fn(() => Promise.resolve(row()));
+    chain.limit = vi.fn(() =>
+      Promise.resolve({ data: table === 'agent_identities' ? [{ id }] : [], error: null })
+    );
     return chain;
   });
 }
