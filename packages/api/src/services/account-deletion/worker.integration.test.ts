@@ -22,6 +22,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getDataComposer } from '../../data/composer';
+import { savedLoginStore } from '../saved-logins';
 import { claudeProjectDirName } from './files';
 import { accountGate } from './gate';
 import { advanceDeletion, type DeletionDeps } from './worker';
@@ -99,6 +100,26 @@ function plantFiles(sbId: string) {
   return { folder, projects };
 }
 
+/** Vault secrets still tagged for the person, counted in vault.secrets itself. */
+async function vaultSecretsTaggedFor(userId: string): Promise<number> {
+  const url = process.env.INTEGRATION_DB_URL;
+  if (!url) throw new Error('INTEGRATION_DB_URL is required: run through the managed harness');
+  const { Client: Pg } = await import('pg');
+  const asPostgres = new URL(url);
+  asPostgres.username = 'postgres';
+  const pg = new Pg({ connectionString: asPostgres.toString() });
+  await pg.connect();
+  try {
+    const { rows } = await pg.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM vault.secrets WHERE description = $1',
+      [`saved_login:${userId}`]
+    );
+    return rows[0]!.n;
+  } finally {
+    await pg.end();
+  }
+}
+
 async function stepOf(userId: string) {
   const { data } = await (await client())
     .from('account_deletion_requests')
@@ -137,6 +158,54 @@ describe('the deletion worker', () => {
     expect((await db.from('users').select('id').eq('id', lia.userId)).data).toEqual([]);
     expect((await stepOf(lia.userId)).step).toBe('completed');
     expect(accountGate.isClosed(lia.userId)).toBe(false);
+  });
+
+  it('takes the account’s saved logins with it, leaving no Vault secret tagged for them', async () => {
+    const pia = await consumer('pia');
+    const db = await client();
+    const store = savedLoginStore(async () => db, { SAVED_LOGINS_STORE: 'supabase-vault' })!;
+    const item = { name: 'Example Mail', url: 'https://mail.example.test', username: null };
+    const secret = (label: string) => ({
+      password: `FAKE-PW-${run}-${label}`,
+      authenticator: null,
+    });
+    const saved = await store.create(pia.userId, item, secret('first'));
+    // An edit points the login at a new pair; the old pair goes with the edit.
+    await store.replace(pia.userId, saved.id, saved.revision, item, secret('second'));
+    await store.create(pia.userId, { ...item, name: 'Second' }, secret('other'));
+    // A secret whose write never landed: owned, though no login points at it.
+    const { error } = await db.rpc('create_saved_login_secret', {
+      p_owner: pia.userId,
+      p_value: `FAKE-PW-${run}-leftover`,
+    });
+    expect(error).toBeNull();
+    // Someone else's login, which stays.
+    const { data: bystander } = await db
+      .from('users')
+      .insert({ email: `kai-${run}@example.com`, auth_uid: randomUUID() })
+      .select('id')
+      .single();
+    await store.create(bystander!.id, item, secret('kai'));
+    // Two logins' pairs and the leftover; vault-store's own tests pin that the
+    // edit's old pair is gone already.
+    expect(await vaultSecretsTaggedFor(pia.userId)).toBeGreaterThanOrEqual(5);
+
+    try {
+      // No removeSavedLogins in deps: under the saved-login triggers, the
+      // users delete in delete_account is the whole cleanup.
+      expect(await advanceDeletion(await deps(), pia.userId)).toEqual({ step: 'completed' });
+
+      expect(await vaultSecretsTaggedFor(pia.userId)).toBe(0);
+      expect((await db.from('saved_logins').select('id').eq('user_id', pia.userId)).data).toEqual(
+        []
+      );
+      expect(
+        (await db.from('saved_login_secrets').select('secret_id').eq('user_id', pia.userId)).data
+      ).toEqual([]);
+      expect(await vaultSecretsTaggedFor(bystander!.id)).toBe(2);
+    } finally {
+      await db.from('users').delete().eq('id', bystander!.id);
+    }
   });
 
   it('holds an operator account before anything is revoked', async () => {
