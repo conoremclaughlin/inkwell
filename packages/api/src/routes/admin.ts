@@ -157,6 +157,13 @@ import {
   workspaceNameFrom,
   type InvitationRow,
 } from '../services/workspace-invitations';
+import { resolveAccountForPrincipal } from '../services/account-deletion/principal';
+import { leaseAccountForRequest } from '../services/account-deletion/request-lease';
+import { deletionIneligibility } from '../services/account-deletion/eligibility';
+import { nudgeDeletionWorker } from '../services/account-deletion/runtime';
+import { spaceGate } from '../services/account-deletion/gate';
+import { removeSpaceUploads } from '../services/uploads/account';
+import { cancelInklingTurns } from '../services/inklings/inkling-turns';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1171,58 +1178,39 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         return;
       }
 
-      // Look up (or create) Inkwell user by email.
+      // The account bound to this sign-in, created bound when there is none
+      // (ink://specs/account-deletion §7). Never resolved by email alone.
       const normalizedEmail = user.email?.toLowerCase() ?? null;
-      let { data: inkUser } = await supabase
-        .from('users')
-        .select('id, telegram_id, whatsapp_id')
-        .eq('email', normalizedEmail)
-        .single();
-
-      if (!inkUser) {
-        if (!normalizedEmail) {
-          res.status(403).json({ error: 'User email not available for Inkwell provisioning' });
-          return;
+      const resolved = await resolveAccountForPrincipal(supabase, {
+        authUid: user.id,
+        email: normalizedEmail,
+        create: true,
+      });
+      if (!resolved.ok) {
+        if (resolved.status === 500) {
+          logger.error('Failed to resolve the Inkwell user during admin auth', {
+            reason: resolved.reason,
+          });
         }
-
-        const { data: createdUser, error: createUserError } = await supabase
-          .from('users')
-          .insert({ email: normalizedEmail, last_login_at: new Date().toISOString() })
-          .select('id, telegram_id, whatsapp_id')
-          .single();
-
-        if (createUserError) {
-          const { data: racedUser } = await supabase
-            .from('users')
-            .select('id, telegram_id, whatsapp_id')
-            .eq('email', normalizedEmail)
-            .single();
-
-          if (!racedUser) {
-            logger.error('Failed to auto-provision Inkwell user during admin auth', {
-              email: normalizedEmail,
-              error: createUserError.message,
-            });
-            res.status(500).json({ error: 'Failed to provision Inkwell user' });
-            return;
-          }
-
-          inkUser = racedUser;
-        } else {
-          inkUser = createdUser;
-        }
+        res.status(resolved.status).json({ error: resolved.reason });
+        return;
       }
 
       // Update last_login_at — Tier 3 only runs on actual login (Supabase token verification)
       await supabase
         .from('users')
         .update({ last_login_at: new Date().toISOString() })
-        .eq('id', inkUser.id);
+        .eq('id', resolved.userId);
 
-      inkUserId = inkUser.id;
+      inkUserId = resolved.userId;
       userEmail = normalizedEmail || user.email || undefined;
       issueTokenCookies = true;
     }
+
+    // Every tier has its account now. One being deleted takes no new
+    // requests; this one holds its gate until its response has closed
+    // (ink://specs/account-deletion §3).
+    if (!leaseAccountForRequest(res, inkUserId)) return;
 
     // --- Workspace resolution (all tiers, 1 DB query) ---
     const dataComposer = await getDataComposer();
@@ -1505,11 +1493,15 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const inkUser = await findOrProvisionInkUserByEmail(supabase, email);
-    if (!inkUser) {
-      res.status(500).json({ error: 'Failed to provision user' });
+    const inkUser = await findOrProvisionInkUser(supabase, {
+      authUid: signIn.user.id,
+      email,
+    });
+    if (!('id' in inkUser)) {
+      res.status(inkUser.status).json({ error: inkUser.reason });
       return;
     }
+    if (!leaseAccountForRequest(res, inkUser.id)) return;
 
     res.json(await issueMobileTokens(supabase, inkUser.id, email));
   } catch (error) {
@@ -1519,34 +1511,32 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
 });
 
 /**
- * Look up (or provision) the Inkwell user for an email Supabase has just
+ * Look up (or provision) the Inkwell user for a sign-in Supabase has just
  * verified — the middleware's Tier 3 contract, shared by every mobile route
- * that mints credentials so they cannot drift apart.
+ * that mints credentials so they cannot drift apart. The account is the one
+ * bound to the sign-in, never one found by email alone
+ * (ink://specs/account-deletion §7).
  */
-async function findOrProvisionInkUserByEmail(
+async function findOrProvisionInkUser(
   supabase: SupabaseClient<Database>,
-  email: string
-): Promise<{ id: string } | null> {
-  const nowIso = new Date().toISOString();
-  const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
-  if (existing) {
-    await supabase.from('users').update({ last_login_at: nowIso }).eq('id', existing.id);
-    return existing;
+  signIn: { authUid: string; email: string }
+): Promise<{ id: string } | { status: number; reason: string }> {
+  const resolved = await resolveAccountForPrincipal(supabase, {
+    authUid: signIn.authUid,
+    email: signIn.email,
+    create: true,
+  });
+  if (!resolved.ok) {
+    if (resolved.status === 500) {
+      logger.error('Failed to provision Inkwell user for mobile auth', { reason: resolved.reason });
+    }
+    return { status: resolved.status, reason: resolved.reason };
   }
-
-  const { data: created, error: createError } = await supabase
+  await supabase
     .from('users')
-    .insert({ email, last_login_at: nowIso })
-    .select('id')
-    .single();
-  if (!createError && created) return created;
-
-  // Lost an insert race — the row exists now.
-  const { data: raced } = await supabase.from('users').select('id').eq('email', email).single();
-  if (raced) return raced;
-
-  logger.error('Failed to provision Inkwell user for mobile auth', { error: createError?.message });
-  return null;
+    .update({ last_login_at: new Date().toISOString() })
+    .eq('id', resolved.userId);
+  return { id: resolved.userId };
 }
 
 /** The pcp_admin access/refresh pair every mobile sign-in path returns. */
@@ -1650,11 +1640,17 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    const inkUser = await findOrProvisionInkUserByEmail(supabase, email);
-    if (!inkUser) {
+    const authUid = signUp.user?.id ?? signUp.session.user?.id;
+    if (!authUid) {
       res.status(500).json({ error: 'Failed to provision user' });
       return;
     }
+    const inkUser = await findOrProvisionInkUser(supabase, { authUid, email });
+    if (!('id' in inkUser)) {
+      res.status(inkUser.status).json({ error: inkUser.reason });
+      return;
+    }
+    if (!leaseAccountForRequest(res, inkUser.id)) return;
 
     res.json({
       confirmationRequired: false,
@@ -1774,6 +1770,7 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
       res.status(401).json({ error: 'Invalid or expired pairing code' });
       return;
     }
+    if (!leaseAccountForRequest(res, user.id)) return;
     await supabase
       .from('users')
       .update({ last_login_at: new Date().toISOString() })
@@ -1813,6 +1810,7 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
       res.status(401).json({ error: 'Invalid or expired refresh token' });
       return;
     }
+    if (!leaseAccountForRequest(res, result.userId)) return;
 
     res.json({
       accessToken: result.accessToken,
@@ -2023,46 +2021,142 @@ router.post('/browser-companion/pairing-code', async (req: Request, res: Respons
 
 /**
  * POST /api/admin/account/deletion
- *   → 202 { deletion: { status: 'pending' | 'completed', requestedAt } }
+ *   → 202 { deletion: { status: 'queued', requestedAt } }
+ *   → 409 { error, reason: 'owns-shared-space', spaces: [{ id, name, members }] }
+ *   → 409 { error, reason: 'operator-account' }
  *
- * Records that the signed-in person asked, from inside the app, for their
- * account to be deleted. That is all it does. It ends no session, blocks no
- * sign-in and deletes no data: fulfilling the request (what is deleted, by
- * whom, how long it takes and how the person hears it is done) is a separate,
- * reviewed step that sets completed_at. Until that exists, no client should
- * present this as account deletion.
+ * The signed-in person asks, from inside the app, for their account to be
+ * deleted (ink://specs/account-deletion v6). An account that can't be
+ * deleted from the app is refused before anything is recorded: one that
+ * owns a space with other members deletes that space first (its own
+ * action), and an operator account is deleted by hand.
+ *
+ * Otherwise the request is recorded with the sign-in it belongs to and a
+ * hash of its email, and the deletion worker takes it from there: the
+ * account is closed, its sign-in deleted, its work drained, its files and
+ * then its rows removed. There is no status to ask for afterwards; once the
+ * sign-in is gone there is nothing to ask with, so the app says the request
+ * is queued and signs out.
  *
  * Asking again changes nothing and answers with the first request's time.
  */
 router.post('/account/deletion', async (req: Request, res: Response) => {
   try {
     const userId = (req as AdminAuthRequest).inkUserId;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const { error: recordError } = await supabase
+    const { data: existing, error: existingError } = await supabase
       .from('account_deletion_requests')
-      .upsert({ user_id: userId }, { onConflict: 'user_id', ignoreDuplicates: true });
-    if (recordError) throw recordError;
+      .select('requested_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (existingError) throw existingError;
+
+    if (!existing) {
+      const problem = await deletionIneligibility(supabase, userId);
+      if (problem?.reason === 'owns-shared-space') {
+        res.status(409).json({
+          error: 'Delete the spaces you share with others first',
+          reason: problem.reason,
+          spaces: problem.spaces,
+        });
+        return;
+      }
+      if (problem) {
+        res.status(409).json({
+          error: 'This account is deleted by hand, not from the app',
+          reason: problem.reason,
+        });
+        return;
+      }
+
+      const { data: account, error: accountError } = await supabase
+        .from('users')
+        .select('email, auth_uid')
+        .eq('id', userId)
+        .single();
+      if (accountError || !account) throw accountError ?? new Error('Account not found');
+      const authUid =
+        account.auth_uid ??
+        (account.email ? await bindAuthUidByEmail(supabase, userId, account.email) : null);
+      if (!authUid) {
+        res.status(409).json({
+          error: 'Sign in again to confirm it is you, then ask again',
+          reason: 'sign-in-unknown',
+        });
+        return;
+      }
+
+      const { error: recordError } = await supabase.from('account_deletion_requests').upsert(
+        {
+          user_id: userId,
+          auth_uid: authUid,
+          email_sha256: account.email ? emailSha256(account.email) : null,
+        },
+        { onConflict: 'user_id', ignoreDuplicates: true }
+      );
+      if (recordError) throw recordError;
+    }
+
     const { data: recorded, error: readError } = await supabase
       .from('account_deletion_requests')
-      .select('requested_at, completed_at')
+      .select('requested_at')
       .eq('user_id', userId)
       .single();
     if (readError || !recorded) throw readError ?? new Error('Deletion request was not recorded');
 
-    res.status(202).json({
-      deletion: {
-        status: recorded.completed_at ? 'completed' : 'pending',
-        requestedAt: recorded.requested_at,
-      },
-    });
+    void nudgeDeletionWorker();
+    res.status(202).json({ deletion: { status: 'queued', requestedAt: recorded.requested_at } });
   } catch (error) {
     logger.error('Account deletion request error:', error);
     res.status(500).json(errorJson('Could not record the deletion request', error));
   }
 });
+
+/** The deletion record's email hash: the trimmed, lowercased address, hashed. */
+function emailSha256(email: string): string {
+  return crypto.createHash('sha256').update(email.trim().toLowerCase(), 'utf8').digest('hex');
+}
+
+/**
+ * The Supabase sign-in of an account that has not signed in through
+ * Supabase since accounts were bound to their sign-ins: found by email, and
+ * bound only while the account is unbound. A later sign-in of the same email
+ * would have its own id, so this runs only for the account being deleted.
+ */
+async function bindAuthUidByEmail(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  email: string
+): Promise<string | null> {
+  const wanted = email.trim().toLowerCase();
+  for (let page = 1; page <= 20; page += 1) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw new Error(`Could not read sign-ins: ${error.message}`);
+    const users = data?.users ?? [];
+    const match = users.find((u) => (u.email ?? '').trim().toLowerCase() === wanted);
+    if (match) {
+      const { data: bound, error: bindError } = await supabase
+        .from('users')
+        .update({ auth_uid: match.id })
+        .eq('id', userId)
+        .is('auth_uid', null)
+        .select('auth_uid');
+      if (bindError) throw new Error(`Could not bind the sign-in: ${bindError.message}`);
+      if ((bound ?? []).length === 1) return match.id;
+      const { data: reread } = await supabase
+        .from('users')
+        .select('auth_uid')
+        .eq('id', userId)
+        .maybeSingle();
+      return reread?.auth_uid === match.id ? match.id : null;
+    }
+    if (users.length < 1000) return null;
+  }
+  return null;
+}
 
 router.get('/workspaces', async (req: Request, res: Response) => {
   try {
@@ -2225,6 +2319,180 @@ router.get('/workspaces/:workspaceId/members', async (req: Request, res: Respons
  * POST /api/admin/workspaces/:workspaceId/members
  * Invite/add collaborator by email to workspace.
  */
+// =============================================================================
+// Delete space (ink://specs/account-deletion v6 §8)
+// =============================================================================
+//
+// Deleting a space is its own action, separate from deleting an account
+// (Conor, Oct 7: "deleting an account and choosing to delete a space are two
+// separate actions"). An account that owns a space with other members can't
+// be deleted until that space is.
+
+interface OwnedSpace {
+  id: string;
+  name: string;
+  slug: string;
+  type: string;
+  user_id: string;
+}
+
+/** The space, when the signed-in person owns it and it isn't their personal space. */
+async function ownedDeletableSpace(
+  supabase: SupabaseClient<Database>,
+  workspaceId: string,
+  userId: string
+): Promise<{ space: OwnedSpace } | { status: number; error: string }> {
+  const { data, error } = await supabase
+    .from('workspaces')
+    .select('id, name, slug, type, user_id')
+    .eq('id', workspaceId)
+    .maybeSingle();
+  if (error) throw error;
+  const space = data as OwnedSpace | null;
+  if (!space || space.user_id !== userId) return { status: 404, error: 'Space not found' };
+  if (space.type === 'personal') {
+    return { status: 409, error: 'Your own space goes when your account is deleted' };
+  }
+  return { space };
+}
+
+/**
+ * GET /api/admin/workspaces/:workspaceId/deletion-preview
+ *   → 200 { space: { id, name, slug }, members: [{ name }], conversations, uploads }
+ *
+ * What deleting the space would remove, for the confirmation. Changes nothing.
+ */
+router.get('/workspaces/:workspaceId/deletion-preview', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AdminAuthRequest).inkUserId;
+    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const owned = await ownedDeletableSpace(supabase, req.params.workspaceId, userId);
+    if (!('space' in owned)) {
+      res.status(owned.status).json({ error: owned.error });
+      return;
+    }
+    const { space } = owned;
+    const { data: members, error: membersError } = await supabase
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', space.id)
+      .neq('user_id', userId);
+    if (membersError) throw membersError;
+    const memberIds = (members ?? []).map((m) => m.user_id);
+    const { data: people, error: peopleError } = memberIds.length
+      ? await supabase
+          .from('users')
+          .select('id, first_name, last_name, username')
+          .in('id', memberIds)
+      : { data: [], error: null };
+    if (peopleError) throw peopleError;
+    const { count: conversations, error: threadsError } = await supabase
+      .from('inbox_threads')
+      .select('id', { count: 'exact', head: true })
+      .eq('workspace_id', space.id);
+    if (threadsError) throw threadsError;
+    // thread_uploads is outside the generated types, as in services/uploads.
+    const { count: uploads, error: uploadsError } = await (supabase as unknown as SupabaseClient)
+      .from('thread_uploads')
+      .select('id', { count: 'exact', head: true })
+      .eq('workspace_id', space.id)
+      .in('state', ['live', 'removing']);
+    if (uploadsError) throw uploadsError;
+    res.json({
+      space: { id: space.id, name: space.name, slug: space.slug },
+      members: (people ?? []).map((p) => ({
+        name: [p.first_name, p.last_name].filter(Boolean).join(' ') || p.username || 'A member',
+      })),
+      conversations: conversations ?? 0,
+      uploads: uploads ?? 0,
+    });
+  } catch (error) {
+    logger.error('Space deletion preview error:', error);
+    res.status(500).json(errorJson('Could not preview the deletion', error));
+  }
+});
+
+/**
+ * DELETE /api/admin/workspaces/:workspaceId
+ * Body: { confirmSlug } — the space's slug, as the confirmation shows it.
+ *   → 200 { deleted: true }
+ *   → 503 { error } while work in the space is still finishing: the space
+ *     stays closed, and asking again resumes
+ *
+ * Closes the space first (archived, and its gate closed, so no upload,
+ * member or invitation enters it), stops and waits for work in it, removes
+ * its uploads, and only then deletes it, with its conversations.
+ */
+router.delete('/workspaces/:workspaceId', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AdminAuthRequest).inkUserId;
+    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const owned = await ownedDeletableSpace(supabase, req.params.workspaceId, userId);
+    if (!('space' in owned)) {
+      res.status(owned.status).json({ error: owned.error });
+      return;
+    }
+    const { space } = owned;
+    if (typeof req.body?.confirmSlug !== 'string' || req.body.confirmSlug !== space.slug) {
+      res.status(400).json({ error: "Confirm with the space's name" });
+      return;
+    }
+
+    // 1. Close: nothing new enters it from here, in this server and in reads.
+    spaceGate.close(space.id);
+    const { error: archiveError } = await supabase
+      .from('workspaces')
+      .update({ archived_at: new Date().toISOString() })
+      .eq('id', space.id)
+      .is('archived_at', null);
+    if (archiveError) throw archiveError;
+
+    // 2. Drain: stop turns of identities in the space, and wait for uploads
+    //    into it to finish.
+    const { data: identities, error: identitiesError } = await supabase
+      .from('agent_identities')
+      .select('id')
+      .eq('workspace_id', space.id);
+    if (identitiesError) throw identitiesError;
+    for (const identity of identities ?? []) cancelInklingTurns(identity.id);
+    if (!(await spaceGate.waitDrained(space.id, 30_000))) {
+      res.status(503).json({ error: 'Work in this space is still finishing; try again shortly' });
+      return;
+    }
+
+    // 3. Its uploads, every member's.
+    const uploads = await removeSpaceUploads(
+      {
+        db: supabase as never,
+        root: uploadsRoot(),
+        now: Date.now,
+        drained: (id) => spaceGate.isClosed(id) && spaceGate.inFlightCount(id) === 0,
+      },
+      space.id
+    );
+    if (!uploads.complete) {
+      res
+        .status(503)
+        .json({ error: "Some of this space's files are still being removed; try again" });
+      return;
+    }
+
+    // 4. The space, and its conversations with it.
+    const { error: deleteError } = await supabase.from('workspaces').delete().eq('id', space.id);
+    if (deleteError) throw deleteError;
+    spaceGate.forget(space.id);
+    logger.info('Space deleted', { workspaceId: space.id, removedUploads: uploads.removed });
+    res.json({ deleted: true });
+  } catch (error) {
+    logger.error('Space deletion error:', error);
+    res.status(500).json(errorJson('Could not delete the space', error));
+  }
+});
+
 router.post('/workspaces/:workspaceId/members', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
@@ -2232,6 +2500,10 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
     const workspaceRepo = dataComposer.repositories.workspaces;
     const usersRepo = dataComposer.repositories.users;
     const workspaceId = req.params.workspaceId;
+    if (spaceGate.isClosed(workspaceId)) {
+      res.status(409).json({ error: 'This space is being deleted' });
+      return;
+    }
 
     const workspace = await workspaceRepo.findById(workspaceId, authReq.inkUserId);
     if (!workspace) {
@@ -2396,6 +2668,10 @@ router.patch('/workspaces/:workspaceId', async (req: Request, res: Response) => 
 router.post('/workspaces/:workspaceId/invitations', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
+    if (spaceGate.isClosed(req.params.workspaceId)) {
+      res.status(409).json({ error: 'This space is being deleted' });
+      return;
+    }
     const kind = req.body?.kind;
     if (kind !== 'code' && kind !== 'email') {
       res.status(400).json({ error: "kind must be 'code' or 'email'" });

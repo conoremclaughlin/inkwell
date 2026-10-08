@@ -370,6 +370,11 @@ export function configureLaunchRecording(config: RecordingConfig | undefined): v
   recording = config;
 }
 
+/** The server instance this process records its launches under, once recording. */
+export function recordingServerInstance(): string | undefined {
+  return recording?.serverInstance;
+}
+
 export interface LaunchReservation {
   /** Why the launch must not start: it could not be written first. */
   refused?: string;

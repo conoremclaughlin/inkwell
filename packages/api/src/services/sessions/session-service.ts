@@ -48,6 +48,7 @@ import {
   admitStateWrite,
 } from './active-runs.js';
 import { launchHoldFor, reserveLaunch } from './launched-processes.js';
+import { accountGate, GateClosedError, type GateLease } from '../account-deletion/gate.js';
 import { uploadMediaForRunner } from '../uploads/runner-media.js';
 import { uploadsRoot } from '../uploads/runtime.js';
 import {
@@ -2518,12 +2519,20 @@ export class SessionService implements ISessionService {
     turnEpochCandidate?: string
   ): Promise<SessionResult> {
     const hooks = request.turnHooks;
-    if (hooks) await this.callTurnHook('start', request, () => hooks.start());
-    const result = await this.processMessage(request, session, turnEpochCandidate);
-    // Every caller of this reports the turn as admitted: it ran.
-    if (hooks)
-      await this.callTurnHook('end', request, () => hooks.end({ ...result, admitted: true }));
-    return result;
+    // Account gates the turn entered (ink://specs/account-deletion §3), held
+    // until its end hook has run: a deletion drains it only after its last
+    // write.
+    const accountLeases: GateLease[] = [];
+    try {
+      if (hooks) await this.callTurnHook('start', request, () => hooks.start());
+      const result = await this.processMessage(request, session, turnEpochCandidate, accountLeases);
+      // Every caller of this reports the turn as admitted: it ran.
+      if (hooks)
+        await this.callTurnHook('end', request, () => hooks.end({ ...result, admitted: true }));
+      return result;
+    } finally {
+      for (const lease of accountLeases) lease.release();
+    }
   }
 
   private async callTurnHook(
@@ -2549,7 +2558,8 @@ export class SessionService implements ISessionService {
   private async processMessage(
     request: SessionRequest,
     session: Session,
-    turnEpochCandidate?: string
+    turnEpochCandidate?: string,
+    accountLeases: GateLease[] = []
   ): Promise<SessionResult> {
     const { userId, sbSlug, metadata } = request;
 
@@ -2699,6 +2709,18 @@ export class SessionService implements ISessionService {
         // runtimeConfig's outer cycles, as any SB's is.
         inklingTurn = true;
         inklingSbId = inklingIdentity.id;
+        // Its owner's account gate, entered before anything of the turn
+        // touches a file and held through its end (runTurn): a deletion
+        // either sees this turn and waits for it, or this turn sees the
+        // account closed and starts nothing (ink://specs/account-deletion §3).
+        try {
+          accountLeases.push(accountGate.enter(inklingIdentity.userId));
+        } catch (error) {
+          if (error instanceof GateClosedError) {
+            return refuseInklingTurn('this account is being deleted');
+          }
+          throw error;
+        }
         // Its turn runs in its own folder, never the Inkwell checkout or the
         // server's default directory (organisation, not isolation:
         // inkling-folder.ts). Routing gave it no studio to resolve from.

@@ -132,6 +132,10 @@ function call(
   const sent: Sent = { status: 0, body: undefined, headers: {} };
   const res = {
     headersSent: false,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       sent.status = code;
       return this;
@@ -414,6 +418,10 @@ describe('threadUploadsRouter', () => {
     ) => void;
     const sent: Sent = { status: 0, body: undefined, headers: {} };
     const res = {
+      // A real response is an event emitter; the account lease listens for 'close'.
+      once() {
+        return this;
+      },
       status(code: number) {
         sent.status = code;
         return this;

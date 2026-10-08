@@ -1383,7 +1383,7 @@ describe('turn-epoch candidate threading (round 9)', () => {
     const mint = source.indexOf('const turnEpochCandidate = randomUUID();', handle);
     const routed = source.indexOf('sessionRoutingOptions(request, turnEpochCandidate)', mint);
     const processed = source.indexOf(
-      'this.processMessage(request, session, turnEpochCandidate)',
+      'this.processMessage(request, session, turnEpochCandidate, accountLeases)',
       mint
     );
     expect(handle).toBeGreaterThan(-1);
@@ -1426,7 +1426,9 @@ describe('turn-epoch candidate threading (round 9)', () => {
       turn +
       source
         .slice(turn)
-        .search(/this\.processMessage\(\s*request,\s*session,\s*turnEpochCandidate\s*\)/);
+        .search(
+          /this\.processMessage\(\s*request,\s*session,\s*turnEpochCandidate,\s*accountLeases\s*\)/
+        );
     expect(queued).toBeGreaterThan(-1);
     expect(dequeueRoute).toBeGreaterThan(-1);
     expect(runner).toBeGreaterThan(dequeueRoute);

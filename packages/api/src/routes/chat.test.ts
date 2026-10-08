@@ -35,6 +35,13 @@ vi.mock('../config/env', async () => ({
   },
 }));
 
+// The account is resolved by its sign-in (services/account-deletion/
+// principal.ts, tested against a real database).
+const mockResolvePrincipal = vi.fn();
+vi.mock('../services/account-deletion/principal', () => ({
+  resolveAccountForPrincipal: (...args: unknown[]) => mockResolvePrincipal(...args),
+}));
+
 import { chatAuthMiddleware, type ChatAuthRequest } from './chat-auth';
 import type { Request, Response, NextFunction } from 'express';
 
@@ -84,6 +91,10 @@ function createMockRes(): Response & { _status: number; _json: unknown } {
   const res = {
     _status: 200,
     _json: null,
+    // A real response is an event emitter; the account lease listens for 'close'.
+    once() {
+      return this;
+    },
     status(code: number) {
       res._status = code;
       return res;
@@ -152,6 +163,11 @@ describe('chatAuthMiddleware', () => {
       error: null,
     });
     mockFrom.mockReturnValue(createChainableQuery(null));
+    mockResolvePrincipal.mockResolvedValue({
+      ok: false,
+      status: 403,
+      reason: 'No account for this sign-in',
+    });
 
     const req = createMockReq({
       headers: { authorization: 'Bearer valid-token' } as Record<string, string>,
@@ -161,6 +177,11 @@ describe('chatAuthMiddleware', () => {
 
     await chatAuthMiddleware(req, res, next);
 
+    expect(mockResolvePrincipal).toHaveBeenCalledWith(expect.anything(), {
+      authUid: 'supabase-id',
+      email: 'nobody@example.com',
+      create: false,
+    });
     expect(res._status).toBe(403);
     expect((res._json as Record<string, string>).error).toBe('User not found in Inkwell system');
     expect(next).not.toHaveBeenCalled();
@@ -172,6 +193,7 @@ describe('chatAuthMiddleware', () => {
       error: null,
     });
     mockFrom.mockReturnValue(createChainableQuery({ id: 'ink-user-123' }));
+    mockResolvePrincipal.mockResolvedValue({ ok: true, userId: 'ink-user-123', created: false });
 
     const req = createMockReq({
       headers: { authorization: 'Bearer valid-token' } as Record<string, string>,

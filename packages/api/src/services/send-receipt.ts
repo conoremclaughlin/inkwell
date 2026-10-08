@@ -347,8 +347,10 @@ export async function lookUpClientMessage(
 /**
  * Record the dispatch outcome on the stored message, so a replay can report
  * it. Best effort: if this write fails, a replay says `unknown`, which is
- * true. Nothing else writes a thread message's metadata after it is
- * stored, so read-then-write loses nothing.
+ * true. The only other writer of a stored message's metadata is account
+ * deletion, which turns the message into one from "Deleted account"; the
+ * write is conditional on the sender kind it read, so it never puts the
+ * removed sender back.
  */
 export async function recordDelivery(
   supabase: SupabaseClient,
@@ -358,13 +360,18 @@ export async function recordDelivery(
   try {
     const { data, error: readError } = await supabase
       .from('inbox_thread_messages')
-      .select('metadata')
+      .select('metadata, sender_kind')
       .eq('id', messageId)
       .maybeSingle();
     if (readError || !data) throw new Error(readError?.message ?? 'message not found');
-    const metadata = ((data as { metadata: Record<string, unknown> | null }).metadata ??
-      {}) as Record<string, unknown>;
+    const row = data as { metadata: Record<string, unknown> | null; sender_kind: string };
+    // A message whose author's account was deleted names no one, and this
+    // write must not name them again (ink://specs/account-deletion §1).
+    if (row.sender_kind === 'deleted_account') return;
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
     const inkMeta = (metadata.pcp ?? {}) as Record<string, unknown>;
+    // Conditional on the sender kind it read: if the author's account was
+    // deleted in between, the row no longer matches and nothing is written.
     const { error } = await supabase
       .from('inbox_thread_messages')
       .update({
@@ -373,7 +380,8 @@ export async function recordDelivery(
           pcp: { ...inkMeta, delivery: { ...delivery, recordedAt: new Date().toISOString() } },
         },
       })
-      .eq('id', messageId);
+      .eq('id', messageId)
+      .eq('sender_kind', row.sender_kind);
     if (error) throw new Error(error.message);
   } catch (error) {
     logger.warn('Failed to record a message delivery outcome; a replay will report unknown', {

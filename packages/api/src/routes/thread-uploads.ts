@@ -37,6 +37,7 @@ import {
 import { uploadResponseHeaders } from '../services/uploads/headers';
 import { isCanonicalId, type UploadLocation } from '../services/uploads/layout';
 import { insertWithSlots } from '../services/uploads/slots';
+import { GateClosedError, spaceGate } from '../services/account-deletion/gate';
 import { extForContentType, MAX_UPLOAD_BYTES, sniffUploadType } from '../services/uploads/sniff';
 import {
   beginRemoval,
@@ -104,6 +105,18 @@ export async function postUpload(
   const auth = req as SignedIn;
   if (!deps.writeRoles.has(auth.inkWorkspaceRole)) {
     res.status(403).json({ error: 'Your role in this space cannot send messages' });
+    return;
+  }
+  // The space's gate, held until this response has closed: a space being
+  // deleted takes no new upload, and its deletion waits for this one before
+  // it removes the space's files (ink://specs/account-deletion §8). The
+  // account's own gate is held by the auth middleware already.
+  try {
+    const spaceLease = spaceGate.enter(auth.inkWorkspaceId);
+    res.once('close', () => spaceLease.release());
+  } catch (error) {
+    if (!(error instanceof GateClosedError)) throw error;
+    res.status(409).json({ error: 'This space is being deleted' });
     return;
   }
   const key = typeof req.query.key === 'string' ? req.query.key.trim() : '';

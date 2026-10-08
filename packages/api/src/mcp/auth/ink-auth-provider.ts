@@ -20,6 +20,8 @@ import {
   createRefreshToken,
   exchangeRefreshToken as exchangeRefreshTokenShared,
 } from '../../auth/ink-tokens';
+import { resolveAccountForPrincipal } from '../../services/account-deletion/principal';
+import { accountGate } from '../../services/account-deletion/gate';
 
 /**
  * Carry an SB binding across the rename on a pending-auth JWT.
@@ -174,57 +176,25 @@ export class InkAuthProvider {
         return { error: 'access_denied', error_description: 'Authentication failed' };
       }
 
-      // Look up or create Inkwell user
-      let { data: inkUser, error: userError } = await this.supabase
-        .from('users')
-        .select('id, email')
-        .eq('email', user.email!)
-        .single();
-
-      // Auto-create Inkwell user on first OAuth login (if not found)
-      if (userError?.code === 'PGRST116') {
-        logger.info('Auto-creating Inkwell user on first MCP auth', { email: user.email });
-        const { data: newUser, error: createError } = await this.supabase
-          .from('users')
-          .insert({ email: user.email })
-          .select('id, email')
-          .single();
-
-        if (createError) {
-          // Check if user was created by another request (race condition or unique violation)
-          if (createError.code === '23505') {
-            logger.info('User already exists (race condition), retrying lookup', {
-              email: user.email,
-            });
-            const { data: existingUser, error: retryError } = await this.supabase
-              .from('users')
-              .select('id, email')
-              .eq('email', user.email!)
-              .single();
-
-            if (retryError || !existingUser) {
-              logger.error('Failed to fetch existing user after unique violation', {
-                email: user.email,
-                error: retryError,
-              });
-              return { error: 'server_error', error_description: 'User lookup failed' };
-            }
-
-            inkUser = existingUser;
-          } else {
-            logger.error('Failed to create Inkwell user', {
-              email: user.email,
-              error: createError,
-            });
-            return { error: 'server_error', error_description: 'Failed to create user account' };
-          }
-        } else {
-          inkUser = newUser;
+      // The account bound to this sign-in, created bound on first OAuth
+      // login. Never resolved by email alone (ink://specs/account-deletion
+      // §7), and never one that is being deleted.
+      const resolved = await resolveAccountForPrincipal(this.supabase, {
+        authUid: user.id,
+        email: user.email ?? null,
+        create: true,
+      });
+      if (!resolved.ok) {
+        if (resolved.status === 500) {
+          logger.error('Inkwell user lookup failed', { reason: resolved.reason });
+          return { error: 'server_error', error_description: 'User lookup failed' };
         }
-      } else if (userError || !inkUser) {
-        logger.error('Inkwell user lookup failed', { email: user.email, error: userError });
-        return { error: 'access_denied', error_description: 'User lookup failed' };
+        return { error: 'access_denied', error_description: resolved.reason };
       }
+      if (resolved.created) {
+        logger.info('Auto-created Inkwell user on first MCP auth', { userId: resolved.userId });
+      }
+      const inkUser = { id: resolved.userId, email: user.email ?? null };
 
       // Create authorization code
       const code = `ink-code-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
@@ -271,6 +241,13 @@ export class InkAuthProvider {
     if (Date.now() > codeData.expiresAt) {
       this.authCodes.delete(params.code);
       return { error: 'invalid_grant', error_description: 'Authorization code expired' };
+    }
+
+    // A code issued before its account's deletion closed it is spent, not
+    // exchanged (ink://specs/account-deletion §7).
+    if (accountGate.isClosed(codeData.userId)) {
+      this.authCodes.delete(params.code);
+      return { error: 'invalid_grant', error_description: 'This account is being deleted' };
     }
 
     // Fall back to the client_id stored in the auth code (from /authorize).
@@ -390,6 +367,9 @@ export class InkAuthProvider {
 
     if (!result) {
       return { error: 'invalid_grant', error_description: 'Invalid refresh token' };
+    }
+    if (accountGate.isClosed(result.userId)) {
+      return { error: 'invalid_grant', error_description: 'This account is being deleted' };
     }
 
     logger.info('MCP token refreshed', {
