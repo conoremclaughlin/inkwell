@@ -23,6 +23,7 @@ import type { Memory } from '../../data/models/memory.js';
 import { logger } from '../../utils/logger.js';
 import { resolveSbIdResult } from '../../auth/resolve-identity.js';
 import { isUnnamed } from '../identity-name.js';
+import { constitutionWorkspaceId } from '../constitution-workspace.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
 const HIGH_MEMORY_LIMIT = 10;
@@ -473,20 +474,7 @@ export class ContextBuilder implements IContextBuilder {
     agentWorkspaceId?: string
   ): Promise<ConstitutionDocs | undefined> {
     try {
-      let workspaceId = agentWorkspaceId;
-
-      if (!workspaceId) {
-        const { data: personalWorkspace } = await this.supabase
-          .from('workspaces')
-          .select('id')
-          .eq('user_id', userId)
-          .eq('type', 'personal')
-          .is('archived_at', null)
-          .order('created_at', { ascending: true })
-          .limit(1)
-          .maybeSingle();
-        workspaceId = personalWorkspace?.id || undefined;
-      }
+      const workspaceId = await constitutionWorkspaceId(this.supabase, userId, agentWorkspaceId);
 
       const { data: workspace } = workspaceId
         ? await this.supabase

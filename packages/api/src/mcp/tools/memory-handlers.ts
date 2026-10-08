@@ -10,6 +10,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
+import type { SessionFocus } from '../../data/repositories/session-focus.repository';
 import type { Json } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
@@ -363,6 +364,7 @@ const topicsSchema = z
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
+import { constitutionWorkspaceId } from '../../services/constitution-workspace';
 import { presenceRefused } from '../../services/inklings/poll-gate';
 import {
   actorOwnerSbId,
@@ -2771,6 +2773,28 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 // ==============================================// BOOTSTRAP HANDLER
 // ==============================================
 /**
+ * The person's latest focus, when its project is in this workspace. Focus is
+ * stored per person and points at a project, so read unscoped it handed an
+ * identity in one workspace the person's focus on another workspace's work.
+ * A focus with no project names no workspace and is not shown.
+ */
+async function latestFocusInWorkspace(
+  dataComposer: DataComposer,
+  userId: string,
+  workspaceId: string
+): Promise<SessionFocus | null> {
+  const focus = await dataComposer.repositories.sessionFocus.findLatestByUser(userId);
+  if (!focus?.project_id) return null;
+  const { data: project } = await dataComposer
+    .getClient()
+    .from('projects')
+    .select('workspace_id')
+    .eq('id', focus.project_id)
+    .maybeSingle();
+  return project?.workspace_id === workspaceId ? focus : null;
+}
+
+/**
  * Who bootstrap tells the calling SB it is. An inkling that hasn't been named
  * yet gets a null name and a plain statement of that, never its stored
  * placeholder: its first act on waking is to call bootstrap.
@@ -2875,15 +2899,18 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
+  const callerWorkspace = resolveCallerWorkspace(dataComposer.getClient(), user.id);
 
   const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
     await Promise.all([
       // Active projects
-      resolveCallerWorkspace(dataComposer.getClient(), user.id).then(({ workspaceId }) =>
+      callerWorkspace.then(({ workspaceId }) =>
         dataComposer.repositories.projects.findAllByWorkspace(workspaceId, 'active')
       ),
-      // Current focus
-      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // Current focus, from the same workspace as the projects
+      callerWorkspace.then(({ workspaceId }) =>
+        latestFocusInWorkspace(dataComposer, user.id, workspaceId)
+      ),
       // All active sessions (filter by sbSlug if provided) — client picks the right one
       dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
       // Database identity (for cloud agents, includes metadata, heartbeat, soul).
@@ -2998,21 +3025,15 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   // Resolve workspace scope for shared docs:
   // 1) explicit workspaceId param
-  // 2) deterministic fallback to personal workspace
-  let resolvedWorkspaceId = params.workspaceId;
-
-  if (!resolvedWorkspaceId) {
-    const { data: personalWorkspace } = await supabase
-      .from('workspaces')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('type', 'personal')
-      .is('archived_at', null)
-      .order('created_at', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    resolvedWorkspaceId = personalWorkspace?.id || undefined;
-  }
+  // 2) the identity's own workspace, else the oldest personal one — the same
+  //    rule context-builder applies (constitution-workspace.ts)
+  const resolvedWorkspaceId =
+    params.workspaceId ||
+    (await constitutionWorkspaceId(
+      supabase,
+      user.id,
+      (dbIdentity?.workspace_id as string | null | undefined) ?? null
+    ));
 
   const { data: dbWorkspaceSharedDocs } = resolvedWorkspaceId
     ? await supabase
