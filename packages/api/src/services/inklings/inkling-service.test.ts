@@ -476,6 +476,50 @@ describe('the space’s starter set at an awakening (starter-space.ts)', () => {
     ).toBeNull();
   });
 
+  it('counts an emptied document as written: empty values and an empty page stay empty', async () => {
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: '',
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: '',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(rowsOf('workspaces').find((row) => row.id === ME.workspaceId)!.shared_values).toBe('');
+    expect(pagesIn(ME.workspaceId)).toEqual([expect.objectContaining({ user_profile_md: '' })]);
+  });
+
+  it('writes the page where the person has a row but no page was ever written', async () => {
+    // Saving a space's values first leaves such a row (save_team_constitution).
+    db.seed('workspaces', {
+      id: ME.workspaceId,
+      user_id: ME.userId,
+      shared_values: null,
+      process: null,
+    });
+    db.seed('user_identity', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      user_profile_md: null,
+      shared_values_md: 'HISTORY-COPY',
+    });
+
+    await service.awaken(ME, REQUEST);
+
+    expect(pagesIn(ME.workspaceId)).toEqual([
+      expect.objectContaining({
+        user_profile_md: ABOUT_YOU_TEMPLATE,
+        shared_values_md: 'HISTORY-COPY',
+      }),
+    ]);
+  });
+
   it('changes nothing the second time', async () => {
     db.seed('workspaces', {
       id: ME.workspaceId,

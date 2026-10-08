@@ -128,8 +128,12 @@ export function isInklingStarterSpace(metadata: unknown): boolean {
 
 /**
  * Gives this person their own About page in the space, unless they have one.
- * The page is keyed (person, space), so it can never be another person's, and
- * an existing page, written by the person or their inkling, is never replaced.
+ * The page is keyed (person, space), so it can never be another person's.
+ *
+ * "Has one" means a page was ever written: a row whose page is null has
+ * none, and gets the template (such a row exists when a space's values were
+ * saved before anyone wrote a page there). A page the person or their
+ * inkling wrote, or emptied to an empty string, is theirs and stays as it is.
  */
 export async function ensureOwnAboutPage(
   supabase: SupabaseClient,
@@ -139,21 +143,32 @@ export async function ensureOwnAboutPage(
   const { error } = await supabase
     .from('user_identity')
     .insert({ user_id: userId, workspace_id: workspaceId, user_profile_md: ABOUT_YOU_TEMPLATE });
-  // user_identity_user_workspace_key: the person already has a page here.
-  if (error && error.code !== UNIQUE_VIOLATION) {
+  if (!error) return;
+  // user_identity_user_workspace_key: the person already has a row here.
+  if (error.code !== UNIQUE_VIOLATION) {
     throw new Error(`Failed to create the About page: ${error.message}`);
   }
+  const { error: fillError } = await supabase
+    .from('user_identity')
+    .update({ user_profile_md: ABOUT_YOU_TEMPLATE })
+    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId)
+    .is('user_profile_md', null);
+  if (fillError) throw new Error(`Failed to write the About page: ${fillError.message}`);
 }
 
 /**
  * Gives a space the starter set at an inkling's awakening, if it never had
  * it: a space created before seeding on creation was live, or created
  * without asking for it, still starts like a new one. Nothing that exists is
- * replaced. The values are written only where both values and process are
- * unset, in one conditional update, so a space with documents of its own
- * keeps them, and a concurrent writer's are never overwritten. The person's
- * About page is written only if they have none in the space. Running it again
- * changes nothing.
+ * replaced.
+ *
+ * "Never had it" means never written, which is null. The values are written
+ * only where both values and process are null, in one conditional update, so
+ * a space with documents of its own keeps them and a concurrent writer's are
+ * never overwritten. A document someone emptied to an empty string counts as
+ * written, and is never refilled. The person's About page follows the same
+ * rule (ensureOwnAboutPage). Running it again changes nothing.
  */
 export async function ensureInklingStarterSet(
   supabase: SupabaseClient,
