@@ -7,6 +7,7 @@ export default defineConfig({
       // Match the root and CLI projects: exercise current shared source, not
       // the last build. Source-level provider mocks must intercept the same
       // module the host loads, or a fake-child test can prepare real files.
+      '@inklabs/shared/node-host': path.resolve(__dirname, '../shared/src/node-host/index.ts'),
       '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
       '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
     },

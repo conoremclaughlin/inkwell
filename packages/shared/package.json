@@ -49,6 +49,16 @@
         "types": "./dist/cjs/providers/index.d.ts",
         "default": "./dist/cjs/providers/index.js"
       }
+    },
+    "./node-host": {
+      "import": {
+        "types": "./dist/node-host/index.d.ts",
+        "default": "./dist/node-host/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/node-host/index.d.ts",
+        "default": "./dist/cjs/node-host/index.js"
+      }
     }
   },
   "scripts": {

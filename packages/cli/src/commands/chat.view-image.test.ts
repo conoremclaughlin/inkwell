@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { crc32, deflateSync } from 'zlib';
@@ -19,6 +19,7 @@ import { crc32, deflateSync } from 'zlib';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
+  carriedBytes: new Map<string, Buffer>(),
   runBackendImpl: vi.fn(),
 }));
 
@@ -155,6 +156,9 @@ function scriptBackend(
   let spawn = 0;
   testState.runBackendImpl.mockImplementation(async (request: SpawnRequest) => {
     const carried = request.contextImages ? carry(request.contextImages, spawn) : [];
+    for (const image of request.contextImages ?? []) {
+      testState.carriedBytes.set(image.path, readFileSync(image.path));
+    }
     spawn += 1;
     return {
       success: true,
@@ -180,6 +184,7 @@ describe('images from tools reach the model as images', () => {
 
   beforeEach(() => {
     testState.inputs = [];
+    testState.carriedBytes.clear();
     testState.runBackendImpl.mockReset();
     testCwd = mkdtempSync(join(tmpdir(), 'ink-chat-view-image-'));
     process.chdir(testCwd);
@@ -212,7 +217,9 @@ describe('images from tools reach the model as images', () => {
     expect(continuation!.contextImages).toHaveLength(1);
     const [image] = continuation!.contextImages!;
     expect(image).toMatchObject({ mimeType: 'image/png', width: 640, height: 480 });
-    expect(readFileSync(image!.path).equals(png)).toBe(true);
+    // Measure while the provider owns the input, not after session disposal.
+    expect(testState.carriedBytes.get(image!.path)?.equals(png)).toBe(true);
+    expect(existsSync(image!.path)).toBe(false);
     // Delivered into the session the opening spawn seeded, not a new one.
     expect(opening!.backendSessionSeedId).toBeDefined();
     expect(continuation!.backendSessionId).toBe(opening!.backendSessionSeedId);

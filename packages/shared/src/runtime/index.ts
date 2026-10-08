@@ -60,3 +60,5 @@ export * from './spawn-agent.js';
 export * from './tool-parameter-help.js';
 export * from './local-tool-catalog.js';
 export * from './tool-dispatch.js';
+
+export * from './credential-resolver.js';

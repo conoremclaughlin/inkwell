@@ -9,9 +9,15 @@ describe('production chat signal binding', () => {
     const ast = ts.createSourceFile('chat.ts', source, ts.ScriptTarget.Latest, true);
     const chat = ast.statements.find(
       (node): node is ts.FunctionDeclaration =>
-        ts.isFunctionDeclaration(node) && node.name?.text === 'runChat'
+        ts.isFunctionDeclaration(node) && node.name?.text === 'runChatSession'
     );
     expect(chat?.body).toBeDefined();
+    const wrapper = ast.statements.find(
+      (node): node is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(node) && node.name?.text === 'runChat'
+    );
+    expect(wrapper?.body?.getText(ast)).toContain('await runChatSession(options,');
+    expect(wrapper?.body?.getText(ast)).toMatch(/finally\s*\{[\s\S]*await disposeTools\?\.\(\)/);
     const declarations = chat!
       .body!.statements.filter(ts.isVariableStatement)
       .flatMap((statement) => [...statement.declarationList.declarations]);

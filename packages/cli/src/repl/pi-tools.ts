@@ -41,6 +41,13 @@ let cachedCwd: string | null = null;
 export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>> {
   if (cachedTools && cachedCwd === cwd) return cachedTools;
 
+  cachedTools = await createPiTools(cwd);
+  cachedCwd = cwd;
+  return cachedTools;
+}
+
+/** Fresh tool set for a session host; never changes the compatibility cache. */
+export async function createPiTools(cwd: string): Promise<Map<string, PiAgentTool>> {
   const pi = await import('@mariozechner/pi-coding-agent');
   const tools = [
     pi.createReadTool(cwd),
@@ -51,13 +58,7 @@ export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>
     pi.createFindTool(cwd),
     pi.createLsTool(cwd),
   ] as unknown as PiAgentTool[];
-
-  cachedTools = new Map();
-  for (const tool of tools) {
-    cachedTools.set(tool.name, tool);
-  }
-  cachedCwd = cwd;
-  return cachedTools;
+  return new Map(tools.map((tool) => [tool.name, tool]));
 }
 
 // PathContainmentError, validatePathArgs, assertContainedPath imported from @inklabs/shared
@@ -66,7 +67,10 @@ const DOCUMENT_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
 };
 
-async function tryReadDocument(filePath: string, cwd: string): Promise<InkToolCallResult | null> {
+export async function tryReadDocument(
+  filePath: string,
+  cwd: string
+): Promise<InkToolCallResult | null> {
   const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
   if (!DOCUMENT_EXTENSIONS[ext]) return null;
 

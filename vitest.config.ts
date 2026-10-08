@@ -15,6 +15,10 @@ export default defineConfig({
       // CLI, and the CLI's wiring tests drive it: through dist, an edit to the
       // loop would not reach them until someone rebuilt, and they would pass
       // against the old loop. packages/cli/vitest.config.ts repeats this.
+      '@inklabs/shared/node-host': path.resolve(
+        __dirname,
+        'packages/shared/src/node-host/index.ts'
+      ),
       '@inklabs/shared/runtime': path.resolve(__dirname, 'packages/shared/src/runtime/index.ts'),
       // The provider adapters and startBackendTurn, for the same reason.
       '@inklabs/shared/providers': path.resolve(

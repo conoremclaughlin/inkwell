@@ -1,3 +1,5 @@
+import { createSessionToolHost } from '@inklabs/shared/node-host';
+import { homedir, tmpdir } from 'os';
 import {
   runSessionAgentTurn,
   SessionStream,
@@ -169,11 +171,7 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
-import {
-  resolveCredentialRefs,
-  loadKeychainCredentials,
-  buildResolverEnv,
-} from '../repl/credential-resolver.js';
+import { resolveCredentialRefs, loadKeychainCredentials } from '../repl/credential-resolver.js';
 import {
   createSignalSink,
   isClientLocalTool,
@@ -191,21 +189,14 @@ import {
   formatProfileList,
   isValidProfileId,
 } from '../repl/tool-profiles.js';
-import { isPiTool, callPiTool } from '../repl/pi-tools.js';
+import { isPiTool, createPiTools, tryReadDocument } from '../repl/pi-tools.js';
 import {
   bareToolName,
   createLocalToolDispatcher,
   impossibleCallRefusal,
-} from '../repl/tool-dispatch.js';
+} from '@inklabs/shared/runtime';
 import { createToolParametersLookup } from '../repl/tool-parameter-help.js';
-import {
-  imagesToDeliver,
-  processImageCacheDir,
-  takeCapturedImages,
-  withImageCapture,
-  type ContextImage,
-  type ImageDelivery,
-} from '../repl/tool-images.js';
+import { imagesToDeliver, type ContextImage, type ImageDelivery } from '../repl/tool-images.js';
 import { renderLocalToolGroup } from '../repl/local-tool-catalog.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
@@ -2080,6 +2071,22 @@ export async function prepareChatStudio(
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
+  let disposeTools: (() => Promise<void>) | undefined;
+  try {
+    await runChatSession(options, (dispose) => {
+      disposeTools = dispose;
+    });
+  } finally {
+    // Session-owned files must also retire on a setup/input failure, not only
+    // the ordinary /quit and headless-return paths.
+    await disposeTools?.();
+  }
+}
+
+async function runChatSession(
+  options: ChatOptions,
+  setToolDisposer: (dispose: () => Promise<void>) => void
+): Promise<void> {
   // Read once and removed before anything is spawned: the token is how the
   // server tells this process's turn_reply lines from anything else on its
   // stdout, so no tool or provider child may inherit it (turn-reply.ts).
@@ -2662,6 +2669,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * another turn, or switch sessions while its clones keep working.
    */
   const cloneRegistry = new CloneRegistry();
+  const cloneRuns = new Set<Promise<unknown>>();
 
   // Non-interactive event stream. When running headless (server-spawned via
   // InkRunner with --non-interactive), emit structured NDJSON lines to stdout
@@ -2794,6 +2802,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let readyForAutoRun = false;
   let enqueueAutoRunFromInbox: ((message: InboxMessage) => Promise<void>) | null = null;
 
+  let sessionCredentials: Record<string, string> = {};
+
   // Shared bootstrap sequence: identity override, context/timezone, host
   // preparation, recall dedup and ledger marker. Only presentation and I/O
   // stay here; a server host supplies these same ports without a CLI process.
@@ -2817,6 +2827,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       },
       prepareHost: async () => {
         const keychainCreds = await loadKeychainCredentials();
+        sessionCredentials = { ...keychainCreds };
         if (Object.keys(keychainCreds).length > 0) {
           console.log(
             chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`)
@@ -3118,7 +3129,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // (fresh, rolled, or re-seeded after a lost session) everything the ledger
   // still holds, a stateless backend all of them every time. Evicting or
   // compacting the entry rolls the session, so the next seed simply omits it.
-  const toolImageCacheDir = processImageCacheDir();
+  const sessionToolHost = createSessionToolHost({
+    cwd: process.cwd(),
+    home: homedir(),
+    imageRoots: [process.cwd(), join(homedir(), '.ink', 'files')],
+    tempDir: tmpdir(),
+    credentials: sessionCredentials,
+    coding: { load: createPiTools, readDocument: tryReadDocument },
+  });
+  setToolDisposer(() => sessionToolHost.close());
+  const toolImageCacheDir = sessionToolHost.cacheDir;
+  const { withImageCapture, takeCapturedImages } = sessionToolHost.images;
   const parentImageDelivery = (): ImageDelivery =>
     acceptsContextImagesFor(runtime.backend)
       ? { deliverable: true }
@@ -4527,7 +4548,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         callTool: withImageCapture(
           createLocalToolDispatcher({
             cwd: process.cwd(),
-            callPi: callPiTool,
+            ...sessionToolHost.dispatch,
             callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
             toolParameters: inkToolParameters,
             // The clone's own policy, not the parent's: a clone that may not
@@ -4536,7 +4557,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               const decision = opts.policy.inspectInkTool('describe_tool', runtime.sessionId);
               return decision.allowed && !decision.wouldConsumeGrant;
             },
-            resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+            resolveCredentials: (args) => sessionToolHost.dispatch.resolveCredentials(args),
             // A clone asking what it can call gets its own narrower surface —
             // the same one its prompt described, not the parent's.
             audience: 'clone',
@@ -4723,6 +4744,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
       })
     );
+
+    cloneRuns.add(running);
+    void running.then(() => cloneRuns.delete(running));
 
     if (!wait) {
       // Background: the clones keep running in this process while the parent
@@ -4920,7 +4944,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       callTool: withImageCapture(
         createLocalToolDispatcher({
           cwd: process.cwd(),
-          callPi: callPiTool,
+          ...sessionToolHost.dispatch,
           callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
           toolParameters: inkToolParameters,
           // Help the model didn't ask for runs only where describe_tool is
@@ -4935,7 +4959,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           resolveCredentials: (args) => {
             const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
               args,
-              buildResolverEnv()
+              sessionCredentials
             );
             if (resolutions.length > 0 && runtime.verbose) {
               const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
@@ -5740,6 +5764,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     },
   });
+  setToolDisposer(async () => {
+    readyForAutoRun = false;
+    if (pollTimer) clearInterval(pollTimer);
+    stopEventStream?.();
+    // Stop producers first, drain ordinary input, then retire any clone that
+    // input started while draining. Never delete images a child still reads.
+    cancelRunningClones();
+    await inputDrain.close();
+    cancelRunningClones();
+    await Promise.allSettled([...cloneRuns]);
+    await sessionToolHost.close();
+  });
   const enqueueTurn = (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
@@ -6052,6 +6088,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // cli_turn_at this process opened but failed to close, and marks the
     // session unattached so trigger spawns resume.
     await turnSignal.detach();
+    // The outer finally drains input/clones before disposing tool files.
     // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
     // don't prevent the event loop from draining. Guarded: some stdin
     // stream types (already-closed pipes) don't implement unref.
@@ -7605,6 +7642,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   approvalCoordinator.dispose();
   cancelRunningClones();
   runtime.approvalChannel?.dispose();
+  // The outer finally drains input/clones before disposing tool files.
 
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {

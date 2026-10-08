@@ -34,73 +34,14 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
-export interface CredentialResolution {
-  /** Env var name that was resolved */
-  name: string;
-  /** Tool parameter path where it was found (e.g., "value", "options.password") */
-  path: string;
-}
-
-export interface ResolveResult {
-  /** The args with credential references resolved */
-  args: Record<string, unknown>;
-  /** Which credentials were resolved (for audit logging — never includes values) */
-  resolutions: CredentialResolution[];
-}
-
-const BARE_REF_PATTERN = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$/;
-
-/**
- * Resolve credential references in tool call arguments.
- *
- * Only resolves bare references where the entire string value is a single
- * `$VAR` or `${VAR}`. Embedded references in longer strings are left as-is
- * to prevent credential leakage into text fields.
- */
+import { resolveCredentialRefs as resolveSharedCredentials } from '@inklabs/shared/runtime';
+export type { CredentialResolution, ResolveResult } from '@inklabs/shared/runtime';
+/** Historical CLI default; session hosts pass a private credential snapshot. */
 export function resolveCredentialRefs(
   args: Record<string, unknown>,
   env: Record<string, string | undefined> = process.env
-): ResolveResult {
-  const resolutions: CredentialResolution[] = [];
-
-  function resolveValue(value: unknown, path: string): unknown {
-    if (typeof value === 'string') {
-      return resolveString(value, path);
-    }
-    if (Array.isArray(value)) {
-      return value.map((item, i) => resolveValue(item, `${path}[${i}]`));
-    }
-    if (value !== null && typeof value === 'object') {
-      return resolveObject(value as Record<string, unknown>, path);
-    }
-    return value;
-  }
-
-  function resolveString(value: string, path: string): string {
-    const m = value.trim().match(BARE_REF_PATTERN);
-    if (!m) return value;
-    const varName = m[1] || m[2];
-    if (!varName) return value;
-    const resolved = env[varName];
-    if (resolved === undefined) return value;
-    resolutions.push({ name: varName, path });
-    return resolved;
-  }
-
-  function resolveObject(
-    obj: Record<string, unknown>,
-    parentPath: string
-  ): Record<string, unknown> {
-    const resolved: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj)) {
-      const path = parentPath ? `${parentPath}.${key}` : key;
-      resolved[key] = resolveValue(value, path);
-    }
-    return resolved;
-  }
-
-  const resolvedArgs = resolveObject(args, '');
-  return { args: resolvedArgs, resolutions };
+) {
+  return resolveSharedCredentials(args, env);
 }
 
 // ─── Keychain Integration ──────────────────────────────────────
