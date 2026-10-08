@@ -23,8 +23,12 @@
  *   session rather than the token);
  * - the slugs beside them, looked up among all of the account owner's
  *   identities, in every workspace.
- * Any one being an inkling is enough. No SB at all (a person, or work
- * outside a request) is not gated. A failed identity read refuses.
+ * Any one being an inkling is enough. An SB the request names that no
+ * identity row answers to counts as an inkling too: an issued token outlives
+ * its identity when a space is deleted (the rows cascade, the owner's
+ * account stays), and the gate can't tell a deleted inkling from anything
+ * else (Lumen, PR #793). No SB at all (a person, or work outside a request)
+ * is not gated. A failed identity read refuses.
  *
  * Being an inkling is read from metadata.client, which no identity write can
  * change (assertInklingStatusKept in identity-handlers.ts).
@@ -71,13 +75,15 @@ export function accountGateCaller(
 
 interface IdentityRow {
   id: string;
+  agent_id: string;
   metadata: Record<string, unknown> | null;
 }
 
 /**
- * The inklings among the caller's SBs. UUIDs and slugs are both read: a
- * token minted with a slug alone, beside a context naming another SB by
- * UUID, must not pass on the UUID.
+ * The inklings among the caller's SBs, and the SBs it names that no row
+ * answers to: a UUID with no row, or a slug none of the rows read carries.
+ * UUIDs and slugs are both read: a token minted with a slug alone, beside a
+ * context naming another SB by UUID, must not pass on the UUID.
  *
  * A slug is read among all of the account owner's identities, never only in
  * the request's workspace. A slug-only token is bound to no workspace, and
@@ -87,20 +93,22 @@ interface IdentityRow {
  * PR #793). An inkling's slug is `kindle-<token id>` and never renamed, so an
  * ordinary SB elsewhere doesn't share it by chance.
  */
-async function callingInklings(
+async function identifyCaller(
   supabase: SupabaseClient,
   ownerUserId: string,
   caller: AccountGateCaller
-): Promise<IdentityRow[]> {
+): Promise<{ inklings: IdentityRow[]; unidentified: string[] }> {
   const reads: Array<PromiseLike<{ data: unknown; error: { message: string } | null }>> = [];
   if (caller.sbIds.length > 0) {
-    reads.push(supabase.from('agent_identities').select('id, metadata').in('id', caller.sbIds));
+    reads.push(
+      supabase.from('agent_identities').select('id, agent_id, metadata').in('id', caller.sbIds)
+    );
   }
   if (caller.sbSlugs.length > 0) {
     reads.push(
       supabase
         .from('agent_identities')
-        .select('id, metadata')
+        .select('id, agent_id, metadata')
         .eq('user_id', ownerUserId)
         .in('agent_id', caller.sbSlugs)
     );
@@ -114,12 +122,21 @@ async function callingInklings(
     }
     rows.push(...((data ?? []) as IdentityRow[]));
   }
-  return rows.filter((row) => row.metadata?.client === INKLING_CLIENT);
+  const ids = new Set(rows.map((row) => row.id.toLowerCase()));
+  const slugs = new Set(rows.map((row) => row.agent_id));
+  return {
+    inklings: rows.filter((row) => row.metadata?.client === INKLING_CLIENT),
+    unidentified: [
+      ...caller.sbIds.filter((id) => !ids.has(id)),
+      ...caller.sbSlugs.filter((slug) => !slugs.has(slug)),
+    ],
+  };
 }
 
 /**
- * Refuses (throws) when the caller is an inkling and the tool it runs inside
- * is not turned on for inklings. Called before any account is looked up.
+ * Refuses (throws) when the caller is an inkling, or names an SB no row
+ * answers to, and the tool it runs inside is not turned on for inklings.
+ * Called before any account is looked up.
  */
 export async function assertAccountTokenAllowed(
   supabase: SupabaseClient,
@@ -132,8 +149,8 @@ export async function assertAccountTokenAllowed(
   } = {}
 ): Promise<void> {
   const caller = options.caller ?? accountGateCaller();
-  const inklings = await callingInklings(supabase, ownerUserId, caller);
-  if (inklings.length === 0) return;
+  const { inklings, unidentified } = await identifyCaller(supabase, ownerUserId, caller);
+  if (inklings.length === 0 && unidentified.length === 0) return;
   const toolName = options.toolName ?? currentToolName();
   const allowlist = options.allowlist ?? inklingAccountToolAllowlist().tools;
   if (toolName && allowlist.has(toolName)) return;
@@ -141,9 +158,14 @@ export async function assertAccountTokenAllowed(
     provider,
     tool: toolName ?? null,
     sbIds: inklings.map((row) => row.id),
+    unidentified: unidentified.length,
   });
+  const call = toolName ?? 'This call';
   throw new InklingAccountRefusedError(
-    `${toolName ?? 'This call'} can't use its owner's ${provider} account in an inkling's turn: ` +
-      'it is not turned on for inklings on this server.'
+    inklings.length > 0
+      ? `${call} can't use its owner's ${provider} account in an inkling's turn: ` +
+          'it is not turned on for inklings on this server.'
+      : `${call} can't use its owner's ${provider} account: the calling SB has no identity ` +
+          "on this account, and an SB the server can't identify is refused like an inkling."
   );
 }

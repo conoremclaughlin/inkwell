@@ -129,7 +129,9 @@ vi.mock('googleapis', () => ({
 
 import { applyProfile } from '../../../../cli/src/repl/tool-profiles';
 import { ToolPolicyState } from '../../../../cli/src/repl/tool-policy';
+import { signRunnerAccessToken } from '../../auth/ink-tokens';
 import { executionTierFor } from '../../config/execution-tier';
+import { InkAuthProvider } from '../../mcp/auth/ink-auth-provider';
 import { registerAllTools } from '../../mcp/tools/index';
 import { runWithRequestContext, tokenIdentityContext } from '../../utils/request-context';
 import { currentToolName, runInToolCall } from '../../utils/tool-call-context';
@@ -284,6 +286,60 @@ describe('assertAccountTokenAllowed', () => {
       ]);
     }
   );
+
+  describe('an SB the request names that no row answers to is refused like an inkling (Lumen, PR #793)', () => {
+    const GONE = '00000000-0000-4000-8000-0000000000dd';
+
+    it('refuses a token whose identity row is gone', async () => {
+      await expect(
+        gate({ ...tokenIdentityContext({ sbId: GONE, sbSlug: 'pip-gone' }) }, 'list_emails')
+      ).rejects.toThrow(
+        "list_emails can't use its owner's google account: the calling SB has no identity on this account"
+      );
+    });
+
+    it('refuses a slug-only token whose slug no row carries', async () => {
+      await expect(
+        gate({ ...tokenIdentityContext({ sbSlug: 'kindle-gone' }) }, 'list_emails')
+      ).rejects.toThrow('the calling SB has no identity on this account');
+    });
+
+    it("refuses an ordinary SB's token beside a context naming an SB that is gone", async () => {
+      await expect(
+        gate(
+          { ...tokenIdentityContext({ sbId: ORDINARY_SB, sbSlug: 'myra' }), sbId: GONE },
+          'list_emails'
+        )
+      ).rejects.toThrow(InklingAccountRefusedError);
+    });
+
+    it('admits it for a tool turned on for inklings, as it would an inkling', async () => {
+      await expect(
+        gate({ ...tokenIdentityContext({ sbId: GONE }) }, 'list_emails', new Set(['list_emails']))
+      ).resolves.toBeUndefined();
+    });
+
+    it('counts a slug as identified by the row its UUID names, whoever owns that row', async () => {
+      fake.tables.agent_identities.push({
+        id: '00000000-0000-4000-8000-0000000000ee',
+        agent_id: 'quill',
+        user_id: '00000000-0000-4000-8000-0000000000ff',
+        workspace_id: WORKSPACE,
+        metadata: {},
+      });
+      await expect(
+        gate(
+          {
+            ...tokenIdentityContext({
+              sbId: '00000000-0000-4000-8000-0000000000ee',
+              sbSlug: 'quill',
+            }),
+          },
+          'list_emails'
+        )
+      ).resolves.toBeUndefined();
+    });
+  });
 
   it('does not gate a person (no SB in the context), and reads nothing', async () => {
     await expect(
@@ -541,6 +597,40 @@ describe('a Google tool from an inkling turn, end to end', () => {
       expect(fake.provider).not.toHaveBeenCalled();
     }
   );
+
+  it("refuses an inkling's still-valid token after its identity is deleted with its space (Lumen, PR #793)", async () => {
+    const token = signRunnerAccessToken({
+      userId: OWNER,
+      email: 'owner@example.test',
+      sbSlug: 'pip',
+      sbId: INKLING,
+      sessionId: '00000000-0000-4000-8000-000000000088',
+    });
+    const verifier = Object.create(InkAuthProvider.prototype) as InkAuthProvider;
+    const server = registered();
+    const verified = verifier.verifyAccessToken(`Bearer ${token}`)!;
+    expect(verified).toMatchObject({ userId: OWNER, sbId: INKLING, sbSlug: 'pip' });
+
+    // A deleted space takes its identities with it (ON DELETE CASCADE); the
+    // owner's account, and the token already issued, remain.
+    fake.tables.agent_identities = fake.tables.agent_identities.filter((row) => row.id !== INKLING);
+    const stillVerified = verifier.verifyAccessToken(`Bearer ${token}`)!;
+    expect(stillVerified).toMatchObject({ userId: OWNER, sbId: INKLING });
+    const scope = await resolveWorkspaceContextForRequest({
+      requestedWorkspaceId: OTHER_WORKSPACE,
+      validateRequestedWorkspaceId: async (id) => id === OTHER_WORKSPACE,
+    });
+
+    const result = await call(server, 'list_email_labels', {
+      ...stillVerified,
+      ...tokenIdentityContext(stillVerified),
+      workspaceId: scope!.workspaceId,
+      workspaceSource: scope!.source,
+    });
+    expect(result.error).toContain('the calling SB has no identity on this account');
+    expect(accountReads()).toEqual([]);
+    expect(fake.provider).not.toHaveBeenCalled();
+  });
 
   it('keeps each registered handler in its own name while calls overlap (Lumen, PR #793)', async () => {
     const server = registered();
