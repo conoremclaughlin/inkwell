@@ -1122,6 +1122,9 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     let userEmail: string | undefined;
     let tokenSbId: string | undefined;
     let issueTokenCookies = false;
+    // Tier 3 resolves its account from the database; tiers 1 and 2 take it
+    // from a signed token or a refresh row, which outlive a deleted account.
+    let accountReadFromDatabase = false;
 
     // --- Tier 1: Inkwell admin access JWT (local, ~0ms) ---
     const payload = verifyInkAccessToken(token, 'pcp_admin');
@@ -1213,17 +1216,13 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       inkUserId = resolved.userId;
       userEmail = normalizedEmail || user.email || undefined;
       issueTokenCookies = true;
+      accountReadFromDatabase = true;
     }
 
     // Every tier has its account now. One being deleted takes no new
     // requests; this one holds its gate until its response has closed
     // (ink://specs/account-deletion §3).
     if (!leaseAccountForRequest(res, inkUserId)) return;
-
-    // --- Workspace resolution (all tiers, 1 DB query) ---
-    const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaces;
-    const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
     // For trusted-user resolution we need telegram/whatsapp IDs.
     // Tier 1/2 don't have them in JWT claims, so fetch when needed.
@@ -1232,6 +1231,38 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       telegram_id: string | null;
       whatsapp_id: string | null;
     } | null = null;
+
+    // A signed token proves who it was issued to, not that the account is
+    // still there: one deleted after the token was signed gets the refusal an
+    // expired token gets, before anything is provisioned for it (task
+    // 7ee3c7be: a deleted account's mobile token reached
+    // ensurePersonalWorkspace, whose insert its key refused, as a 500). One
+    // primary-key read; a read that fails refuses rather than lets the
+    // request through.
+    if (!accountReadFromDatabase) {
+      const { data: account, error: accountError } = await supabase
+        .from('users')
+        .select('id, telegram_id, whatsapp_id')
+        .eq('id', inkUserId)
+        .maybeSingle();
+      if (accountError) {
+        logger.error('Could not confirm the account for an admin request', {
+          error: accountError.message,
+        });
+        res.status(503).json({ error: 'Could not confirm your account. Try again.' });
+        return;
+      }
+      if (!account) {
+        res.status(401).json({ error: 'Account not found' });
+        return;
+      }
+      inkUserRecord = account;
+    }
+
+    // --- Workspace resolution (all tiers, 1 DB query) ---
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaces;
+    const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
     const getInkUserRecord = async () => {
       if (!inkUserRecord) {
@@ -1547,8 +1578,11 @@ async function findOrProvisionInkUser(
   return { id: resolved.userId };
 }
 
-/** The pcp_admin access/refresh pair every mobile sign-in path returns. */
-async function issueMobileTokens(
+/**
+ * The pcp_admin access/refresh pair every mobile sign-in path returns.
+ * Exported so a regression can sign in exactly as the app does.
+ */
+export async function issueMobileTokens(
   supabase: SupabaseClient<Database>,
   userId: string,
   email: string

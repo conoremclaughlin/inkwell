@@ -198,6 +198,7 @@ function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
   userChain.update = vi.fn(() => userChain);
   userChain.eq = vi.fn(() => userChain);
   userChain.single = vi.fn(() => Promise.resolve({ data: inkUser, error: null }));
+  userChain.maybeSingle = vi.fn(() => Promise.resolve({ data: inkUser, error: null }));
 
   mockSupabaseFrom.mockImplementation((table: string) => {
     if (table === 'users') return userChain;
@@ -206,6 +207,29 @@ function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
   mockResolvePrincipal.mockResolvedValue({ ok: true, userId: inkUser.id, created: false });
 
   return userChain;
+}
+
+/**
+ * Every account a token names exists unless a test says otherwise: the users
+ * read tiers 1 and 2 make answers with the row for the id it is asked about.
+ */
+function mockAccountsExist() {
+  mockSupabaseFrom.mockImplementation((table: string) => {
+    const chain: Record<string, any> = {};
+    let id = '';
+    chain.select = vi.fn(() => chain);
+    chain.eq = vi.fn((_column: string, value: string) => {
+      id = value;
+      return chain;
+    });
+    const row = () => ({
+      data: table === 'users' ? { id, telegram_id: null, whatsapp_id: null } : null,
+      error: null,
+    });
+    chain.maybeSingle = vi.fn(() => Promise.resolve(row()));
+    chain.single = vi.fn(() => Promise.resolve(row()));
+    return chain;
+  });
 }
 
 /** Standard workspace mock that returns a personal workspace */
@@ -229,6 +253,7 @@ describe('adminAuthMiddleware', () => {
     capturedRunContext = null;
     middleware = getMiddleware();
     mockDefaultWorkspace();
+    mockAccountsExist();
   });
 
   // =========================================================================
@@ -551,6 +576,92 @@ describe('adminAuthMiddleware', () => {
   });
 
   // =========================================================================
+  // An account deleted after its token was signed (task 7ee3c7be)
+  // =========================================================================
+
+  describe('an account that is gone', () => {
+    /** The users read answers with no row, or fails, for whichever id it is asked about. */
+    function accountsRead(answer: { data: null; error: { message: string } | null }) {
+      const chain: Record<string, any> = {};
+      chain.select = vi.fn(() => chain);
+      chain.eq = vi.fn(() => chain);
+      chain.maybeSingle = vi.fn(() => Promise.resolve(answer));
+      chain.single = vi.fn(() => Promise.resolve(answer));
+      mockSupabaseFrom.mockImplementation(() => chain);
+      return chain;
+    }
+    const nothingProvisioned = () => {
+      expect(mockEnsurePersonalWorkspace).not.toHaveBeenCalled();
+      expect(mockFindByIdWithRole).not.toHaveBeenCalled();
+      expect(mockFindRawById).not.toHaveBeenCalled();
+    };
+    const adminToken = (sub: string) =>
+      mockVerifyInkAccessToken.mockReturnValue({
+        type: 'pcp_admin',
+        sub,
+        email: 'gone@example.com',
+        scope: 'admin',
+      });
+
+    it('refuses a signed token whose account is gone with 401, before any workspace is looked up or made, with or without a space named', async () => {
+      accountsRead({ data: null, error: null });
+      adminToken('user-gone');
+      for (const headers of [
+        { authorization: 'Bearer test-token' },
+        { authorization: 'Bearer test-token', 'x-ink-workspace-id': 'workspace-1' },
+      ]) {
+        const res = createMockRes();
+        const next = vi.fn();
+        await middleware(createMockReq({ headers }), res, next);
+        expect(res._status).toBe(401);
+        expect(res._json).toEqual({ error: 'Account not found' });
+        expect(next).not.toHaveBeenCalled();
+      }
+      nothingProvisioned();
+      // The gate was never closed for it, as after a restart: the read decides.
+      expect(accountGate.isClosed('user-gone')).toBe(false);
+    });
+
+    it('refuses a refresh cookie whose account is gone the same way', async () => {
+      accountsRead({ data: null, error: null });
+      mockVerifyInkAccessToken.mockReturnValue(null);
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'new-access-jwt',
+        userId: 'user-gone',
+        email: 'gone@example.com',
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+      await middleware(
+        createMockReq({ cookies: { 'pcp-admin-refresh': 'ink-rt-left' } }),
+        res,
+        next
+      );
+      expect(res._status).toBe(401);
+      expect(next).not.toHaveBeenCalled();
+      nothingProvisioned();
+    });
+
+    it('refuses with 503 when the account cannot be read, never letting the request through', async () => {
+      accountsRead({ data: null, error: { message: 'connection reset' } });
+      adminToken('user-unread');
+      const res = createMockRes();
+      const next = vi.fn();
+      await middleware(createMockReq(), res, next);
+      expect(res._status).toBe(503);
+      expect(next).not.toHaveBeenCalled();
+      nothingProvisioned();
+    });
+
+    it('reads the account once for a signed token and reuses the row for trusted access', async () => {
+      adminToken('user-123');
+      await middleware(createMockReq(), createMockRes(), vi.fn());
+      const usersReads = mockSupabaseFrom.mock.calls.filter(([table]) => table === 'users');
+      expect(usersReads).toHaveLength(1);
+    });
+  });
+
+  // =========================================================================
   // Tier 2: Refresh token exchange
   // =========================================================================
 
@@ -669,7 +780,7 @@ describe('adminAuthMiddleware', () => {
         data: { user: { email: 'tier3@example.com' } },
         error: null,
       });
-      mockSupabaseUserLookup({
+      const usersChain = mockSupabaseUserLookup({
         id: 'user-tier3',
         telegram_id: null,
         whatsapp_id: null,
@@ -711,6 +822,8 @@ describe('adminAuthMiddleware', () => {
         { type: 'pcp_admin', sub: 'user-tier3', email: 'tier3@example.com', scope: 'admin' },
         3600
       );
+      // Its account was resolved from the database already: no second read.
+      expect(usersChain.maybeSingle).not.toHaveBeenCalled();
 
       // Should create refresh token with dashboard client
       expect(mockCreateRefreshToken).toHaveBeenCalledWith(
