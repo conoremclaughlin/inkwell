@@ -136,6 +136,23 @@ d('held notices — real schema', () => {
     expect(error).toBeNull();
   };
 
+  /**
+   * Users for notices beyond the two fixture users. A notice's user_id is a
+   * key to users (ink://specs/account-deletion), so each one is a real,
+   * synthetic users row, removed after its case.
+   */
+  const seededUsers: string[] = [];
+  const ensureUsers = async (ids: string[]) => {
+    for (let i = 0; i < ids.length; i += 1_000) {
+      const chunk = ids.slice(i, i + 1_000);
+      const { error } = await client
+        .from('users')
+        .insert(chunk.map((id) => ({ id, email: `held-notices-${id}@example.test` })) as never);
+      expect(error).toBeNull();
+      seededUsers.push(...chunk);
+    }
+  };
+
   // Each case starts from no notices. In afterEach, not at the end of a test,
   // so a failing assertion cannot leave its rows for the next case to find.
   afterEach(async () => {
@@ -144,6 +161,10 @@ d('held notices — real schema', () => {
       .delete()
       .in('reminder_id', [reminderId, otherReminderId]);
     await client.from('reminder_history').delete().in('reminder_id', [reminderId, otherReminderId]);
+    while (seededUsers.length > 0) {
+      const chunk = seededUsers.splice(0, 500);
+      await client.from('users').delete().in('id', chunk);
+    }
   });
 
   afterAll(async () => {
@@ -340,13 +361,14 @@ d('held notices — real schema', () => {
   /**
    * The candidate read takes users 100 at a time. 100 users fill the first
    * chunk with 20 newer notices; the 101st user's notice is older than all of
-   * them. Notices need only the reminder's foreign key, so the users here are
-   * ids on the fixture reminder.
+   * them. The notices sit on the fixture reminder; the users holding a notice
+   * are real rows (ensureUsers), and the rest of the chunk is ids only.
    */
   const crossChunkFixture = async () => {
     const firstChunk = Array.from({ length: 100 }, () => randomUUID());
     const lateUser = randomUUID();
     const oldest = `oldest-${randomUUID()}`;
+    await ensureUsers([lateUser, ...firstChunk.slice(0, 20)]);
     // Its own INSERT, before the others, so its created_at is the earliest.
     await insertHeld({ kind: 'outage', episodeKey: oldest, uid: lateUser });
     await insertMany(
@@ -378,6 +400,7 @@ d('held notices — real schema', () => {
   it('lists every user, past any fixed number of pages', async () => {
     // 10,001 users: one more than fifty pages of two hundred.
     const users = Array.from({ length: 10_001 }, () => randomUUID());
+    await ensureUsers(users);
     for (let i = 0; i < users.length; i += 1_000) {
       await insertMany(
         users

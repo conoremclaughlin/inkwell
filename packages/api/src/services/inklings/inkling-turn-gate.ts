@@ -29,7 +29,19 @@ import { INKLING_CLIENT } from './inkling-service';
  * the whole gate.
  */
 export type InklingIdentity =
-  | { kind: 'inkling'; id: string; userId: string; metadata: Record<string, unknown> }
+  | {
+      kind: 'inkling';
+      id: string;
+      userId: string;
+      /**
+       * Its space: the only space whose conversations it takes part in, since
+       * a thread participant's identity must belong to the thread's space
+       * (inbox_thread_participants_sb_workspace_fkey). Null for a legacy
+       * workspace-less row.
+       */
+      workspaceId: string | null;
+      metadata: Record<string, unknown>;
+    }
   | { kind: 'other' }
   | { kind: 'unknown'; transient: boolean };
 
@@ -45,18 +57,25 @@ export async function classifyIdentityById(
 ): Promise<InklingIdentity> {
   const { data, error } = await supabase
     .from('agent_identities')
-    .select('id, user_id, metadata')
+    .select('id, user_id, workspace_id, metadata')
     .eq('id', sbId)
     .maybeSingle();
   if (error) return { kind: 'unknown', transient: true };
   const row = data as {
     id: string;
     user_id: string;
+    workspace_id: string | null;
     metadata: Record<string, unknown> | null;
   } | null;
   if (!row) return { kind: 'unknown', transient: false };
   if (row.metadata?.client !== INKLING_CLIENT) return { kind: 'other' };
-  return { kind: 'inkling', id: row.id, userId: row.user_id, metadata: row.metadata ?? {} };
+  return {
+    kind: 'inkling',
+    id: row.id,
+    userId: row.user_id,
+    workspaceId: row.workspace_id ?? null,
+    metadata: row.metadata ?? {},
+  };
 }
 
 /**
