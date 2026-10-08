@@ -76,13 +76,31 @@ describe('classifyAddress', () => {
     ['::ffff:0:a00:1', 'private'],
     ['64:ff9b::7f00:1', 'loopback'],
     ['64:ff9b::a9fe:a9fe', 'link-local'],
-    ['64:ff9b:1::a00:1', 'private'],
     ['2002:7f00:1::', 'loopback'],
     ['2002:c0a8:0101::1', 'private'],
     ['2600:1f18::5efe:7f00:1', 'loopback'],
     ['2600:1f18::200:5efe:a9fe:a9fe', 'link-local'],
   ])('refuses %s by the IPv4 address it carries (%s)', (address, range) => {
     expect(classifyAddress(address)).toBe(range);
+  });
+
+  // The local-use NAT64 /48 carries its IPv4 at a position that depends on
+  // the operator's prefix length, so all of it is refused, public payloads
+  // included. The first two are Lumen's, from review of PR #792.
+  it.each([
+    '64:ff9b:1:1234::a00:1',
+    '64:ff9b:1:1234::a9fe:a9fe',
+    '64:ff9b:1::a00:1',
+    '64:ff9b:1::808:808',
+    '64:ff9b:1:ffff:ffff:ffff:ffff:ffff',
+  ])('refuses %s, inside the local-use NAT64 prefix', (address) => {
+    expect(classifyAddress(address)).toBe('reserved');
+  });
+
+  it('stops at the edges of that /48', () => {
+    // Just outside it on each side. Not a claim that either is routable.
+    expect(classifyAddress('64:ff9b:0:ffff:ffff:ffff:ffff:ffff')).toBeNull();
+    expect(classifyAddress('64:ff9b:2::1')).toBeNull();
   });
 
   it.each([
@@ -133,7 +151,6 @@ describe('ipv6Hextets', () => {
     expect(carried('::ffff:10.1.2.3')).toBe('10.1.2.3');
     expect(carried('::ffff:0:a01:203')).toBe('10.1.2.3');
     expect(carried('64:ff9b::a01:203')).toBe('10.1.2.3');
-    expect(carried('64:ff9b:1::a01:203')).toBe('10.1.2.3');
     expect(carried('2002:a01:203::')).toBe('10.1.2.3');
     expect(carried('2600::5efe:a01:203')).toBe('10.1.2.3');
     expect(carried('2606:4700:4700::1111')).toBeNull();

@@ -95,11 +95,19 @@ const IPV4_RANGES = rangeList('ipv4', [
  * where OpenClaw lets Teredo and a few other carve-outs through to the
  * embedded-IPv4 check; nothing fetchable lives there, and Teredo's public
  * relays are gone. AWS's IPv6 metadata address, fd00:ec2::254, is unique-local.
+ *
+ * The NAT64 local-use prefix, 64:ff9b:1::/48 (RFC 8215), is refused whole as
+ * well. An operator may translate through any more specific prefix inside
+ * it, and RFC 6052 puts the IPv4 address at a different position for each
+ * prefix length, so no one position can be read and checked. OpenClaw read
+ * the last 32 bits of 64:ff9b:1::/96 only, which let 64:ff9b:1:1234::a00:1
+ * through (Lumen, PR #792).
  */
 const IPV6_RANGES = rangeList('ipv6', [
   ['::', 128, 'unspecified'],
   ['::1', 128, 'loopback'],
   ['::', 96, 'reserved'],
+  ['64:ff9b:1::', 48, 'reserved'],
   ['100::', 64, 'reserved'],
   ['2001::', 23, 'reserved'],
   ['2001:db8::', 32, 'documentation'],
@@ -170,8 +178,9 @@ function ipv4FromHextets(high: number, low: number): string {
 /**
  * The IPv4 address an IPv6 one carries, when it is one of the forms that
  * route to it: IPv4-mapped (::ffff:0:0/96), IPv4-translated (::ffff:0:0:0/96),
- * NAT64 (64:ff9b::/96 and the local-use 64:ff9b:1::/48), 6to4 (2002::/16), and
- * an ISATAP interface id (…:0:5efe:w.x.y.z). OpenClaw's rules, ported.
+ * well-known NAT64 (64:ff9b::/96), 6to4 (2002::/16), and an ISATAP interface
+ * id (…:0:5efe:w.x.y.z). OpenClaw's rules, ported; the local-use NAT64 prefix
+ * is a refused range instead (see IPV6_RANGES).
  */
 export function embeddedIpv4(hextets: number[]): string | null {
   const [a, b, c, d, e, f, g, h] = hextets;
@@ -179,7 +188,6 @@ export function embeddedIpv4(hextets: number[]): string | null {
   if (zero(a, b, c, d, e) && f === 0xffff) return ipv4FromHextets(g, h);
   if (zero(a, b, c, d) && e === 0xffff && f === 0) return ipv4FromHextets(g, h);
   if (a === 0x0064 && b === 0xff9b && zero(c, d, e, f)) return ipv4FromHextets(g, h);
-  if (a === 0x0064 && b === 0xff9b && c === 0x0001 && zero(d, e, f)) return ipv4FromHextets(g, h);
   if (a === 0x2002) return ipv4FromHextets(b, c);
   if ((e & 0xfcff) === 0 && f === 0x5efe) return ipv4FromHextets(g, h);
   return null;
