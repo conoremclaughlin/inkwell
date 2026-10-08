@@ -160,6 +160,40 @@ describe('saved logins in Supabase Vault', () => {
     await store.remove(ada, saved.id);
   });
 
+  it('reads and lists while the login is being edited see one version or the other, never a gap', async () => {
+    // Each edit deletes the secrets the login pointed at. A read that took
+    // the row in one statement and its secrets in another could land in
+    // between and find them gone (PR #782 review, P2).
+    const saved = await store.create(ada, item, { password: `${PASSWORD}-0`, authenticator: null });
+    const seen = new Set<string>();
+    for (let revision = 1; revision <= 12; revision++) {
+      const [edited, ...reads] = await Promise.all([
+        store.replace(ada, saved.id, revision, item, {
+          password: `${PASSWORD}-${revision}`,
+          authenticator: null,
+        }),
+        store.open(ada, saved.id, ['item', 'secret']),
+        store.open(ada, saved.id, ['secret']),
+        store.list(ada),
+        store.open(ada, saved.id, ['secret']),
+      ]);
+      expect(edited?.revision).toBe(revision + 1);
+      for (const read of reads) {
+        if (Array.isArray(read)) {
+          expect(read.map((l) => l.item)).toEqual([item]);
+        } else {
+          expect([`${PASSWORD}-${revision - 1}`, `${PASSWORD}-${revision}`]).toContain(
+            read!.secret!.password
+          );
+          seen.add(read!.secret!.password!);
+        }
+      }
+    }
+    expect(seen.size).toBeGreaterThan(1);
+    expect(await owned(ada)).toHaveLength(2);
+    await store.remove(ada, saved.id);
+  });
+
   it('keeps every value encrypted at rest', async () => {
     const saved = await store.create(ada, item, { password: PASSWORD, authenticator: null });
     const client = await pg();
