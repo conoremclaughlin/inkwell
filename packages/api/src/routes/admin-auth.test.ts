@@ -119,6 +119,7 @@ vi.mock('../utils/request-context', () => ({
 // ---------------------------------------------------------------------------
 
 import router from './admin';
+import { accountGate } from '../services/account-deletion/gate';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -301,6 +302,45 @@ describe('adminAuthMiddleware', () => {
       expect(mockGetUser).not.toHaveBeenCalled();
       // Should NOT issue new cookies
       expect(Object.keys(res._cookies)).toHaveLength(0);
+    });
+
+    it('refuses an account that is being deleted, at every tier, and holds its gate while a request runs', async () => {
+      mockVerifyInkAccessToken.mockReturnValue({
+        type: 'pcp_admin',
+        sub: 'user-closing',
+        email: 'closing@example.com',
+        scope: 'admin',
+      });
+
+      // Open: the request holds the account's gate until its response closes.
+      const listeners: Array<() => void> = [];
+      const open = createMockRes();
+      (open as unknown as { once: (event: string, fn: () => void) => void }).once = (
+        event: string,
+        fn: () => void
+      ) => {
+        if (event === 'close') listeners.push(fn);
+      };
+      const next = vi.fn();
+      await middleware(createMockReq(), open, next);
+      expect(next).toHaveBeenCalled();
+      expect(accountGate.inFlightCount('user-closing')).toBe(1);
+      for (const fn of listeners) fn();
+      expect(accountGate.inFlightCount('user-closing')).toBe(0);
+
+      // Closed: answered 403, and nothing behind the middleware runs.
+      accountGate.close('user-closing');
+      try {
+        const res = createMockRes();
+        const refusedNext = vi.fn();
+        await middleware(createMockReq(), res, refusedNext);
+        expect(res._status).toBe(403);
+        expect(res._json).toEqual({ error: 'This account is being deleted' });
+        expect(refusedNext).not.toHaveBeenCalled();
+        expect(accountGate.inFlightCount('user-closing')).toBe(0);
+      } finally {
+        accountGate.forget('user-closing');
+      }
     });
 
     it('should set inkUserId and email from JWT claims', async () => {

@@ -145,10 +145,13 @@ ALTER TABLE public.inbox_threads VALIDATE CONSTRAINT inbox_threads_closer_princi
 -- insert that names any of them waits for this transaction and then fails
 -- its key check.
 
+-- search_path is public, not empty: the identity and memory archive
+-- triggers this delete fires name their history tables unqualified, and a
+-- trigger runs under the search_path of the function that fired it.
 CREATE OR REPLACE FUNCTION public.delete_account(p_user_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
-SET search_path = ''
+SET search_path = public
 AS $$
 DECLARE
   v_step text;
@@ -270,7 +273,8 @@ BEGIN
   GET DIAGNOSTICS v_n = ROW_COUNT;
   v_counts := v_counts || jsonb_build_object('legacyInboxSent', v_n);
 
-  DELETE FROM public.task_comments WHERE user_id = p_user_id OR created_by_sb_id = ANY (v_sb);
+  DELETE FROM public.task_comments
+  WHERE user_id = p_user_id OR created_by_sb_id = ANY (v_sb) OR workspace_id = ANY (v_ws);
   GET DIAGNOSTICS v_n = ROW_COUNT;
   v_counts := v_counts || jsonb_build_object('taskComments', v_n);
 
@@ -308,6 +312,14 @@ BEGIN
   UPDATE public.trusted_users SET added_by = NULL WHERE added_by = p_user_id;
   UPDATE public.user_permissions SET granted_by = NULL WHERE granted_by = p_user_id;
   UPDATE public.scheduled_reminders SET sb_id = NULL WHERE sb_id = ANY (v_sb) AND user_id <> p_user_id;
+
+  -- The account's own conversations and reminders go before its identities:
+  -- they name them by keys with no delete rule, and the users row's cascade
+  -- (which would take them too) comes only after.
+  DELETE FROM public.inbox_threads WHERE workspace_id = ANY (v_ws);
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  v_counts := v_counts || jsonb_build_object('ownThreads', v_n);
+  DELETE FROM public.scheduled_reminders WHERE user_id = p_user_id;
 
   -- Memories and identities archive themselves on delete, so they go before
   -- the users row, and their history after them.

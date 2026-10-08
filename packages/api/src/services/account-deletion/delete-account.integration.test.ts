@@ -212,9 +212,9 @@ describe('delete_account', () => {
     );
     sharedThread = await thread(shared, { userId: ada.id });
     await db.query(
-      `INSERT INTO inbox_thread_participants (thread_id, workspace_id, user_id, principal_key)
-       VALUES ($1, $2, $3, $4), ($1, $2, $5, $6)`,
-      [sharedThread, shared, ada.id, `user:${ada.id}`, bea.id, `user:${bea.id}`]
+      `INSERT INTO inbox_thread_participants (thread_id, workspace_id, user_id)
+       VALUES ($1, $2, $3), ($1, $2, $4)`,
+      [sharedThread, shared, ada.id, bea.id]
     );
     adaInShared = await userMessage(sharedThread, ada.id, 'Chapter three was the best one');
     beaInShared = await userMessage(sharedThread, bea.id, 'Agreed');
