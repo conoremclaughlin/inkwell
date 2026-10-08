@@ -134,8 +134,10 @@ export class SessionTurnCoordinator {
     if (!submitted.raw.trim()) return undefined;
     this.running = true;
     const input = { ...submitted };
+    let inputEid: number | undefined;
+    let executionEntered = false;
     try {
-      this.recordInput(input);
+      inputEid = this.recordInput(input);
       await this.ports.inputRecorded?.();
       signal?.throwIfAborted();
       await this.ports.compact('pre-turn budget check');
@@ -152,6 +154,7 @@ export class SessionTurnCoordinator {
       // No provider dispatch after an unobserved asynchronous input/hook write failure.
       await this.ports.log.flush();
       signal?.throwIfAborted();
+      executionEntered = true;
       const execution = await execute({ input, occupancy, promptHooks });
       const { loop, backend } = execution;
       const state = this.ports.state();
@@ -202,23 +205,38 @@ export class SessionTurnCoordinator {
       }
       await this.ports.log.flush();
       return { execution, endHooks, autoEviction };
+    } catch (error) {
+      if (signal?.aborted && inputEid !== undefined && !executionEntered) {
+        // Input stays history, but is not an unfinished command to replay.
+        // This says ONLY that ordinary execution was not entered: preparation,
+        // hooks or compaction may already have performed their own effects.
+        // Finish while the host log is still writable. A failed append/flush
+        // propagates as uncertainty, never as a confirmed cancellation receipt.
+        this.ports.log.append({
+          type: 'input_cancelled',
+          inputEid,
+          stage: 'before_ordinary_dispatch',
+        });
+        await this.ports.log.flush();
+      }
+      throw error;
     } finally {
       this.running = false;
     }
   }
 
-  private recordInput(input: SessionTurnInput): void {
+  private recordInput(input: SessionTurnInput): number {
     const { ledger, log } = this.ports;
     if (input.source === 'user') {
       ledger.addEntry('user', input.raw, 'repl');
-      log.append({ type: 'user', content: input.raw });
+      return log.append({ type: 'user', content: input.raw });
     } else if (input.source === 'system') {
       const label = input.displayLabel || 'system';
       ledger.addEntry('system', input.raw, label);
-      log.append({ type: 'system_turn', content: input.raw, label });
+      return log.append({ type: 'system_turn', content: input.raw, label });
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${input.raw}`, 500), 'auto-run');
-      log.append({ type: 'auto_turn', content: input.raw });
+      return log.append({ type: 'auto_turn', content: input.raw });
     }
   }
 

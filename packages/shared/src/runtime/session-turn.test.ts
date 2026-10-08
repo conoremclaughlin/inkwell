@@ -430,7 +430,121 @@ describe('SessionTurnCoordinator', () => {
     await assertion;
     expect(execute).not.toHaveBeenCalled();
     expect(h.events.some((e) => e.type === 'hook_timeout')).toBe(false);
+    expect(h.events.at(-1)).toMatchObject({
+      type: 'input_cancelled',
+      inputEid: h.events[0].eid,
+      stage: 'before_ordinary_dispatch',
+    });
     release.resolve();
+  });
+
+  it.each(['user', 'system', 'inbox-auto'] as const)(
+    '%s cancelled after recording stays history with a receipt, not a pending command',
+    async (source) => {
+      const h = harness();
+      const stop = new AbortController();
+      h.ports.inputRecorded.mockImplementation(async () => {
+        stop.abort(new Error('stopped'));
+      });
+      const execute = vi.fn(async () => outcome());
+      await expect(
+        h.coordinator.run({ raw: 'retained input', source }, execute, undefined, stop.signal)
+      ).rejects.toThrow('stopped');
+      expect(execute).not.toHaveBeenCalled();
+      expect(h.events).toHaveLength(2);
+      expect(h.events[0].content).toBe('retained input');
+      expect(h.events[1]).toMatchObject({
+        type: 'input_cancelled',
+        inputEid: h.events[0].eid,
+        stage: 'before_ordinary_dispatch',
+      });
+      expect(h.ledger.listEntries()).toHaveLength(1);
+      expect(h.coordinator.turnCount).toBe(0);
+    }
+  );
+
+  it('awaits the cancellation receipt before returning; compaction is not claimed effect-free', async () => {
+    const h = harness();
+    const stop = new AbortController();
+    const release = deferred();
+    const writing = deferred();
+    h.ports.log = new SessionLog({
+      path: 'memory',
+      sink: {
+        write: async (line) => {
+          const entry = JSON.parse(line);
+          if (entry.type === 'input_cancelled') {
+            writing.resolve();
+            await release.promise;
+          }
+          h.events.push(entry);
+        },
+      },
+    });
+    h.ports.compact.mockImplementation(async () => {
+      h.ports.log.append({ type: 'synthetic_compaction_effect' });
+      stop.abort(new Error('stopped'));
+    });
+    const execute = vi.fn(async () => outcome());
+    let returned = false;
+    const run = h.coordinator
+      .run({ raw: 'hi', source: 'user' }, execute, undefined, stop.signal)
+      .catch((error: unknown) => {
+        returned = true;
+        return error;
+      });
+    await writing.promise;
+    expect(returned).toBe(false);
+    expect(execute).not.toHaveBeenCalled();
+    release.resolve();
+    await run;
+    expect(h.events.map((event) => event.type)).toEqual([
+      'user',
+      'synthetic_compaction_effect',
+      'input_cancelled',
+    ]);
+    expect(h.events.at(-1)).toMatchObject({ stage: 'before_ordinary_dispatch' });
+  });
+
+  it('does not report cancellation confirmation if the receipt cannot be persisted', async () => {
+    const h = harness();
+    const stop = new AbortController();
+    h.ports.inputRecorded.mockImplementation(async () => {
+      stop.abort(new Error('stopped'));
+    });
+    h.ports.log = new SessionLog({
+      path: 'memory',
+      sink: {
+        write: (line) => {
+          const entry = JSON.parse(line);
+          if (entry.type === 'input_cancelled') throw new Error('receipt unavailable');
+          h.events.push(entry);
+        },
+      },
+    });
+    const execute = vi.fn(async () => outcome());
+    await expect(
+      h.coordinator.run({ raw: 'hi', source: 'user' }, execute, undefined, stop.signal)
+    ).rejects.toThrow('receipt unavailable');
+    expect(execute).not.toHaveBeenCalled();
+    expect(h.events.map((event) => event.type)).toEqual(['user']);
+  });
+
+  it('never writes a before-dispatch receipt for a cancellation after execute was entered', async () => {
+    const h = harness();
+    const stop = new AbortController();
+    await expect(
+      h.coordinator.run(
+        { raw: 'hi', source: 'user' },
+        async () => {
+          stop.abort(new Error('stopped after entry'));
+          throw stop.signal.reason;
+        },
+        undefined,
+        stop.signal
+      )
+    ).rejects.toThrow('stopped after entry');
+    expect(h.events.map((event) => event.type)).toEqual(['user']);
   });
 
   it('an already cancelled submission does not persist input', async () => {
