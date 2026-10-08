@@ -110,6 +110,12 @@ import { FAILURE_NOTICE_ERROR_KEYS } from '../services/trigger-failure-notice';
 import { takeReplyTicket } from '../services/inklings/inkling-reply-chain';
 import { inklingTurnActivity } from '../services/inklings/inkling-turns';
 import {
+  INKLING_SPACE_VALUES,
+  INKLING_STARTER,
+  ensureOwnAboutPage,
+  isInklingStarterSpace,
+} from '../services/inklings/starter-space';
+import {
   ReactionRefusedError,
   loadReactions,
   reactToMessage,
@@ -2164,6 +2170,12 @@ router.get('/workspaces', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaces;
+    // The space a request with no workspace header is scoped to, so a client
+    // that has switched elsewhere still knows the person's own space without
+    // guessing it by name or kind. Ensured before the list is read: a request
+    // scoped to a group can be the one that creates it, and the list must
+    // carry the space it names (Lumen, #784).
+    const defaultWorkspace = await workspaceRepo.ensurePersonalWorkspace(authReq.inkUserId);
     const workspaces = await workspaceRepo.listMembershipsByUser(authReq.inkUserId, {
       includeArchived: false,
     });
@@ -2175,6 +2187,7 @@ router.get('/workspaces', async (req: Request, res: Response) => {
 
     res.json({
       currentWorkspaceId: authReq.inkWorkspaceId,
+      defaultWorkspaceId: defaultWorkspace.id,
       currentWorkspaceRole,
       workspaces: workspaces.map((w) => ({
         id: w.id,
@@ -2217,6 +2230,13 @@ router.post('/workspaces', async (req: Request, res: Response) => {
     // A group that takes members only by invitation (limit B): set when it is
     // created, never switched later.
     const inviteOnly = workspaceType === 'team' && req.body?.membershipMode === INVITE_ONLY;
+    // The inkling starter set, asked for at creation: the inkling values, no
+    // process, and the creator's own About page (starter-space.ts).
+    const inklingStarter = req.body?.starter === INKLING_STARTER;
+    const metadata = {
+      ...(inviteOnly ? { membershipMode: INVITE_ONLY } : {}),
+      ...(inklingStarter ? { starter: INKLING_STARTER } : {}),
+    };
     const workspaceDescription =
       typeof req.body?.description === 'string' && req.body.description.trim()
         ? req.body.description.trim()
@@ -2236,7 +2256,8 @@ router.post('/workspaces', async (req: Request, res: Response) => {
         slug,
         type: workspaceType,
         description: workspaceDescription,
-        ...(inviteOnly ? { metadata: { membershipMode: INVITE_ONLY } } : {}),
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+        ...(inklingStarter ? { sharedValues: INKLING_SPACE_VALUES } : {}),
       });
     let createdWorkspace;
     try {
@@ -2248,6 +2269,20 @@ router.post('/workspaces', async (req: Request, res: Response) => {
     }
 
     await workspaceRepo.addMember(createdWorkspace.id, authReq.inkUserId, 'owner');
+    if (inklingStarter) {
+      // The space and its values exist by now; a missing template page is not
+      // worth a failure the app would retry into a second space.
+      await ensureOwnAboutPage(
+        dataComposer.getClient(),
+        createdWorkspace.id,
+        authReq.inkUserId
+      ).catch((error) =>
+        logger.warn('Inkling space created without its About page', {
+          workspaceId: createdWorkspace.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      );
+    }
 
     res.status(201).json({
       workspace: {
@@ -2975,11 +3010,23 @@ router.post('/invitations/accept', async (req: Request, res: Response) => {
     }
     const { data: workspace } = await supabase
       .from('workspaces')
-      .select('id, name')
+      .select('id, name, metadata')
       .eq('id', result.workspaceId)
       .maybeSingle();
+    // A person who joins an inkling space gets their own About page, never
+    // anyone else's (starter-space.ts).
+    if (workspace && isInklingStarterSpace(workspace.metadata)) {
+      await ensureOwnAboutPage(supabase, workspace.id, authReq.inkUserId).catch((error) =>
+        logger.warn('Joined an inkling space without an About page', {
+          workspaceId: workspace.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      );
+    }
     res.json({
-      workspace: workspace ?? { id: result.workspaceId, name: null },
+      workspace: workspace
+        ? { id: workspace.id, name: workspace.name }
+        : { id: result.workspaceId, name: null },
       alreadyMember: result.alreadyMember === true,
     });
   } catch (error) {
