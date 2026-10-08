@@ -60,6 +60,11 @@ describe('classifyAddress', () => {
     ['::8.8.8.8', 'reserved'],
     ['100::1', 'reserved'],
     ['2001::1', 'reserved'],
+    // 2001::/23 is refused whole. These two would pass OpenClaw's rules: a
+    // Teredo address whose client is the public 8.8.8.8, and AMT, a range
+    // ipaddr.js names but OpenClaw doesn't block.
+    ['2001::f7f7:f7f7', 'reserved'],
+    ['2001:3::1', 'reserved'],
     ['2001:2::1', 'reserved'],
     ['2001:db8::1', 'documentation'],
     ['fd00:ec2::254', 'unique-local'],
