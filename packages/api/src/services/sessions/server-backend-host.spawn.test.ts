@@ -114,6 +114,11 @@ function hostInput(overrides: Partial<ServerBackendHostInput> = {}) {
     claudeSupportsPartialMessages: async () => false,
     skillMcpServers: async () => [],
     warn: () => undefined,
+    reserveLaunch: async () => ({
+      env: { INK_LAUNCH_ID: 'synthetic-launch' },
+      spawned: vi.fn(),
+      exited: vi.fn(),
+    }),
     ...overrides,
   };
   return { input, mintAccessToken };
@@ -193,6 +198,8 @@ describe('a turn run through the server host', () => {
 
       expect(spawned).toHaveLength(1);
       const { env } = spawned[0]!;
+      expect(Object.keys(env)[0]).toBe('INK_LAUNCH_ID');
+      expect(env.INK_LAUNCH_ID).toBe('synthetic-launch');
       expect(env.INK_ACCESS_TOKEN).toBe('minted-for-this-spawn');
       expect(env.INK_DELEGATION_SECRET).toBe('synthetic-delegation-secret');
       expect(env.INK_SESSION_ID).toBe(admission.sessionId);

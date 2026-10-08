@@ -8,6 +8,15 @@
 import type { BackendStreamParser } from './stream.js';
 import type { SkillMcpServer } from './skill-mcp.js';
 
+/** One provider attempt's durable launch record, not the outer Ink turn's. */
+export interface BackendSpawnReservation {
+  readonly launchId: string;
+  /** Called synchronously after spawn returns a pid; never guesses a process group. */
+  spawned(process: { pid: number; pgid?: number }): void;
+  /** Called only when no child started or its exit is confirmed. */
+  exited(): void;
+}
+
 /**
  * What a provider spawn needs from the process that makes it, asked for by
  * name rather than read from that process's env, cwd or home. The CLI's host
@@ -88,6 +97,14 @@ export interface BackendHost {
    * is its own session (the CLI) has none to lose and omits it.
    */
   admitSpawn?(): boolean;
+  /**
+   * Optional for the CLI, mandatory for a hosted child: write the attempt
+   * before spawning it. Called after preparation and the effective-config
+   * check, then deadline, cancellation and admission are checked again.
+   * Rejection means nothing started. Each returned reservation belongs to
+   * exactly one attempt, even if several turns share a host concurrently.
+   */
+  reserveSpawn?(backend: string): Promise<BackendSpawnReservation>;
   /** A warning an adapter raises, such as media it could not inject. */
   warn(message: string): void;
 }
@@ -242,7 +259,8 @@ export interface PreparedBackend {
    * list alone: an image offered but not carried must go again with the next
    * spawn, not be counted as seen.
    */
-  contextImagesDelivered?: TurnMedia[]; /**
+  contextImagesDelivered?: TurnMedia[];
+  /**
    * What of this launch affects the backend's configuration, for its
    * effective-config check to apply as the spawn will: the arguments in
    * launch order, or a fixed reason they cannot be applied to a check.

@@ -1,9 +1,14 @@
-import { buildCleanEnv, SPAWN_ENV_INHERITED_NAMES, spawnBackend } from '../runner/spawn-backend.js';
+import {
+  buildCleanEnv,
+  LAUNCH_TAG,
+  SPAWN_ENV_INHERITED_NAMES,
+  spawnBackend,
+} from '../runner/spawn-backend.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from '../runtime/token-usage.js';
 import { getBackend } from './registry.js';
 import { PARENT_OWNED_TURN_ENV } from './turn-owner.js';
 import type { BackendTurnEvent } from './stream.js';
-import type { BackendHost, TurnMedia } from './types.js';
+import type { BackendHost, BackendSpawnReservation, TurnMedia } from './types.js';
 
 /** Env names that say which session a child serves; only the request's ids set them. */
 const ROUTING_ENV_NAMES = ['INK_SESSION_ID', 'INK_STUDIO_ID', 'INK_CONTEXT'] as const;
@@ -222,6 +227,10 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const preSpawn = new AbortController();
 
   const run = async (): Promise<BackendRunResult> => {
+    let reservation: BackendSpawnReservation | undefined;
+    // Once spawn is attempted, only its result can establish exit. A thrown
+    // spawn or an unknown result must leave the record open for reconciliation.
+    let childExited = true;
     const prepared = await adapter.prepare(
       {
         sbSlug: request.sbSlug,
@@ -288,6 +297,16 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         timedOut: false,
         childExited: true,
       });
+      const notAdmitted = (command: string): BackendRunResult => ({
+        success: false,
+        stdout: '',
+        stderr: 'the host withdrew admission before the backend was spawned',
+        exitCode: SPAWN_NOT_ADMITTED_EXIT_CODE,
+        durationMs: 0,
+        command,
+        timedOut: false,
+        childExited: true,
+      });
       // An abort during preparation ends the turn before anything is minted:
       // a minting host's credential would otherwise outlive the turn.
       if (abortRequested) {
@@ -311,7 +330,11 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       // env. The caller owns the logical turn of the session this child
       // serves (turn-owner.ts), and its host hands over that session's
       // credentials; buildCleanEnv inherits none of them on its own.
-      const sessionAdditions = { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV };
+      const sessionAdditions: Record<string, string> = {
+        ...credentials,
+        ...prepared.env,
+        ...PARENT_OWNED_TURN_ENV,
+      };
 
       if (adapter.checkEffectiveConfig) {
         // A budget the mint and the lookup already spent is a deadline passing,
@@ -356,7 +379,16 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         if (refusal !== undefined) return configRefused(command, refusal);
       }
 
-      // Measured at the spawn, after the check: the child's ceiling is never
+      if (host.admitSpawn && !host.admitSpawn()) return notAdmitted(command);
+      if (host.reserveSpawn) {
+        reservation = await host.reserveSpawn(request.backend);
+        if (!reservation.launchId.trim()) throw new Error('the launch record has no tag');
+        // A stale tag in credentials or adapter config cannot select another
+        // attempt's row. buildCleanEnv puts this reserved tag first.
+        sessionAdditions[LAUNCH_TAG] = reservation.launchId;
+      }
+
+      // Measured at the spawn, after the check and reservation: the child's ceiling is never
       // longer than what is left of the credentials it is handed, however
       // long the mint, the lookup and the check took.
       const hardTimeoutMs = Math.min(mintedCeilingMs - (Date.now() - mintedAt), ceilingMs());
@@ -370,18 +402,10 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       // whose admission was lost during the mint or the check (a takeover, a
       // shutdown closing intake) starts no child (Lumen, #701 873209b4).
       if (host.admitSpawn && !host.admitSpawn()) {
-        return {
-          success: false,
-          stdout: '',
-          stderr: 'the host withdrew admission before the backend was spawned',
-          exitCode: SPAWN_NOT_ADMITTED_EXIT_CODE,
-          durationMs: 0,
-          command,
-          timedOut: false,
-          childExited: true,
-        };
+        return notAdmitted(command);
       }
 
+      childExited = false;
       const spawned = spawnBackend({
         binary,
         args: prepared.args,
@@ -402,7 +426,19 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         onStderr: request.verbose ? (chunk) => process.stderr.write(chunk) : undefined,
       });
       stop = spawned.stop;
+      if (spawned.child.pid !== undefined && reservation) {
+        try {
+          reservation.spawned({ pid: spawned.child.pid });
+        } catch {
+          // A bookkeeping callback cannot abandon a live child, or masquerade
+          // as a refusal before spawn. Stop and wait for the real result.
+          spawned.stop(3000);
+          childExited = (await spawned.result).childExited;
+          throw new Error('the provider started but its pid could not be recorded');
+        }
+      }
       const spawnResult = await spawned.result;
+      childExited = spawnResult.childExited;
 
       if (parser) drain(parser.end());
       // In streaming mode the parsed assistant text is authoritative (stdout is
@@ -429,6 +465,15 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
           : {}),
       };
     } finally {
+      if (reservation && childExited) {
+        try {
+          reservation.exited();
+        } catch {
+          // Leaving a stale open row is conservative. Do not replace the
+          // provider's result with a best-effort record-cleanup failure.
+          host.warn('the provider launch exit could not be recorded');
+        }
+      }
       // After the child has stopped (spawnBackend settles no sooner), or
       // after a failure before it was spawned.
       await prepared.cleanup();

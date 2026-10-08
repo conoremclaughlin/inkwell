@@ -28,6 +28,7 @@ import {
   otherGenerationOwnsChild,
   type ChildOwnership,
 } from './active-runs.js';
+import { LAUNCH_TAG, reserveLaunch } from './launched-processes.js';
 
 /**
  * Added to a minted credential's lifetime for clock skew between this server
@@ -46,6 +47,8 @@ export const SERVER_HOST_REFUSALS = {
   wrongSession: 'a hosted turn must name the session its generation was admitted for',
   olderChildUnconfirmed:
     'another generation of this session still owns a child whose exit is not confirmed; nothing is minted or started beside it',
+  launchUnrecorded: 'this hosted provider launch has no durable record; nothing was started',
+  unknownProvider: 'this provider has no known executable identity for restart tracking',
 } as const;
 
 /**
@@ -102,6 +105,10 @@ export interface ServerBackendHostInput {
   claudeSupportsPartialMessages(): Promise<boolean>;
   skillMcpServers: BackendHost['skillMcpServers'];
   warn(message: string): void;
+  /** The outer caller's current admission (identity restrictions and survivor holds). */
+  admitSpawn?: () => string | undefined;
+  /** Uses this server's startup recording. Tests inject a store-free reservation. */
+  reserveLaunch?: typeof reserveLaunch;
   /** This process's clock. Tests replace it. */
   now?: () => number;
 }
@@ -127,9 +134,10 @@ function requireFinitePositive(value: number, what: string): void {
  */
 export function createServerBackendHost(input: ServerBackendHostInput): BackendHost {
   const { admission } = input;
+  const refusal = () => refusalFor(admission) ?? input.admitSpawn?.();
   const run = getActiveRun(admission.sessionId);
   if (!run) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
-  const refusedAtCreation = refusalFor(admission);
+  const refusedAtCreation = refusal();
   if (refusedAtCreation) throw new Error(refusedAtCreation);
   requireFinitePositive(input.budgetMs, 'the run budget');
   if (!Number.isFinite(run.startedAt)) {
@@ -173,14 +181,14 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
       // can stretch a credential past the run.
       const remainingMs = deadlineAt - now();
       if (remainingMs <= 0) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.deadlinePassed);
-      const refused = refusalFor(admission);
+      const refused = refusal();
       if (refused) throw new HostedSpawnRefusal(refused);
       const lifetimeMs =
         Math.min(hardTimeoutMs, remainingMs) + STOP_GRACE_MS + STOP_GIVE_UP_MS + MINT_SKEW_MS;
       const token = await input.mintAccessToken({ ttlSeconds: Math.ceil(lifetimeMs / 1000) });
       // Asked again after the await: admission lost during the mint means the
       // credential exists but is handed to nothing.
-      const refusedAfterMint = refusalFor(admission);
+      const refusedAfterMint = refusal();
       if (refusedAfterMint) throw new HostedSpawnRefusal(refusedAfterMint);
       if (typeof token !== 'string' || token.length === 0) {
         throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.missingCredential);
@@ -194,7 +202,39 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
     inkwellMcpUrl: input.inkwellMcpUrl,
     resolveBinary: (name) => input.resolveBinary(name),
     warn: (message) => input.warn(message),
-    admitSpawn: () => refusalFor(admission) === undefined,
+    admitSpawn: () => refusal() === undefined,
+    async reserveSpawn(backend) {
+      const refused = refusal();
+      if (refused) throw new HostedSpawnRefusal(refused);
+      // The outer turn's `ink` row cannot identify a claude/codex child.
+      // Unknown keys in the restart sweep mean "any executable", so refuse
+      // rather than letting a future provider silently widen that scope.
+      const key =
+        backend === 'claude'
+          ? 'claude-code'
+          : backend === 'codex'
+            ? 'codex-cli'
+            : backend === 'gemini'
+              ? 'gemini'
+              : undefined;
+      if (!key) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.unknownProvider);
+      let launch: Awaited<ReturnType<typeof reserveLaunch>>;
+      try {
+        launch = await (input.reserveLaunch ?? reserveLaunch)(admission.sessionId, key);
+      } catch {
+        throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.launchUnrecorded);
+      }
+      if (launch.refused || !launch.env[LAUNCH_TAG]?.trim()) {
+        throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.launchUnrecorded);
+      }
+      // Return even if admission was lost during the write: the runner's
+      // final synchronous gate refuses and retires this unspawned record.
+      return {
+        launchId: launch.env[LAUNCH_TAG],
+        spawned: (process) => launch.spawned(process),
+        exited: () => launch.exited(),
+      };
+    },
   };
 }
 
