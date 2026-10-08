@@ -524,6 +524,14 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
   };
 });
 
+// The inkling poll gate (poll-gate.ts): these suites' callers are ordinary
+// SBs, so it answers "may read" unless a test says otherwise. The gate itself
+// is tested over a real classification in services/inklings/poll-gate.test.ts.
+const pollGate = vi.hoisted(() => ({ refusal: vi.fn(async (): Promise<string | null> => null) }));
+vi.mock('../../services/inklings/poll-gate.js', () => ({
+  pollReaderRefusal: pollGate.refusal,
+  presenceRefused: vi.fn(async () => false),
+}));
 vi.mock('../../utils/logger', () => ({
   logger: {
     info: vi.fn(),
@@ -1224,6 +1232,40 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
     expect(ids).toContain('old-0');
     expect(ids).not.toContain('old-29');
+  });
+
+  // #779: a polling client never reads an inkling's thread, cursor or not,
+  // before the thread is looked up or any pointer moves (poll-gate.ts).
+  it.each([
+    ['a delivery poll', { channelPoll: true }],
+    [
+      'a poll with an explicit cursor',
+      { channelPoll: true, afterMessageId: '11111111-1111-1111-1111-111111111111' },
+    ],
+    ['a full-history poll', { channelPoll: true, fullHistory: true }],
+  ])('returns nothing to %s as an inkling', async (_label, args) => {
+    pollGate.refusal.mockResolvedValueOnce(
+      "an inkling's mail is never delivered to a polling client"
+    );
+    const rows = Array.from({ length: 5 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const mockSb = createGuardMockSupabase(rows);
+    const parsed = await callGuard(mockSb, args);
+    expect(parsed).toMatchObject({ success: true, messages: [] });
+    expect(parsed.refused).toContain('inkling');
+    const tables = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[0]);
+    expect(tables).not.toContain('inbox_threads');
+    expect(tables).not.toContain('inbox_thread_messages');
+    expect(tables).not.toContain('inbox_thread_read_status');
+  });
+
+  it("still lets an inkling's own turn read its thread (no channelPoll)", async () => {
+    pollGate.refusal.mockResolvedValue("an inkling's mail is never delivered to a polling client");
+    const rows = Array.from({ length: 5 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {});
+    pollGate.refusal.mockResolvedValue(null);
+    expect(parsed.success).toBe(true);
+    expect(parsed.refused).toBeUndefined();
+    expect(pollGate.refusal).not.toHaveBeenCalled();
   });
 
   it('explicit afterMessageId bypasses the guard entirely', async () => {

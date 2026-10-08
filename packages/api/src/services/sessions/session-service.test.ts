@@ -1662,7 +1662,7 @@ describe('SessionService', () => {
             ]
           )[1].config;
 
-        it('an inkling session on ink runs on InkRunner, bounded as on Claude, one outer cycle and local tools whatever the dashboard says', async () => {
+        it("an inkling session on ink runs on InkRunner, bounded as on Claude, with its dashboard's outer cycles like any SB's, and local tools", async () => {
           vi.stubEnv('INKLING_TURN_TIMEOUT_MS', '60000');
           const result = await turn(
             { ...INKLING, runtimeConfig: { maxTurns: 7, toolRouting: 'backend' } },
@@ -1677,7 +1677,8 @@ describe('SessionService', () => {
           expect(config).toMatchObject({
             killProcessGroup: true,
             timeoutMs: 60000,
-            maxTurns: 1,
+            // Conor, Oct 7: no inkling-only limit on outer cycles (2.8).
+            maxTurns: 7,
             toolRouting: 'local',
             workingDirectory: join(inklingsRoot, SB),
             inkProvider: 'claude',

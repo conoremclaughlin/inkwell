@@ -27,6 +27,18 @@ vi.mock('../principals.js', () => ({
   personalWorkspaceOf: vi.fn(async () => 'ws-1'),
 }));
 
+// The inkling turn gate's owner proof, per stored message (see the inkling merge test).
+const ownerProof = vi.hoisted(() => ({ of: new Map<string, 'yes' | 'no' | 'unreadable'>() }));
+vi.mock('../inklings/inkling-turn-gate.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    isOwnersOwnMessage: vi.fn(
+      async (_supabase: unknown, input: { threadMessageId?: string }) =>
+        ownerProof.of.get(input.threadMessageId ?? '') ?? 'no'
+    ),
+  };
+});
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -384,11 +396,8 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
     expect(turns[1]).toContain('message-d');
   });
 
-  it('runs an inkling’s wakes, and wakes whose identity cannot be read, one by one', async () => {
-    for (const identity of [
-      { kind: 'inkling', id: 'inkling-1', userId: 'user-456' },
-      { kind: 'unknown', transient: true },
-    ]) {
+  it('runs wakes whose identity cannot be read one by one', async () => {
+    for (const identity of [{ kind: 'unknown', transient: true }]) {
       const processed: string[] = [];
       const classify = vi
         .spyOn(
@@ -432,6 +441,185 @@ describe('queued wakes run as one turn (spec trigger-pipe-in v7, slice 1)', () =
       classify.mockRestore();
       process.mockRestore();
     }
+  });
+
+  // 3.5 (Oct 7 audit): an inkling's queued wakes merge as an ordinary SB's do,
+  // but its gate reads each wake's own source. Only its owner's own messages
+  // share a turn; every other wake runs alone and meets the gate there.
+  // One conversation: owner wakes share a turn only within it (Lumen, #780 P1).
+  const C1 = { threadKey: 'chat:c1' };
+  const C2 = { threadKey: 'chat:c2' };
+
+  function inklingTurns() {
+    const turns: Array<{ content: string; sources: unknown; trigger?: unknown }> = [];
+    // A client to prove sources with; the proof itself is ownerProof's, and
+    // the lease carries no epochs, as with no lease service.
+    (service as unknown as { supabase: unknown }).supabase = {};
+    vi.spyOn(
+      service as unknown as { leaseTurnEpochs: () => Promise<Set<string>> },
+      'leaseTurnEpochs'
+    ).mockResolvedValue(new Set());
+    vi.spyOn(
+      service as unknown as { classifyTurnIdentity: () => Promise<unknown> },
+      'classifyTurnIdentity'
+    ).mockResolvedValue({ kind: 'inkling', id: 'inkling-1', userId: 'user-456' });
+    vi.spyOn(
+      service as unknown as { processMessage: (r: SessionRequest) => Promise<SessionResult> },
+      'processMessage'
+    ).mockImplementation(async (request: SessionRequest) => {
+      turns.push({
+        content: request.content,
+        sources: request.metadata?.coalescedSources,
+        trigger: request.metadata?.triggerThreadMessageId,
+      });
+      if (request.content === 'turn-a') await new Promise<void>((r) => (releaseFirst = r));
+      return {
+        success: true,
+        sessionId: 'session-a',
+        backendSessionId: 'backend-session-a',
+        responses: [],
+        sessionStatus: 'active',
+        compactionTriggered: false,
+      } as unknown as SessionResult;
+    });
+    return turns;
+  }
+
+  async function queueBehindATurn(requests: SessionRequest[]) {
+    const first = service.handleMessage(channelMessage('turn-a'));
+    // turn-a is running, and holds the lock the wakes queue behind.
+    await vi.waitFor(() => expect(internals().processingLocks.has('myra:session-a')).toBe(true));
+    const waits = [];
+    for (const request of requests) {
+      const before = queued();
+      waits.push(service.handleMessage(request));
+      await vi.waitFor(() => expect(queued()).toBe(before + 1));
+    }
+    releaseFirst();
+    await Promise.all([first, ...waits]);
+  }
+
+  it("merges an inkling's owner wakes, and runs an SB's wake queued among them alone (Myra a8f943a7)", async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['s1', 'no'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('o1', C1, 'conor'),
+      wake('s1', C1, 'lumen'),
+      wake('o2', C1, 'conor'),
+    ]);
+
+    expect(turns).toHaveLength(3);
+    // The owner's two share one turn, led by the first; the SB's never joins it.
+    expect(turns[1].content).toContain('wake for o1');
+    expect(turns[1].content).toContain('wake for o2');
+    expect(turns[1].content).not.toContain('wake for s1');
+    expect(turns[1].sources).toHaveLength(2);
+    // The SB's runs alone afterwards, where the gate refuses it.
+    expect(turns[2]).toMatchObject({ content: 'wake for s1', sources: undefined });
+  });
+
+  it("leads the merged turn with an owner's wake, so the turn's own gate reads an owner's message", async () => {
+    ownerProof.of = new Map([
+      ['s1', 'no'],
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('s1', C1, 'lumen'),
+      wake('o1', C1, 'conor'),
+      wake('o2', C1, 'conor'),
+    ]);
+
+    expect(turns[1].trigger).toBe('o1');
+    expect(turns[1].content).not.toContain('wake for s1');
+    expect(turns[2]).toMatchObject({ content: 'wake for s1', trigger: 's1' });
+  });
+
+  it("keeps an inkling wake whose source can't be read out of the merge", async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['u1', 'unreadable'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('o1', C1, 'conor'),
+      wake('u1', C1, 'conor'),
+      wake('o2', C1, 'conor'),
+    ]);
+
+    expect(turns[1].content).not.toContain('wake for u1');
+    expect(turns[1].sources).toHaveLength(2);
+    expect(turns[2]).toMatchObject({ content: 'wake for u1', sources: undefined });
+  });
+
+  it('runs an inkling’s wakes one by one when no client can prove their sources', async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    (service as unknown as { supabase: unknown }).supabase = null;
+    await queueBehindATurn([wake('o1', C1, 'conor'), wake('o2', C1, 'conor')]);
+
+    expect(turns.map((t) => t.content)).toEqual(['turn-a', 'wake for o1', 'wake for o2']);
+  });
+
+  it('never merges owner wakes from two conversations: a turn has one reply destination', async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([wake('o1', C1, 'conor'), wake('o2', C2, 'conor')]);
+
+    expect(turns.map((t) => t.content)).toEqual(['turn-a', 'wake for o1', 'wake for o2']);
+  });
+
+  it("merges the lead conversation's owner wakes, and runs another conversation's alone", async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['o2', 'yes'],
+      ['o3', 'yes'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('o1', C1, 'conor'),
+      wake('o2', C2, 'conor'),
+      wake('o3', C1, 'conor'),
+    ]);
+
+    expect(turns).toHaveLength(3);
+    expect(turns[1].content).toContain('wake for o1');
+    expect(turns[1].content).toContain('wake for o3');
+    expect(turns[1].content).not.toContain('wake for o2');
+    expect(turns[2]).toMatchObject({ content: 'wake for o2', trigger: 'o2' });
+  });
+
+  it('runs them one by one when fewer than two are the owner’s', async () => {
+    ownerProof.of = new Map([
+      ['o1', 'yes'],
+      ['s1', 'no'],
+      ['s2', 'no'],
+    ]);
+    const turns = inklingTurns();
+    await queueBehindATurn([
+      wake('o1', C1, 'conor'),
+      wake('s1', C1, 'lumen'),
+      wake('s2', C1, 'lumen'),
+    ]);
+
+    expect(turns.map((t) => t.content)).toEqual([
+      'turn-a',
+      'wake for o1',
+      'wake for s1',
+      'wake for s2',
+    ]);
   });
 
   /** Record the epoch candidate each turn runs under, running it for real. */

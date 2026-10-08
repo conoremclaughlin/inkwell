@@ -22,6 +22,7 @@ import type { InkToolCallResult } from '../lib/ink-client.js';
 import { isPiTool } from './pi-tools.js';
 import { describeToolWithLocalSurface, type LocalToolAudience } from './local-tool-catalog.js';
 import { VIEW_IMAGE_TOOL, viewImage } from './view-image.js';
+import { callWithParameterHelp, type ToolParametersLookup } from './tool-parameter-help.js';
 
 export interface ToolDispatchContext {
   /** Cancels an in-flight tool. Reaches the tool itself, not just the wait. */
@@ -83,6 +84,21 @@ export interface LocalToolDispatchDeps {
    * spends one-use grants, and asking what exists must not bill the user.
    */
   isHardDenied?: (tool: string) => boolean;
+  /**
+   * An Inkwell tool's parameters, looked up once per process through
+   * `describe_tool`. With it, a validation error carries the tool's real
+   * parameters and a success notes a key the tool ignored
+   * (tool-parameter-help.ts). Without it, Inkwell calls go out bare, as before.
+   */
+  toolParameters?: ToolParametersLookup;
+  /**
+   * Whether this caller's policy auto-allows `describe_tool` right now: allowed,
+   * and without spending a one-use grant (`inspectInkTool`, never
+   * `canCallInkTool`). The lookup is help the model didn't ask for, so it
+   * runs only on an explicit yes. Without one, Inkwell calls go out bare and
+   * no earlier answer is used either.
+   */
+  mayLookUpParameters?: () => boolean;
 }
 
 /** Strip the MCP namespace the model may emit; InkClient wants bare names. */
@@ -248,6 +264,11 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
       });
     }
 
-    return deps.callInk(name, deps.resolveCredentials(args));
+    return callWithParameterHelp(
+      name,
+      args,
+      () => deps.callInk(name, deps.resolveCredentials(args)),
+      deps.mayLookUpParameters?.() === true ? deps.toolParameters : undefined
+    );
   };
 }

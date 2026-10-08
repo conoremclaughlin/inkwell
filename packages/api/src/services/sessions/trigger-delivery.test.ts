@@ -4,11 +4,17 @@ import {
   checkLegacyAttached,
   shouldSkipSpawn,
   decideDelivery,
+  hasOwnTurnGate,
   type SessionPollRow,
   type SessionAttachedRow,
 } from './trigger-delivery';
+import { INKLING_CLIENT } from '../inklings/inkling-client';
 
 const NOW = Date.now();
+
+/** An inkling's and an ordinary SB's agent_identities.metadata. */
+const INKLING = { client: INKLING_CLIENT, named: false, ownerTest: true };
+const ORDINARY = { role: 'developer' };
 
 function freshPollRow(sessionId: string): SessionPollRow {
   return { id: sessionId, cli_poll_at: new Date(NOW - 5_000).toISOString(), studio_id: null };
@@ -156,6 +162,76 @@ describe('trigger-delivery', () => {
         now: NOW,
       });
       expect(result).toEqual({ mode: 'spawn', forced: false });
+    });
+  });
+
+  // Oct 7 audit, suspected #1: inline delivery skips processMessage, where an
+  // inkling's owner test, profile and withheld provider tools live. A CLI
+  // attached to an inkling's session must never receive its wakes. The
+  // decision takes no sender, so the owner's own message and anyone else's
+  // decide alike: both spawn and meet the gate.
+  describe('decideDelivery — a target with its own gate (an inkling) never goes inline', () => {
+    it('knows an inkling by its metadata, and nothing else as one', () => {
+      expect(hasOwnTurnGate(INKLING)).toBe(true);
+      expect(hasOwnTurnGate(ORDINARY)).toBe(false);
+      expect(hasOwnTurnGate({ client: 'web' })).toBe(false);
+      expect(hasOwnTurnGate(null)).toBe(false);
+      expect(hasOwnTurnGate(undefined)).toBe(false);
+    });
+
+    it('spawns past a fresh legacy attachment, and says why', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: null,
+        attachedRow: attachedRow(1_000),
+        targetMetadata: INKLING,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: false, inlineRefused: 'own-gate' });
+    });
+
+    it('spawns past a fresh poll too', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: freshPollRow('s1'),
+        attachedRow: null,
+        targetMetadata: INKLING,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: false, inlineRefused: 'own-gate' });
+    });
+
+    it('with no live CLI, it is an ordinary spawn with nothing refused', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: stalePollRow('s1'),
+        attachedRow: null,
+        targetMetadata: INKLING,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: false });
+    });
+
+    it('a forced spawn stays forced', () => {
+      const result = decideDelivery({
+        forceSpawn: true,
+        pollRow: freshPollRow('s1'),
+        attachedRow: attachedRow(1_000),
+        targetMetadata: INKLING,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: true });
+    });
+
+    it('control: the same attached session of an ordinary SB is still delivered inline', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: null,
+        attachedRow: attachedRow(1_000),
+        targetMetadata: ORDINARY,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'inline', source: 'cli_attached', sessionId: null });
     });
   });
 });
