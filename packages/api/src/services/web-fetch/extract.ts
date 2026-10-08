@@ -221,23 +221,31 @@ function cachedPattern(cache: Map<string, RegExp>, key: string, build: () => Reg
   return pattern;
 }
 
-const stylePatterns = new Map<string, RegExp>();
-
-function styleProperty(style: string, property: string): string | undefined {
-  const pattern = cachedPattern(
-    stylePatterns,
-    property,
-    () => new RegExp(`(?:^|;)\\s*${property.replace(/-/g, '\\-')}\\s*:\\s*([^;]+)`, 'i')
-  );
-  return style.match(pattern)?.[1];
+/**
+ * A style attribute's declarations, property name lowercased. A later
+ * declaration replaces an earlier one, as it does in CSS: OpenClaw read the
+ * first, so `display:block;display:none` counted as visible and its hidden
+ * text reached the reader.
+ */
+function parseStyle(style: string): Map<string, string> {
+  const declarations = new Map<string, string>();
+  for (const declaration of style.split(';')) {
+    const colon = declaration.indexOf(':');
+    if (colon <= 0) continue;
+    const property = declaration.slice(0, colon).trim().toLowerCase();
+    if (property) declarations.set(property, declaration.slice(colon + 1));
+  }
+  return declarations;
 }
 
 function isStyleHidden(style: string): boolean {
+  const declarations = parseStyle(style);
+  const styleProperty = (property: string) => declarations.get(property);
   for (const [property, pattern] of HIDDEN_STYLE_PATTERNS) {
-    const value = styleProperty(style, property);
+    const value = styleProperty(property);
     if (value !== undefined && pattern.test(value)) return true;
   }
-  const clipPath = styleProperty(style, 'clip-path');
+  const clipPath = styleProperty('clip-path');
   if (
     clipPath &&
     !/^\s*none\s*$/i.test(clipPath) &&
@@ -245,7 +253,7 @@ function isStyleHidden(style: string): boolean {
   ) {
     return true;
   }
-  const transform = styleProperty(style, 'transform');
+  const transform = styleProperty('transform');
   if (
     transform &&
     (/scale\s*\(\s*0\s*\)/i.test(transform) ||
@@ -253,9 +261,9 @@ function isStyleHidden(style: string): boolean {
   ) {
     return true;
   }
-  const width = styleProperty(style, 'width');
-  const height = styleProperty(style, 'height');
-  const overflow = styleProperty(style, 'overflow');
+  const width = styleProperty('width');
+  const height = styleProperty('height');
+  const overflow = styleProperty('overflow');
   if (
     width !== undefined &&
     /^\s*0(px)?\s*$/i.test(width) &&
@@ -266,17 +274,17 @@ function isStyleHidden(style: string): boolean {
   ) {
     return true;
   }
-  const left = styleProperty(style, 'left');
-  const top = styleProperty(style, 'top');
+  const left = styleProperty('left');
+  const top = styleProperty('top');
   return (
     (left !== undefined && /^\s*-\d{4,}px\s*$/i.test(left)) ||
     (top !== undefined && /^\s*-\d{4,}px\s*$/i.test(top))
   );
 }
 
-/** `name`'s value in a tag's attribute text; "" for a bare attribute, undefined if absent. */
 const attributePatterns = new Map<string, RegExp>();
 
+/** `name`'s value in a tag's attribute text; "" for a bare attribute, undefined if absent. */
 function readAttribute(attrs: string, name: string): string | undefined {
   const pattern = cachedPattern(
     attributePatterns,
@@ -561,9 +569,61 @@ export function htmlToReadable(html: string, mode: ExtractMode): { text: string;
 
 // ============== By content type ==============
 
+/**
+ * The most characters a pretty-printed body may come to. Indentation grows
+ * with depth on every line, so a small, deep body prints enormous: Lumen's
+ * 20,401-byte probe prints 4,110,801 characters (PR #792), and the text is
+ * only cut to maxChars after it is built. Past this, the body is returned as
+ * it came.
+ */
+export const PRETTY_JSON_BUDGET = 1_000_000;
+
+/**
+ * An upper bound on JSON.stringify(value, null, 2).length, or Infinity as soon
+ * as it passes `budget`. Iterative, so depth costs no stack. A container's
+ * child lines are counted before any child is pushed, so a huge array is
+ * refused before it fills the stack.
+ */
+export function prettyLengthBound(value: unknown, budget: number): number {
+  let total = 0;
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  while (stack.length > 0) {
+    const { value: current, depth } = stack.pop()!;
+    if (current === null || typeof current !== 'object') {
+      total += JSON.stringify(current)?.length ?? 4;
+    } else {
+      const record = current as Record<string, unknown>;
+      const keys = Array.isArray(current) ? null : Object.keys(record);
+      const count = keys ? keys.length : (current as unknown[]).length;
+      // Both brackets and the closing bracket's own line; then each child's
+      // line (newline, indent, comma), and an object key's `"…": `.
+      total += 2 * depth + 3 + count * (2 * (depth + 1) + 2);
+      if (total > budget) return Infinity;
+      if (keys) {
+        for (const key of keys) {
+          total += JSON.stringify(key).length + 2;
+          if (total > budget) return Infinity;
+          stack.push({ value: record[key], depth: depth + 1 });
+        }
+      } else {
+        for (const item of current as unknown[]) stack.push({ value: item, depth: depth + 1 });
+      }
+    }
+    if (total > budget) return Infinity;
+  }
+  return total;
+}
+
 function prettyJson(body: string): string | null {
+  let value: unknown;
   try {
-    return JSON.stringify(JSON.parse(body), null, 2);
+    value = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (prettyLengthBound(value, PRETTY_JSON_BUDGET) > PRETTY_JSON_BUDGET) return null;
+  try {
+    return JSON.stringify(value, null, 2);
   } catch {
     return null;
   }

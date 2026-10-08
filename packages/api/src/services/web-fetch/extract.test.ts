@@ -6,6 +6,7 @@ import {
   htmlToReadable,
   isTextMediaType,
   mediaTypeOf,
+  prettyLengthBound,
 } from './extract';
 
 const md = (html: string) => htmlToReadable(html, 'markdown').text;
@@ -17,6 +18,10 @@ describe('htmlToReadable drops what a reader would not see', () => {
     ['aria-hidden', '<div aria-hidden="true">SECRET</div>'],
     ['a hidden class', '<span class="nav sr-only">SECRET</span>'],
     ['display:none', '<div style="color:red; display: none">SECRET</div>'],
+    [
+      'a later display:none, as CSS reads it',
+      '<div style="display:block; DISPLAY:none">SECRET</div>',
+    ],
     ['opacity 0', '<div style="opacity:0">SECRET</div>'],
     ['font-size 0', '<div style="font-size:0px">SECRET</div>'],
     ['offscreen positioning', '<div style="position:absolute;left:-9999px">SECRET</div>'],
@@ -170,6 +175,47 @@ describe('decodeBody', () => {
 });
 
 describe('extractContent by media type', () => {
+  it('returns deep JSON as it came rather than pretty-print it past a budget (Lumen, PR #792)', () => {
+    // Lumen's probe: 20,401 bytes that pretty-print to 4,110,801 characters.
+    const probe = '['.repeat(200) + '0,'.repeat(10_000) + '0' + ']'.repeat(200);
+    expect(probe).toHaveLength(20_401);
+    expect(JSON.stringify(JSON.parse(probe), null, 2).length).toBe(4_110_801);
+    const result = extractContent(probe, 'application/json', 'markdown');
+    expect(result).toEqual({ text: probe, extractor: 'text' });
+  });
+
+  // Not a regression test: JSON.stringify overflows the stack at this depth,
+  // so the old code also fell back. It guards the budget walk, which must not
+  // recurse or take long on a 50,000-deep, 2 MB body.
+  it('measures a 2 MB, 50,000-deep body without recursing', () => {
+    const body = '['.repeat(50_000) + '0,'.repeat(950_000) + '0' + ']'.repeat(50_000);
+    const started = performance.now();
+    const result = extractContent(body, 'application/json', 'markdown');
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(result.text).toHaveLength(body.length);
+  });
+
+  it('bounds the pretty length from above, for every shape', () => {
+    const samples: unknown[] = [
+      0,
+      'a',
+      'quote " and \\ and \n and \u{1F600}',
+      null,
+      true,
+      [],
+      {},
+      [[], {}, [[]]],
+      { a: { b: { c: [1, 2, { d: 'e' }] } }, 'key with "quotes"': -1.5e-7 },
+      Array.from({ length: 50 }, (_, i) => ({ id: i, tags: ['x', 'y'], nested: [[i]] })),
+      JSON.parse('['.repeat(40) + '1e21' + ']'.repeat(40)),
+    ];
+    for (const sample of samples) {
+      expect(prettyLengthBound(sample, Infinity)).toBeGreaterThanOrEqual(
+        JSON.stringify(sample, null, 2).length
+      );
+    }
+  });
+
   it('pretty-prints JSON', () => {
     const result = extractContent('{"a":[1,2]}', 'application/json; charset=utf-8', 'markdown');
     expect(result).toEqual({ text: '{\n  "a": [\n    1,\n    2\n  ]\n}', extractor: 'json' });
