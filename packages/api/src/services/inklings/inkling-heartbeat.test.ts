@@ -457,6 +457,12 @@ describe('the heartbeat text (starter-space.ts, frozen by Myra, 748a9c97)', () =
     expect(INKLING_HEARTBEAT).toMatch(/A quiet heartbeat is a good one\./);
   });
 
+  it('writes down what it holds, since only what it wrote down survives to the next turn (Conor, Oct 8)', () => {
+    expect(INKLING_HEARTBEAT).toMatch(
+      /If it can wait, let it wait, and mention it when they do\. Write it down now: you wake fresh, so you'll only have it then if you wrote it down\./
+    );
+  });
+
   it('tells only the person it belongs to, and nothing of anyone else', () => {
     expect(INKLING_HEARTBEAT).toMatch(/#### Other people\n\nTell only the person you belong to\./);
     expect(INKLING_HEARTBEAT).toMatch(/never the other person's details\./);
