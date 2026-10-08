@@ -14,16 +14,22 @@ type Row = Record<string, unknown>;
 const db = vi.hoisted(() => ({
   tables: {} as Record<string, Row[]>,
   failOn: null as string | null,
+  throwOn: null as string | null,
   reads: [] as Array<{ table: string; filters: Array<[string, unknown]> }>,
 }));
 
-/** A query builder over db.tables: select/eq/limit/single, delete and update. */
+/**
+ * A query builder over db.tables: select/eq/limit/single/maybeSingle, insert,
+ * delete and update. maybeSingle answers as PostgREST does: more than one row
+ * is an error, with no data.
+ */
 function fakeClient() {
   return {
     from(table: string) {
+      if (db.throwOn === table) throw new Error('socket closed');
       const read = { table, filters: [] as Array<[string, unknown]> };
       db.reads.push(read);
-      let mode: 'select' | 'delete' | 'update' = 'select';
+      let mode: 'select' | 'insert' | 'delete' | 'update' = 'select';
       let patch: Row = {};
       const matching = () =>
         (db.tables[table] ?? []).filter((row) =>
@@ -31,6 +37,15 @@ function fakeClient() {
         );
       const run = () => {
         if (db.failOn === table) return { data: null, error: { message: 'connection reset' } };
+        if (mode === 'insert') {
+          (db.tables[table] ??= []).push({
+            agent_id: null,
+            sb_id: null,
+            users: { email: 'owner@example.test' },
+            ...patch,
+          });
+          return { data: null, error: null };
+        }
         if (mode === 'delete') {
           const gone = new Set(matching());
           db.tables[table] = (db.tables[table] ?? []).filter((row) => !gone.has(row));
@@ -49,6 +64,19 @@ function fakeClient() {
           return builder;
         },
         limit: () => builder,
+        insert: (fields: Row) => {
+          mode = 'insert';
+          patch = fields;
+          return builder;
+        },
+        maybeSingle: async () => {
+          const result = run();
+          const rows = (result.data as Row[] | null) ?? [];
+          if (result.error) return { data: null, error: result.error };
+          return rows.length > 1
+            ? { data: null, error: { message: 'multiple rows returned' } }
+            : { data: rows[0] ?? null, error: null };
+        },
         delete: () => {
           mode = 'delete';
           return builder;
@@ -121,6 +149,7 @@ beforeEach(() => {
     ],
   };
   db.failOn = null;
+  db.throwOn = null;
   db.reads.length = 0;
 });
 
@@ -269,10 +298,12 @@ describe('refresh exchange: a record whose SB is gone mints nothing', () => {
     await expect(refresh(new InkAuthProvider())).resolves.toMatchObject({ error: 'invalid_grant' });
   });
 
-  it("KNOWN GAP: a same-slug SB in another of the owner's spaces still lets the record mint", async () => {
-    // A slug is unique only within a workspace, and the record kept only its
-    // slug. Closing this needs the record to keep which identity it was bound
-    // to (a schema change), so it is pinned here, not fixed.
+  it("the exchange alone can't refuse a nulled record while a same-slug SB exists", async () => {
+    // A slug is unique only within a workspace, and a nulled record kept only
+    // its slug. The database now leaves no such record: mcp_tokens_sb_id_fkey
+    // deletes a deleted SB's records (deleted-space-tokens.integration.test.ts),
+    // and a login that names an SB binds its UUID or is refused (below). This
+    // fake has no foreign key, so it pins what the exchange does on its own.
     db.tables.agent_identities.push({
       id: 'twin',
       user_id: OWNER,
@@ -281,5 +312,69 @@ describe('refresh exchange: a record whose SB is gone mints nothing', () => {
     });
     deleteSpace();
     await expect(refresh(new InkAuthProvider())).resolves.toHaveProperty('access_token');
+  });
+});
+
+describe('login: a code exchange that names an SB binds its UUID, or issues nothing', () => {
+  /**
+   * Exchange an authorization code for OWNER, naming `sbSlug` or no SB. The code
+   * is placed where the auth callback would put it; the callback's own path
+   * (Supabase sign-in, account resolution) isn't what's under test here.
+   */
+  async function login(sbSlug?: string) {
+    db.tables.mcp_tokens = [];
+    const provider = new InkAuthProvider();
+    (provider as unknown as { authCodes: Map<string, unknown> }).authCodes.set('code-1', {
+      clientId: 'ink-cli',
+      codeChallenge: '',
+      redirectUri: 'http://localhost/callback',
+      userId: OWNER,
+      userEmail: 'owner@example.test',
+      ...(sbSlug ? { sbSlug } : {}),
+      expiresAt: Date.now() + 60_000,
+    });
+    const result = await provider.exchangeAuthorizationCode({
+      code: 'code-1',
+      codeVerifier: '',
+      clientId: 'ink-cli',
+    });
+    return { provider, result };
+  }
+
+  it("binds a unique SB's UUID into the access token and the refresh record", async () => {
+    const { provider, result } = await login('pip');
+    expect('error' in result).toBe(false);
+    if ('error' in result) return;
+    expect(db.tables.mcp_tokens).toHaveLength(1);
+    expect(db.tables.mcp_tokens[0]).toMatchObject({ agent_id: 'pip', sb_id: SB });
+    expect(provider.verifyAccessTokenSignature(`Bearer ${result.access_token}`)).toMatchObject({
+      sbId: SB,
+    });
+  });
+
+  // On main each of these issued a pair bound by slug alone: a refresh record
+  // with sb_id null, which ON DELETE CASCADE can't reach (Lumen, PR #795).
+  it.each([
+    ['its account has no SB of that slug', 'invalid_grant'],
+    ['more than one of its SBs has that slug', 'invalid_grant'],
+    ['the identity read fails', 'server_error'],
+    ['the identity read throws', 'server_error'],
+  ])('refuses, and stores no refresh record, when %s', async (situation, expected) => {
+    if (situation.startsWith('its account has no')) db.tables.agent_identities = [];
+    if (situation.startsWith('more than one')) {
+      db.tables.agent_identities.push({ ...identity(), id: 'twin', workspace_id: OTHER_SPACE });
+    }
+    if (situation === 'the identity read fails') db.failOn = 'agent_identities';
+    if (situation === 'the identity read throws') db.throwOn = 'agent_identities';
+    const { result } = await login('pip');
+    expect('error' in result ? result.error : 'a token pair was issued').toBe(expected);
+    expect(db.tables.mcp_tokens).toEqual([]);
+  });
+
+  it("leaves a person's login alone: no SB named, no identity read", async () => {
+    const { result } = await login();
+    expect(result).toHaveProperty('access_token');
+    expect(db.reads.filter((read) => read.table === 'agent_identities')).toEqual([]);
+    expect(db.tables.mcp_tokens[0]).toMatchObject({ agent_id: null, sb_id: null });
   });
 });

@@ -302,22 +302,15 @@ export class InkAuthProvider {
       }
     }
 
-    // Resolve canonical identity UUID when agent_id is provided
+    // A login that names an SB binds that SB's UUID, or is refused. A slug is
+    // unique only within a workspace, and a refresh record bound by slug alone
+    // outlives its SB: mcp_tokens_sb_id_fkey deletes only the records that
+    // carry sb_id (PR #795).
     let sbId: string | undefined;
     if (codeData.sbSlug) {
-      const { data: identity } = await this.supabase
-        .from('agent_identities')
-        .select('id')
-        .eq('user_id', codeData.userId)
-        .eq('agent_id', codeData.sbSlug)
-        .maybeSingle();
-      sbId = identity?.id;
-      if (!sbId) {
-        logger.warn('No agent_identities record found for token binding', {
-          userId: codeData.userId,
-          sbSlug: codeData.sbSlug,
-        });
-      }
+      const binding = await this.resolveLoginSb(codeData.userId, codeData.sbSlug);
+      if (!binding.ok) return binding.error;
+      sbId = binding.sbId;
     }
 
     // Create refresh token in database (with optional identity binding)
@@ -371,6 +364,60 @@ export class InkAuthProvider {
       expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
       scope: 'mcp:tools',
     };
+  }
+
+  /**
+   * The one identity a login's SB slug names among its account's SBs. Reads up
+   * to two rows, so that none and more than one are told apart from a failed
+   * read: the first two refuse the login, and a failed read is a server error
+   * the client can retry. Never throws.
+   */
+  private async resolveLoginSb(
+    userId: string,
+    sbSlug: string
+  ): Promise<{ ok: true; sbId: string } | { ok: false; error: OAuthErrorResponse }> {
+    let rows: Array<{ id: string }> | null = null;
+    let failure: string | null = null;
+    try {
+      const result = await this.supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', sbSlug)
+        .limit(2);
+      rows = result.data;
+      failure = result.error?.message ?? null;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    if (failure !== null) {
+      logger.error('Could not read the SB a login names', { userId, sbSlug, error: failure });
+      return {
+        ok: false,
+        error: { error: 'server_error', error_description: 'Identity lookup failed' },
+      };
+    }
+    if (!rows || rows.length === 0) {
+      logger.warn('Refused a login naming an SB its account does not have', { userId, sbSlug });
+      return {
+        ok: false,
+        error: { error: 'invalid_grant', error_description: 'This account has no SB of that name' },
+      };
+    }
+    if (rows.length > 1) {
+      logger.warn('Refused a login naming an SB slug held by more than one identity', {
+        userId,
+        sbSlug,
+      });
+      return {
+        ok: false,
+        error: {
+          error: 'invalid_grant',
+          error_description: 'More than one SB on this account has that name',
+        },
+      };
+    }
+    return { ok: true, sbId: rows[0].id };
   }
 
   // --------------------------------------------------------------------------
