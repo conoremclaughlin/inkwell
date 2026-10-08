@@ -112,6 +112,14 @@ describe('classifyAddress', () => {
     expect(classifyAddress('64:ff9b:2::1')).toBeNull();
   });
 
+  it('refuses 3fff::/20 (RFC 9637) as documentation, up to its edge', () => {
+    // New with ipaddr.js 2.5; #792's tables didn't have it.
+    expect(classifyAddress('3fff::1')).toBe('documentation');
+    expect(classifyAddress('3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe('documentation');
+    // Just outside. Not a claim that it's routable.
+    expect(classifyAddress('3fff:1000::1')).toBeNull();
+  });
+
   it.each([
     '8.8.8.8',
     '1.1.1.1',
