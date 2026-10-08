@@ -136,6 +136,8 @@ import {
   getActivitySummarySchema,
 } from './permissions';
 
+import { handleWebFetch, webFetchSchema, WEB_FETCH_DESCRIPTION } from './web-fetch';
+
 import {
   handleChooseName,
   handleMeetFamily,
@@ -3015,6 +3017,34 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
   // =====================================================
 
   registerMiniAppRecordTools(server, dataComposer);
+
+  // =====================================================
+  // WEB FETCH
+  // =====================================================
+
+  server.registerTool(
+    'web_fetch',
+    { description: WEB_FETCH_DESCRIPTION, inputSchema: webFetchSchema },
+    async (args) => {
+      try {
+        return await handleWebFetch(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in web_fetch:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
 
   // =====================================================
   // PERMISSION & AUDIT TOOLS

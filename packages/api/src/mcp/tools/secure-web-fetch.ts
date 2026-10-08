@@ -55,10 +55,15 @@ export function wrapWebFetchContent(
     extractOnly?: boolean;
     userId?: string;
     maxLength?: number;
+    /** What the audit log records instead of `url` (web_fetch drops the query). */
+    auditTarget?: string;
+    /** Merged into the audit row's metadata. */
+    auditMetadata?: Record<string, unknown>;
   }
 ): SecureWebFetchResult {
   const auditService = getAuditService();
   const maxLength = options?.maxLength ?? 100000; // 100KB default
+  const auditTarget = options?.auditTarget ?? url;
 
   try {
     // Truncate if too large
@@ -79,10 +84,10 @@ export function wrapWebFetchContent(
       userId: options?.userId,
       action: 'web_fetch',
       category: 'network',
-      target: url,
+      target: auditTarget,
       responseStatus: 'success',
       responseSummary: `Fetched ${content.length} bytes${truncated ? ' (truncated)' : ''}`,
-      metadata: { truncated, originalLength: rawHtml.length },
+      metadata: { ...options?.auditMetadata, truncated, originalLength: rawHtml.length },
     });
 
     if (options?.extractOnly) {
@@ -122,7 +127,7 @@ export function wrapWebFetchContent(
       userId: options?.userId,
       action: 'web_fetch',
       category: 'network',
-      target: url,
+      target: auditTarget,
       responseStatus: 'error',
       responseSummary: errorMessage,
     });
@@ -191,6 +196,11 @@ const BLOCKED_URL_PATTERNS = [
 /**
  * Check if a URL is safe to fetch.
  * Blocks local/private network addresses by default.
+ *
+ * A string check only: it never resolves the name, so it can't see a public
+ * name that resolves to 127.0.0.1. It also passes http://[::ffff:7f00:1],
+ * http://0x7f.1 and the metadata address http://169.254.169.254 as safe.
+ * The web_fetch tool doesn't use it; its guard is services/web-fetch.
  */
 export function isUrlSafeToFetch(
   url: string,
