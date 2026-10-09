@@ -1380,8 +1380,8 @@ $("item").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer =
 /* ---------- plan badge: the pricing page saves the sign-up ---------- */
 try {
   const p = JSON.parse(localStorage.getItem("cortex-plan-v1") || "null");
-  if (p && p.plan === "Starter" && typeof p.name === "string" && p.name.trim() && Number.isFinite(Date.parse(p.startedAt))) {
-    $("planBadge").textContent = "Cortex Starter (demo)"; $("planBadge").hidden = false; $("plansLink").hidden = true;
+  if (p && p.plan === "Starter" && typeof p.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email) && Number.isFinite(Date.parse(p.startedAt))) {
+    $("planBadge").textContent = "Cortex Starter"; $("planBadge").title = "Signed up as " + p.email; $("planBadge").hidden = false; $("plansLink").hidden = true;
   }
 } catch {}
 
