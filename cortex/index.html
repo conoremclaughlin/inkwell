@@ -1089,7 +1089,11 @@ function bundleQuoteAnswer(text) {
   const nrc = one.reduce((a, i) => a + i.amount * i.qty, 0);
   const terms = [...new Set(items.map(i => i.months).filter(Boolean))];
   const globalTerm = text.match(/\b(\d{1,3})[- ]?(?:months?|mths?|mos)\b(?:\s+(?:term|contract))?/i) || text.match(/\b(?:term|contract)\s*(?:of|:)?\s*(\d{1,3})\b/i);
-  let months = terms.length ? Math.max(...terms) : globalTerm ? Number(globalTerm[1]) : null;
+  // Sales teams write "3-year term" and "for 3 years" as often as "36 months".
+  const yearTerm = text.match(/\b(\d{1,2}|one|two|three|four|five)[- ]?(?:years?|yrs?)\b/i);
+  const yearWords = { one: 1, two: 2, three: 3, four: 4, five: 5 };
+  const yearsAsMonths = yearTerm ? 12 * (yearWords[yearTerm[1].toLowerCase()] || Number(yearTerm[1])) : null;
+  let months = terms.length ? Math.max(...terms) : globalTerm ? Number(globalTerm[1]) : yearsAsMonths;
   if (terms.length > 1) mismatched.push("line items carry different terms (" + terms.join(", ") + " months)");
   const dm = text.match(/\bdiscount\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)\s*%/i) || text.match(/(\d+(?:\.\d+)?)\s*%\s*(?:off|discount)/i);
   const discount = dm ? Number(dm[1]) : 0;
