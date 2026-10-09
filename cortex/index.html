@@ -1177,10 +1177,12 @@ function supplyAnswer(text) {
 /* ---------- a customer asking where their order is ---------- */
 function isOrderStatus(text) {
   const t = text.trim();
-  // Marisol: a follow-up on an order is order flow, not a support reply. Complaints stay Support.
-  const asks = /\bwhere('?s| is)\s+(my|our|the)\s+order\b|\bfollow(ing)?[- ]?up on (my |our |the )?order\b|\b(status|update|news)\s+(on|of|for|about)\s+(my |our |the )?order\b|\b(has|did|is)\s+(my |our |the )?order\b[^.?!\n]{0,20}\b(ship|shipped|go out|gone out|been sent|been packed|left)\b|\bwhen will (my |our |the )?order\b[^.?!\n]{0,12}\b(ship|go out|be sent)\b|\border\s*#?\s*\d{3,}[^.?!\n]{0,30}\b(ship(ped)? yet|gone out|status)\b/i;
-  return t.length <= 400 && asks.test(t)
-    && !/\b(tracking|supposed to|refund|cancel|damaged|broken|wrong|missing|complain|never arrived|hasn'?t arrived)/i.test(t);
+  // Marisol: a question about an order's status is order flow, tracking requests included.
+  // Only a complaint (late, damaged, never came) is a support reply.
+  const asks = /\bwhere('?s| is)\s+(my|our|the)\s+order\b|\bfollow(ing)?[- ]?up on (my |our |the )?order\b|\bchecking in on (my |our |the )?order\b|\b(status|update|news|eta)\s+(on|of|for|about)\s+(my |our |the |this )?order\b|\bwhat'?s the (status|eta)\b|\border status\b|\b(has|did|is)\s+(my |our |the |this )?(order|it)\b[^.?!\n]{0,20}\b(ship|shipped|go out|gone out|been sent|been packed|left)\b|\bhasn'?t (shipped|gone out|been sent)\b|\bwhen will (my |our |the |this )?(order|it)\b[^.?!\n]{0,12}\b(ship|go out|be sent|arrive|be delivered)\b|\border\s*#?\s*\d{3,}[^.?!\n]{0,40}\b(ship(ped)? yet|gone out|status|tracking)\b|\b(send|share|get|have|need)\b[^.?!\n]{0,15}\btracking\b|\btracking (number|info|information|link|details)\b/i;
+  const complaint = /\b(supposed to|hasn'?t moved|not moving|stuck|late|delayed|overdue|refund|cancel|damaged|broken|wrong|missing|complain|never arrived|hasn'?t arrived|didn'?t arrive|still (hasn'?t|not) (arrived|here)|lost)\b/i;
+  const orderish = /\border\b|#\s?\d{3,}|\btracking\b|\bshipped\b/i;
+  return t.length <= 400 && asks.test(t) && orderish.test(t) && !complaint.test(t);
 }
 function orderStatusAnswer(text) {
   const num = orderNumber(text);
