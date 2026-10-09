@@ -1207,6 +1207,8 @@ function isOrderStatus(text) {
   const late = /\b(supposed to (arrive|be here|ship)|hasn'?t moved|not moving|stuck|late|delayed|overdue|never arrived|hasn'?t arrived|didn'?t arrive|still (hasn'?t|not) (arrived|here)|tracking hasn'?t)\b/i;
   const complaint = /\b(refund|cancel|damaged|broken|cracked|wrong|missing|complain|lost|leak(ed|ing)?)\b/i;
   const orderish = /\b(my|our|the) (order|delivery|package|parcel|shipment)\b|\border\s*#?\s*\d{3,}|#\s?\d{3,}|\btracking\b|\bshipped\b/i;
+  // A supplier's delay is Supply Risk, never a customer's order question.
+  if (isSupplyRisk(t) || /\b(suppliers?|vendors?|wholesalers?|manufacturer|mill|PO\b|purchase orders?)\b/i.test(t)) return false;
   return t.length <= 400 && orderish.test(t) && (asks.test(t) || late.test(t)) && !complaint.test(t);
 }
 function orderStatusAnswer(text) {
@@ -1546,7 +1548,7 @@ function classify(text, now = new Date()) {
     for (const f of facts) if (f[0] === "To roast") f[0] = "Items";
   }
   // Marisol: a tracking-and-update reply is order flow, so it is labelled Order, never Support.
-  if (topCat === "support" && /^Send tracking and an update/.test(step)) {
+  if (topCat === "support" && /^Send tracking and an update/.test(step) && !/\b(suppliers?|vendors?|wholesalers?|manufacturer|mill|purchase orders?)\b/i.test(clean)) {
     const num = orderNumber(clean);
     return { category: "order", label: "Order", confidence, urgency, step: (num ? "Look up order " + num : "Look up the order") + ", send tracking and an update today",
       why: "A customer asking where their order is.", facts, signals: top.hits };
