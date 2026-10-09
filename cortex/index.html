@@ -915,16 +915,17 @@ function movingAnswer(kind, text) {
 
 /* ---------- fees: M-Pesa confirmations ---------- */
 function isMpesa(text) {
-  return /\bconfirmed\b/i.test(text) && /\bk\s?sh\b/i.test(text) && /\breceived from\b/i.test(text);
+  // Real texts write "KSh 12,500", "Ksh2,500.00" or "KES 2,500", and "received from NAME" or "received Ksh2,500.00 from NAME".
+  return /\bconfirmed\b/i.test(text) && /\b(?:k\s?sh|kes)\.?\s*\d/i.test(text) && /\breceived\b[^\n]{0,40}?\bfrom\b/i.test(text);
 }
 function feesAnswer(text) {
   const t = text.replace(/\s+/g, " ").trim();
   const first = (t.split(" ")[0] || "").replace(/[^A-Za-z0-9]/g, "");
   const code = /^[A-Za-z0-9]{6,12}$/.test(first) && first.toLowerCase() !== "confirmed" ? first.toUpperCase() : null;
-  const amountM = t.match(/\bk\s?sh\.?\s*([\d,]+(?:\.\d{1,2})?)/i);
+  const amountM = t.match(/\b(?:k\s?sh|kes)\.?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
   const amount = amountM ? amountM[1].replace(/,$/, "") : null;
   // The payer: the words after "received from", stopping at a phone number, "on", or punctuation.
-  const payerM = t.match(/\breceived from\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*)*?)(?=\s+(?:\+?\d|on\b)|\s*[.,;]|$)/i);
+  const payerM = t.match(/\breceived\s+(?:(?:k\s?sh|kes)\.?\s*[\d,]+(?:\.\d{1,2})?\s+)?from\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*)*?)(?=\s+(?:\+?\d|on\b)|\s*[.,;]|$)/i);
   const payer = payerM ? payerM[1].trim() : null;
   const dateM = t.match(/\bon\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
   const timeM = t.match(/\bat\s+(\d{1,2}:\d{2})\s*([AaPp]\.?\s?[Mm]\.?)?/);
