@@ -22,6 +22,17 @@ function missing(error: unknown) {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
+class SkillCatalogLimitError extends Error {}
+
+function isolateCatalogEntry(error: unknown, signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+  if (
+    error instanceof SkillCatalogLimitError ||
+    (error instanceof Error && error.name === 'AbortError')
+  )
+    throw error;
+}
+
 /** Linked roots/files below the explicit host root refuse, rather than borrow a trust label. */
 async function checkedPath(path: string, root: string, signal?: AbortSignal) {
   signal?.throwIfAborted();
@@ -114,40 +125,42 @@ export function createSkillInstructionHost(cwd: string, home: string) {
       let entries = 0;
       const skills: DiscoveredSkill[] = [];
       const directories = async (dir: string, root: string): Promise<string[]> => {
-        let canonical: string;
         try {
-          canonical = await checkedPath(dir, root, signal);
+          const canonical = await checkedPath(dir, root, signal);
+          const names: string[] = [];
+          for await (const entry of await opendir(canonical)) {
+            signal?.throwIfAborted();
+            if (++entries > sessionSkillLimits.entries)
+              throw new SkillCatalogLimitError('Skill discovery exceeds the hosted entry limit');
+            if (entry.isDirectory()) names.push(entry.name);
+          }
+          return names.sort();
         } catch (error) {
-          if (missing(error)) return [];
-          throw error;
+          isolateCatalogEntry(error, signal);
+          // A bad shared home catalog must not hide independent repo catalogs.
+          return [];
         }
-        const names: string[] = [];
-        for await (const entry of await opendir(canonical)) {
-          signal?.throwIfAborted();
-          if (++entries > sessionSkillLimits.entries)
-            throw new Error('Skill discovery exceeds the hosted entry limit');
-          if (entry.isDirectory()) names.push(entry.name);
-        }
-        return names.sort();
       };
       const add = async (path: string, name: string, source: string): Promise<boolean> => {
         const root = hostRoot(source);
         try {
           const marker = await checkedPath(join(path, 'SKILL.md'), root, signal);
           if (!(await stat(marker)).isFile()) throw new Error('Skill input must be a regular file');
+          const metadata = await provenance(path, root, signal);
+          skills.push({
+            name,
+            path,
+            source,
+            provenance: metadata,
+            trustLevel: inferSkillTrust(source, metadata),
+          });
+          return true;
         } catch (error) {
-          if (missing(error)) return false;
-          throw error;
+          isolateCatalogEntry(error, signal);
+          // Only an absent marker asks the caller to look for .system children.
+          // A malformed/unsafe skill is omitted, never followed or made trusted.
+          return !missing(error);
         }
-        const metadata = await provenance(path, root, signal);
-        skills.push({
-          name,
-          path,
-          source,
-          provenance: metadata,
-          trustLevel: inferSkillTrust(source, metadata),
-        });
-        return true;
       };
       for (const { dir, source } of roots) {
         for (const name of await directories(dir, hostRoot(source))) {

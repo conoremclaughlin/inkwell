@@ -179,14 +179,20 @@ describe('explicit-root asynchronous skill instructions', () => {
     ]);
   });
 
-  it.each(['catalog', 'marker', 'provenance', 'nested'] as const)(
-    'refuses linked %s instead of borrowing a root trust label',
+  it.each(['catalog', 'dot-dir', 'marker', 'provenance', 'nested'] as const)(
+    'omits linked %s without hiding independent catalogs or borrowing trust',
     async (kind) => {
       const path = await put(join(cwd, '.ink', 'skills', 'review'));
       const external = await put(join(root, 'outside'));
+      await put(join(external, 'child'));
+      await put(join(external, 'skills', 'review'));
+      await put(join(cwd, '.gemini', 'skills', 'healthy'));
       if (kind === 'catalog') {
         await rm(join(cwd, '.ink', 'skills'), { recursive: true });
         await symlink(external, join(cwd, '.ink', 'skills'));
+      } else if (kind === 'dot-dir') {
+        await rm(join(cwd, '.ink'), { recursive: true });
+        await symlink(external, join(cwd, '.ink'));
       } else if (kind === 'marker') {
         await rm(join(path, 'SKILL.md'));
         await symlink(join(external, 'SKILL.md'), join(path, 'SKILL.md'));
@@ -197,9 +203,9 @@ describe('explicit-root asynchronous skill instructions', () => {
         await rm(join(path, 'SKILL.md'));
         await symlink(external, join(path, '.system'));
       }
-      await expect(createSkillInstructionHost(cwd, home).discover()).rejects.toThrow(
-        'Linked skill'
-      );
+      expect(
+        (await createSkillInstructionHost(cwd, home).discover()).map((skill) => skill.name)
+      ).toEqual(['healthy']);
     }
   );
 
@@ -230,7 +236,46 @@ describe('explicit-root asynchronous skill instructions', () => {
       join(path, 'provenance.json'),
       ' '.repeat(sessionSkillLimits.provenanceBytes + 1)
     );
-    await expect(host.discover()).rejects.toThrow('byte limit');
+    expect(await host.discover()).toEqual([]);
+    await expect(host.load(skill)).rejects.toThrow('byte limit');
+  });
+
+  it.each(['marker-directory', 'provenance-directory', 'provenance-oversized'] as const)(
+    'isolates %s from healthy siblings and other sessions',
+    async (kind) => {
+      const path = await put(join(home, '.ink', 'skills', 'bad'));
+      if (kind === 'marker-directory') {
+        await rm(join(path, 'SKILL.md'));
+        await mkdir(join(path, 'SKILL.md'));
+      } else if (kind === 'provenance-directory') {
+        await mkdir(join(path, 'provenance.json'));
+      } else {
+        await writeFile(
+          join(path, 'provenance.json'),
+          ' '.repeat(sessionSkillLimits.provenanceBytes + 1)
+        );
+      }
+      await put(join(home, '.ink', 'skills', 'healthy'));
+      await put(join(cwd, '.codex', 'skills', 'repo'));
+      const [first, second] = await Promise.all([
+        createSkillInstructionHost(cwd, home).discover(),
+        createSkillInstructionHost(join(root, 'other-session'), home).discover(),
+      ]);
+      expect(first.map((skill) => skill.name)).toEqual(['healthy', 'repo']);
+      expect(second.map((skill) => skill.name)).toEqual(['healthy']);
+    }
+  );
+
+  it('isolates a non-directory catalog and preserves a filesystem AbortError', async () => {
+    await mkdir(join(home, '.ink'));
+    await writeFile(join(home, '.ink', 'skills'), 'not a directory');
+    await put(join(cwd, '.ink', 'skills', 'healthy'));
+    const host = createSkillInstructionHost(cwd, home);
+    expect((await host.discover()).map((skill) => skill.name)).toEqual(['healthy']);
+    hooks.afterRealpath = () => {
+      throw Object.assign(new Error('aborted I/O'), { name: 'AbortError' });
+    };
+    await expect(host.discover()).rejects.toThrow('aborted I/O');
   });
 
   it('bounds catalog enumeration including non-directory entries', async () => {
