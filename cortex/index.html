@@ -425,6 +425,7 @@ const RULES = {
   support: [
     [/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/, 4, "late delivery"],
     [/\b(back in stock|in stock\?|restock(ed)?|when will .{0,40}\b(be )?(back|available|in stock))\b/, 3, "a stock question"],
+    [/\b(is|are|do you have|do you carry|can i get)\b[^?]{0,80}\b(available|in stock|back|left)\b[^?]{0,60}\?/, 3, "a product question"],
     [/\btracking\b/, 1, "tracking"],
     [/\b(refund|money back|return it|send it back|exchange)\b/, 4, "refund or return"],
     [/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/, 4, "a problem with the order"],
@@ -544,7 +545,8 @@ function firstMatch(text, patterns) {
 // The number never follows an identifier (SKU 4471, #1042, order 1042).
 const NUMC = "(?<![\\w.#])(?<!\\b(?:sku|order|inv|invoice|po)\\s*[:#]?\\s*)";
 const N = name => NUMC + "(?<" + name + ">-?(?:\\d[\\d,]*(?:\\.\\d+)?|\\.\\d+))(?![\\d.])";
-const SEP = "\\s*(?:[:=]|is|of|at|in)?\\s*(?:about|approx\\.?|approximately|around|roughly|~|≈)?\\s*";
+const SEP = "\\s*(?:[:=]|is|of)?\\s*(?:about|approx\\.?|approximately|around|roughly|~|≈)?\\s*";
+const SEP_LEAD = "\\s*(?:[:=]|is|of|in)?\\s*(?:about|approx\\.?|approximately|around|roughly|~|≈)?\\s*";
 const RANGE = "(?:\\s*(?:-|–|to)\\s*" + N("n2") + ")?";
 const UNITW = "(?<u>[A-Za-z]+(?:\\s+(?:days?|weeks?|months?))?)";
 const LEAD_LABEL = "(?:supplier\\s+)?(?:lead[\\s-]?time|lead|lt|replenishment(?:\\s+time)?|restock(?:\\s+time)?|resupply(?:\\s+time)?|delivery time)";
@@ -565,17 +567,19 @@ const FIELDS = {
       new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate|units?)\\b(?:\\s*\\(units?\\))?" + SEP + N("n"), "id"),
       new RegExp("\\b(?:avg\\.?|average)?\\s*(?:sales|demand|sells|selling|sold)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + N("n"), "id"),
       new RegExp("\\b(?:avg|average)\\s*(?:\\/|per)\\s*(?:wk|week)\\b" + SEP + N("n"), "id"),
-      new RegExp("\\b(?:aws|weekly avg\\.?|weekly average|weekly)\\b\\s*[:=]\\s*" + N("n"), "id"),
+      new RegExp("\\baws\\b\\s*[:=]?\\s*" + N("n"), "id"),
+      new RegExp("\\b(?:weekly avg\\.?|weekly average|weekly)\\b\\s*[:=]\\s*" + N("n"), "id"),
       new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*(?:about|~|around)?\\s*" + N("n") + "\\s*(?:units?)?\\s*(?:per|\\/|a|each)\\s*(?:wk|week)\\b", "id")
     ],
     before: [
       new RegExp(N("n") + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "id"),
-      new RegExp(N("n") + "\\s*(?:units?)?\\s*(?:sold|sales)?\\s*(?:\\/|per|a|each)\\s*(?:wk|week)\\b", "id")
+      new RegExp(N("n") + "\\s*(?:units?\\s*)?(?:sold|sales)\\s*(?:\\/|per|a|each)\\s*(?:wk|week)\\b", "id"),
+      new RegExp(N("n") + "\\s*(?:units?)?\\s*(?:\\/|per)\\s*(?:wk|week)\\b", "id")
     ]
   },
   lead: {
     after: [
-      new RegExp("\\b" + LEAD_LABEL + "\\b(?:\\s*\\((?<pu>months?|weeks?|wks?|days?)\\))?" + SEP + N("n") + RANGE + "(?:\\s*" + UNITW + ")?", "id"),
+      new RegExp("\\b" + LEAD_LABEL + "\\b(?:\\s*\\((?<pu>months?|weeks?|wks?|days?)\\))?" + SEP_LEAD + N("n") + RANGE + "(?:\\s*" + UNITW + ")?", "id"),
       new RegExp("\\b(?:takes|arrives in|arriving in|ships in|restocks? in|back in)\\s*(?:about|~|around)?\\s*" + N("n") + RANGE + "\\s*" + UNITW, "id")
     ],
     before: [
@@ -634,8 +638,10 @@ function parseStock(text) {
     leadWeeks = leadUnit === "days" ? lead / 7 : leadUnit === "months" ? lead * 52 / 12 : lead;
   }
   const fields = [onHand, weekly, lead].filter(v => v != null).length;
-  const isStock = fields >= 2 || (fields >= 1 && (skuM || words >= 2));
-  const STOP = /[,;|]|\b(?:on[\s-]?hand|avg|average|weekly|lead|qty|in stock|stock|sells|selling)\b/i;
+  const stockLabel = /\b(on[\s-]?hand|soh|in stock|stock on hand|stock level|inventory\s*[:=]|lead[\s-]?time|weekly sales|weekly demand|aws|sales\s*(?:\/|per)\s*(?:wk|week))\b/i.test(t);
+  const personal = /^(hi|hello|hey|dear|good (morning|afternoon|evening))\b/i.test(t.trim()) || /\?/.test(t);
+  const isStock = (fields >= 2 || (fields >= 1 && (skuM || words >= 2))) && (stockLabel || !personal);
+  const STOP = /[,;|]|\b(?:on[\s-]?hand|avg|average|weekly|lead|qty|in stock|stock|sells|selling|only|available|soh|aws|restock|supplier|takes)\b/i;
   const tidy = v => v.replace(/^[\s:–—-]+|[\s:–—-]+$/g, "").replace(/[\s:–—-]*\d[\d,.]*\s*$/, "").trim();
   let item = null;
   if (skuM) {
