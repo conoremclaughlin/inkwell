@@ -51,6 +51,7 @@
   --supply-bg: #fbecd2; --supply-fg: #7a4a06; --supply-dot: #c98410;
   --pending-bg: #f8e1e6; --pending-fg: #8c1d3c; --pending-dot: #d6456b;
   --bid-bg: #e3e6f5; --bid-fg: #2f3a7a; --bid-dot: #5865c4;
+  --approval-bg: #dcf0f2; --approval-fg: #0f5560; --approval-dot: #1d97a6;
   --ok-bg: #e3f2e6; --ok-fg: #1d5a37; --ok-line: #9fd2ae;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
@@ -79,6 +80,7 @@
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
     --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
     --bid-bg: #1f2447; --bid-fg: #b9c1f3; --bid-dot: #7f8be0;
+    --approval-bg: #12333a; --approval-fg: #9fdde5; --approval-dot: #3cbccb;
     --ok-bg: #15301f; --ok-fg: #a6e0bc; --ok-line: #2f6a45;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
@@ -105,6 +107,7 @@
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
     --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
     --bid-bg: #1f2447; --bid-fg: #b9c1f3; --bid-dot: #7f8be0;
+    --approval-bg: #12333a; --approval-fg: #9fdde5; --approval-dot: #3cbccb;
     --ok-bg: #15301f; --ok-fg: #a6e0bc; --ok-line: #2f6a45;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
@@ -265,6 +268,8 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .flag-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .pill.bid { background: var(--bid-bg); color: var(--bid-fg); }
 .pill.bid::before { background: var(--bid-dot); }
+.pill.approval { background: var(--approval-bg); color: var(--approval-fg); }
+.pill.approval::before { background: var(--approval-dot); }
 /* Bid margin check: green when it's fine to send, red (the alert style) when it needs a VP. */
 .result.ok { background: var(--ok-bg); border: 1.5px solid var(--ok-line); }
 .result.ok .step { color: var(--ok-fg); font-weight: 600; }
@@ -491,6 +496,11 @@ footer {
             <span>Construction:</span>
             <button type="button" class="chip" data-example="bid">A bid to check</button>
           </div>
+          <div class="examples" role="group" aria-label="Fill in a work approval example">
+            <span>Auto shop:</span>
+            <button type="button" class="chip" data-example="phoneOkay">Phone okay</button>
+            <button type="button" class="chip" data-example="signed">Signed</button>
+          </div>
           <div class="centre">
             <label for="centrePhone">Received on centre phone</label>
             <select id="centrePhone" name="centrePhone">
@@ -590,6 +600,8 @@ const EXAMPLES = {
   entrega: "Oi, quando chega minha caixa? O rastreio não atualiza há 3 dias.",
   bundle: "1Gbps fibre SGD 2,400/mo x 36; install SGD 6,000 one-time; managed router SGD 300/mo; discount 12%",
   bid: "Midtown clinic fit-out, cost $1.42M, bid $1.51M, contingency 2%",
+  phoneOkay: "Mrs. Lee okayed front brakes and rotors, $480, by phone.",
+  signed: "Mrs. Lee signed the estimate for front brakes and rotors, $480.",
   supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
   parentfee: "Good morning, I have paid Ada's school fees, KSh 15,000 through M-Pesa this morning. Ref QKL2M4N6P8.\nThank you,\nGrace",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
@@ -1376,10 +1388,45 @@ function bidAnswer(b, floors = bidFloors()) {
     summary: [job, pct(margin) + " margin", thinMargin || thinCont ? "⚠️ Hold for VP review" : "OK to send"].join(" · ") };
 }
 
+/* ---------- work approval: was the job approved in writing before the tech starts? ---------- */
+const APPROVAL_WRITTEN = /\b(signed|signature|in writing|e-?sign(ed)?|written approval|approved in writing|texted back|replied yes|approved by (text|email|e-?mail)|approval by (text|email))\b/i;
+const APPROVAL_SAID = /\b(approv(e|ed|al|es)|ok(ay)?(ed|'d|s)?|o\.k\.|yes|agreed|go ahead|green[- ]?lit)\b/i;
+const APPROVAL_VERBAL = /\b(phone|verbal(ly)?|called|calls?|on the call|over the phone)\b/i;
+function workApprovalKind(text) {
+  // Anything in writing counts as written, even if there was also a call.
+  if (APPROVAL_WRITTEN.test(text)) return "written";
+  if (APPROVAL_SAID.test(text) && APPROVAL_VERBAL.test(text)) return "verbal";
+  return null;
+}
+function workApprovalAnswer(kind, text) {
+  const facts = [];
+  const who = text.match(/\b((?:Mr|Mrs|Ms|Miss|Dr)\.?\s+[A-Z][a-z]+|[A-Z][a-z]+\s+[A-Z][a-z]+)\b/);
+  if (who) facts.push(["Customer", who[1]]);
+  // "$480," at the end of a clause: the comma is punctuation, not part of the amount.
+  const amount = text.match(/\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?(?![\d])|\$\s?\d+(?:\.\d{2})?/);
+  if (amount) facts.push(["Amount", amount[0].replace(/\s/g, "")]);
+  const job = text.match(/\b(?:okayed|approved|signed(?: the estimate| off)?(?: for)?|for)\s+((?:the\s+)?[a-z][a-z ,&-]{2,60}?)(?=,|\.|\s+by\b|\s+for\b|\s+over\b|$)/i);
+  if (job) facts.push(["Work", job[1].replace(/^the estimate for\s+/i, "").trim()]);
+  facts.push(["Approval", kind === "written" ? "In writing" : "Verbal only"]);
+  if (kind === "verbal") {
+    return { category: "approval", label: "Work approval", urgency: "Hold", confidence: null, thin: true,
+      step: "⚠️ HOLD: verbal approval only. Get it in writing before the tech starts.",
+      why: "The customer agreed by phone, but there's no signature or written approval yet.", facts, signals: [],
+      summary: [who && who[1], amount && amount[0], "⚠️ HOLD: verbal only"].filter(Boolean).join(" · ") };
+  }
+  return { category: "approval", label: "Work approval", urgency: "Ready", confidence: null, ok: true,
+    step: "✅ Approved in writing: release to tech.",
+    why: "There's a signature or written approval on record.", facts, signals: [],
+    summary: [who && who[1], amount && amount[0], "✅ Approved in writing"].filter(Boolean).join(" · ") };
+}
+
 function classify(text, now = new Date()) {
   // Personal data is masked first, so nothing below can show or log a full CPF or phone number.
   const clean = maskLGPD(text).trim();
   if (!clean) return null;
+  // Work approval comes before everything else: a tech must not start on a verbal okay.
+  const approval = workApprovalKind(clean);
+  if (approval) return workApprovalAnswer(approval, clean);
   if (isMpesa(clean) || isParentFee(clean)) return feesAnswer(clean);
   if (isBundleQuote(clean)) return bundleQuoteAnswer(clean);
   // A failed payment comes before Support and Billing: the box mustn't ship unpaid.
@@ -1572,6 +1619,7 @@ function renderLog(freshId) {
     if (t.day) timeEl.append(el("small", { text: t.day }));
     const body = el("div", { class: "entry-body" },
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      e.category === "approval" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "bid" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "pending" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "fees" && (e.summary || e.centre) ? el("div", { class: "entry-fee", text: [e.summary, e.centre].filter(Boolean).join(" · ") }) : null,
@@ -1590,7 +1638,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, pending: 0, bid: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, pending: 0, bid: 0, approval: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1606,6 +1654,7 @@ function renderLog(freshId) {
   if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
   if (counts.supply) parts.push(counts.supply + " supply risk");
   if (counts.pending) parts.push(counts.pending + " pagamento pendente");
+  if (counts.approval) parts.push(counts.approval + (counts.approval === 1 ? " work approval" : " work approvals"));
   if (counts.bid) parts.push(counts.bid + (counts.bid === 1 ? " bid check" : " bid checks"));
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
@@ -1802,6 +1851,7 @@ function hint(text) {
     crew: "The crew has a question. Sort it and I'll log it.",
     fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
     supply: "A supplier running late. Sort it and I'll flag the reorder point.",
+    approval: "A work approval. Sort it and I'll check it's in writing.",
     bid: "A bid. Sort it and I'll check the margin against your floor.",
     pending: "A failed payment. Sort it and I'll tell you what to send before the box ships.",
     other: "Hmm, I can't tell what that is yet."
@@ -1828,6 +1878,7 @@ function react(r) {
   if (r.category === "partner") { say("A follow-up to schedule."); mood(0.6, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
+  if (r.category === "approval") { say(r.ok ? "Approved in writing. Release it to the tech." : "Hold on: that's only a verbal okay. Get it in writing first."); mood(r.ok ? 1 : 0, r.ok ? 0 : 0.8); if (r.ok) hop(); return; }
   if (r.category === "bid") { if (r.thin) { say("Hold on: " + r.step.replace(/^⚠️ /, "")); mood(0, 0.8, 4200); } else { say(r.ok ? "Margin looks healthy. OK to send." : r.step); mood(r.ok ? 1 : 0, r.ok ? 0 : 0.5); if (r.ok) hop(); } return; }
   if (r.category === "pending") { say("Pagamento pendente: send the subscriber a Pix link before the box ships."); mood(0, 0.6); return; }
   if (r.category === "supply") { say("A supplier is running late. Check whether what's on hand lasts, or line up a backup."); mood(0, 0.6); return; }
