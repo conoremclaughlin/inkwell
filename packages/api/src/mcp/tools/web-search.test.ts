@@ -1,17 +1,27 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DataComposer } from '../../data/composer';
 import type { AuditEntry } from '../../services/audit';
 import type { WebSearchOutput } from '../../services/web-search/types';
 
 const mocks = vi.hoisted(() => ({
+  spawn: vi.fn(() => {
+    throw new Error('Unexpected provider launch in preflight tests');
+  }),
   isEnabled: vi.fn<(...args: unknown[]) => Promise<boolean>>(),
   log: vi.fn<(entry: AuditEntry, options?: { required?: boolean }) => Promise<void>>(),
+}));
+vi.mock('node:child_process', async (original) => ({
+  ...(await original<typeof import('node:child_process')>()),
+  spawn: mocks.spawn,
 }));
 vi.mock('../../services/audit', () => ({ getAuditService: () => ({ log: mocks.log }) }));
 vi.mock('../../services/permissions', () => ({
   getPermissionsService: () => ({ isEnabled: mocks.isEnabled }),
 }));
 
+import { searchWeb } from '../../services/web-search';
+import { SearchAdmission, searchAdmission } from '../../services/web-search/admission';
+import { SYNTHETIC_ENV } from '../../services/web-search/fixtures.test-support';
 import { WebSearchError } from '../../services/web-search/errors';
 import { runWithRequestContext } from '../../utils/request-context';
 import { handleWebSearch, webSearchSchema } from './web-search';
@@ -47,11 +57,19 @@ function parse(result: Awaited<ReturnType<typeof handleWebSearch>>) {
   return JSON.parse(result.content[0].text) as Record<string, unknown>;
 }
 
+let originalEnv: NodeJS.ProcessEnv;
 beforeEach(() => {
+  originalEnv = process.env;
+  process.env = { ...SYNTHETIC_ENV };
   vi.clearAllMocks();
   mocks.isEnabled.mockResolvedValue(true);
   mocks.log.mockResolvedValue(undefined);
   search.mockResolvedValue(output);
+});
+
+afterEach(() => {
+  process.env = originalEnv;
+  vi.restoreAllMocks();
 });
 
 describe('web_search auth, policy and audit', () => {
@@ -62,6 +80,9 @@ describe('web_search auth, policy and audit', () => {
     });
     for (const bad of [
       { query: '' },
+      { query: 'before\tafter' },
+      { query: 'before\nafter' },
+      { query: 'before\u007fafter' },
       { query: 'a'.repeat(501) },
       { query: 'q', maxResults: 11 },
       { query: 'q', provider: 'codex' },
@@ -147,7 +168,7 @@ describe('web_search auth, policy and audit', () => {
     expect(JSON.stringify(result)).not.toContain('Untrusted title');
   });
 
-  it.each([new Error('private auth detail'), new WebSearchError('search_not_observed')])(
+  it.each([new Error('private auth detail'), new WebSearchError('search_not_observed', true)])(
     'audits a static provider failure without exposing its exception',
     async (error) => {
       search.mockRejectedValueOnce(error);
@@ -199,5 +220,76 @@ describe('web_search untrusted result envelope', () => {
     expect(suffix).toContain('UNTRUSTED');
     expect(prefix + suffix).not.toContain(query);
     expect(prefix + suffix).not.toContain(output.results[0].url);
+  });
+});
+
+describe('real searchWeb / handler preflight composition (no provider)', () => {
+  // No injected search fake: exercise the handler's production service path.
+  const realCall = () =>
+    runWithRequestContext({ userId }, () =>
+      handleWebSearch({ query: 'private preflight query' }, composer)
+    );
+
+  it('keeps a default-disabled request query-free, even if account permission resolves on', async () => {
+    delete process.env.INK_WEB_SEARCH_ENABLED;
+    await expect(
+      searchWeb({ query: 'private preflight query', maxResults: 5 })
+    ).rejects.toMatchObject({ reason: 'disabled', launched: false });
+    expect(parse(await realCall())).toMatchObject({ reason: 'disabled', searchMayHaveRun: false });
+    expect(mocks.log).toHaveBeenCalledTimes(1);
+    expect(mocks.log.mock.calls[0][0]).toMatchObject({
+      responseStatus: 'blocked',
+      metadata: { reason: 'disabled' },
+    });
+    expect(JSON.stringify(mocks.log.mock.calls)).not.toContain('private preflight query');
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed disabled audit query-free with an honest receipt', async () => {
+    delete process.env.INK_WEB_SEARCH_ENABLED;
+    mocks.log.mockRejectedValue(new Error('private persistence failure'));
+    expect(parse(await realCall())).toMatchObject({
+      reason: 'audit-unavailable',
+      searchMayHaveRun: false,
+    });
+    expect(JSON.stringify(mocks.log.mock.calls)).not.toContain('private preflight query');
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'missing_configuration',
+    'unsupported_provider',
+    'capacity_exhausted',
+    'service_quarantined',
+  ])('does not imply an external search on real-service %s', async (reason) => {
+    const admission = new SearchAdmission();
+    vi.spyOn(searchAdmission, 'acquire').mockImplementation(() => admission.acquire());
+    if (reason === 'missing_configuration') delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
+    if (reason === 'unsupported_provider') process.env.INK_WEB_SEARCH_PROVIDER = 'codex';
+    const occupied =
+      reason === 'capacity_exhausted' || reason === 'service_quarantined'
+        ? admission.acquire()
+        : undefined;
+    if (reason === 'service_quarantined') occupied!.quarantine();
+    try {
+      expect(parse(await realCall())).toMatchObject({ reason, searchMayHaveRun: false });
+      expect(mocks.log.mock.calls[1][0]).toMatchObject({
+        responseStatus: 'blocked',
+        metadata: { reason, searchMayHaveRun: false },
+      });
+      expect(mocks.spawn).not.toHaveBeenCalled();
+    } finally {
+      occupied?.release();
+    }
+  });
+
+  it('preserves pre-launch certainty when recording the refusal fails', async () => {
+    delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
+    mocks.log.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('private error'));
+    expect(parse(await realCall())).toMatchObject({
+      reason: 'audit-unavailable',
+      searchMayHaveRun: false,
+    });
+    expect(mocks.spawn).not.toHaveBeenCalled();
   });
 });

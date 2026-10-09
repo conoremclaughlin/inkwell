@@ -17,6 +17,7 @@ export type { WebSearchInput, WebSearchOutput } from './types.js';
  * The caller must record its required audit BEFORE invoking this function.
  */
 export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput> {
+  let launched = false;
   try {
     const config = readConfig(process.env);
     const request = validateInput(input);
@@ -52,9 +53,13 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
         await assertUnmanagedHost();
         const timeoutMs = remaining(); // Recheck after the final asynchronous preflight.
         const stream = new ClaudeSearchStream(config.model, request.maxResults);
+        const args = claudeArgs(config, sandbox);
+        // From this call onward, failures (including cleanup) may follow an
+        // external search. Credential-free probes above never set this bit.
+        launched = true;
         await runBounded({
           executable,
-          args: claudeArgs(config, sandbox),
+          args,
           cwd: sandbox.cwd,
           env: { ...sandbox.env, ANTHROPIC_API_KEY: config.apiKey },
           stdin: JSON.stringify({ query: request.query, maxResults: request.maxResults }) + '\n',
@@ -77,6 +82,6 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
       admission.release();
     }
   } catch (error) {
-    throw staticError(error);
+    throw new WebSearchError(staticError(error).reason, launched);
   }
 }

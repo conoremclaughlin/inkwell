@@ -7,12 +7,13 @@ import { getAuditService, type AuditEntry } from '../../services/audit';
 import { getPermissionsService } from '../../services/permissions';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { searchWeb, WebSearchError } from '../../services/web-search';
+import { isWebSearchEnabled, LIMITS, webSearchQuerySchema } from '../../services/web-search/config';
 import { getRequestContext } from '../../utils/request-context';
 
 export const webSearchSchema = userIdentifierBaseSchema
   .extend({
-    query: z.string().trim().min(1).max(500).describe('The public web search query.'),
-    maxResults: z.number().int().min(1).max(10).optional().default(5),
+    query: webSearchQuerySchema.describe('The public web search query.'),
+    maxResults: z.number().int().min(1).max(LIMITS.results).optional().default(5),
   })
   .strict();
 
@@ -91,6 +92,16 @@ export async function handleWebSearch(
     }
     return fail('permission-off');
   }
+  // A dark deployment must not persist the query as a pending search. This
+  // gate is independent of the account's existing web_search permission.
+  if (!isWebSearchEnabled()) {
+    try {
+      await record('outcome', 'blocked', { reason: 'disabled' });
+    } catch {
+      return fail('audit-unavailable');
+    }
+    return fail('disabled');
+  }
   if (deps.signal?.aborted) {
     try {
       await record('outcome', 'blocked', { reason: 'cancelled' });
@@ -114,14 +125,15 @@ export async function handleWebSearch(
     });
   } catch (error) {
     const reason = error instanceof WebSearchError ? error.reason : 'provider-failed';
+    const searchMayHaveRun = error instanceof WebSearchError ? error.launched : true;
     try {
-      await record('outcome', 'error', { reason });
+      await record('outcome', searchMayHaveRun ? 'error' : 'blocked', { reason, searchMayHaveRun });
     } catch {
-      return fail('audit-unavailable', true);
+      return fail('audit-unavailable', searchMayHaveRun);
     }
     // Do not encourage an automatic paid retry. Unless the backend supplies
     // positive pre-launch evidence, failure may follow an external search.
-    return fail(reason, true);
+    return fail(reason, searchMayHaveRun);
   }
   try {
     await record('outcome', 'success', {

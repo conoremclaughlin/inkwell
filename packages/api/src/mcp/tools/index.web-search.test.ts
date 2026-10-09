@@ -1,5 +1,5 @@
 import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 
@@ -35,11 +35,13 @@ class FakeServer {
   }
 }
 beforeEach(() => {
+  vi.stubEnv('INK_WEB_SEARCH_ENABLED', 'true');
   handler.mockReset();
   mocks.allowed.mockReset();
   mocks.audit.mockReset();
   mocks.search.mockReset();
 });
+afterEach(() => vi.unstubAllEnvs());
 describe('registered web_search path', () => {
   function setup() {
     const server = new FakeServer();

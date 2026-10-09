@@ -32,8 +32,12 @@ export interface SearchConfig {
   apiKey: string;
 }
 
+export function isWebSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_WEB_SEARCH_ENABLED === 'true';
+}
+
 export function readConfig(env: NodeJS.ProcessEnv): SearchConfig {
-  if (env.INK_WEB_SEARCH_ENABLED !== 'true') throw new WebSearchError('disabled');
+  if (!isWebSearchEnabled(env)) throw new WebSearchError('disabled');
   if (env.INK_WEB_SEARCH_PROVIDER === 'codex') {
     // shell_tool=false does NOT remove apply_patch, apps, or MCP. A complete
     // native search-only allowlist has not been demonstrated for Codex.
@@ -67,14 +71,17 @@ export function readConfig(env: NodeJS.ProcessEnv): SearchConfig {
   return { executable, model, apiKey };
 }
 
+// Shared by the public tool and service so validation cannot drift at dispatch.
+export const webSearchQuerySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(LIMITS.queryChars)
+  .refine((query) => !/[\x00-\x1f\x7f]/.test(query));
+
 const inputSchema = z
   .object({
-    query: z
-      .string()
-      .trim()
-      .min(1)
-      .max(LIMITS.queryChars)
-      .refine((query) => !/[\x00-\x1f\x7f]/.test(query)),
+    query: webSearchQuerySchema,
     maxResults: z.number().int().min(1).max(LIMITS.results),
     signal: z.custom<AbortSignal>((value) => value instanceof AbortSignal).optional(),
   })

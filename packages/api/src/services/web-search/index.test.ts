@@ -76,7 +76,10 @@ describe('searchWeb operator configuration boundary', () => {
     'is dark unless explicitly true (%s)',
     async (enabled) => {
       process.env.INK_WEB_SEARCH_ENABLED = enabled;
-      await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'disabled' });
+      await expect(searchWeb(request)).rejects.toMatchObject({
+        reason: 'disabled',
+        launched: false,
+      });
       expect(mocks.spawn).not.toHaveBeenCalled();
     }
   );
@@ -88,7 +91,10 @@ describe('searchWeb operator configuration boundary', () => {
     'INK_WEB_SEARCH_CLAUDE_API_KEY',
   ])('refuses missing %s before any spawn', async (key) => {
     delete process.env[key];
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'missing_configuration' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'missing_configuration',
+      launched: false,
+    });
     expect(mocks.spawn).not.toHaveBeenCalled();
   });
 
@@ -96,11 +102,20 @@ describe('searchWeb operator configuration boundary', () => {
     delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'synthetic-ambient-key';
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'synthetic-ambient-oauth';
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'missing_configuration' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'missing_configuration',
+      launched: false,
+    });
     process.env.INK_WEB_SEARCH_CLAUDE_OAUTH_TOKEN = 'synthetic-dedicated-oauth';
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'unsupported_credential' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'unsupported_credential',
+      launched: false,
+    });
     process.env.INK_WEB_SEARCH_PROVIDER = 'codex';
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'unsupported_provider' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'unsupported_provider',
+      launched: false,
+    });
     expect(mocks.spawn).not.toHaveBeenCalled();
     expect(() => readConfig({ ...SYNTHETIC_ENV, INK_WEB_SEARCH_CLAUDE_PATH: 'claude' })).toThrow(
       'missing_configuration'
@@ -122,6 +137,7 @@ describe('searchWeb operator configuration boundary', () => {
     ])
       await expect(searchWeb(input as typeof request)).rejects.toMatchObject({
         reason: 'invalid_input',
+        launched: false,
       });
     expect(mocks.spawn).not.toHaveBeenCalled();
     expect(validateInput({ query: 'x'.repeat(500), maxResults: 10 }).query).toHaveLength(500);
@@ -273,7 +289,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     async (which) => {
       if (which === 'version') version = '9.9.9 (Claude Code)';
       else help = help.replace('--tools', '--unsupported');
-      await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'unsupported_capability' });
+      await expect(searchWeb(request)).rejects.toMatchObject({
+        reason: 'unsupported_capability',
+        launched: false,
+      });
       expect(children).toHaveLength(2);
       expect(children.every((child) => !child.input)).toBe(true);
       await expectRemoved();
@@ -286,6 +305,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     const create = vi.spyOn(isolation, 'createSandbox');
     await expect(searchWeb({ ...request, signal: controller.signal })).rejects.toMatchObject({
       reason: 'cancelled',
+      launched: false,
     });
     expect(mocks.spawn).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
@@ -296,6 +316,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     inference = () => controller.abort();
     await expect(searchWeb({ ...request, signal: controller.signal })).rejects.toMatchObject({
       reason: 'cancelled',
+      launched: true,
     });
     expect(children[2].signalCode).toBe('SIGTERM');
     expect(children[2].groupAlive).toBe(false);
@@ -310,6 +331,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     };
     await expect(searchWeb(request)).rejects.toMatchObject({
       reason: 'output_limit',
+      launched: true,
       message: 'Web search refused: output_limit',
     });
     expect(children[2].groupAlive).toBe(false);
@@ -322,7 +344,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       init.tools = ['WebSearch', 'Bash'];
       child.events([init]);
     };
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'unsupported_capability' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'unsupported_capability',
+      launched: true,
+    });
     expect(children[2].signals).toEqual(['SIGTERM']);
     await expectRemoved();
   });
@@ -336,6 +361,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     const failure = await searchWeb(request).catch((error: unknown) => error);
     expect(failure).toMatchObject({
       reason: 'provider_failed',
+      launched: true,
       message: 'Web search refused: provider_failed',
     });
     expect(failure).not.toHaveProperty('cause');
@@ -347,7 +373,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     mocks.spawn.mockImplementation(() => {
       throw new Error('synthetic sensitive spawn data');
     });
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'spawn_failed' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'spawn_failed',
+      launched: false,
+    });
     const sandbox = await create.mock.results[0].value;
     await expect(access(sandbox.root)).rejects.toThrow();
   });
@@ -360,7 +389,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       queueMicrotask(() => child.emit('error', new Error('synthetic private launch detail')));
       return child;
     });
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'spawn_failed' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'spawn_failed',
+      launched: false,
+    });
     expect(process.kill).not.toHaveBeenCalled();
     const sandbox = await create.mock.results[0].value;
     await expect(access(sandbox.root)).rejects.toThrow();
@@ -381,6 +413,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     });
     await expect(searchWeb(request)).rejects.toMatchObject({
       reason: 'cleanup_failed',
+      launched: true,
       message: 'Web search refused: cleanup_failed',
     });
     const sandbox = await create.mock.results[0].value;
@@ -392,7 +425,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     vi.mocked(isolation.assertUnmanagedHost).mockRejectedValue(
       new WebSearchError('managed_configuration')
     );
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'managed_configuration' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'managed_configuration',
+      launched: false,
+    });
     expect(mocks.spawn).not.toHaveBeenCalled();
   });
 
@@ -404,7 +440,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     inference = () => ready();
     const first = searchWeb(request);
     await spawned;
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'capacity_exhausted' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'capacity_exhausted',
+      launched: false,
+    });
     expect(children).toHaveLength(3);
     children[2].events(searchEvents());
     children[2].finish();
@@ -430,15 +469,24 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       ready();
     };
     const first = searchWeb({ ...request, signal: controller.signal });
-    const rejected = expect(first).rejects.toMatchObject({ reason: 'stop_unconfirmed' });
+    const rejected = expect(first).rejects.toMatchObject({
+      reason: 'stop_unconfirmed',
+      launched: true,
+    });
     await spawned;
     vi.useFakeTimers();
     controller.abort();
     await vi.advanceTimersByTimeAsync(LIMITS.stopGraceMs + LIMITS.stopGiveUpMs);
     await rejected;
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'service_quarantined' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'service_quarantined',
+      launched: false,
+    });
     children[2].finish();
-    await expect(searchWeb(request)).rejects.toMatchObject({ reason: 'service_quarantined' });
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'service_quarantined',
+      launched: false,
+    });
     expect(children).toHaveLength(3);
     await expectRemoved();
   });
@@ -450,6 +498,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     });
     await expect(searchWeb({ ...request, signal: controller.signal })).rejects.toMatchObject({
       reason: 'cancelled',
+      launched: false,
     });
     expect(children).toHaveLength(2);
     expect(children.every((child) => !child.options.env?.ANTHROPIC_API_KEY)).toBe(true);

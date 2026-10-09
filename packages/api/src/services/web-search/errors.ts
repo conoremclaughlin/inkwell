@@ -27,12 +27,16 @@ export type WebSearchReason = (typeof WEB_SEARCH_REASONS)[number];
 export class WebSearchError extends Error {
   readonly reason: WebSearchReason;
 
-  constructor(reason: WebSearchReason) {
+  /** Credentialed dispatch was attempted; not proof a search completed. */
+  readonly launched: boolean;
+
+  constructor(reason: WebSearchReason, launched = false) {
     // Also guard callers using untyped JavaScript.
     const safeReason = WEB_SEARCH_REASONS.includes(reason) ? reason : 'internal_error';
     super(`Web search refused: ${safeReason}`);
     this.name = 'WebSearchError';
     this.reason = safeReason;
+    this.launched = launched;
   }
 }
 
