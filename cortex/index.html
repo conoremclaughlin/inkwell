@@ -525,42 +525,77 @@ function signOff(text) {
 }
 
 /* ---------- inventory: on hand against avg weekly sales × lead time ---------- */
-const NUM = "(\\d[\\d,]*(?:\\.\\d+)?)";
+// A whole number token: its sign and a leading decimal point belong to it, so ".5" is never 5 and "-5" never 5.
+const NUM = "(?<![\\w.#])(?<!\\b(?:sku|order|inv|invoice|po)\\s*[:#]?\\s*)(-?(?:\\d[\\d,]*(?:\\.\\d+)?|\\.\\d+))(?![\\d.])";
 function num(v) { return v == null ? null : Number(String(v).replace(/,/g, "")); }
 function firstMatch(text, patterns) {
   for (const re of patterns) { const m = text.match(re); if (m) return m; }
   return null;
 }
+const SEP = "\\s*(?:[:=]|is|of)?\\s*";
+const UNIT = "(months?|mos?|mo|weeks?|wks?|w|days?|d)";
+// Each field written label-then-number, or number-then-label.
+const FIELDS = {
+  onHand: {
+    after: [
+      new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b" + SEP + NUM, "i"),
+      new RegExp("\\b(?:in stock|stock on hand|stock)\\b" + SEP + NUM, "i")
+    ],
+    before: [
+      new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "i"),
+      new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "i")
+    ]
+  },
+  weekly: {
+    after: [
+      new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b" + SEP + NUM, "i"),
+      new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + NUM, "i"),
+      new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "i")
+    ],
+    before: [
+      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "i"),
+      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "i")
+    ]
+  },
+  lead: {
+    after: [new RegExp("\\blead[\\s-]?time\\b" + SEP + NUM + "(?:\\s*([A-Za-z]+))?", "i")],
+    before: [
+      new RegExp(NUM + "\\s*" + UNIT + "\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
+      new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "i")
+    ]
+  }
+};
+/**
+ * One reading for the whole line: number-then-label when the line opens with a
+ * number ("120 on hand 85 avg weekly sales…"), label-then-number otherwise, and
+ * the other form only for a field the first reading can't find.
+ */
+function readField(t, field, numberFirst) {
+  const f = FIELDS[field];
+  return numberFirst ? firstMatch(t, f.before) || firstMatch(t, f.after) : firstMatch(t, f.after) || firstMatch(t, f.before);
+}
 function parseStock(text) {
   const t = text.replace(/\s+/g, " ");
-  const onHandM = firstMatch(t, [
-    new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
-    new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "i"),
-    new RegExp("\\b(?:in stock|stock|inventory|qty|quantity)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
-    new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "i")
-  ]);
-  const weeklyM = firstMatch(t, [
-    new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
-    new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
-    new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "i"),
-    new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "i"),
-    new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "i")
-  ]);
-  const leadM = firstMatch(t, [
-    new RegExp("\\blead[\\s-]?time\\b\\s*(?:[:=]|is|of)?\\s*" + NUM + "\\s*(months?|mos?|mo|weeks?|wks?|w|days?|d)?\\b", "i"),
-    new RegExp(NUM + "\\s*(months?|mos?|mo|weeks?|wks?|w|days?|d)\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
-    new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "i")
-  ]);
+  const numberFirst = /^\s*-?\.?\d/.test(t);
+  const onHandM = readField(t, "onHand", numberFirst);
+  const weeklyM = readField(t, "weekly", numberFirst);
+  const leadM = readField(t, "lead", numberFirst);
   const skuM = t.match(/\bsku\s*[:#]?\s*([A-Za-z0-9][\w-]*)/i);
   const lower = t.toLowerCase();
   const words = ["on hand", "on-hand", "weekly sales", "lead time", "lead-time", "in stock", "sku", "reorder", "stock"].filter(w => lower.includes(w)).length;
   const onHand = onHandM ? num(onHandM[1]) : null;
   const weekly = weeklyM ? num(weeklyM[1]) : null;
   let lead = null, leadUnit = "weeks", leadWeeks = null;
+  let badUnit = null;
   if (leadM) {
     lead = num(leadM[1]);
-    const u = (leadM[2] || "weeks").toLowerCase();
-    leadUnit = u.startsWith("d") ? "days" : u.startsWith("m") ? "months" : "weeks";
+    const word = (leadM[2] || "").toLowerCase();
+    if (/^(weeks?|wks?|w)$/.test(word) || word === "") leadUnit = "weeks";
+    else if (/^(days?|d)$/.test(word)) leadUnit = "days";
+    else if (/^(months?|mos?|mo)$/.test(word)) leadUnit = "months";
+    // No unit written, and the next word starts another field: weeks, as before.
+    else if (/^(on|avg|average|weekly|sku|sells|selling|in|stock|and|qty|sales)$/.test(word)) leadUnit = "weeks";
+    else badUnit = word;
     leadWeeks = leadUnit === "days" ? lead / 7 : leadUnit === "months" ? lead * 52 / 12 : lead;
   }
   const fields = [onHand, weekly, lead].filter(v => v != null).length;
@@ -577,7 +612,7 @@ function parseStock(text) {
     const name = tidy(t.split(STOP)[0]);
     if (name && /[A-Za-z]/.test(name) && name.length <= 60) item = name;
   }
-  return { isStock, sku: skuM ? skuM[1] : null, item, onHand, weekly, lead, leadUnit, leadWeeks };
+  return { isStock, sku: skuM ? skuM[1] : null, item, onHand, weekly, lead, leadUnit, leadWeeks, badUnit };
 }
 
 function plural(n, unit) {
@@ -597,6 +632,23 @@ function stockAnswer(st) {
   if (st.onHand == null) missing.push("on hand");
   if (st.weekly == null) missing.push("avg weekly sales");
   if (st.lead == null) missing.push("lead time");
+  if (st.badUnit) {
+    return {
+      category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
+      step: "Give the lead time in weeks, days or months",
+      why: "I can't use a lead time in “" + st.badUnit + "”.",
+      facts: facts.filter(f => f[0] !== "Lead time"), signals: []
+    };
+  }
+  const negative = [["on hand", st.onHand], ["avg weekly sales", st.weekly], ["lead time", st.lead]].filter(([, v]) => v != null && v < 0).map(([k]) => k);
+  if (negative.length) {
+    return {
+      category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
+      step: "Check the " + negative.join(" and ") + ": it can't be below zero",
+      why: "A stock check needs on hand, avg weekly sales and lead time of zero or more.",
+      facts, signals: []
+    };
+  }
   if (missing.length) {
     return {
       category: "inventory", label: "Inventory", urgency: "Needs a number", confidence: null,
@@ -610,11 +662,12 @@ function stockAnswer(st) {
   const inWeeks = st.leadUnit === "weeks" ? over : over + " (" + (Math.round(st.leadWeeks * 10) / 10) + " weeks)";
   facts.push(["Demand over lead time", "~" + fmt(demand)]);
   if (st.onHand < demand) {
-    const reorder = demand - st.onHand;
-    facts.push(["Reorder", "~" + fmt(reorder) + " units"]);
+    const reorder = Math.max(1, Math.ceil(demand - st.onHand - 1e-9));
+    const units = reorder === 1 ? " unit" : " units";
+    facts.push(["Reorder", "~" + reorder.toLocaleString("en-US") + units]);
     return {
       category: "inventory", label: "Inventory", urgency: "Now", confidence: null,
-      step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover ~" + fmt(demand) + " demand over " + over + ". Reorder ~" + fmt(reorder) + " units now.",
+      step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover ~" + fmt(demand) + " demand over " + over + ". Reorder ~" + reorder.toLocaleString("en-US") + units + " now.",
       why: st.weekly.toLocaleString("en-US") + " a week × " + inWeeks + " = ~" + fmt(demand) + ".",
       facts, signals: [], stockout: true
     };
@@ -896,7 +949,7 @@ function eyeD(cx, cy, r, open, joy) {
 }
 function drawInk(pose) {
   const g = $("inkBody");
-  if (!g) return;
+  if (!g || !["tip", "blink", "joy", "uncertain", "stretch", "bounce", "lean"].every(k => Number.isFinite(pose[k]))) return;
   const joy = clamp01(pose.joy), unsure = clamp01(pose.uncertain);
   $("inkBodyPath").setAttribute("d", toD(bent(BODY_PTS, pose.tip), true));
   $("inkFacePath").setAttribute("d", toD(bent(FACE_PTS, pose.tip), true));
@@ -906,6 +959,7 @@ function drawInk(pose) {
   $("inkMouthPath").setAttribute("d", toD(bent(m, pose.tip), false));
   const sy = pose.stretch, sx = 1 / Math.sqrt(Math.max(0.5, sy));
   const baseY = BASE[1] - pose.bounce * BOUNCE_UNITS;
+  if (![sy, sx, baseY, pose.lean].every(Number.isFinite)) return;
   g.setAttribute("transform", "translate(55 " + baseY.toFixed(2) + ") rotate(" + (pose.lean * 180 / Math.PI).toFixed(2) + ") scale(" + sx.toFixed(4) + " " + sy.toFixed(4) + ") translate(-55 -111)");
   const sh = $("inkShadow");
   if (sh) { sh.setAttribute("rx", (34 * (1 - pose.bounce * 0.9)).toFixed(2)); sh.setAttribute("opacity", (0.12 * (1 - pose.bounce * 1.2)).toFixed(3)); }
@@ -923,7 +977,8 @@ function pose(now) {
   const b = (now - ink.blinkAt) / 150;
   if (b >= 0 && b < 1) p.blink = Math.abs(1 - 2 * b) * 0.93 + 0.07;
   if (ink.hopAt >= 0) {
-    const f = Math.floor((now - ink.hopAt) / 1000 * HOP.fps);
+    // A frame's timestamp can come a moment before the hop was asked for.
+    const f = Math.max(0, Math.floor((now - ink.hopAt) / 1000 * HOP.fps));
     if (f >= HOP.frames) ink.hopAt = -1;
     else {
       p.bounce = HOP.bounce[f]; p.lean = HOP.lean[f]; p.stretch *= HOP.stretch[f]; p.tip = HOP.tip[f];
