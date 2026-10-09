@@ -538,48 +538,62 @@ const UNIT = "(months?|mos?|mo|weeks?|wks?|w|days?|d)";
 const FIELDS = {
   onHand: {
     after: [
-      new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b" + SEP + NUM, "i"),
-      new RegExp("\\b(?:in stock|stock on hand|stock)\\b" + SEP + NUM, "i")
+      new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b" + SEP + NUM, "id"),
+      new RegExp("\\b(?:in stock|stock on hand|stock)\\b" + SEP + NUM, "id")
     ],
     before: [
-      new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "i"),
-      new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "i")
+      new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "id"),
+      new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "id")
     ]
   },
   weekly: {
     after: [
-      new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b" + SEP + NUM, "i"),
-      new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + NUM, "i"),
-      new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "i")
+      new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b" + SEP + NUM, "id"),
+      new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + NUM, "id"),
+      new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "id")
     ],
     before: [
-      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "i"),
-      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "i")
+      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "id"),
+      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "id")
     ]
   },
   lead: {
-    after: [new RegExp("\\blead[\\s-]?time\\b" + SEP + NUM + "(?:\\s*([A-Za-z]+))?", "i")],
+    after: [new RegExp("\\blead[\\s-]?time\\b" + SEP + NUM + "(?:\\s*([A-Za-z]+))?", "id")],
     before: [
-      new RegExp(NUM + "\\s*" + UNIT + "\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
-      new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "i")
+      new RegExp(NUM + "\\s*" + UNIT + "\\s*(?:of\\s+)?lead[\\s-]?time\\b", "id"),
+      new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "id")
     ]
   }
 };
 /**
- * One reading for the whole line: number-then-label when the line opens with a
- * number ("120 on hand 85 avg weekly sales…"), label-then-number otherwise, and
- * the other form only for a field the first reading can't find.
+ * Each field can be written label-then-number or number-then-label, so a line
+ * is read both ways. A reading that gives one number to two fields is wrong.
+ * If both readings are clean and disagree, the line is ambiguous: it asks for
+ * commas rather than guess.
  */
-function readField(t, field, numberFirst) {
-  const f = FIELDS[field];
-  return numberFirst ? firstMatch(t, f.before) || firstMatch(t, f.after) : firstMatch(t, f.after) || firstMatch(t, f.before);
+function reading(t, numberFirst) {
+  const out = {};
+  for (const field of Object.keys(FIELDS)) {
+    const f = FIELDS[field];
+    out[field] = numberFirst ? firstMatch(t, f.before) || firstMatch(t, f.after) : firstMatch(t, f.after) || firstMatch(t, f.before);
+  }
+  return out;
+}
+function clean(r) {
+  const at = Object.values(r).filter(Boolean).map(m => m.indices[1][0]);
+  return new Set(at).size === at.length;
+}
+function same(a, b) {
+  return Object.keys(FIELDS).every(k => (a[k] ? a[k][1] : null) === (b[k] ? b[k][1] : null));
 }
 function parseStock(text) {
   const t = text.replace(/\s+/g, " ");
-  const numberFirst = /^\s*-?\.?\d/.test(t);
-  const onHandM = readField(t, "onHand", numberFirst);
-  const weeklyM = readField(t, "weekly", numberFirst);
-  const leadM = readField(t, "lead", numberFirst);
+  const labelFirst = reading(t, false), numberFirst = reading(t, true);
+  let read = labelFirst, ambiguous = false;
+  if (clean(labelFirst) && clean(numberFirst)) ambiguous = !same(labelFirst, numberFirst);
+  else if (clean(numberFirst)) read = numberFirst;
+  else if (!clean(labelFirst)) ambiguous = true;
+  const onHandM = read.onHand, weeklyM = read.weekly, leadM = read.lead;
   const skuM = t.match(/\bsku\s*[:#]?\s*([A-Za-z0-9][\w-]*)/i);
   const lower = t.toLowerCase();
   const words = ["on hand", "on-hand", "weekly sales", "lead time", "lead-time", "in stock", "sku", "reorder", "stock"].filter(w => lower.includes(w)).length;
@@ -612,7 +626,7 @@ function parseStock(text) {
     const name = tidy(t.split(STOP)[0]);
     if (name && /[A-Za-z]/.test(name) && name.length <= 60) item = name;
   }
-  return { isStock, sku: skuM ? skuM[1] : null, item, onHand, weekly, lead, leadUnit, leadWeeks, badUnit };
+  return { isStock, sku: skuM ? skuM[1] : null, item, onHand, weekly, lead, leadUnit, leadWeeks, badUnit, ambiguous };
 }
 
 function plural(n, unit) {
@@ -632,6 +646,14 @@ function stockAnswer(st) {
   if (st.onHand == null) missing.push("on hand");
   if (st.weekly == null) missing.push("avg weekly sales");
   if (st.lead == null) missing.push("lead time");
+  if (st.ambiguous) {
+    return {
+      category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
+      step: "Put commas between the fields so each number goes with its label",
+      why: "I can read this line two ways, so I won't guess. For example: on hand: 120, avg weekly sales: 85, lead time: 3 weeks.",
+      facts: facts.filter(f => f[0] === "SKU" || f[0] === "Item"), signals: []
+    };
+  }
   if (st.badUnit) {
     return {
       category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
