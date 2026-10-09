@@ -13,6 +13,7 @@ import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callb
 import { connectorsRouter } from './admin-connectors';
 import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
+import { afterCursorFilter, encodeTasksCursor, parseTasksPage } from './tasks-page';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
@@ -10155,10 +10156,24 @@ router.get('/media', async (req: Request, res: Response) => {
 
 /**
  * GET /api/admin/tasks
- * List tasks for the active user with optional filters
+ * List tasks for the active user with optional filters.
+ *
+ * Paging (task 0ed92d60) is opt-in: `limit` (1–1000) and `before` (a
+ * `meta.nextBefore` from an earlier page). A paged answer comes newest first
+ * by (created_at, id) and is not re-sorted, because a status-and-priority
+ * order can't hold across pages. `meta.total` stays the filter's exact count
+ * whatever the cursor, and `meta.nextBefore` is null on the last page.
+ * Without either parameter the answer is exactly what it was before paging.
  */
 router.get('/tasks', async (req: Request, res: Response) => {
   try {
+    const pageRequest = parseTasksPage(req.query);
+    if (!pageRequest.ok) {
+      res.status(400).json({ error: pageRequest.error });
+      return;
+    }
+    const page = pageRequest.page;
+
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
@@ -10168,20 +10183,31 @@ router.get('/tasks', async (req: Request, res: Response) => {
       .from('tasks')
       .select('*, projects(name), task_groups(title)', { count: 'exact' })
       .eq('user_id', authReq.inkUserId);
+    // A paged answer behind a cursor counts its filter's total on its own.
+    // Every filter goes on both, in the same branch, so the two can't drift.
+    // Nothing is sent for it unless it's awaited.
+    let totalQuery = supabase
+      .from('tasks')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', authReq.inkUserId);
 
     // Optional filters
     const { status, projectId, groupId, activeOnly } = req.query;
     if (status) {
       query = query.eq('status', status as string);
+      totalQuery = totalQuery.eq('status', status as string);
     }
     if (projectId) {
       query = query.eq('project_id', projectId as string);
+      totalQuery = totalQuery.eq('project_id', projectId as string);
     }
     if (groupId) {
       query = query.eq('task_group_id', groupId as string);
+      totalQuery = totalQuery.eq('task_group_id', groupId as string);
     }
     if (activeOnly === 'true') {
       query = query.in('status', ['pending', 'in_progress', 'blocked']);
+      totalQuery = totalQuery.in('status', ['pending', 'in_progress', 'blocked']);
     }
 
     // Order before capping: the old unordered .limit(200) silently dropped an
@@ -10190,22 +10216,59 @@ router.get('/tasks', async (req: Request, res: Response) => {
     // so truncation is REPORTED, never silent: beyond the cap, an omitted
     // active blocker would otherwise read as satisfied downstream.
     const TASKS_CAP = 1000;
+    if (page.paged && page.before) {
+      query = query.or(afterCursorFilter(page.before));
+    }
     const {
       data,
       error,
       count: totalMatched,
-    } = await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
+    } = page.paged
+      ? await query
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .limit(page.limit)
+      : await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list tasks', error));
       return;
     }
     const fetchedCount = (data || []).length;
-    const meta = {
+    let meta: {
+      fetched: number;
+      total: number;
+      truncated: boolean;
+      nextBefore?: string | null;
+    } = {
       fetched: fetchedCount,
       total: totalMatched ?? fetchedCount,
       truncated: (totalMatched ?? fetchedCount) > fetchedCount,
     };
+    if (page.paged) {
+      // Behind a cursor, the count above is what remains from it on (this
+      // page included), and the filter's total is counted on its own.
+      const remaining = totalMatched ?? fetchedCount;
+      let total = remaining;
+      if (page.before) {
+        const { count, error: countError } = await totalQuery;
+        if (countError) {
+          res.status(500).json(errorJson('Failed to list tasks', countError));
+          return;
+        }
+        total = count ?? remaining;
+      }
+      const last = data?.[fetchedCount - 1];
+      meta = {
+        fetched: fetchedCount,
+        total,
+        truncated: total > fetchedCount,
+        nextBefore:
+          last && remaining > fetchedCount
+            ? encodeTasksCursor({ createdAt: last.created_at, id: last.id })
+            : null,
+      };
+    }
 
     // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
     const tasks = await applyGraphBlockedBy(supabase, data || []);
@@ -10248,13 +10311,16 @@ router.get('/tasks', async (req: Request, res: Response) => {
       low: 3,
     };
 
-    tasks.sort((a, b) => {
-      const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
-      if (statusDiff !== 0) return statusDiff;
-      const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
-      if (priorityDiff !== 0) return priorityDiff;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+    // A paged answer keeps its keyset order; archived blockers follow its rows.
+    if (!page.paged) {
+      tasks.sort((a, b) => {
+        const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
+        if (statusDiff !== 0) return statusDiff;
+        const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
+        if (priorityDiff !== 0) return priorityDiff;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+    }
 
     // Compute stats
     const stats = {
