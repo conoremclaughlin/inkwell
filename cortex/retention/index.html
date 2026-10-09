@@ -158,13 +158,13 @@ function luhn(d) { let s = 0, alt = false; for (let i = d.length - 1; i >= 0; i-
 function mask(text) {
   const found = { cpf: 0, card: 0, phone: 0 };
   // A +55 phone first, so its 12 or 13 digits are never read as a card.
-  text = text.replace(/\+\s?55[\s-]?\(?\d{2}\)?[\s-]?9?\d{4}[\s-]?\d{4}\b/g, () => { found.phone++; return "[phone masked]"; });
+  text = text.replace(/\+\s?55[\s-]?\(?\d{2}\)?[\s-]?(?:9[\s-]?)?\d{4}[\s-]?\d{4}\b/g, () => { found.phone++; return "[phone masked]"; });
   // Cards next: any 13 to 19 digit run, typos included, with spaces, dots or dashes between groups.
   let t = text.replace(/\b(?:\d[ .-]?){12,18}\d\b/g, m => { const d = m.replace(/\D/g, ""); if (d.length < 13 || d.length > 19) return m; found.card++; return "[card ••••" + d.slice(-4) + "]"; });
   // CPF: 11 digits as 123.456.789-09, 123 456 789 09 or 12345678909.
   t = t.replace(/\b\d{3}[ .]?\d{3}[ .]?\d{3}[ .-]?\d{2}\b/g, m => { found.cpf++; return "[CPF masked]"; });
   // Phones: with or without +55 and the area code; a bare mobile is 9xxxx-xxxx.
-  t = t.replace(/(?:\+?55[\s-]?)?(?:\(?\b\d{2}\)?[\s-]?)?\b9\d{4}[\s-]?\d{4}\b|(?:\+?55[\s-]?)?\(?\b\d{2}\)?[\s-]?\d{4}[\s-]?\d{4}\b/g, m => { found.phone++; return "[phone masked]"; });
+  t = t.replace(/(?:\+?55[\s-]?)?(?:\(?\b\d{2}\)?[\s-]?)?\b9[\s-]?\d{4}[\s-]?\d{4}\b|(?:\+?55[\s-]?)?\(?\b\d{2}\)?[\s-]?\d{4}[\s-]?\d{4}\b/g, m => { found.phone++; return "[phone masked]"; });
   return { text: t, found };
 }
 const box = $("contact");
