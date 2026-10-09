@@ -268,7 +268,7 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 
 
 
-/* Plans: a self-serve Starter, and a Team plan beside it for scale. */
+/* Plans. */
 .plans { display: flex; flex-direction: column; gap: 16px; }
 .plans-head { display: flex; flex-direction: column; gap: 4px; }
 .plans-head h2 { font: 500 26px/1.15 var(--serif); text-wrap: balance; }
@@ -396,7 +396,7 @@ footer {
       <h1>Cortex</h1>
       <p class="lede">Paste one thing from the inbox. Get what it is and what to do next.</p>
     </div>
-    <a class="top-link" id="plansLink" href="#pricing">Plans and pricing</a>
+    <a class="top-link" id="plansLink" href="pricing/">Pricing</a>
     <span class="plan-badge" id="planBadge" hidden></span>
   </header>
 
@@ -478,61 +478,6 @@ footer {
     </section>
   </main>
 
-  <section class="plans" id="pricing" aria-labelledby="plansTitle">
-    <div class="plans-head">
-      <h2 id="plansTitle">Start on your own, in two minutes</h2>
-      <p class="hint">No sales call, no contract, no card to start. Cancel any time. Prices shown are introductory pricing for this preview.</p>
-    </div>
-    <div class="plan-grid">
-      <article class="plan featured" aria-labelledby="starterName">
-        <div class="plan-top"><h3 id="starterName">Starter</h3><span class="tag">Sign up yourself</span></div>
-        <p class="price"><b>$29</b><span>a month</span></p>
-        <p class="price-note">Or $290 a year. 14 days free first.</p>
-        <ul>
-          <li>Sort orders, customer emails, invoices and stock lines</li>
-          <li>A next step for each one</li>
-          <li>Stockout warnings with how many to reorder</li>
-          <li>An activity log with times</li>
-          <li>1 person</li>
-        </ul>
-        <button type="button" class="btn" data-plan="Starter"><span class="spark" aria-hidden="true"></span>Try Starter free</button>
-      </article>
-      <article class="plan" aria-labelledby="teamName2">
-        <div class="plan-top"><h3 id="teamName2">Team</h3></div>
-        <p class="price"><b>$79</b><span>a month</span></p>
-        <p class="price-note">Or $790 a year. 14 days free first.</p>
-        <ul>
-          <li>Everything in Starter</li>
-          <li>Up to 5 people</li>
-        </ul>
-        <button type="button" class="btn ghost" data-plan="Team">Try Team free</button>
-      </article>
-    </div>
-    <form class="signup" id="signupForm" novalidate hidden>
-      <h3 id="signupTitle">Start Starter</h3>
-      <div class="field">
-        <label for="signupName">Your name</label>
-        <input id="signupName" name="name" autocomplete="name" required>
-        <span class="err" id="nameErr" hidden>Add your name.</span>
-      </div>
-      <div class="field">
-        <label for="signupEmail">Work email</label>
-        <input id="signupEmail" name="email" type="email" autocomplete="email" required>
-        <span class="err" id="emailErr" hidden>Add an email address, like you@yourshop.com.</span>
-      </div>
-      <button type="submit" class="btn" id="signupBtn">Start my free trial</button>
-      <p class="fine">Demo sign-up: this saves your choice in this browser only. It doesn't create an account or a subscription, no card is asked for, and nothing is charged.</p>
-    </form>
-    <div class="signed" id="signedIn" hidden aria-live="polite">
-      <strong id="signedText"></strong>
-      <span id="signedNote"></span>
-      <div class="pin-row">
-        <button type="button" class="btn" id="goPaste">Paste your first item</button>
-        <button type="button" class="link" id="clearPlan">Clear this demo sign-up</button>
-      </div>
-    </div>
-    <p class="fine" id="planNote" hidden aria-live="polite"></p>
-  </section>
 
   <footer>
     <div class="team">
@@ -1431,84 +1376,13 @@ function react(r) {
 let hintTimer = 0;
 $("item").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(() => hint($("item").value), 450); });
 
-/* ---------- plans: a self-serve sign-up that stays in this browser ---------- */
-const PLAN_KEY = "cortex-plan-v1";
-const TRIAL_DAYS = 14;
-// A saved sign-up is used only when every field is one this page could have written.
-function validPlan(p) {
-  return !!p && typeof p === "object" && ["Starter", "Team"].includes(p.plan) &&
-    typeof p.name === "string" && p.name.trim().length > 0 && typeof p.email === "string" &&
-    Number.isFinite(Date.parse(p.startedAt));
-}
-let plan = null;
+/* ---------- plan badge: the pricing page saves the sign-up ---------- */
 try {
-  const stored = JSON.parse(localStorage.getItem(PLAN_KEY) || "null");
-  if (validPlan(stored)) plan = { ...stored, saved: true };
-} catch { plan = null; }
-let chosen = "Starter";
-function planNote(text) { const n = $("planNote"); n.textContent = text; n.hidden = !text; }
-function showPlan() {
-  const badge = $("planBadge"), link = $("plansLink");
-  if (!plan) {
-    badge.hidden = true; link.hidden = false;
-    $("signedIn").hidden = true;
-    return;
+  const p = JSON.parse(localStorage.getItem("cortex-plan-v1") || "null");
+  if (p && p.plan === "Starter" && typeof p.name === "string" && p.name.trim() && Number.isFinite(Date.parse(p.startedAt))) {
+    $("planBadge").textContent = "Cortex Starter (demo)"; $("planBadge").hidden = false; $("plansLink").hidden = true;
   }
-  const ends = new Date(Date.parse(plan.startedAt) + TRIAL_DAYS * 86400000);
-  const endText = ends.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-  const ended = Date.now() > ends.getTime();
-  badge.textContent = plan.plan + (ended ? " trial ended (demo)" : " trial (demo)");
-  badge.hidden = false; link.hidden = true;
-  $("signupForm").hidden = true;
-  $("signedIn").hidden = false;
-  if (ended) {
-    $("signedText").textContent = "Your " + plan.plan + " demo trial ended on " + endText + ".";
-    $("signedNote").textContent = "Start it again with the plan buttons above, or clear it. No account was created and nothing was charged.";
-  } else {
-    $("signedText").textContent = plan.plan + " trial started, " + plan.name + ".";
-    $("signedNote").textContent = plan.saved
-      ? "In this demo the trial runs until " + endText + " and is saved in this browser only: no account is created and nothing is charged."
-      : "This browser wouldn't save it, so it lasts until you close this tab. In this demo the trial runs until " + endText + ": no account is created and nothing is charged.";
-  }
-}
-document.querySelectorAll("[data-plan]").forEach(b => b.addEventListener("click", () => {
-  chosen = b.dataset.plan;
-  $("signupTitle").textContent = "Start your " + chosen + " trial";
-  $("signedIn").hidden = true;
-  planNote("");
-  $("signupForm").hidden = false;
-  $("signupName").focus();
-}));
-$("signupForm").addEventListener("submit", e => {
-  e.preventDefault();
-  const name = $("signupName").value.trim();
-  const email = $("signupEmail").value.trim();
-  const nameOk = name.length > 0;
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-  $("nameErr").hidden = nameOk;
-  $("emailErr").hidden = emailOk;
-  if (!nameOk) { $("signupName").focus(); return; }
-  if (!emailOk) { $("signupEmail").focus(); return; }
-  const record = { plan: chosen, name, email, startedAt: new Date().toISOString() };
-  let saved = false;
-  try { localStorage.setItem(PLAN_KEY, JSON.stringify(record)); saved = localStorage.getItem(PLAN_KEY) !== null; } catch { saved = false; }
-  plan = { ...record, saved };
-  showPlan();
-  $("goPaste").focus();
-  say("Welcome aboard, " + name + "! Your " + chosen + " trial is on. Paste something from your inbox and I'll sort it.");
-  mood(1, 0); hop();
-});
-$("clearPlan").addEventListener("click", () => {
-  let cleared = true;
-  try { localStorage.removeItem(PLAN_KEY); cleared = localStorage.getItem(PLAN_KEY) === null; } catch { cleared = false; }
-  if (!cleared && plan && plan.saved) { planNote("This browser wouldn't clear it. Try clearing this site's data in your browser settings."); return; }
-  plan = null;
-  showPlan();
-  planNote("Demo sign-up cleared from this browser.");
-  $("plansLink").focus();
-});
-$("goPaste").addEventListener("click", () => { $("item").scrollIntoView({ behavior: still.matches ? "auto" : "smooth", block: "center" }); $("item").focus(); });
-showPlan();
+} catch {}
 
 if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
 $("item").value = EXAMPLES.order;
