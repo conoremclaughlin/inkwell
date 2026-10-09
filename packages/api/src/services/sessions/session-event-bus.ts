@@ -124,6 +124,7 @@ export const OBSERVER_PROJECTION_TYPES: ReadonlySet<string> = new Set([
   'pcp_tool',
   'backend_session',
   'compaction',
+  'session_control',
   'session_pause',
   'session_end',
 ]);
@@ -185,6 +186,9 @@ export function projectObserverEntry(entry: ObserverEntry): ObserverEntry | null
         ...(entry.subject !== undefined ? { subject: String(entry.subject) } : {}),
         preview: truncateForWire(entry.rendered ?? entry.content, 200),
       };
+    case 'session_control':
+      // Receipt only: local paths, provenance and instruction contents are not observer fields.
+      return { ...base, controlId: truncateForWire(entry.controlId, 128), status: 'applied' };
     case 'backend_session':
       return { ...base, ...(entry.id !== undefined ? { id: String(entry.id) } : {}) };
     case 'compaction':

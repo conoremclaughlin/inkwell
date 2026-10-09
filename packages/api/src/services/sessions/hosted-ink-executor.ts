@@ -5,6 +5,7 @@ import {
   buildAttachmentBlock,
   collectAttachmentDirs,
   type SessionCompositionPorts,
+  type SessionControlsPorts,
 } from '@inklabs/shared/node-host';
 import {
   applyLaunchProfile,
@@ -29,6 +30,8 @@ export interface HostedInkEffects extends Pick<
   'toolHost' | 'policy' | 'cloneLog' | 'approve' | 'approveClone' | 'presentation' | 'mintId'
 > {
   activeSkills: readonly SessionPromptSkill[];
+  manualSkills?: SessionControlsPorts['skills'];
+  controlReceipt?: SessionControlsPorts['receipt'];
   /** Host closes its private resources only after all clone runs settle. */
   close(): Promise<void>;
   /** Persist queued policy changes before admission; approvals must do the same before returning true. */
@@ -54,6 +57,7 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
     }
     ports.signal.throwIfAborted();
     const effects = await prepare(input, ports);
+    let releaseControls: (() => void) | undefined;
     let session: Awaited<ReturnType<typeof composeInkSession>> | undefined;
     const toolCalls: ToolCall[] = [];
     const backend = input.options.backend ?? 'claude';
@@ -120,6 +124,14 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
           cwd: input.workingDirectory,
           toolHost: effects.toolHost,
           policy: effects.policy,
+          controls: {
+            skills: effects.manualSkills,
+            receipt: effects.controlReceipt,
+            assertCurrent: () => {
+              ports.signal.throwIfAborted();
+              ports.controls?.assertCurrent();
+            },
+          },
           callInk,
           logActivity: async (activity) => {
             // Telemetry must neither disappear on normal failure nor hold the
@@ -157,6 +169,7 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
         ports.signal
       );
       const live = session;
+      releaseControls = ports.controls?.bind((request) => live.controls.enqueue(request));
       const outer = await runHeadlessSession(
         {
           message: [input.message, attachmentBlock].filter(Boolean).join('\n\n'),
@@ -214,6 +227,10 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
           },
         }
       );
+      // Close before the final sweep: no enqueue can fall between drain and release.
+      live.controls.close();
+      await live.controls.drain(ports.signal);
+      releaseControls?.();
       ports.sessionLog.append({
         type: 'session_pause',
         sessionId: input.sessionId,
@@ -244,7 +261,9 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
         toolCalls,
       };
     } finally {
+      releaseControls?.();
       if (session) {
+        session.controls.refusePending('owner_stopped');
         session.clones.cancel();
         await session.clones.drain();
       }

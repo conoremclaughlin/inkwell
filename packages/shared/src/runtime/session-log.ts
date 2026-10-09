@@ -17,6 +17,7 @@ export const OBS_PROJECTION_TYPES: ReadonlySet<string> = new Set([
   'pcp_tool',
   'backend_session',
   'compaction',
+  'session_control',
   'session_pause',
   'session_end',
 ]);

@@ -1,8 +1,21 @@
+import { Router } from 'express';
+import { addSessionControlRoute } from '../../routes/session-controls';
+import {
+  registerActiveRun,
+  resetActiveRuns,
+  attachRunControls,
+  submitRunControl,
+  isGenerationAdmitted,
+} from './active-runs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, realpath, rm, writeFile } from 'fs/promises';
+import { mkdtemp, realpath, rm, writeFile, mkdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createSessionToolHost, type CodingTool } from '@inklabs/shared/node-host';
+import {
+  createSessionToolHost,
+  createSkillInstructionHost,
+  type CodingTool,
+} from '@inklabs/shared/node-host';
 import { SessionLog, ToolPolicyState } from '@inklabs/shared/runtime';
 import type { BackendHost, BackendRunResult, BackendRunRequest } from '@inklabs/shared/providers';
 import { createHostedInkExecutor, type HostedInkEffects } from './hosted-ink-executor';
@@ -11,6 +24,7 @@ import type { ClaudeRunnerConfig } from './types';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  resetActiveRuns();
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 const tool = (name: string, args: Record<string, unknown>) =>
@@ -230,5 +244,183 @@ describe('HostedInkSessionRunner executing the shared session composition', () =
     });
     expect(h.start.mock.calls[0][0].prompt).toContain('[Attached files]');
     expect(h.start.mock.calls[1][0]).toMatchObject({ media: undefined, attachmentDirs: [h.root] });
+  });
+});
+
+function controlsHarness(h: Awaited<ReturnType<typeof fixture>>) {
+  const receipts: unknown[] = [];
+  h.effects.manualSkills = createSkillInstructionHost(h.root, h.root);
+  h.effects.controlReceipt = (receipt) => receipts.push(receipt);
+  const runner = new HostedInkSessionRunner({
+    execute: createHostedInkExecutor(h.prepare),
+    forTurn: ({ sessionId, turnEpoch }) => {
+      registerActiveRun({
+        sessionId,
+        turnEpoch,
+        userId: 'fixture-owner',
+        sbSlug: 'echo',
+        backend: 'ink',
+        startedAt: Date.now(),
+      });
+      return {
+        ...h.deps(),
+        controls: {
+          assertCurrent: () => {
+            if (!isGenerationAdmitted(sessionId, turnEpoch)) throw new Error('stale');
+          },
+          bind: (enqueue) => attachRunControls(sessionId, turnEpoch, enqueue),
+        },
+      };
+    },
+  });
+  const router = Router();
+  addSessionControlRoute(router, {
+    authProvider: {
+      verifyAccessToken: async () => ({ ok: true, token: { userId: 'fixture-owner' } }),
+    } as never,
+    dataComposer: {
+      getClient: () => ({
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              single: async () => ({
+                data: {
+                  user_id: 'fixture-owner',
+                  cli_attached: false,
+                  turn_epoch: h.config.turnEpoch,
+                },
+              }),
+            }),
+          }),
+        }),
+      }),
+    } as never,
+  });
+  const post = async (control: Record<string, unknown>) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await router.stack[0].route!.stack[0].handle(
+      {
+        headers: {},
+        params: { id: 'hosted-fixture' },
+        body: { turnEpoch: h.config.turnEpoch, control },
+      } as never,
+      res as never,
+      vi.fn()
+    );
+    return res;
+  };
+  return { runner, post, receipts };
+}
+
+describe('hosted live controls through the admitted route and real composition', () => {
+  it('queues during a provider, persists at the final boundary, then replays, resumes and removes drift', async () => {
+    const h = await fixture(['second', 'third', 'fourth']);
+    const skillsPath = join(h.root, '.ink', 'skills', 'review');
+    await mkdir(skillsPath, { recursive: true });
+    await writeFile(join(skillsPath, 'SKILL.md'), 'CONTROL SKILL ORIGINAL');
+    const c = controlsHarness(h);
+    let started!: () => void;
+    const began = new Promise<void>((r) => {
+      started = r;
+    });
+    let finish!: (value: BackendRunResult) => void;
+    h.start.mockImplementationOnce(() => {
+      started();
+      return {
+        result: new Promise<BackendRunResult>((r) => {
+          finish = r;
+        }),
+        abort: vi.fn(),
+      };
+    });
+    const first = c.runner.run('first', { config: h.config });
+    await began;
+    const model = await c.post({ controlId: 'model', action: 'model', model: 'fixture-selected' });
+    const skill = await c.post({ controlId: 'skill', action: 'skill_use', name: 'review' });
+    expect(model.status).toHaveBeenCalledWith(202);
+    expect(skill.status).toHaveBeenCalledWith(202);
+    expect(h.events.some((e) => e.type === 'session_control')).toBe(false);
+    expect(h.start.mock.calls[0][0].model).not.toBe('fixture-selected');
+    finish(result('first'));
+    expect((await first).success).toBe(true);
+    expect(c.receipts).toEqual([
+      expect.objectContaining({ controlId: 'model', status: 'applied' }),
+      expect.objectContaining({ controlId: 'skill', status: 'applied' }),
+    ]);
+    const committed = h.events.filter((e) => e.type === 'session_control');
+    expect(committed).toHaveLength(2);
+    expect(h.projections.filter((e) => e.type === 'session_control')).toEqual(committed);
+    expect(JSON.stringify(committed)).not.toContain('CONTROL SKILL ORIGINAL');
+    const closed = await c.post({ controlId: 'late', action: 'model', model: null });
+    expect(closed.status).toHaveBeenCalledWith(409);
+    h.config.turnEpoch = 'epoch-second';
+    expect((await c.runner.run('second', { config: h.config })).success).toBe(true);
+    const second = h.start.mock.calls[1][0];
+    expect(second.model).toBe('fixture-selected');
+    expect(second.prompt).toContain('CONTROL SKILL ORIGINAL');
+    expect(second.backendSessionId).toBeUndefined();
+    const baseline = second.backendSessionSeedId;
+    h.config.turnEpoch = 'epoch-third';
+    await c.runner.run('third', { config: h.config });
+    expect(h.start.mock.calls[2][0].backendSessionId).toBe(baseline);
+    await writeFile(join(skillsPath, 'SKILL.md'), 'CHANGED WITHOUT CONSENT');
+    h.config.turnEpoch = 'epoch-fourth';
+    await c.runner.run('fourth', { config: h.config });
+    const fourth = h.start.mock.calls[3][0];
+    expect(fourth.backendSessionId).toBeUndefined();
+    expect(fourth.prompt).not.toContain('CHANGED WITHOUT CONSENT');
+    expect(fourth.prompt).not.toContain('CONTROL SKILL ORIGINAL');
+    expect(h.events.filter((e) => e.type === 'session_control').at(-1)).toMatchObject({
+      reason: 'replay_skill_removed',
+      selection: { skills: [] },
+    });
+  });
+  it('applies before the next outer turn, not during an inner provider turn', async () => {
+    const h = await fixture(['next turn']);
+    h.config.maxTurns = 2;
+    const c = controlsHarness(h);
+    h.start.mockImplementationOnce(() => {
+      expect(
+        submitRunControl('hosted-fixture', 'epoch-fixture', {
+          controlId: 'between',
+          action: 'model',
+          model: 'outer-model',
+        }).status
+      ).toBe('pending');
+      return { result: Promise.resolve(result('first')), abort: vi.fn() };
+    });
+    expect((await c.runner.run('first', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[0][0].model).not.toBe('outer-model');
+    expect(h.start.mock.calls[1][0].model).toBe('outer-model');
+    expect(h.start.mock.calls[1][0].backendSessionId).toBeUndefined();
+    const controlIndex = h.events.findIndex((e) => e.type === 'session_control');
+    expect(controlIndex).toBeGreaterThan(h.events.findIndex((e) => e.type === 'assistant'));
+    expect(controlIndex).toBeLessThan(h.events.map((e) => e.type).lastIndexOf('backend_session'));
+  });
+  it('Stop closes the mailbox and refuses queued controls without a late applied receipt', async () => {
+    const h = await fixture([]);
+    const c = controlsHarness(h);
+    const stop = new AbortController();
+    h.config.signal = stop.signal;
+    h.start.mockImplementationOnce(() => {
+      submitRunControl('hosted-fixture', 'epoch-fixture', {
+        controlId: 'stop',
+        action: 'model',
+        model: 'never',
+      });
+      stop.abort();
+      return { result: Promise.resolve(result('stopped')), abort: vi.fn() };
+    });
+    expect((await c.runner.run('first', { config: h.config })).success).toBe(false);
+    expect(h.events.filter((e) => e.type === 'session_control')).toEqual([]);
+    expect(c.receipts).toContainEqual(
+      expect.objectContaining({ controlId: 'stop', status: 'refused' })
+    );
+    expect(
+      submitRunControl('hosted-fixture', 'epoch-fixture', {
+        controlId: 'after',
+        action: 'skill_clear',
+      }).status
+    ).toBe('refused');
   });
 });

@@ -34,6 +34,7 @@
  * children and must not terminalize them.
  */
 
+import type { SessionControlRequest, SessionControlReceipt } from '@inklabs/shared/runtime';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -94,6 +95,8 @@ export interface ActiveRun {
    * registry operations are unaffected.
    */
   turnEpochCandidates?: string[];
+  /** Routing only; registered by the already-admitted hosted composer, never an owner lease. */
+  hostedControls?: (request: SessionControlRequest) => SessionControlReceipt;
 }
 
 const active = new Map<string, ActiveRun>();
@@ -517,4 +520,35 @@ export function resetActiveRuns(): void {
   inFlightWrites.clear();
   ownedChildren.clear();
   intakeOpen = true;
+}
+
+/** Give the existing active generation a control mailbox, never a second owner registry. */
+export function attachRunControls(
+  sessionId: string,
+  turnEpoch: string,
+  enqueue: (request: SessionControlRequest) => SessionControlReceipt
+): () => void {
+  if (!mayGenerationProceed(sessionId, turnEpoch))
+    throw new Error('Hosted control owner not admitted');
+  const run = active.get(sessionId)!;
+  if (run.hostedControls || run.runnerSettledAt !== undefined)
+    throw new Error('Hosted control port unavailable');
+  run.hostedControls = enqueue;
+  return () => {
+    if (run.hostedControls === enqueue) delete run.hostedControls;
+  };
+}
+export function submitRunControl(
+  sessionId: string,
+  turnEpoch: string,
+  request: SessionControlRequest
+): SessionControlReceipt {
+  const run = active.get(sessionId);
+  if (
+    !mayGenerationProceed(sessionId, turnEpoch) ||
+    run?.runnerSettledAt !== undefined ||
+    !run?.hostedControls
+  )
+    return { controlId: request.controlId, status: 'refused', reason: 'no_current_hosted_owner' };
+  return run.hostedControls(request);
 }

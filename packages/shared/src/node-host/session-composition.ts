@@ -36,6 +36,7 @@ import {
   type ToolCallResult,
 } from '../runtime/index.js';
 import type { createSessionToolHost } from './session-tool-host.js';
+import { createSessionControls, type SessionControlsPorts } from './session-controls.js';
 import { imagesToDeliver } from './tool-images.js';
 import { localDeliveredSend } from '../runner/turn-reply.js';
 import { createSessionClones, type SessionClonesPorts } from './session-clones.js';
@@ -103,6 +104,7 @@ export interface SessionCompositionPorts {
     notice(message: string): void;
   };
   observe?: AgentLoopPorts['observe'];
+  controls?: Pick<SessionControlsPorts, 'skills' | 'assertCurrent' | 'receipt'>;
 }
 
 export interface ComposedTurnInput extends SessionTurnInput {
@@ -161,14 +163,35 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     append: (event) => log.append(event),
     rolled: presentation.notice,
   });
+  const controls = createSessionControls({
+    runtime,
+    log,
+    policy,
+    contextBudgetAuto: ports.contextBudgetAuto,
+    mintId: ports.mintId,
+    assertCurrent:
+      ports.controls?.assertCurrent ??
+      (() => {
+        signal?.throwIfAborted();
+      }),
+    skills: ports.controls?.skills,
+    receipt: ports.controls?.receipt,
+    invalidateProvider: () => context.clearProvider(),
+  });
   const recovery = createProviderRecovery(runtime.backend);
   const hydrated = await hydrateLedgerFromEventStream(ledger, ports.history, sbSlug, (event) => {
     signal?.throwIfAborted();
     recovery.push(event);
+    controls.replay(event);
   });
   log.seed(hydrated.maxEid);
   const evicted: EvictedEntryRecord[] = [...hydrated.evictedEntries];
   passiveRecall.seedBootstrapIds(hydrated.recoveredMemoryIds);
+  if (runtime.backend === 'claude') {
+    const recovered = recovery.session;
+    if (recovered?.routing === runtime.toolRouting) context.provider.id = recovered.id;
+  }
+  await controls.restore(signal);
   const recoveredModel = recovery.model;
   if (recoveredModel && !runtime.model) {
     runtime.detectedModel = recoveredModel;
@@ -178,10 +201,6 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
         runtime.backendTokenWindow,
         promptTransportFor(runtime.backend)
       );
-  }
-  if (runtime.backend === 'claude') {
-    const recovered = recovery.session;
-    if (recovered?.routing === runtime.toolRouting) context.provider.id = recovered.id;
   }
   const sample = hydrated.providerSample;
   if (sample)
@@ -322,6 +341,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     if (!input.raw.trim()) return undefined;
     running = true;
     try {
+      await controls.drain(options.signal);
       stream.resetTurn();
       stream.resetSends();
       return await coordinator.run(
@@ -479,6 +499,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     run,
     clones,
     cloneRegistry,
+    controls,
     consecutiveBackendFailures: () => consecutiveBackendFailures,
   };
 }

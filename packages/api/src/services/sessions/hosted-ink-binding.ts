@@ -7,7 +7,7 @@ import {
   signInkAccessToken,
   type InkTokenPayload,
 } from '../../auth/ink-tokens';
-import { getActiveRun, isGenerationAdmitted } from './active-runs';
+import { getActiveRun, isGenerationAdmitted, attachRunControls } from './active-runs';
 import { createHostedInkExecutor, type PrepareHostedInkEffects } from './hosted-ink-executor';
 import { HostedInkSessionRunner } from './hosted-ink-session';
 import {
@@ -142,6 +142,13 @@ export function createBoundHostedInkRunner(input: HostedInkBinding) {
       admitted();
       return {
         deadlineAt,
+        controls: {
+          assertCurrent: admitted,
+          bind: (enqueue) => {
+            admitted();
+            return attachRunControls(sessionId, turnEpoch, enqueue);
+          },
+        },
         inkwell,
         sessionLog,
         isHostedRefusal: (error) => error instanceof HostedSpawnRefusal,

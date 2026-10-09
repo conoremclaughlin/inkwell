@@ -1,3 +1,4 @@
+import type { SessionControlRequest, SessionControlReceipt } from '@inklabs/shared/runtime';
 import type { BackendRunResult, SessionProviderPorts } from '@inklabs/shared/providers';
 /**
  * An `ink` session's turn run inside this server by the shared session
@@ -98,7 +99,13 @@ export interface HostedInkSessionInput {
 }
 
 /** What the server supplies the composition for one turn. */
+export interface HostedControlPort {
+  assertCurrent(): void;
+  bind(enqueue: (request: SessionControlRequest) => SessionControlReceipt): () => void;
+}
+
 export interface HostedInkSessionPorts {
+  readonly controls?: HostedControlPort;
   /** Every Inkwell tool, bootstrap, recall and send_response included, token-scoped to the session. */
   readonly inkwell: {
     callTool(
@@ -143,6 +150,7 @@ export type ExecuteHostedInkSession = (
 
 /** Built once per turn, then frozen. */
 export interface HostedInkTurnDependencies {
+  readonly controls?: HostedControlPort;
   readonly inkwell: HostedInkSessionPorts['inkwell'];
   /** The server host: startHostedBackendTurn(hostInput, request). Throws with nothing started when refused. */
   startProviderTurn(request: ProviderTurnRequest): ProviderTurnHandle;
@@ -538,6 +546,30 @@ export class HostedInkSessionRunner implements IRunner {
       const onTurnReply = config.onTurnReply;
       const retiredRejection = () => Promise.reject(new HostedTurnRetired());
       const ports: HostedInkSessionPorts = Object.freeze({
+        ...(deps.controls
+          ? {
+              controls: {
+                assertCurrent: () => {
+                  lifetime.signal.throwIfAborted();
+                  deps.controls!.assertCurrent();
+                },
+                bind: (enqueue: (request: SessionControlRequest) => SessionControlReceipt) => {
+                  lifetime.signal.throwIfAborted();
+                  const release = deps.controls!.bind((request) => {
+                    if (lifetime.closed)
+                      return {
+                        controlId: request.controlId,
+                        status: 'refused',
+                        reason: 'owner_closing',
+                      };
+                    return enqueue(request);
+                  });
+                  lifetime.whenClosed(release);
+                  return release;
+                },
+              },
+            }
+          : {}),
         inkwell: Object.freeze({
           callTool: (name: string, args: Record<string, unknown>, opts: { signal: AbortSignal }) =>
             lifetime.retired ? retiredRejection() : deps.inkwell.callTool(name, args, opts),

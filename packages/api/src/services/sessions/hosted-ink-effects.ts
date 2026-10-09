@@ -5,6 +5,7 @@ import { dirname, isAbsolute } from 'path';
 import { encodeContextToken } from '@inklabs/shared';
 import {
   createSessionToolHost,
+  createSkillInstructionHost,
   sessionCredentialsForProfile,
   requestHostedToolApproval,
   type CodingToolHostPorts,
@@ -208,6 +209,8 @@ export function createHostedInkEffects(host: HostedInkEffectHost): PrepareHosted
       policy,
       toolHost: toolkit,
       activeSkills,
+      manualSkills: createSkillInstructionHost(input.workingDirectory, host.home),
+      controlReceipt: (receipt) => emit('session_control_receipt', { ...receipt }),
       mintId: randomUUID,
       // Launch profiles are per-run, not edits of a shared machine policy. Approved
       // persistent grants await their merged write above before returning true.

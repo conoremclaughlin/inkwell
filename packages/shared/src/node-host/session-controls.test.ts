@@ -1,0 +1,280 @@
+import { describe, it, expect, vi } from 'vitest';
+import { createSessionControls } from './session-controls.js';
+import {
+  SessionLog,
+  ToolPolicyState,
+  createProviderRecovery,
+  type SessionControlReceipt,
+  type SessionControlRecord,
+} from '../runtime/index.js';
+import type { SkillInstruction } from '../providers/skill-discovery.js';
+
+const skill: SkillInstruction = {
+  name: 'review',
+  path: '/fixture/review',
+  source: 'repo:.ink',
+  trustLevel: 'local',
+  contentDigest: 'a'.repeat(64),
+  content: 'CHECK THE FIXTURE',
+  provenance: { registry: 'fixture' },
+};
+function fixture() {
+  const events: Record<string, unknown>[] = [];
+  let write = async (line: string) => {
+    events.push(JSON.parse(line));
+  };
+  const log = new SessionLog({
+    path: '/fixture/session.jsonl',
+    sink: { write: (line) => write(line) },
+  });
+  const runtime = {
+    sessionId: 'one',
+    backend: 'claude',
+    model: 'before' as string | undefined,
+    detectedModel: undefined as string | undefined,
+    backendTokenWindow: 200_000,
+    maxContextTokens: 100_000,
+    activeSkills: [] as SkillInstruction[],
+  };
+  const policy = new ToolPolicyState('backend');
+  const skills = { discover: vi.fn(async () => [skill]), load: vi.fn(async () => ({ ...skill })) };
+  const invalidateProvider = vi.fn();
+  let admitted = true;
+  const receipts: SessionControlReceipt[] = [];
+  const control = createSessionControls({
+    runtime,
+    log,
+    policy,
+    skills,
+    contextBudgetAuto: true,
+    assertCurrent: () => {
+      if (!admitted) throw new Error('old owner');
+    },
+    invalidateProvider,
+    mintId: () => 'replay-removal',
+    receipt: (value) => receipts.push(value),
+  });
+  return {
+    control,
+    runtime,
+    events,
+    log,
+    skills,
+    policy,
+    invalidateProvider,
+    receipts,
+    setWrite: (fn: typeof write) => {
+      write = fn;
+    },
+    retire: () => {
+      admitted = false;
+    },
+  };
+}
+const record = (selection: SessionControlRecord['selection']): SessionControlRecord => ({
+  type: 'session_control',
+  version: 1,
+  controlId: 'earlier',
+  backend: 'claude',
+  selection,
+});
+const ref = (({ content, ...rest }) => rest)(
+  skill
+) as SessionControlRecord['selection']['skills'][number];
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+};
+
+describe('sole-composer durable controls', () => {
+  it('queues without effect; commits before applying, including no-op invalidation', async () => {
+    const h = fixture();
+    const gate = deferred();
+    const writing = deferred();
+    h.setWrite(async (line) => {
+      writing.resolve();
+      await gate.promise;
+      h.events.push(JSON.parse(line));
+    });
+    const request = { controlId: 'first', action: 'model' as const, model: 'after' };
+    expect(h.control.enqueue(request).status).toBe('pending');
+    const run = h.control.drain();
+    await writing.promise;
+    expect(h.runtime.model).toBe('before');
+    expect(h.invalidateProvider).not.toHaveBeenCalled();
+    expect(h.receipts).toEqual([]);
+    gate.resolve();
+    await run;
+    expect(h.runtime.model).toBe('after');
+    expect(h.receipts[0]).toMatchObject({ status: 'applied', eid: 1 });
+    expect(h.control.enqueue(request)).toEqual(h.receipts[0]);
+    h.control.enqueue({ ...request, controlId: 'again' });
+    await h.control.drain();
+    expect(h.invalidateProvider).toHaveBeenCalledTimes(2);
+  });
+  it('does not persist instructions or grant tools, and clears skills durably', async () => {
+    const h = fixture();
+    const policy = h.policy.snapshot();
+    h.control.enqueue({ controlId: 'use', action: 'skill_use', name: 'review' });
+    await h.control.drain();
+    expect(h.runtime.activeSkills[0]?.content).toBe(skill.content);
+    expect(JSON.stringify(h.events)).not.toContain(skill.content);
+    expect(h.events[0]).toMatchObject({ selection: { skills: [ref] } });
+    expect(h.policy.snapshot()).toEqual(policy);
+    h.control.enqueue({ controlId: 'clear', action: 'skill_clear' });
+    await h.control.drain();
+    expect(h.runtime.activeSkills).toEqual([]);
+    expect(h.events[1]).toMatchObject({ selection: { skills: [] } });
+  });
+  it('replays full-log state independently of compaction and honors explicit model reset', async () => {
+    const h = fixture();
+    h.control.replay(record({ model: null, skills: [ref] }));
+    h.control.replay({ type: 'compaction' });
+    await h.control.restore();
+    expect(h.runtime.model).toBeUndefined();
+    expect(h.runtime.activeSkills).toHaveLength(1);
+    expect(h.events).toEqual([]);
+  });
+  it.each(['content', 'provenance', 'identity', 'policy', 'missing'])(
+    'durably removes a replayed skill on %s drift and never resurrects it',
+    async (kind) => {
+      const h = fixture();
+      if (kind === 'content')
+        h.skills.load.mockResolvedValue({ ...skill, contentDigest: 'b'.repeat(64) });
+      if (kind === 'provenance')
+        h.skills.load.mockResolvedValue({ ...skill, provenance: { registry: 'changed' } });
+      if (kind === 'identity') h.skills.load.mockResolvedValue({ ...skill, path: '/other' });
+      if (kind === 'policy') vi.spyOn(h.policy, 'isSkillAllowed').mockReturnValue(false);
+      if (kind === 'missing') h.skills.load.mockRejectedValue(new Error('not found'));
+      h.control.replay(record({ skills: [ref] }));
+      await h.control.restore();
+      expect(h.runtime.activeSkills).toEqual([]);
+      expect(h.events[0]).toMatchObject({
+        type: 'session_control',
+        reason: 'replay_skill_removed',
+        selection: { skills: [] },
+      });
+      const next = fixture();
+      next.control.replay(h.events[0]);
+      await next.control.restore();
+      expect(next.skills.load).not.toHaveBeenCalled();
+      expect(next.runtime.activeSkills).toEqual([]);
+    }
+  );
+  it('refuses unknown record versions and backend changes rather than guessing', async () => {
+    const h = fixture();
+    expect(() => h.control.replay({ ...record({ skills: [] }), version: 2 })).toThrow();
+    h.control.replay({ ...record({ skills: [] }), backend: 'codex' });
+    await expect(h.control.restore()).rejects.toThrow(/different backend/);
+  });
+  it('retains a late cancellation as unknown, blocks launches/drains, and does not apply', async () => {
+    const h = fixture();
+    const gate = deferred();
+    const writing = deferred();
+    const stop = new AbortController();
+    h.setWrite(async (line) => {
+      writing.resolve();
+      await gate.promise;
+      h.events.push(JSON.parse(line));
+    });
+    h.control.enqueue({ controlId: 'cancel', action: 'model', model: 'late' });
+    const run = h.control.drain(stop.signal);
+    await writing.promise;
+    stop.abort();
+    gate.resolve();
+    await expect(run).rejects.toThrow();
+    expect(h.runtime.model).toBe('before');
+    expect(h.receipts[0].status).toBe('unknown');
+    await expect(h.control.drain()).rejects.toThrow(/uncertain/);
+    expect(h.events).toHaveLength(1); // the receipt must not lie about absence
+  });
+  it('fails closed on a write rejection', async () => {
+    const h = fixture();
+    h.setWrite(async () => {
+      throw new Error('disk');
+    });
+    h.control.enqueue({ controlId: 'disk', action: 'model', model: 'late' });
+    await expect(h.control.drain()).rejects.toThrow(/uncertain/);
+    expect(h.receipts[0].status).toBe('unknown');
+    expect(h.runtime.model).toBe('before');
+  });
+  it('checks policy again after loading and during persistence', async () => {
+    const h = fixture();
+    h.skills.load.mockImplementation(async () => {
+      vi.spyOn(h.policy, 'isSkillAllowed').mockReturnValue(false);
+      return skill;
+    });
+    h.control.enqueue({ controlId: 'load', action: 'skill_use', name: 'review' });
+    await h.control.drain();
+    expect(h.events).toEqual([]);
+    expect(h.receipts[0].status).toBe('refused');
+    const other = fixture();
+    other.setWrite(async (line) => {
+      other.events.push(JSON.parse(line));
+      vi.spyOn(other.policy, 'isSkillAllowed').mockReturnValue(false);
+    });
+    other.control.enqueue({ controlId: 'write', action: 'skill_use', name: 'review' });
+    await expect(other.control.drain()).rejects.toThrow(/uncertain/);
+    expect(other.receipts[0].status).toBe('unknown');
+  });
+  it('fences application after a load, and keeps sessions independent', async () => {
+    const a = fixture(),
+      b = fixture();
+    a.skills.load.mockImplementation(async () => {
+      a.retire();
+      return skill;
+    });
+    a.control.enqueue({ controlId: 'same', action: 'skill_use', name: 'review' });
+    b.control.enqueue({ controlId: 'same', action: 'model', model: 'other' });
+    await expect(a.control.drain()).rejects.toThrow(/owner/);
+    await b.control.drain();
+    expect(a.events).toEqual([]);
+    expect(a.receipts[0].status).toBe('refused');
+    expect(b.runtime.model).toBe('other');
+  });
+  it('closes enqueue before a final drain and rejects id substitution', async () => {
+    const h = fixture();
+    const request = { controlId: 'one', action: 'model' as const, model: null };
+    h.control.enqueue(request);
+    expect(h.control.enqueue({ ...request, model: 'different' }).reason).toBe(
+      'control_id_conflict'
+    );
+    h.control.close();
+    expect(h.control.enqueue({ ...request, controlId: 'late' }).status).toBe('refused');
+    await h.control.drain();
+    expect(h.receipts[0].status).toBe('applied');
+  });
+  it('bounds pending requests plus receipt evidence without evicting dedupe', () => {
+    const h = fixture();
+    for (let i = 0; i < 128; i++)
+      expect(h.control.enqueue({ controlId: String(i), action: 'skill_clear' }).status).toBe(
+        'pending'
+      );
+    expect(h.control.enqueue({ controlId: '129', action: 'skill_clear' }).reason).toBe(
+      'control_capacity'
+    );
+    h.control.refusePending('stopped');
+    expect(h.receipts).toHaveLength(128);
+  });
+  it('a control invalidates native recovery only until a new baseline is written', () => {
+    const recovery = createProviderRecovery('claude');
+    recovery.push({ type: 'backend_session', id: 'stale', routing: 'local' });
+    recovery.push(record({ model: 'new', skills: [] }));
+    expect(recovery.session).toBeUndefined();
+    recovery.push({ type: 'backend_session', id: 'new', routing: 'local' });
+    recovery.push({ type: 'assistant', content: 'reply' });
+    expect(recovery.session?.id).toBe('new');
+  });
+});
+
+it('skill-only controls retain a reported model window; an explicit model reset clears it', () => {
+  const recovery = createProviderRecovery('claude');
+  recovery.push({ type: 'model_detected', backend: 'claude', model: 'reported-large-window' });
+  recovery.push(record({ skills: [] }));
+  expect(recovery.model).toBe('reported-large-window');
+  recovery.push(record({ model: null, skills: [] }));
+  expect(recovery.model).toBeUndefined();
+});

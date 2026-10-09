@@ -40,6 +40,12 @@ vi.mock('../utils/logger', () => ({
 import { signBrowserClientToken } from './browser-client-tokens';
 import { signInkAccessToken } from './ink-tokens';
 import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
+import { createSessionsRouter } from '../routes/sessions';
+import {
+  registerActiveRun,
+  attachRunControls,
+  resetActiveRuns,
+} from '../services/sessions/active-runs';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import type { DataComposer } from '../data/composer';
 
@@ -273,6 +279,9 @@ describe('bearer-verification census', () => {
     'routes/alerts.ts',
     'routes/hook-lifecycle.ts',
     'routes/sessions.ts',
+    // Same type-pinned verifier, then owning-user-only mutation. No browser
+    // grant or observer token becomes a control principal; HTTP controls below.
+    'routes/session-controls.ts',
     // Door 2.
     'routes/admin.ts',
     // Door 3.
@@ -317,5 +326,72 @@ describe('bearer-verification census', () => {
       .sort();
 
     expect(found).toEqual(EXPECTED_CALL_SITES);
+  });
+});
+
+describe('session controls — browser grants cannot mutate a hosted owner', () => {
+  let server: Server;
+  let baseUrl: string;
+  const enqueue = vi.fn(() => ({ controlId: 'boundary-test', status: 'pending' as const }));
+  beforeAll(async () => {
+    registerActiveRun({
+      sessionId: 'fixture',
+      turnEpoch: 'epoch',
+      userId: USER_ID,
+      sbSlug: 'echo',
+      backend: 'ink',
+      startedAt: Date.now(),
+    });
+    attachRunControls('fixture', 'epoch', enqueue);
+    const dataComposer = {
+      getClient: () => ({
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              single: async () => ({
+                data: { user_id: USER_ID, cli_attached: false, turn_epoch: 'epoch' },
+              }),
+            }),
+          }),
+        }),
+      }),
+    } as unknown as DataComposer;
+    const app = express();
+    app.use(express.json());
+    app.use(
+      '/api/sessions',
+      createSessionsRouter({ authProvider: new InkAuthProvider(), dataComposer })
+    );
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('no port');
+    baseUrl = `http://127.0.0.1:${address.port}`;
+  });
+  afterAll(async () => {
+    resetActiveRuns();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  });
+  const post = (token: string) =>
+    fetch(`${baseUrl}/api/sessions/fixture/controls`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        turnEpoch: 'epoch',
+        control: { controlId: 'boundary-test', action: 'model', model: 'fixture' },
+      }),
+    });
+  it('refuses a real browser_client token before it reaches the owner', async () => {
+    enqueue.mockClear();
+    expect((await post(browserToken())).status).toBe(401);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+  it('CONTROL: a signed owning-user mcp_access credential reaches the mailbox', async () => {
+    enqueue.mockClear();
+    expect((await post(mcpToken())).status).toBe(202);
+    expect(enqueue).toHaveBeenCalledOnce();
   });
 });

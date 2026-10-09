@@ -75,6 +75,7 @@ export function createProviderRecovery(backend: string) {
           'context_trim',
           'context_budget_changed',
           'backend_session_invalidated',
+          'session_control',
         ].includes(event.type)
       ) {
         session = undefined;
@@ -86,7 +87,14 @@ export function createProviderRecovery(backend: string) {
         event.model
       ) {
         model = event.model;
-      } else if (event.type === 'model_detection_reset' && event.backend === backend) {
+      } else if (
+        (event.type === 'model_detection_reset' ||
+          (event.type === 'session_control' &&
+            event.selection !== null &&
+            typeof event.selection === 'object' &&
+            'model' in event.selection)) &&
+        event.backend === backend
+      ) {
         model = undefined;
       }
     },
