@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1024 1024%22%3E%3Crect width=%221024%22 height=%221024%22 rx=%22220%22 fill=%22%23F5F3EC%22/%3E%3Ccircle cx=%22573%22 cy=%22584%22 r=%22261%22 fill=%22%23151515%22/%3E%3Ccircle cx=%22261%22 cy=%22261%22 r=%22118%22 fill=%22%23F2683A%22/%3E%3C/svg%3E">
+</head>
+<body>
+<title>Cortex Pricing</title>
+<style>
+/* Layout: one working column (paste box, then the answer) beside the activity log; stacked on a phone. Paper, ink and spark. */
+:root {
+  --paper: #f5f3ec;
+  --raised: #fbfaf6;
+  --sunk: #ebe8de;
+  --ink: #202923;
+  --ink-soft: #46514a;
+  --muted: #5b645c;
+  --line: #d9dccf;
+  --edge: rgba(32, 41, 35, 0.08);
+  --spark: #f2683a;
+  --spark-a: #ffcf5a;
+  --spark-b: #f04e2b;
+  --button: #202923;
+  --button-text: #f8f4e7;
+  --order-bg: #e3eddf;
+  --order-fg: #0b6a5d;
+  --order-dot: #16a390;
+  --support-bg: #f6e1d3;
+  --support-fg: #8a4523;
+  --support-dot: #e3a785;
+  --billing-bg: #fce6d8;
+  --billing-fg: #a3360f;
+  --billing-dot: #f2683a;
+  --other-bg: #ebe8de;
+  --other-fg: #46514a;
+  --other-dot: #8b938b;
+  --inventory-bg: #e2e8f1;
+  --inventory-fg: #274472;
+  --inventory-dot: #4b6fae;
+  --alert-bg: #fde6e0;
+  --alert-fg: #a01d0b;
+  --alert-line: #f0ad9c;
+  --quote-bg: #e6efe0; --quote-fg: #2f5d1e; --quote-dot: #5c9a3c;
+  --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
+  --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
+  --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
+  --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
+  --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+    --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+    --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+    --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+    --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+    --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+    --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+    --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+  --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+  --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+  --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+  --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+  --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+  --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+  --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-inline: 20px;
+  padding-block: 28px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  min-height: 100vh;
+}
+@media (max-width: 520px) { .wrap { padding-inline: 16px; padding-block: 20px 0; gap: 22px; } }
+
+header { display: flex; align-items: center; gap: 14px; }
+.mark { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: var(--shadow); }
+.brand { min-width: 0; }
+h1 {
+  font: 500 30px/1.1 var(--serif);
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+}
+.lede { margin: 4px 0 0; color: var(--muted); font-size: 15px; text-wrap: pretty; }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 22px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+@media (max-width: 520px) { .panel { padding: 18px 16px; border-radius: 16px; } }
+
+h2 { font: 600 19px/1.25 var(--serif); margin: 0; }
+.label { display: block; font-weight: 600; font-size: 15px; }
+.hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+
+textarea {
+  width: 100%;
+  min-height: 168px;
+  resize: vertical;
+  font: 14px/1.55 var(--mono);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+
+.examples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.examples span { color: var(--muted); font-size: 13px; }
+.chip {
+  font: 500 13px/1 var(--sans);
+  color: var(--ink-soft);
+  background: var(--sunk);
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.chip:hover { color: var(--ink); }
+.chip:focus-visible, .btn:focus-visible, .link:focus-visible { outline: 2px solid var(--spark); outline-offset: 2px; }
+
+.actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.btn {
+  font: 600 15px/1 var(--sans);
+  color: var(--button-text);
+  background: var(--button);
+  border: 0;
+  border-radius: 999px;
+  padding: 13px 22px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn .spark { width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, var(--spark-a), var(--spark-b)); }
+.kbd { color: var(--muted); font-size: 12px; }
+
+/* The answer */
+.result {
+  border-radius: 14px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.result[data-state="empty"] { color: var(--muted); }
+.result-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: 600 12px/1 var(--sans);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 6px 10px 6px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.order { background: var(--order-bg); color: var(--order-fg); }
+.pill.order::before { background: var(--order-dot); }
+.pill.support { background: var(--support-bg); color: var(--support-fg); }
+.pill.support::before { background: var(--support-dot); }
+.pill.billing { background: var(--billing-bg); color: var(--billing-fg); }
+.pill.billing::before { background: var(--billing-dot); }
+.pill.other { background: var(--other-bg); color: var(--other-fg); }
+.pill.other::before { background: var(--other-dot); }
+.pill.inventory { background: var(--inventory-bg); color: var(--inventory-fg); }
+.pill.inventory::before { background: var(--inventory-dot); }
+.pill.quote { background: var(--quote-bg); color: var(--quote-fg); }
+.pill.quote::before { background: var(--quote-dot); }
+.pill.storage { background: var(--storage-bg); color: var(--storage-fg); }
+.pill.storage::before { background: var(--storage-dot); }
+.pill.crew { background: var(--crew-bg); color: var(--crew-fg); }
+.pill.crew::before { background: var(--crew-dot); }
+.pill.issue { background: var(--issue-bg); color: var(--issue-fg); }
+.pill.issue::before { background: var(--issue-dot); }
+.pill.fees { background: var(--fees-bg); color: var(--fees-fg); }
+.pill.fees::before { background: var(--fees-dot); }
+.entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
+.centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
+.centre select { font: 14px/1.3 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.centre select:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; }
+.result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
+.alert-tag.big { font-size: 16px; padding: 9px 14px; letter-spacing: 0.08em; }
+.pinned { border-top: 0; background: var(--alert-bg); border-radius: 12px; padding: 12px 12px; margin-bottom: 8px; }
+.pinned + .entry { border-top: 0; }
+.pin-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pin-row .btn { padding: 8px 14px; font-size: 13px; }
+.handled-note { color: var(--muted); font-size: 12px; }
+.examples + .examples { margin-top: -4px; }
+.result.alert .step { color: var(--alert-fg); font-weight: 600; }
+.alert-tag { display: inline-flex; align-items: center; font: 700 12px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--alert-bg); background: var(--alert-fg); border-radius: 999px; padding: 6px 10px; }
+.entry.alert-entry .entry-step { color: var(--alert-fg); }
+.when { font-size: 13px; color: var(--muted); }
+.when b { color: var(--ink-soft); font-weight: 600; }
+.step { font: 500 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
+.why { margin: 0; color: var(--ink-soft); font-size: 14px; }
+.facts { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 14px; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.signals { color: var(--muted); font-size: 12px; margin: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  .result.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+  .entry.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+}
+@keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
+
+
+
+/* Plans. */
+.plans { display: flex; flex-direction: column; gap: 16px; }
+.plans-head { display: flex; flex-direction: column; gap: 4px; }
+.plans-head h2 { font: 500 26px/1.15 var(--serif); text-wrap: balance; }
+.plan-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 720px) { .plan-grid { grid-template-columns: minmax(0, 1fr); } }
+.plan { background: var(--raised); border: 1px solid var(--edge); border-radius: 18px; box-shadow: var(--shadow); padding: 20px 22px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.plan.featured { border: 1.5px solid var(--ink-soft); }
+.plan-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.plan h3 { margin: 0; font: 600 19px/1.2 var(--serif); }
+.plan .tag { font: 600 11px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 6px 9px; }
+.price { margin: 0; display: flex; align-items: baseline; gap: 4px; }
+.price b { font: 600 34px/1 var(--serif); font-variant-numeric: tabular-nums; }
+.price span { color: var(--muted); font-size: 14px; }
+.price-note { margin: 0; color: var(--ink-soft); font-size: 14px; }
+.plan ul { margin: 2px 0 6px; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.plan .btn { align-self: flex-start; }
+.btn.ghost { background: var(--sunk); color: var(--ink); }
+.signup { background: var(--raised); border: 1px solid var(--edge); border-radius: 18px; box-shadow: var(--shadow); padding: 20px 22px; display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
+.signup h3 { margin: 0; font: 600 19px/1.2 var(--serif); }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-weight: 600; font-size: 14px; }
+.field input { font: 15px/1.4 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.field input:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+.field .err { color: var(--alert-fg); font-size: 13px; }
+.fine { color: var(--muted); font-size: 12px; margin: 0; }
+.signed { background: var(--order-bg); color: var(--order-fg); border-radius: 18px; padding: 18px 22px; display: flex; flex-direction: column; gap: 8px; max-width: 560px; }
+.signed strong { font: 600 19px/1.25 var(--serif); }
+.signed .btn { align-self: flex-start; }
+.top-link { margin-left: auto; font: 500 14px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.plan-badge { margin-left: auto; font: 600 12px/1 var(--sans); letter-spacing: 0.04em; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 7px 11px; white-space: nowrap; }
+header { flex-wrap: wrap; }
+
+/* The greeter. */
+.greeter { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
+.ink-avatar { width: 92px; height: 110px; flex: none; overflow: visible; }
+.bubble {
+  position: relative;
+  min-width: 0;
+  max-width: 62ch;
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  box-shadow: var(--shadow);
+  border-radius: 18px 18px 18px 6px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+  min-height: 3.2em;
+}
+.bubble .who { display: block; font: 600 12px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+@media (max-width: 520px) { .ink-avatar { width: 72px; height: 88px; } .bubble { font-size: 14px; } }
+
+/* The mark: the ink settles in, the spark lights, the eyes blink. */
+.mark .ink, .mark .spk, .mark .eyes { transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: no-preference) {
+  .mark .ink { animation: inkIn 720ms cubic-bezier(.2,.8,.2,1) both; }
+  .mark .spk { animation: sparkOn 820ms 260ms cubic-bezier(.2,.8,.2,1) both; }
+  .mark .eyes { animation: blink 5.6s 1.6s infinite; }
+  .mark.lit .spk { animation: sparkPulse 560ms cubic-bezier(.2,.8,.2,1); }
+}
+@keyframes inkIn { from { transform: scale(.6); } to { transform: scale(1); } }
+@keyframes sparkOn { 0% { opacity: 0; transform: scale(.5); } 65% { opacity: 1; transform: scale(1.14); } 100% { opacity: 1; transform: scale(1); } }
+@keyframes blink { 0%, 93%, 100% { transform: scaleY(1); } 95.5% { transform: scaleY(.08); } }
+@keyframes sparkPulse { 0% { transform: scale(1); } 40% { transform: scale(1.28); } 100% { transform: scale(1); } }
+
+/* The log */
+.log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.tally { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.entries { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.entry {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 4px 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.entry:first-child { border-top: 0; padding-top: 2px; }
+.entry time { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 2px; line-height: 1.3; }
+.entry time small { display: block; font-size: 11px; }
+.entry-body { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.entry-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.entry-step { font-weight: 600; font-size: 14px; }
+.entry-snip { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entry .pill { font-size: 11px; padding: 5px 8px 5px 7px; }
+.empty { color: var(--muted); font-size: 14px; padding: 18px 0 6px; display: flex; flex-direction: column; gap: 4px; }
+.empty strong { color: var(--ink-soft); font: 500 17px/1.3 var(--serif); }
+.log-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.link { background: none; border: 0; padding: 4px 0; font: 500 13px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.confirm { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--ink-soft); }
+.confirm .btn { padding: 8px 14px; font-size: 13px; }
+
+footer {
+  margin-top: auto;
+  padding-block: 22px 26px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 13px;
+}
+.team { display: flex; align-items: center; gap: 10px; color: var(--ink); }
+.team svg { width: 22px; height: 22px; border-radius: 6px; flex: none; }
+.team b { font: 600 15px var(--serif); }
+</style>
+<style>
+.price-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 860px) { .price-grid { grid-template-columns: minmax(0, 1fr); } }
+.plan.best { border: 2px solid var(--spark); }
+.plan .tag.best { color: #fff; background: var(--spark); }
+</style>
+<div class="wrap">
+  <header>
+    <svg class="mark" viewBox="0 0 1024 1024" aria-hidden="true">
+      <defs><linearGradient id="sparkA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+      <rect width="1024" height="1024" fill="#F5F3EC"/>
+      <g class="ink">
+        <circle cx="573" cy="584" r="261" fill="#151515"/>
+        <g class="eyes" fill="#F8F4E7">
+          <ellipse cx="505" cy="556" rx="27" ry="40"/>
+          <ellipse cx="641" cy="556" rx="27" ry="40"/>
+        </g>
+      </g>
+      <circle class="spk" cx="261" cy="261" r="118" fill="url(#sparkA)"/>
+    </svg>
+    <div class="brand"><h1>Cortex Pricing</h1><p class="lede">Sign yourself up. No contract and no sales call.</p></div>
+    <a class="top-link" href="../">Back to Cortex</a>
+  </header>
+  <section class="plans" aria-labelledby="plansTitle">
+    <div class="plan-grid price-grid">
+      <article class="plan" aria-labelledby="mName">
+        <div class="plan-top"><h3 id="mName">Starter, monthly</h3></div>
+        <p class="price"><b>$450</b><span>/month</span></p>
+        <p class="price-note">Billed monthly. Cancel anytime. No contract, no sales call.</p>
+        <button type="button" class="btn ghost" data-billing="monthly">Choose monthly</button>
+      </article>
+      <article class="plan best" aria-labelledby="aName">
+        <div class="plan-top"><h3 id="aName">Starter, annual</h3><span class="tag best">Best value</span></div>
+        <p class="price"><b>$3,990</b><span>/year</span></p>
+        <p class="price-note">Paid upfront. Save $1,410 a year compared with monthly.</p>
+        <button type="button" class="btn" data-billing="annual"><span class="spark" aria-hidden="true"></span>Choose annual</button>
+      </article>
+      <article class="plan" aria-labelledby="eName">
+        <div class="plan-top"><h3 id="eName">Enterprise</h3></div>
+        <p class="price"><b>Custom</b></p>
+        <p class="price-note">For larger teams. Contact sales: <span style="user-select: all">sales@cortex.example</span></p>
+      </article>
+    </div>
+    <form class="signup" id="signupForm" novalidate>
+      <h3>Start Starter plan</h3>
+      <p class="hint" id="billingLine">Annual: $3,990/year, paid upfront.</p>
+      <div class="field"><label for="signupName">Name</label><input id="signupName" autocomplete="name"><span class="err" id="nameErr" hidden>Add your name.</span></div>
+      <div class="field"><label for="signupEmail">Email</label><input id="signupEmail" type="email" autocomplete="email"><span class="err" id="emailErr" hidden>Add an email address, like you@company.com.</span></div>
+      <div class="field"><label for="signupCompany">Company</label><input id="signupCompany" autocomplete="organization"><span class="err" id="companyErr" hidden>Add your company.</span></div>
+      <button type="submit" class="btn" id="signupBtn">Start Starter plan</button>
+      <p class="fine">Demo sign-up: kept in this browser only. No account is created and no payment is taken.</p>
+    </form>
+    <div class="signed" id="signedIn" hidden aria-live="polite">
+      <strong id="signedText"></strong>
+      <span id="signedNote"></span>
+      <div class="pin-row"><a class="btn" href="../">Go to Cortex</a><button type="button" class="link" id="cancelPlan">Cancel Starter plan</button></div>
+    </div>
+    <p class="fine" id="planNote" hidden aria-live="polite"></p>
+  </section>
+  <footer>
+    <div class="team">
+      <svg viewBox="0 0 1024 1024" aria-hidden="true">
+        <defs><linearGradient id="sparkB" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+        <rect width="1024" height="1024" fill="#F5F3EC"/>
+        <circle cx="573" cy="584" r="261" fill="#151515"/>
+        <circle cx="261" cy="261" r="118" fill="url(#sparkB)"/>
+      </svg>
+      <span>Made by <b id="teamName">Team ARC AI</b></span>
+    </div>
+    <span>Cortex</span>
+  </footer>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const KEY = "cortex-plan-v1";
+const PRICES = { monthly: "$450/month, billed monthly", annual: "$3,990/year, paid upfront" };
+let billing = "annual";
+const valid = p => !!p && p.plan === "Starter" && (p.billing === "monthly" || p.billing === "annual") &&
+  ["name", "email", "company"].every(k => typeof p[k] === "string" && p[k].trim()) && Number.isFinite(Date.parse(p.startedAt));
+function note(t) { $("planNote").textContent = t; $("planNote").hidden = !t; }
+function show(p, saved) {
+  $("signupForm").hidden = true; $("signedIn").hidden = false;
+  $("signedText").textContent = "Welcome to Cortex Starter, " + p.name + "!";
+  $("signedNote").textContent = "Starter " + p.billing + ": " + PRICES[p.billing] + ". " +
+    (saved ? "Saved in this browser only (demo): no account is created and no payment is taken." : "Not saved: refreshing or leaving this page will lose it. No account is created and no payment is taken.");
+}
+document.querySelectorAll("[data-billing]").forEach(b => b.addEventListener("click", () => {
+  billing = b.dataset.billing;
+  $("billingLine").textContent = (billing === "annual" ? "Annual: " : "Monthly: ") + PRICES[billing] + ".";
+  $("signupForm").hidden = false; $("signedIn").hidden = true; note("");
+  $("signupName").focus();
+}));
+$("signupForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const v = { name: $("signupName").value.trim(), email: $("signupEmail").value.trim(), company: $("signupCompany").value.trim() };
+  const ok = { name: !!v.name, email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.email), company: !!v.company };
+  $("nameErr").hidden = ok.name; $("emailErr").hidden = ok.email; $("companyErr").hidden = ok.company;
+  const bad = ["name", "email", "company"].find(k => !ok[k]);
+  if (bad) { $("signup" + bad[0].toUpperCase() + bad.slice(1)).focus(); return; }
+  const p = { plan: "Starter", billing, ...v, startedAt: new Date().toISOString() };
+  let saved = false;
+  try { localStorage.setItem(KEY, JSON.stringify(p)); saved = localStorage.getItem(KEY) === JSON.stringify(p); } catch { saved = false; }
+  show(p, saved);
+});
+$("cancelPlan").addEventListener("click", () => {
+  let gone = false;
+  try { localStorage.removeItem(KEY); gone = localStorage.getItem(KEY) === null; } catch { gone = false; }
+  if (!gone) { note("This browser wouldn't remove the saved sign-up. Clear this site's data in your browser settings."); return; }
+  $("signupForm").reset();
+  $("signedText").textContent = ""; $("signedNote").textContent = "";
+  $("signedIn").hidden = true; $("signupForm").hidden = false;
+  note("Starter plan cancelled. Nothing was charged.");
+});
+try { const p = JSON.parse(localStorage.getItem(KEY) || "null"); if (valid(p)) show(p, true); } catch {}
+</script>
+</body>
+</html>
