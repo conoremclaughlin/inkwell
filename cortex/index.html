@@ -900,17 +900,18 @@ const CREW_WORDS = /\b(crew|crew lead|foreman|dispatch|movers)\b/i;
 const INVOICE_WORDS = /\binvoice\b|\binv[-\s#]?\d+|\b(amount due|balance due|total due|net\s?\d{2})\b/i;
 const FURNITURE = ["dresser", "mirror", "sofa", "couch", "piano", "table", "chair", "bed", "mattress", "wardrobe", "bookcase", "armoire", "desk", "tv", "lamp", "cabinet", "boxes"];
 
-const REFUND_WORDS = /\b(refunds?|refunded|money back|charge ?backs?|return (it|this|them|these|my|the|an?|our)\b|returning (it|this|them|my|the)|send (it|this|them) back)/i;
+const RETURN_GOODS = "(order|items?|products?|purchase|package|parcel|candles?|mugs?|shirts?|boxes|box|bags?|blankets?|throws?|gifts?|goods|stuff)";
+const REFUND_WORDS = new RegExp("\\b(refunds?|refunded|money back|charge ?backs?|return (it|this|them|these)\\b(?! (call|form|email|message))|returning (it|this|them)\\b|return (my|the|an?|our|this|these|those) (\\w+ )?" + RETURN_GOODS + "\\b|returning (my|the|an?|our) (\\w+ )?" + RETURN_GOODS + "\\b|return label|send (it|this|them) back)", "i");
 const PARTNER_WORDS = /\b(partner|partners|partnership|partnerships|intro|introduction|introducing)\b/i;
 const FOLLOWUP_WORDS = /\b(following up|follow(ing)?[- ]up|circle back|circling back)\b/i;
-const FOLLOWUP_BLOCK = /(#\s?\d{3,}|\border\s*(#|no\.?|number)?\s*\d{3,}|\b(refund|invoice|damaged|late|hasn'?t arrived|has not arrived|never arrived)\b)/i;
+const FOLLOWUP_BLOCK = /(#\s?\d{3,}|\border\s*(#|no\.?|number)?\s*\d{3,}|\b(my|our|the) order\b|\b(refund|invoice|damaged|late|tracking|delivery|shipping|hasn'?t arrived|has not arrived|never arrived)\b)/i;
 function movingKind(text) {
   const t = text;
   if (ISSUE_WORDS.test(t) && (MOVING_CONTEXT.test(t) || STRONG_ISSUE.test(t))) return "issue";
   if (INVOICE_WORDS.test(t)) return null;
   // Dev: refunds, and partner or follow-up notes.
   if (REFUND_WORDS.test(t)) return "refund";
-  if (PARTNER_WORDS.test(t) || (FOLLOWUP_WORDS.test(t) && !FOLLOWUP_BLOCK.test(t))) return "partner";
+  if ((PARTNER_WORDS.test(t) || FOLLOWUP_WORDS.test(t)) && !FOLLOWUP_BLOCK.test(t)) return "partner";
   // Colleen: "we need movers" and "how much to move a 2-bedroom" are quote requests too.
   if (/\b(need (some |a few |a couple of )?movers|looking for movers|how much)\b/i.test(t) && /\b(mov(e|ing|ers)|relocat\w*)\b/i.test(t)) return "quote";
   if (QUOTE_WORDS.test(t)) return "quote";
@@ -1025,11 +1026,13 @@ function isMpesa(text) {
   // Real texts write "KSh 12,500", "Ksh2,500.00" or "KES 2,500", and "received from NAME" or "received Ksh2,500.00 from NAME".
   return /\bconfirmed\b/i.test(text) && /\b(?:k\s?sh|kes)\.?\s*\d/i.test(text) && /\b(received\b[^\n]{0,40}?\bfrom|sent to|paid to)\b/i.test(text);
 }
+const UNPAID = /\b(haven'?t|have not|hasn'?t|has not|didn'?t|did not|not yet|yet to|unable to|can'?t|cannot)\s+(\w+\s+)?(paid|pay|sent|send)\b|\b(how much|amount due|balance due|fee balance|what do i owe|how much do i owe)\b/i;
 // A parent writing about fees they paid: "I've paid Ada's school fees, KSh 15,000 by M-Pesa, ref QKL2M4N6P8".
 function isParentFee(text) {
   if (/\b(invoice|inv[-\s#]?\d|suppliers?|vendors?|freight|customs|shipping|clearance)\b/i.test(text)) return false;
   const school = /\b(school|tuition|term \w+ fees?|fee balance|pupil|student|learner|class|grade)\b/i.test(text)
     || (/\bfees?\b/i.test(text) && /\b(son|daughter|child|children|kids?|[A-Z][a-z]+'s)\b/.test(text));
+  if (school && UNPAID.test(text)) return true;
   return school
     && /\b(paid|sent|deposited|transferred|made (a |the )?payment|payment (was |has been )?(made|sent|done))\b/i.test(text)
     && (/\b(?:k\s?sh|kes)\.?\s*\d|\bm-?pesa\b|\bpaybill\b|\breceipt\b|\bconfirm\b/i.test(text) || /\b(?=[A-Z0-9]{10}\b)(?=[A-Z0-9]*\d)[A-Z0-9]*[A-Z][A-Z0-9]*\b/.test(text));
@@ -1052,10 +1055,13 @@ function feesAnswer(text) {
   const time = timeM ? timeM[1] + (timeM[2] ? " " + timeM[2].replace(/[.\s]/g, "").toUpperCase() : "") : null;
   const when = [date, time].filter(Boolean).join(" ");
   let step = "Record in the fee register";
-  const wantsReceipt = !isMpesa(text) && /\b(receipt|confirm)\b/i.test(t);
+  const unpaid = !isMpesa(text) && UNPAID.test(t);
+  const wantsReceipt = !isMpesa(text) && !unpaid && /\b(receipt|confirm)\b/i.test(t);
   const detail = [];
-  if (wantsReceipt) {
-    step = "Find the " + (amount ? "KSh " + amount + " " : "") + "payment in the fee register and send " + (payer || "the parent") + " a receipt";
+  if (unpaid) {
+    step = "Reply with the fee balance due" + (payer ? " to " + payer : "");
+  } else if (wantsReceipt) {
+    step = "Find the payment" + (amount ? " (KSh " + amount + ")" : "") + " in the fee register and send " + (payer || "the parent") + " a receipt";
     if (code) step += " (ref " + code + ")";
   } else {
     if (amount) step += ": KSh " + amount + (payer ? " from " + payer : "");
@@ -1073,7 +1079,7 @@ function feesAnswer(text) {
   if (time) facts.push(["Time", time]);
   return {
     category: "fees", label: "Fees", urgency: "Today", confidence: null, step,
-    why: isMpesa(text) ? "An M-Pesa payment confirmation." : "A parent saying they've paid fees. Check it against the M-Pesa statement.", facts, signals: [],
+    why: isMpesa(text) ? "An M-Pesa payment confirmation." : unpaid ? "A parent asking what they owe. Nothing has been paid yet." : "A parent saying they've paid fees. Check it against the M-Pesa statement.", facts, signals: [],
     summary: [amount ? "KSh " + amount : null, payer].filter(Boolean).join(" · ")
   };
 }
