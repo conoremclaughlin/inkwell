@@ -445,15 +445,16 @@ function parseBid(text) {
   return { job, cost, sell, cont };
 }
 function parseRisks(text) {
-  return text.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => {
+  // One risk per line, or several on a line split by ; or by a comma before the next label.
+  return text.split(/\n+|;\s*|,\s+(?=[A-Za-z])/).map(l => l.trim()).filter(Boolean).map(l => {
     // The amount is the $-prefixed or k/m-suffixed number, else the last plain number.
     // Never a percent, never a digit inside a label like "Q1" or "Phase 2".
     const all = [...l.matchAll(new RegExp(MONEY, "gi"))].filter(x => !/^\s*%/.test(l.slice(x.index + x[0].length)) && !/[A-Za-z]$/.test(l.slice(0, x.index)));
     const m = all.find(x => /\$/.test(x[0]) || /[kKmM]|million|thousand/i.test(x[0])) || all[all.length - 1] || null;
     const amount = m ? parseMoney(m[0]) : null;
     const label = (m ? l.slice(0, m.index) + l.slice(m.index + m[0].length) : l).replace(/[:\-–—=]\s*$/, "").replace(/\s{2,}/g, " ").trim() || "Risk";
-    return { label, amount };
-  }).filter(r => r.amount != null);
+    return { label, amount, raw: l };
+  });
 }
 // The check itself: plain arithmetic, every step shown.
 function checkBid({ cost, sell, cont, risks = [], floor = 10, contFloor = 5 }) {
@@ -484,9 +485,9 @@ function checkBid({ cost, sell, cont, risks = [], floor = 10, contFloor = 5 }) {
   }
   const r1 = x => Math.round(x * 10) / 10;
   if (marginD < 0) out.flags.push({ key: "loss", tag: "Loss", text: "Loss: the bid is " + usd(-marginD) + " below cost" });
-  else if (r1(marginP) < floor) out.flags.push({ key: "thin", tag: "Thin margin", text: "Thin margin: " + pct(marginP) + " vs your " + pctPlain(floor) + " floor" });
+  else if (marginP < floor) out.flags.push({ key: "thin", tag: "Thin margin", text: "Thin margin: " + pct(marginP) + " vs your " + pctPlain(floor) + " floor" });
   if (cont != null && Number.isFinite(cont) && r1(cont) < contFloor) out.flags.push({ key: "cont", tag: "Low contingency", text: "contingency below " + pctPlain(contFloor), long: "Contingency " + pctPlain(cont) + " is below your " + pctPlain(contFloor) + " floor" });
-  if (out.adjP != null && r1(out.adjP) < floor && !(marginD < 0) && !(r1(marginP) < floor)) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk-adjusted margin " + pct(out.adjP) + " is under your " + pctPlain(floor) + " floor" });
+  if (out.adjP != null && r1(out.adjP) < floor && !(marginD < 0) && !(marginP < floor)) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk-adjusted margin " + pct(out.adjP) + " is under your " + pctPlain(floor) + " floor" });
   else if (out.adjP != null && r1(out.adjP) < floor) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk lines take it to " + pct(out.adjP) });
   if (out.flags.length) {
     const lead = out.flags[0];
@@ -550,7 +551,11 @@ function check() {
   const cost = numIn("cost"), sell = numIn("sell");
   const contRaw = $("cont").value.trim();
   const cont = contRaw === "" ? null : Number(contRaw.replace(/[%\s]/g, ""));
-  const out = checkBid({ cost, sell, cont: Number.isFinite(cont) ? cont : null, risks: parseRisks($("risks").value), floor: pctIn("floor", 10), contFloor: pctIn("contFloor", 5) });
+  const allRisks = parseRisks($("risks").value);
+  const out = checkBid({ cost, sell, cont: Number.isFinite(cont) ? cont : null, risks: allRisks.filter(r => r.amount != null), floor: pctIn("floor", 10), contFloor: pctIn("contFloor", 5) });
+  // A risk line with no readable amount is never dropped silently.
+  const unread = allRisks.filter(r => r.amount == null);
+  if (out.ok && unread.length) out.flags.push({ key: "unread", tag: "Unread risk line", text: "couldn't read an amount in: " + unread.map(r => r.raw).join("; ") });
   render(out, true);
   if (!out.ok) return;
   log.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: new Date().toISOString(),
