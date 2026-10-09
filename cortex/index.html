@@ -35,6 +35,9 @@
   --other-bg: #ebe8de;
   --other-fg: #46514a;
   --other-dot: #8b938b;
+  --inventory-bg: #e2e8f1;
+  --inventory-fg: #274472;
+  --inventory-dot: #4b6fae;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -50,6 +53,7 @@
     --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
     --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
     --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -63,6 +67,7 @@
   --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
   --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
   --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -199,6 +204,8 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.billing::before { background: var(--billing-dot); }
 .pill.other { background: var(--other-bg); color: var(--other-fg); }
 .pill.other::before { background: var(--other-dot); }
+.pill.inventory { background: var(--inventory-bg); color: var(--inventory-fg); }
+.pill.inventory::before { background: var(--inventory-dot); }
 .when { font-size: 13px; color: var(--muted); }
 .when b { color: var(--ink-soft); font-weight: 600; }
 .step { font: 500 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
@@ -285,7 +292,7 @@ footer {
     </svg>
     <div class="brand">
       <h1>Cortex</h1>
-      <p class="lede">Paste one thing from the roastery inbox. Get what it is and what to do next.</p>
+      <p class="lede">Paste one thing from the inbox. Get what it is and what to do next.</p>
     </div>
   </header>
 
@@ -294,7 +301,7 @@ footer {
       <form id="sortForm" novalidate>
         <div style="display:flex;flex-direction:column;gap:12px">
           <div>
-            <label class="label" id="pasteLabel" for="item">Paste an order, a customer email or an invoice line</label>
+            <label class="label" id="pasteLabel" for="item">Paste an order, a customer email, an invoice line or a stock line</label>
             <p class="hint">One thing at a time. It stays in this browser.</p>
           </div>
           <textarea id="item" name="item" spellcheck="false" autocomplete="off"></textarea>
@@ -303,6 +310,7 @@ footer {
             <button type="button" class="chip" data-example="order">An order</button>
             <button type="button" class="chip" data-example="support">A customer email</button>
             <button type="button" class="chip" data-example="billing">An invoice line</button>
+            <button type="button" class="chip" data-example="inventory">A stock line</button>
           </div>
           <div class="actions">
             <button type="submit" class="btn" id="sortBtn"><span class="spark" aria-hidden="true"></span>Sort it</button>
@@ -353,7 +361,8 @@ footer {
 const EXAMPLES = {
   order: "New order #1042 from Sam Rivera\n2 x Ethiopia Guji, 12 oz, whole bean\n1 x House Espresso, 2 lb, ground for espresso\nShip to: 18 Alder St, Portland, OR 97214\nShipping: USPS Priority",
   support: "Hi there,\nMy order #1037 was supposed to arrive on Tuesday and the tracking hasn't moved in three days. It's a birthday gift, so could you check on it?\nThanks,\nPriya",
-  billing: "INVOICE INV-2291 | Harbor Green Imports | 10 bags Colombia Huila, 69 kg each | Total due $1,842.50 | Due Oct 30, 2026 | Net 30"
+  billing: "INVOICE INV-2291 | Harbor Green Imports | 10 bags Colombia Huila, 69 kg each | Total due $1,842.50 | Due Oct 30, 2026 | Net 30",
+  inventory: "SKU 4471 Holiday Throw Blanket, on hand: 120, avg weekly sales: 85, lead time: 3 weeks"
 };
 
 const RULES = {
@@ -479,9 +488,113 @@ function signOff(text) {
   return inline ? inline[1] : null;
 }
 
+/* ---------- inventory: on hand against avg weekly sales × lead time ---------- */
+const NUM = "(\\d[\\d,]*(?:\\.\\d+)?)";
+function num(v) { return v == null ? null : Number(String(v).replace(/,/g, "")); }
+function firstMatch(text, patterns) {
+  for (const re of patterns) { const m = text.match(re); if (m) return m; }
+  return null;
+}
+function parseStock(text) {
+  const t = text.replace(/\s+/g, " ");
+  const onHandM = firstMatch(t, [
+    new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
+    new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "i"),
+    new RegExp("\\b(?:in stock|stock|inventory|qty|quantity)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
+    new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "i")
+  ]);
+  const weeklyM = firstMatch(t, [
+    new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
+    new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b\\s*(?:[:=]|is|of)?\\s*" + NUM, "i"),
+    new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "i"),
+    new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "i"),
+    new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "i")
+  ]);
+  const leadM = firstMatch(t, [
+    new RegExp("\\blead[\\s-]?time\\b\\s*(?:[:=]|is|of)?\\s*" + NUM + "\\s*(weeks?|wks?|w|days?|d)?\\b", "i"),
+    new RegExp(NUM + "\\s*(weeks?|wks?|w|days?|d)\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
+    new RegExp(NUM + "[\\s-]*(weeks?|wks?|days?)[\\s-]*lead\\b", "i")
+  ]);
+  const skuM = t.match(/\bsku\s*[:#]?\s*([A-Za-z0-9][\w-]*)/i);
+  const lower = t.toLowerCase();
+  const words = ["on hand", "on-hand", "weekly sales", "lead time", "lead-time", "in stock", "sku", "reorder", "stock"].filter(w => lower.includes(w)).length;
+  const onHand = onHandM ? num(onHandM[1]) : null;
+  const weekly = weeklyM ? num(weeklyM[1]) : null;
+  let lead = null, leadUnit = "weeks", leadWeeks = null;
+  if (leadM) {
+    lead = num(leadM[1]);
+    const u = (leadM[2] || "weeks").toLowerCase();
+    leadUnit = u.startsWith("d") ? "days" : "weeks";
+    leadWeeks = leadUnit === "days" ? lead / 7 : lead;
+  }
+  const fields = [onHand, weekly, lead].filter(v => v != null).length;
+  const isStock = fields >= 2 || (skuM && fields >= 1) || words >= 2;
+  const STOP = /[,;|]|\b(?:on[\s-]?hand|avg|average|weekly|lead|qty|in stock|stock|sells|selling)\b/i;
+  const tidy = v => v.replace(/^[\s:–—-]+|[\s:–—-]+$/g, "").replace(/[\s:–—-]*\d[\d,.]*\s*$/, "").trim();
+  let item = null;
+  if (skuM) {
+    const at = t.toLowerCase().indexOf(skuM[0].toLowerCase());
+    const after = tidy(t.slice(at + skuM[0].length).split(STOP)[0]);
+    const before = tidy(t.slice(0, at).split(STOP).pop() || "");
+    item = [after, before].find(v => v && /[A-Za-z]/.test(v) && v.length <= 60) || null;
+  } else {
+    const name = tidy(t.split(STOP)[0]);
+    if (name && /[A-Za-z]/.test(name) && name.length <= 60) item = name;
+  }
+  return { isStock, sku: skuM ? skuM[1] : null, item, onHand, weekly, lead, leadUnit, leadWeeks };
+}
+
+function plural(n, unit) {
+  const one = unit.replace(/s$/, "");
+  return n + " " + (n === 1 ? one : one + "s");
+}
+function fmt(n) { return Math.round(n).toLocaleString("en-US"); }
+
+function stockAnswer(st) {
+  const facts = [];
+  if (st.sku) facts.push(["SKU", st.sku]);
+  if (st.item) facts.push(["Item", st.item]);
+  if (st.onHand != null) facts.push(["On hand", st.onHand.toLocaleString("en-US")]);
+  if (st.weekly != null) facts.push(["Avg weekly sales", st.weekly.toLocaleString("en-US")]);
+  if (st.lead != null) facts.push(["Lead time", plural(st.lead, st.leadUnit)]);
+  const missing = [];
+  if (st.onHand == null) missing.push("on hand");
+  if (st.weekly == null) missing.push("avg weekly sales");
+  if (st.lead == null) missing.push("lead time");
+  if (missing.length) {
+    return {
+      category: "inventory", label: "Inventory", urgency: "Needs a number", confidence: null,
+      step: "Add the " + missing.join(" and ") + " to check this stock",
+      why: "To check stock I need on hand, avg weekly sales and lead time.",
+      facts, signals: []
+    };
+  }
+  const demand = st.weekly * st.leadWeeks;
+  const over = plural(st.lead, st.leadUnit);
+  facts.push(["Demand over lead time", "~" + fmt(demand)]);
+  if (st.onHand < demand) {
+    const reorder = demand - st.onHand;
+    facts.push(["Reorder", "~" + fmt(reorder) + " units"]);
+    return {
+      category: "inventory", label: "Inventory", urgency: "Now", confidence: null,
+      step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover ~" + fmt(demand) + " demand over " + over + ". Reorder ~" + fmt(reorder) + " units now.",
+      why: st.weekly.toLocaleString("en-US") + " a week × " + over + " = ~" + fmt(demand) + ".",
+      facts, signals: [], stockout: true
+    };
+  }
+  return {
+    category: "inventory", label: "Inventory", urgency: "Fine for now", confidence: null,
+    step: "✅ Stock OK",
+    why: st.onHand.toLocaleString("en-US") + " on hand covers ~" + fmt(demand) + " demand over " + over + ", with ~" + fmt(st.onHand - demand) + " to spare.",
+    facts, signals: []
+  };
+}
+
 function classify(text, now = new Date()) {
   const clean = text.trim();
   if (!clean) return null;
+  const stock = parseStock(clean);
+  if (stock.isStock) return stockAnswer(stock);
   const s = score(clean);
   const ranked = Object.entries(s).sort((a, b) => b[1].score - a[1].score);
   const [topCat, top] = ranked[0];
@@ -646,12 +759,13 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
   if (counts.support) parts.push(counts.support + " support");
   if (counts.billing) parts.push(counts.billing + " billing");
+  if (counts.inventory) parts.push(counts.inventory + " inventory");
   if (counts.other) parts.push(counts.other + " unsure");
   $("tally").textContent = parts.join(" · ");
   const foot = $("logFoot").firstElementChild;
