@@ -921,8 +921,8 @@ function movingAnswer(kind, text) {
 }
 
 /* ---------- supply risk: a supplier or shipment running late ---------- */
-const SUPPLY_WHO = /\b(suppliers?|vendors?|shipments?|deliver(y|ies)|wholesaler|manufacturer|freight|raw materials?|(wax|wick|jar|glass|fragrance|oil|fabric|packaging|bean|stock) (order|shipment|delivery))\b/i;
-const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]order(ed)?|running late|(is|are|be|will be|arriving) late|slipp(ed|ing)|postponed|out of stock until|won'?t (arrive|ship|be here) until|rescheduled)\b/i;
+const SUPPLY_WHO = /\b(suppliers?|vendors?|shipments?|deliver(y|ies)|wholesaler|manufacturer|freight|raw materials?|PO|purchase orders?|(wax|wick|jar|glass|fragrance|oil|fabric|packaging|bean|stock) (order|shipment|delivery))\b/i;
+const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]order(ed)?|running late|(is|are|be|will be|arriving) late|slipp(ed|ing)|postponed|out of stock until|won'?t (arrive|ship|be here) until|rescheduled|(stuck|held( up)?) (in|at) customs|customs hold|short[- ]?shipp?(ed|ing)?|short shipment|partial shipment|only \d[\d,]*\s*\w*\s+(of|out of) (the )?\d[\d,]*|can'?t (fill|fulfill|ship|deliver)\b[^.\n]{0,30}\buntil|lead times?\b[^.\n]{0,30}\b(is now|now|increased|went up|longer|extended|doubled)|eta\b[^.\n]{0,12}\b(moved|pushed|slipped|changed))\b/i;
 function isSupplyRisk(text) {
   // A customer asking where their own order is stays an order or support question.
   if (/\b(my|our) (order|package|parcel)\b/i.test(text) && !/\bsupplier|vendor|wholesaler\b/i.test(text)) return false;
@@ -1004,9 +1004,9 @@ function classify(text, now = new Date()) {
   if (!clean) return null;
   if (isMpesa(clean)) return feesAnswer(clean);
   if (isOrderStatus(clean)) return orderStatusAnswer(clean);
-  if (isSupplyRisk(clean)) return supplyAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
+  if (isSupplyRisk(clean)) return supplyAnswer(clean);
   const kind = movingKind(clean);
   if (kind) return movingAnswer(kind, clean);
   const s = score(clean);
@@ -1397,9 +1397,10 @@ function hint(text) {
     storage: "A storage question. Sort it and I'll note what they need.",
     crew: "The crew has a question. Sort it and I'll log it.",
     fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
+    supply: "A supplier running late. Sort it and I'll flag the reorder point.",
     other: "Hmm, I can't tell what that is yet."
   };
-  say(lines[r.category]);
+  say(lines[r.category] || lines.other);
   if (r.category === "other") mood(0, 0.5, 1800); else mood(0.25, 0, 1400);
 }
 
