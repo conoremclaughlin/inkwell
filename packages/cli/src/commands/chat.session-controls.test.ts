@@ -385,4 +385,28 @@ describe('CLI consumes shared session controls', () => {
     expect(fixture.requests[0].model).toBe('choice-127');
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('control_capacity'));
   });
+  it('treats server launch defaults as fallbacks, not new selections on each headless turn', async () => {
+    await run({ defaultModel: 'fleet', nonInteractive: true, message: 'Initial default' });
+    expect(fixture.requests[0].model).toBe('fleet');
+    expect(controls()).toHaveLength(0);
+    fixture.inputs = ['/model chosen', '/quit'];
+    await run();
+    fixture.requests = [];
+    await run({ defaultModel: 'fleet', nonInteractive: true, message: 'Keep chosen' });
+    expect(fixture.requests[0].model).toBe('chosen');
+    expect(controls()).toHaveLength(1);
+    fixture.requests = [];
+    await run({
+      defaultModel: 'fleet',
+      model: 'intentional',
+      nonInteractive: true,
+      message: 'Explicit override',
+    });
+    expect(fixture.requests[0].model).toBe('intentional');
+    expect(controls().at(-1)?.selection.model).toBe('intentional');
+    fixture.requests = [];
+    await run({ defaultModel: 'fleet', nonInteractive: true, message: 'Keep intentional' });
+    expect(fixture.requests[0].model).toBe('intentional');
+    expect(controls()).toHaveLength(2);
+  });
 });

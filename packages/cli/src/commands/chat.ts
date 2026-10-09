@@ -171,7 +171,7 @@ import {
 import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
-import { discoverSkills, type SkillInstruction } from '../repl/skills.js';
+import { type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
@@ -289,6 +289,8 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  /** Launch fallback, not an explicit user selection. */
+  defaultModel?: string;
   effort?: string;
   systemPromptFile?: string;
   toolRouting?: string;
@@ -2036,7 +2038,8 @@ async function runChatSession(
   let autoAttachedLatest = false;
   let contextBudgetAuto = !options.maxContextTokens;
   const initialBackend = options.backend || 'claude';
-  const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, options.model);
+  const initialModel = options.model ?? options.defaultModel;
+  const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, initialModel);
   const configuredMaxContextTokens = Number.parseInt(
     options.maxContextTokens ||
       String(defaultContextBudget(initialBackendTokenWindow, promptTransportFor(initialBackend))),
@@ -2069,7 +2072,7 @@ async function runChatSession(
 
   const runtime: ChatRuntime = {
     backend: initialBackend,
-    model: options.model,
+    model: initialModel,
     effort: options.effort,
     verbose: options.verbose ?? false,
     toolMode:
@@ -3066,11 +3069,12 @@ async function runChatSession(
   // Bind only after the canonical session/log has been selected. The CLI uses
   // the hosted reducer and rooted async instruction loader, never a second log.
   const controlsSessionId = runtime.sessionId;
+  const manualSkillHost = createSkillInstructionHost(process.cwd(), homedir());
   const sessionControls = createSessionControls({
     runtime,
     log: runtime.log,
     policy: toolPolicy,
-    skills: createSkillInstructionHost(process.cwd(), homedir()),
+    skills: manualSkillHost,
     get contextBudgetAuto() {
       return contextBudgetAuto;
     },
@@ -6223,7 +6227,13 @@ async function runChatSession(
         }
         case 'capabilities': {
           const servers = listConfiguredMcpServers(process.cwd());
-          const skills = discoverSkills(process.cwd());
+          let skills;
+          try {
+            skills = await manualSkillHost.discover();
+          } catch {
+            showInPanel(['Skill catalog unavailable or over its entry limit.']);
+            break;
+          }
           const filtered = filterSkillsByPolicy(skills, toolPolicy);
 
           const capLines: string[] = [
@@ -6326,7 +6336,13 @@ async function runChatSession(
           break;
         }
         case 'skills': {
-          const skills = discoverSkills(process.cwd());
+          let skills;
+          try {
+            skills = await manualSkillHost.discover();
+          } catch {
+            showInPanel(['Skill catalog unavailable or over its entry limit.']);
+            break;
+          }
           if (skills.length === 0) {
             showInPanel(['No local skills discovered.']);
             break;
@@ -6912,7 +6928,11 @@ export function registerChatCommand(program: Command): void {
       .description(description)
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
-      .option('-m, --model <model>', 'Model override for backend')
+      .option('-m, --model <model>', 'Explicit model selection (persisted for this session)')
+      .option(
+        '--default-model <model>',
+        'Launch fallback; a persisted session selection takes precedence'
+      )
       .option(
         '--effort <level>',
         'Reasoning effort for the backend (claude: low | medium | high | xhigh | max)'

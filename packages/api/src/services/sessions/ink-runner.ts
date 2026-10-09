@@ -372,7 +372,9 @@ export class InkRunner implements IRunner {
     }
 
     if (session.model) {
-      args.push('--model', session.model);
+      // Fleet/per-SB launch configuration is not a new user selection. The
+      // session's durable model choice must win, as it does in the hosted loop.
+      args.push('--default-model', session.model);
     }
     if (session.effort) {
       args.push('--effort', session.effort);
