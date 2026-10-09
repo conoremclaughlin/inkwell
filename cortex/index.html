@@ -875,7 +875,7 @@ function stockAnswer(st) {
 
 /* ---------- moving & storage: customer issue, quote, storage, crew ---------- */
 const MOVING_CONTEXT = /\b(mov(e|ed|es|ing|ers?)|relocat\w*|crew|truck|furniture|dresser|sofa|couch|piano|mattress|wardrobe|bookcase|armoire|boxes|packers?|packing|storage|warehouse|walk[- ]?through)\b/i;
-const ISSUE_WORDS = /\b(damage[ds]?|damaging|broken|broke|scratch(es|ed)?|dent(s|ed)?|claims?|complaint|complain(ed|ing)?|missing items?|lost items?|missing (a|my|our|the) \w+)\b/i;
+const ISSUE_WORDS = /\b(damage[ds]?|damaging|broken|broke|scratch(es|ed)?|dent(s|ed)?|claims?|complaint|complain(ed|ing)?|missing items?|lost items?|missing (a|my|our|the) \w+|lost (a|my|our|the|some|two|three|\d+) \w+|(got|was|were|been) lost (in|during) the move)\b/i;
 const STRONG_ISSUE = /\b(claims?|complaint|complain(ed|ing)?|scratch(es|ed)?|missing items?)\b/i;
 const QUOTE_WORDS = /\b(need a quote|get a quote|a quote for|quote for|request(ing)? a quote|free quote|estimates?|moving on|we('| a)?re moving|moving (from|to|out|in)\b|how much (would|will|does) it cost to move|price to move)\b/i;
 const STORAGE_WORDS = /\b(storage|climate[- ]controlled|units? (available|availability|sizes?|rental)|(a|your|any) units?\b|\d+\s*[x×]\s*\d+\b|store (my|our) (things|stuff|furniture|belongings))/i;
@@ -894,6 +894,8 @@ function movingKind(text) {
   // Dev: refunds, and partner or follow-up notes.
   if (REFUND_WORDS.test(t)) return "refund";
   if (PARTNER_WORDS.test(t) || (FOLLOWUP_WORDS.test(t) && !FOLLOWUP_BLOCK.test(t))) return "partner";
+  // Colleen: "we need movers" and "how much to move a 2-bedroom" are quote requests too.
+  if (/\b(need (some |a few |a couple of )?movers|looking for movers|how much)\b/i.test(t) && /\b(mov(e|ing|ers)|relocat\w*)\b/i.test(t)) return "quote";
   if (QUOTE_WORDS.test(t)) return "quote";
   if (STORAGE_WORDS.test(t)) return "storage";
   if (CREW_WORDS.test(t)) return "crew";
