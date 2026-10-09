@@ -487,8 +487,8 @@ function checkBid({ cost, sell, cont, risks = [], floor = 10, contFloor = 5 }) {
   if (marginD < 0) out.flags.push({ key: "loss", tag: "Loss", text: "Loss: the bid is " + usd(-marginD) + " below cost" });
   else if (marginP < floor) out.flags.push({ key: "thin", tag: "Thin margin", text: "Thin margin: " + pct(marginP) + " vs your " + pctPlain(floor) + " floor" });
   if (cont != null && Number.isFinite(cont) && r1(cont) < contFloor) out.flags.push({ key: "cont", tag: "Low contingency", text: "contingency below " + pctPlain(contFloor), long: "Contingency " + pctPlain(cont) + " is below your " + pctPlain(contFloor) + " floor" });
-  if (out.adjP != null && r1(out.adjP) < floor && !(marginD < 0) && !(marginP < floor)) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk-adjusted margin " + pct(out.adjP) + " is under your " + pctPlain(floor) + " floor" });
-  else if (out.adjP != null && r1(out.adjP) < floor) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk lines take it to " + pct(out.adjP) });
+  if (out.adjP != null && out.adjP < floor && !(marginD < 0) && !(marginP < floor)) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk-adjusted margin " + pct(out.adjP) + " is under your " + pctPlain(floor) + " floor" });
+  else if (out.adjP != null && out.adjP < floor) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk lines take it to " + pct(out.adjP) });
   if (out.flags.length) {
     const lead = out.flags[0];
     const rest = out.flags.slice(1).map(f => f.text);
