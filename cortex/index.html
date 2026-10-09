@@ -38,6 +38,9 @@
   --inventory-bg: #e2e8f1;
   --inventory-fg: #274472;
   --inventory-dot: #4b6fae;
+  --alert-bg: #fde6e0;
+  --alert-fg: #a01d0b;
+  --alert-line: #f0ad9c;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -54,6 +57,7 @@
     --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
     --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -68,6 +72,7 @@
   --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
   --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -206,6 +211,10 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.other::before { background: var(--other-dot); }
 .pill.inventory { background: var(--inventory-bg); color: var(--inventory-fg); }
 .pill.inventory::before { background: var(--inventory-dot); }
+.result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
+.result.alert .step { color: var(--alert-fg); font-weight: 600; }
+.alert-tag { display: inline-flex; align-items: center; font: 700 12px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--alert-bg); background: var(--alert-fg); border-radius: 999px; padding: 6px 10px; }
+.entry.alert-entry .entry-step { color: var(--alert-fg); }
 .when { font-size: 13px; color: var(--muted); }
 .when b { color: var(--ink-soft); font-weight: 600; }
 .step { font: 500 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
@@ -532,36 +541,46 @@ function firstMatch(text, patterns) {
   for (const re of patterns) { const m = text.match(re); if (m) return m; }
   return null;
 }
-const SEP = "\\s*(?:[:=]|is|of)?\\s*";
-const UNIT = "(months?|mos?|mo|weeks?|wks?|w|days?|d)";
+// The number never follows an identifier (SKU 4471, #1042, order 1042).
+const NUMC = "(?<![\\w.#])(?<!\\b(?:sku|order|inv|invoice|po)\\s*[:#]?\\s*)";
+const N = name => NUMC + "(?<" + name + ">-?(?:\\d[\\d,]*(?:\\.\\d+)?|\\.\\d+))(?![\\d.])";
+const SEP = "\\s*(?:[:=]|is|of|at|in)?\\s*(?:about|approx\\.?|approximately|around|roughly|~|≈)?\\s*";
+const RANGE = "(?:\\s*(?:-|–|to)\\s*" + N("n2") + ")?";
+const UNITW = "(?<u>[A-Za-z]+(?:\\s+(?:days?|weeks?|months?))?)";
+const LEAD_LABEL = "(?:supplier\\s+)?(?:lead[\\s-]?time|lead|lt|replenishment(?:\\s+time)?|restock(?:\\s+time)?|resupply(?:\\s+time)?|delivery time)";
 // Each field written label-then-number, or number-then-label.
 const FIELDS = {
   onHand: {
     after: [
-      new RegExp("\\b(?:qty\\s+)?on[\\s-]?hand\\b" + SEP + NUM, "id"),
-      new RegExp("\\b(?:in stock|stock on hand|stock)\\b" + SEP + NUM, "id")
+      new RegExp("\\b(?:qty\\s+|units?\\s+|stock\\s+)?on[\\s-]?hand\\b(?:\\s*\\((?:units?|qty)\\))?" + SEP + N("n"), "id"),
+      new RegExp("\\b(?:soh|oh)\\b\\s*[:=]?\\s*" + N("n"), "id"),
+      new RegExp("\\b(?:in stock|stock on hand|stock level|stock|inventory|available|avail\\.?)\\b" + SEP + N("n"), "id")
     ],
     before: [
-      new RegExp(NUM + "\\s*(?:units?|pcs|pieces|ea)?\\s*on[\\s-]?hand\\b", "id"),
-      new RegExp(NUM + "\\s*(?:units?|pcs|pieces)?\\s*in stock\\b", "id")
+      new RegExp(N("n") + "\\s*(?:units?|pcs|pieces|ea)?\\s*(?:on[\\s-]?hand|in stock|available|left|remaining)\\b", "id")
     ]
   },
   weekly: {
     after: [
-      new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate)\\b" + SEP + NUM, "id"),
-      new RegExp("\\b(?:sales|demand|sells|selling)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + NUM, "id"),
-      new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*" + NUM + "\\s*(?:units?)?\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b", "id")
+      new RegExp("\\b(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand|velocity|run[\\s-]?rate|units?)\\b(?:\\s*\\(units?\\))?" + SEP + N("n"), "id"),
+      new RegExp("\\b(?:avg\\.?|average)?\\s*(?:sales|demand|sells|selling|sold)\\s*(?:per|\\/|a)\\s*(?:wk|week)\\b" + SEP + N("n"), "id"),
+      new RegExp("\\b(?:avg|average)\\s*(?:\\/|per)\\s*(?:wk|week)\\b" + SEP + N("n"), "id"),
+      new RegExp("\\b(?:aws|weekly avg\\.?|weekly average|weekly)\\b\\s*[:=]\\s*" + N("n"), "id"),
+      new RegExp("\\b(?:sells|selling|sales of|demand of)\\s*(?:about|~|around)?\\s*" + N("n") + "\\s*(?:units?)?\\s*(?:per|\\/|a|each)\\s*(?:wk|week)\\b", "id")
     ],
     before: [
-      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "id"),
-      new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "id")
+      new RegExp(N("n") + "\\s*(?:units?)?\\s*(?:avg\\.?|average)?\\s*weekly\\s+(?:sales|demand)\\b", "id"),
+      new RegExp(N("n") + "\\s*(?:units?)?\\s*(?:sold|sales)?\\s*(?:\\/|per|a|each)\\s*(?:wk|week)\\b", "id")
     ]
   },
   lead: {
-    after: [new RegExp("\\blead[\\s-]?time\\b" + SEP + NUM + "(?:\\s*([A-Za-z]+))?", "id")],
+    after: [
+      new RegExp("\\b" + LEAD_LABEL + "\\b(?:\\s*\\((?<pu>months?|weeks?|wks?|days?)\\))?" + SEP + N("n") + RANGE + "(?:\\s*" + UNITW + ")?", "id"),
+      new RegExp("\\b(?:takes|arrives in|arriving in|ships in|restocks? in|back in)\\s*(?:about|~|around)?\\s*" + N("n") + RANGE + "\\s*" + UNITW, "id")
+    ],
     before: [
-      new RegExp(NUM + "\\s*" + UNIT + "\\s*(?:of\\s+)?lead[\\s-]?time\\b", "id"),
-      new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "id")
+      new RegExp(N("n") + RANGE + "[\\s-]*(?<u>months?|mos?|mo|weeks?|wks?|w|days?|d)\\s*(?:of\\s+)?" + LEAD_LABEL + "\\b", "id"),
+      new RegExp(N("n") + RANGE + "[\\s-]*(?<u>months?|weeks?|wks?|days?)\\s*to\\s+(?:restock|arrive|replenish|ship)\\b", "id")
     ]
   }
 };
@@ -580,11 +599,12 @@ function reading(t, numberFirst) {
   return out;
 }
 function clean(r) {
-  const at = Object.values(r).filter(Boolean).map(m => m.indices[1][0]);
+  const at = Object.values(r).filter(Boolean).map(m => m.indices.groups.n[0]);
   return new Set(at).size === at.length;
 }
 function same(a, b) {
-  return Object.keys(FIELDS).every(k => (a[k] ? a[k][1] : null) === (b[k] ? b[k][1] : null));
+  const v = m => (m ? m.groups.n + "|" + (m.groups.n2 || "") : null);
+  return Object.keys(FIELDS).every(k => v(a[k]) === v(b[k]));
 }
 function parseStock(text) {
   const t = text.replace(/\s+/g, " ");
@@ -597,18 +617,19 @@ function parseStock(text) {
   const skuM = t.match(/\bsku\s*[:#]?\s*([A-Za-z0-9][\w-]*)/i);
   const lower = t.toLowerCase();
   const words = ["on hand", "on-hand", "weekly sales", "lead time", "lead-time", "in stock", "sku", "reorder", "stock"].filter(w => lower.includes(w)).length;
-  const onHand = onHandM ? num(onHandM[1]) : null;
-  const weekly = weeklyM ? num(weeklyM[1]) : null;
+  const onHand = onHandM ? num(onHandM.groups.n) : null;
+  const weekly = weeklyM ? num(weeklyM.groups.n) : null;
   let lead = null, leadUnit = "weeks", leadWeeks = null;
   let badUnit = null;
   if (leadM) {
-    lead = num(leadM[1]);
-    const word = (leadM[2] || "").toLowerCase();
+    // A range ("2-3 weeks") is read at its longer end.
+    lead = num(leadM.groups.n2 || leadM.groups.n);
+    const word = (leadM.groups.pu || leadM.groups.u || "").toLowerCase();
     if (/^(weeks?|wks?|w)$/.test(word) || word === "") leadUnit = "weeks";
     else if (/^(days?|d)$/.test(word)) leadUnit = "days";
     else if (/^(months?|mos?|mo)$/.test(word)) leadUnit = "months";
     // No unit written, and the next word starts another field: weeks, as before.
-    else if (/^(on|avg|average|weekly|sku|sells|selling|in|stock|and|qty|sales)$/.test(word)) leadUnit = "weeks";
+    else if (/^(on|oh|soh|avg|average|weekly|sku|sells|selling|in|stock|and|qty|sales|units?|only|available)\b/.test(word)) leadUnit = "weeks";
     else badUnit = word;
     leadWeeks = leadUnit === "days" ? lead / 7 : leadUnit === "months" ? lead * 52 / 12 : lead;
   }
@@ -633,7 +654,9 @@ function plural(n, unit) {
   const one = unit.replace(/s$/, "");
   return n + " " + (n === 1 ? one : one + "s");
 }
-function fmt(n) { return Math.round(n).toLocaleString("en-US"); }
+function fmt(n) {
+  return n < 10 && Math.abs(n - Math.round(n)) >= 0.05 ? n.toFixed(1) : Math.round(n).toLocaleString("en-US");
+}
 
 function stockAnswer(st) {
   const facts = [];
@@ -658,7 +681,7 @@ function stockAnswer(st) {
     return {
       category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
       step: "Give the lead time in weeks, days or months",
-      why: "I can't use a lead time in “" + st.badUnit + "”.",
+      why: "I can't use a lead time in " + st.badUnit + ".",
       facts: facts.filter(f => f[0] !== "Lead time"), signals: []
     };
   }
@@ -668,6 +691,24 @@ function stockAnswer(st) {
       category: "inventory", label: "Inventory", urgency: "Needs a fix", confidence: null,
       step: "Check the " + negative.join(" and ") + ": it can't be below zero",
       why: "A stock check needs on hand, avg weekly sales and lead time of zero or more.",
+      facts, signals: []
+    };
+  }
+  if (st.lead == null && st.onHand != null && st.weekly != null && st.weekly > 0) {
+    const cover = st.onHand / st.weekly;
+    facts.push(["Covers", "~" + fmt(cover) + (cover === 1 ? " week" : " weeks") + " of sales"]);
+    if (cover < 1) {
+      return {
+        category: "inventory", label: "Inventory", urgency: "Now", confidence: null, stockout: true,
+        step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover even one week of sales (~" + st.weekly.toLocaleString("en-US") + " a week). Add the lead time to size the reorder.",
+        why: "On hand ÷ weekly sales: " + st.onHand.toLocaleString("en-US") + " ÷ " + st.weekly.toLocaleString("en-US") + " = ~" + fmt(cover) + " weeks.",
+        facts, signals: []
+      };
+    }
+    return {
+      category: "inventory", label: "Inventory", urgency: "Needs a number", confidence: null,
+      step: "Add the lead time to check this stock",
+      why: st.onHand.toLocaleString("en-US") + " on hand covers ~" + fmt(cover) + " weeks of sales. The lead time says whether that's enough.",
       facts, signals: []
     };
   }
@@ -690,7 +731,7 @@ function stockAnswer(st) {
     return {
       category: "inventory", label: "Inventory", urgency: "Now", confidence: null,
       step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover ~" + fmt(demand) + " demand over " + over + ". Reorder ~" + reorder.toLocaleString("en-US") + units + " now.",
-      why: st.weekly.toLocaleString("en-US") + " a week × " + inWeeks + " = ~" + fmt(demand) + ".",
+      why: "Weekly sales × lead time: " + st.weekly.toLocaleString("en-US") + " × " + inWeeks + " = ~" + fmt(demand) + ".",
       facts, signals: [], stockout: true
     };
   }
@@ -842,8 +883,11 @@ function renderResult(r, fresh) {
   const box = $("result");
   box.replaceChildren();
   box.dataset.state = "filled";
+  box.classList.toggle("alert", !!r.stockout);
+  if (r.stockout) box.setAttribute("role", "alert"); else box.removeAttribute("role");
   const top = el("div", { class: "result-top" },
     el("span", { class: "pill " + r.category, text: r.label }),
+    r.stockout ? el("span", { class: "alert-tag", text: "Stockout risk" }) : null,
     el("span", { class: "when" }, el("b", { text: r.urgency }), document.createTextNode(r.confidence ? " · " + r.confidence : ""))
   );
   box.append(top, el("p", { class: "step", text: r.step }), el("p", { class: "why", text: r.why }));
@@ -868,7 +912,7 @@ function renderLog(freshId) {
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
-    const li = el("li", { class: "entry" + (e.id === freshId ? " fresh" : "") }, timeEl, body);
+    const li = el("li", { class: "entry" + (e.stockout ? " alert-entry" : "") + (e.id === freshId ? " fresh" : "") }, timeEl, body);
     list.append(li);
   }
   $("emptyLog").hidden = log.length > 0;
@@ -906,7 +950,7 @@ function sortNow() {
   const entry = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     at: new Date().toISOString(),
-    category: r.category, label: r.label, step: r.step,
+    category: r.category, label: r.label, step: r.step, stockout: !!r.stockout,
     snippet: oneLine.length > 140 ? oneLine.slice(0, 139) + "…" : oneLine
   };
   log.unshift(entry);
