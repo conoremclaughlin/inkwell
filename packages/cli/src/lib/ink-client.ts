@@ -2,7 +2,7 @@ import { parseJsonRpcToolPayload, parseJsonRpcResponse } from '@inklabs/shared/r
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { getValidAccessToken } from '../auth/tokens.js';
+import { getValidAccessToken, hasSessionTokenBinding } from '../auth/tokens.js';
 
 import type { InkToolCallResult } from '@inklabs/shared/runtime';
 export type { InkToolCallResult } from '@inklabs/shared/runtime';
@@ -118,6 +118,11 @@ export class InkClient {
     if (result) {
       return result;
     }
+    if (hasSessionTokenBinding()) {
+      throw new Error(
+        'Session-scoped MCP authority is unavailable; re-admit the session before retrying'
+      );
+    }
 
     // callToolJsonRpc returns null in two cases: no access token, or the
     // server doesn't serve /mcp. Surface the auth case directly — falling
@@ -189,6 +194,7 @@ export class InkClient {
     if (authToken) {
       return authToken;
     }
+    if (hasSessionTokenBinding()) return null;
 
     // Secondary source: legacy config.json token fields.
     if (this.config.accessToken && !this.isTokenExpiredSkewed(this.config.tokenExpiresAt)) {
@@ -288,7 +294,11 @@ export class InkClient {
     // retry with the local auth.json token before giving up (mirrors the
     // fallback in hooks.ts callInkTool). Stale env tokens outlive their expiry
     // in long-running agent sessions and would otherwise 401 forever.
-    if (response.status === 401 && process.env.INK_ACCESS_TOKEN?.trim() === token) {
+    if (
+      response.status === 401 &&
+      !hasSessionTokenBinding() &&
+      process.env.INK_ACCESS_TOKEN?.trim() === token
+    ) {
       const localToken = await getValidAccessToken(this.baseUrl, { allowEnvToken: false });
       if (localToken && localToken !== token) {
         try {
@@ -300,7 +310,7 @@ export class InkClient {
       }
     }
 
-    if (response.status === 401 && this.config.refreshToken) {
+    if (response.status === 401 && !hasSessionTokenBinding() && this.config.refreshToken) {
       const refreshed = await this.refreshAccessToken();
       if (refreshed?.accessToken) {
         response = await call(refreshed.accessToken);
@@ -314,7 +324,9 @@ export class InkClient {
       if (response.status === 401 || response.status === 403) {
         throw new Error(
           `Inkwell MCP auth failed (${response.status}) at ${this.baseUrl}/mcp.\n` +
-            `Run: INK_SERVER_URL=${this.baseUrl} ink auth login\n` +
+            (hasSessionTokenBinding()
+              ? 'Re-admit the session to obtain a fresh scoped credential.\n'
+              : `Run: INK_SERVER_URL=${this.baseUrl} ink auth login\n`) +
             (bodySnippet ? `Server response: ${bodySnippet}` : '')
         );
       }

@@ -234,6 +234,11 @@ export interface SelectedCredential {
   token: string;
 }
 
+/** An injected session credential must never widen into the machine login. */
+export function hasSessionTokenBinding(): boolean {
+  return Boolean(process.env.INK_SESSION_ID?.trim() && process.env.INK_ACCESS_TOKEN?.trim());
+}
+
 /**
  * The credential-selection half of `getValidAccessToken`, without the network.
  *
@@ -253,15 +258,15 @@ export function selectCredential(options?: { allowEnvToken?: boolean }): Selecte
   const allowEnvToken = options?.allowEnvToken !== false;
   if (allowEnvToken) {
     const envToken = process.env.INK_ACCESS_TOKEN?.trim();
-    // Skip a provably-expired env token instead of returning it blindly.
-    // Long-lived agent sessions inherit INK_ACCESS_TOKEN injected at session
-    // start; once it expires, every spawned CLI command would 401 forever —
-    // even after a fresh `ink login` — because the env token short-circuits
-    // the auth.json path below.
+    // Skip provably expired env tokens. Unscoped commands may use the
+    // stored login below; session-bound commands must instead re-admit.
     if (envToken && !isJwtProvablyExpired(envToken)) {
       return { source: 'env', token: envToken };
     }
   }
+  // Expired/revoked session authority requires re-admission, not auth.json.
+  // This also fences explicit allowEnvToken:false fallback callers.
+  if (hasSessionTokenBinding()) return null;
   const auth = loadAuth();
   return auth ? { source: 'stored', token: auth.access_token } : null;
 }
