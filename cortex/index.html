@@ -1545,6 +1545,12 @@ function classify(text, now = new Date()) {
     step = unroast(step); why = unroast(why);
     for (const f of facts) if (f[0] === "To roast") f[0] = "Items";
   }
+  // Marisol: a tracking-and-update reply is order flow, so it is labelled Order, never Support.
+  if (topCat === "support" && /^Send tracking and an update/.test(step)) {
+    const num = orderNumber(clean);
+    return { category: "order", label: "Order", confidence, urgency, step: (num ? "Look up order " + num : "Look up the order") + ", send tracking and an update today",
+      why: "A customer asking where their order is.", facts, signals: top.hits };
+  }
   return { category: topCat, label, confidence, urgency, step, why, facts, signals: top.hits };
 }
 // SORTER-END
