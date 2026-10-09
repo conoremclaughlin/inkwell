@@ -1,12 +1,12 @@
 import type { SkillMcpServer } from './skill-mcp.js';
 
 /** Scan complete lines: whitespace must never backtrack across line boundaries. */
-function blockAfter(lines: string[], header: string, member: RegExp): string[] {
+function blockAfter(lines: string[], header: string, member: (line: string) => boolean): string[] {
   const start = lines.findIndex((line) => line.trim() === header);
   if (start === -1) return [];
   const result: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
-    if (!member.test(lines[i])) break;
+    if (!member(lines[i])) break;
     result.push(lines[i]);
   }
   return result;
@@ -34,16 +34,22 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
   while (first < lines.length && !lines[first].trim()) first++;
   const mcpLines: string[] = [];
   for (let i = first; i < lines.length && /^  .+/.test(lines[i]); i++) mcpLines.push(lines[i]);
-  const mcpBlock = mcpLines.join('\n');
+  const matchLine = (pattern: RegExp) => {
+    for (const line of mcpLines) {
+      const match = pattern.exec(line);
+      if (match) return match;
+    }
+    return null;
+  };
 
-  const name = mcpBlock.match(/^[ \t]*name:[ \t]*(.+)/m)?.[1]?.trim();
-  const command = mcpBlock.match(/^[ \t]*command:[ \t]*(.+)/m)?.[1]?.trim();
+  const name = matchLine(/^[ \t]*name:[ \t]*(.+)/)?.[1]?.trim();
+  const command = matchLine(/^[ \t]*command:[ \t]*(.+)/)?.[1]?.trim();
 
   if (!name || !command) return null;
 
   // Parse args — inline [a, b] or block-style list (- a\n- b)
   let args: string[] = [];
-  const argsInlineMatch = mcpBlock.match(/^[ \t]*args:[ \t]*\[([^\]]*)\]/m);
+  const argsInlineMatch = matchLine(/^[ \t]*args:[ \t]*\[([^\]]*)\]/);
   if (argsInlineMatch) {
     args = argsInlineMatch[1]
       .split(',')
@@ -51,7 +57,15 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
       .filter(Boolean);
   } else {
     // Block-style: args:\n    - value1\n    - value2
-    const argsBlock = blockAfter(mcpLines, 'args:', /^[ \t]+-[ \t]+.+$/);
+    const argsBlock = blockAfter(mcpLines, 'args:', (line) => {
+      const value = line.replace(/^[ \t]+/, '');
+      return (
+        value.length < line.length &&
+        value[0] === '-' &&
+        (value[1] === ' ' || value[1] === '\t') &&
+        !/[\r\u2028\u2029]/.test(value)
+      );
+    });
     if (argsBlock.length) {
       args = argsBlock
         .map((line) =>
@@ -66,7 +80,7 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
 
   // Parse env — inline {K: V} or block-style (K: V\n K2: V2)
   const env: Record<string, string> = {};
-  const envInlineMatch = mcpBlock.match(/^[ \t]*env:[ \t]*\{([^}]*)\}/m);
+  const envInlineMatch = matchLine(/^[ \t]*env:[ \t]*\{([^}]*)\}/);
   if (envInlineMatch && envInlineMatch[1].trim()) {
     envInlineMatch[1].split(',').forEach((pair) => {
       const [k, v] = pair.split(':').map((s) => s.trim().replace(/^["']|["']$/g, ''));
@@ -74,7 +88,7 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
     });
   } else {
     // Block-style: env:\n    KEY: VALUE
-    const envBlock = blockAfter(mcpLines, 'env:', /^[ \t]+\w+:.+$/);
+    const envBlock = blockAfter(mcpLines, 'env:', (line) => /^[ \t]+\w+:.+$/.test(line));
     if (envBlock.length) {
       envBlock.forEach((line) => {
         const colonIdx = line.indexOf(':');

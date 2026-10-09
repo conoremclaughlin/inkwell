@@ -43,6 +43,7 @@ export interface JwtPayload {
   scope: string;
   sbSlug?: string;
   identityId?: string;
+  sessionId?: string;
   exp: number;
   iat: number;
 }
@@ -234,9 +235,14 @@ export interface SelectedCredential {
   token: string;
 }
 
-/** An injected session credential must never widen into the machine login. */
+/** A token naming a session must never widen into the machine login. */
 export function hasSessionTokenBinding(): boolean {
-  return Boolean(process.env.INK_SESSION_ID?.trim() && process.env.INK_ACCESS_TOKEN?.trim());
+  const token = process.env.INK_ACCESS_TOKEN?.trim();
+  const sessionId = token ? decodeJwtPayload(token)?.sessionId : undefined;
+  // Interactive launchers also set INK_SESSION_ID beside a human OAuth token.
+  // Only the credential's own claim limits authority to that session. Decoding
+  // is not verification; the server still verifies the signature and scope.
+  return typeof sessionId === 'string' && sessionId.trim().length > 0;
 }
 
 /**

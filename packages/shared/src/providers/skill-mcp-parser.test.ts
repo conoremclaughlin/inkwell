@@ -62,4 +62,16 @@ describe('skill MCP line parser', () => {
     expect(parseSkillMcpContent('no frontmatter')).toBeNull();
     expect(parseSkillMcpContent('---\nmcp:\n  name: incomplete\n---')).toBeNull();
   });
+  it('does not backtrack within a tab-filled item followed by a Unicode line break', () => {
+    const input = skill(`  args:\n    -\t${'\t'.repeat(60_000)}\u2028!`);
+    const start = performance.now();
+    expect(parseSkillMcpContent(input)).toMatchObject({ args: [] });
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+  it('does not rescan malformed inline lists across subsequent properties', () => {
+    const input = skill('  args: [\n'.repeat(20_000));
+    const start = performance.now();
+    expect(parseSkillMcpContent(input)).toMatchObject({ args: [] });
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
 });
