@@ -434,6 +434,7 @@ footer {
             <button type="button" class="chip" data-example="billing">An invoice line</button>
             <button type="button" class="chip" data-example="inventory">A stock line</button>
             <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
+            <button type="button" class="chip" data-example="parentfee">A parent's fee message</button>
             <button type="button" class="chip" data-example="supply">A late supplier</button>
           </div>
           <div class="examples" role="group" aria-label="Fill in a moving and storage example">
@@ -512,6 +513,7 @@ const EXAMPLES = {
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
   crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
   supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
+  parentfee: "Good morning, I have paid Ada's school fees, KSh 15,000 through M-Pesa this morning. Ref QKL2M4N6P8.\nThank you,\nGrace",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
 };
 
@@ -963,38 +965,54 @@ function orderStatusAnswer(text) {
 /* ---------- fees: M-Pesa confirmations ---------- */
 function isMpesa(text) {
   // Real texts write "KSh 12,500", "Ksh2,500.00" or "KES 2,500", and "received from NAME" or "received Ksh2,500.00 from NAME".
-  return /\bconfirmed\b/i.test(text) && /\b(?:k\s?sh|kes)\.?\s*\d/i.test(text) && /\breceived\b[^\n]{0,40}?\bfrom\b/i.test(text);
+  return /\bconfirmed\b/i.test(text) && /\b(?:k\s?sh|kes)\.?\s*\d/i.test(text) && /\b(received\b[^\n]{0,40}?\bfrom|sent to|paid to)\b/i.test(text);
+}
+// A parent writing about fees they paid: "I've paid Ada's school fees, KSh 15,000 by M-Pesa, ref QKL2M4N6P8".
+function isParentFee(text) {
+  return /\b(school fees?|fees?|tuition|term \w+ fees?|fee balance)\b/i.test(text)
+    && /\b(paid|sent|payment|deposited|transferred|pay(ing)?)\b/i.test(text)
+    && (/\b(?:k\s?sh|kes)\.?\s*\d|\bm-?pesa\b|\bpaybill\b|\breceipt\b|\bconfirm\b/i.test(text) || /\b(?=[A-Z0-9]{10}\b)(?=[A-Z0-9]*\d)[A-Z0-9]*[A-Z][A-Z0-9]*\b/.test(text));
 }
 function feesAnswer(text) {
   const t = text.replace(/\s+/g, " ").trim();
   const first = (t.split(" ")[0] || "").replace(/[^A-Za-z0-9]/g, "");
-  const code = /^[A-Za-z0-9]{6,12}$/.test(first) && first.toLowerCase() !== "confirmed" ? first.toUpperCase() : null;
+  const refM = t.match(/\b(?:ref(?:erence)?|code|transaction(?: id| code)?|receipt(?: no\.?)?)\s*[:#]?\s*([A-Z0-9]{8,12})\b/i) || t.match(/\b(?=[A-Z0-9]{10}\b)(?=[A-Z0-9]*\d)[A-Z0-9]*[A-Z][A-Z0-9]*\b/);
+  const code = /^[A-Za-z0-9]{6,12}$/.test(first) && /\d/.test(first) && first.toLowerCase() !== "confirmed" ? first.toUpperCase() : (refM ? (refM[1] || refM[0]).toUpperCase() : null);
   const amountM = t.match(/\b(?:k\s?sh|kes)\.?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
   const amount = amountM ? amountM[1].replace(/,$/, "") : null;
   // The payer: the words after "received from", stopping at a phone number, "on", or punctuation.
   const payerM = t.match(/\breceived\s+(?:(?:k\s?sh|kes)\.?\s*[\d,]+(?:\.\d{1,2})?\s+)?from\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*)*?)(?=\s+(?:\+?\d|on\b)|\s*[.,;]|$)/i);
-  const payer = payerM ? payerM[1].trim() : null;
+  const sentM = t.match(/\b(?:sent|paid) to\s+([A-Za-z][A-Za-z'.&-]*(?:\s+[A-Za-z][A-Za-z'.&-]*)*?)(?=\s+(?:for account|account|\+?\d|on\b)|\s*[.,;]|$)/i);
+  const accountM = t.match(/\bfor account\s+([A-Za-z0-9-]+)/i) || t.match(/\baccount (?:no\.?|number)?\s*:?\s*([A-Za-z0-9-]{3,})/i);
+  const payer = payerM ? payerM[1].trim() : (sentM ? signOff(text) : null) || (!/\breceived\b/i.test(t) ? signOff(text) : null);
   const dateM = t.match(/\bon\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
   const timeM = t.match(/\bat\s+(\d{1,2}:\d{2})\s*([AaPp]\.?\s?[Mm]\.?)?/);
   const date = dateM ? dateM[1] : null;
   const time = timeM ? timeM[1] + (timeM[2] ? " " + timeM[2].replace(/[.\s]/g, "").toUpperCase() : "") : null;
   const when = [date, time].filter(Boolean).join(" ");
   let step = "Record in the fee register";
+  const wantsReceipt = !isMpesa(text) && !amount && /\b(receipt|confirm)\b/i.test(t);
   const detail = [];
-  if (amount) step += ": KSh " + amount + (payer ? " from " + payer : "");
-  else if (payer) step += ": payment from " + payer;
-  if (code) detail.push("ref " + code);
-  if (when) detail.push(when);
-  if (detail.length) step += (amount || payer ? ", " : ": ") + detail.join(", ");
+  if (wantsReceipt) {
+    step = "Find the payment in the fee register and send " + (payer || "the parent") + " a receipt";
+    if (code) step += " (ref " + code + ")";
+  } else {
+    if (amount) step += ": KSh " + amount + (payer ? " from " + payer : "");
+    else if (payer) step += ": payment from " + payer;
+    if (code) detail.push("ref " + code);
+    if (when) detail.push(when);
+    if (detail.length) step += (amount || payer ? ", " : ": ") + detail.join(", ");
+  }
   const facts = [];
   if (code) facts.push(["Ref", code]);
+  if (accountM) facts.push(["Account", accountM[1]]);
   if (amount) facts.push(["Amount", "KSh " + amount]);
   if (payer) facts.push(["From", payer]);
   if (date) facts.push(["Date", date]);
   if (time) facts.push(["Time", time]);
   return {
     category: "fees", label: "Fees", urgency: "Today", confidence: null, step,
-    why: "An M-Pesa payment confirmation.", facts, signals: [],
+    why: isMpesa(text) ? "An M-Pesa payment confirmation." : "A parent saying they've paid fees. Check it against the M-Pesa statement.", facts, signals: [],
     summary: [amount ? "KSh " + amount : null, payer].filter(Boolean).join(" · ")
   };
 }
@@ -1002,7 +1020,7 @@ function feesAnswer(text) {
 function classify(text, now = new Date()) {
   const clean = text.trim();
   if (!clean) return null;
-  if (isMpesa(clean)) return feesAnswer(clean);
+  if (isMpesa(clean) || isParentFee(clean)) return feesAnswer(clean);
   if (isOrderStatus(clean)) return orderStatusAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
