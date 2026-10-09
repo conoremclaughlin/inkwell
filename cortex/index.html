@@ -46,6 +46,7 @@
   --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
   --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
   --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
+  --supply-bg: #fbecd2; --supply-fg: #7a4a06; --supply-dot: #c98410;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -68,6 +69,7 @@
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+    --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -88,6 +90,7 @@
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+    --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -236,6 +239,8 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.issue::before { background: var(--issue-dot); }
 .pill.fees { background: var(--fees-bg); color: var(--fees-fg); }
 .pill.fees::before { background: var(--fees-dot); }
+.pill.supply { background: var(--supply-bg); color: var(--supply-fg); }
+.pill.supply::before { background: var(--supply-dot); }
 .entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
 .centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
@@ -429,6 +434,7 @@ footer {
             <button type="button" class="chip" data-example="billing">An invoice line</button>
             <button type="button" class="chip" data-example="inventory">A stock line</button>
             <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
+            <button type="button" class="chip" data-example="supply">A late supplier</button>
           </div>
           <div class="examples" role="group" aria-label="Fill in a moving and storage example">
             <span>Moving &amp; storage:</span>
@@ -505,6 +511,7 @@ const EXAMPLES = {
   issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
   crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
+  supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
 };
 
@@ -913,6 +920,46 @@ function movingAnswer(kind, text) {
     step: "Answer the crew today", why: "A question from a crew about a job.", facts, signals: [] };
 }
 
+/* ---------- supply risk: a supplier or shipment running late ---------- */
+const SUPPLY_WHO = /\b(suppliers?|vendors?|shipments?|deliver(y|ies)|wholesaler|manufacturer|freight|raw materials?|(wax|wick|jar|glass|fragrance|oil|fabric|packaging|bean|stock) (order|shipment|delivery))\b/i;
+const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]order(ed)?|running late|(is|are|be|will be|arriving) late|slipp(ed|ing)|postponed|out of stock until|won'?t (arrive|ship|be here) until|rescheduled)\b/i;
+function isSupplyRisk(text) {
+  // A customer asking where their own order is stays an order or support question.
+  if (/\b(my|our) (order|package|parcel)\b/i.test(text) && !/\bsupplier|vendor|wholesaler\b/i.test(text)) return false;
+  return SUPPLY_WHO.test(text) && SUPPLY_LATE.test(text);
+}
+function supplyAnswer(text) {
+  const facts = [];
+  const what = text.match(/\b((?:wax|wick|jar|glass|fragrance|oil|fabric|packaging|bean|stock)s?)\s+(?:order|shipment|delivery)\b/i);
+  if (what) facts.push(["Supply", what[1].toLowerCase()]);
+  const slip = text.match(/\b(\d+|one|two|three|four|five|six)\s+(days?|weeks?|months?)\b/i);
+  if (slip) facts.push(["Delay", slip[0]]);
+  const newDate = text.match(/\b(?:new (?:delivery |ship |arrival )?date(?: is)?|now (?:arriving|due|expected)(?: on)?|until)\s*:?\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i);
+  if (newDate) facts.push(["New date", newDate[1]]);
+  const from = signOff(text);
+  if (from) facts.push(["From", from]);
+  return { category: "supply", label: "Supply Risk", urgency: "Today", confidence: null,
+    step: "Check reorder point: reorder now or line up a backup supplier",
+    why: "A supplier or shipment is running late, so what's on hand has to last longer.", facts, signals: [] };
+}
+
+/* ---------- a customer asking where their order is ---------- */
+function isOrderStatus(text) {
+  const t = text.trim();
+  return t.length <= 160 && /\bwhere('?s| is)\s+(my|our)\s+order\b/i.test(t)
+    && !/\b(tracking|supposed to|late|delayed|refund|cancel|damaged|broken|wrong|missing|gift|complain)/i.test(t);
+}
+function orderStatusAnswer(text) {
+  const num = orderNumber(text);
+  const facts = [];
+  if (num) facts.push(["Order", num]);
+  const who = signOff(text);
+  if (who) facts.push(["Customer", who]);
+  return { category: "order", label: "Order", urgency: "Today", confidence: null,
+    step: num ? "Look up order " + num + " and reply with its status" : "Look up the order and reply with its status",
+    why: "A customer checking on their order.", facts, signals: [] };
+}
+
 /* ---------- fees: M-Pesa confirmations ---------- */
 function isMpesa(text) {
   // Real texts write "KSh 12,500", "Ksh2,500.00" or "KES 2,500", and "received from NAME" or "received Ksh2,500.00 from NAME".
@@ -956,6 +1003,8 @@ function classify(text, now = new Date()) {
   const clean = text.trim();
   if (!clean) return null;
   if (isMpesa(clean)) return feesAnswer(clean);
+  if (isOrderStatus(clean)) return orderStatusAnswer(clean);
+  if (isSupplyRisk(clean)) return supplyAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
   const kind = movingKind(clean);
@@ -1148,7 +1197,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1160,6 +1209,7 @@ function renderLog(freshId) {
   if (counts.storage) parts.push(counts.storage + " storage");
   if (counts.crew) parts.push(counts.crew + " crew");
   if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
+  if (counts.supply) parts.push(counts.supply + " supply risk");
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
@@ -1368,6 +1418,7 @@ function react(r) {
   if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
+  if (r.category === "supply") { say("A supplier is running late. Check whether what's on hand lasts, or line up a backup."); mood(0, 0.6); return; }
   if (r.category === "fees") { say("Payment received" + (r.summary ? ": " + r.summary : "") + ". Record it in the fee register."); mood(1, 0); hop(); return; }
   const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
   say(lead + " Next step: " + r.step + ".");
