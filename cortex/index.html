@@ -42,6 +42,8 @@
   --alert-fg: #a01d0b;
   --alert-line: #f0ad9c;
   --quote-bg: #e6efe0; --quote-fg: #2f5d1e; --quote-dot: #5c9a3c;
+  --refund-bg: #fbe9d7; --refund-fg: #8a4a12; --refund-dot: #d9822b;
+  --partner-bg: #e2ecf3; --partner-fg: #224a63; --partner-dot: #4a86ad;
   --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
   --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
   --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
@@ -65,6 +67,8 @@
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
     --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
     --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --refund-bg: #3b2614; --refund-fg: #f4c08f; --refund-dot: #e39a4f;
+    --partner-bg: #1a2c38; --partner-fg: #aacde3; --partner-dot: #6aa6cc;
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
@@ -86,6 +90,8 @@
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
     --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
     --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --refund-bg: #3b2614; --refund-fg: #f4c08f; --refund-dot: #e39a4f;
+    --partner-bg: #1a2c38; --partner-fg: #aacde3; --partner-dot: #6aa6cc;
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
@@ -231,6 +237,10 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.inventory::before { background: var(--inventory-dot); }
 .pill.quote { background: var(--quote-bg); color: var(--quote-fg); }
 .pill.quote::before { background: var(--quote-dot); }
+.pill.refund { background: var(--refund-bg); color: var(--refund-fg); }
+.pill.refund::before { background: var(--refund-dot); }
+.pill.partner { background: var(--partner-bg); color: var(--partner-fg); }
+.pill.partner::before { background: var(--partner-dot); }
 .pill.storage { background: var(--storage-bg); color: var(--storage-fg); }
 .pill.storage::before { background: var(--storage-dot); }
 .pill.crew { background: var(--crew-bg); color: var(--crew-fg); }
@@ -436,6 +446,8 @@ footer {
             <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
             <button type="button" class="chip" data-example="parentfee">A parent's fee message</button>
             <button type="button" class="chip" data-example="supply">A late supplier</button>
+            <button type="button" class="chip" data-example="refund">A refund request</button>
+            <button type="button" class="chip" data-example="partner">A partner follow-up</button>
           </div>
           <div class="examples" role="group" aria-label="Fill in a moving and storage example">
             <span>Moving &amp; storage:</span>
@@ -509,6 +521,8 @@ const EXAMPLES = {
   billing: "INVOICE INV-2291 | Harbor Green Imports | 10 bags Colombia Huila, 69 kg each | Total due $1,842.50 | Due Oct 30, 2026 | Net 30",
   inventory: "SKU 4471 Holiday Throw Blanket, on hand: 120, avg weekly sales: 85, lead time: 3 weeks",
   quote: "Hi, we need a quote for a 3-bedroom move from Albany to Saratoga Springs. We're moving on June 14. Could someone call me back?\nThanks,\nMaria",
+  refund: "Hi, I'd like a refund for last month, the product didn't work for us. Thanks, Lee",
+  partner: "Following up on our partnership intro from last week. Could we find 30 minutes? - Sam",
   issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
   crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
@@ -869,10 +883,17 @@ const CREW_WORDS = /\b(crew|crew lead|foreman|dispatch|movers)\b/i;
 const INVOICE_WORDS = /\binvoice\b|\binv[-\s#]?\d+|\b(amount due|balance due|total due|net\s?\d{2})\b/i;
 const FURNITURE = ["dresser", "mirror", "sofa", "couch", "piano", "table", "chair", "bed", "mattress", "wardrobe", "bookcase", "armoire", "desk", "tv", "lamp", "cabinet", "boxes"];
 
+const REFUND_WORDS = /\b(refunds?|refunded|money back|charge ?backs?|return (it|this|them|these|my|the|an?|our)\b|returning (it|this|them|my|the)|send (it|this|them) back)/i;
+const PARTNER_WORDS = /\b(partner|partners|partnership|partnerships|intro|introduction|introducing)\b/i;
+const FOLLOWUP_WORDS = /\b(following up|follow(ing)?[- ]up|circle back|circling back)\b/i;
+const FOLLOWUP_BLOCK = /(#\s?\d{3,}|\border\s*(#|no\.?|number)?\s*\d{3,}|\b(refund|invoice|damaged|late|hasn'?t arrived|has not arrived|never arrived)\b)/i;
 function movingKind(text) {
   const t = text;
   if (ISSUE_WORDS.test(t) && (MOVING_CONTEXT.test(t) || STRONG_ISSUE.test(t))) return "issue";
   if (INVOICE_WORDS.test(t)) return null;
+  // Dev: refunds, and partner or follow-up notes.
+  if (REFUND_WORDS.test(t)) return "refund";
+  if (PARTNER_WORDS.test(t) || (FOLLOWUP_WORDS.test(t) && !FOLLOWUP_BLOCK.test(t))) return "partner";
   if (QUOTE_WORDS.test(t)) return "quote";
   if (STORAGE_WORDS.test(t)) return "storage";
   if (CREW_WORDS.test(t)) return "crew";
@@ -903,6 +924,22 @@ function movingAnswer(kind, text) {
     if (when) facts.push(["Move date", when[1]]);
     return { category: "quote", label: "Quote", urgency: "Today", confidence: null,
       step: "New quote: call back today", why: "Someone wants a price for a move.", facts, signals: [] };
+  }
+  if (kind === "refund") {
+    if (who) facts.push(["Customer", who]);
+    const num = orderNumber(text);
+    if (num) facts.push(["About order", num]);
+    const span = text.match(/\b(last|this) (month|week|year)\b/i);
+    if (span) facts.push(["Period", span[0]]);
+    return { category: "refund", label: "Refund", urgency: "Today", confidence: null,
+      step: "Issue refund", why: "They're asking for their money back.", facts, signals: [] };
+  }
+  if (kind === "partner") {
+    if (who) facts.push(["From", who]);
+    const when = text.match(/\b(last|next|this) (week|month)\b/i);
+    if (when) facts.push(["Mentioned", when[0]]);
+    return { category: "partner", label: "Partner / Follow-up", urgency: "This week", confidence: null,
+      step: "Schedule follow-up", why: "A partner or follow-up note.", facts, signals: [] };
   }
   if (kind === "storage") {
     if (who) facts.push(["Customer", who]);
@@ -1223,6 +1260,8 @@ function renderLog(freshId) {
   if (counts.billing) parts.push(counts.billing + " billing");
   if (counts.inventory) parts.push(counts.inventory + " inventory");
   if (counts.quote) parts.push(counts.quote + (counts.quote === 1 ? " quote" : " quotes"));
+  if (counts.refund) parts.push(counts.refund + (counts.refund === 1 ? " refund" : " refunds"));
+  if (counts.partner) parts.push(counts.partner + (counts.partner === 1 ? " follow-up" : " follow-ups"));
   if (counts.issue) parts.push(counts.issue + (counts.issue === 1 ? " customer issue" : " customer issues"));
   if (counts.storage) parts.push(counts.storage + " storage");
   if (counts.crew) parts.push(counts.crew + " crew");
@@ -1412,6 +1451,8 @@ function hint(text) {
     inventory: "A stock line. Sort it and I'll check it against demand.",
     issue: "That sounds like a customer issue. Sort it and I'll flag it urgent.",
     quote: "New business! Sort it and I'll log the quote request.",
+    refund: "Someone wants their money back. Sort it and I'll log the refund.",
+    partner: "A partner or follow-up note. Sort it and I'll log it.",
     storage: "A storage question. Sort it and I'll note what they need.",
     crew: "The crew has a question. Sort it and I'll log it.",
     fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
@@ -1435,6 +1476,8 @@ function react(r) {
   if (r.category === "other") { say("I'm not sure about this one. Best to read it yourself."); mood(0, 0.8); return; }
   if (r.category === "issue") { say("Urgent: a customer issue. I've pinned it to the top of the log until it's handled."); mood(0, 0.9, 4200); return; }
   if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
+  if (r.category === "refund") { say("A refund request. Issue the refund."); mood(0.2, 0.2); return; }
+  if (r.category === "partner") { say("A follow-up to schedule."); mood(0.6, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
   if (r.category === "supply") { say("A supplier is running late. Check whether what's on hand lasts, or line up a backup."); mood(0, 0.6); return; }
