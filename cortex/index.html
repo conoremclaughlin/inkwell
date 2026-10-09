@@ -983,7 +983,7 @@ const SUPPLY_WHO = /\b(suppliers?|vendors?|shipments?|deliver(y|ies)|wholesaler|
 const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]order(ed)?|running late|(is|are|be|will be|arriving) late|slipp(ed|ing)|postponed|out of stock until|won'?t (arrive|ship|be here) until|rescheduled|(stuck|held( up)?) (in|at) customs|customs hold|short[- ]?shipp?(ed|ing)?|short shipment|partial shipment|only \d[\d,]*\s*\w*\s+(of|out of) (the )?\d[\d,]*|can'?t (fill|fulfill|ship|deliver)\b[^.\n]{0,30}\buntil|lead times?\b[^.\n]{0,30}\b(is now|now|increased|went up|longer|extended|doubled)|eta\b[^.\n]{0,12}\b(moved|pushed|slipped|changed))\b/i;
 function isSupplyRisk(text) {
   // A customer asking where their own order is stays an order or support question.
-  if (/\b(my|our) (order|package|parcel)\b/i.test(text) && !/\bsupplier|vendor|wholesaler\b/i.test(text)) return false;
+  if (/\b(my|our) (order|package|parcel)\b|\bmy\b|\bI ordered\b/i.test(text) && !/\b(suppliers?|vendors?|wholesalers?|manufacturer|PO|purchase orders?)\b/i.test(text)) return false;
   return SUPPLY_WHO.test(text) && SUPPLY_LATE.test(text);
 }
 function supplyAnswer(text) {
@@ -1004,8 +1004,10 @@ function supplyAnswer(text) {
 /* ---------- a customer asking where their order is ---------- */
 function isOrderStatus(text) {
   const t = text.trim();
-  return t.length <= 160 && /\bwhere('?s| is)\s+(my|our)\s+order\b/i.test(t)
-    && !/\b(tracking|supposed to|late|delayed|refund|cancel|damaged|broken|wrong|missing|gift|complain)/i.test(t);
+  // Marisol: a follow-up on an order is order flow, not a support reply. Complaints stay Support.
+  const asks = /\bwhere('?s| is)\s+(my|our|the)\s+order\b|\bfollow(ing)?[- ]?up on (my |our |the )?order\b|\b(status|update|news)\s+(on|of|for|about)\s+(my |our |the )?order\b|\b(has|did|is)\s+(my |our |the )?order\b[^.?!\n]{0,20}\b(ship|shipped|go out|gone out|been sent|been packed|left)\b|\bwhen will (my |our |the )?order\b[^.?!\n]{0,12}\b(ship|go out|be sent)\b|\border\s*#?\s*\d{3,}[^.?!\n]{0,30}\b(ship(ped)? yet|gone out|status)\b/i;
+  return t.length <= 400 && asks.test(t)
+    && !/\b(tracking|supposed to|refund|cancel|damaged|broken|wrong|missing|complain|never arrived|hasn'?t arrived)/i.test(t);
 }
 function orderStatusAnswer(text) {
   const num = orderNumber(text);
@@ -1025,8 +1027,11 @@ function isMpesa(text) {
 }
 // A parent writing about fees they paid: "I've paid Ada's school fees, KSh 15,000 by M-Pesa, ref QKL2M4N6P8".
 function isParentFee(text) {
-  return /\b(school fees?|fees?|tuition|term \w+ fees?|fee balance)\b/i.test(text)
-    && /\b(paid|sent|payment|deposited|transferred|pay(ing)?)\b/i.test(text)
+  if (/\b(invoice|inv[-\s#]?\d|suppliers?|vendors?|freight|customs|shipping|clearance)\b/i.test(text)) return false;
+  const school = /\b(school|tuition|term \w+ fees?|fee balance|pupil|student|learner|class|grade)\b/i.test(text)
+    || (/\bfees?\b/i.test(text) && /\b(son|daughter|child|children|kids?|[A-Z][a-z]+'s)\b/.test(text));
+  return school
+    && /\b(paid|sent|deposited|transferred|made (a |the )?payment|payment (was |has been )?(made|sent|done))\b/i.test(text)
     && (/\b(?:k\s?sh|kes)\.?\s*\d|\bm-?pesa\b|\bpaybill\b|\breceipt\b|\bconfirm\b/i.test(text) || /\b(?=[A-Z0-9]{10}\b)(?=[A-Z0-9]*\d)[A-Z0-9]*[A-Z][A-Z0-9]*\b/.test(text));
 }
 function feesAnswer(text) {
@@ -1047,10 +1052,10 @@ function feesAnswer(text) {
   const time = timeM ? timeM[1] + (timeM[2] ? " " + timeM[2].replace(/[.\s]/g, "").toUpperCase() : "") : null;
   const when = [date, time].filter(Boolean).join(" ");
   let step = "Record in the fee register";
-  const wantsReceipt = !isMpesa(text) && !amount && /\b(receipt|confirm)\b/i.test(t);
+  const wantsReceipt = !isMpesa(text) && /\b(receipt|confirm)\b/i.test(t);
   const detail = [];
   if (wantsReceipt) {
-    step = "Find the payment in the fee register and send " + (payer || "the parent") + " a receipt";
+    step = "Find the " + (amount ? "KSh " + amount + " " : "") + "payment in the fee register and send " + (payer || "the parent") + " a receipt";
     if (code) step += " (ref " + code + ")";
   } else {
     if (amount) step += ": KSh " + amount + (payer ? " from " + payer : "");
