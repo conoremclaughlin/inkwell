@@ -22,6 +22,7 @@ export interface SessionControlsPorts {
     sessionId: string;
     activeSkills?: readonly SessionPromptSkill[];
     providerRecoveryDisabled?: boolean;
+    appliedControlId?: string;
   };
   log: Pick<SessionLog, 'append' | 'flush'>;
   policy: ToolPolicyState;
@@ -73,8 +74,9 @@ export function createSessionControls(ports: SessionControlsPorts) {
     ports.assertCurrent();
     if (poisoned) throw new Error('Session control persistence is uncertain');
   }
-  function install(next: SessionSelection, skills: SkillInstruction[]) {
+  function install(next: SessionSelection, skills: SkillInstruction[], controlId: string) {
     selection = next;
+    ports.runtime.appliedControlId = controlId;
     manual = skills;
     ports.runtime.providerRecoveryDisabled = skills.length !== next.skills.length;
     // Compute with the shared selector, but only assign after the durable barrier.
@@ -119,7 +121,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
       poisoned = true;
       throw error;
     }
-    install(record.selection, skills);
+    install(record.selection, skills, record.controlId);
     ports.invalidateProvider(); // even no-op settings must establish a fresh native baseline
     return eid;
   }
@@ -142,12 +144,14 @@ export function createSessionControls(ports: SessionControlsPorts) {
         notice('Skipped an invalid or unsupported session control record.');
       }
     },
-    async restore(signal?: AbortSignal) {
+    async restore(signal?: AbortSignal, providerControlId?: string) {
       current(signal);
       // A later native marker could have been seeded under an unfamiliar record.
       // Keep the last known selection, but never resume that opaque baseline.
-      if (skippedRecord) ports.invalidateProvider();
-      if (!recovered) return;
+      if (!recovered) {
+        if (skippedRecord) ports.invalidateProvider();
+        return;
+      }
       const backendChanged = recovered.backend !== ports.runtime.backend;
       const loaded: SkillInstruction[] = [];
       const retained: SessionSelection['skills'] = [];
@@ -200,9 +204,14 @@ export function createSessionControls(ports: SessionControlsPorts) {
           backendChanged ? 'replay_backend_changed' : 'replay_skill_removed'
         );
       else {
-        install(next, allowed);
+        install(next, allowed, recovered.controlId);
         // Omitting unavailable instructions requires a fresh provider envelope too.
-        if (allowed.length !== skills.length) ports.invalidateProvider();
+        if (
+          skippedRecord ||
+          providerControlId !== recovered.controlId ||
+          allowed.length !== skills.length
+        )
+          ports.invalidateProvider();
       }
     },
     enqueue(value: SessionControlRequest): SessionControlReceipt {

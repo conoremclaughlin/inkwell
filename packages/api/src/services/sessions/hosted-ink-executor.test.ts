@@ -439,6 +439,32 @@ describe('hosted live controls through the admitted route and real composition',
       'Skipped an invalid or unsupported session control record.'
     );
   });
+  it('does not adopt a CLI seed that never applied the hosted selection', async () => {
+    const h = await fixture(['reseeding', 'resuming']);
+    const c = controlsHarness(h);
+    h.events.push(
+      {
+        eid: 1,
+        type: 'session_control',
+        version: 1,
+        controlId: 'selected',
+        backend: 'claude',
+        selection: { model: 'persisted-model', skills: [] },
+      },
+      // A CLI without durable control support does not stamp an applied control id.
+      { eid: 2, type: 'backend_session', id: 'cli-unaware', routing: 'local' }
+    );
+    expect((await c.runner.run('hosted again', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[0][0].backendSessionId).toBeUndefined();
+    expect(h.start.mock.calls[0][0].model).toBe('persisted-model');
+    expect(h.events.filter((e) => e.type === 'backend_session').at(-1)).toMatchObject({
+      controlId: 'selected',
+    });
+    const seed = h.start.mock.calls[0][0].backendSessionSeedId;
+    h.config.turnEpoch = 'epoch-next';
+    expect((await c.runner.run('matching host', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[1][0].backendSessionId).toBe(seed);
+  });
   it('applies before the next outer turn, not during an inner provider turn', async () => {
     const h = await fixture(['next turn']);
     h.config.maxTurns = 2;

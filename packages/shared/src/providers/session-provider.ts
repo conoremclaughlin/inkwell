@@ -40,6 +40,8 @@ export interface SessionProviderRuntime extends SessionPromptState {
   backendIdleTimeoutMs?: number;
   /** This owner can continue, but its temporarily incomplete envelope cannot survive reattach. */
   providerRecoveryDisabled?: boolean;
+  /** Durable selection actually installed by this composer, not merely present in its log. */
+  appliedControlId?: string;
 }
 export interface SessionProviderPorts {
   runtime: SessionProviderRuntime;
@@ -145,6 +147,7 @@ export function createSessionProviderTurn(
     // seeded under the other instruction envelope.
     ports.append({
       type: 'backend_session',
+      ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
       ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
       id: seedProviderSessionId,
       routing: runtime.toolRouting,
@@ -355,6 +358,7 @@ export function createSessionProviderTurn(
         state.shape = currentEnvelopeShape;
         ports.append({
           type: 'backend_session',
+          ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
           ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
           id: reseedId,
           routing: runtime.toolRouting,
@@ -437,6 +441,7 @@ export function createSessionProviderTurn(
       state.shape = envelopeShapeKey(runtime);
       ports.append({
         type: 'backend_session',
+        ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
         ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
         id: decision.id,
         routing: runtime.toolRouting,

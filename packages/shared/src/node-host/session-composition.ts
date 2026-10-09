@@ -192,7 +192,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     const recovered = recovery.session;
     if (recovered?.routing === runtime.toolRouting) context.provider.id = recovered.id;
   }
-  await controls.restore(signal);
+  await controls.restore(signal, recovery.session?.controlId);
   const recoveredModel = recovery.model;
   if (recoveredModel && !runtime.model) {
     runtime.detectedModel = recoveredModel;

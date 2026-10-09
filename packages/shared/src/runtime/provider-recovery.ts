@@ -1,5 +1,7 @@
 export interface RecoveredBackendSession {
   id: string;
+  /** Which durable selection the writer actually installed before this seed. */
+  controlId?: string;
   /**
    * Tool routing the session's envelope was seeded under. Absent on legacy
    * markers written before routing was persisted — treated as a mismatch by
@@ -66,6 +68,7 @@ export function createProviderRecovery(backend: string) {
             ? undefined
             : {
                 id: event.id,
+                ...(typeof event.controlId === 'string' ? { controlId: event.controlId } : {}),
                 ...(event.routing === 'backend' || event.routing === 'local'
                   ? { routing: event.routing }
                   : {}),

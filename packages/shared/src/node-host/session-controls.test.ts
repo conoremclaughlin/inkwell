@@ -411,3 +411,14 @@ it('does not recover a seed with temporarily missing instructions or an old prov
   recovery.push({ ...record({ skills: [] }), backend: 'codex' });
   expect(recovery.model).toBeUndefined();
 });
+
+it.each([undefined, 'different', 'earlier'])(
+  'matches the native seed selection marker %s before recovery',
+  async (controlId) => {
+    const h = fixture();
+    h.control.replay(record({ model: 'selected', skills: [] }));
+    await h.control.restore(undefined, controlId);
+    expect(h.invalidateProvider).toHaveBeenCalledTimes(controlId === 'earlier' ? 0 : 1);
+    expect(h.runtime).toHaveProperty('appliedControlId', 'earlier');
+  }
+);
