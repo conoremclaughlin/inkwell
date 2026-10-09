@@ -256,6 +256,7 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.supply::before { background: var(--supply-dot); }
 .pill.pending { background: var(--pending-bg); color: var(--pending-fg); }
 .pill.pending::before { background: var(--pending-dot); }
+.flag-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
 .centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
@@ -451,6 +452,7 @@ footer {
             <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
             <button type="button" class="chip" data-example="parentfee">A parent's fee message</button>
             <button type="button" class="chip" data-example="supply">A late supplier</button>
+            <button type="button" class="chip" data-example="bundle">A bundle quote</button>
             <button type="button" class="chip" data-example="refund">A refund request</button>
             <button type="button" class="chip" data-example="partner">A partner follow-up</button>
           </div>
@@ -538,6 +540,7 @@ const EXAMPLES = {
   crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
   boleto: "Oi, meu boleto venceu ontem e não consegui pagar. CPF 123.456.789-09, tel (11) 91234-5678. Minha caixa ainda vai sair?",
   entrega: "Oi, quando chega minha caixa? O rastreio não atualiza há 3 dias.",
+  bundle: "1Gbps fibre SGD 2,400/mo x 36; install SGD 6,000 one-time; managed router SGD 300/mo; discount 12%",
   supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
   parentfee: "Good morning, I have paid Ada's school fees, KSh 15,000 through M-Pesa this morning. Ref QKL2M4N6P8.\nThank you,\nGrace",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
@@ -979,6 +982,125 @@ function movingAnswer(kind, text) {
     step: "Answer the crew today", why: "A question from a crew about a job.", facts, signals: [] };
 }
 
+/* ---------- bundle quote check: recurring (MRC) vs one-time (NRC), TCV, discount approval ---------- */
+const QUOTE_CUR = /\b(SGD|USD|MYR|HKD|AUD|EUR|GBP)\b|S\$|US\$|\$/i;
+const QUOTE_AMT = /(?:\b(SGD|USD|MYR|HKD|AUD|EUR|GBP)\s*|(S\$|US\$|\$)\s*)(\d[\d,]*(?:\.\d+)?)(\s*[kK]\b)?/;
+const RECURRING = /\/\s*(mo|mth|month)\b|\bper\s+month\b|\bmonthly\b|\ba month\b|\bMRC\b|\bp\.?m\.?\b|\brecurring\b/i;
+const ONE_TIME = /\bone[- ]?time\b|\bone[- ]?off\b|\bonce\b|\bNRC\b|\bnon[- ]recurring\b|\bupfront\b/i;
+const ONE_TIME_ITEM = /\b(install(ation)?|set[- ]?up|activation|commissioning|survey|onboarding|migration|cabling|wiring|connection fee|site works?)\b/i;
+const RECURRING_ITEM = /\b(fibre|fiber|broadband|bandwidth|internet|circuit|dia|mpls|sd-?wan|managed|router|firewall|licen[cs]es?|subscription|support|monitoring|lines?|seats?|sip|voice|hosting|cloud|wifi|wi-fi|4g|5g|lte|backup)\b/i;
+const money2 = (n, cur) => (cur ? cur + " " : "") + n.toLocaleString("en-US", { maximumFractionDigits: 2, minimumFractionDigits: Number.isInteger(Math.round(n * 100) / 100) ? 0 : 2 });
+
+function isBundleQuote(text) {
+  const items = quoteItems(text);
+  const priced = items.filter(i => i.amount != null);
+  if (priced.length < 1) return false;
+  const hasRec = priced.some(i => i.recurring);
+  const hasOne = priced.some(i => i.oneTime) || ONE_TIME.test(text);
+  return hasRec && (hasOne || priced.length >= 2 || /\bdiscount\b|\bterm\b|\bmonths?\b|\bx\s*\d{2}\b/i.test(text));
+}
+
+function quoteItems(text) {
+  const parts = text.split(/[;\n|]+|,\s+(?=[^,]*?(?:SGD|USD|S\$|\$))/i).map(x => x.trim()).filter(Boolean);
+  return parts.map(raw => {
+    const m = raw.match(QUOTE_AMT);
+    const item = { raw, amount: null, recurring: false, oneTime: false, months: null, qty: 1, stated: null, name: raw };
+    // A stated total or a discount line is checked against the items, never added to them.
+    if (!m || /^\s*(?:(?:MRC|NRC|one[- ]?time|monthly|grand|contract)\s+total|total\b|TCV\b|total contract value|discount\b)/i.test(raw)) return item;
+    item.cur = (m[1] || m[2] || "").toUpperCase();
+    item.amount = Number(m[3].replace(/,/g, "")) * (m[4] ? 1000 : 1);
+    const after = raw.slice(m.index + m[0].length);
+    item.recurring = RECURRING.test(raw);
+    item.oneTime = ONE_TIME.test(raw);
+    const q = raw.match(/^\s*(\d{1,4})\s*(?:x|×)\s+/i);
+    if (q) item.qty = Number(q[1]);
+    const mo = after.match(/(?:x|×)\s*(\d{1,3})\b(?!\s*(?:units?|qty|pcs))/i) || raw.match(/\b(\d{1,3})[- ]?(?:months?|mths?|mos)\b/i) || raw.match(/\bterm\s*:?\s*(\d{1,3})\b/i);
+    if (mo && (item.recurring || /months?|term/i.test(mo[0]))) item.months = Number(mo[1]);
+    const eq = after.match(/=\s*(?:SGD|USD|S\$|US\$|\$)?\s*(\d[\d,]*(?:\.\d+)?)/i);
+    if (eq) item.stated = Number(eq[1].replace(/,/g, ""));
+    item.name = raw.slice(0, m.index).replace(/^\s*\d{1,4}\s*(?:x|×)\s+/i, "").replace(/[:\-–—@]\s*$/, "").trim() || raw.slice(m.index + m[0].length).replace(/^[\s/]*(mo|month)\b/i, "").trim();
+    return item;
+  });
+}
+
+function bundleQuoteAnswer(text) {
+  const items = quoteItems(text).filter(i => i.amount != null);
+  const cur = (items.find(i => i.cur) || {}).cur || "";
+  const flags = [];
+  const mismatched = [];
+  for (const i of items) {
+    // The words name one kind of charge, the price marks it as the other.
+    if (i.recurring && !i.oneTime && ONE_TIME_ITEM.test(i.name)) mismatched.push(i.name + " is priced per month but reads as a one-time charge");
+    else if (i.oneTime && !i.recurring && RECURRING_ITEM.test(i.name) && !ONE_TIME_ITEM.test(i.name)) mismatched.push(i.name + " is priced one-time but reads as a monthly service");
+    else if (!i.recurring && !i.oneTime && !ONE_TIME_ITEM.test(i.name)) mismatched.push(i.name + " has no /mo or one-time marker");
+  }
+  const rec = items.filter(i => i.recurring && !i.oneTime);
+  const one = items.filter(i => !(i.recurring && !i.oneTime));
+  const mrc = rec.reduce((a, i) => a + i.amount * i.qty, 0);
+  const nrc = one.reduce((a, i) => a + i.amount * i.qty, 0);
+  const terms = [...new Set(items.map(i => i.months).filter(Boolean))];
+  const globalTerm = text.match(/\b(\d{1,3})[- ]?(?:months?|mths?|mos)\b(?:\s+(?:term|contract))?/i) || text.match(/\b(?:term|contract)\s*(?:of|:)?\s*(\d{1,3})\b/i);
+  let months = terms.length ? Math.max(...terms) : globalTerm ? Number(globalTerm[1]) : null;
+  if (terms.length > 1) mismatched.push("line items carry different terms (" + terms.join(", ") + " months)");
+  const dm = text.match(/\bdiscount\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)\s*%/i) || text.match(/(\d+(?:\.\d+)?)\s*%\s*(?:off|discount)/i);
+  const discount = dm ? Number(dm[1]) : 0;
+  let scope = "MRC only";
+  let scopeNote = "the quote doesn't say, so it is read as MRC only";
+  if (/\bdiscount\b[^.\n;]{0,40}\b(on|to|across)\s+(both|all|everything|the total|total|tcv|mrc and nrc|recurring and one[- ]?time)\b|\bdiscount\b[^.\n;]{0,20}\b(on|to)\s+(nrc|install(ation)?|one[- ]?time)\b/i.test(text)) {
+    scope = /\b(on|to)\s+(nrc|install(ation)?|one[- ]?time)\b/i.test(text) && !/\b(both|all|everything|total|tcv|mrc)\b/i.test(text.match(/\bdiscount\b[^.\n;]{0,40}/i)[0]) ? "NRC only" : "MRC and NRC";
+    scopeNote = "the quote says so";
+  } else if (/\bdiscount\b[^.\n;]{0,40}\b(on|to)\s+(mrc|recurring|monthly)\b|\b(mrc|recurring|monthly)\s+only\b/i.test(text)) {
+    scopeNote = "the quote says so";
+  }
+  const facts = [];
+  facts.push(["MRC total", money2(mrc, cur) + "/mo" + (rec.length ? " (" + rec.map(i => (i.qty > 1 ? i.qty + " × " : "") + money2(i.amount, "")).join(" + ") + ")" : "")]);
+  facts.push(["NRC total", money2(nrc, cur) + " one-time"]);
+  let step;
+  let tcv = null, dtcv = null;
+  if (months) {
+    tcv = mrc * months + nrc;
+    facts.push(["Term", months + " months"]);
+    facts.push(["TCV before discount", money2(mrc, "") + " × " + months + " + " + money2(nrc, "") + " = " + money2(tcv, cur)]);
+  } else if (mrc) {
+    flags.push("Add the contract term");
+  }
+  if (discount) {
+    const d = discount / 100;
+    const mrcD = scope === "NRC only" ? mrc : mrc * (1 - d);
+    const nrcD = scope === "MRC only" ? nrc : nrc * (1 - d);
+    facts.push(["Discount", discount + "% on " + scope + " (" + scopeNote + ")"]);
+    if (months) {
+      dtcv = mrcD * months + nrcD;
+      facts.push(["Discounted TCV", money2(mrcD, "") + " × " + months + " + " + money2(nrcD, "") + " = " + money2(dtcv, cur)]);
+    }
+    if (discount >= 20) flags.push("CRO attention");
+    else if (discount > 10) flags.push("Needs regional approval");
+  }
+  if (mismatched.length) { flags.push("Check recurring vs one-time"); facts.push(["Recurring vs one-time", mismatched.join("; ")]); }
+  // Totals the quote states, checked against the line items.
+  const errs = [];
+  const near = (a, b) => Math.abs(a - b) < 0.51;
+  for (const i of items) if (i.stated != null && i.months && !near(i.stated, i.amount * i.qty * i.months)) errs.push(i.name + ": " + money2(i.amount * i.qty, "") + " × " + i.months + " is " + money2(i.amount * i.qty * i.months, "") + ", not " + money2(i.stated, ""));
+  const statedNum = re => { const m = text.match(re); return m ? Number(m[1].replace(/,/g, "")) * (m[2] ? 1000 : 1) : null; };
+  const AMT = "\\s*(?:is|of|:|=)?\\s*(?:SGD|USD|S\\$|US\\$|\\$)?\\s*(\\d[\\d,]*(?:\\.\\d+)?)(\\s*[kK]\\b)?";
+  const sMrc = statedNum(new RegExp("\\b(?:MRC total|total MRC|monthly total|total monthly|total per month)" + AMT, "i"));
+  const sNrc = statedNum(new RegExp("\\b(?:NRC total|total NRC|one[- ]?time total|total one[- ]?time)" + AMT, "i"));
+  const sTcv = statedNum(new RegExp("\\b(?:TCV|total contract value|contract total|grand total)(?:\\s+(?:after|before) discount)?" + AMT, "i"));
+  if (sMrc != null && !near(sMrc, mrc)) errs.push("MRC total says " + money2(sMrc, "") + ", line items give " + money2(mrc, ""));
+  if (sNrc != null && !near(sNrc, nrc)) errs.push("NRC total says " + money2(sNrc, "") + ", line items give " + money2(nrc, ""));
+  if (sTcv != null && tcv != null && !near(sTcv, tcv) && !(dtcv != null && near(sTcv, dtcv))) errs.push("TCV says " + money2(sTcv, "") + ", line items give " + money2(tcv, "") + (dtcv != null ? " (" + money2(dtcv, "") + " after discount)" : ""));
+  if (errs.length) { flags.unshift("Quote math error"); facts.push(["Math check", errs.join("; ")]); }
+  else if (sMrc != null || sNrc != null || sTcv != null) facts.push(["Math check", "Stated totals match the line items"]);
+  facts.push(["Approval", discount > 10 ? (discount >= 20 ? "CRO attention: " : "Needs regional approval: ") + discount + "% is above the 10% line" : discount ? discount + "% is within the 10% line" : "No discount"]);
+  const headline = dtcv != null ? "TCV " + money2(dtcv, cur) + " after " + discount + "% on " + scope + " (" + money2(tcv, cur) + " before)"
+    : tcv != null ? "TCV " + money2(tcv, cur) : "MRC " + money2(mrc, cur) + "/mo, NRC " + money2(nrc, cur);
+  step = (flags.length ? "⚠️ " + flags.join(" · ") + ": " : "") + headline;
+  return { category: "quote", label: "Quote", urgency: flags.length ? "Needs a check" : "Ready", confidence: null, step,
+    why: "A bundle quote: recurring (MRC) and one-time (NRC) charges kept apart, TCV = MRC × months + NRC.",
+    facts, signals: [], flags, alert: flags.length > 0,
+    summary: [tcv != null ? "TCV " + money2(dtcv != null ? dtcv : tcv, cur) : null, discount ? discount + "% off " + scope : null].filter(Boolean).join(" · ") };
+}
+
 /* ---------- supply risk: a supplier or shipment running late ---------- */
 const SUPPLY_WHO = /\b(suppliers?|vendors?|shipments?|deliver(y|ies)|wholesaler|manufacturer|freight|raw materials?|PO|purchase orders?|(wax|wick|jar|glass|fragrance|oil|fabric|packaging|bean|stock) (order|shipment|delivery))\b/i;
 const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]order(ed)?|running late|(is|are|be|will be|arriving) late|slipp(ed|ing)|postponed|out of stock until|won'?t (arrive|ship|be here) until|rescheduled|(stuck|held( up)?) (in|at) customs|customs hold|short[- ]?shipp?(ed|ing)?|short shipment|partial shipment|only \d[\d,]*\s*\w*\s+(of|out of) (the )?\d[\d,]*|can'?t (fill|fulfill|ship|deliver)\b[^.\n]{0,30}\buntil|lead times?\b[^.\n]{0,30}\b(is now|now|increased|went up|longer|extended|doubled)|eta\b[^.\n]{0,12}\b(moved|pushed|slipped|changed))\b/i;
@@ -1140,6 +1262,7 @@ function classify(text, now = new Date()) {
   const clean = maskLGPD(text).trim();
   if (!clean) return null;
   if (isMpesa(clean) || isParentFee(clean)) return feesAnswer(clean);
+  if (isBundleQuote(clean)) return bundleQuoteAnswer(clean);
   // A failed payment comes before Support and Billing: the box mustn't ship unpaid.
   if (isPending(clean)) return pendingAnswer(clean);
   if (isOrderStatus(clean)) return orderStatusAnswer(clean);
@@ -1281,14 +1404,16 @@ function renderResult(r, fresh) {
   const box = $("result");
   box.replaceChildren();
   box.dataset.state = "filled";
-  box.classList.toggle("alert", !!(r.stockout || r.urgent));
+  box.classList.toggle("alert", !!(r.stockout || r.urgent || r.alert));
   if (r.stockout || r.urgent) box.setAttribute("role", "alert"); else box.removeAttribute("role");
   const top = el("div", { class: "result-top" },
     el("span", { class: "pill " + r.category, text: r.label }),
     r.urgent ? el("span", { class: "alert-tag big", text: "URGENT" }) : r.stockout ? el("span", { class: "alert-tag", text: "Stockout risk" }) : null,
     el("span", { class: "when" }, el("b", { text: r.urgency }), document.createTextNode(r.confidence ? " · " + r.confidence : ""))
   );
-  box.append(top, el("p", { class: "step", text: r.step }), el("p", { class: "why", text: r.why }));
+  box.append(top);
+  if (r.flags && r.flags.length) box.append(el("div", { class: "flag-row" }, ...r.flags.map(f => el("span", { class: "alert-tag", text: f }))));
+  box.append(el("p", { class: "step", text: r.step }), el("p", { class: "why", text: r.why }));
   if (r.facts.length) {
     const dl = el("dl", { class: "facts" });
     for (const [k, v] of r.facts) dl.append(el("dt", { text: k }), el("dd", { text: v }));
@@ -1536,7 +1661,7 @@ function hint(text) {
     billing: "That's a bill. Sort it and I'll find what's due and when.",
     inventory: "A stock line. Sort it and I'll check it against demand.",
     issue: "That sounds like a customer issue. Sort it and I'll flag it urgent.",
-    quote: "New business! Sort it and I'll log the quote request.",
+    quote: "A quote. Sort it and I'll check the numbers.",
     refund: "Someone wants their money back. Sort it and I'll log the refund.",
     partner: "A partner or follow-up note. Sort it and I'll log it.",
     storage: "A storage question. Sort it and I'll note what they need.",
@@ -1562,6 +1687,7 @@ function react(r) {
   }
   if (r.category === "other") { say("I'm not sure about this one. Best to read it yourself."); mood(0, 0.8); return; }
   if (r.category === "issue") { say("Urgent: a customer issue. I've pinned it to the top of the log until it's handled."); mood(0, 0.9, 4200); return; }
+  if (r.category === "quote" && r.flags) { say(r.flags.length ? "Check before it goes out: " + r.flags.join(", ") + "." : "The quote math checks out. TCV " + (r.summary || "") + "."); mood(r.flags.length ? 0 : 1, r.flags.length ? 0.6 : 0); if (!r.flags.length) hop(); return; }
   if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
   if (r.category === "refund") { say("A refund request. Issue the refund."); mood(0.2, 0.2); return; }
   if (r.category === "partner") { say("A follow-up to schedule."); mood(0.6, 0); hop(); return; }
