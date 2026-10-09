@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { inferSkillTrust, skillProvenanceFiles, skillRoots } from './skill-metadata.js';
 
 export interface DiscoveredSkill {
   name: string;
@@ -17,6 +18,8 @@ export interface SkillInstruction {
   trustLevel: 'trusted' | 'local' | 'untrusted';
   provenance?: SkillProvenance;
   content: string;
+  /** Optional hash of the complete file, before prompt truncation, from an async host. */
+  contentDigest?: string;
 }
 
 export interface SkillProvenance {
@@ -28,19 +31,8 @@ export interface SkillProvenance {
   trusted?: boolean;
 }
 
-function inferTrustLevel(
-  source: string,
-  provenance?: SkillProvenance
-): 'trusted' | 'local' | 'untrusted' {
-  if (provenance?.trusted) return 'trusted';
-  if (source.startsWith('repo:')) return 'trusted';
-  if (source.startsWith('home:')) return 'local';
-  return 'untrusted';
-}
-
 function loadProvenance(skillPath: string): SkillProvenance | undefined {
-  const candidates = ['skill-provenance.json', 'provenance.json', '.ink-skill.json'];
-  for (const name of candidates) {
+  for (const name of skillProvenanceFiles) {
     const filePath = join(skillPath, name);
     if (!existsSync(filePath)) continue;
     try {
@@ -69,7 +61,7 @@ function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
         path: skillPath,
         source,
         provenance,
-        trustLevel: inferTrustLevel(source, provenance),
+        trustLevel: inferSkillTrust(source, provenance),
       });
       continue;
     }
@@ -88,7 +80,7 @@ function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
             path: nestedPath,
             source,
             provenance,
-            trustLevel: inferTrustLevel(source, provenance),
+            trustLevel: inferSkillTrust(source, provenance),
           });
         }
       }
@@ -99,16 +91,7 @@ function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
 }
 
 export function discoverSkills(cwd: string): DiscoveredSkill[] {
-  const roots: Array<{ dir: string; source: string }> = [
-    { dir: join(cwd, '.codex', 'skills'), source: 'repo:.codex/skills' },
-    { dir: join(homedir(), '.codex', 'skills'), source: 'home:~/.codex/skills' },
-    { dir: join(cwd, '.ink', 'skills'), source: 'repo:.ink/skills' },
-    { dir: join(homedir(), '.ink', 'skills'), source: 'home:~/.ink/skills' },
-    { dir: join(cwd, '.claude', 'skills'), source: 'repo:.claude/skills' },
-    { dir: join(homedir(), '.claude', 'skills'), source: 'home:~/.claude/skills' },
-    { dir: join(cwd, '.gemini', 'skills'), source: 'repo:.gemini/skills' },
-    { dir: join(homedir(), '.gemini', 'skills'), source: 'home:~/.gemini/skills' },
-  ];
+  const roots = skillRoots(cwd, homedir());
 
   const all = roots.flatMap((root) => discoverFromDir(root.dir, root.source));
   const dedupe = new Map<string, DiscoveredSkill>();

@@ -16,3 +16,4 @@ export * from './tool-processes.js';
 export * from './session-activity.js';
 export * from './skill-policy.js';
 export * from './session-skills.js';
+export * from './skill-instructions.js';
