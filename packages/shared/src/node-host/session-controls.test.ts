@@ -278,3 +278,15 @@ it('skill-only controls retain a reported model window; an explicit model reset 
   recovery.push(record({ model: null, skills: [] }));
   expect(recovery.model).toBeUndefined();
 });
+
+it('refuses a skill without a durable hash before writing, without poisoning the owner', async () => {
+  const h = fixture();
+  h.skills.load.mockResolvedValue({ ...skill, contentDigest: undefined });
+  h.control.enqueue({ controlId: 'bad-hash', action: 'skill_use', name: 'review' });
+  await h.control.drain();
+  expect(h.receipts[0].status).toBe('refused');
+  expect(h.events).toEqual([]);
+  h.control.enqueue({ controlId: 'valid', action: 'model', model: 'next' });
+  await h.control.drain();
+  expect(h.runtime.model).toBe('next');
+});

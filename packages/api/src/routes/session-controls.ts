@@ -67,7 +67,7 @@ export function addSessionControlRoute(
       const receipt = submitRunControl(req.params.id, turnEpoch, request);
       res
         .status(receipt.status === 'pending' ? 202 : receipt.status === 'applied' ? 200 : 409)
-        .json(receipt);
+        .json({ ...receipt, turnEpoch });
     } catch {
       res.status(503).json({ error: 'Session control unavailable' });
     }

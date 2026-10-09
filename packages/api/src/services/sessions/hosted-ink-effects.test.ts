@@ -19,6 +19,7 @@ async function setup() {
   const close = vi.fn(async () => {});
   const credentials = vi.fn(async (input: HostedInkSessionInput) => ({ PRIVATE: input.sessionId }));
   const handoffs: Array<(signal: AbortSignal) => Promise<Readonly<NodeJS.ProcessEnv>>> = [];
+  const publish = vi.fn();
   const prepare = createHostedInkEffects({
     home: root,
     tempDir: root,
@@ -34,7 +35,7 @@ async function setup() {
     },
     credentials,
     activeSkills: async () => [],
-    publish: vi.fn(),
+    publish,
   });
   const input = (sbSlug: string): HostedInkSessionInput => ({
     sessionId: `${sbSlug}-session`,
@@ -80,7 +81,7 @@ async function setup() {
       )
   );
   vi.stubGlobal('fetch', fetch);
-  return { root, path, a, b, close, fetch, prepare, input, ports, credentials, handoffs };
+  return { root, path, a, b, close, fetch, prepare, input, ports, credentials, handoffs, publish };
 }
 describe('hosted session effects', () => {
   it('keeps credentials private and merges concurrent permanent grants without sharing policy state', async () => {
@@ -173,4 +174,30 @@ describe('hosted session effects', () => {
     await h.a.close();
     await h.b.close();
   });
+});
+
+it('publishes generation-scoped terminal control receipts after Stop, without late text', async () => {
+  const h = await setup();
+  const stop = new AbortController();
+  const effects = await h.prepare(h.input('fixture'), {
+    ...h.ports('fixture'),
+    signal: stop.signal,
+  });
+  h.publish.mockClear();
+  stop.abort();
+  effects.presentation.notice('late text');
+  effects.controlReceipt?.({
+    controlId: 'pending-at-stop',
+    status: 'refused',
+    reason: 'owner_stopped',
+  });
+  expect(h.publish).toHaveBeenCalledExactlyOnceWith('fixture-session', 'session_control_receipt', {
+    controlId: 'pending-at-stop',
+    status: 'refused',
+    reason: 'owner_stopped',
+    turnEpoch: 'epoch',
+  });
+  await effects.close();
+  await h.a.close();
+  await h.b.close();
 });

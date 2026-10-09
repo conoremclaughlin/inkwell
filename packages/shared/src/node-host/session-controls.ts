@@ -191,7 +191,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
           const entry = entries.get(id)!;
           const draft = { sessionId: ports.runtime.sessionId, activeSkills: [...manual] };
           const next = { ...selection, skills: [...selection.skills] };
-          let appended = false;
+          let attemptingCommit = false;
           try {
             current(signal);
             const request = entry.request;
@@ -215,14 +215,17 @@ export function createSessionControls(ports: SessionControlsPorts) {
             if (draft.activeSkills.some((s) => !canActivateSkill(s, ports.policy).allowed))
               throw new Error('Skill policy changed');
             next.skills = draft.activeSkills.map(reference) as SessionSelection['skills'];
-            appended = true;
+            attemptingCommit = true;
             const eid = await commit(id, next, draft.activeSkills, signal);
             publish(id, { controlId: id, status: 'applied', eid });
           } catch {
             publish(id, {
               controlId: id,
-              status: appended ? 'unknown' : 'refused',
-              reason: appended ? 'persistence_or_owner_uncertain' : 'control_not_allowed',
+              status: attemptingCommit && poisoned ? 'unknown' : 'refused',
+              reason:
+                attemptingCommit && poisoned
+                  ? 'persistence_or_owner_uncertain'
+                  : 'control_not_allowed',
             });
           }
         }

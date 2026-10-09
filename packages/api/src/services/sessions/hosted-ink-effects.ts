@@ -210,7 +210,13 @@ export function createHostedInkEffects(host: HostedInkEffectHost): PrepareHosted
       toolHost: toolkit,
       activeSkills,
       manualSkills: createSkillInstructionHost(input.workingDirectory, host.home),
-      controlReceipt: (receipt) => emit('session_control_receipt', { ...receipt }),
+      // Terminal control receipts must survive Stop; they describe the old
+      // generation, not new provider output or permission to run another turn.
+      controlReceipt: (receipt) =>
+        host.publish(input.sessionId, 'session_control_receipt', {
+          ...receipt,
+          turnEpoch: input.turnEpoch,
+        }),
       mintId: randomUUID,
       // Launch profiles are per-run, not edits of a shared machine policy. Approved
       // persistent grants await their merged write above before returning true.
