@@ -45,6 +45,7 @@
   --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
   --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
   --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
+  --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -66,6 +67,7 @@
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -85,6 +87,7 @@
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -231,6 +234,13 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.crew::before { background: var(--crew-dot); }
 .pill.issue { background: var(--issue-bg); color: var(--issue-fg); }
 .pill.issue::before { background: var(--issue-dot); }
+.pill.fees { background: var(--fees-bg); color: var(--fees-fg); }
+.pill.fees::before { background: var(--fees-dot); }
+.entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
+.centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
+.centre select { font: 14px/1.3 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.centre select:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; }
 .result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
 .alert-tag.big { font-size: 16px; padding: 9px 14px; letter-spacing: 0.08em; }
 .pinned { border-top: 0; background: var(--alert-bg); border-radius: 12px; padding: 12px 12px; margin-bottom: 8px; }
@@ -418,6 +428,7 @@ footer {
             <button type="button" class="chip" data-example="support">A customer email</button>
             <button type="button" class="chip" data-example="billing">An invoice line</button>
             <button type="button" class="chip" data-example="inventory">A stock line</button>
+            <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
           </div>
           <div class="examples" role="group" aria-label="Fill in a moving and storage example">
             <span>Moving &amp; storage:</span>
@@ -425,6 +436,18 @@ footer {
             <button type="button" class="chip" data-example="issue">A damage claim</button>
             <button type="button" class="chip" data-example="storage">A storage question</button>
             <button type="button" class="chip" data-example="crew">A crew question</button>
+          </div>
+          <div class="centre">
+            <label for="centrePhone">Received on centre phone</label>
+            <select id="centrePhone" name="centrePhone">
+              <option value="">Not set</option>
+              <option>Centre 1</option>
+              <option>Centre 2</option>
+              <option>Centre 3</option>
+              <option>Centre 4</option>
+              <option>Centre 5</option>
+              <option>Centre 6</option>
+            </select>
           </div>
           <div class="actions">
             <button type="submit" class="btn" id="sortBtn"><span class="spark" aria-hidden="true"></span>Sort it</button>
@@ -536,7 +559,8 @@ const EXAMPLES = {
   quote: "Hi, we need a quote for a 3-bedroom move from Albany to Saratoga Springs. We're moving on June 14. Could someone call me back?\nThanks,\nMaria",
   issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
-  crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?"
+  crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
+  fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
 };
 
 const RULES = {
@@ -944,9 +968,48 @@ function movingAnswer(kind, text) {
     step: "Answer the crew today", why: "A question from a crew about a job.", facts, signals: [] };
 }
 
+/* ---------- fees: M-Pesa confirmations ---------- */
+function isMpesa(text) {
+  return /\bconfirmed\b/i.test(text) && /\bk\s?sh\b/i.test(text) && /\breceived from\b/i.test(text);
+}
+function feesAnswer(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  const first = (t.split(" ")[0] || "").replace(/[^A-Za-z0-9]/g, "");
+  const code = /^[A-Za-z0-9]{6,12}$/.test(first) && first.toLowerCase() !== "confirmed" ? first.toUpperCase() : null;
+  const amountM = t.match(/\bk\s?sh\.?\s*([\d,]+(?:\.\d{1,2})?)/i);
+  const amount = amountM ? amountM[1].replace(/,$/, "") : null;
+  // The payer: the words after "received from", stopping at a phone number, "on", or punctuation.
+  const payerM = t.match(/\breceived from\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*)*?)(?=\s+(?:\+?\d|on\b)|\s*[.,;]|$)/i);
+  const payer = payerM ? payerM[1].trim() : null;
+  const dateM = t.match(/\bon\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
+  const timeM = t.match(/\bat\s+(\d{1,2}:\d{2})\s*([AaPp]\.?\s?[Mm]\.?)?/);
+  const date = dateM ? dateM[1] : null;
+  const time = timeM ? timeM[1] + (timeM[2] ? " " + timeM[2].replace(/[.\s]/g, "").toUpperCase() : "") : null;
+  const when = [date, time].filter(Boolean).join(" ");
+  let step = "Record in the fee register";
+  const detail = [];
+  if (amount) step += ": KSh " + amount + (payer ? " from " + payer : "");
+  else if (payer) step += ": payment from " + payer;
+  if (code) detail.push("ref " + code);
+  if (when) detail.push(when);
+  if (detail.length) step += (amount || payer ? ", " : ": ") + detail.join(", ");
+  const facts = [];
+  if (code) facts.push(["Ref", code]);
+  if (amount) facts.push(["Amount", "KSh " + amount]);
+  if (payer) facts.push(["From", payer]);
+  if (date) facts.push(["Date", date]);
+  if (time) facts.push(["Time", time]);
+  return {
+    category: "fees", label: "Fees", urgency: "Today", confidence: null, step,
+    why: "An M-Pesa payment confirmation.", facts, signals: [],
+    summary: [amount ? "KSh " + amount : null, payer].filter(Boolean).join(" · ")
+  };
+}
+
 function classify(text, now = new Date()) {
   const clean = text.trim();
   if (!clean) return null;
+  if (isMpesa(clean)) return feesAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
   const kind = movingKind(clean);
@@ -1123,6 +1186,7 @@ function renderLog(freshId) {
     if (t.day) timeEl.append(el("small", { text: t.day }));
     const body = el("div", { class: "entry-body" },
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      e.category === "fees" && (e.summary || e.centre) ? el("div", { class: "entry-fee", text: [e.summary, e.centre].filter(Boolean).join(" · ") }) : null,
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
     const pinned = e.urgent && !e.handled;
@@ -1138,7 +1202,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1149,6 +1213,7 @@ function renderLog(freshId) {
   if (counts.issue) parts.push(counts.issue + (counts.issue === 1 ? " customer issue" : " customer issues"));
   if (counts.storage) parts.push(counts.storage + " storage");
   if (counts.crew) parts.push(counts.crew + " crew");
+  if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
@@ -1166,6 +1231,8 @@ function sortNow() {
     $("item").focus();
     return;
   }
+  const centre = $("centrePhone") ? $("centrePhone").value : "";
+  if (r.category === "fees" && centre) r.facts.push(["Received on", centre]);
   renderResult(r, true);
   react(r);
   const mark = $("mark");
@@ -1177,6 +1244,7 @@ function sortNow() {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     at: new Date().toISOString(),
     category: r.category, label: r.label, step: r.step, stockout: !!r.stockout, urgent: !!r.urgent, handled: false,
+    summary: r.summary || "", centre: r.category === "fees" ? centre : "",
     snippet: oneLine.length > 140 ? oneLine.slice(0, 139) + "…" : oneLine
   };
   log.unshift(entry);
@@ -1332,6 +1400,7 @@ function hint(text) {
     quote: "New business! Sort it and I'll log the quote request.",
     storage: "A storage question. Sort it and I'll note what they need.",
     crew: "The crew has a question. Sort it and I'll log it.",
+    fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
     other: "Hmm, I can't tell what that is yet."
   };
   say(lines[r.category]);
@@ -1353,6 +1422,7 @@ function react(r) {
   if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
+  if (r.category === "fees") { say("Payment received" + (r.summary ? ": " + r.summary : "") + ". Record it in the fee register."); mood(1, 0); hop(); return; }
   const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
   say(lead + " Next step: " + r.step + ".");
   mood(r.category === "support" ? 0.35 : 0.9, 0); hop();
