@@ -464,7 +464,7 @@ footer {
         <span class="err" id="emailErr" hidden>Add an email address, like you@yourshop.com.</span>
       </div>
       <button type="submit" class="btn" id="signupBtn">Start my free trial</button>
-      <p class="fine">No card is asked for and nothing is charged. In this demo your sign-up stays in this browser.</p>
+      <p class="fine">Demo sign-up: this saves your choice in this browser only. It doesn't create an account or a subscription, no card is asked for, and nothing is charged.</p>
     </form>
     <div class="signed" id="signedIn" hidden aria-live="polite">
       <strong id="signedText"></strong>
@@ -1230,12 +1230,12 @@ function showPlan() {
   const badge = $("planBadge"), link = $("plansLink");
   if (plan && plan.plan) {
     const ends = new Date(new Date(plan.startedAt).getTime() + 14 * 86400000);
-    badge.textContent = plan.plan + " trial";
+    badge.textContent = plan.plan + " trial (demo)";
     badge.hidden = false; link.hidden = true;
     $("signupForm").hidden = true;
     $("signedIn").hidden = false;
-    $("signedText").textContent = "You're on " + plan.plan + ", " + plan.name + ".";
-    $("signedNote").textContent = "Your free trial runs until " + ends.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + ". Nothing is charged before then.";
+    $("signedText").textContent = plan.plan + " trial started, " + plan.name + ".";
+    $("signedNote").textContent = "In this demo the trial runs until " + ends.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " and is saved in this browser only: no account is created and nothing is charged.";
   } else {
     badge.hidden = true; link.hidden = false;
     $("signedIn").hidden = true;
