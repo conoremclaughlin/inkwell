@@ -121,6 +121,13 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
           toolHost: effects.toolHost,
           policy: effects.policy,
           callInk,
+          logActivity: async (activity) => {
+            // Telemetry must neither disappear on normal failure nor hold the
+            // user reply for the generic tool timeout. No retry/duplicate log.
+            await ports.inkwell.callTool('log_activity', activity, {
+              signal: AbortSignal.any([ports.signal, AbortSignal.timeout(5000)]),
+            });
+          },
           prepareHost: async () => {
             ports.signal.throwIfAborted();
           },

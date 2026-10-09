@@ -1,3 +1,4 @@
+import { backendTurnActivity } from '@inklabs/shared/node-host';
 import { sanitizeArgsForApproval } from '@inklabs/shared/runtime';
 import { createSessionClones } from '@inklabs/shared/node-host';
 import { createSessionToolHost } from '@inklabs/shared/node-host';
@@ -173,6 +174,7 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import { sessionCredentialsForProfile } from '@inklabs/shared/node-host';
 import { resolveCredentialRefs, loadKeychainCredentials } from '../repl/credential-resolver.js';
 import {
   createSignalSink,
@@ -267,7 +269,6 @@ export {
   stripLocalToolBlocks,
 } from '@inklabs/shared/runtime';
 import {
-  classifyError,
   createThreadDrainState,
   decodeDelegationToken,
   drainThreads,
@@ -2697,7 +2698,10 @@ async function runChatSession(
         );
       },
       prepareHost: async () => {
-        const keychainCreds = await loadKeychainCredentials();
+        const keychainCreds = await sessionCredentialsForProfile(
+          launchProfileName,
+          loadKeychainCredentials
+        );
         sessionCredentials = { ...keychainCreds };
         if (Object.keys(keychainCreds).length > 0) {
           console.log(
@@ -4528,42 +4532,18 @@ async function runChatSession(
         // shows the correct execution layer. Continuations are the same logical
         // turn and deliberately do NOT log again.
         if (runtime.sessionId) {
-          const turnStatus = runResult.success ? 'completed' : 'failed';
-          const cliErrorClassification = !runResult.success
-            ? classifyError({
-                errorText: runResult.stderr || runResult.stdout,
-                backend: runtime.backend,
-                exitCode: runResult.exitCode,
-              })
-            : null;
-
-          const runnerLabel = 'ink';
-          inkClient
-            .callTool('log_activity', {
-              sbSlug,
-              type: runResult.success ? 'agent_complete' : 'error',
-              subtype: `backend_cli:${runnerLabel}`,
-              content: runResult.success
-                ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
-                : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
-              sessionId: runtime.sessionId,
-              status: turnStatus,
-              payload: {
-                backend: runnerLabel,
-                exitCode: runResult.exitCode,
-                durationMs: turnDurationSeconds * 1000,
+          void inkClient
+            .callTool(
+              'log_activity',
+              backendTurnActivity({
+                sbSlug,
+                sessionId: runtime.sessionId,
                 studioId: runtime.studioId,
-                ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
-                ...(cliErrorClassification
-                  ? {
-                      errorCategory: cliErrorClassification.category,
-                      errorSummary: cliErrorClassification.summary,
-                      retryable: cliErrorClassification.retryable,
-                    }
-                  : {}),
-                ...(runResult.usage ? { usage: runResult.usage } : {}),
-              },
-            })
+                backend: runtime.backend,
+                durationSeconds: turnDurationSeconds,
+                result: runResult,
+              })
+            )
             .catch(() => undefined);
         }
       },

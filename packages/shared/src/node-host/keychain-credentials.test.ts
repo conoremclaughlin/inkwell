@@ -18,7 +18,10 @@ vi.mock('child_process', () => ({
     callback(null, { stdout });
   },
 }));
-import { readHostKeychainCredentials } from './keychain-credentials.js';
+import {
+  readHostKeychainCredentials,
+  sessionCredentialsForProfile,
+} from './keychain-credentials.js';
 beforeEach(() => {
   capture.calls = [];
   capture.value = 'first';
@@ -47,3 +50,16 @@ describe('session keychain snapshot', () => {
     expect(capture.calls).toEqual([]);
   });
 });
+
+it.each(['tools', 'inkling'])(
+  'never reads the keychain for %s, including bare send text',
+  async (profile) => {
+    const load = vi.fn(async () => ({ FIXTURE: 'private' }));
+    const { resolveCredentialRefs } = await import('../runtime/credential-resolver.js');
+    const credentials = await sessionCredentialsForProfile(profile, load);
+    expect(load).not.toHaveBeenCalled();
+    expect(resolveCredentialRefs({ content: '$FIXTURE' }, credentials).args).toEqual({
+      content: '$FIXTURE',
+    });
+  }
+);

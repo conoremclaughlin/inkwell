@@ -1,5 +1,6 @@
 /** Async host for the existing JSONL ledger; preserves CLI continuity and observer eids. */
 import { appendFile, mkdir, readdir, open, lstat } from 'fs/promises';
+import { setImmediate as yieldToHost } from 'timers/promises';
 import { join, basename, dirname, isAbsolute } from 'path';
 import { SessionLog } from '@inklabs/shared/runtime';
 import type { HostedSessionLog } from './hosted-ink-session';
@@ -47,62 +48,69 @@ export async function openHostedInkLog(input: {
     append: (event) => log.append(event),
     flush: () => log.flush(),
     async read() {
-      // Preserve the existing replay reducer's semantics, without allocating a whole
-      // JSONL file and its split copy. Never silently truncate history/dedupe/eids.
-      const maxBytes = 8 * 1024 * 1024;
-      const maxLineBytes = 1024 * 1024;
-      const events: Record<string, unknown>[] = [];
-      const parseLine = (line: Buffer) => {
-        if (line.length > maxLineBytes)
-          throw new Error('Hosted ledger entry exceeds its replay byte bound');
-        try {
-          const event: unknown = JSON.parse(line.toString('utf8'));
-          if (event && typeof event === 'object' && !Array.isArray(event)) {
-            if (events.length >= 50_000)
-              throw new RangeError('Hosted ledger exceeds its replay event bound');
-            events.push(event as Record<string, unknown>);
-          }
-        } catch (error) {
-          if (!(error instanceof SyntaxError)) throw error;
-          // Existing reader tolerates torn lines; seed starts a new boundary.
-        }
-      };
-      let file;
-      try {
-        file = await open(path, 'r');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-        throw error;
-      }
-      let pending = Buffer.alloc(0),
-        total = 0;
-      try {
-        for await (const chunk of file.createReadStream({
-          highWaterMark: 64 * 1024,
-          autoClose: false,
-        })) {
-          input.signal?.throwIfAborted();
-          total += chunk.length;
-          if (total > maxBytes)
-            throw new Error('Hosted ledger exceeds the replay byte bound; compact before resuming');
-          const bytes = Buffer.concat([pending, chunk]);
-          let start = 0,
-            end: number;
-          while ((end = bytes.indexOf(10, start)) !== -1) {
-            parseLine(bytes.subarray(start, end));
-            start = end + 1;
-          }
-          pending = Buffer.from(bytes.subarray(start));
-          if (pending.length > maxLineBytes)
-            throw new Error('Hosted ledger entry exceeds its replay byte bound');
-        }
-        if (pending.length) parseLine(pending);
-      } finally {
-        await file.close();
-      }
-      return events;
+      return entries();
     },
   };
+
+  async function* entries(): AsyncGenerator<Record<string, unknown>> {
+    // The append-only file grows across compactions. Stream EVERY event through
+    // the shared reducer: retain active context/dedupe state, not a file-sized
+    // JSON array, and never mistake total file size for active context size.
+    const maxLineBytes = 1024 * 1024;
+    const parseLine = (line: Buffer): Record<string, unknown> | undefined => {
+      if (line.length > maxLineBytes)
+        throw new Error(
+          'Hosted ledger entry exceeds its 1 MiB bound; repair this entry before resuming'
+        );
+      try {
+        const event: unknown = JSON.parse(line.toString('utf8'));
+        if (event && typeof event === 'object' && !Array.isArray(event))
+          return event as Record<string, unknown>;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        // The existing CLI reader tolerates torn lines.
+      }
+      return undefined;
+    };
+    let file;
+    try {
+      file = await open(path, 'r');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    let pending = Buffer.alloc(0);
+    try {
+      for await (const chunk of file.createReadStream({
+        highWaterMark: 64 * 1024,
+        autoClose: false,
+      })) {
+        input.signal?.throwIfAborted();
+        const bytes = Buffer.concat([pending, chunk]);
+        let start = 0,
+          end: number;
+        while ((end = bytes.indexOf(10, start)) !== -1) {
+          input.signal?.throwIfAborted();
+          const event = parseLine(bytes.subarray(start, end));
+          if (event) yield event;
+          start = end + 1;
+        }
+        pending = Buffer.from(bytes.subarray(start));
+        if (pending.length > maxLineBytes)
+          throw new Error(
+            'Hosted ledger entry exceeds its 1 MiB bound; repair this entry before resuming'
+          );
+        await yieldToHost(); // IO may be cached; do not starve other sessions.
+      }
+      input.signal?.throwIfAborted();
+      if (pending.length) {
+        const event = parseLine(pending);
+        if (event) yield event;
+      }
+    } finally {
+      await file.close();
+    }
+  }
 }
 
 /** Clones are children of this log, never another session's or a live observer source. */

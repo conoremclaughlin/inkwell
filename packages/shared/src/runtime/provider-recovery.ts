@@ -25,33 +25,9 @@ export interface RecoveredBackendSession {
 export function findLastBackendSessionInEvents(
   events: readonly Record<string, unknown>[]
 ): RecoveredBackendSession | undefined {
-  let found: RecoveredBackendSession | undefined;
-  for (const event of events) {
-    if (event.type === 'backend_session' && typeof event.id === 'string') {
-      found = {
-        id: event.id,
-        ...(event.routing === 'backend' || event.routing === 'local'
-          ? { routing: event.routing }
-          : {}),
-      };
-    } else if (
-      event.type === 'compaction' ||
-      event.type === 'context_evict' ||
-      event.type === 'context_trim' ||
-      event.type === 'context_budget_changed' ||
-      event.type === 'backend_session_invalidated'
-    ) {
-      // A context-boundary mutation rolled the provider session — including a
-      // PACKING-WIDTH change from model detection: a session seeded at the
-      // old budget holds only that slice of history and must not be resumed
-      // at the new one (Lumen, PR #477 round 3). So did an explicit
-      // invalidation (a native session left holding uncorrected fabricated
-      // tool results, #569). Abandon any prior id — a backend_session marker
-      // after this point re-establishes it.
-      found = undefined;
-    }
-  }
-  return found;
+  const recovery = createProviderRecovery('');
+  for (const event of events) recovery.push(event);
+  return recovery.session;
 }
 
 /**
@@ -67,23 +43,54 @@ export function findLastDetectedModelInEvents(
   events: readonly Record<string, unknown>[],
   backend: string
 ): string | undefined {
-  let found: string | undefined;
-  for (const event of events) {
-    if (
-      event.type === 'model_detected' &&
-      event.backend === backend &&
-      typeof event.model === 'string' &&
-      event.model
-    ) {
-      found = event.model;
-    } else if (event.type === 'model_detection_reset' && event.backend === backend) {
-      // The model selection changed after this point (/model set or clear) —
-      // prior detection no longer describes what serves the session. A new
-      // model_detected entry after the reset re-establishes authority.
-      found = undefined;
-    }
-  }
-  return found;
+  const recovery = createProviderRecovery(backend);
+  for (const event of events) recovery.push(event);
+  return recovery.model;
+}
+
+/** Constant-sized provider state, shared by array and streamed history replay. */
+export function createProviderRecovery(backend: string) {
+  let session: RecoveredBackendSession | undefined;
+  let model: string | undefined;
+  return {
+    get session() {
+      return session;
+    },
+    get model() {
+      return model;
+    },
+    push(event: Record<string, unknown>) {
+      if (event.type === 'backend_session' && typeof event.id === 'string') {
+        session = {
+          id: event.id,
+          ...(event.routing === 'backend' || event.routing === 'local'
+            ? { routing: event.routing }
+            : {}),
+        };
+      } else if (
+        typeof event.type === 'string' &&
+        [
+          'compaction',
+          'context_evict',
+          'context_trim',
+          'context_budget_changed',
+          'backend_session_invalidated',
+        ].includes(event.type)
+      ) {
+        session = undefined;
+      }
+      if (
+        event.type === 'model_detected' &&
+        event.backend === backend &&
+        typeof event.model === 'string' &&
+        event.model
+      ) {
+        model = event.model;
+      } else if (event.type === 'model_detection_reset' && event.backend === backend) {
+        model = undefined;
+      }
+    },
+  };
 }
 
 /**

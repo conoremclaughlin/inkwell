@@ -79,7 +79,7 @@ export interface HostedSessionLog {
   seed(maxEid: number): void;
   append(event: Record<string, unknown>): number;
   flush(): Promise<void>;
-  read(): Promise<ReadonlyArray<Record<string, unknown>>>;
+  read(): Promise<Iterable<Record<string, unknown>> | AsyncIterable<Record<string, unknown>>>;
 }
 
 /** What the composition is told about the turn it runs. */

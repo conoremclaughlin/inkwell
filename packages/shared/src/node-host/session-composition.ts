@@ -14,9 +14,8 @@ import {
   createSignalSink,
   registerBuiltinHooks,
   bootstrapSessionIdentity,
-  hydrateLedgerFromEvents,
-  findLastBackendSessionInEvents,
-  findLastDetectedModelInEvents,
+  hydrateLedgerFromEventStream,
+  createProviderRecovery,
   resolveModelContextWindow,
   contextBudgetForWindow,
   createSessionTools,
@@ -40,6 +39,7 @@ import type { createSessionToolHost } from './session-tool-host.js';
 import { imagesToDeliver } from './tool-images.js';
 import { localDeliveredSend } from '../runner/turn-reply.js';
 import { createSessionClones, type SessionClonesPorts } from './session-clones.js';
+import { backendTurnActivity } from './session-activity.js';
 import { runSessionAgentTurn } from '../providers/session-agent-turn.js';
 import {
   createSessionCompaction,
@@ -69,13 +69,15 @@ export interface SessionCompositionPorts {
   runtime: ComposedSessionState;
   cliAttached: boolean;
   contextBudgetAuto: boolean;
-  history: readonly Record<string, unknown>[];
+  history: Iterable<Record<string, unknown>> | AsyncIterable<Record<string, unknown>>;
   log: Pick<SessionLog, 'path' | 'append' | 'flush' | 'seed'>;
   policy: ToolPolicyState;
   toolHost: ReturnType<typeof createSessionToolHost>;
   cwd: string;
   /** Session-scoped, including bootstrap, passive recall and sends. */
   callInk: SessionToolsPorts['dispatch']['callInk'];
+  /** Best-effort activity with a host-owned finite deadline; no turn continuation logs. */
+  logActivity(activity: Record<string, unknown>): Promise<void>;
   prepareHost(): Promise<void>;
   unavailable(reason: string): void;
   mintId(): string;
@@ -159,11 +161,15 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     append: (event) => log.append(event),
     rolled: presentation.notice,
   });
-  const hydrated = hydrateLedgerFromEvents(ledger, ports.history, sbSlug);
+  const recovery = createProviderRecovery(runtime.backend);
+  const hydrated = await hydrateLedgerFromEventStream(ledger, ports.history, sbSlug, (event) => {
+    signal?.throwIfAborted();
+    recovery.push(event);
+  });
   log.seed(hydrated.maxEid);
   const evicted: EvictedEntryRecord[] = [...hydrated.evictedEntries];
   passiveRecall.seedBootstrapIds(hydrated.recoveredMemoryIds);
-  const recoveredModel = findLastDetectedModelInEvents(ports.history, runtime.backend);
+  const recoveredModel = recovery.model;
   if (recoveredModel && !runtime.model) {
     runtime.detectedModel = recoveredModel;
     runtime.backendTokenWindow = resolveModelContextWindow(runtime.backend, recoveredModel);
@@ -174,7 +180,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
       );
   }
   if (runtime.backend === 'claude') {
-    const recovered = findLastBackendSessionInEvents(ports.history);
+    const recovered = recovery.session;
     if (recovered?.routing === runtime.toolRouting) context.provider.id = recovered.id;
   }
   const sample = hydrated.providerSample;
@@ -295,6 +301,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     recordEviction: compaction.recordEviction,
   });
   let consecutiveBackendFailures = 0;
+  const activityWrites = new Set<Promise<void>>();
   let deliveredImages: { sessionId: string | undefined; refs: Set<string> } = {
     sessionId: undefined,
     refs: new Set(),
@@ -406,6 +413,22 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
                 onInitialSettled: () => {},
                 onInitialResult: (result) => {
                   consecutiveBackendFailures = result.success ? 0 : consecutiveBackendFailures + 1;
+                  const write = Promise.resolve()
+                    .then(() =>
+                      ports.logActivity(
+                        backendTurnActivity({
+                          sbSlug,
+                          sessionId: runtime.sessionId,
+                          studioId: runtime.studioId,
+                          backend: runtime.backend,
+                          durationSeconds: Math.max(0, Math.round(result.durationMs / 1000)),
+                          result,
+                        })
+                      )
+                    )
+                    .catch(() => undefined);
+                  activityWrites.add(write);
+                  void write.then(() => activityWrites.delete(write));
                 },
                 recordUsage: (value) => usage.record(value),
                 sampleContext: (value) => context.sampleUsage(value),
@@ -437,6 +460,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
         options.signal
       );
     } finally {
+      await Promise.all(activityWrites);
       running = false;
     }
   };

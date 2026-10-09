@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { mkdtemp, readFile, mkdir, rm, realpath } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { decodeContextToken } from '@inklabs/shared';
 import { applyLaunchProfile, ToolPolicyState } from '@inklabs/shared/runtime';
 import type { BackendHost } from '@inklabs/shared/providers';
 import { createHostedInkEffects } from './hosted-ink-effects';
@@ -16,17 +17,22 @@ async function setup() {
   roots.push(root);
   const path = join(root, 'policy.json');
   const close = vi.fn(async () => {});
+  const credentials = vi.fn(async (input: HostedInkSessionInput) => ({ PRIVATE: input.sessionId }));
+  const handoffs: Array<(signal: AbortSignal) => Promise<Readonly<NodeJS.ProcessEnv>>> = [];
   const prepare = createHostedInkEffects({
     home: root,
     tempDir: root,
     inkFiles: root,
     policyPath: path,
     mcpUrl: 'http://127.0.0.1:49199/mcp',
-    coding: async () => ({
-      ports: { load: async () => new Map(), readDocument: async () => null },
-      close,
-    }),
-    credentials: async (input) => ({ PRIVATE: input.sessionId }),
+    coding: async (_input, _signal, sessionEnv) => {
+      handoffs.push(sessionEnv);
+      return {
+        ports: { load: async () => new Map(), readDocument: async () => null },
+        close,
+      };
+    },
+    credentials,
     activeSkills: async () => [],
     publish: vi.fn(),
   });
@@ -74,7 +80,7 @@ async function setup() {
       )
   );
   vi.stubGlobal('fetch', fetch);
-  return { root, path, a, b, close, fetch };
+  return { root, path, a, b, close, fetch, prepare, input, ports, credentials, handoffs };
 }
 describe('hosted session effects', () => {
   it('keeps credentials private and merges concurrent permanent grants without sharing policy state', async () => {
@@ -103,6 +109,50 @@ describe('hosted session effects', () => {
     await h.b.close();
     expect(h.close).toHaveBeenCalledTimes(2);
   });
+  it('builds the shell handoff from the admitted session, not the server environment', async () => {
+    const h = await setup();
+    const signal = new AbortController().signal;
+    const [a, b] = await Promise.all(h.handoffs.map((fn) => fn(signal)));
+    expect(a).toMatchObject({
+      INK_ACCESS_TOKEN: 'scoped-token',
+      INK_SERVER_URL: 'http://127.0.0.1:49199',
+      INK_SESSION_ID: 'echo-session',
+      SB_SLUG: 'echo',
+    });
+    expect(b.INK_SESSION_ID).toBe('myra-session');
+    expect(decodeContextToken(a.INK_CONTEXT!)).toMatchObject({
+      sessionId: 'echo-session',
+      sbSlug: 'echo',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+    const stop = new AbortController();
+    stop.abort();
+    await expect(h.handoffs[0](stop.signal)).rejects.toThrow();
+    await Promise.all([h.a.close(), h.b.close()]);
+  });
+  it.each(['tools'] as const)(
+    'does not acquire credentials for the %s launch profile',
+    async (profile) => {
+      const h = await setup();
+      h.credentials.mockClear();
+      const base = h.input('echo');
+      const input: HostedInkSessionInput = {
+        ...base,
+        options: {
+          ...base.options,
+          profile,
+          requireProfile: profile === 'tools' ? 'tools' : undefined,
+        },
+      };
+      const restricted = await h.prepare(input, h.ports('echo'));
+      expect(h.credentials).not.toHaveBeenCalled();
+      expect(restricted.toolHost.dispatch.resolveCredentials({ content: '$PRIVATE' })).toEqual({
+        content: '$PRIVATE',
+      });
+      await Promise.all([restricted.close(), h.a.close(), h.b.close()]);
+    }
+  );
   it('hard denies never ask and an aborted approval cannot dispatch HTTP', async () => {
     const h = await setup();
     h.a.policy.denyTool('write');

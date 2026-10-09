@@ -40,3 +40,11 @@ export async function readHostKeychainCredentials(input: {
   }
   return result;
 }
+
+/** Tools-only sessions never acquire machine secrets, even for permitted MCP calls. */
+export async function sessionCredentialsForProfile(
+  profile: string | undefined,
+  load: () => Promise<Readonly<Record<string, string>>>
+): Promise<Readonly<Record<string, string>>> {
+  return profile === 'tools' || profile === 'inkling' ? {} : load();
+}

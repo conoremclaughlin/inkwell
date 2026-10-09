@@ -77,6 +77,16 @@ describe.skipIf(!enabled)('real hosted Ink and CLI continuity', () => {
       return data;
     };
     const priorLaunches = new Set((await launches()).map((row) => row.id));
+    const activityIds = async () => {
+      const { data, error } = await db
+        .from('activity_stream')
+        .select('id, status, payload')
+        .eq('session_id', sessionId)
+        .eq('subtype', 'backend_cli:ink');
+      if (error) throw new Error('Could not read isolated activity evidence');
+      return data;
+    };
+    const priorActivities = new Set((await activityIds()).map((row) => row.id));
     for (const name of ['home', 'cwd', 'tmp']) {
       const path = await realpath(join(root, name));
       const rel = relative(root, path);
@@ -144,6 +154,26 @@ describe.skipIf(!enabled)('real hosted Ink and CLI continuity', () => {
       expect(result.success).toBe(true);
       expect(result.sessionId).toBe(sessionId);
       expect(result.response).toBe(`HOSTED-${nonce}`);
+      await expect
+        .poll(
+          async () =>
+            (await activityIds()).filter(
+              (row) =>
+                !priorActivities.has(row.id) &&
+                // Session-service also writes outer start/end activities with this
+                // subtype. Only the per-backend result carries an exitCode.
+                Object.prototype.hasOwnProperty.call(row.payload ?? {}, 'exitCode')
+            ),
+          {
+            timeout: 5000,
+          }
+        )
+        .toEqual([
+          expect.objectContaining({
+            status: 'completed',
+            payload: expect.objectContaining({ backend: 'ink', exitCode: 0 }),
+          }),
+        ]);
       const recorded = (await launches()).filter((row) => !priorLaunches.has(row.id));
       // Without this the old child-ink runner could pass the same chat assertions.
       // Hosted execution records each physical provider; the outer reservation

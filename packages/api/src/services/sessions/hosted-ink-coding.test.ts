@@ -18,6 +18,15 @@ async function fixture() {
   await mkdir(tempDir);
   const stop = new AbortController();
   const resolveBinary = vi.fn(async (name: 'rg' | 'fd') => join(cwd, name));
+  const sessionEnv = vi.fn(async () => ({
+    INK_ACCESS_TOKEN: 'scoped-fixture',
+    INK_SESSION_ID: 'fixture-session',
+    INK_CONTEXT: 'fixture-context',
+    SB_SLUG: 'echo',
+    INK_SERVER_URL: 'http://localhost:49199',
+    JWT_SECRET: 'still-not-for-child',
+    ANTHROPIC_API_KEY: 'still-not-for-child',
+  }));
   const scope = await createHostedInkCoding({
     cwd,
     tempDir,
@@ -29,10 +38,11 @@ async function fixture() {
       INK_ACCESS_TOKEN: 'should-not-reach-child',
     },
     resolveBinary,
+    sessionEnv,
     signal: stop.signal,
   });
   const host = createCodingToolHost(cwd, scope.ports);
-  return { cwd, home, tempDir, scope, host, stop, resolveBinary };
+  return { cwd, home, tempDir, scope, host, stop, resolveBinary, sessionEnv };
 }
 describe('actual hosted Pi effects', () => {
   it('runs existing read/write/edit/ls with session cwd and async operations', async () => {
@@ -59,13 +69,40 @@ describe('actual hosted Pi effects', () => {
         command:
           'printf "%s|%s|%s|%s" "$HOME" "$JWT_SECRET" "$INK_ACCESS_TOKEN" "$HOSTED_TEST_AMBIENT"',
       });
-      expect(result.text).toBe(`${h.home}|||`);
+      expect(result.text).toBe(`${h.home}||scoped-fixture|`);
       // Finite harmless output: exercise the real async spill stream, not a synthetic Pi tool.
       const spilled = await h.host.call('bash', { command: "printf '%060000d' 0" });
       expect(spilled.text).toContain('Full output:');
       expect(String(spilled.text)).toContain(h.tempDir);
       h.stop.abort();
       await expect(h.host.call('bash', { command: 'printf no' })).rejects.toThrow();
+    } finally {
+      await h.scope.close();
+    }
+  });
+  it('remints scoped bash handoff per call and refuses missing credentials without spawning', async () => {
+    const h = await fixture();
+    try {
+      const args = {
+        command:
+          'printf "%s|%s|%s|%s|%s|%s" "$INK_ACCESS_TOKEN" "$INK_SESSION_ID" "$INK_CONTEXT" "$SB_SLUG" "$INK_SERVER_URL" "$ANTHROPIC_API_KEY"',
+      };
+      expect((await h.host.call('bash', args)).text).toBe(
+        'scoped-fixture|fixture-session|fixture-context|echo|http://localhost:49199|'
+      );
+      h.sessionEnv.mockResolvedValueOnce({
+        ...(await h.sessionEnv()),
+        INK_ACCESS_TOKEN: 'next-fixture',
+      });
+      expect((await h.host.call('bash', args)).text).toContain('next-fixture|');
+      h.sessionEnv.mockResolvedValueOnce({ ...(await h.sessionEnv()), INK_ACCESS_TOKEN: '' });
+      await expect(h.host.call('bash', { command: 'printf should-not-run' })).rejects.toThrow(
+        'no session handoff'
+      );
+      h.sessionEnv.mockRejectedValueOnce(new Error('retired'));
+      await expect(h.host.call('bash', { command: 'printf should-not-run' })).rejects.toThrow(
+        'retired'
+      );
     } finally {
       await h.scope.close();
     }

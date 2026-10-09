@@ -93,12 +93,8 @@ export function readProviderSampleEvent(
   };
 }
 
-/** Replay a host-loaded snapshot. No filesystem, network, provider or process work. */
-export function hydrateLedgerFromEvents(
-  ledger: ContextLedger,
-  events: readonly Record<string, unknown>[],
-  sbSlug?: string
-): {
+/** The same reducer is driven by either a CLI array or an async host stream. */
+export type LedgerHydration = {
   loaded: number;
   messageCount: number;
   tailPreview: HistoryHydrationResult['tailPreview'];
@@ -118,7 +114,40 @@ export function hydrateLedgerFromEvents(
    * pre-turn check (Lumen, PR #583 round 2).
    */
   providerSample?: PersistedProviderSample;
-} {
+};
+
+/** Replay a host-loaded snapshot without changing the CLI's synchronous API. */
+export function hydrateLedgerFromEvents(
+  ledger: ContextLedger,
+  events: readonly Record<string, unknown>[],
+  sbSlug?: string
+): LedgerHydration {
+  const replay = ledgerHydration(ledger, sbSlug);
+  replay.next();
+  for (const event of events) replay.next(event);
+  return replay.next(undefined).value!;
+}
+
+/** Hosts supply cancellation/yielding through the iterator; no file-sized array. */
+export async function hydrateLedgerFromEventStream(
+  ledger: ContextLedger,
+  events: AsyncIterable<Record<string, unknown>> | Iterable<Record<string, unknown>>,
+  sbSlug?: string,
+  observe?: (event: Record<string, unknown>) => void
+): Promise<LedgerHydration> {
+  const replay = ledgerHydration(ledger, sbSlug);
+  replay.next();
+  for await (const event of events) {
+    observe?.(event);
+    replay.next(event);
+  }
+  return replay.next(undefined).value!;
+}
+
+function* ledgerHydration(
+  ledger: ContextLedger,
+  sbSlug?: string
+): Generator<undefined, LedgerHydration, Record<string, unknown> | undefined> {
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
@@ -153,7 +182,7 @@ export function hydrateLedgerFromEvents(
     }
   };
 
-  for (const event of events) {
+  for (let event = yield; event !== undefined; event = yield) {
     const type = typeof event.type === 'string' ? event.type : '';
     const eid = typeof event.eid === 'number' ? event.eid : undefined;
     if (eid !== undefined && eid > maxEid) maxEid = eid;

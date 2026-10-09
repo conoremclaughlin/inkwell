@@ -7,6 +7,7 @@ import {
   type CodingTool,
   type CodingToolHostPorts,
 } from '@inklabs/shared/node-host';
+import { sessionEnvHandoff } from '@inklabs/shared';
 import { extractPdfText } from '@inklabs/shared/providers';
 import type { InkToolCallResult } from '@inklabs/shared/runtime';
 
@@ -49,6 +50,8 @@ export async function createHostedInkCoding(input: {
   tempDir: string;
   env: Readonly<NodeJS.ProcessEnv>;
   shell: string;
+  /** Fresh session token/context for bash, checked before each child launch. */
+  sessionEnv(signal: AbortSignal): Promise<Readonly<NodeJS.ProcessEnv>>;
   resolveBinary(name: 'rg' | 'fd'): Promise<string>;
   signal: AbortSignal;
 }) {
@@ -119,9 +122,25 @@ export async function createHostedInkCoding(input: {
       (!Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 2000)
     )
       throw new Error('Hosted tool limit must be an integer between 1 and 2000');
+    const callEnv = { ...env };
+    if (name === 'bash') {
+      const scoped = await input.sessionEnv(stop);
+      stop.throwIfAborted();
+      for (const key of [
+        'INK_ACCESS_TOKEN',
+        'INK_SESSION_ID',
+        'INK_CONTEXT',
+        'SB_SLUG',
+        'INK_SERVER_URL',
+      ])
+        if (!scoped[key]) throw new Error(`Hosted bash has no session handoff: ${key}`);
+      Object.assign(callEnv, sessionEnvHandoff({ ...scoped }), {
+        INK_SERVER_URL: scoped.INK_SERVER_URL,
+      });
+    }
     const processes = createToolProcesses({
       cwd: input.cwd,
-      env,
+      env: callEnv,
       signal: stop,
       timeoutMs: 120_000,
       maxOutputBytes: MAX_OUTPUT_BYTES,
@@ -236,7 +255,7 @@ export async function createHostedInkCoding(input: {
         find: () => pi.createFindTool(input.cwd, search('fd')),
         bash: () =>
           pi.createBashTool(input.cwd, {
-            env,
+            env: callEnv,
             tempDirectory: input.tempDir,
             operations: {
               exec: async (command, cwd, options) => {

@@ -85,11 +85,12 @@ export function createLocalHostedInkRunner(input: {
       inkFiles: paths.inkFiles,
       policyPath: join(input.home, '.ink', 'security', 'tool-policy.json'),
       mcpUrl: input.mcpUrl,
-      coding: async (turn, signal) =>
+      coding: async (turn, signal, sessionEnv) =>
         createHostedInkCoding({
           cwd: turn.workingDirectory,
           tempDir: input.tempDir,
           env: baseEnv,
+          sessionEnv,
           shell: await resolveBinary('bash'),
           resolveBinary,
           signal,

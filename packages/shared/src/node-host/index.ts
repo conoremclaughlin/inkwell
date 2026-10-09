@@ -12,3 +12,5 @@ export * from './mcp-client.js';
 export * from './skill-mcp-discovery.js';
 export * from './keychain-credentials.js';
 export * from './tool-processes.js';
+
+export * from './session-activity.js';

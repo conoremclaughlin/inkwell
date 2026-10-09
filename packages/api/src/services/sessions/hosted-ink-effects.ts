@@ -5,6 +5,7 @@ import { dirname, isAbsolute } from 'path';
 import { encodeContextToken } from '@inklabs/shared';
 import {
   createSessionToolHost,
+  sessionCredentialsForProfile,
   requestHostedToolApproval,
   type CodingToolHostPorts,
 } from '@inklabs/shared/node-host';
@@ -29,7 +30,8 @@ export interface HostedInkEffectHost {
   /** Must not run synchronous Pi work on the API event loop or inherit API secrets. */
   coding(
     input: HostedInkSessionInput,
-    signal: AbortSignal
+    signal: AbortSignal,
+    sessionEnv: (signal: AbortSignal) => Promise<Readonly<NodeJS.ProcessEnv>>
   ): Promise<{ ports: CodingToolHostPorts; close(): Promise<void> }>;
   credentials(
     input: HostedInkSessionInput,
@@ -94,9 +96,33 @@ export function createHostedInkEffects(host: HostedInkEffectHost): PrepareHosted
       context: { sbSlug: input.sbSlug, studioId: input.studioId },
     });
     const activeSkills = await host.activeSkills(input, signal);
-    const credentials = await host.credentials(input, signal);
+    const credentials = await sessionCredentialsForProfile(
+      input.options.requireProfile ?? input.options.profile,
+      () => host.credentials(input, signal)
+    );
     signal.throwIfAborted();
-    const coding = await host.coding(input, signal);
+    const coding = await host.coding(input, signal, async (callSignal) => {
+      callSignal.throwIfAborted();
+      const env = await ports.provider.context!.host.sessionEnv({
+        hardTimeoutMs: Math.max(1, ports.deadlineAt - Date.now()),
+      });
+      callSignal.throwIfAborted();
+      return {
+        ...env,
+        INK_SERVER_URL: new URL(host.mcpUrl).origin,
+        INK_SESSION_ID: input.sessionId,
+        ...(input.studioId ? { INK_STUDIO_ID: input.studioId } : {}),
+        SB_SLUG: input.sbSlug,
+        AGENT_ID: input.sbSlug,
+        INK_CONTEXT: encodeContextToken({
+          sessionId: input.sessionId,
+          studioId: input.studioId ?? 'main',
+          sbSlug: input.sbSlug!,
+          runtime: 'ink',
+          cliAttached: false,
+        }),
+      };
+    });
     let toolkit: ReturnType<typeof createSessionToolHost>;
     try {
       signal.throwIfAborted();

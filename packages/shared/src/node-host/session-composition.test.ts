@@ -109,6 +109,7 @@ async function fixture(name: string, replies: string[], history: Record<string, 
           }
         : { success: true, memories: [] }
     ),
+    logActivity: vi.fn(async () => {}),
     prepareHost: vi.fn(async () => {}),
     unavailable: (reason) => {
       throw new Error(reason);

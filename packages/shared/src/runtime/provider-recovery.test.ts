@@ -59,3 +59,9 @@ describe('provider recovery from a host-loaded snapshot', () => {
     ).toBe('fixture-new-model');
   });
 });
+
+// Persisted input is JSON, not necessarily a well-formed event. In particular
+// do not coerce an object-shaped `type` through its own `toString` field.
+it('ignores non-string event types without coercion', () => {
+  expect(findLastBackendSessionInEvents([{ type: { toString: 'invalid' } }])).toBeUndefined();
+});
