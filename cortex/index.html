@@ -49,6 +49,7 @@
   --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
   --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
   --supply-bg: #fbecd2; --supply-fg: #7a4a06; --supply-dot: #c98410;
+  --pending-bg: #f8e1e6; --pending-fg: #8c1d3c; --pending-dot: #d6456b;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -74,6 +75,7 @@
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
+    --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -97,6 +99,7 @@
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
+    --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -251,6 +254,8 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.fees::before { background: var(--fees-dot); }
 .pill.supply { background: var(--supply-bg); color: var(--supply-fg); }
 .pill.supply::before { background: var(--supply-dot); }
+.pill.pending { background: var(--pending-bg); color: var(--pending-fg); }
+.pill.pending::before { background: var(--pending-dot); }
 .entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
 .centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
@@ -456,6 +461,11 @@ footer {
             <button type="button" class="chip" data-example="storage">A storage question</button>
             <button type="button" class="chip" data-example="crew">A crew question</button>
           </div>
+          <div class="examples" role="group" aria-label="Fill in a subscription box example">
+            <span>Clube Caramelo:</span>
+            <button type="button" class="chip" data-example="boleto">Boleto vencido</button>
+            <button type="button" class="chip" data-example="entrega">Pergunta de entrega</button>
+          </div>
           <div class="centre">
             <label for="centrePhone">Received on centre phone</label>
             <select id="centrePhone" name="centrePhone">
@@ -526,10 +536,15 @@ const EXAMPLES = {
   issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
   crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
+  boleto: "Oi, meu boleto venceu ontem e não consegui pagar. CPF 123.456.789-09, tel (11) 91234-5678. Minha caixa ainda vai sair?",
+  entrega: "Oi, quando chega minha caixa? O rastreio não atualiza há 3 dias.",
   supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
   parentfee: "Good morning, I have paid Ada's school fees, KSh 15,000 through M-Pesa this morning. Ref QKL2M4N6P8.\nThank you,\nGrace",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
 };
+
+// A Portuguese delivery question. No \b after accented letters: JavaScript's \b only knows a-z.
+const PT_LATE = /\b(quando chega|quando vai chegar|ainda n[ãa]o chegou|n[ãa]o chegou|n[ãa]o recebi|rastreio|rastreamento|c[oó]digo de rastreio|cad[êe] (a |o )?minh[ao]|minha (caixa|encomenda|entrega) (est[áa] )?atrasad[ao])/;
 
 const RULES = {
   order: [
@@ -546,6 +561,8 @@ const RULES = {
   ],
   support: [
     [/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/, 4, "late delivery"],
+    // Portuguese (Clube Caramelo): "quando chega minha caixa?", "o rastreio não atualiza", "não chegou".
+    [PT_LATE, 4, "late delivery"],
     [/\b(back in stock|in stock\?|restock(ed)?|when will .{0,40}\b(be )?(back|available|in stock))\b/, 3, "a stock question"],
     [/\b(is|are|do you have|do you carry|can i get)\b[^?]{0,80}\b(available|in stock|back|left)\b[^?]{0,60}\?/, 3, "a product question"],
     [/\btracking\b/, 1, "tracking"],
@@ -1056,10 +1073,64 @@ function feesAnswer(text) {
   };
 }
 
+/* ---------- LGPD: mask CPF and Brazilian phone numbers before anything is shown or logged ---------- */
+// CPF 123.456.789-09 or 12345678909 becomes ***.456.789-**.
+// Phones (11) 91234-5678, 11912345678 or +55 11 91234-5678 become (11) 9****-5678.
+function maskLGPD(text) {
+  const cpf = (a, b, c) => "***." + b + "." + c + "-**";
+  return String(text)
+    // 1. A written-out CPF: 123.456.789-09
+    .replace(/(?<![\d*])(\d{3})\.(\d{3})\.(\d{3})-(\d{2})(?!\d)/g, (m, a, b, c) => cpf(a, b, c))
+    // 2. Eleven bare digits right after the word CPF are a CPF, even if they'd also fit a phone.
+    .replace(/(\bcpf\s*(?:n[ºo°.]?\s*)?[:#-]?\s*)(\d{3})(\d{3})(\d{3})(\d{2})(?!\d)/gi, (m, lead, a, b, c) => lead + cpf(a, b, c))
+    // 3. Phones: optional +55, a two-digit area code (with or without brackets), then 9 + 8 digits (mobile) or 8 digits.
+    .replace(/(?<![\d*])(?:\+\s?55[\s.-]?)?(?:\((\d{2})\)|(\d{2}))[\s.-]?(9?)\s?(\d{4})[\s.-]?(\d{4})(?!\d)/g,
+      (m, ddBracket, ddBare, nine, mid, last) => {
+        const bare = !ddBracket && !/[\s.()+-]/.test(m);
+        // A bare run of digits is only a phone if it's a mobile (DD9XXXXXXXX); otherwise leave it for the CPF rule.
+        if (bare && !nine) return m;
+        return "(" + (ddBracket || ddBare) + ") " + nine + "****-" + last;
+      })
+    // 4. Any other eleven bare digits: a CPF.
+    .replace(/(?<![\d*])(\d{3})(\d{3})(\d{3})(\d{2})(?!\d)/g, (m, a, b, c) => cpf(a, b, c));
+}
+
+/* ---------- Pagamento pendente: a failed or expired payment on a subscription (Clube Caramelo) ---------- */
+// Portuguese and English, any case, with or without accents ("nao" or "não").
+const PENDING = [
+  /\bboleto\b[^.!?\n]{0,40}?\b(vencid[oa]|venceu|vence hoje|expirad[oa]|expirou|n[ãa]o (foi )?pago|n[ãa]o paguei|em aberto)/i,
+  /\bpix\b[^.!?\n]{0,30}?\bn[ãa]o (foi )?(confirmado|caiu|entrou|aprovado)/i,
+  /\bpix\b[^.!?\n]{0,10}?\bn[ãa]o foi\b/i,
+  /\bpagamento\b[^.!?\n]{0,20}?\b(recusado|falhou|pendente|n[ãa]o (foi )?aprovado|n[ãa]o (foi )?confirmado|em aberto)/i,
+  /\bassinatura\b[^.!?\n]{0,20}?\b(suspensa|pausada por falta de pagamento|cancelada por falta de pagamento)/i,
+  /\bn[ãa]o consegui pagar\b/i,
+  /\b(expired boleto|boleto (has )?expired|pix (payment )?(failed|not confirmed)|payment (failed|declined|was declined|did not go through|didn'?t go through)|card (was )?declined|subscription (is )?suspended)\b/i
+];
+function isPending(text) { return PENDING.some(re => re.test(text)); }
+function pendingAnswer(text) {
+  const facts = [];
+  const hit = PENDING.map(re => text.match(re)).find(Boolean);
+  if (hit) facts.push(["Reported", hit[0].replace(/\s+/g, " ").trim()]);
+  // The text is already masked here, so only the masked CPF and phone can ever show up.
+  const cpf = text.match(/\*\*\*\.\d{3}\.\d{3}-\*\*/);
+  if (cpf) facts.push(["CPF", cpf[0]]);
+  const phone = text.match(/\(\d{2}\) 9?\*{4}-\d{4}/);
+  if (phone) facts.push(["Phone", phone[0]]);
+  return {
+    category: "pending", label: "Pagamento pendente", urgency: "Before the box ships", confidence: null,
+    step: "Envie um link Pix ao assinante antes do envio da caixa",
+    why: "Send the subscriber a Pix link before the box ships: their payment failed or expired.",
+    facts, signals: [], summary: [cpf && cpf[0], phone && phone[0]].filter(Boolean).join(" · ")
+  };
+}
+
 function classify(text, now = new Date()) {
-  const clean = text.trim();
+  // Personal data is masked first, so nothing below can show or log a full CPF or phone number.
+  const clean = maskLGPD(text).trim();
   if (!clean) return null;
   if (isMpesa(clean) || isParentFee(clean)) return feesAnswer(clean);
+  // A failed payment comes before Support and Billing: the box mustn't ship unpaid.
+  if (isPending(clean)) return pendingAnswer(clean);
   if (isOrderStatus(clean)) return orderStatusAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
@@ -1124,7 +1195,7 @@ function classify(text, now = new Date()) {
       step = "Process the refund"; why = "They're asking for their money back or a return.";
     } else if (/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/.test(lower)) {
       step = "Send a replacement and apologize"; why = "Something arrived wrong or damaged.";
-    } else if (/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/.test(lower)) {
+    } else if (/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/.test(lower) || PT_LATE.test(lower)) {
       step = "Send tracking and an update today"; why = "The order seems late and they're waiting on it.";
     } else {
       step = "Reply to the customer today"; why = "It's a question from a customer."; urgency = "Today";
@@ -1238,6 +1309,7 @@ function renderLog(freshId) {
     if (t.day) timeEl.append(el("small", { text: t.day }));
     const body = el("div", { class: "entry-body" },
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      e.category === "pending" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "fees" && (e.summary || e.centre) ? el("div", { class: "entry-fee", text: [e.summary, e.centre].filter(Boolean).join(" · ") }) : null,
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
@@ -1254,7 +1326,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, pending: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1269,6 +1341,7 @@ function renderLog(freshId) {
   if (counts.crew) parts.push(counts.crew + " crew");
   if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
   if (counts.supply) parts.push(counts.supply + " supply risk");
+  if (counts.pending) parts.push(counts.pending + " pagamento pendente");
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
@@ -1294,7 +1367,7 @@ function sortNow() {
   mark.classList.remove("lit");
   void mark.getBoundingClientRect();
   mark.classList.add("lit");
-  const oneLine = text.trim().replace(/\s+/g, " ");
+  const oneLine = maskLGPD(text).trim().replace(/\s+/g, " ");
   const entry = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     at: new Date().toISOString(),
@@ -1459,6 +1532,7 @@ function hint(text) {
     crew: "The crew has a question. Sort it and I'll log it.",
     fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
     supply: "A supplier running late. Sort it and I'll flag the reorder point.",
+    pending: "A failed payment. Sort it and I'll tell you what to send before the box ships.",
     other: "Hmm, I can't tell what that is yet."
   };
   say(lines[r.category] || lines.other);
@@ -1482,6 +1556,7 @@ function react(r) {
   if (r.category === "partner") { say("A follow-up to schedule."); mood(0.6, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
+  if (r.category === "pending") { say("Pagamento pendente: send the subscriber a Pix link before the box ships."); mood(0, 0.6); return; }
   if (r.category === "supply") { say("A supplier is running late. Check whether what's on hand lasts, or line up a backup."); mood(0, 0.6); return; }
   if (r.category === "fees") { say("Payment received" + (r.summary ? ": " + r.summary : "") + ". Record it in the fee register."); mood(1, 0); hop(); return; }
   const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
