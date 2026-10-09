@@ -277,6 +277,10 @@ describe('bearer-verification census', () => {
     'routes/admin.ts',
     // Door 3.
     'routes/chat-auth.ts',
+    // Hosted runtime accepts only a signed mcp_access token bound to the admitted
+    // session, identity label and user. Browser grants are refused; regression in
+    // hosted-ink-binding.test.ts. No human-auth fallback or token-type downgrade.
+    'services/sessions/hosted-ink-binding.ts',
     // The companion router itself.
     'routes/browser-companion.ts',
   ].sort();
