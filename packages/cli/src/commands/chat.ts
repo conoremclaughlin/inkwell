@@ -6,7 +6,6 @@ import { homedir, tmpdir } from 'os';
 import {
   runSessionAgentTurn,
   SessionStream,
-  applyModelSelection,
   applyBackendSelection,
   applyDetectedModel,
   createSessionCompaction,
@@ -64,6 +63,7 @@ import {
   type EvictedEntryRecord,
   type HistoryHydrationResult,
   type RecoveredBackendSession,
+  type SessionControlRequest,
 } from '@inklabs/shared/runtime';
 export {
   keptEntriesForCompaction,
@@ -171,11 +171,15 @@ import {
 import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
-import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
+import { discoverSkills, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
-import { createSessionSkills, sessionCredentialsForProfile } from '@inklabs/shared/node-host';
+import {
+  createSessionControls,
+  createSkillInstructionHost,
+  sessionCredentialsForProfile,
+} from '@inklabs/shared/node-host';
 import { resolveCredentialRefs, loadKeychainCredentials } from '../repl/credential-resolver.js';
 import {
   createSignalSink,
@@ -372,6 +376,8 @@ function readSystemPromptFile(path?: string): string | undefined {
 
 interface ChatRuntime {
   backend: string;
+  appliedControlId?: string;
+  providerRecoveryDisabled?: boolean;
   model?: string;
   /** Reasoning effort for every backend spawn (claude: low | medium | high | xhigh | max). */
   effort?: string;
@@ -2209,13 +2215,6 @@ async function runChatSession(
     runtime.toolMode,
     policyPathFromEnv ? { policyPath: policyPathFromEnv } : undefined
   );
-  const sessionSkills = createSessionSkills({
-    state: () => runtime,
-    policy: toolPolicy,
-    // Interactive host adapters only. The server must supply async, rooted I/O.
-    discover: () => discoverSkills(process.cwd()),
-    load: (skill) => loadSkillInstruction(skill),
-  });
   toolPolicy.setContext({
     sbSlug,
     studioId: runtime.studioId,
@@ -3064,6 +3063,33 @@ async function runChatSession(
     }
   };
 
+  // Bind only after the canonical session/log has been selected. The CLI uses
+  // the hosted reducer and rooted async instruction loader, never a second log.
+  const controlsSessionId = runtime.sessionId;
+  const sessionControls = createSessionControls({
+    runtime,
+    log: runtime.log,
+    policy: toolPolicy,
+    skills: createSkillInstructionHost(process.cwd(), homedir()),
+    get contextBudgetAuto() {
+      return contextBudgetAuto;
+    },
+    assertCurrent: () => {
+      if (runtime.sessionId !== controlsSessionId)
+        throw new Error('Session controls belong to a different session');
+    },
+    invalidateProvider: () => sessionContext.clearProvider(),
+    mintId: randomUUID,
+    notice: (message) => printEvent(chalk.yellow(message)),
+  });
+  const applySessionControl = async (request: SessionControlRequest): Promise<void> => {
+    const accepted = sessionControls.enqueue(request);
+    if (accepted.status !== 'pending') throw new Error(`Control refused: ${accepted.reason}`);
+    await sessionControls.drain();
+    const receipt = sessionControls.enqueue(request); // exact retry reads the terminal receipt
+    if (receipt.status !== 'applied') throw new Error(`Control not applied: ${receipt.reason}`);
+  };
+  let recoveredProviderControlId: string | undefined;
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, sbSlug);
@@ -3086,25 +3112,6 @@ async function runChatSession(
         s.at
       );
     }
-    // Recover the provider-reported model persisted by the prior process
-    // BEFORE any budget enforcement runs: a reattached large transcript must
-    // be judged against the session's REAL window, not the conservative
-    // default that stands in until this process's own init event arrives.
-    // An explicit --model override still wins.
-    const persistedModel = findLastDetectedModel(existingTranscript, runtime.backend);
-    if (persistedModel && !runtime.model) {
-      runtime.detectedModel = persistedModel;
-      const recoveredWindow = resolveBackendTokenWindow(runtime.backend, persistedModel);
-      if (recoveredWindow !== runtime.backendTokenWindow) {
-        runtime.backendTokenWindow = recoveredWindow;
-        if (contextBudgetAuto) {
-          runtime.maxContextTokens = defaultContextBudget(
-            recoveredWindow,
-            promptTransportFor(runtime.backend)
-          );
-        }
-      }
-    }
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
@@ -3116,12 +3123,14 @@ async function runChatSession(
       // turn below, AFTER all startup mutations, so a matching session
       // resumes rather than spuriously reseeding on startup-timing drift.
       const recovered = findLastBackendSession(existingTranscript);
+      recoveredProviderControlId = recovered?.controlId;
       if (recovered && recovered.routing === runtime.toolRouting) {
         sessionContext.provider.id = recovered.id;
       }
     }
     // Continue the event-id sequence from where the file left off
     runtime.log.seed(hydrated.maxEid);
+    for (const event of readTranscriptEvents(existingTranscript)) sessionControls.replay(event);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
     // Replayed tool calls populate the inspector's Tool Calls section so
     // Ctrl+T shows the receipts behind prior turns, not just this session's
@@ -3159,6 +3168,38 @@ async function runChatSession(
         source: 'none',
         tailPreview: [],
       };
+    }
+  }
+
+  await sessionControls.restore(undefined, recoveredProviderControlId);
+  // Explicit launch configuration wins, but is now part of the same durable
+  // selection: the next host must not silently restore the previous override.
+  if (options.model !== undefined && sessionControls.selectedModel !== (options.model || null)) {
+    await applySessionControl({
+      controlId: randomUUID(),
+      action: 'model',
+      model: options.model || null,
+    });
+  }
+  if (existingTranscript) {
+    // Recover the provider-reported model persisted by the prior process
+    // BEFORE any budget enforcement runs: a reattached large transcript must
+    // be judged against the session's REAL window, not the conservative
+    // default that stands in until this process's own init event arrives.
+    // An explicit --model override still wins.
+    const persistedModel = findLastDetectedModel(existingTranscript, runtime.backend);
+    if (persistedModel && !runtime.model) {
+      runtime.detectedModel = persistedModel;
+      const recoveredWindow = resolveBackendTokenWindow(runtime.backend, persistedModel);
+      if (recoveredWindow !== runtime.backendTokenWindow) {
+        runtime.backendTokenWindow = recoveredWindow;
+        if (contextBudgetAuto) {
+          runtime.maxContextTokens = defaultContextBudget(
+            recoveredWindow,
+            promptTransportFor(runtime.backend)
+          );
+        }
+      }
     }
   }
 
@@ -4767,6 +4808,9 @@ async function runChatSession(
     onReplyReady?: () => void
   ) => {
     if (!raw.trim()) return;
+    // Even an empty drain checks the persistence-uncertainty fence, including
+    // the headless path which does not go through the interactive FIFO.
+    await sessionControls.drain();
     sessionStream.resetTurn();
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
@@ -4883,19 +4927,47 @@ async function runChatSession(
   // One shared ordinary-input drain. The CLI still owns admission, context,
   // policy and rendering; hosted callers must supply durable command IDs and
   // the canonical owner fence rather than treating this queue as a lease.
-  const inputDrain = new SerialInputDrain<{
-    raw: string;
-    source: 'user' | 'inbox-auto' | 'system';
-    displayLabel?: string;
-    onReplyReady?: () => void;
-  }>({
+  type CliInput =
+    | {
+        kind: 'turn';
+        raw: string;
+        source: 'user' | 'inbox-auto' | 'system';
+        displayLabel?: string;
+        onReplyReady?: () => void;
+      }
+    | { kind: 'control'; request: SessionControlRequest; backend?: string };
+  const inputDrain = new SerialInputDrain<CliInput>({
     maxPendingInputs: 128,
     maxPendingBytes: 8 * 1024 * 1024,
-    sizeOf: ({ raw, source, displayLabel }) =>
-      Buffer.byteLength(raw, 'utf8') +
-      Buffer.byteLength(source, 'utf8') +
-      Buffer.byteLength(displayLabel ?? '', 'utf8'),
-    run: async ({ raw, source, displayLabel, onReplyReady }) => {
+    sizeOf: (input) =>
+      input.kind === 'control'
+        ? Buffer.byteLength(JSON.stringify(input), 'utf8')
+        : Buffer.byteLength(input.raw, 'utf8') +
+          Buffer.byteLength(input.source, 'utf8') +
+          Buffer.byteLength(input.displayLabel ?? '', 'utf8'),
+    run: async (input) => {
+      if (input.kind === 'control') {
+        // /backend remains CLI-local. No provider can run in this FIFO slot;
+        // publish its selection before success, restoring local state on refusal.
+        const before = {
+          backend: runtime.backend,
+          model: runtime.model,
+          detectedModel: runtime.detectedModel,
+          backendTokenWindow: runtime.backendTokenWindow,
+          maxContextTokens: runtime.maxContextTokens,
+        };
+        try {
+          if (input.backend) applyBackendSelection(runtime, input.backend, contextBudgetAuto);
+          await applySessionControl(input.request);
+        } catch (error) {
+          Object.assign(runtime, before);
+          // An uncertain write still poisons the shared composer: rollback is
+          // not a claim that the durable write failed or permission to launch.
+          throw error;
+        }
+        return;
+      }
+      const { raw, source, displayLabel, onReplyReady } = input;
       if (inkRepl) {
         inkRepl.setWaiting(true, runtime.backend);
       } else {
@@ -4940,6 +5012,7 @@ async function runChatSession(
     // input started while draining. Never delete images a child still reads.
     cancelRunningClones();
     await inputDrain.close();
+    sessionControls.close();
     cancelRunningClones();
     await clones.drain();
     await sessionToolHost.close();
@@ -4950,7 +5023,7 @@ async function runChatSession(
     displayLabel?: string,
     onReplyReady?: () => void
   ): Promise<void> =>
-    inputDrain.enqueue({ raw, source, displayLabel, onReplyReady }, () => {
+    inputDrain.enqueue({ kind: 'turn', raw, source, displayLabel, onReplyReady }, () => {
       // Echo at SUBMIT time, not when the queue reaches the turn — a message
       // typed while another turn is in flight must not vanish until its turn
       // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
@@ -5821,7 +5894,16 @@ async function runChatSession(
             showInPanel(['Usage: /backend <claude|codex|gemini>']);
             break;
           }
-          applyBackendSelection(runtime, next, contextBudgetAuto);
+          try {
+            await inputDrain.enqueue({
+              kind: 'control',
+              backend: next,
+              request: { controlId: randomUUID(), action: 'model', model: runtime.model ?? null },
+            });
+          } catch (error) {
+            showInPanel([String(error)]);
+            break;
+          }
           const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
             backendLines.push(
@@ -5833,7 +5915,15 @@ async function runChatSession(
         }
         case 'model': {
           const next = slash.args[0];
-          applyModelSelection(runtime, next || undefined, contextBudgetAuto);
+          try {
+            await inputDrain.enqueue({
+              kind: 'control',
+              request: { controlId: randomUUID(), action: 'model', model: next || null },
+            });
+          } catch (error) {
+            showInPanel([String(error)]);
+            break;
+          }
           showInPanel([
             `Model override: ${runtime.model || '(backend default)'}`,
             `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok`,
@@ -6335,24 +6425,33 @@ async function runChatSession(
             showInPanel(['Usage: /skill-use <name>']);
             break;
           }
-          const activation = await sessionSkills.activate(name);
-          showInPanel([
-            activation.allowed ? `Activated skill ${activation.skill.name}` : activation.reason,
-          ]);
+          try {
+            await inputDrain.enqueue({
+              kind: 'control',
+              request: { controlId: randomUUID(), action: 'skill_use', name },
+            });
+            showInPanel([`Activated skill ${name}`]);
+          } catch (error) {
+            showInPanel([String(error)]);
+          }
           break;
         }
         case 'skill-clear': {
           const name = slash.args.join(' ').trim();
-          if (!name) {
-            sessionSkills.clear();
-            showInPanel(['Cleared all active skills.']);
-            break;
-          }
-          const removed = sessionSkills.clear(name);
-          if (removed === 0) {
-            showInPanel([`No active skill matched: ${name}`]);
-          } else {
-            showInPanel([`Cleared ${removed} active skill(s) for ${name}`]);
+          try {
+            await inputDrain.enqueue({
+              kind: 'control',
+              request: {
+                controlId: randomUUID(),
+                action: 'skill_clear',
+                ...(name ? { name } : {}),
+              },
+            });
+            showInPanel([
+              name ? `Cleared active skills named ${name}.` : 'Cleared all active skills.',
+            ]);
+          } catch (error) {
+            showInPanel([String(error)]);
           }
           break;
         }

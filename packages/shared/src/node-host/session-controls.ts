@@ -19,7 +19,7 @@ import { SkillInstructionDriftError } from './skill-instructions.js';
 
 export interface SessionControlsPorts {
   runtime: Omit<SessionModelState, 'log'> & {
-    sessionId: string;
+    sessionId?: string;
     activeSkills?: readonly SessionPromptSkill[];
     providerRecoveryDisabled?: boolean;
     appliedControlId?: string;
@@ -135,6 +135,10 @@ export function createSessionControls(ports: SessionControlsPorts) {
     }
   }
   return {
+    /** Persisted model choice, distinct from an inherited launch default. */
+    get selectedModel(): string | null | undefined {
+      return selection.model;
+    },
     replay(event: Record<string, unknown>) {
       if (event.type !== 'session_control') return;
       try {
