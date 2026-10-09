@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1024 1024%22%3E%3Crect width=%221024%22 height=%221024%22 rx=%22220%22 fill=%22%23F5F3EC%22/%3E%3Ccircle cx=%22573%22 cy=%22584%22 r=%22261%22 fill=%22%23151515%22/%3E%3Ccircle cx=%22261%22 cy=%22261%22 r=%22118%22 fill=%22%23F2683A%22/%3E%3C/svg%3E">
+</head>
+<body>
+<title>Cortex Bid Check</title>
+<style>
+/* Layout: the bid on the left (paste, fields, risk lines), the verdict and the math beside it, the log underneath. Paper, ink and spark. */
+:root {
+  --paper: #f5f3ec;
+  --raised: #fbfaf6;
+  --sunk: #ebe8de;
+  --ink: #202923;
+  --ink-soft: #46514a;
+  --muted: #5b645c;
+  --line: #d9dccf;
+  --edge: rgba(32, 41, 35, 0.08);
+  --spark: #f2683a;
+  --spark-a: #ffcf5a;
+  --spark-b: #f04e2b;
+  --button: #202923;
+  --button-text: #f8f4e7;
+  --order-bg: #e3eddf;
+  --order-fg: #0b6a5d;
+  --order-dot: #16a390;
+  --support-bg: #f6e1d3;
+  --support-fg: #8a4523;
+  --support-dot: #e3a785;
+  --billing-bg: #fce6d8;
+  --billing-fg: #a3360f;
+  --billing-dot: #f2683a;
+  --other-bg: #ebe8de;
+  --other-fg: #46514a;
+  --other-dot: #8b938b;
+  --inventory-bg: #e2e8f1;
+  --inventory-fg: #274472;
+  --inventory-dot: #4b6fae;
+  --alert-bg: #fde6e0;
+  --alert-fg: #a01d0b;
+  --alert-line: #f0ad9c;
+  --quote-bg: #e6efe0; --quote-fg: #2f5d1e; --quote-dot: #5c9a3c;
+  --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
+  --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
+  --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
+  --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
+  --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+    --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+    --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+    --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+    --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+    --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+    --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+    --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+  --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+  --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+  --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+  --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+  --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+  --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+  --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
+    --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-inline: 20px;
+  padding-block: 28px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  min-height: 100vh;
+}
+@media (max-width: 520px) { .wrap { padding-inline: 16px; padding-block: 20px 0; gap: 22px; } }
+
+header { display: flex; align-items: center; gap: 14px; }
+.mark { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: var(--shadow); }
+.brand { min-width: 0; }
+h1 {
+  font: 500 30px/1.1 var(--serif);
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+}
+.lede { margin: 4px 0 0; color: var(--muted); font-size: 15px; text-wrap: pretty; }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 22px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+@media (max-width: 520px) { .panel { padding: 18px 16px; border-radius: 16px; } }
+
+h2 { font: 600 19px/1.25 var(--serif); margin: 0; }
+.label { display: block; font-weight: 600; font-size: 15px; }
+.hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+
+textarea {
+  width: 100%;
+  min-height: 168px;
+  resize: vertical;
+  font: 14px/1.55 var(--mono);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+
+.examples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.examples span { color: var(--muted); font-size: 13px; }
+.chip {
+  font: 500 13px/1 var(--sans);
+  color: var(--ink-soft);
+  background: var(--sunk);
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.chip:hover { color: var(--ink); }
+.chip:focus-visible, .btn:focus-visible, .link:focus-visible { outline: 2px solid var(--spark); outline-offset: 2px; }
+
+.actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.btn {
+  font: 600 15px/1 var(--sans);
+  color: var(--button-text);
+  background: var(--button);
+  border: 0;
+  border-radius: 999px;
+  padding: 13px 22px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn .spark { width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, var(--spark-a), var(--spark-b)); }
+.kbd { color: var(--muted); font-size: 12px; }
+
+/* The answer */
+.result {
+  border-radius: 14px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.result[data-state="empty"] { color: var(--muted); }
+.result-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: 600 12px/1 var(--sans);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 6px 10px 6px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.order { background: var(--order-bg); color: var(--order-fg); }
+.pill.order::before { background: var(--order-dot); }
+.pill.support { background: var(--support-bg); color: var(--support-fg); }
+.pill.support::before { background: var(--support-dot); }
+.pill.billing { background: var(--billing-bg); color: var(--billing-fg); }
+.pill.billing::before { background: var(--billing-dot); }
+.pill.other { background: var(--other-bg); color: var(--other-fg); }
+.pill.other::before { background: var(--other-dot); }
+.pill.inventory { background: var(--inventory-bg); color: var(--inventory-fg); }
+.pill.inventory::before { background: var(--inventory-dot); }
+.pill.quote { background: var(--quote-bg); color: var(--quote-fg); }
+.pill.quote::before { background: var(--quote-dot); }
+.pill.storage { background: var(--storage-bg); color: var(--storage-fg); }
+.pill.storage::before { background: var(--storage-dot); }
+.pill.crew { background: var(--crew-bg); color: var(--crew-fg); }
+.pill.crew::before { background: var(--crew-dot); }
+.pill.issue { background: var(--issue-bg); color: var(--issue-fg); }
+.pill.issue::before { background: var(--issue-dot); }
+.pill.fees { background: var(--fees-bg); color: var(--fees-fg); }
+.pill.fees::before { background: var(--fees-dot); }
+.entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
+.centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
+.centre select { font: 14px/1.3 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.centre select:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; }
+.result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
+.alert-tag.big { font-size: 16px; padding: 9px 14px; letter-spacing: 0.08em; }
+.pinned { border-top: 0; background: var(--alert-bg); border-radius: 12px; padding: 12px 12px; margin-bottom: 8px; }
+.pinned + .entry { border-top: 0; }
+.pin-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pin-row .btn { padding: 8px 14px; font-size: 13px; }
+.handled-note { color: var(--muted); font-size: 12px; }
+.examples + .examples { margin-top: -4px; }
+.result.alert .step { color: var(--alert-fg); font-weight: 600; }
+.alert-tag { display: inline-flex; align-items: center; font: 700 12px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--alert-bg); background: var(--alert-fg); border-radius: 999px; padding: 6px 10px; }
+.entry.alert-entry .entry-step { color: var(--alert-fg); }
+.when { font-size: 13px; color: var(--muted); }
+.when b { color: var(--ink-soft); font-weight: 600; }
+.step { font: 500 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
+.why { margin: 0; color: var(--ink-soft); font-size: 14px; }
+.facts { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 14px; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.signals { color: var(--muted); font-size: 12px; margin: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  .result.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+  .entry.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+}
+@keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
+
+
+
+
+.top-link { margin-left: auto; font: 500 14px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+header { flex-wrap: wrap; }
+.paste { min-height: 84px; }
+.fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 520px) { .fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .fields .field.wide { grid-column: 1 / -1; } }
+.field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.field label { font-weight: 600; font-size: 13px; color: var(--ink-soft); }
+.field input { width: 100%; min-width: 0; font: 15px/1.4 var(--sans); font-variant-numeric: tabular-nums; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; }
+.field input:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+.risks { min-height: 72px; font-size: 13px; }
+.floors { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: center; font-size: 13px; color: var(--ink-soft); }
+.floors label { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.floors input { width: 64px; font: 14px/1.3 var(--sans); font-variant-numeric: tabular-nums; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.verdict { border-radius: 14px; background: var(--paper); border: 1px solid var(--line); padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.verdict[data-state="empty"] { color: var(--muted); }
+.verdict.hold { background: var(--alert-bg); border: 2px solid var(--alert-line); }
+.verdict.clear { background: var(--order-bg); border: 1px solid transparent; }
+.verdict .head { font: 600 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
+.verdict.hold .head { color: var(--alert-fg); }
+.verdict.clear .head { color: var(--order-fg); }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.alert-tag { display: inline-flex; align-items: center; font: 700 12px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--alert-bg); background: var(--alert-fg); border-radius: 999px; padding: 7px 11px; }
+.alert-tag.big { font-size: 15px; padding: 9px 14px; }
+.math { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 14px; font-size: 14px; }
+.math dt { color: var(--muted); }
+.math dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.math dd .eq { color: var(--muted); font-family: var(--mono); font-size: 12.5px; display: block; }
+.note { color: var(--muted); font-size: 12.5px; margin: 0; }
+.log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.tally { color: var(--ink-soft); font-size: 13px; font-variant-numeric: tabular-nums; }
+.log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.row { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 4px 14px; padding: 12px 0; border-top: 1px solid var(--line); align-items: start; }
+.row:first-child { border-top: 0; }
+@media (max-width: 520px) { .row { grid-template-columns: minmax(0, 1fr) auto; } .row time { grid-column: 1 / -1; } }
+.row time { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.row .job { font-weight: 600; overflow-wrap: anywhere; }
+.row .nums { color: var(--ink-soft); font-size: 13px; font-variant-numeric: tabular-nums; }
+.row.flagged .nums b { color: var(--alert-fg); }
+.row .tags { margin-top: 4px; }
+.row .tag-sm { font: 700 11px/1 var(--sans); letter-spacing: 0.04em; text-transform: uppercase; color: var(--alert-fg); background: var(--alert-bg); border-radius: 999px; padding: 5px 8px; }
+.row .ok-sm { font: 700 11px/1 var(--sans); letter-spacing: 0.04em; text-transform: uppercase; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 5px 8px; }
+.sent { font: 600 12px/1 var(--sans); border-radius: 999px; padding: 8px 11px; cursor: pointer; border: 1px solid var(--line); background: var(--raised); color: var(--ink-soft); white-space: nowrap; }
+.sent[aria-pressed="true"] { background: var(--alert-fg); color: var(--alert-bg); border-color: transparent; }
+.sent:focus-visible, .link:focus-visible { outline: 2px solid var(--spark); outline-offset: 2px; }
+.link { background: none; border: 0; padding: 0; color: var(--ink-soft); font: 500 13px var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.empty { color: var(--muted); font-size: 14px; margin: 0; }
+footer { margin-top: auto; padding: 22px 0 28px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; flex-wrap: wrap; }
+footer .team { display: inline-flex; align-items: center; gap: 8px; }
+footer svg { width: 22px; height: 22px; border-radius: 6px; }
+footer b { color: var(--ink-soft); font-weight: 600; }
+@media (prefers-reduced-motion: no-preference) { .verdict.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); } }
+@keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <svg class="mark" viewBox="0 0 1024 1024" aria-hidden="true">
+      <defs><linearGradient id="sparkA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+      <rect width="1024" height="1024" fill="#F5F3EC"/>
+      <circle cx="573" cy="584" r="261" fill="#151515"/>
+      <g fill="#F8F4E7"><ellipse cx="505" cy="556" rx="27" ry="40"/><ellipse cx="641" cy="556" rx="27" ry="40"/></g>
+      <circle cx="261" cy="261" r="118" fill="url(#sparkA)"/>
+    </svg>
+    <div class="brand">
+      <h1>Cortex Bid Check</h1>
+      <p class="lede">The last check before a bid goes out. Cost, bid, contingency in; margin and flags out.</p>
+    </div>
+    <a class="top-link" href="../">Cortex inbox</a>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="bidTitle">
+      <div>
+        <h2 id="bidTitle">The bid</h2>
+        <p class="hint">Paste the summary line, or type the numbers. $1.42M, $1,420,000, 1.42m and 950k all work.</p>
+      </div>
+      <div class="field">
+        <label for="paste">Bid summary</label>
+        <textarea id="paste" class="paste" spellcheck="false" autocomplete="off" placeholder="Midtown clinic fit-out, cost $1.42M, bid $1.51M, contingency 2%"></textarea>
+      </div>
+      <div class="fields">
+        <div class="field wide"><label for="job">Job</label><input id="job" autocomplete="off"></div>
+        <div class="field"><label for="cost">Cost ($)</label><input id="cost" inputmode="decimal" autocomplete="off"></div>
+        <div class="field"><label for="sell">Bid / sell ($)</label><input id="sell" inputmode="decimal" autocomplete="off"></div>
+        <div class="field"><label for="cont">Contingency (% of cost)</label><input id="cont" inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="field">
+        <label for="risks">Risk lines <span class="note" style="font-weight:400">(optional, one per line: exposure not yet in cost)</span></label>
+        <textarea id="risks" class="risks" spellcheck="false" autocomplete="off" placeholder="Steel escalation $25k&#10;Winter conditions $15k"></textarea>
+      </div>
+      <div class="floors">
+        <label>Margin floor <input id="floor" inputmode="decimal" value="10">%</label>
+        <label>Contingency floor <input id="contFloor" inputmode="decimal" value="5">%</label>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn" id="check"><span class="spark" aria-hidden="true"></span>Check bid</button>
+        <button type="button" class="chip" id="example">Try an example</button>
+        <span class="kbd" id="kbdHint">or press ⌘ + Enter</span>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="verdictTitle">
+      <h2 id="verdictTitle">Before it goes out</h2>
+      <div class="verdict" id="verdict" data-state="empty" aria-live="polite">
+        <p class="head" style="font-size:18px;color:var(--muted)">Check a bid to see its margin and any flags.</p>
+      </div>
+      <p class="note">Gross margin is on the bid (sell), not markup on cost: (bid − cost) ÷ bid. Contingency is read as a % of cost, carried inside the cost figure.</p>
+    </section>
+  </main>
+
+  <section class="panel" aria-labelledby="logTitle">
+    <div class="log-head">
+      <h2 id="logTitle">Bids checked</h2>
+      <span class="tally" id="tally"></span>
+    </div>
+    <p class="empty" id="emptyLog">Nothing checked yet. Every bid you check lands here with the time, so you can see later which thin ones went out anyway.</p>
+    <ol class="log" id="log"></ol>
+    <div class="actions" id="logActions" hidden>
+      <button type="button" class="link" id="csv">Download CSV</button>
+      <button type="button" class="link" id="clear">Clear log</button>
+      <span class="note" id="keep"></span>
+    </div>
+  </section>
+
+  <footer>
+    <div class="team">
+      <svg viewBox="0 0 1024 1024" aria-hidden="true">
+        <defs><linearGradient id="sparkB" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+        <rect width="1024" height="1024" fill="#F5F3EC"/>
+        <circle cx="573" cy="584" r="261" fill="#151515"/>
+        <circle cx="261" cy="261" r="118" fill="url(#sparkB)"/>
+      </svg>
+      <span>Made by <b>Team ARC AI</b></span>
+    </div>
+    <span>Cortex</span>
+  </footer>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const LOG_KEY = "cortex-bids-v1", FLOOR_KEY = "cortex-bid-floors-v1";
+const EXAMPLE = "Midtown clinic fit-out, cost $1.42M, bid $1.51M, contingency 2%";
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); return localStorage.getItem(k) === v; } catch { return false; } },
+  del(k) { try { localStorage.removeItem(k); } catch {} }
+};
+
+// BID-START
+// "$1.42M", "1,420,000", "1.42m", "950k", "$2.1 million" → dollars.
+function parseMoney(s) {
+  if (s == null) return null;
+  const m = String(s).replace(/\s+/g, " ").match(/\$?\s*(\d[\d,]*(?:\.\d+)?|\.\d+)\s*(mm|m|million|k|thousand|b|bn)?\b/i);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  if (!Number.isFinite(n)) return null;
+  const u = (m[2] || "").toLowerCase();
+  return n * (u === "m" || u === "mm" || u === "million" ? 1e6 : u === "k" || u === "thousand" ? 1e3 : u === "b" || u === "bn" ? 1e9 : 1);
+}
+const MONEY = "\\$?\\s*(?:\\d[\\d,]*(?:\\.\\d+)?|\\.\\d+)\\s*(?:mm|m|million|k|thousand|bn|b)?\\b";
+function parseBid(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  const grab = re => { const m = t.match(re); return m ? parseMoney(m[1]) : null; };
+  const cost = grab(new RegExp("\\b(?:total |estimated |our |direct )?costs?\\s*(?:is|of|at|:|=)?\\s*(" + MONEY + ")", "i"));
+  const sell = grab(new RegExp("\\b(?:bid|sell(?:ing)?(?: price)?|price|contract(?: value)?|quote|proposal)\\s*(?:is|of|at|:|=)?\\s*(" + MONEY + ")", "i"));
+  let cont = null;
+  const cp = t.match(/\bcontingency\s*(?:is|of|at|:|=)?\s*(\d+(?:\.\d+)?)\s*%/i) || t.match(/(\d+(?:\.\d+)?)\s*%\s*contingency\b/i);
+  if (cp) cont = Number(cp[1]);
+  else {
+    const cd = t.match(new RegExp("\\bcontingency\\s*(?:is|of|at|:|=)?\\s*(" + MONEY + ")", "i"));
+    if (cd && cost) cont = parseMoney(cd[1]) / cost * 100;
+  }
+  const first = t.split(/[,;|]/)[0].trim();
+  const job = first && !/\b(cost|bid|sell|price|contingency)\b|\$|\d/i.test(first) ? first : "";
+  return { job, cost, sell, cont };
+}
+function parseRisks(text) {
+  return text.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => {
+    const m = l.match(new RegExp(MONEY.replace("\\$?", "\\$?"), "i"));
+    const amount = m ? parseMoney(m[0]) : null;
+    const label = (m ? l.slice(0, m.index) + l.slice(m.index + m[0].length) : l).replace(/[:\-–—=]\s*$/, "").replace(/\s{2,}/g, " ").trim() || "Risk";
+    return { label, amount };
+  }).filter(r => r.amount != null);
+}
+// The check itself: plain arithmetic, every step shown.
+function checkBid({ cost, sell, cont, risks = [], floor = 10, contFloor = 5 }) {
+  const out = { ok: false, flags: [], math: [], missing: [] };
+  if (!(cost > 0)) out.missing.push("cost");
+  if (!(sell > 0)) out.missing.push("bid");
+  if (out.missing.length) return out;
+  out.ok = true;
+  const marginD = sell - cost;
+  const marginP = marginD / sell * 100;
+  const markupP = marginD / cost * 100;
+  out.marginD = marginD; out.marginP = marginP; out.markupP = markupP;
+  out.math.push(["Gross margin", usd(marginD), usd(sell) + " − " + usd(cost) + " = " + usd(marginD)]);
+  out.math.push(["Margin % (on bid)", pct(marginP), usd(marginD) + " ÷ " + usd(sell) + " = " + pct(marginP)]);
+  out.math.push(["Markup % (on cost)", pct(markupP), usd(marginD) + " ÷ " + usd(cost) + " = " + pct(markupP)]);
+  if (cont != null && Number.isFinite(cont)) {
+    const contD = cost * cont / 100;
+    out.contD = contD;
+    out.math.push(["Contingency", usd(contD), pctPlain(cont) + " of cost: " + pctPlain(cont) + " × " + usd(cost) + " = " + usd(contD)]);
+  }
+  const riskTotal = risks.reduce((a, r) => a + r.amount, 0);
+  if (risks.length) {
+    const adjD = sell - cost - riskTotal;
+    const adjP = adjD / sell * 100;
+    out.adjP = adjP;
+    out.math.push(["Risk lines", usd(riskTotal), risks.map(r => r.label + " " + usd(r.amount)).join(" + ")]);
+    out.math.push(["Risk-adjusted margin", pct(adjP), "(" + usd(sell) + " − " + usd(cost) + " − " + usd(riskTotal) + ") ÷ " + usd(sell) + " = " + pct(adjP)]);
+  }
+  const r1 = x => Math.round(x * 10) / 10;
+  if (marginD < 0) out.flags.push({ key: "loss", tag: "Loss", text: "Loss: the bid is " + usd(-marginD) + " below cost" });
+  else if (r1(marginP) < floor) out.flags.push({ key: "thin", tag: "Thin margin", text: "Thin margin: " + pct(marginP) + " vs your " + pctPlain(floor) + " floor" });
+  if (cont != null && Number.isFinite(cont) && r1(cont) < contFloor) out.flags.push({ key: "cont", tag: "Low contingency", text: "contingency below " + pctPlain(contFloor), long: "Contingency " + pctPlain(cont) + " is below your " + pctPlain(contFloor) + " floor" });
+  if (out.adjP != null && r1(out.adjP) < floor && !(marginD < 0) && !(r1(marginP) < floor)) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk-adjusted margin " + pct(out.adjP) + " is under your " + pctPlain(floor) + " floor" });
+  else if (out.adjP != null && r1(out.adjP) < floor) out.flags.push({ key: "risk", tag: "Risk-adjusted under floor", text: "risk lines take it to " + pct(out.adjP) });
+  if (out.flags.length) {
+    const lead = out.flags[0];
+    const rest = out.flags.slice(1).map(f => f.text);
+    let head = lead.key === "cont" ? lead.long : lead.key === "risk" ? "Risk-adjusted margin " + pct(out.adjP) + " vs your " + pctPlain(floor) + " floor" : lead.text;
+    out.headline = "⚠️ " + head + (rest.length ? ", " + rest.join(", ") : "") + ". Hold for VP review.";
+  } else {
+    out.headline = "Clears the floor: " + pct(marginP) + " margin" + (cont != null ? ", contingency " + pctPlain(cont) : "") + ".";
+  }
+  return out;
+}
+function usd(n) { const neg = n < 0; const v = Math.abs(n); return (neg ? "−" : "") + "$" + v.toLocaleString("en-US", { maximumFractionDigits: v >= 100 ? 0 : 2 }); }
+function pct(n) { return (Math.round(n * 10) / 10).toFixed(1) + "%"; }
+// Floors and contingency read the way they were typed: 10%, 2%, 2.5%.
+function pctPlain(n) { const r = Math.round(n * 100) / 100; return (Number.isInteger(r) ? String(r) : String(r)) + "%"; }
+// BID-END
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) { if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v); }
+  for (const k of kids) if (k) n.append(k);
+  return n;
+}
+function numIn(id) { const v = $(id).value.trim(); return v === "" ? null : parseMoney(v); }
+function pctIn(id, dflt) { const n = Number(String($(id).value).replace(/[%\s]/g, "")); return Number.isFinite(n) && $(id).value.trim() !== "" ? n : dflt; }
+
+// Floors, remembered per browser.
+try { const f = JSON.parse(store.get(FLOOR_KEY) || "null"); if (f) { if (Number.isFinite(f.floor)) $("floor").value = f.floor; if (Number.isFinite(f.contFloor)) $("contFloor").value = f.contFloor; } } catch {}
+for (const id of ["floor", "contFloor"]) $(id).addEventListener("change", () => store.set(FLOOR_KEY, JSON.stringify({ floor: pctIn("floor", 10), contFloor: pctIn("contFloor", 5) })));
+
+// The paste fills the fields; the fields stay editable.
+function fillFromPaste() {
+  const p = parseBid($("paste").value);
+  if (p.job) $("job").value = p.job;
+  if (p.cost != null) $("cost").value = Math.round(p.cost).toLocaleString("en-US");
+  if (p.sell != null) $("sell").value = Math.round(p.sell).toLocaleString("en-US");
+  if (p.cont != null) $("cont").value = String(Math.round(p.cont * 100) / 100);
+}
+$("paste").addEventListener("input", fillFromPaste);
+
+let log = [], memoryOnly = false;
+try { const l = JSON.parse(store.get(LOG_KEY) || "[]"); if (Array.isArray(l)) log = l.filter(e => e && typeof e.id === "string"); } catch {}
+function saveLog() { memoryOnly = !store.set(LOG_KEY, JSON.stringify(log)); }
+
+function render(out, fresh) {
+  const v = $("verdict");
+  v.replaceChildren();
+  v.className = "verdict" + (out.ok ? (out.flags.length ? " hold" : " clear") : "");
+  v.dataset.state = out.ok ? "filled" : "empty";
+  if (out.ok && out.flags.length) v.setAttribute("role", "alert"); else v.removeAttribute("role");
+  if (!out.ok) { v.append(el("p", { class: "head", text: "Add the " + out.missing.join(" and ") + " to check this bid.", style: "font-size:18px" })); return; }
+  if (out.flags.length) v.append(el("div", { class: "tags" }, el("span", { class: "alert-tag big", text: "Hold for VP review" }), ...out.flags.map(f => el("span", { class: "alert-tag", text: f.tag }))));
+  v.append(el("p", { class: "head", text: out.headline }));
+  const dl = el("dl", { class: "math" });
+  for (const [k, val, eq] of out.math) dl.append(el("dt", { text: k }), el("dd", {}, document.createTextNode(val), el("span", { class: "eq", text: eq })));
+  v.append(dl);
+  if (fresh) { v.classList.remove("fresh"); void v.offsetWidth; v.classList.add("fresh"); }
+}
+
+function check() {
+  const cost = numIn("cost"), sell = numIn("sell");
+  const contRaw = $("cont").value.trim();
+  const cont = contRaw === "" ? null : Number(contRaw.replace(/[%\s]/g, ""));
+  const out = checkBid({ cost, sell, cont: Number.isFinite(cont) ? cont : null, risks: parseRisks($("risks").value), floor: pctIn("floor", 10), contFloor: pctIn("contFloor", 5) });
+  render(out, true);
+  if (!out.ok) return;
+  log.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: new Date().toISOString(),
+    job: $("job").value.trim() || "Untitled bid", cost, sell, marginP: Math.round(out.marginP * 10) / 10,
+    flags: out.flags.map(f => f.tag), sentAnyway: false });
+  saveLog(); renderLog();
+}
+
+function when(iso) {
+  const d = new Date(iso), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return d.toDateString() === now.toDateString() ? time : d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + time;
+}
+function renderLog() {
+  const list = $("log"); list.replaceChildren();
+  for (const e of log) {
+    const flagged = e.flags.length > 0;
+    const btn = el("button", { type: "button", class: "sent", "aria-pressed": String(!!e.sentAnyway), text: e.sentAnyway ? "Sent anyway ✓" : (flagged ? "Mark sent anyway" : "Mark sent") });
+    btn.addEventListener("click", () => { e.sentAnyway = !e.sentAnyway; saveLog(); renderLog(); });
+    list.append(el("li", { class: "row" + (flagged ? " flagged" : "") },
+      el("time", { datetime: e.at, text: when(e.at) }),
+      el("div", {}, el("div", { class: "job", text: e.job }),
+        el("div", { class: "nums" }, document.createTextNode("Cost " + usd(e.cost) + " · Bid " + usd(e.sell) + " · Margin "), el("b", { text: pct(e.marginP) })),
+        el("div", { class: "tags" }, ...(flagged ? e.flags.map(f => el("span", { class: "tag-sm", text: f })) : [el("span", { class: "ok-sm", text: "Clears the floor" })]))),
+      btn));
+  }
+  $("emptyLog").hidden = log.length > 0;
+  $("logActions").hidden = log.length === 0;
+  const flagged = log.filter(e => e.flags.length), out = flagged.filter(e => e.sentAnyway);
+  $("tally").textContent = log.length ? log.length + " checked · " + flagged.length + " flagged · " + out.length + " flagged sent anyway" : "";
+  $("keep").textContent = memoryOnly ? "This browser won't keep the log after you close the page." : "Saved in this browser.";
+}
+
+$("check").addEventListener("click", check);
+for (const id of ["paste", "job", "cost", "sell", "cont", "risks"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); check(); } });
+$("example").addEventListener("click", () => { $("paste").value = EXAMPLE; fillFromPaste(); $("risks").value = ""; check(); });
+$("clear").addEventListener("click", () => { log = []; store.del(LOG_KEY); renderLog(); });
+$("csv").addEventListener("click", () => {
+  const q = v => '"' + String(v).replace(/"/g, '""') + '"';
+  const rows = [["checked_at", "job", "cost", "bid", "margin_pct", "flags", "sent_anyway"]].concat(log.map(e => [e.at, e.job, e.cost, e.sell, e.marginP, e.flags.join("; "), e.sentAnyway ? "yes" : "no"]));
+  const blob = new Blob([rows.map(r => r.map(q).join(",")).join("\n")], { type: "text/csv" });
+  const a = el("a", { href: URL.createObjectURL(blob), download: "bids-checked.csv" });
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
+renderLog();
+</script>
+</body>
+</html>
