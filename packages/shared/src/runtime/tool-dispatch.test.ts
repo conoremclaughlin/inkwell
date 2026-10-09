@@ -125,6 +125,32 @@ describe('host-independent tool dispatch', () => {
     expect(await a.dispatch('custom', { b: 'value' }, {})).not.toHaveProperty('ignoredParameters');
     expect(la).toHaveBeenCalledTimes(1);
   });
+  it.each([
+    ['mcp__github__list', 'github'],
+    ['MCP__FOREIGN__some tool__part', 'FOREIGN'],
+    ['mcp__foreign__nested__read', 'foreign__nested'],
+    ['mcp__foreign__read__', 'foreign'],
+  ])('preserves the greedy foreign namespace of %s', async (name, server) => {
+    const f = fixture('/synthetic/a');
+    const result = await f.dispatch(name, {}, {});
+    expect(result).toMatchObject({
+      isError: true,
+      content: [
+        expect.objectContaining({
+          text: expect.stringContaining(`hosts no "${server}" MCP server`),
+        }),
+      ],
+    });
+    expect(f.callInk).not.toHaveBeenCalled();
+  });
+  it('does not backtrack through repeated separators before an invalid multiline suffix', async () => {
+    const f = fixture('/synthetic/a');
+    const tool = `mcp__-__${'-__-'.repeat(30_000)}\n!`;
+    const start = performance.now();
+    await f.dispatch(tool, {}, {});
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(f.callInk).toHaveBeenCalledTimes(1);
+  });
   it('answers impossible namespaces and miscasing locally rather than inventing a server capability', async () => {
     const f = fixture('/synthetic/a');
     expect(await f.dispatch('mcp__foreign__read', {}, {})).toMatchObject({ isError: true });

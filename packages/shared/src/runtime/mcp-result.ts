@@ -135,11 +135,12 @@ export function parseJsonRpcResponse(raw: string): JsonRpcResponse {
   }
 
   // Some streamable HTTP servers return SSE framing for POST responses.
+  // Scan each line once; \n\s* retries the same newline run quadratically.
   if (
-    trimmed.startsWith('event:') ||
-    trimmed.startsWith('data:') ||
-    /\n\s*event:/.test(trimmed) ||
-    /\n\s*data:/.test(trimmed)
+    trimmed.split('\n').some((line) => {
+      const start = line.trimStart();
+      return start.startsWith('event:') || start.startsWith('data:');
+    })
   ) {
     return parseSseJsonRpcResponse(trimmed);
   }

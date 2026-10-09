@@ -1,4 +1,17 @@
 import type { SkillMcpServer } from './skill-mcp.js';
+
+/** Scan complete lines: whitespace must never backtrack across line boundaries. */
+function blockAfter(lines: string[], header: string, member: RegExp): string[] {
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start === -1) return [];
+  const result: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (!member.test(lines[i])) break;
+    result.push(lines[i]);
+  }
+  return result;
+}
+
 export function parseSkillMcpContent(content: string): SkillMcpServer | null {
   // Extract YAML frontmatter between --- delimiters
   const match = content.match(/^---\n([\s\S]*?)\n---/);
@@ -13,22 +26,24 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
   //     command: <string>
   //     args: [...]
   //     env: {}
-  // `\n?` on the last line: the frontmatter capture strips the newline before
-  // the closing ---, so an mcp block that ends the frontmatter would otherwise
-  // silently lose its final property.
-  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n?)*)/m);
-  if (!mcpMatch) return null;
+  // Include the final property even without a trailing newline in the capture.
+  const lines = frontmatter.split('\n');
+  const start = lines.findIndex((line) => /^mcp:[ \t]*$/.test(line));
+  if (start === -1) return null;
+  let first = start + 1;
+  while (first < lines.length && !lines[first].trim()) first++;
+  const mcpLines: string[] = [];
+  for (let i = first; i < lines.length && /^  .+/.test(lines[i]); i++) mcpLines.push(lines[i]);
+  const mcpBlock = mcpLines.join('\n');
 
-  const mcpBlock = mcpMatch[1];
-
-  const name = mcpBlock.match(/^\s*name:\s*(.+)/m)?.[1]?.trim();
-  const command = mcpBlock.match(/^\s*command:\s*(.+)/m)?.[1]?.trim();
+  const name = mcpBlock.match(/^[ \t]*name:[ \t]*(.+)/m)?.[1]?.trim();
+  const command = mcpBlock.match(/^[ \t]*command:[ \t]*(.+)/m)?.[1]?.trim();
 
   if (!name || !command) return null;
 
   // Parse args — inline [a, b] or block-style list (- a\n- b)
   let args: string[] = [];
-  const argsInlineMatch = mcpBlock.match(/^\s*args:\s*\[([^\]]*)\]/m);
+  const argsInlineMatch = mcpBlock.match(/^[ \t]*args:[ \t]*\[([^\]]*)\]/m);
   if (argsInlineMatch) {
     args = argsInlineMatch[1]
       .split(',')
@@ -36,13 +51,12 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
       .filter(Boolean);
   } else {
     // Block-style: args:\n    - value1\n    - value2
-    const argsBlockMatch = mcpBlock.match(/^\s*args:\s*\n((?:\s+-\s+.+\n?)*)/m);
-    if (argsBlockMatch) {
-      args = argsBlockMatch[1]
-        .split('\n')
+    const argsBlock = blockAfter(mcpLines, 'args:', /^[ \t]+-[ \t]+.+$/);
+    if (argsBlock.length) {
+      args = argsBlock
         .map((line) =>
           line
-            .replace(/^\s*-\s+/, '')
+            .replace(/^[ \t]*-[ \t]+/, '')
             .trim()
             .replace(/^["']|["']$/g, '')
         )
@@ -52,7 +66,7 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
 
   // Parse env — inline {K: V} or block-style (K: V\n K2: V2)
   const env: Record<string, string> = {};
-  const envInlineMatch = mcpBlock.match(/^\s*env:\s*\{([^}]*)\}/m);
+  const envInlineMatch = mcpBlock.match(/^[ \t]*env:[ \t]*\{([^}]*)\}/m);
   if (envInlineMatch && envInlineMatch[1].trim()) {
     envInlineMatch[1].split(',').forEach((pair) => {
       const [k, v] = pair.split(':').map((s) => s.trim().replace(/^["']|["']$/g, ''));
@@ -60,9 +74,9 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
     });
   } else {
     // Block-style: env:\n    KEY: VALUE
-    const envBlockMatch = mcpBlock.match(/^\s*env:\s*\n((?:\s+\w+:.+\n?)*)/m);
-    if (envBlockMatch) {
-      envBlockMatch[1].split('\n').forEach((line) => {
+    const envBlock = blockAfter(mcpLines, 'env:', /^[ \t]+\w+:.+$/);
+    if (envBlock.length) {
+      envBlock.forEach((line) => {
         const colonIdx = line.indexOf(':');
         if (colonIdx === -1) return;
         const k = line.slice(0, colonIdx).trim();

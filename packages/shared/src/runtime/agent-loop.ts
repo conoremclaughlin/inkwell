@@ -1966,8 +1966,8 @@ export function extractToolBlocks(responseText: string): {
   // via the fallback router, and text-form signal_status never halted the
   // continuation loop). Parse and execute the variant so the turn WORKS;
   // the continuation prompt separately steers the model back to the fence.
-  for (const match of responseText.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
-    const payload = (match[1] || '').trim();
+  for (const block of findXmlToolBlocks(responseText)) {
+    const payload = responseText.slice(block.payloadStart, block.payloadEnd).trim();
     if (!payload) continue;
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
@@ -1981,8 +1981,8 @@ export function extractToolBlocks(responseText: string): {
           ? (parsed.arguments as Record<string, unknown>)
           : {};
       indexed.push({
-        index: match.index ?? 0,
-        call: { tool, args, raw: match[0] || '', variantFormat: true },
+        index: block.start,
+        call: { tool, args, raw: responseText.slice(block.start, block.end), variantFormat: true },
       });
     } catch (error) {
       // Same invariant as the fence path. The variant is deprecated, which is
@@ -2022,6 +2022,23 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
   return extractToolBlocks(responseText).calls;
 }
 
+/** One monotonic tag scan, including when thousands of open tags lack a close. */
+function* findXmlToolBlocks(text: string) {
+  let start: number | undefined;
+  let payloadStart = 0;
+  for (const tag of text.matchAll(/<\/?tool_call>/gi)) {
+    if (tag[0][1] !== '/') {
+      if (start === undefined) {
+        start = tag.index;
+        payloadStart = tag.index + tag[0].length;
+      }
+    } else if (start !== undefined) {
+      yield { start, payloadStart, payloadEnd: tag.index, end: tag.index + tag[0].length };
+      start = undefined;
+    }
+  }
+}
+
 export function stripLocalToolBlocks(responseText: string): string {
   // Remove ink-tool blocks by the SAME scan the extractor uses — a regex
   // here would disagree with extraction on payloads containing ``` and leak
@@ -2033,7 +2050,13 @@ export function stripLocalToolBlocks(responseText: string): string {
     cursor = block.end;
   }
   out += responseText.slice(cursor);
-  return out.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '').trim();
+  let visible = '';
+  cursor = 0;
+  for (const block of findXmlToolBlocks(out)) {
+    visible += out.slice(cursor, block.start);
+    cursor = block.end;
+  }
+  return (visible + out.slice(cursor)).trim();
 }
 
 /**

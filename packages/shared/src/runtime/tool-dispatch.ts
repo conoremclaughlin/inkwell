@@ -126,12 +126,22 @@ export function bareToolName(tool: string): string {
  * back to searching Gmail, because nothing told her the capability was absent
  * rather than misspelled.
  */
-const FOREIGN_MCP_NAMESPACE = /^mcp__([a-z0-9_-]+)__(.+)$/i;
+function foreignMcpNamespace(tool: string): string | undefined {
+  if (tool.slice(0, 5).toLowerCase() !== 'mcp__') return;
+  // Preserve the greedy namespace split without retrying an unbounded suffix
+  // for every possible delimiter. Tool names cannot contain line breaks.
+  if (/[\r\n\u2028\u2029]/.test(tool)) return;
+  let separator = -1;
+  for (let i = 5; i < tool.length; i++) {
+    if (!/[a-z0-9_-]/i.test(tool[i])) break;
+    if (i > 5 && i + 2 < tool.length && tool[i] === '_' && tool[i + 1] === '_') separator = i;
+  }
+  return separator === -1 ? undefined : tool.slice(5, separator);
+}
 
 function foreignNamespaceRefusal(tool: string): InkToolCallResult | null {
-  const match = FOREIGN_MCP_NAMESPACE.exec(tool);
-  if (!match) return null;
-  const [, server] = match;
+  const server = foreignMcpNamespace(tool);
+  if (!server) return null;
   return {
     content: [
       {
