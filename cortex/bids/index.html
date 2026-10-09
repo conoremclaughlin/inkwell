@@ -449,7 +449,7 @@ function parseRisks(text) {
   return text.split(/\n+|;\s*|,\s+(?=[A-Za-z])/).map(l => l.trim()).filter(Boolean).map(l => {
     // The amount is the $-prefixed or k/m-suffixed number, else the last plain number.
     // Never a percent, never a digit inside a label like "Q1" or "Phase 2".
-    const all = [...l.matchAll(new RegExp(MONEY, "gi"))].filter(x => !/^\s*%/.test(l.slice(x.index + x[0].length)) && !/[A-Za-z]$/.test(l.slice(0, x.index)));
+    const all = [...l.matchAll(new RegExp(MONEY, "gi"))].filter(x => !/^\s*%/.test(l.slice(x.index + x[0].length)) && (/^[\s$]/.test(x[0]) || !/[A-Za-z]$/.test(l.slice(0, x.index))));
     const m = all.find(x => /\$/.test(x[0]) || /[kKmM]|million|thousand/i.test(x[0])) || all[all.length - 1] || null;
     const amount = m ? parseMoney(m[0]) : null;
     const label = (m ? l.slice(0, m.index) + l.slice(m.index + m[0].length) : l).replace(/[:\-–—=]\s*$/, "").replace(/\s{2,}/g, " ").trim() || "Risk";
@@ -500,7 +500,7 @@ function checkBid({ cost, sell, cont, risks = [], floor = 10, contFloor = 5 }) {
   return out;
 }
 function usd(n) { const neg = n < 0; const v = Math.abs(n); return (neg ? "−" : "") + "$" + v.toLocaleString("en-US", { maximumFractionDigits: v >= 100 ? 0 : 2 }); }
-function pct(n) { return (Math.round(n * 10) / 10).toFixed(1) + "%"; }
+function pct(n) { const one = Math.round(n * 10) / 10; return (Math.abs(n - one) >= 0.005 && Number.isInteger(one) ? (Math.round(n * 100) / 100).toFixed(2) : one.toFixed(1)) + "%"; }
 // Floors and contingency read the way they were typed: 10%, 2%, 2.5%.
 function pctPlain(n) { const r = Math.round(n * 100) / 100; return (Number.isInteger(r) ? String(r) : String(r)) + "%"; }
 // BID-END
@@ -555,7 +555,11 @@ function check() {
   const out = checkBid({ cost, sell, cont: Number.isFinite(cont) ? cont : null, risks: allRisks.filter(r => r.amount != null), floor: pctIn("floor", 10), contFloor: pctIn("contFloor", 5) });
   // A risk line with no readable amount is never dropped silently.
   const unread = allRisks.filter(r => r.amount == null);
-  if (out.ok && unread.length) out.flags.push({ key: "unread", tag: "Unread risk line", text: "couldn't read an amount in: " + unread.map(r => r.raw).join("; ") });
+  if (out.ok && unread.length) {
+    out.flags.unshift({ key: "unread", tag: "Unread risk line", text: "couldn't read an amount in: " + unread.map(r => r.raw).join("; ") });
+    out.headline = "⚠️ Couldn't read a risk line: " + unread.map(r => r.raw).join("; ") + ". " + (out.headline.startsWith("⚠️") ? out.headline.replace(/^⚠️\s*/, "") : "Hold for VP review.");
+    out.math.push(["Unread risk line", "not counted", unread.map(r => r.raw).join("; ") + ": add a $ amount so it counts"]);
+  }
   render(out, true);
   if (!out.ok) return;
   log.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: new Date().toISOString(),
