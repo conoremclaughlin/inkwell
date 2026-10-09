@@ -74,7 +74,7 @@ describe('session-bound client authority', () => {
     await unchanged();
   });
   it('does not drop authentication through the legacy endpoint when scoped MCP is unavailable', async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response('not found', { status: 404 }));
+    vi.mocked(fetch).mockImplementation(async () => new Response('not found', { status: 404 }));
     await expect(
       new InkClient('http://127.0.0.1:9999', configPath).callTool('recall', {})
     ).rejects.toThrow(/Session-scoped/);
