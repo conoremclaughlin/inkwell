@@ -24,6 +24,9 @@ function missing(error: unknown) {
 
 class SkillCatalogLimitError extends Error {}
 
+/** Positive identity/provenance drift, distinct from transient filesystem failures. */
+export class SkillInstructionDriftError extends Error {}
+
 function isolateCatalogEntry(error: unknown, signal?: AbortSignal): void {
   signal?.throwIfAborted();
   if (
@@ -195,13 +198,15 @@ export function createSkillInstructionHost(cwd: string, home: string) {
         ) ||
         parts.join('/') !== skill.name
       )
-        throw new Error('Skill identity does not belong to this host catalog');
+        throw new SkillInstructionDriftError('Skill identity does not belong to this host catalog');
       const metadata = await provenance(skill.path, hostRoot(skill.source), signal);
       if (
         !isDeepStrictEqual(metadata, skill.provenance) ||
         inferSkillTrust(skill.source, metadata) !== skill.trustLevel
       )
-        throw new Error('Skill provenance changed; discover and select it again');
+        throw new SkillInstructionDriftError(
+          'Skill provenance changed; discover and select it again'
+        );
       const bytes = await readBounded(
         join(skill.path, 'SKILL.md'),
         hostRoot(skill.source),
@@ -211,7 +216,9 @@ export function createSkillInstructionHost(cwd: string, home: string) {
       if (
         !isDeepStrictEqual(metadata, await provenance(skill.path, hostRoot(skill.source), signal))
       )
-        throw new Error('Skill provenance changed during loading; discover and select it again');
+        throw new SkillInstructionDriftError(
+          'Skill provenance changed during loading; discover and select it again'
+        );
       let content = bytes.toString('utf8');
       if (content.length > sessionSkillLimits.instructionChars)
         content = `${content.slice(0, sessionSkillLimits.instructionChars)}\n\n...[truncated]`;

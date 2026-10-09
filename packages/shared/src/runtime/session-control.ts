@@ -36,7 +36,7 @@ export interface SessionControlRecord extends Record<string, unknown> {
   controlId: string;
   backend: string;
   selection: SessionSelection;
-  reason?: 'replay_skill_removed';
+  reason?: 'replay_skill_removed' | 'replay_backend_changed';
 }
 export const MAX_SELECTED_SKILLS = 16;
 const object = (v: unknown): v is Record<string, unknown> =>

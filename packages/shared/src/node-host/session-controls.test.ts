@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { SkillInstructionDriftError } from './skill-instructions.js';
 import { createSessionControls } from './session-controls.js';
 import {
   SessionLog,
@@ -7,7 +8,7 @@ import {
   type SessionControlReceipt,
   type SessionControlRecord,
 } from '../runtime/index.js';
-import type { SkillInstruction } from '../providers/skill-discovery.js';
+import type { SkillInstruction, DiscoveredSkill } from '../providers/skill-discovery.js';
 
 const skill: SkillInstruction = {
   name: 'review',
@@ -18,7 +19,7 @@ const skill: SkillInstruction = {
   content: 'CHECK THE FIXTURE',
   provenance: { registry: 'fixture' },
 };
-function fixture() {
+function fixture(withSkills = true) {
   const events: Record<string, unknown>[] = [];
   let write = async (line: string) => {
     events.push(JSON.parse(line));
@@ -37,15 +38,20 @@ function fixture() {
     activeSkills: [] as SkillInstruction[],
   };
   const policy = new ToolPolicyState('backend');
-  const skills = { discover: vi.fn(async () => [skill]), load: vi.fn(async () => ({ ...skill })) };
+  const skills = {
+    discover: vi.fn(async () => [skill]),
+    load: vi.fn(async (_candidate: DiscoveredSkill, _signal?: AbortSignal) => ({ ...skill })),
+  };
   const invalidateProvider = vi.fn();
   let admitted = true;
   const receipts: SessionControlReceipt[] = [];
+  const notice = vi.fn();
   const control = createSessionControls({
     runtime,
     log,
     policy,
-    skills,
+    skills: withSkills ? skills : undefined,
+    notice,
     contextBudgetAuto: true,
     assertCurrent: () => {
       if (!admitted) throw new Error('old owner');
@@ -63,6 +69,7 @@ function fixture() {
     policy,
     invalidateProvider,
     receipts,
+    notice,
     setWrite: (fn: typeof write) => {
       write = fn;
     },
@@ -148,7 +155,8 @@ describe('sole-composer durable controls', () => {
         h.skills.load.mockResolvedValue({ ...skill, provenance: { registry: 'changed' } });
       if (kind === 'identity') h.skills.load.mockResolvedValue({ ...skill, path: '/other' });
       if (kind === 'policy') vi.spyOn(h.policy, 'isSkillAllowed').mockReturnValue(false);
-      if (kind === 'missing') h.skills.load.mockRejectedValue(new Error('not found'));
+      if (kind === 'missing')
+        h.skills.load.mockRejectedValue(Object.assign(new Error('not found'), { code: 'ENOENT' }));
       h.control.replay(record({ skills: [ref] }));
       await h.control.restore();
       expect(h.runtime.activeSkills).toEqual([]);
@@ -164,11 +172,94 @@ describe('sole-composer durable controls', () => {
       expect(next.runtime.activeSkills).toEqual([]);
     }
   );
-  it('refuses unknown record versions and backend changes rather than guessing', async () => {
+  it('skips malformed and future records, retains last valid state and reports only static diagnostics', async () => {
     const h = fixture();
-    expect(() => h.control.replay({ ...record({ skills: [] }), version: 2 })).toThrow();
-    h.control.replay({ ...record({ skills: [] }), backend: 'codex' });
-    await expect(h.control.restore()).rejects.toThrow(/different backend/);
+    h.control.replay(record({ model: 'valid', skills: [ref] }));
+    for (const bad of [
+      { ...record({ skills: [] }), version: 2 },
+      { type: 'session_control', selection: 'SECRET RECORD BYTES' },
+    ])
+      expect(() => h.control.replay(bad)).not.toThrow();
+    await h.control.restore();
+    expect(h.runtime.model).toBe('valid');
+    expect(h.runtime.activeSkills).toHaveLength(1);
+    expect(h.events).toEqual([]);
+    expect(h.notice).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(h.notice.mock.calls)).not.toContain('SECRET');
+    expect(h.invalidateProvider).toHaveBeenCalledOnce();
+    const empty = fixture();
+    empty.control.replay({ type: 'session_control', version: 2 });
+    await expect(empty.control.restore()).resolves.toBeUndefined();
+    expect(empty.invalidateProvider).toHaveBeenCalledOnce();
+  });
+  it('commits a backend reset before effect, re-gates skills, and does not keep the old model', async () => {
+    const h = fixture();
+    h.control.replay({ ...record({ model: 'old-provider', skills: [ref] }), backend: 'codex' });
+    const gate = deferred(),
+      writing = deferred();
+    h.setWrite(async (line) => {
+      writing.resolve();
+      await gate.promise;
+      h.events.push(JSON.parse(line));
+    });
+    const run = h.control.restore();
+    await writing.promise;
+    expect(h.runtime.activeSkills).toEqual([]);
+    expect(h.invalidateProvider).not.toHaveBeenCalled();
+    gate.resolve();
+    await run;
+    expect(h.runtime.model).toBe('before'); // new host's configured model wins
+    expect(h.runtime.activeSkills).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({
+      backend: 'claude',
+      reason: 'replay_backend_changed',
+      selection: { skills: [ref] },
+    });
+    expect(h.events[0].selection).not.toHaveProperty('model');
+    const next = fixture();
+    next.control.replay(h.events[0]);
+    await next.control.restore();
+    expect(next.events).toEqual([]); // migration happens once, not on every run
+  });
+  it.each(['EMFILE', 'EACCES', 'EIO', 'unclassified', 'missing_port'])(
+    'retains a %s selection through a later model control and retries it next run',
+    async (code) => {
+      const h = fixture(code !== 'missing_port');
+      h.skills.load.mockRejectedValue(Object.assign(new Error('private path'), { code }));
+      h.control.replay(record({ skills: [ref] }));
+      await h.control.restore();
+      expect(h.events).toEqual([]);
+      expect(h.runtime.activeSkills).toEqual([]);
+      expect(h.runtime).toHaveProperty('providerRecoveryDisabled', true);
+      expect(h.invalidateProvider).toHaveBeenCalledOnce();
+      h.control.enqueue({ controlId: 'model', action: 'model', model: 'changed' });
+      await h.control.drain();
+      expect(h.events[0]).toMatchObject({ selection: { model: 'changed', skills: [ref] } });
+      const next = fixture();
+      next.control.replay(h.events[0]);
+      await next.control.restore();
+      expect(next.runtime.activeSkills).toHaveLength(1);
+      expect(next.events).toEqual([]);
+      // A user can still deliberately clear an unavailable selection.
+      h.control.enqueue({ controlId: 'clear', action: 'skill_clear', name: 'review' });
+      await h.control.drain();
+      expect(h.events[1]).toMatchObject({ selection: { skills: [] } });
+    }
+  );
+  it('persists only positive removals when drift and transient errors coexist', async () => {
+    const h = fixture();
+    const absent = { ...ref, name: 'absent', path: '/fixture/absent' };
+    h.skills.load.mockImplementation(async (s) => {
+      if (s.name === 'absent') throw new SkillInstructionDriftError('provenance changed');
+      throw Object.assign(new Error('busy'), { code: 'EMFILE' });
+    });
+    h.control.replay({ ...record({ skills: [ref, absent] }), backend: 'codex' });
+    await h.control.restore();
+    expect(h.events[0]).toMatchObject({
+      reason: 'replay_backend_changed',
+      selection: { skills: [ref] },
+    });
+    expect(h.runtime.activeSkills).toEqual([]);
   });
   it('retains a late cancellation as unknown, blocks launches/drains, and does not apply', async () => {
     const h = fixture();
@@ -289,4 +380,34 @@ it('refuses a skill without a durable hash before writing, without poisoning the
   h.control.enqueue({ controlId: 'valid', action: 'model', model: 'next' });
   await h.control.drain();
   expect(h.runtime.model).toBe('next');
+});
+
+it.each(['abort', 'retire'])(
+  'classifies %s during a drain as stopped for every uncommitted request',
+  async (mode) => {
+    const h = fixture();
+    const stop = new AbortController();
+    h.skills.load.mockImplementation(async () => {
+      if (mode === 'abort') stop.abort();
+      else h.retire();
+      return skill;
+    });
+    h.control.enqueue({ controlId: 'loading', action: 'skill_use', name: 'review' });
+    h.control.enqueue({ controlId: 'later', action: 'model', model: 'later' });
+    await expect(h.control.drain(stop.signal)).rejects.toThrow();
+    expect(h.events).toEqual([]);
+    expect(h.receipts).toEqual([
+      { controlId: 'loading', status: 'refused', reason: 'owner_stopped' },
+      { controlId: 'later', status: 'refused', reason: 'owner_stopped' },
+    ]);
+  }
+);
+it('does not recover a seed with temporarily missing instructions or an old provider model window', () => {
+  const recovery = createProviderRecovery('claude');
+  recovery.push({ type: 'backend_session', id: 'usable' });
+  recovery.push({ type: 'backend_session', id: 'incomplete', recoverable: false });
+  expect(recovery.session).toBeUndefined();
+  recovery.push({ type: 'model_detected', backend: 'claude', model: 'old-window' });
+  recovery.push({ ...record({ skills: [] }), backend: 'codex' });
+  expect(recovery.model).toBeUndefined();
 });

@@ -1,3 +1,4 @@
+import { SkillInstructionDriftError } from './skill-instructions.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, realpath, mkdir, writeFile, rm, symlink, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -140,7 +141,7 @@ describe('explicit-root asynchronous skill instructions', () => {
     const host = createSkillInstructionHost(cwd, home);
     const [skill] = await host.discover();
     await writeFile(join(path, 'provenance.json'), JSON.stringify({ trusted: true }));
-    await expect(host.load(skill)).rejects.toThrow('provenance changed');
+    await expect(host.load(skill)).rejects.toBeInstanceOf(SkillInstructionDriftError);
     const [fresh] = await host.discover();
     const loading = host.load(fresh);
     fresh.name = 'mutated';

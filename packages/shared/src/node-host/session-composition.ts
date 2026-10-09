@@ -176,6 +176,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
       }),
     skills: ports.controls?.skills,
     receipt: ports.controls?.receipt,
+    notice: presentation.notice,
     invalidateProvider: () => context.clearProvider(),
   });
   const recovery = createProviderRecovery(runtime.backend);

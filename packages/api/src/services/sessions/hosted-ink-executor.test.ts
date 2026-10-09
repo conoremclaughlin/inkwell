@@ -375,6 +375,70 @@ describe('hosted live controls through the admitted route and real composition',
       selection: { skills: [] },
     });
   });
+  it('retains unavailable skills without recovering an incomplete native seed on the next run', async () => {
+    const h = await fixture(['temporarily absent', 'restored', 'resumed']);
+    const path = join(h.root, '.ink', 'skills', 'review');
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, 'SKILL.md'), 'RECOVERED SKILL INSTRUCTION');
+    const c = controlsHarness(h);
+    const host = h.effects.manualSkills!;
+    const [found] = await host.discover();
+    const { content: _content, ...selected } = await host.load(found);
+    h.events.push({
+      eid: 1,
+      type: 'session_control',
+      version: 1,
+      controlId: 'prior',
+      backend: 'claude',
+      selection: { skills: [selected] },
+    });
+    h.effects.manualSkills = {
+      ...host,
+      load: async () => {
+        throw Object.assign(new Error('busy'), { code: 'EMFILE' });
+      },
+    };
+    expect((await c.runner.run('unavailable', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[0][0].prompt).not.toContain('RECOVERED SKILL INSTRUCTION');
+    expect(h.events.filter((e) => e.type === 'session_control')).toHaveLength(1);
+    expect(h.events.filter((e) => e.type === 'backend_session').at(-1)).toMatchObject({
+      recoverable: false,
+    });
+    h.effects.manualSkills = host;
+    h.config.turnEpoch = 'epoch-restored';
+    expect((await c.runner.run('restored', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[1][0].backendSessionId).toBeUndefined();
+    expect(h.start.mock.calls[1][0].prompt).toContain('RECOVERED SKILL INSTRUCTION');
+    const restored = h.start.mock.calls[1][0].backendSessionSeedId;
+    h.config.turnEpoch = 'epoch-resumed';
+    expect((await c.runner.run('resumed', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[2][0].backendSessionId).toBe(restored);
+  });
+  it('hydrates past future records and commits a changed-provider reset before launch', async () => {
+    const h = await fixture(['reset complete']);
+    const c = controlsHarness(h);
+    h.events.push(
+      {
+        eid: 1,
+        type: 'session_control',
+        version: 1,
+        controlId: 'prior',
+        backend: 'codex',
+        selection: { model: 'old-provider-only', skills: [] },
+      },
+      { eid: 2, type: 'session_control', version: 2, selection: 'opaque' },
+      { eid: 3, type: 'backend_session', id: 'opaque-provider-seed', routing: 'local' }
+    );
+    expect((await c.runner.run('reset', { config: h.config })).success).toBe(true);
+    expect(h.start.mock.calls[0][0].model).not.toBe('old-provider-only');
+    expect(h.start.mock.calls[0][0].backendSessionId).toBeUndefined();
+    const reset = h.events.findIndex((e) => e.reason === 'replay_backend_changed');
+    expect(reset).toBeGreaterThan(2);
+    expect(reset).toBeLessThan(h.events.map((e) => e.type).lastIndexOf('backend_session'));
+    expect(h.effects.presentation.notice).toHaveBeenCalledWith(
+      'Skipped an invalid or unsupported session control record.'
+    );
+  });
   it('applies before the next outer turn, not during an inner provider turn', async () => {
     const h = await fixture(['next turn']);
     h.config.maxTurns = 2;

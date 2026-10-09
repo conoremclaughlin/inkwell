@@ -15,11 +15,13 @@ import { applyModelSelection, type SessionModelState } from '../providers/sessio
 import type { SkillInstruction } from '../providers/skill-discovery.js';
 import { createSessionSkills, type SessionSkillsPorts } from './session-skills.js';
 import { canActivateSkill } from './skill-policy.js';
+import { SkillInstructionDriftError } from './skill-instructions.js';
 
 export interface SessionControlsPorts {
   runtime: Omit<SessionModelState, 'log'> & {
     sessionId: string;
     activeSkills?: readonly SessionPromptSkill[];
+    providerRecoveryDisabled?: boolean;
   };
   log: Pick<SessionLog, 'append' | 'flush'>;
   policy: ToolPolicyState;
@@ -29,6 +31,8 @@ export interface SessionControlsPorts {
   invalidateProvider(): void;
   mintId(): string;
   receipt?(receipt: SessionControlReceipt): void;
+  /** Static diagnostics only: never relay untrusted record bytes or filesystem errors. */
+  notice?(message: string): void;
 }
 const reference = ({ content: _content, ...skill }: SkillInstruction) => skill;
 const provenanceKey = (skill: { provenance?: object }) =>
@@ -39,6 +43,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
   let manual: SkillInstruction[] = [];
   const baseline = [...(ports.runtime.activeSkills ?? [])];
   let recovered: SessionControlRecord | undefined;
+  let skippedRecord = false;
   let open = true;
   let draining = false;
   let poisoned = false;
@@ -47,6 +52,22 @@ export function createSessionControls(ports: SessionControlsPorts) {
     { request: SessionControlRequest; receipt: SessionControlReceipt }
   >();
   const pending: string[] = [];
+  function notice(message: string) {
+    try {
+      ports.notice?.(message);
+    } catch {
+      /* presentation cannot break replay */
+    }
+  }
+  function ownerStopped(signal?: AbortSignal) {
+    if (signal?.aborted) return true;
+    try {
+      ports.assertCurrent();
+      return false;
+    } catch {
+      return true;
+    }
+  }
   function current(signal?: AbortSignal) {
     signal?.throwIfAborted();
     ports.assertCurrent();
@@ -55,6 +76,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
   function install(next: SessionSelection, skills: SkillInstruction[]) {
     selection = next;
     manual = skills;
+    ports.runtime.providerRecoveryDisabled = skills.length !== next.skills.length;
     // Compute with the shared selector, but only assign after the durable barrier.
     if ('model' in next) {
       const draft = { ...ports.runtime, log: { append: () => 0 } };
@@ -73,7 +95,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
     next: SessionSelection,
     skills: SkillInstruction[],
     signal?: AbortSignal,
-    reason?: 'replay_skill_removed'
+    reason?: SessionControlRecord['reason']
   ) {
     current(signal);
     const record = readSessionControl({
@@ -89,7 +111,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
       eid = ports.log.append(record);
       await ports.log.flush();
       current(signal);
-      if (skills.some((skill) => !canActivateSkill(skill, ports.policy).allowed))
+      if (next.skills.some((skill) => !canActivateSkill(skill, ports.policy).allowed))
         throw new Error('Skill policy changed during persistence');
     } catch (error) {
       // A failed/timed-out flush may still have written the record. Never retry
@@ -112,19 +134,31 @@ export function createSessionControls(ports: SessionControlsPorts) {
   }
   return {
     replay(event: Record<string, unknown>) {
-      if (event.type === 'session_control') recovered = readSessionControl(event);
+      if (event.type !== 'session_control') return;
+      try {
+        recovered = readSessionControl(event);
+      } catch {
+        skippedRecord = true;
+        notice('Skipped an invalid or unsupported session control record.');
+      }
     },
     async restore(signal?: AbortSignal) {
-      if (!recovered) return;
       current(signal);
-      if (recovered.backend !== ports.runtime.backend)
-        throw new Error(
-          'Session controls belong to a different backend; explicit migration required'
-        );
+      // A later native marker could have been seeded under an unfamiliar record.
+      // Keep the last known selection, but never resume that opaque baseline.
+      if (skippedRecord) ports.invalidateProvider();
+      if (!recovered) return;
+      const backendChanged = recovered.backend !== ports.runtime.backend;
       const loaded: SkillInstruction[] = [];
+      const retained: SessionSelection['skills'] = [];
       for (const expected of recovered.selection.skills) {
         current(signal);
-        if (!ports.skills || !canActivateSkill(expected, ports.policy).allowed) continue;
+        if (!canActivateSkill(expected, ports.policy).allowed) continue;
+        if (!ports.skills) {
+          retained.push(expected);
+          notice('A selected skill is unavailable on this host; retaining its selection.');
+          continue;
+        }
         try {
           const skill = await ports.skills.load(expected, signal);
           current(signal);
@@ -136,18 +170,40 @@ export function createSessionControls(ports: SessionControlsPorts) {
             skill.contentDigest === expected.contentDigest &&
             provenanceKey(skill) === provenanceKey(expected) &&
             canActivateSkill(skill, ports.policy).allowed
-          )
+          ) {
             loaded.push(skill);
-        } catch {
+            retained.push(expected);
+          }
+        } catch (error) {
           current(signal); // cancellation/lost ownership is not evidence to drop a skill
+          const absent =
+            !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT';
+          if (absent || error instanceof SkillInstructionDriftError) continue;
+          retained.push(expected);
+          notice('A selected skill could not be loaded for this run; retaining its selection.');
         }
       }
       current(signal);
+      const skills = retained.filter((skill) => canActivateSkill(skill, ports.policy).allowed);
       const allowed = loaded.filter((skill) => canActivateSkill(skill, ports.policy).allowed);
-      const next = { ...recovered.selection, skills: allowed.map(reference) } as SessionSelection;
-      if (allowed.length !== recovered.selection.skills.length)
-        await commit(ports.mintId(), next, allowed, signal, 'replay_skill_removed');
-      else install(next, allowed);
+      // Desired references and this run's instructions differ on transient I/O.
+      // Future controls must preserve those references until explicitly cleared.
+      const next: SessionSelection = backendChanged
+        ? { skills } // old provider's model cannot override the new launch configuration
+        : { ...recovered.selection, skills };
+      if (backendChanged || skills.length !== recovered.selection.skills.length)
+        await commit(
+          ports.mintId(),
+          next,
+          allowed,
+          signal,
+          backendChanged ? 'replay_backend_changed' : 'replay_skill_removed'
+        );
+      else {
+        install(next, allowed);
+        // Omitting unavailable instructions requires a fresh provider envelope too.
+        if (allowed.length !== skills.length) ports.invalidateProvider();
+      }
     },
     enqueue(value: SessionControlRequest): SessionControlReceipt {
       const request = parseSessionControl(value);
@@ -200,6 +256,7 @@ export function createSessionControls(ports: SessionControlsPorts) {
               draft.activeSkills = request.name
                 ? draft.activeSkills.filter((s) => s.name !== request.name)
                 : [];
+              next.skills = request.name ? next.skills.filter((s) => s.name !== request.name) : [];
             } else {
               if (!ports.skills) throw new Error('Manual skills are unavailable on this host');
               const activation = await createSessionSkills({
@@ -208,13 +265,16 @@ export function createSessionControls(ports: SessionControlsPorts) {
                 ...ports.skills,
               }).activate(request.name, signal);
               if (!activation.allowed) throw new Error(activation.reason);
-              if (draft.activeSkills.length > MAX_SELECTED_SKILLS)
+              next.skills = [
+                ...next.skills.filter((s) => s.path !== activation.skill.path),
+                reference(activation.skill) as SessionSelection['skills'][number],
+              ];
+              if (next.skills.length > MAX_SELECTED_SKILLS)
                 throw new Error('Too many active skills');
             }
             current(signal);
-            if (draft.activeSkills.some((s) => !canActivateSkill(s, ports.policy).allowed))
+            if (next.skills.some((s) => !canActivateSkill(s, ports.policy).allowed))
               throw new Error('Skill policy changed');
-            next.skills = draft.activeSkills.map(reference) as SessionSelection['skills'];
             attemptingCommit = true;
             const eid = await commit(id, next, draft.activeSkills, signal);
             publish(id, { controlId: id, status: 'applied', eid });
@@ -225,7 +285,9 @@ export function createSessionControls(ports: SessionControlsPorts) {
               reason:
                 attemptingCommit && poisoned
                   ? 'persistence_or_owner_uncertain'
-                  : 'control_not_allowed',
+                  : ownerStopped(signal)
+                    ? 'owner_stopped'
+                    : 'control_not_allowed',
             });
           }
         }

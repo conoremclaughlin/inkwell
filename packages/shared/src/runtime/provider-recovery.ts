@@ -61,12 +61,15 @@ export function createProviderRecovery(backend: string) {
     },
     push(event: Record<string, unknown>) {
       if (event.type === 'backend_session' && typeof event.id === 'string') {
-        session = {
-          id: event.id,
-          ...(event.routing === 'backend' || event.routing === 'local'
-            ? { routing: event.routing }
-            : {}),
-        };
+        session =
+          event.recoverable === false
+            ? undefined
+            : {
+                id: event.id,
+                ...(event.routing === 'backend' || event.routing === 'local'
+                  ? { routing: event.routing }
+                  : {}),
+              };
       } else if (
         typeof event.type === 'string' &&
         [
@@ -87,6 +90,8 @@ export function createProviderRecovery(backend: string) {
         event.model
       ) {
         model = event.model;
+      } else if (event.type === 'session_control' && event.backend !== backend) {
+        model = undefined;
       } else if (
         (event.type === 'model_detection_reset' ||
           (event.type === 'session_control' &&

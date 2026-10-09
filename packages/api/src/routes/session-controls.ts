@@ -1,4 +1,7 @@
-/** Mutation is deliberately narrower than observation: owning human credentials only. */
+/** Mutation requires the owning user's unscoped MCP authority, not observer access.
+ * A launcher may delegate that same user token to a process; this is a credential
+ * boundary, not proof of a human at the keyboard. browser_client is not accepted.
+ */
 import type { Router, Request, Response } from 'express';
 import { parseSessionControl } from '@inklabs/shared/runtime';
 import type { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
@@ -21,7 +24,7 @@ export function addSessionControlRoute(
       }
       const auth = verdict.token;
       // Read grants and same-agent tokens do NOT confer mutation rights. Never
-      // use an unsigned context header to classify this caller as human.
+      // use an unsigned context header to upgrade the caller to unscoped user authority.
       if (auth.sbId || auth.sbSlug || auth.sessionId || auth.contactId) {
         res.status(403).json({ error: 'Owning user credentials required' });
         return;
