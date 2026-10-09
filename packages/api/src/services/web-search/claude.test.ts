@@ -1,0 +1,218 @@
+import { describe, expect, it } from 'vitest';
+import { ClaudeSearchStream, validatedUrl, verifyCapabilities } from './claude.js';
+import { CLAUDE_VERSION } from './config.js';
+import { WebSearchError } from './errors.js';
+import { HELP, MODEL, searchEvents } from './fixtures.test-support.js';
+
+function read(events: Record<string, unknown>[], maxResults = 10) {
+  const stream = new ClaudeSearchStream(MODEL, maxResults);
+  for (const event of events) stream.accept(JSON.stringify(event));
+  return stream.output();
+}
+
+describe('Claude capability and native search evidence (synthetic only)', () => {
+  it('requires the reviewed version AND structural isolation flags', () => {
+    expect(() => verifyCapabilities(`${CLAUDE_VERSION} (Claude Code)\n`, HELP)).not.toThrow();
+    for (const version of ['2.1.293', '2.1.295', '3.0.0']) {
+      expect(() => verifyCapabilities(`${version} (Claude Code)`, HELP)).toThrow(
+        'unsupported_capability'
+      );
+    }
+    for (const flag of [
+      '--tools',
+      '--bare',
+      '--strict-mcp-config',
+      '--disallowedTools',
+      '--setting-sources',
+    ]) {
+      expect(() =>
+        verifyCapabilities(`${CLAUDE_VERSION} (Claude Code)`, HELP.replace(flag, 'omitted'))
+      ).toThrow('unsupported_capability');
+    }
+  });
+
+  it('uses native links and observed queries; never assistant claims or commentary', () => {
+    const events = searchEvents();
+    events[3].result = JSON.stringify({
+      results: [
+        { title: 'Hallucinated', url: 'https://example.org/invented', snippet: 'invented' },
+      ],
+      searchQueries: ['claimed query'],
+    });
+    const output = read(events);
+    expect(output).toEqual({
+      provider: 'claude',
+      model: MODEL,
+      results: [{ title: 'Synthetic search hit', url: 'https://example.com/result', snippet: '' }],
+      searchQueries: ['synthetic query'],
+      usage: { inputTokens: 42, outputTokens: 8 },
+    });
+  });
+
+  it('deduplicates and caps results, but validates even discarded links', () => {
+    const events = searchEvents('q', [
+      'https://example.com/a',
+      'https://example.com/a',
+      'https://example.com/b',
+    ]);
+    expect(read(events, 1).results).toHaveLength(1);
+    expect(() =>
+      read(searchEvents('q', ['https://example.com/a', 'file:///synthetic']), 1)
+    ).toThrow('invalid_output');
+  });
+
+  it('accepts a successful zero-hit native search', () => {
+    expect(read(searchEvents('empty query', [])).results).toEqual([]);
+  });
+
+  it('refuses answers and tool-call announcements without actual search results', () => {
+    const events = searchEvents();
+    expect(() => read([events[0], events[3]])).toThrow('search_not_observed');
+    expect(() => read([events[0], events[1], events[3]])).toThrow('search_not_observed');
+    expect(() => read(events.slice(0, 3))).toThrow('search_not_observed');
+  });
+
+  it('refuses commentary-only success, budget skips, missing native metadata and errors', () => {
+    for (const results of [
+      [],
+      ['Some links: https://example.com'],
+      ['Web search error: limit'],
+      ['Web search was not performed'],
+    ]) {
+      const events = searchEvents();
+      (events[2].tool_use_result as Record<string, unknown>).results = results;
+      expect(() => read(events)).toThrow('search_not_observed');
+    }
+    const events = searchEvents();
+    delete events[2].tool_use_result;
+    expect(() => read(events)).toThrow('invalid_output');
+    const zeroBudget = searchEvents();
+    (zeroBudget[2].tool_use_result as Record<string, unknown>).searchCount = 0;
+    expect(() => read(zeroBudget)).toThrow('invalid_output');
+  });
+
+  it.each(['Bash', 'Read', 'WebFetch', 'Agent', 'mcp__synthetic__search', 'apply_patch'])(
+    'refuses %s in the observed tool surface',
+    (tool) => {
+      const events = searchEvents();
+      events[0].tools = ['WebSearch', tool];
+      expect(() => read(events)).toThrow('unsupported_capability');
+    }
+  );
+
+  it('refuses MCP connections, plugins, wrong models/versions, and missing init', () => {
+    for (const patch of [
+      { mcp_servers: [{ name: 'synthetic' }] },
+      { plugins: [{ name: 'synthetic' }] },
+      { model: 'different-model' },
+      { claude_code_version: '0.0.0' },
+      { tools: [] },
+    ]) {
+      const events = searchEvents();
+      Object.assign(events[0], patch);
+      expect(() => read(events)).toThrow('unsupported_capability');
+    }
+    expect(() => read(searchEvents().slice(1))).toThrow('invalid_output');
+  });
+
+  it('correlates tool results by ID and query, rejects duplicate/reordered results', () => {
+    const events = searchEvents();
+    expect(() => read([events[0], events[2], events[1], events[3]])).toThrow('invalid_output');
+    expect(() => read([events[0], events[1], events[2], events[2], events[3]])).toThrow(
+      'invalid_output'
+    );
+    (events[2].tool_use_result as Record<string, unknown>).query = 'not the observed query';
+    expect(() => read(events)).toThrow('invalid_output');
+  });
+
+  it('refuses denied/error events and unexpected tool calls even with valid earlier results', () => {
+    const events = searchEvents();
+    events[1] = {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: {} }] },
+    };
+    expect(() => read(events)).toThrow('unsupported_capability');
+    const denied = searchEvents();
+    denied[2] = {
+      ...denied[2],
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'search-1',
+            is_error: true,
+            content: 'synthetic private stderr',
+          },
+        ],
+      },
+    };
+    expect(() => read(denied)).toThrow('provider_failed');
+    const failed = searchEvents();
+    failed[3].is_error = true;
+    expect(() => read(failed)).toThrow('provider_failed');
+    const hook = searchEvents();
+    hook.splice(1, 0, { type: 'system', subtype: 'hook_started' });
+    expect(() => read(hook)).toThrow('unsupported_capability');
+  });
+
+  it('bounds tool calls, event count, fields, and usage; malformed input errors remain static', () => {
+    const events = searchEvents();
+    const stream = new ClaudeSearchStream(MODEL, 10);
+    stream.accept(JSON.stringify(events[0]));
+    for (let index = 0; index < 4; index++) {
+      stream.accept(
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              { type: 'tool_use', id: `s-${index}`, name: 'WebSearch', input: { query: 'q' } },
+            ],
+          },
+        })
+      );
+    }
+    expect(() =>
+      stream.accept(
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [{ type: 'tool_use', id: 's-5', name: 'WebSearch', input: { query: 'q' } }],
+          },
+        })
+      )
+    ).toThrow('output_limit');
+    events[3].usage = { input_tokens: -1 };
+    expect(() => read(events)).toThrow('invalid_output');
+    expect(() => stream.accept('synthetic provider private text')).toThrow(
+      /^Web search refused: invalid_output$/
+    );
+    expect(new WebSearchError('timeout').cause).toBeUndefined();
+    expect(() => read(searchEvents('q'.repeat(501)))).toThrow('invalid_output');
+    const many = new ClaudeSearchStream(MODEL, 1);
+    many.accept(JSON.stringify(searchEvents()[0]));
+    for (let index = 0; index < 255; index++)
+      many.accept(JSON.stringify({ type: 'assistant', message: { content: [] } }));
+    expect(() => many.accept('{}')).toThrow('output_limit');
+  });
+
+  it.each([
+    'file:///tmp/synthetic',
+    'javascript:synthetic',
+    'data:text/plain,synthetic',
+    'https://name:secret@example.com',
+    'http://localhost/a',
+    'http://127.0.0.1',
+    'http://0x7f000001',
+    'http://2130706433',
+    'http://[::1]',
+    'http://[::ffff:127.0.0.1]',
+    'https://example.local',
+    'https://example.internal',
+    'https://example.com:8080',
+    'https://example.com\\@localhost',
+    'https://example.com/\n',
+    '//example.com/a',
+  ])('rejects invalid/nonpublic URL %s without DNS/fetch', (url) => {
+    expect(() => validatedUrl(url)).toThrow('invalid_output');
+  });
+});
