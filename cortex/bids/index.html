@@ -446,7 +446,10 @@ function parseBid(text) {
 }
 function parseRisks(text) {
   return text.split(/\n+/).map(l => l.trim()).filter(Boolean).map(l => {
-    const m = l.match(new RegExp(MONEY.replace("\\$?", "\\$?"), "i"));
+    // The amount is the $-prefixed or k/m-suffixed number, else the last plain number.
+    // Never a percent, never a digit inside a label like "Q1" or "Phase 2".
+    const all = [...l.matchAll(new RegExp(MONEY, "gi"))].filter(x => !/^\s*%/.test(l.slice(x.index + x[0].length)) && !/[A-Za-z]$/.test(l.slice(0, x.index)));
+    const m = all.find(x => /\$/.test(x[0]) || /[kKmM]|million|thousand/i.test(x[0])) || all[all.length - 1] || null;
     const amount = m ? parseMoney(m[0]) : null;
     const label = (m ? l.slice(0, m.index) + l.slice(m.index + m[0].length) : l).replace(/[:\-–—=]\s*$/, "").replace(/\s{2,}/g, " ").trim() || "Risk";
     return { label, amount };
