@@ -11,6 +11,6 @@
     "icon:generate": "node scripts/generate-icon.mjs"
   },
   "devDependencies": {
-    "electron": "^43.0.0"
+    "electron": "^43.5.0"
   }
 }
