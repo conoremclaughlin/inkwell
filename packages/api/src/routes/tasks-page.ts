@@ -2,19 +2,25 @@
  * Paging for GET /api/admin/tasks (task 0ed92d60).
  *
  * A page is a keyset slice, newest first by (created_at, id). The cursor is
- * the last row's pair, so a task added while someone pages lands before
- * every cursor already handed out and moves nothing after it. The id breaks
- * ties: tasks share timestamps (639 pending tasks held 632 distinct values
- * on 2026-10-08), and a created_at-only cursor skips or repeats the rest of
- * a tie.
+ * the last row's pair. The id breaks ties: tasks share timestamps (639
+ * pending tasks held 632 distinct values on 2026-10-08), and a
+ * created_at-only cursor skips or repeats the rest of a tie.
+ *
+ * Paging is a live traversal, not a snapshot. A task created while someone
+ * pages (created_at defaults to now()) lands before every cursor already
+ * handed out, but a status change or a backdated insert can move a task into
+ * or out of a later page, and a page's total is counted by its own query.
  *
  * created_at travels as the text Postgres printed, never through a Date. A
  * timestamptz has microseconds and a Date keeps milliseconds, so a cursor
  * rebuilt from a Date lands inside a run of rows that differ only below the
  * millisecond.
  *
- * The cursor is opaque to callers (base64url), and validated strictly on the
- * way back in: its two values go into a PostgREST filter string.
+ * The cursor is opaque to callers (base64url), and its shape is validated
+ * strictly on the way back in, because its two values go into a PostgREST
+ * filter string. It isn't signed: a caller can build any well-formed pair,
+ * which reaches nothing new, since the query keeps the caller's own user and
+ * filters whatever the cursor says.
  */
 
 /** PostgREST's max_rows (supabase/config.toml), and the route's cap before paging existed. */
@@ -66,7 +72,7 @@ export function encodeTasksCursor(cursor: TasksCursor): string {
   return Buffer.from(JSON.stringify([cursor.createdAt, cursor.id]), 'utf8').toString('base64url');
 }
 
-/** The cursor's pair, or null for anything this route didn't issue. */
+/** The cursor's pair, or null for anything that isn't a well-formed one. */
 export function decodeTasksCursor(value: string): TasksCursor | null {
   if (value.length > CURSOR_MAX_LENGTH || !BASE64URL.test(value)) return null;
   let parsed: unknown;

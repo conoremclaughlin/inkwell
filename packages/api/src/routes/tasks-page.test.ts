@@ -28,7 +28,7 @@ describe('a tasks cursor', () => {
     }
   });
 
-  it('refuses anything this route did not issue', () => {
+  it('refuses anything that is not a well-formed pair', () => {
     const refused: Array<[string, string]> = [
       ['not base64url', 'a+b/c='],
       ['not JSON', Buffer.from('nope').toString('base64url')],
