@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+</head>
+<body>
+<title>Cortex</title>
+<style>
+/* Layout: one working column (paste box, then the answer) beside the activity log; stacked on a phone. Paper, ink and spark. */
+:root {
+  --paper: #f5f3ec;
+  --raised: #fbfaf6;
+  --sunk: #ebe8de;
+  --ink: #202923;
+  --ink-soft: #46514a;
+  --muted: #5b645c;
+  --line: #d9dccf;
+  --edge: rgba(32, 41, 35, 0.08);
+  --spark: #f2683a;
+  --spark-a: #ffcf5a;
+  --spark-b: #f04e2b;
+  --button: #202923;
+  --button-text: #f8f4e7;
+  --order-bg: #e3eddf;
+  --order-fg: #0b6a5d;
+  --order-dot: #16a390;
+  --support-bg: #f6e1d3;
+  --support-fg: #8a4523;
+  --support-dot: #e3a785;
+  --billing-bg: #fce6d8;
+  --billing-fg: #a3360f;
+  --billing-dot: #f2683a;
+  --other-bg: #ebe8de;
+  --other-fg: #46514a;
+  --other-dot: #8b938b;
+  --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+    --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+    --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+    --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+    --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+    --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+    --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+    --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141815; --raised: #1c211e; --sunk: #262c28;
+  --ink: #ecebe4; --ink-soft: #c9cdc4; --muted: #9ea69e;
+  --line: #333a35; --edge: rgba(236, 235, 228, 0.08);
+  --spark: #ff8a5c; --button: #ecebe4; --button-text: #141815;
+  --order-bg: #17342d; --order-fg: #8fe0cc; --order-dot: #2fc4ad;
+  --support-bg: #3a2a20; --support-fg: #f2c3a3; --support-dot: #e3a785;
+  --billing-bg: #3d2318; --billing-fg: #ffb08f; --billing-dot: #ff8a5c;
+  --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-inline: 20px;
+  padding-block: 28px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  min-height: 100vh;
+}
+@media (max-width: 520px) { .wrap { padding-inline: 16px; padding-block: 20px 0; gap: 22px; } }
+
+header { display: flex; align-items: center; gap: 14px; }
+.mark { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: var(--shadow); }
+.brand { min-width: 0; }
+h1 {
+  font: 500 30px/1.1 var(--serif);
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+}
+.lede { margin: 4px 0 0; color: var(--muted); font-size: 15px; text-wrap: pretty; }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 22px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+@media (max-width: 520px) { .panel { padding: 18px 16px; border-radius: 16px; } }
+
+h2 { font: 600 19px/1.25 var(--serif); margin: 0; }
+.label { display: block; font-weight: 600; font-size: 15px; }
+.hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+
+textarea {
+  width: 100%;
+  min-height: 168px;
+  resize: vertical;
+  font: 14px/1.55 var(--mono);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+
+.examples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.examples span { color: var(--muted); font-size: 13px; }
+.chip {
+  font: 500 13px/1 var(--sans);
+  color: var(--ink-soft);
+  background: var(--sunk);
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.chip:hover { color: var(--ink); }
+.chip:focus-visible, .btn:focus-visible, .link:focus-visible { outline: 2px solid var(--spark); outline-offset: 2px; }
+
+.actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.btn {
+  font: 600 15px/1 var(--sans);
+  color: var(--button-text);
+  background: var(--button);
+  border: 0;
+  border-radius: 999px;
+  padding: 13px 22px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn .spark { width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, var(--spark-a), var(--spark-b)); }
+.kbd { color: var(--muted); font-size: 12px; }
+
+/* The answer */
+.result {
+  border-radius: 14px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.result[data-state="empty"] { color: var(--muted); }
+.result-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: 600 12px/1 var(--sans);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 6px 10px 6px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.order { background: var(--order-bg); color: var(--order-fg); }
+.pill.order::before { background: var(--order-dot); }
+.pill.support { background: var(--support-bg); color: var(--support-fg); }
+.pill.support::before { background: var(--support-dot); }
+.pill.billing { background: var(--billing-bg); color: var(--billing-fg); }
+.pill.billing::before { background: var(--billing-dot); }
+.pill.other { background: var(--other-bg); color: var(--other-fg); }
+.pill.other::before { background: var(--other-dot); }
+.when { font-size: 13px; color: var(--muted); }
+.when b { color: var(--ink-soft); font-weight: 600; }
+.step { font: 500 24px/1.2 var(--serif); margin: 0; text-wrap: balance; }
+.why { margin: 0; color: var(--ink-soft); font-size: 14px; }
+.facts { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 14px; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.signals { color: var(--muted); font-size: 12px; margin: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  .result.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+  .entry.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); }
+}
+@keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
+
+/* The mark: the ink settles in, the spark lights, the eyes blink. */
+.mark .ink, .mark .spk, .mark .eyes { transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: no-preference) {
+  .mark .ink { animation: inkIn 720ms cubic-bezier(.2,.8,.2,1) both; }
+  .mark .spk { animation: sparkOn 820ms 260ms cubic-bezier(.2,.8,.2,1) both; }
+  .mark .eyes { animation: blink 5.6s 1.6s infinite; }
+  .mark.lit .spk { animation: sparkPulse 560ms cubic-bezier(.2,.8,.2,1); }
+}
+@keyframes inkIn { from { transform: scale(.6); } to { transform: scale(1); } }
+@keyframes sparkOn { 0% { opacity: 0; transform: scale(.5); } 65% { opacity: 1; transform: scale(1.14); } 100% { opacity: 1; transform: scale(1); } }
+@keyframes blink { 0%, 93%, 100% { transform: scaleY(1); } 95.5% { transform: scaleY(.08); } }
+@keyframes sparkPulse { 0% { transform: scale(1); } 40% { transform: scale(1.28); } 100% { transform: scale(1); } }
+
+/* The log */
+.log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.tally { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.entries { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.entry {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 4px 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.entry:first-child { border-top: 0; padding-top: 2px; }
+.entry time { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 2px; line-height: 1.3; }
+.entry time small { display: block; font-size: 11px; }
+.entry-body { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.entry-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.entry-step { font-weight: 600; font-size: 14px; }
+.entry-snip { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entry .pill { font-size: 11px; padding: 5px 8px 5px 7px; }
+.empty { color: var(--muted); font-size: 14px; padding: 18px 0 6px; display: flex; flex-direction: column; gap: 4px; }
+.empty strong { color: var(--ink-soft); font: 500 17px/1.3 var(--serif); }
+.log-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.link { background: none; border: 0; padding: 4px 0; font: 500 13px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.confirm { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--ink-soft); }
+.confirm .btn { padding: 8px 14px; font-size: 13px; }
+
+footer {
+  margin-top: auto;
+  padding-block: 22px 26px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 13px;
+}
+.team { display: flex; align-items: center; gap: 10px; color: var(--ink); }
+.team svg { width: 22px; height: 22px; border-radius: 6px; flex: none; }
+.team b { font: 600 15px var(--serif); }
+</style>
+
+<div class="wrap">
+  <header>
+    <svg class="mark" id="mark" viewBox="0 0 1024 1024" aria-hidden="true">
+      <defs><linearGradient id="sparkA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+      <rect width="1024" height="1024" fill="#F5F3EC"/>
+      <g class="ink">
+        <circle cx="573" cy="584" r="261" fill="#151515"/>
+        <g class="eyes" fill="#F8F4E7">
+          <ellipse cx="505" cy="556" rx="27" ry="40"/>
+          <ellipse cx="641" cy="556" rx="27" ry="40"/>
+        </g>
+      </g>
+      <circle class="spk" cx="261" cy="261" r="118" fill="url(#sparkA)"/>
+    </svg>
+    <div class="brand">
+      <h1>Cortex</h1>
+      <p class="lede">Paste one thing from the roastery inbox. Get what it is and what to do next.</p>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="pasteLabel">
+      <form id="sortForm" novalidate>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="label" id="pasteLabel" for="item">Paste an order, a customer email or an invoice line</label>
+            <p class="hint">One thing at a time. It stays in this browser.</p>
+          </div>
+          <textarea id="item" name="item" spellcheck="false" autocomplete="off"></textarea>
+          <div class="examples" role="group" aria-label="Fill in an example">
+            <span>Try an example:</span>
+            <button type="button" class="chip" data-example="order">An order</button>
+            <button type="button" class="chip" data-example="support">A customer email</button>
+            <button type="button" class="chip" data-example="billing">An invoice line</button>
+          </div>
+          <div class="actions">
+            <button type="submit" class="btn" id="sortBtn"><span class="spark" aria-hidden="true"></span>Sort it</button>
+            <span class="kbd" id="kbdHint">or press ⌘ Enter</span>
+          </div>
+        </div>
+      </form>
+
+      <div class="result" id="result" data-state="empty" aria-live="polite">
+        <p class="why" style="margin:0">The category and next step show up here.</p>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="logTitle">
+      <div class="log-head">
+        <h2 id="logTitle">Activity log</h2>
+        <span class="tally" id="tally"></span>
+      </div>
+      <ol class="entries" id="entries"></ol>
+      <div class="empty" id="emptyLog">
+        <strong>Nothing sorted yet</strong>
+        <span>Each thing you sort lands here with its time, newest first.</span>
+      </div>
+      <div class="log-foot" id="logFoot" hidden>
+        <span>Saved in this browser.</span>
+        <span id="clearArea"><button type="button" class="link" id="clearBtn">Clear the log</button></span>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="team">
+      <svg viewBox="0 0 1024 1024" aria-hidden="true">
+        <defs><linearGradient id="sparkB" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+        <rect width="1024" height="1024" fill="#F5F3EC"/>
+        <circle cx="573" cy="584" r="261" fill="#151515"/>
+        <circle cx="261" cy="261" r="118" fill="url(#sparkB)"/>
+      </svg>
+      <span>Made by <b id="teamName">Team ARC AI</b></span>
+    </div>
+    <span>Cortex</span>
+  </footer>
+</div>
+
+<script>
+/* ---------- sorting: plain rules, no network ---------- */
+// SORTER-START
+const EXAMPLES = {
+  order: "New order #1042 from Sam Rivera\n2 x Ethiopia Guji, 12 oz, whole bean\n1 x House Espresso, 2 lb, ground for espresso\nShip to: 18 Alder St, Portland, OR 97214\nShipping: USPS Priority",
+  support: "Hi there,\nMy order #1037 was supposed to arrive on Tuesday and the tracking hasn't moved in three days. It's a birthday gift, so could you check on it?\nThanks,\nPriya",
+  billing: "INVOICE INV-2291 | Harbor Green Imports | 10 bags Colombia Huila, 69 kg each | Total due $1,842.50 | Due Oct 30, 2026 | Net 30"
+};
+
+const RULES = {
+  order: [
+    [/\b(new|wholesale|subscription|web|online)\s+order\b/, 3, "new order"],
+    [/\border\s*(#|no\.?|number|num)\s*:?\s*\d+/, 2, "order number"],
+    [/\bship(ping)?\s+(to|address)\b/, 3, "ship-to address"],
+    [/\b\d+\s*(x|×)\s+\S/, 2, "item quantities"],
+    [/\b\d+(\.\d+)?\s*(oz|lb|lbs|kg|g)\b/, 1, "bag sizes"],
+    [/\b(whole bean|ground for|grind|espresso grind|drip grind)\b/, 1, "grind"],
+    [/\b(qty|quantity)\b/, 2, "quantity"],
+    [/\bpurchase order\b|\bp\.?o\.?\s*#?\s*\d+/, 2, "purchase order"],
+    [/\b(i'?d like to order|we'?d like to order|we'?d like to place|please send us|send us|(can|could) (we|i) (get|order|grab)|we'?ll need|reorder|re-order|same as last time)\b/, 3, "asks to order"],
+    [/\b(shopify|squarespace|etsy|checkout)\b/, 1, "shop order"]
+  ],
+  support: [
+    [/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|hasn'?t moved|running late|is late|delayed)\b/, 4, "late delivery"],
+    [/\btracking\b/, 1, "tracking"],
+    [/\b(refund|money back|return it|send it back|exchange)\b/, 4, "refund or return"],
+    [/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/, 4, "a problem with the order"],
+    [/\bcancel(l?ed|l?ing|lation)?\b/, 3, "cancellation"],
+    [/\b(change|update|wrong) (my|the|shipping) address\b/, 4, "address change"],
+    [/\b(unhappy|disappointed|complaint|not happy|upset)\b/, 3, "unhappy customer"],
+    [/\b(question|wondering|could you|can you|do you|how do i|is it possible|help)\b/, 1, "a question"],
+    [/\?/, 1, "a question"],
+    [/^(hi|hello|hey|dear|good morning)\b/, 1, "email greeting"]
+  ],
+  billing: [
+    [/\binvoice\b|\binv[-\s#]?\d+/, 4, "invoice"],
+    [/\b(amount due|balance due|total due|due date|due on|due by|payment due|past due|overdue|now due)\b/, 3, "amount due"],
+    [/\bnet\s?(15|30|45|60|90)\b/, 3, "payment terms"],
+    [/\b(remit|remittance|ach|wire transfer|bank transfer|pay online)\b/, 2, "payment details"],
+    [/\b(statement|billing|bill for|bill #)\b/, 2, "statement"],
+    [/\b(receipt|paid in full|payment received|thank you for your payment)\b/, 3, "receipt"],
+    [/\$\s?\d[\d,]*(\.\d{2})?/, 1, "a dollar amount"],
+    [/\b(imports?|importers?|supplier|freight|green coffee|packaging|roaster parts|propane)\b/, 1, "a supplier"]
+  ]
+};
+
+const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+
+function score(text) {
+  const t = text.toLowerCase();
+  const out = {};
+  for (const [cat, rules] of Object.entries(RULES)) {
+    let s = 0;
+    const hits = [];
+    for (const [re, w, why] of rules) {
+      if (re.test(t)) { s += w; if (!hits.includes(why)) hits.push(why); }
+    }
+    out[cat] = { score: s, hits };
+  }
+  // A complaint about an order is support, and an invoice that lists goods is billing.
+  const complaint = /(late delivery|refund or return|a problem with the order|cancellation|address change)/;
+  if (out.support.hits.some(h => complaint.test(h))) out.support.score += 3;
+  if (out.billing.hits.includes("invoice") || out.billing.hits.includes("receipt")) out.billing.score += 3;
+  return out;
+}
+
+function parseDue(text, now) {
+  const t = text.replace(/\s+/g, " ");
+  let m = t.match(/\bdue(?:\s+(?:on|by|date:?))?\s*:?\s*([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?/i);
+  if (m) {
+    const mi = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase());
+    if (mi >= 0) {
+      const year = m[3] ? Number(m[3]) : now.getFullYear();
+      return new Date(year, mi, Number(m[2]));
+    }
+  }
+  m = t.match(/\bdue(?:\s+(?:on|by|date:?))?\s*:?\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/i);
+  if (m) {
+    let year = m[3] ? Number(m[3]) : now.getFullYear();
+    if (year < 100) year += 2000;
+    return new Date(year, Number(m[1]) - 1, Number(m[2]));
+  }
+  return null;
+}
+
+function money(text) {
+  const found = [...text.matchAll(/\$\s?(\d[\d,]*(?:\.\d{2})?)/g)].map(m => m[1]);
+  if (!found.length) return null;
+  const cents = found.some(v => v.includes("."));
+  const max = Math.max(...found.map(v => Number(v.replace(/,/g, ""))));
+  return "$" + max.toLocaleString("en-US", { minimumFractionDigits: cents ? 2 : 0, maximumFractionDigits: 2 });
+}
+
+const VENDOR_WORD = "(?:Imports?|Importers|Supply|Supplies|Co\\.?|Company|Inc\\.?|LLC|Ltd|Roasters?|Packaging|Freight|Trading|Propane|Farms?|Coffee)";
+function vendor(text) {
+  const short = text.split(/[|\n·•]/).map(p => p.trim()).find(p => p.length <= 40 && new RegExp("\\b" + VENDOR_WORD + "\\b", "i").test(p) && !/\b(due|invoice|inv|bags?|kg|lb)\b/i.test(p));
+  if (short) return short;
+  const named = text.match(new RegExp("\\b([A-Z][A-Za-z&'.-]*(?:\\s+[A-Z][A-Za-z&'.-]*)*\\s+" + VENDOR_WORD + ")(?=\\W|$)"));
+  if (named) return named[1];
+  const from = text.match(/\bfrom\s+([A-Z][\w&'.-]*(?:\s+[A-Z][\w&'.-]*){0,4})/);
+  return from ? from[1] : null;
+}
+
+function fmtDate(d) {
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function daysBetween(a, b) {
+  const da = new Date(a.getFullYear(), a.getMonth(), a.getDate());
+  const db = new Date(b.getFullYear(), b.getMonth(), b.getDate());
+  return Math.round((db - da) / 86400000);
+}
+
+function orderNumber(text) {
+  const m = text.match(/\border\s*(?:#|no\.?|number|num)?\s*:?\s*#?\s*(\d{3,})/i) || text.match(/#\s?(\d{3,})/);
+  return m ? "#" + m[1] : null;
+}
+
+function signOff(text) {
+  const inlineFirst = text.trim().match(/\b(?:thanks|thank you|cheers|best),?\s+([A-Z][a-z]+)\.?\s*$/i);
+  if (inlineFirst && /^[A-Z]/.test(inlineFirst[1])) return inlineFirst[1];
+  const dash = text.trim().match(/[-–—]\s*([A-Z][a-z]+)(?:,[^\n]*)?\s*$/);
+  if (dash) return dash[1];
+  const lines = text.trim().split(/\n+/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return null;
+  const last = lines[lines.length - 1].replace(/^[-–—~\s]+/, "");
+  const prev = lines[lines.length - 2].toLowerCase();
+  if (/^[A-Z][a-z]+( [A-Z][a-z]+)?\.?$/.test(last) && (/^(thanks|thank you|cheers|best|regards|sincerely)/.test(prev) || lines[lines.length - 1].startsWith("-"))) return last.replace(/\.$/, "");
+  const inline = text.match(/\b(?:thanks|thank you|cheers|best),?\s+([A-Z][a-z]+)\s*$/);
+  return inline ? inline[1] : null;
+}
+
+function classify(text, now = new Date()) {
+  const clean = text.trim();
+  if (!clean) return null;
+  const s = score(clean);
+  const ranked = Object.entries(s).sort((a, b) => b[1].score - a[1].score);
+  const [topCat, top] = ranked[0];
+  const second = ranked[1][1].score;
+  const lower = clean.toLowerCase();
+
+  if (top.score < 3) {
+    return {
+      category: "other", label: "Not sure", urgency: "When you can",
+      step: "Read this one yourself",
+      why: "It doesn't read like an order, a customer email or an invoice.",
+      facts: [], signals: top.hits
+    };
+  }
+  const confidence = top.score - second >= 3 ? "Sure" : "Probably";
+  const facts = [];
+  let step, why, urgency = "Today";
+
+  if (topCat === "order") {
+    const num = orderNumber(clean);
+    if (num) facts.push(["Order", num]);
+    const from = clean.match(/\bfrom\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/);
+    const customer = from ? from[1] : signOff(clean);
+    if (customer) facts.push(["Customer", customer]);
+    let items = clean.split(/\n/).map(l => l.trim()).filter(l => l.length <= 80 && (/^\d+\s*(x|×)\s+/i.test(l) || (/\b\d+(\.\d+)?\s*(oz|lb|lbs|kg)\b/i.test(l) && !/ship/i.test(l))));
+    if (!items.length) {
+      // Quantities inside a sentence: "10 lb of the house espresso and 5 lb Colombia".
+      items = [...clean.matchAll(/\b(\d+(?:\.\d+)?)\s*(lb|lbs|oz|kg)\b(?:\s+of)?(?:\s+the)?((?:\s+(?!and\b|for\b|this\b|please\b|to\b|by\b|each\b)[A-Za-z'-]+){1,3})/gi)]
+        .map(m => m[1] + " " + m[2].toLowerCase() + m[3]);
+    }
+    if (items.length) facts.push(["To roast", items.slice(0, 4).map(l => l.replace(/^(\d+)\s*x\s+/i, "$1 × ")).join("; ")]);
+    const shipTo = clean.match(/ship(?:ping)?\s+(?:to|address)\s*:?\s*(.+)/i);
+    if (shipTo) facts.push(["Ship to", shipTo[1].trim()]);
+    if (/\b(rush|asap|overnight|express|next[- ]day)\b/.test(lower)) {
+      step = "Ship today, first thing"; why = "It's marked as a rush, so roast and pack it before anything else.";
+    } else if (/\b(pick ?up|collect it|will collect)\b/.test(lower)) {
+      step = "Roast it and set it aside for pickup"; why = "They're collecting it, so nothing to ship.";
+    } else if (/\bsubscription\b/.test(lower)) {
+      step = "Add it to this week's subscription roast"; why = "It's a subscription order, so it goes out with the regular batch."; urgency = "This week";
+    } else if (/\b(wholesale|cafe|café|restaurant)\b/.test(lower)) {
+      step = "Roast it and confirm the delivery day"; why = "It's a wholesale order, so check when they want it.";
+    } else {
+      step = "Ship today"; why = items.length ? "Roast and pack the items below, then ship." : "Roast and pack it, then ship.";
+    }
+  } else if (topCat === "support") {
+    const num = orderNumber(clean);
+    if (num) facts.push(["About order", num]);
+    const who = signOff(clean);
+    if (who) facts.push(["Customer", who]);
+    if (/\b(gift|birthday|anniversary|wedding)\b/.test(lower)) facts.push(["Note", "It's a gift"]);
+    if (/\b(change|update|wrong) (my|the|shipping) address\b/.test(lower)) {
+      step = "Update the address before it ships"; why = "They need the shipping address changed.";
+    } else if (/\bcancel/.test(lower)) {
+      step = "Cancel it before it ships"; why = "They want to cancel the order.";
+    } else if (/\b(refund|money back|return it|send it back|exchange)\b/.test(lower)) {
+      step = "Process the refund"; why = "They're asking for their money back or a return.";
+    } else if (/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/.test(lower)) {
+      step = "Send a replacement and apologize"; why = "Something arrived wrong or damaged.";
+    } else if (/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|hasn'?t moved|running late|is late|delayed)\b/.test(lower)) {
+      step = "Send tracking and an update today"; why = "The order seems late and they're waiting on it.";
+    } else {
+      step = "Reply to the customer today"; why = "It's a question from a customer."; urgency = "Today";
+    }
+  } else {
+    const inv = clean.match(/\binv(?:oice)?[-\s#:]*(?:no\.?\s*)?([A-Z]*-?\d[\w-]*)/i);
+    if (inv) facts.push(["Invoice", inv[1].toUpperCase().startsWith("INV") ? inv[1].toUpperCase() : "INV-" + inv[1].replace(/^-/, "")]);
+    const from = vendor(clean);
+    if (from) facts.push(["From", from]);
+    const amt = money(clean);
+    if (amt) facts.push(["Amount", amt]);
+    const due = parseDue(clean, now);
+    if (due) facts.push(["Due", fmtDate(due)]);
+    const terms = clean.match(/\bnet\s?(15|30|45|60|90)\b/i);
+    if (/\b(receipt|paid in full|payment received|thank you for your payment)\b/.test(lower)) {
+      step = "File the receipt. Nothing to pay"; why = "It confirms a payment that's already made."; urgency = "When you can";
+    } else if (/\b(past due|overdue|late fee|final notice)\b/.test(lower) || (due && daysBetween(now, due) < 0)) {
+      step = "Pay the invoice today"; why = "It's overdue.";
+    } else if (due) {
+      const left = daysBetween(now, due);
+      step = "Pay the invoice by " + fmtDate(due);
+      why = left === 0 ? "It's due today." : left === 1 ? "It's due tomorrow." : "It's due in " + left + " days.";
+      urgency = left <= 2 ? "Today" : left <= 7 ? "This week" : "Before " + fmtDate(due);
+    } else if (terms) {
+      step = "Pay the invoice within " + terms[1] + " days"; why = "The terms are net " + terms[1] + "."; urgency = "This month";
+    } else {
+      step = "Pay the invoice"; why = "It's a bill from a supplier."; urgency = "This week";
+    }
+  }
+  const label = { order: "Order", support: "Support", billing: "Billing" }[topCat];
+  return { category: topCat, label, confidence, urgency, step, why, facts, signals: top.hits };
+}
+// SORTER-END
+
+/* ---------- page ---------- */
+const $ = id => document.getElementById(id);
+const KEY = "cortex-log-v1";
+let log = [];
+let memoryOnly = false;
+
+function loadLog() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    log = Array.isArray(parsed) ? parsed.filter(e => e && e.at && e.category) : [];
+  } catch { log = []; memoryOnly = true; }
+}
+function saveLog() {
+  try { localStorage.setItem(KEY, JSON.stringify(log.slice(0, 300))); }
+  catch { memoryOnly = true; }
+}
+
+function timeParts(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const diff = daysBetween(d, now);
+  const day = diff === 0 ? "" : diff === 1 ? "Yesterday" : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return { time, day, full: d.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }) };
+}
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v);
+  }
+  for (const k of kids) if (k) n.append(k);
+  return n;
+}
+
+function renderResult(r, fresh) {
+  const box = $("result");
+  box.replaceChildren();
+  box.dataset.state = "filled";
+  const top = el("div", { class: "result-top" },
+    el("span", { class: "pill " + r.category, text: r.label }),
+    el("span", { class: "when" }, el("b", { text: r.urgency }), document.createTextNode(r.confidence ? " · " + r.confidence : ""))
+  );
+  box.append(top, el("p", { class: "step", text: r.step }), el("p", { class: "why", text: r.why }));
+  if (r.facts.length) {
+    const dl = el("dl", { class: "facts" });
+    for (const [k, v] of r.facts) dl.append(el("dt", { text: k }), el("dd", { text: v }));
+    box.append(dl);
+  }
+  if (r.signals.length) box.append(el("p", { class: "signals", text: "Read as " + r.label.toLowerCase() + " from: " + r.signals.join(", ") }));
+  box.classList.remove("fresh");
+  if (fresh) { void box.offsetWidth; box.classList.add("fresh"); }
+}
+
+function renderLog(freshId) {
+  const list = $("entries");
+  list.replaceChildren();
+  for (const e of log) {
+    const t = timeParts(e.at);
+    const timeEl = el("time", { datetime: e.at, title: t.full }, document.createTextNode(t.time));
+    if (t.day) timeEl.append(el("small", { text: t.day }));
+    const body = el("div", { class: "entry-body" },
+      el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
+    );
+    const li = el("li", { class: "entry" + (e.id === freshId ? " fresh" : "") }, timeEl, body);
+    list.append(li);
+  }
+  $("emptyLog").hidden = log.length > 0;
+  $("logFoot").hidden = log.length === 0;
+  const counts = { order: 0, support: 0, billing: 0, other: 0 };
+  for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
+  const parts = [];
+  if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
+  if (counts.support) parts.push(counts.support + " support");
+  if (counts.billing) parts.push(counts.billing + " billing");
+  if (counts.other) parts.push(counts.other + " unsure");
+  $("tally").textContent = parts.join(" · ");
+  const foot = $("logFoot").firstElementChild;
+  foot.textContent = memoryOnly ? "This browser won't keep it after you close the page." : "Saved in this browser.";
+}
+
+function sortNow() {
+  const text = $("item").value;
+  const r = classify(text);
+  if (!r) {
+    const box = $("result");
+    box.replaceChildren(el("p", { class: "why", text: "Paste something first: an order, a customer email or an invoice line." }));
+    box.dataset.state = "empty";
+    $("item").focus();
+    return;
+  }
+  renderResult(r, true);
+  const mark = $("mark");
+  mark.classList.remove("lit");
+  void mark.getBoundingClientRect();
+  mark.classList.add("lit");
+  const oneLine = text.trim().replace(/\s+/g, " ");
+  const entry = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    at: new Date().toISOString(),
+    category: r.category, label: r.label, step: r.step,
+    snippet: oneLine.length > 140 ? oneLine.slice(0, 139) + "…" : oneLine
+  };
+  log.unshift(entry);
+  saveLog();
+  renderLog(entry.id);
+}
+
+$("sortForm").addEventListener("submit", e => { e.preventDefault(); sortNow(); });
+$("item").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sortNow(); }
+});
+document.querySelectorAll("[data-example]").forEach(b => b.addEventListener("click", () => {
+  $("item").value = EXAMPLES[b.dataset.example];
+  $("item").focus();
+}));
+
+function showClear() {
+  const area = $("clearArea");
+  area.replaceChildren(el("button", { type: "button", class: "link", id: "clearBtn", text: "Clear the log" }));
+  $("clearBtn").addEventListener("click", () => {
+    const n = log.length;
+    const yes = el("button", { type: "button", class: "btn", text: "Clear" });
+    const no = el("button", { type: "button", class: "link", text: "Keep it" });
+    area.replaceChildren(el("span", { class: "confirm" }, document.createTextNode("Clear all " + n + (n === 1 ? " entry?" : " entries?")), yes, no));
+    yes.addEventListener("click", () => { log = []; saveLog(); renderLog(); showClear(); $("item").focus(); });
+    no.addEventListener("click", showClear);
+    no.focus();
+  });
+}
+
+if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
+$("item").value = EXAMPLES.order;
+loadLog();
+renderLog();
+showClear();
+</script>
+
+</body>
+</html>
