@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cortex Retention</title>
+<style>
+/* Layout: the contact on the left (paste, masked as it lands), the verdict beside it, the retention queue and the COO line underneath. */
+:root {
+  --paper: #f5f3ec; --raised: #fbfaf6; --sunk: #ebe8de;
+  --ink: #202923; --ink-soft: #46514a; --muted: #5b645c; --line: #d9dccf;
+  --spark: #f2683a; --button: #202923; --button-text: #f8f4e7;
+  --alert-bg: #fde0da; --alert-fg: #a01d0b; --alert-line: #f0ad9c;
+  --ok-bg: #e3eddf; --ok-fg: #0b6a5d;
+  --mask-bg: #e2e8f1; --mask-fg: #274472;
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --sans: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #161b18; --raised: #1d2420; --sunk: #232b26;
+    --ink: #eef0e8; --ink-soft: #c6cdc4; --muted: #a3aba1; --line: #343d37;
+    --button: #eef0e8; --button-text: #161b18;
+    --alert-bg: #44160f; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --ok-bg: #16302a; --ok-fg: #8fdcc8;
+    --mask-bg: #1d2a40; --mask-fg: #a9c3ef;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #161b18; --raised: #1d2420; --sunk: #232b26;
+  --ink: #eef0e8; --ink-soft: #c6cdc4; --muted: #a3aba1; --line: #343d37;
+  --button: #eef0e8; --button-text: #161b18;
+  --alert-bg: #44160f; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+  --ok-bg: #16302a; --ok-fg: #8fdcc8;
+  --mask-bg: #1d2a40; --mask-fg: #a9c3ef;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); }
+.wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: flex; flex-direction: column; gap: 20px; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font: 600 28px/1.15 var(--serif); margin: 0; text-wrap: balance; }
+header nav { display: flex; gap: 14px; font-size: 14px; }
+a { color: inherit; }
+.sub { margin: 4px 0 0; color: var(--muted); font-size: 14px; max-width: 65ch; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+.card { background: var(--raised); border: 1px solid var(--line); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+label, .label { font-weight: 600; font-size: 14px; }
+textarea { width: 100%; min-height: 150px; resize: vertical; font: 15px/1.45 var(--mono); padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); }
+textarea:focus-visible, button:focus-visible, select:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); }
+.btn { font: 600 15px var(--sans); padding: 9px 16px; border-radius: 999px; border: 0; background: var(--button); color: var(--button-text); cursor: pointer; }
+.btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; font-size: 13px; color: var(--muted); align-items: center; }
+.chip { font: 13px var(--sans); padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); cursor: pointer; }
+.masked { font-size: 13px; padding: 8px 10px; border-radius: 10px; background: var(--mask-bg); color: var(--mask-fg); }
+.verdict { border-radius: 14px; padding: 14px; background: var(--sunk); display: flex; flex-direction: column; gap: 8px; }
+.verdict.risk { background: var(--alert-bg); color: var(--alert-fg); border: 1px solid var(--alert-line); }
+.verdict.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.verdict .head { font: 600 19px/1.3 var(--serif); margin: 0; }
+.verdict .why { margin: 0; font-size: 14px; }
+.tag { display: inline-block; font: 700 12px var(--sans); letter-spacing: 0.04em; text-transform: uppercase; padding: 3px 8px; border-radius: 6px; background: var(--alert-fg); color: var(--raised); }
+dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 14px; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+.coo { font: 600 17px/1.4 var(--serif); padding: 12px 16px; border-radius: 14px; background: var(--raised); border: 1px solid var(--line); }
+.coo span { font: 13px var(--sans); color: var(--muted); display: block; font-weight: 400; }
+.queue { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.queue li { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--paper); }
+.queue li.open { border-color: var(--alert-line); }
+.queue .meta { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.queue .clock { font: 600 15px var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.queue .clock.late { color: var(--alert-fg); }
+.queue .snip { grid-column: 1 / -1; font: 13px var(--mono); color: var(--ink-soft); overflow-wrap: anywhere; }
+.empty { color: var(--muted); font-size: 14px; margin: 0; }
+.fine { font-size: 13px; color: var(--muted); margin: 0; }
+footer { font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Cortex Retention</h1>
+      <p class="sub">Paste a customer contact. CPF, card and phone numbers are masked the moment they land, in this browser, before anything is saved. This page sends nothing anywhere: open the network tab and check.</p>
+    </div>
+    <nav><a href="../">Inbox</a><a href="../pricing/">Pricing</a></nav>
+  </header>
+
+  <p class="coo" id="coo">0 at-risk contacts routed to retention.<span>Time to retention: none yet.</span></p>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="pasteLabel">
+      <label id="pasteLabel" for="contact">Customer contact</label>
+      <textarea id="contact" spellcheck="false" autocomplete="off" placeholder="Paste a chat, email or call note"></textarea>
+      <div class="chips" role="group" aria-label="Fill in an example">
+        <span>Try:</span>
+        <button type="button" class="chip" data-ex="cancel">Wants to cancel</button>
+        <button type="button" class="chip" data-ex="port">Portabilidade</button>
+        <button type="button" class="chip" data-ex="repeat">Second contact</button>
+        <button type="button" class="chip" data-ex="plain">Plain question</button>
+      </div>
+      <div class="row">
+        <label for="owner">Retention owner</label>
+        <select id="owner"><option>Ana (Retention)</option><option>Bruno (Retention)</option><option>Carla (Retention)</option><option value="auto" selected>Next in rotation</option></select>
+      </div>
+      <div class="row"><button type="button" class="btn" id="checkBtn">Check contact</button><button type="button" class="btn ghost" id="clearBtn">Clear</button></div>
+      <p class="masked" id="maskNote" hidden></p>
+    </section>
+
+    <section class="card" aria-live="polite">
+      <span class="label">Verdict</span>
+      <div class="verdict" id="verdict"><p class="why">Paste a contact and check it. A repeat from the same account within 30 days, or "cancelar", "portabilidade" or "switching", is a churn risk.</p></div>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="qLabel">
+    <span class="label" id="qLabel">Retention queue</span>
+    <ul class="queue" id="queue"></ul>
+    <p class="empty" id="qEmpty">No handoffs yet.</p>
+    <p class="fine" id="storeNote">Saved in this browser: masked text and hashed account IDs only.</p>
+  </section>
+
+  <footer><span>Made by <b>Team ARC AI</b></span><span>Cortex</span></footer>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const KEY = "cortex-retention-v1";
+const DAY = 86400000;
+const EXAMPLES = {
+  cancel: "Cliente: Conta 4471-8890\nQuero cancelar meu plano de internet. Meu CPF é 123.456.789-09 e o telefone (11) 98765-4321. Paguei com o cartão 4111 1111 1111 1111.",
+  port: "Account 5520-1134: I'm thinking about switching to another carrier, can you start the portabilidade of my number +55 21 99876-5432?",
+  repeat: "Conta 4471-8890\nOi, liguei semana passada sobre a velocidade. Ainda está lenta.",
+  plain: "Conta 7781-2201\nQual é o horário de atendimento da loja do centro?"
+};
+
+/* ---------- masking: runs on paste and on every input, before anything is stored ---------- */
+function luhn(d) { let s = 0, alt = false; for (let i = d.length - 1; i >= 0; i--) { let n = +d[i]; if (alt) { n *= 2; if (n > 9) n -= 9; } s += n; alt = !alt; } return s % 10 === 0; }
+function mask(text) {
+  const found = { cpf: 0, card: 0, phone: 0 };
+  let t = text.replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, m => { found.cpf++; return "[CPF masked]"; });
+  t = t.replace(/\b(?:\d[ -]?){13,19}\b/g, m => { const d = m.replace(/\D/g, ""); if (d.length >= 13 && d.length <= 19 && luhn(d)) { found.card++; return "[card ••••" + d.slice(-4) + "]"; } return m; });
+  t = t.replace(/(?:\+?55[\s-]?)?\(?\b\d{2}\)?[\s-]?9?\d{4}[\s-]?\d{4}\b/g, m => { if (m.replace(/\D/g, "").length < 10) return m; found.phone++; return "[phone masked]"; });
+  return { text: t, found };
+}
+const box = $("contact");
+function maskBox() {
+  const r = mask(box.value);
+  if (r.text !== box.value) { const end = box.selectionEnd === box.value.length; box.value = r.text; if (end) box.selectionStart = box.selectionEnd = box.value.length; }
+  const n = r.found.cpf + r.found.card + r.found.phone;
+  if (n) { const parts = []; if (r.found.cpf) parts.push(r.found.cpf + " CPF"); if (r.found.card) parts.push(r.found.card + " card"); if (r.found.phone) parts.push(r.found.phone + " phone"); $("maskNote").textContent = "Masked in this browser before saving: " + parts.join(", ") + "."; $("maskNote").hidden = false; }
+}
+box.addEventListener("paste", () => setTimeout(maskBox, 0));
+box.addEventListener("input", maskBox);
+
+/* ---------- account id, hashed ---------- */
+function accountId(text) {
+  const m = text.match(/\b(?:conta|account|acct|cliente|contrato|customer|id)\s*(?:n[ºo°.]?|#|:)?\s*([A-Z]{0,3}[-\s]?\d[\d-]{3,})/i);
+  return m ? m[1].replace(/\s+/g, "").toUpperCase() : null;
+}
+async function hashId(id) {
+  const data = new TextEncoder().encode("cortex-retention:" + id);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+const INTENT = /\b(cancelar|cancelamento|cancela|cancel(ar|ling|lation)?|portabilidade|portar|switch(ing)?( to)?|mudar de operadora|trocar de operadora|vou sair)\b/i;
+
+/* ---------- state ---------- */
+let state = { contacts: [], handoffs: [], rotation: 0 };
+let memoryOnly = false;
+try { const s = JSON.parse(localStorage.getItem(KEY) || "null"); if (s && Array.isArray(s.contacts)) state = s; } catch { memoryOnly = true; }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); memoryOnly = localStorage.getItem(KEY) === null; } catch { memoryOnly = true; } $("storeNote").textContent = memoryOnly ? "This browser won't keep it after you close the page." : "Saved in this browser: masked text and hashed account IDs only."; }
+const OWNERS = ["Ana (Retention)", "Bruno (Retention)", "Carla (Retention)"];
+
+function el(tag, attrs = {}, ...kids) { const n = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) { if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v); } for (const k of kids) if (k) n.append(k); return n; }
+function clock(ms) { const s = Math.max(0, Math.floor(ms / 1000)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return (h ? h + "h " : "") + String(m).padStart(h ? 2 : 1, "0") + "m " + String(x).padStart(2, "0") + "s"; }
+function stamp(iso) { return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
+
+async function check() {
+  maskBox();
+  const text = box.value.trim();
+  const v = $("verdict");
+  if (!text) { v.className = "verdict"; v.replaceChildren(el("p", { class: "why", text: "Paste a contact first." })); return; }
+  const id = accountId(text);
+  const hash = id ? await hashId(id) : null;
+  const now = Date.now();
+  const prior = hash ? state.contacts.filter(c => c.hash === hash && now - Date.parse(c.at) <= 30 * DAY) : [];
+  const intent = (text.match(INTENT) || [])[0];
+  const reasons = [];
+  if (prior.length) reasons.push("Repeat contact: this account was in touch " + prior.length + (prior.length === 1 ? " time" : " times") + " in the last 30 days (last " + stamp(prior[0].at) + ")");
+  if (intent) reasons.push("Says “" + intent.toLowerCase() + "”" + (prior.length ? "" : " on first contact"));
+  const at = new Date().toISOString();
+  state.contacts.unshift({ hash, at, risk: reasons.length > 0 });
+  const facts = [["Account", id ? "hashed " + hash + " (the ID itself is not saved)" : "no account ID found"], ["Contacts in 30 days", String(prior.length + 1)]];
+  v.replaceChildren();
+  if (reasons.length) {
+    let owner = $("owner").value;
+    if (owner === "auto") { owner = OWNERS[state.rotation % OWNERS.length]; state.rotation++; }
+    state.handoffs.unshift({ id: now.toString(36) + Math.random().toString(36).slice(2, 6), at, owner, hash, reasons, respondedAt: null, snippet: text.replace(/\s+/g, " ").slice(0, 160) });
+    v.className = "verdict risk"; v.setAttribute("role", "alert");
+    v.append(el("div", {}, el("span", { class: "tag", text: "Churn risk" })), el("p", { class: "head", text: "Churn risk, route to retention now." }), el("p", { class: "why", text: reasons.join(". ") + "." }));
+    facts.push(["Handed to", owner + " at " + stamp(at) + ", clock running"]);
+  } else {
+    v.className = "verdict ok"; v.removeAttribute("role");
+    v.append(el("p", { class: "head", text: "No churn signal. Handle as usual." }), el("p", { class: "why", text: id ? "First contact from this account in 30 days, and no cancel or switching language." : "No cancel or switching language. Add the account ID to catch repeat contacts." }));
+  }
+  const dl = el("dl"); for (const [k, x] of facts) dl.append(el("dt", { text: k }), el("dd", { text: x })); v.append(dl);
+  save(); render();
+}
+
+function render() {
+  const q = $("queue"); q.replaceChildren();
+  const now = Date.now();
+  for (const h of state.handoffs) {
+    const open = !h.respondedAt;
+    const elapsed = (open ? now : Date.parse(h.respondedAt)) - Date.parse(h.at);
+    const btn = open ? el("button", { type: "button", class: "btn ghost", text: "Retention responded" }) : null;
+    if (btn) btn.addEventListener("click", () => { h.respondedAt = new Date().toISOString(); save(); render(); });
+    q.append(el("li", { class: open ? "open" : "" },
+      el("div", {}, el("div", { text: h.owner + (open ? "" : " · responded") }), el("div", { class: "meta", text: "Handed off " + stamp(h.at) + " · account " + (h.hash || "unknown") + " · " + h.reasons.join("; ") })),
+      el("div", {}, el("div", { class: "clock" + (open && elapsed > 15 * 60000 ? " late" : ""), "data-clock": h.id, text: (open ? "" : "in ") + clock(elapsed) }), btn),
+      el("div", { class: "snip", text: h.snippet })));
+  }
+  $("qEmpty").hidden = state.handoffs.length > 0;
+  const done = state.handoffs.filter(h => h.respondedAt).map(h => Date.parse(h.respondedAt) - Date.parse(h.at)).sort((a, b) => a - b);
+  const openN = state.handoffs.filter(h => !h.respondedAt).length;
+  const n = state.handoffs.length;
+  const avg = done.length ? done.reduce((a, b) => a + b, 0) / done.length : null;
+  const med = done.length ? done[Math.floor((done.length - 1) / 2)] : null;
+  $("coo").replaceChildren(document.createTextNode(n + (n === 1 ? " at-risk contact" : " at-risk contacts") + " routed to retention" + (openN ? ", " + openN + " waiting." : ".")),
+    el("span", { text: done.length ? "Time to retention: median " + clock(med) + ", average " + clock(avg) + " over " + done.length + " answered." : "Time to retention: none answered yet." }));
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const h of state.handoffs) if (!h.respondedAt) { const c = document.querySelector('[data-clock="' + h.id + '"]'); if (c) { const e = now - Date.parse(h.at); c.textContent = clock(e); c.classList.toggle("late", e > 15 * 60000); } }
+}, 1000);
+
+$("checkBtn").addEventListener("click", check);
+box.addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) check(); });
+$("clearBtn").addEventListener("click", () => { box.value = ""; $("maskNote").hidden = true; box.focus(); });
+document.querySelectorAll("[data-ex]").forEach(b => b.addEventListener("click", () => { box.value = EXAMPLES[b.dataset.ex]; maskBox(); box.focus(); }));
+save(); render();
+</script>
+</body>
+</html>
