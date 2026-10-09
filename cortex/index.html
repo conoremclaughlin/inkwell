@@ -50,6 +50,8 @@
   --fees-bg: #e1f1e6; --fees-fg: #1d5a37; --fees-dot: #2f9e63;
   --supply-bg: #fbecd2; --supply-fg: #7a4a06; --supply-dot: #c98410;
   --pending-bg: #f8e1e6; --pending-fg: #8c1d3c; --pending-dot: #d6456b;
+  --bid-bg: #e3e6f5; --bid-fg: #2f3a7a; --bid-dot: #5865c4;
+  --ok-bg: #e3f2e6; --ok-fg: #1d5a37; --ok-line: #9fd2ae;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -76,6 +78,8 @@
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
     --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
+    --bid-bg: #1f2447; --bid-fg: #b9c1f3; --bid-dot: #7f8be0;
+    --ok-bg: #15301f; --ok-fg: #a6e0bc; --ok-line: #2f6a45;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -100,6 +104,8 @@
     --fees-bg: #15301f; --fees-fg: #a6e0bc; --fees-dot: #48c27f;
     --supply-bg: #3a2a0c; --supply-fg: #f3cf8e; --supply-dot: #e0a33a;
     --pending-bg: #3e1622; --pending-fg: #f7b3c6; --pending-dot: #f0688f;
+    --bid-bg: #1f2447; --bid-fg: #b9c1f3; --bid-dot: #7f8be0;
+    --ok-bg: #15301f; --ok-fg: #a6e0bc; --ok-line: #2f6a45;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -257,6 +263,18 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.pending { background: var(--pending-bg); color: var(--pending-fg); }
 .pill.pending::before { background: var(--pending-dot); }
 .flag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill.bid { background: var(--bid-bg); color: var(--bid-fg); }
+.pill.bid::before { background: var(--bid-dot); }
+/* Bid margin check: green when it's fine to send, red (the alert style) when it needs a VP. */
+.result.ok { background: var(--ok-bg); border: 1.5px solid var(--ok-line); }
+.result.ok .step { color: var(--ok-fg); font-weight: 600; }
+.bid-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.bid-grid .field:first-child { grid-column: span 2; }
+@media (max-width: 720px) { .bid-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.bid-settings { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.bid-settings .field { width: 150px; }
+.bid-settings .fine { flex: 1 1 200px; }
+.field input[type=number] { width: 100%; }
 .entry-fee { font-size: 13px; font-weight: 600; color: var(--fees-fg); }
 .centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .centre label { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
@@ -468,6 +486,10 @@ footer {
             <button type="button" class="chip" data-example="boleto">Boleto vencido</button>
             <button type="button" class="chip" data-example="entrega">Pergunta de entrega</button>
           </div>
+          <div class="examples" role="group" aria-label="Fill in a construction bid example">
+            <span>Construction:</span>
+            <button type="button" class="chip" data-example="bid">A bid to check</button>
+          </div>
           <div class="centre">
             <label for="centrePhone">Received on centre phone</label>
             <select id="centrePhone" name="centrePhone">
@@ -509,6 +531,31 @@ footer {
     </section>
   </main>
 
+  <section class="panel" id="bidCheck" aria-labelledby="bidTitle">
+    <div>
+      <h2 id="bidTitle">Bid margin check</h2>
+      <p class="hint">Check a bid before it goes out. Margin = (bid − cost) ÷ bid. You can also paste a line like "Job, cost $1.42M, bid $1.51M, contingency 2%" in the box above.</p>
+    </div>
+    <form id="bidForm" novalidate style="display:flex;flex-direction:column;gap:12px">
+      <div class="bid-grid">
+        <div class="field"><label for="bidJob">Job name</label><input id="bidJob" autocomplete="off" placeholder="Midtown clinic fit-out"></div>
+        <div class="field"><label for="bidCost">Cost ($)</label><input id="bidCost" inputmode="decimal" autocomplete="off" placeholder="1,420,000 or 1.42M"></div>
+        <div class="field"><label for="bidBid">Bid ($)</label><input id="bidBid" inputmode="decimal" autocomplete="off" placeholder="1,510,000 or 1.51M"></div>
+        <div class="field"><label for="bidCont">Contingency %</label><input id="bidCont" type="number" min="0" step="0.1" placeholder="2"></div>
+      </div>
+      <span class="err" id="bidErr" hidden style="color:var(--alert-fg);font-size:13px"></span>
+      <div class="actions"><button type="submit" class="btn"><span class="spark" aria-hidden="true"></span>Check margin</button></div>
+      <div class="bid-settings" aria-label="Settings">
+        <div class="field"><label for="floorMargin">Margin floor %</label><input id="floorMargin" type="number" min="0" step="0.5" value="10"></div>
+        <div class="field"><label for="floorCont">Contingency floor %</label><input id="floorCont" type="number" min="0" step="0.5" value="5"></div>
+        <p class="fine">Settings are remembered in this browser.</p>
+      </div>
+    </form>
+    <div class="result" id="bidResult" data-state="empty" aria-live="polite">
+      <p class="why" style="margin:0">The margin, profit and the math show up here.</p>
+    </div>
+  </section>
+
 
   <footer>
     <div class="team">
@@ -541,6 +588,7 @@ const EXAMPLES = {
   boleto: "Oi, meu boleto venceu ontem e não consegui pagar. CPF 123.456.789-09, tel (11) 91234-5678. Minha caixa ainda vai sair?",
   entrega: "Oi, quando chega minha caixa? O rastreio não atualiza há 3 dias.",
   bundle: "1Gbps fibre SGD 2,400/mo x 36; install SGD 6,000 one-time; managed router SGD 300/mo; discount 12%",
+  bid: "Midtown clinic fit-out, cost $1.42M, bid $1.51M, contingency 2%",
   supply: "Heads up: the wax shipment from our supplier has been pushed back 3 weeks. New delivery date is Nov 2.\n- Dana, Northfield Wax Co.",
   parentfee: "Good morning, I have paid Ada's school fees, KSh 15,000 through M-Pesa this morning. Ref QKL2M4N6P8.\nThank you,\nGrace",
   fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance..."
@@ -1257,6 +1305,69 @@ function pendingAnswer(text) {
   };
 }
 
+/* ---------- bid margin check: margin = (bid - cost) / bid ---------- */
+const BID_FLOORS_KEY = "cortex-bid-floors-v1";
+// The floors live in this browser; 10% margin and 5% contingency until someone changes them.
+function bidFloors() {
+  let f = {};
+  try { f = JSON.parse(localStorage.getItem(BID_FLOORS_KEY) || "{}") || {}; } catch { f = {}; }
+  const ok = v => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  return { margin: ok(f.margin) ? f.margin : 10, contingency: ok(f.contingency) ? f.contingency : 5 };
+}
+// "$1.42M", "1,420,000", "$850k", "2.1 million" -> a number of dollars.
+function dollars(v) {
+  const m = String(v || "").replace(/\s+/g, " ").trim().match(/^\$?\s*(\d[\d,]*(?:\.\d+)?|\.\d+)\s*(k|thousand|m|mm|mil|million|b|bn|billion)?\.?$/i);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  const unit = (m[2] || "").toLowerCase();
+  const x = /^(k|thousand)$/.test(unit) ? 1e3 : /^(m|mm|mil|million)$/.test(unit) ? 1e6 : /^(b|bn|billion)$/.test(unit) ? 1e9 : 1;
+  return Number.isFinite(n) ? Math.round(n * x * 100) / 100 : null;
+}
+const BID_AMOUNT = "\\$?\\s*(\\d[\\d,]*(?:\\.\\d+)?)\\s*(k|thousand|mm|m|mil|million|bn|b|billion)?\\b";
+function parseBid(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  const read = label => { const m = t.match(new RegExp("\\b" + label + "\\b\\s*(?:of|is|at|:|=)?\\s*" + BID_AMOUNT, "i")); return m ? dollars(m[1] + (m[2] || "")) : null; };
+  const cost = read("(?:total |est(?:imated)?\\.? )?costs?");
+  const bid = read("(?:our |the )?bid(?: price| amount)?");
+  const cm = t.match(/\bcontingency\b\s*(?:of|is|at|:|=)?\s*(\d+(?:\.\d+)?)\s*%/i) || t.match(/(\d+(?:\.\d+)?)\s*%\s*contingency\b/i);
+  const contingency = cm ? Number(cm[1]) : null;
+  // The job is whatever comes before the first comma, as long as it isn't one of the numbers.
+  const head = t.split(/[,;|\n]/)[0].trim();
+  const job = head && !/\b(cost|bid|contingency)\b|\$/i.test(head) && head.length <= 80 ? head : null;
+  return { job, cost, bid, contingency };
+}
+function isBid(text) { const b = parseBid(text); return b.cost != null && b.bid != null; }
+const usd = n => (n < 0 ? "−$" : "$") + Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+const pct = n => (Math.round(n * 10) / 10).toFixed(1) + "%";
+const pctPlain = n => String(Math.round(n * 10) / 10) + "%";
+function bidAnswer(b, floors = bidFloors()) {
+  const job = b.job || "This bid";
+  if (!(b.bid > 0) || !(b.cost >= 0)) {
+    return { category: "bid", label: "Bid check", urgency: "Needs a fix", confidence: null,
+      step: "Add a cost and a bid above $0", why: "Margin is (bid − cost) ÷ bid, so the bid can't be zero.",
+      facts: [], signals: [], summary: job };
+  }
+  const profit = b.bid - b.cost;
+  const margin = profit / b.bid * 100;
+  const facts = [["Job", job], ["Cost", usd(b.cost)], ["Bid", usd(b.bid)], ["Profit", usd(profit)],
+    ["Margin", pct(margin) + " (floor " + pctPlain(floors.margin) + ")"]];
+  facts.push(["Contingency", b.contingency != null ? pctPlain(b.contingency) + " (floor " + pctPlain(floors.contingency) + ")" : "Not given"]);
+  const thinMargin = margin < floors.margin;
+  const thinCont = b.contingency != null && b.contingency < floors.contingency;
+  const math = "(" + usd(b.bid) + " − " + usd(b.cost) + ") ÷ " + usd(b.bid) + " = " + usd(profit) + " ÷ " + usd(b.bid) + " = " + pct(margin) + " margin.";
+  let step;
+  if (thinMargin || thinCont) {
+    const parts = [];
+    if (thinMargin) parts.push("Thin margin: " + pct(margin) + " vs " + pctPlain(floors.margin) + " floor");
+    if (thinCont) parts.push((thinMargin ? "contingency " : "Contingency ") + pctPlain(b.contingency) + " below " + pctPlain(floors.contingency));
+    step = "⚠️ " + parts.join(", ") + ". Hold for VP review.";
+  } else step = "OK to send";
+  return { category: "bid", label: "Bid check", urgency: thinMargin || thinCont ? "Hold" : "Ready", confidence: null,
+    step, why: math + (b.contingency == null ? " No contingency given, so only the margin was checked." : ""),
+    facts, signals: [], thin: thinMargin || thinCont, ok: !(thinMargin || thinCont),
+    summary: [job, pct(margin) + " margin", thinMargin || thinCont ? "⚠️ Hold for VP review" : "OK to send"].join(" · ") };
+}
+
 function classify(text, now = new Date()) {
   // Personal data is masked first, so nothing below can show or log a full CPF or phone number.
   const clean = maskLGPD(text).trim();
@@ -1265,6 +1376,8 @@ function classify(text, now = new Date()) {
   if (isBundleQuote(clean)) return bundleQuoteAnswer(clean);
   // A failed payment comes before Support and Billing: the box mustn't ship unpaid.
   if (isPending(clean)) return pendingAnswer(clean);
+  // "Job, cost $1.42M, bid $1.51M, contingency 2%": a bid to check, before Billing claims the dollar amounts.
+  if (isBid(clean)) return bidAnswer(parseBid(clean));
   if (isOrderStatus(clean)) return orderStatusAnswer(clean);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
@@ -1400,12 +1513,12 @@ function el(tag, attrs = {}, ...kids) {
   return n;
 }
 
-function renderResult(r, fresh) {
-  const box = $("result");
+function renderResult(r, fresh, box = $("result")) {
   box.replaceChildren();
   box.dataset.state = "filled";
-  box.classList.toggle("alert", !!(r.stockout || r.urgent || r.alert));
-  if (r.stockout || r.urgent) box.setAttribute("role", "alert"); else box.removeAttribute("role");
+  box.classList.toggle("alert", !!(r.stockout || r.urgent || r.alert || r.thin));
+  box.classList.toggle("ok", !!r.ok);
+  if (r.stockout || r.urgent || r.thin) box.setAttribute("role", "alert"); else box.removeAttribute("role");
   const top = el("div", { class: "result-top" },
     el("span", { class: "pill " + r.category, text: r.label }),
     r.urgent ? el("span", { class: "alert-tag big", text: "URGENT" }) : r.stockout ? el("span", { class: "alert-tag", text: "Stockout risk" }) : null,
@@ -1445,6 +1558,7 @@ function renderLog(freshId) {
     if (t.day) timeEl.append(el("small", { text: t.day }));
     const body = el("div", { class: "entry-body" },
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      e.category === "bid" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "pending" && e.summary ? el("div", { class: "entry-fee", text: e.summary }) : null,
       e.category === "fees" && (e.summary || e.centre) ? el("div", { class: "entry-fee", text: [e.summary, e.centre].filter(Boolean).join(" · ") }) : null,
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
@@ -1462,7 +1576,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, pending: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, supply: 0, pending: 0, bid: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1478,6 +1592,7 @@ function renderLog(freshId) {
   if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
   if (counts.supply) parts.push(counts.supply + " supply risk");
   if (counts.pending) parts.push(counts.pending + " pagamento pendente");
+  if (counts.bid) parts.push(counts.bid + (counts.bid === 1 ? " bid check" : " bid checks"));
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
@@ -1503,6 +1618,11 @@ function sortNow() {
   mark.classList.remove("lit");
   void mark.getBoundingClientRect();
   mark.classList.add("lit");
+  addToLog(r, text, centre);
+}
+
+// Every sorted item and every bid check lands in the log the same way, with its time.
+function addToLog(r, text, centre = "") {
   const oneLine = maskLGPD(text).trim().replace(/\s+/g, " ");
   const entry = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -1668,6 +1788,7 @@ function hint(text) {
     crew: "The crew has a question. Sort it and I'll log it.",
     fees: "An M-Pesa payment. Sort it and I'll write the fee register line.",
     supply: "A supplier running late. Sort it and I'll flag the reorder point.",
+    bid: "A bid. Sort it and I'll check the margin against your floor.",
     pending: "A failed payment. Sort it and I'll tell you what to send before the box ships.",
     other: "Hmm, I can't tell what that is yet."
   };
@@ -1693,6 +1814,7 @@ function react(r) {
   if (r.category === "partner") { say("A follow-up to schedule."); mood(0.6, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
+  if (r.category === "bid") { if (r.thin) { say("Hold on: " + r.step.replace(/^⚠️ /, "")); mood(0, 0.8, 4200); } else { say(r.ok ? "Margin looks healthy. OK to send." : r.step); mood(r.ok ? 1 : 0, r.ok ? 0 : 0.5); if (r.ok) hop(); } return; }
   if (r.category === "pending") { say("Pagamento pendente: send the subscriber a Pix link before the box ships."); mood(0, 0.6); return; }
   if (r.category === "supply") { say("A supplier is running late. Check whether what's on hand lasts, or line up a backup."); mood(0, 0.6); return; }
   if (r.category === "fees") { say("Payment received" + (r.summary ? ": " + r.summary : "") + ". Record it in the fee register."); mood(1, 0); hop(); return; }
@@ -1711,6 +1833,37 @@ try {
     $("planBadge").textContent = "Cortex Starter"; $("planBadge").title = "Signed up as " + p.email; $("planBadge").hidden = false; $("plansLink").hidden = true;
   }
 } catch {}
+
+/* ---------- bid margin check form ---------- */
+(function bidForm() {
+  const f = bidFloors();
+  $("floorMargin").value = f.margin;
+  $("floorCont").value = f.contingency;
+  // Settings are saved as soon as they change.
+  const saveFloors = () => {
+    const m = Number($("floorMargin").value), c = Number($("floorCont").value);
+    const next = { margin: Number.isFinite(m) && m >= 0 ? m : 10, contingency: Number.isFinite(c) && c >= 0 ? c : 5 };
+    try { localStorage.setItem(BID_FLOORS_KEY, JSON.stringify(next)); } catch {}
+  };
+  $("floorMargin").addEventListener("change", saveFloors);
+  $("floorCont").addEventListener("change", saveFloors);
+  $("bidForm").addEventListener("submit", e => {
+    e.preventDefault();
+    saveFloors();
+    const cost = dollars($("bidCost").value), bid = dollars($("bidBid").value);
+    const contRaw = $("bidCont").value.trim();
+    const contingency = contRaw === "" ? null : Number(contRaw);
+    const err = $("bidErr");
+    const problem = cost == null ? "Add the cost, like 1420000 or 1.42M." : bid == null ? "Add the bid, like 1510000 or 1.51M." : !(bid > 0) ? "The bid has to be above $0." : contingency != null && !(contingency >= 0) ? "Contingency is a percent of zero or more." : "";
+    err.textContent = problem; err.hidden = !problem;
+    if (problem) return;
+    const job = $("bidJob").value.trim() || null;
+    const r = bidAnswer({ job, cost, bid, contingency }, bidFloors());
+    renderResult(r, true, $("bidResult"));
+    react(r);
+    addToLog(r, [job || "Bid", "cost " + usd(cost), "bid " + usd(bid), contingency != null ? "contingency " + contingency + "%" : null].filter(Boolean).join(", "));
+  });
+})();
 
 if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
 $("item").value = EXAMPLES.order;
