@@ -220,6 +220,28 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 }
 @keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
 
+
+/* The greeter: Inkling's 2D dumpling, from the app's own geometry and its Blender hop. */
+.greeter { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
+.ink-avatar { width: 92px; height: 110px; flex: none; overflow: visible; }
+.bubble {
+  position: relative;
+  min-width: 0;
+  max-width: 62ch;
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  box-shadow: var(--shadow);
+  border-radius: 18px 18px 18px 6px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+  min-height: 3.2em;
+}
+.bubble .who { display: block; font: 600 12px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+@media (max-width: 520px) { .ink-avatar { width: 72px; height: 88px; } .bubble { font-size: 14px; } }
+
 /* The mark: the ink settles in, the spark lights, the eyes blink. */
 .mark .ink, .mark .spk, .mark .eyes { transform-box: fill-box; transform-origin: center; }
 @media (prefers-reduced-motion: no-preference) {
@@ -295,6 +317,19 @@ footer {
       <p class="lede">Paste one thing from the inbox. Get what it is and what to do next.</p>
     </div>
   </header>
+
+  <section class="greeter" aria-label="Ink, your inbox helper">
+    <svg class="ink-avatar" id="inkAvatar" viewBox="-14 -34 138 162" aria-hidden="true">
+      <ellipse id="inkShadow" cx="55" cy="114" rx="34" ry="5" fill="currentColor" opacity="0.12" style="color: var(--ink)"/>
+      <g id="inkBody">
+        <path id="inkBodyPath" fill="#16a390"/>
+        <path id="inkFacePath" fill="#f4efdf"/>
+        <path id="inkEyesPath" fill="#25392c"/>
+        <path id="inkMouthPath" fill="none" stroke="#25392c" stroke-width="2.2" stroke-linecap="round"/>
+      </g>
+    </svg>
+    <p class="bubble" id="inkBubble" aria-live="polite"><span class="who">Ink</span><span id="inkSay">Hi! I'm Ink.</span></p>
+  </section>
 
   <main>
     <section class="panel" aria-labelledby="pasteLabel">
@@ -379,7 +414,8 @@ const RULES = {
     [/\b(shopify|squarespace|etsy|checkout)\b/, 1, "shop order"]
   ],
   support: [
-    [/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|hasn'?t moved|running late|is late|delayed)\b/, 4, "late delivery"],
+    [/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/, 4, "late delivery"],
+    [/\b(back in stock|in stock\?|restock(ed)?|when will .{0,40}\b(be )?(back|available|in stock))\b/, 3, "a stock question"],
     [/\btracking\b/, 1, "tracking"],
     [/\b(refund|money back|return it|send it back|exchange)\b/, 4, "refund or return"],
     [/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/, 4, "a problem with the order"],
@@ -511,9 +547,9 @@ function parseStock(text) {
     new RegExp(NUM + "\\s*(?:units?)?\\s*(?:\\/|per|a)\\s*(?:wk|week)\\b", "i")
   ]);
   const leadM = firstMatch(t, [
-    new RegExp("\\blead[\\s-]?time\\b\\s*(?:[:=]|is|of)?\\s*" + NUM + "\\s*(weeks?|wks?|w|days?|d)?\\b", "i"),
-    new RegExp(NUM + "\\s*(weeks?|wks?|w|days?|d)\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
-    new RegExp(NUM + "[\\s-]*(weeks?|wks?|days?)[\\s-]*lead\\b", "i")
+    new RegExp("\\blead[\\s-]?time\\b\\s*(?:[:=]|is|of)?\\s*" + NUM + "\\s*(months?|mos?|mo|weeks?|wks?|w|days?|d)?\\b", "i"),
+    new RegExp(NUM + "\\s*(months?|mos?|mo|weeks?|wks?|w|days?|d)\\s*(?:of\\s+)?lead[\\s-]?time\\b", "i"),
+    new RegExp(NUM + "[\\s-]*(months?|weeks?|wks?|days?)[\\s-]*lead\\b", "i")
   ]);
   const skuM = t.match(/\bsku\s*[:#]?\s*([A-Za-z0-9][\w-]*)/i);
   const lower = t.toLowerCase();
@@ -524,11 +560,11 @@ function parseStock(text) {
   if (leadM) {
     lead = num(leadM[1]);
     const u = (leadM[2] || "weeks").toLowerCase();
-    leadUnit = u.startsWith("d") ? "days" : "weeks";
-    leadWeeks = leadUnit === "days" ? lead / 7 : lead;
+    leadUnit = u.startsWith("d") ? "days" : u.startsWith("m") ? "months" : "weeks";
+    leadWeeks = leadUnit === "days" ? lead / 7 : leadUnit === "months" ? lead * 52 / 12 : lead;
   }
   const fields = [onHand, weekly, lead].filter(v => v != null).length;
-  const isStock = fields >= 2 || (skuM && fields >= 1) || words >= 2;
+  const isStock = fields >= 2 || (fields >= 1 && (skuM || words >= 2));
   const STOP = /[,;|]|\b(?:on[\s-]?hand|avg|average|weekly|lead|qty|in stock|stock|sells|selling)\b/i;
   const tidy = v => v.replace(/^[\s:–—-]+|[\s:–—-]+$/g, "").replace(/[\s:–—-]*\d[\d,.]*\s*$/, "").trim();
   let item = null;
@@ -571,6 +607,7 @@ function stockAnswer(st) {
   }
   const demand = st.weekly * st.leadWeeks;
   const over = plural(st.lead, st.leadUnit);
+  const inWeeks = st.leadUnit === "weeks" ? over : over + " (" + (Math.round(st.leadWeeks * 10) / 10) + " weeks)";
   facts.push(["Demand over lead time", "~" + fmt(demand)]);
   if (st.onHand < demand) {
     const reorder = demand - st.onHand;
@@ -578,14 +615,16 @@ function stockAnswer(st) {
     return {
       category: "inventory", label: "Inventory", urgency: "Now", confidence: null,
       step: "⚠️ Stockout risk: " + st.onHand.toLocaleString("en-US") + " on hand won’t cover ~" + fmt(demand) + " demand over " + over + ". Reorder ~" + fmt(reorder) + " units now.",
-      why: st.weekly.toLocaleString("en-US") + " a week × " + over + " = ~" + fmt(demand) + ".",
+      why: st.weekly.toLocaleString("en-US") + " a week × " + inWeeks + " = ~" + fmt(demand) + ".",
       facts, signals: [], stockout: true
     };
   }
   return {
     category: "inventory", label: "Inventory", urgency: "Fine for now", confidence: null,
     step: "✅ Stock OK",
-    why: st.onHand.toLocaleString("en-US") + " on hand covers ~" + fmt(demand) + " demand over " + over + ", with ~" + fmt(st.onHand - demand) + " to spare.",
+    why: Math.round(st.onHand - demand) === 0
+      ? st.onHand.toLocaleString("en-US") + " on hand covers exactly ~" + fmt(demand) + " demand over " + inWeeks + ", with nothing to spare."
+      : st.onHand.toLocaleString("en-US") + " on hand covers ~" + fmt(demand) + " demand over " + inWeeks + ", with ~" + fmt(st.onHand - demand) + " to spare.",
     facts, signals: []
   };
 }
@@ -653,7 +692,7 @@ function classify(text, now = new Date()) {
       step = "Process the refund"; why = "They're asking for their money back or a return.";
     } else if (/\b(damaged|broken|leaking|leaked|torn|crushed|wrong (item|coffee|bag|order|grind)|missing|stale|moldy|burnt)\b/.test(lower)) {
       step = "Send a replacement and apologize"; why = "Something arrived wrong or damaged.";
-    } else if (/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|hasn'?t moved|running late|is late|delayed)\b/.test(lower)) {
+    } else if (/\b(where is|where's|hasn'?t arrived|has not arrived|not arrived|never arrived|still waiting|been waiting|waiting (for|on) (my|the|our)|hasn'?t moved|running late|is late|delayed)\b/.test(lower)) {
       step = "Send tracking and an update today"; why = "The order seems late and they're waiting on it.";
     } else {
       step = "Reply to the customer today"; why = "It's a question from a customer."; urgency = "Today";
@@ -783,6 +822,7 @@ function sortNow() {
     return;
   }
   renderResult(r, true);
+  react(r);
   const mark = $("mark");
   mark.classList.remove("lit");
   void mark.getBoundingClientRect();
@@ -822,11 +862,155 @@ function showClear() {
   });
 }
 
+/* ---------- Ink, the greeter ---------- */
+const INK = {
+  body: "M55 111C25 112 9 95 13 73C17 51 44 40 49 23C52 14 46 12 48 8C65 7 66 23 65 28C63 42 95 48 99 76C105 98 83 111 55 111Z",
+  face: "M57 40C52 54 34 58 28 76C21 95 38 103 56 102C77 103 91 91 85 76C81 63 66 57 57 40Z",
+  eyes: [[43, 80], [70, 79]], eyeR: 3.2,
+  smile: [53, 89, 55.67, 92.33, 58.67, 92, 62, 88],
+  grin: [50.5, 87.5, 53.5, 96, 61, 96, 64.5, 86.5],
+  wobble: [53, 91, 56, 88.4, 59, 92.6, 62, 89.6]
+};
+const HOP = {"fps":60,"frames":85,"bounce":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0031,0.0118,0.0255,0.0432,0.0643,0.088,0.1135,0.14,0.1669,0.1937,0.22,0.2456,0.2699,0.2928,0.3138,0.3325,0.3487,0.3618,0.3717,0.3779,0.38,0.3773,0.3695,0.357,0.3402,0.3195,0.2953,0.2681,0.2382,0.206,0.172,0.1365,0.1,0.0636,0.0316,0.0087,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"lean":[0.0,0.0001,0.0005,0.0012,0.002,0.0031,0.0044,0.0058,0.0074,0.0091,0.011,0.013,0.015,0.0172,0.0194,0.0216,0.0239,0.0261,0.0284,0.0306,0.0328,0.035,0.037,0.039,0.0409,0.0426,0.0442,0.0456,0.0469,0.048,0.0488,0.0495,0.0499,0.05,0.0492,0.047,0.0435,0.0391,0.0338,0.0278,0.0215,0.015,0.0085,0.0022,-0.0038,-0.0091,-0.0135,-0.017,-0.0192,-0.02,-0.0198,-0.0194,-0.0187,-0.0177,-0.0166,-0.0153,-0.0139,-0.0123,-0.0108,-0.0092,-0.0076,-0.0061,-0.0047,-0.0034,-0.0023,-0.0013,-0.0006,-0.0002,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"stretch":[1.0,0.9972,0.9896,0.9781,0.9637,0.9473,0.93,0.9127,0.8963,0.8819,0.8704,0.8628,0.86,0.8733,0.9084,0.9581,1.015,1.0719,1.1216,1.1567,1.17,1.1676,1.1611,1.1511,1.1384,1.1238,1.1081,1.0919,1.0762,1.0616,1.0489,1.0389,1.0324,1.03,1.0318,1.0367,1.0441,1.0533,1.0638,1.075,1.0861,1.0967,1.1059,1.1133,1.1182,1.12,1.07,0.96,0.85,0.8,0.8093,0.8341,0.87,0.9126,0.9574,1.0,1.0359,1.0607,1.07,1.0672,1.0596,1.0484,1.0348,1.02,1.0052,0.9916,0.9804,0.9728,0.97,0.9703,0.9713,0.9728,0.9747,0.977,0.9795,0.9822,0.985,0.9878,0.9905,0.993,0.9953,0.9972,0.9987,0.9997,1.0],"tip":[0.0,-0.0012,-0.0044,-0.0094,-0.0156,-0.0226,-0.03,-0.0374,-0.0444,-0.0506,-0.0556,-0.0588,-0.06,-0.0543,-0.0388,-0.016,0.0115,0.0414,0.0711,0.0981,0.12,0.1371,0.1515,0.1636,0.1734,0.1814,0.1875,0.1921,0.1955,0.1977,0.199,0.1997,0.2,0.2,0.1989,0.1952,0.1889,0.1794,0.1667,0.1503,0.13,0.1056,0.0766,0.0429,0.0041,-0.04,-0.0882,-0.1334,-0.1669,-0.18,-0.1707,-0.1459,-0.11,-0.0674,-0.0226,0.02,0.0559,0.0807,0.09,0.0866,0.0775,0.0641,0.0478,0.03,0.0122,-0.0041,-0.0175,-0.0266,-0.03,-0.0297,-0.0287,-0.0272,-0.0253,-0.023,-0.0205,-0.0178,-0.015,-0.0122,-0.0095,-0.007,-0.0047,-0.0028,-0.0013,-0.0003,0.0],"joy":[0.0,0.0019,0.0076,0.0169,0.0298,0.0462,0.0659,0.089,0.1152,0.1445,0.1768,0.212,0.25,0.2907,0.3336,0.3783,0.4245,0.4716,0.5192,0.5669,0.6143,0.6609,0.7063,0.75,0.7916,0.8307,0.8668,0.8995,0.9284,0.953,0.9729,0.9877,0.9969,1.0,1.0,0.9998,0.9992,0.9983,0.9967,0.9944,0.9913,0.9871,0.9817,0.9751,0.967,0.9573,0.9459,0.9327,0.9174,0.9,0.8803,0.8586,0.8348,0.8093,0.7821,0.7534,0.7234,0.6922,0.66,0.627,0.5933,0.5591,0.5245,0.4898,0.455,0.4203,0.3859,0.352,0.3187,0.2861,0.2545,0.224,0.1947,0.1669,0.1406,0.1161,0.0934,0.0728,0.0545,0.0385,0.0251,0.0143,0.0065,0.0016,0.0],"blink":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.7719,0.3482,0.12,0.1852,0.3482,0.56,0.7719,0.9348,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]};
+const BASE = [55, 111], TOP_Y = 8, TIP_UNITS = 46, BOUNCE_UNITS = 58, K = 0.5523;
+const nums = d => (d.match(/-?\d*\.?\d+/g) || []).map(Number);
+const BODY_PTS = nums(INK.body), FACE_PTS = nums(INK.face);
+const clamp01 = v => Math.min(1, Math.max(0, v));
+function bendX(x, y, tip) {
+  const h = (BASE[1] - y) / (BASE[1] - TOP_Y);
+  const t = clamp01((h - 0.2) / 0.8);
+  const top = t * t * (3 - 2 * t);
+  return x + tip * TIP_UNITS * top * top;
+}
+function bent(pts, tip) { const o = []; for (let i = 0; i + 1 < pts.length; i += 2) o.push(bendX(pts[i], pts[i + 1], tip), pts[i + 1]); return o; }
+function toD(p, closed) {
+  let d = "M" + p[0].toFixed(2) + " " + p[1].toFixed(2);
+  for (let i = 2; i + 5 < p.length; i += 6) d += "C" + p.slice(i, i + 6).map(v => v.toFixed(2)).join(" ");
+  return closed ? d + "Z" : d;
+}
+function eyeD(cx, cy, r, open, joy) {
+  const ry = r * Math.max(0.07, open), rx = r * (1 + 0.18 * joy);
+  const top = cy - ry * (1 + 0.15 * joy), side = cy + ry * 0.4 * joy, bottom = cy + ry * (1 - 1.75 * joy);
+  return toD([cx, top, cx + rx * K, top, cx + rx, side - (side - top) * K, cx + rx, side, cx + rx, side + (bottom - side) * K, cx + rx * K, bottom, cx, bottom,
+    cx - rx * K, bottom, cx - rx, side + (bottom - side) * K, cx - rx, side, cx - rx, side - (side - top) * K, cx - rx * K, top, cx, top], true);
+}
+function drawInk(pose) {
+  const g = $("inkBody");
+  if (!g) return;
+  const joy = clamp01(pose.joy), unsure = clamp01(pose.uncertain);
+  $("inkBodyPath").setAttribute("d", toD(bent(BODY_PTS, pose.tip), true));
+  $("inkFacePath").setAttribute("d", toD(bent(FACE_PTS, pose.tip), true));
+  $("inkEyesPath").setAttribute("d", INK.eyes.map(([x, y], i) =>
+    eyeD(bendX(x, y, pose.tip), y - unsure * 0.8, INK.eyeR * (i === 1 ? 1 - 0.18 * unsure : 1), pose.blink, joy)).join(""));
+  const m = INK.smile.map((v, i) => v + (INK.grin[i] - v) * joy + (INK.wobble[i] - v) * unsure);
+  $("inkMouthPath").setAttribute("d", toD(bent(m, pose.tip), false));
+  const sy = pose.stretch, sx = 1 / Math.sqrt(Math.max(0.5, sy));
+  const baseY = BASE[1] - pose.bounce * BOUNCE_UNITS;
+  g.setAttribute("transform", "translate(55 " + baseY.toFixed(2) + ") rotate(" + (pose.lean * 180 / Math.PI).toFixed(2) + ") scale(" + sx.toFixed(4) + " " + sy.toFixed(4) + ") translate(-55 -111)");
+  const sh = $("inkShadow");
+  if (sh) { sh.setAttribute("rx", (34 * (1 - pose.bounce * 0.9)).toFixed(2)); sh.setAttribute("opacity", (0.12 * (1 - pose.bounce * 1.2)).toFixed(3)); }
+}
+
+const still = matchMedia("(prefers-reduced-motion: reduce)");
+const ink = { joy: 0, uncertain: 0, joyTarget: 0, unsureTarget: 0, hopAt: -1, blinkAt: 0, nextBlink: 1800, moodUntil: 0, last: 0, raf: 0 };
+function hop() { if (!still.matches) ink.hopAt = performance.now(); }
+function mood(joy, unsure, ms = 3600) { ink.joyTarget = joy; ink.unsureTarget = unsure; ink.moodUntil = performance.now() + ms; if (still.matches) { ink.joy = joy; ink.uncertain = unsure; drawInk(pose(performance.now())); } }
+function pose(now) {
+  const p = { bounce: 0, lean: 0, stretch: 1, tip: 0, blink: 1, joy: ink.joy, uncertain: ink.uncertain };
+  if (still.matches) return p;
+  p.stretch = 1 + 0.018 * Math.sin(now / 3200 * Math.PI * 2);
+  if (now >= ink.nextBlink) { ink.blinkAt = now; ink.nextBlink = now + 2600 + Math.random() * 3200; }
+  const b = (now - ink.blinkAt) / 150;
+  if (b >= 0 && b < 1) p.blink = Math.abs(1 - 2 * b) * 0.93 + 0.07;
+  if (ink.hopAt >= 0) {
+    const f = Math.floor((now - ink.hopAt) / 1000 * HOP.fps);
+    if (f >= HOP.frames) ink.hopAt = -1;
+    else {
+      p.bounce = HOP.bounce[f]; p.lean = HOP.lean[f]; p.stretch *= HOP.stretch[f]; p.tip = HOP.tip[f];
+      p.joy = Math.max(p.joy, HOP.joy[f]); p.blink = Math.min(p.blink, HOP.blink[f]);
+    }
+  }
+  return p;
+}
+function tick(now) {
+  const dt = Math.min(64, now - (ink.last || now)); ink.last = now;
+  if (now > ink.moodUntil) { ink.joyTarget = 0; ink.unsureTarget = 0; }
+  const k = 1 - Math.pow(0.0015, dt / 1000);
+  ink.joy += (ink.joyTarget - ink.joy) * k; ink.uncertain += (ink.unsureTarget - ink.uncertain) * k;
+  drawInk(pose(now));
+  ink.raf = requestAnimationFrame(tick);
+}
+function startInk() {
+  cancelAnimationFrame(ink.raf);
+  if (still.matches || document.hidden) { drawInk(pose(performance.now())); return; }
+  ink.last = 0; ink.raf = requestAnimationFrame(tick);
+}
+document.addEventListener("visibilitychange", startInk);
+if (still.addEventListener) still.addEventListener("change", startInk);
+
+let typing = 0;
+function say(text) {
+  const out = $("inkSay");
+  if (!out || out.dataset.full === text) return;
+  out.dataset.full = text;
+  cancelAnimationFrame(typing);
+  if (still.matches) { out.textContent = text; return; }
+  const start = performance.now();
+  const step = now => {
+    const n = Math.min(text.length, Math.floor((now - start) / 16));
+    out.textContent = text.slice(0, n);
+    if (n < text.length) typing = requestAnimationFrame(step);
+  };
+  typing = requestAnimationFrame(step);
+}
+
+function greet() {
+  const h = new Date().getHours();
+  const hello = h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+  say(hello + "! I'm Ink. Paste an order, a customer email, an invoice line or a stock line, and I'll tell you what it is and what to do next.");
+  setTimeout(hop, 350);
+}
+
+function hint(text) {
+  const t = text.trim();
+  if (t.length < 12) return;
+  const r = classify(t);
+  if (!r) return;
+  const lines = {
+    order: "That looks like an order. Press Sort it when you're ready.",
+    support: "Sounds like a customer who needs you. Sort it and I'll suggest a reply.",
+    billing: "That's a bill. Sort it and I'll find what's due and when.",
+    inventory: "A stock line. Sort it and I'll check it against demand.",
+    other: "Hmm, I can't tell what that is yet."
+  };
+  say(lines[r.category]);
+  if (r.category === "other") mood(0, 0.5, 1800); else mood(0.25, 0, 1400);
+}
+
+function react(r) {
+  const fact = name => (r.facts.find(f => f[0] === name) || [])[1];
+  if (r.category === "inventory") {
+    if (r.stockout) { say("Uh oh. That won't last until the next delivery. Reorder " + (fact("Reorder") || "more") + " now."); mood(0, 0.9, 4200); return; }
+    if (r.step.startsWith("✅")) { say("Good news: there's enough on hand to cover the lead time."); mood(1, 0); hop(); return; }
+    say("I need one more number to check this stock: " + r.step.replace(/^Add the | to check this stock$/g, "") + "."); mood(0, 0.6); return;
+  }
+  if (r.category === "other") { say("I'm not sure about this one. Best to read it yourself."); mood(0, 0.8); return; }
+  const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
+  say(lead + " Next step: " + r.step + ".");
+  mood(r.category === "support" ? 0.35 : 0.9, 0); hop();
+}
+
+let hintTimer = 0;
+$("item").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(() => hint($("item").value), 450); });
+
 if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
 $("item").value = EXAMPLES.order;
 loadLog();
 renderLog();
 showClear();
+drawInk(pose(performance.now()));
+startInk();
+greet();
 </script>
 
 </body>
