@@ -6,13 +6,13 @@ ink -b codex --no-codex-inkmail  # opt out
 ink -b codex --codex-inkmail     # require it; fail instead of falling back
 ```
 
-Requires **codex-cli 0.159.2**, macOS/Linux, a registered studio, and session
+Requires the native remote-terminal, queue, receipt and hook interfaces, macOS/Linux, a registered studio, and session
 tracking. Use the normal session picker to start or resume. Review the Inkwell session hooks in Codex's native hook-trust prompt (or `/hooks`). The launcher
 **does not grant hook trust**. Until the three hooks are enabled and trusted,
 mail remains unread and live delivery is paused.
 
 Live mail is the default for interactive, session-tracked Codex terminals with
-supported arguments and the measured version. Unsupported versions/arguments,
+supported arguments and capabilities. Missing capabilities/unsupported arguments,
 missing scope or nonstandard hooks produce a visible fallback to the unchanged
 native invocation, with live mail off. `--codex-inkmail` makes these failures
 fatal instead; `--no-codex-inkmail` skips preflight and session hook setup entirely.
@@ -50,6 +50,23 @@ app, use or configure the shared daemon, relink `ink`, or restart an Inkwell ser
 To adopt it for an existing conversation, restart `ink` and select that same
 session; no new conversation is required. On/off selection is launch-time only.
 
+## Compatibility
+
+There is no release allowlist. Before starting an execution owner, Inkwell reads
+native CLI help and exports the experimental App Server JSON schemas into a
+private temporary directory. It checks the remote terminal, queue inputs,
+pagination, client message identity, completed receipt timestamps and warning
+interfaces. The existing configuration-only probe then checks the effective hook
+configuration with the actual launch overrides. No thread, model, MCP server or
+hook is executed by these probes. Their temporary schema files are removed.
+
+Additive optional fields and new methods do not disable mail. A missing or changed
+required interface pauses live delivery, with a diagnostic naming the capability.
+Structural checks cannot prove all future behavior: runtime replies still require
+exact receipts, and unexpected behavior leaves mail unread rather than guessing.
+The native 0.160.0 integration checks pass; its previous rejection came from the
+0.159.2-only allowlist, not an observed protocol break.
+
 ## Delivery
 
 The wrapper runs a private App Server and attaches the **native Codex TUI** via
@@ -71,6 +88,13 @@ The existing scoped Inkmail drain fetches without marking read. Idle mail starts
 a turn; busy mail waits in the native queue. **Queue acceptance is not delivery.**
 The reader ACKs only after an exact-thread user-message context receipt with
 matching client identity and content. It does not interrupt an active turn.
+
+Text-only transports use readable sender/thread/type headers and multiline
+bodies, not a JSON envelope. Codex, Claude's channel instructions, and `ink`
+share the same handling guidance. Terminal control bytes are removed only for
+presentation. Version 2 journals retain separate source and rendered-content
+hashes; version 1 JSON-envelope intents still reconcile against their exact
+original receipts, without resending during the formatting upgrade.
 
 A private write-ahead journal under `~/.ink/codex-mail` stores identities and
 content hashes, not message bodies. Codex does **not** deduplicate repeated
@@ -176,7 +200,12 @@ is reported, not silently treated as working delivery.
 - Server `forceSpawn` requests still bypass inline delivery and can collide with
   an attached Codex writer. This change does not relax the writer lock or make
   forced headless resumes safe.
-- Queue/receipt APIs are experimental and version-gated. This is not a claim of
+- Independent terminal presence is not implemented here. Plain native fallback,
+  disabled/untrusted hooks, or a reader outage can leave the server without fresh
+  attachment evidence even while the terminal is open. The capability check fixes
+  the unnecessary version fallback; it does not yet guarantee held mail or prevent
+  competing resume attempts in those other cases.
+- Queue/receipt APIs are experimental and capability-checked. This is not a claim of
   desktop support or of delivery into arbitrary pre-existing embedded sessions.
 
 ## Verification
