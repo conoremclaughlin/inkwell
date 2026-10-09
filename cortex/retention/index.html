@@ -137,7 +137,7 @@ footer { font-size: 13px; color: var(--muted); display: flex; justify-content: s
     <span class="label" id="qLabel">Retention queue</span>
     <ul class="queue" id="queue"></ul>
     <p class="empty" id="qEmpty">No handoffs yet.</p>
-    <p class="fine" id="storeNote">Saved in this browser: masked text and hashed account IDs only.</p>
+    <p class="fine" id="storeNote">Saved in this browser: masked text, with account IDs hashed rather than stored in plain text.</p>
   </section>
 
   <footer><span>Made by <b>Team ARC AI</b></span><span>Cortex</span></footer>
@@ -157,9 +157,14 @@ const EXAMPLES = {
 function luhn(d) { let s = 0, alt = false; for (let i = d.length - 1; i >= 0; i--) { let n = +d[i]; if (alt) { n *= 2; if (n > 9) n -= 9; } s += n; alt = !alt; } return s % 10 === 0; }
 function mask(text) {
   const found = { cpf: 0, card: 0, phone: 0 };
-  let t = text.replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, m => { found.cpf++; return "[CPF masked]"; });
-  t = t.replace(/\b(?:\d[ -]?){13,19}\b/g, m => { const d = m.replace(/\D/g, ""); if (d.length >= 13 && d.length <= 19 && luhn(d)) { found.card++; return "[card ••••" + d.slice(-4) + "]"; } return m; });
-  t = t.replace(/(?:\+?55[\s-]?)?\(?\b\d{2}\)?[\s-]?9?\d{4}[\s-]?\d{4}\b/g, m => { if (m.replace(/\D/g, "").length < 10) return m; found.phone++; return "[phone masked]"; });
+  // A +55 phone first, so its 12 or 13 digits are never read as a card.
+  text = text.replace(/\+\s?55[\s-]?\(?\d{2}\)?[\s-]?9?\d{4}[\s-]?\d{4}\b/g, () => { found.phone++; return "[phone masked]"; });
+  // Cards next: any 13 to 19 digit run, typos included, with spaces, dots or dashes between groups.
+  let t = text.replace(/\b(?:\d[ .-]?){12,18}\d\b/g, m => { const d = m.replace(/\D/g, ""); if (d.length < 13 || d.length > 19) return m; found.card++; return "[card ••••" + d.slice(-4) + "]"; });
+  // CPF: 11 digits as 123.456.789-09, 123 456 789 09 or 12345678909.
+  t = t.replace(/\b\d{3}[ .]?\d{3}[ .]?\d{3}[ .-]?\d{2}\b/g, m => { found.cpf++; return "[CPF masked]"; });
+  // Phones: with or without +55 and the area code; a bare mobile is 9xxxx-xxxx.
+  t = t.replace(/(?:\+?55[\s-]?)?(?:\(?\b\d{2}\)?[\s-]?)?\b9\d{4}[\s-]?\d{4}\b|(?:\+?55[\s-]?)?\(?\b\d{2}\)?[\s-]?\d{4}[\s-]?\d{4}\b/g, m => { found.phone++; return "[phone masked]"; });
   return { text: t, found };
 }
 const box = $("contact");
@@ -173,8 +178,9 @@ box.addEventListener("paste", () => setTimeout(maskBox, 0));
 box.addEventListener("input", maskBox);
 
 /* ---------- account id, hashed ---------- */
+const ID_RE = /\b(?:conta|account|acct|cliente|contrato|customer|id)\s*(?:n[ºo°.]?|#|:)?\s*([A-Z]{0,3}[-\s]?\d[\d-]{3,})/i;
 function accountId(text) {
-  const m = text.match(/\b(?:conta|account|acct|cliente|contrato|customer|id)\s*(?:n[ºo°.]?|#|:)?\s*([A-Z]{0,3}[-\s]?\d[\d-]{3,})/i);
+  const m = text.match(ID_RE);
   return m ? m[1].replace(/\s+/g, "").toUpperCase() : null;
 }
 async function hashId(id) {
@@ -188,7 +194,7 @@ const INTENT = /\b(cancelar|cancelamento|cancela|cancel(ar|ling|lation)?|portabi
 let state = { contacts: [], handoffs: [], rotation: 0 };
 let memoryOnly = false;
 try { const s = JSON.parse(localStorage.getItem(KEY) || "null"); if (s && Array.isArray(s.contacts)) state = s; } catch { memoryOnly = true; }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); memoryOnly = localStorage.getItem(KEY) === null; } catch { memoryOnly = true; } $("storeNote").textContent = memoryOnly ? "This browser won't keep it after you close the page." : "Saved in this browser: masked text and hashed account IDs only."; }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); memoryOnly = localStorage.getItem(KEY) === null; } catch { memoryOnly = true; } $("storeNote").textContent = memoryOnly ? "This browser won't keep it after you close the page." : "Saved in this browser: masked text, with account IDs hashed rather than stored in plain text."; }
 const OWNERS = ["Ana (Retention)", "Bruno (Retention)", "Carla (Retention)"];
 
 function el(tag, attrs = {}, ...kids) { const n = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) { if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v); } for (const k of kids) if (k) n.append(k); return n; }
@@ -210,12 +216,13 @@ async function check() {
   if (intent) reasons.push("Says “" + intent.toLowerCase() + "”" + (prior.length ? "" : " on first contact"));
   const at = new Date().toISOString();
   state.contacts.unshift({ hash, at, risk: reasons.length > 0 });
-  const facts = [["Account", id ? "hashed " + hash + " (the ID itself is not saved)" : "no account ID found"], ["Contacts in 30 days", String(prior.length + 1)]];
+  const facts = [["Account", id ? "hashed " + hash + " (not stored in plain text)" : "no account ID found"], ["Contacts in 30 days", String(prior.length + 1)]];
   v.replaceChildren();
   if (reasons.length) {
     let owner = $("owner").value;
     if (owner === "auto") { owner = OWNERS[state.rotation % OWNERS.length]; state.rotation++; }
-    state.handoffs.unshift({ id: now.toString(36) + Math.random().toString(36).slice(2, 6), at, owner, hash, reasons, respondedAt: null, snippet: text.replace(/\s+/g, " ").slice(0, 160) });
+    const safe = id ? text.split(text.match(ID_RE)[1]).join("[account " + hash + "]") : text;
+    state.handoffs.unshift({ id: now.toString(36) + Math.random().toString(36).slice(2, 6), at, owner, hash, reasons, respondedAt: null, snippet: safe.replace(/\s+/g, " ").slice(0, 160) });
     v.className = "verdict risk"; v.setAttribute("role", "alert");
     v.append(el("div", {}, el("span", { class: "tag", text: "Churn risk" })), el("p", { class: "head", text: "Churn risk, route to retention now." }), el("p", { class: "why", text: reasons.join(". ") + "." }));
     facts.push(["Handed to", owner + " at " + stamp(at) + ", clock running"]);
