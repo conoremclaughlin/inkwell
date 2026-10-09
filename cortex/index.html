@@ -953,8 +953,8 @@ const FURNITURE = ["dresser", "mirror", "sofa", "couch", "piano", "table", "chai
 
 const RETURN_GOODS = "(order|items?|products?|purchase|package|parcel|candles?|mugs?|shirts?|boxes|box|bags?|blankets?|throws?|gifts?|goods|stuff)";
 const REFUND_WORDS = new RegExp("\\b(refunds?|refunded|money back|charge ?backs?|return (it|this|them|these)\\b(?! (call|form|email|message))|returning (it|this|them)\\b|return (my|the|an?|our|this|these|those) (\\w+ )?" + RETURN_GOODS + "\\b|returning (my|the|an?|our) (\\w+ )?" + RETURN_GOODS + "\\b|return label|send (it|this|them) back)", "i");
-const PARTNER_WORDS = /\b(partner|partners|partnership|partnerships|intro|introduction|introducing)\b/i;
-const FOLLOWUP_WORDS = /\b(following up|follow(ing)?[- ]up|circle back|circling back)\b/i;
+const PARTNER_WORDS = /\b(partner|partners|partnership|partnerships|intro|introduction|introducing|resellers?|reseller agreement|distributors?|distribution agreement|referral partner|co-marketing|integration partner)\b/i;
+const FOLLOWUP_WORDS = /\b(following up|follow(ing)?[- ]up|circle back|circling back|checking in on|check in on|touching base)\b/i;
 const FOLLOWUP_BLOCK = /(#\s?\d{3,}|\border\s*(#|no\.?|number)?\s*\d{3,}|\b(my|our|the) order\b|\b(refund|invoice|damaged|late|tracking|delivery|shipping|hasn'?t arrived|has not arrived|never arrived)\b)/i;
 function movingKind(text) {
   const t = text;
@@ -1155,6 +1155,7 @@ const SUPPLY_LATE = /\b(delay(ed|s)?|pushed (back|out)|backorder(ed)?|back[- ]or
 function isSupplyRisk(text) {
   // A customer asking where their own order is stays an order or support question.
   if (/\b(my|our) (order|package|parcel)\b|\bmy\b|\bI ordered\b/i.test(text) && !/\b(suppliers?|vendors?|wholesalers?|manufacturer|PO|purchase orders?)\b/i.test(text)) return false;
+  if (/\bbackorder(ed)? (notice|until)\b|\bback[- ]order(ed)? until\b|\blead times?\b[^.\n]{0,40}\b(are|is) now\b|\blead times?\b[^.\n]{0,40}\b(increased|went up|extended|doubled)\b/i.test(text)) return true;
   return SUPPLY_WHO.test(text) && SUPPLY_LATE.test(text);
 }
 function supplyAnswer(text) {
@@ -1226,7 +1227,7 @@ function feesAnswer(text) {
   const when = [date, time].filter(Boolean).join(" ");
   let step = "Record in the fee register";
   const unpaid = !isMpesa(text) && UNPAID.test(t);
-  const wantsReceipt = !isMpesa(text) && !unpaid && /\b(receipt|confirm)\b/i.test(t);
+  const wantsReceipt = !isMpesa(text) && !unpaid && /\b(receipts?|confirm(ation|ed)?)\b/i.test(t);
   const detail = [];
   if (unpaid) {
     step = "Reply with the fee balance due" + (payer ? " to " + payer : "");
@@ -1473,6 +1474,12 @@ function classify(text, now = new Date()) {
     }
   }
   const label = { order: "Order", support: "Support", billing: "Billing" }[topCat];
+  if (topCat === "order" && !/\b(coffee|espresso|roast(ed|ing)?|beans?|whole bean|grind|ground for|decaf|single origin|guji|huila)\b/i.test(clean)) {
+    // Not a coffee order: say pack, not roast.
+    const unroast = x => x.replace(/Roast and pack/g, "Pack").replace(/roast and pack/g, "pack").replace(/Roast it and/g, "Pack it and").replace(/subscription roast/g, "subscription batch");
+    step = unroast(step); why = unroast(why);
+    for (const f of facts) if (f[0] === "To roast") f[0] = "Items";
+  }
   return { category: topCat, label, confidence, urgency, step, why, facts, signals: top.hits };
 }
 // SORTER-END
