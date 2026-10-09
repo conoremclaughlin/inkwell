@@ -230,6 +230,40 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 @keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
 
 
+
+/* Plans: a self-serve Starter, and a Team plan beside it for scale. */
+.plans { display: flex; flex-direction: column; gap: 16px; }
+.plans-head { display: flex; flex-direction: column; gap: 4px; }
+.plans-head h2 { font: 500 26px/1.15 var(--serif); text-wrap: balance; }
+.plan-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 720px) { .plan-grid { grid-template-columns: minmax(0, 1fr); } }
+.plan { background: var(--raised); border: 1px solid var(--edge); border-radius: 18px; box-shadow: var(--shadow); padding: 20px 22px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.plan.featured { border: 1.5px solid var(--ink-soft); }
+.plan-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.plan h3 { margin: 0; font: 600 19px/1.2 var(--serif); }
+.plan .tag { font: 600 11px/1 var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 6px 9px; }
+.price { margin: 0; display: flex; align-items: baseline; gap: 4px; }
+.price b { font: 600 34px/1 var(--serif); font-variant-numeric: tabular-nums; }
+.price span { color: var(--muted); font-size: 14px; }
+.price-note { margin: 0; color: var(--ink-soft); font-size: 14px; }
+.plan ul { margin: 2px 0 6px; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.plan .btn { align-self: flex-start; }
+.btn.ghost { background: var(--sunk); color: var(--ink); }
+.signup { background: var(--raised); border: 1px solid var(--edge); border-radius: 18px; box-shadow: var(--shadow); padding: 20px 22px; display: flex; flex-direction: column; gap: 12px; max-width: 560px; }
+.signup h3 { margin: 0; font: 600 19px/1.2 var(--serif); }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-weight: 600; font-size: 14px; }
+.field input { font: 15px/1.4 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.field input:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; border-color: transparent; }
+.field .err { color: var(--alert-fg); font-size: 13px; }
+.fine { color: var(--muted); font-size: 12px; margin: 0; }
+.signed { background: var(--order-bg); color: var(--order-fg); border-radius: 18px; padding: 18px 22px; display: flex; flex-direction: column; gap: 8px; max-width: 560px; }
+.signed strong { font: 600 19px/1.25 var(--serif); }
+.signed .btn { align-self: flex-start; }
+.top-link { margin-left: auto; font: 500 14px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.plan-badge { margin-left: auto; font: 600 12px/1 var(--sans); letter-spacing: 0.04em; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 7px 11px; white-space: nowrap; }
+header { flex-wrap: wrap; }
+
 /* The greeter. */
 .greeter { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
 .ink-avatar { width: 92px; height: 110px; flex: none; overflow: visible; }
@@ -325,6 +359,8 @@ footer {
       <h1>Cortex</h1>
       <p class="lede">Paste one thing from the inbox. Get what it is and what to do next.</p>
     </div>
+    <a class="top-link" id="plansLink" href="#pricing">Plans and pricing</a>
+    <span class="plan-badge" id="planBadge" hidden></span>
   </header>
 
   <section class="greeter" aria-label="Ink, your inbox helper">
@@ -384,6 +420,58 @@ footer {
       </div>
     </section>
   </main>
+
+  <section class="plans" id="pricing" aria-labelledby="plansTitle">
+    <div class="plans-head">
+      <h2 id="plansTitle">Start on your own, in two minutes</h2>
+      <p class="hint">No sales call, no contract, no card to start. Cancel any time.</p>
+    </div>
+    <div class="plan-grid">
+      <article class="plan featured" aria-labelledby="starterName">
+        <div class="plan-top"><h3 id="starterName">Starter</h3><span class="tag">Sign up yourself</span></div>
+        <p class="price"><b>$29</b><span>a month</span></p>
+        <p class="price-note">Or $290 a year. 14 days free first.</p>
+        <ul>
+          <li>Sort orders, customer emails, invoices and stock lines</li>
+          <li>A next step for each one</li>
+          <li>Stockout warnings with how many to reorder</li>
+          <li>An activity log with times</li>
+          <li>1 person</li>
+        </ul>
+        <button type="button" class="btn" data-plan="Starter"><span class="spark" aria-hidden="true"></span>Start Starter</button>
+      </article>
+      <article class="plan" aria-labelledby="teamName2">
+        <div class="plan-top"><h3 id="teamName2">Team</h3></div>
+        <p class="price"><b>$79</b><span>a month</span></p>
+        <p class="price-note">Or $790 a year. 14 days free first.</p>
+        <ul>
+          <li>Everything in Starter</li>
+          <li>Up to 5 people</li>
+        </ul>
+        <button type="button" class="btn ghost" data-plan="Team">Start Team</button>
+      </article>
+    </div>
+    <form class="signup" id="signupForm" novalidate hidden>
+      <h3 id="signupTitle">Start Starter</h3>
+      <div class="field">
+        <label for="signupName">Your name</label>
+        <input id="signupName" name="name" autocomplete="name" required>
+        <span class="err" id="nameErr" hidden>Add your name.</span>
+      </div>
+      <div class="field">
+        <label for="signupEmail">Work email</label>
+        <input id="signupEmail" name="email" type="email" autocomplete="email" required>
+        <span class="err" id="emailErr" hidden>Add an email address, like you@yourshop.com.</span>
+      </div>
+      <button type="submit" class="btn" id="signupBtn">Start my free trial</button>
+      <p class="fine">Demo sign-up: this saves your choice in this browser only. It doesn't create an account or a subscription, no card is asked for, and nothing is charged.</p>
+    </form>
+    <div class="signed" id="signedIn" hidden aria-live="polite">
+      <strong id="signedText"></strong>
+      <span id="signedNote"></span>
+      <button type="button" class="btn" id="goPaste">Paste your first item</button>
+    </div>
+  </section>
 
   <footer>
     <div class="team">
@@ -1132,6 +1220,53 @@ function react(r) {
 
 let hintTimer = 0;
 $("item").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(() => hint($("item").value), 450); });
+
+/* ---------- plans: a self-serve sign-up that stays in this browser ---------- */
+const PLAN_KEY = "cortex-plan-v1";
+let plan = null;
+try { plan = JSON.parse(localStorage.getItem(PLAN_KEY) || "null"); } catch { plan = null; }
+let chosen = "Starter";
+function showPlan() {
+  const badge = $("planBadge"), link = $("plansLink");
+  if (plan && plan.plan) {
+    const ends = new Date(new Date(plan.startedAt).getTime() + 14 * 86400000);
+    badge.textContent = plan.plan + " trial (demo)";
+    badge.hidden = false; link.hidden = true;
+    $("signupForm").hidden = true;
+    $("signedIn").hidden = false;
+    $("signedText").textContent = plan.plan + " trial started, " + plan.name + ".";
+    $("signedNote").textContent = "In this demo the trial runs until " + ends.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " and is saved in this browser only: no account is created and nothing is charged.";
+  } else {
+    badge.hidden = true; link.hidden = false;
+    $("signedIn").hidden = true;
+  }
+}
+document.querySelectorAll("[data-plan]").forEach(b => b.addEventListener("click", () => {
+  chosen = b.dataset.plan;
+  $("signupTitle").textContent = "Start " + chosen;
+  $("signedIn").hidden = true;
+  $("signupForm").hidden = false;
+  $("signupName").focus();
+}));
+$("signupForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const name = $("signupName").value.trim();
+  const email = $("signupEmail").value.trim();
+  const nameOk = name.length > 0;
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  $("nameErr").hidden = nameOk;
+  $("emailErr").hidden = emailOk;
+  if (!nameOk) { $("signupName").focus(); return; }
+  if (!emailOk) { $("signupEmail").focus(); return; }
+  plan = { plan: chosen, name, email, startedAt: new Date().toISOString() };
+  try { localStorage.setItem(PLAN_KEY, JSON.stringify(plan)); } catch {}
+  showPlan();
+  $("goPaste").focus();
+  say("Welcome aboard, " + name + "! Your " + chosen + " trial is on. Paste something from your inbox and I'll sort it.");
+  mood(1, 0); hop();
+});
+$("goPaste").addEventListener("click", () => { $("item").scrollIntoView({ behavior: still.matches ? "auto" : "smooth", block: "center" }); $("item").focus(); });
+showPlan();
 
 if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)) $("kbdHint").textContent = "or press Ctrl + Enter";
 $("item").value = EXAMPLES.order;
