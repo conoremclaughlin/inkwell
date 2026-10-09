@@ -912,7 +912,7 @@ function renderLog(freshId) {
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
-    const li = el("li", { class: "entry" + (e.stockout ? " alert-entry" : "") + (e.id === freshId ? " fresh" : "") }, timeEl, body);
+    const li = el("li", { class: "entry" + (e.stockout || String(e.step).startsWith("⚠️") ? " alert-entry" : "") + (e.id === freshId ? " fresh" : "") }, timeEl, body);
     list.append(li);
   }
   $("emptyLog").hidden = log.length > 0;
@@ -1111,7 +1111,10 @@ function hint(text) {
 function react(r) {
   const fact = name => (r.facts.find(f => f[0] === name) || [])[1];
   if (r.category === "inventory") {
-    if (r.stockout) { say("Uh oh. That won't last until the next delivery. Reorder " + (fact("Reorder") || "more") + " now."); mood(0, 0.9, 4200); return; }
+    if (r.stockout) {
+      say(fact("Reorder") ? "Uh oh. That won't last until the next delivery. Reorder " + fact("Reorder") + " now." : "Uh oh. That won't even last a week. Add the lead time and I'll size the reorder.");
+      mood(0, 0.9, 4200); return;
+    }
     if (r.step.startsWith("✅")) { say("Good news: there's enough on hand to cover the lead time."); mood(1, 0); hop(); return; }
     say("I need one more number to check this stock: " + r.step.replace(/^Add the | to check this stock$/g, "") + "."); mood(0, 0.6); return;
   }
