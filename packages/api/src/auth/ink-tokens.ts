@@ -12,6 +12,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { Database } from '../data/supabase/types';
+import { tokenIdentityState } from './token-identity';
 
 // ============================================================================
 // Types
@@ -260,6 +261,23 @@ export async function exchangeRefreshToken(
   const tokenAny = tokenRecord as Record<string, unknown>;
   const sbSlug = tokenAny.agent_id as string | null;
   const sbId = tokenAny.sb_id as string | null;
+
+  // A record bound to an SB mints nothing once that SB is gone. Deleting a
+  // space cascades its identities away, and mcp_tokens.sb_id is ON DELETE
+  // SET NULL, so the record keeps only its slug and would otherwise mint a
+  // slug-only access token on every refresh for 90 days (task 3f7f6a8f). The
+  // record is deleted, so a later SB of the same slug doesn't revive it. A
+  // failed read refuses, as a failed record lookup does above.
+  const sbState = await tokenIdentityState(supabase, {
+    userId: tokenRecord.user_id,
+    sbId,
+    sbSlug,
+  });
+  if (sbState === 'gone') {
+    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
+    return null;
+  }
+  if (sbState === 'unreadable') return null;
 
   const accessToken = signInkAccessToken(
     {

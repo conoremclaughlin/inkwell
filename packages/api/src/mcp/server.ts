@@ -44,7 +44,7 @@ import { runWithRequestContext, tokenIdentityContext } from '../utils/request-co
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { getHeartbeatTickHealth } from '../services/heartbeat';
-import { InkAuthProvider } from './auth/ink-auth-provider';
+import { InkAuthProvider, type VerifiedAccessToken } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
 import {
   ACCOUNT_BEING_DELETED,
@@ -453,7 +453,17 @@ export class MCPServer {
 
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
-      let userData = await this.authProvider.verifyAccessToken(authHeader);
+      const verdict = await this.authProvider.verifyAccessToken(authHeader);
+      if (!verdict.ok && verdict.status === 503) {
+        res.status(503).json({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: "The token's SB couldn't be checked; try again" },
+          id: null,
+        });
+        return;
+      }
+      // A token whose SB no longer exists is refused like an invalid one.
+      let userData: VerifiedAccessToken | null = verdict.ok ? verdict.token : null;
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
@@ -908,14 +918,19 @@ export class MCPServer {
     // Delegated token endpoint — mint short-lived agent-bound MCP access tokens.
     app.post('/token/delegate', express.json(), async (req, res) => {
       const authHeader = req.header('authorization');
-      const userData = await this.authProvider.verifyAccessToken(authHeader);
-      if (!userData) {
-        res.status(401).json({
-          error: 'invalid_token',
-          error_description: 'Missing or invalid bearer token',
-        });
+      const verdict = await this.authProvider.verifyAccessToken(authHeader);
+      if (!verdict.ok) {
+        res.status(verdict.status).json(
+          verdict.status === 503
+            ? {
+                error: 'temporarily_unavailable',
+                error_description: "The token's SB couldn't be checked",
+              }
+            : { error: 'invalid_token', error_description: 'Missing or invalid bearer token' }
+        );
         return;
       }
+      const userData = verdict.token;
       if (!leaseAccountForRequest(res, userData.userId)) return;
 
       const requestedSlug =

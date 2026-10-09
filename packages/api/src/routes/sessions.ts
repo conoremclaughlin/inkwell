@@ -132,11 +132,14 @@ export function createSessionsRouter(deps: {
   const router = Router();
 
   router.get('/:id/events', async (req: Request, res: Response): Promise<void> => {
-    const auth = deps.authProvider.verifyAccessToken(req.headers.authorization);
-    if (!auth) {
-      res.status(401).json({ error: 'Unauthorized' });
+    const verdict = await deps.authProvider.verifyAccessToken(req.headers.authorization);
+    if (!verdict.ok) {
+      res.status(verdict.status).json({
+        error: verdict.status === 503 ? 'Could not check the token; try again' : 'Unauthorized',
+      });
       return;
     }
+    const auth = verdict.token;
 
     const sessionId = req.params.id;
     if (!sessionId) {

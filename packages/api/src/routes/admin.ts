@@ -69,6 +69,7 @@ import {
   createRefreshToken,
   exchangeRefreshToken,
 } from '../auth/ink-tokens';
+import { tokenIdentityState } from '../auth/token-identity';
 import type { Database } from '../data/supabase/types';
 import {
   BrowserCompanionGrantService,
@@ -1142,7 +1143,21 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyInkAccessToken(token, 'mcp_access');
-      if (mcpPayload) {
+      // The SB it names must still exist, as on every mcp_access seam
+      // (token-identity.ts). A token whose SB is gone authenticates nothing
+      // here and falls through to the refusal below.
+      const sbState = mcpPayload
+        ? await tokenIdentityState(supabase, {
+            userId: mcpPayload.sub,
+            sbId: mcpPayload.sbId ?? mcpPayload.identityId,
+            sbSlug: mcpPayload.sbSlug,
+          })
+        : 'none';
+      if (sbState === 'unreadable') {
+        res.status(503).json({ error: "Could not check the token's SB; try again" });
+        return;
+      }
+      if (mcpPayload && sbState !== 'gone') {
         inkUserId = mcpPayload.sub;
         userEmail = mcpPayload.email;
         // A runner's token is signed for one identity; keep that, so an

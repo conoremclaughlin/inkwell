@@ -29,9 +29,13 @@ vi.mock('../../utils/logger', () => ({
 // the throttle, so the provider is stubbed to a fixed identity per bearer.
 vi.mock('../../mcp/auth/ink-auth-provider', () => ({
   InkAuthProvider: class {
-    verifyAccessToken(header?: string) {
+    verifyAccessTokenSignature(header?: string) {
       if (!header) return null;
       return { userId: header.replace('Bearer ', '') };
+    }
+    async verifyAccessToken(header?: string) {
+      const token = this.verifyAccessTokenSignature(header);
+      return token ? { ok: true, token } : { ok: false, status: 401 };
     }
   },
 }));
