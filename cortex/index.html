@@ -41,6 +41,10 @@
   --alert-bg: #fde6e0;
   --alert-fg: #a01d0b;
   --alert-line: #f0ad9c;
+  --quote-bg: #e6efe0; --quote-fg: #2f5d1e; --quote-dot: #5c9a3c;
+  --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
+  --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
+  --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -58,6 +62,10 @@
     --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
     --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -73,6 +81,10 @@
   --other-bg: #262c28; --other-fg: #c9cdc4; --other-dot: #8b938b;
     --inventory-bg: #1d2a40; --inventory-fg: #a9c3ef; --inventory-dot: #6f93d6;
     --alert-bg: #3f1d16; --alert-fg: #ffb3a1; --alert-line: #7a3226;
+    --quote-bg: #1f3319; --quote-fg: #b7dca3; --quote-dot: #7fbf5c;
+    --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
+    --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
+    --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -211,7 +223,22 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.other::before { background: var(--other-dot); }
 .pill.inventory { background: var(--inventory-bg); color: var(--inventory-fg); }
 .pill.inventory::before { background: var(--inventory-dot); }
+.pill.quote { background: var(--quote-bg); color: var(--quote-fg); }
+.pill.quote::before { background: var(--quote-dot); }
+.pill.storage { background: var(--storage-bg); color: var(--storage-fg); }
+.pill.storage::before { background: var(--storage-dot); }
+.pill.crew { background: var(--crew-bg); color: var(--crew-fg); }
+.pill.crew::before { background: var(--crew-dot); }
+.pill.issue { background: var(--issue-bg); color: var(--issue-fg); }
+.pill.issue::before { background: var(--issue-dot); }
 .result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
+.alert-tag.big { font-size: 16px; padding: 9px 14px; letter-spacing: 0.08em; }
+.pinned { border-top: 0; background: var(--alert-bg); border-radius: 12px; padding: 12px 12px; margin-bottom: 8px; }
+.pinned + .entry { border-top: 0; }
+.pin-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pin-row .btn { padding: 8px 14px; font-size: 13px; }
+.handled-note { color: var(--muted); font-size: 12px; }
+.examples + .examples { margin-top: -4px; }
 .result.alert .step { color: var(--alert-fg); font-weight: 600; }
 .alert-tag { display: inline-flex; align-items: center; font: 700 12px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--alert-bg); background: var(--alert-fg); border-radius: 999px; padding: 6px 10px; }
 .entry.alert-entry .entry-step { color: var(--alert-fg); }
@@ -392,6 +419,13 @@ footer {
             <button type="button" class="chip" data-example="billing">An invoice line</button>
             <button type="button" class="chip" data-example="inventory">A stock line</button>
           </div>
+          <div class="examples" role="group" aria-label="Fill in a moving and storage example">
+            <span>Moving &amp; storage:</span>
+            <button type="button" class="chip" data-example="quote">A quote request</button>
+            <button type="button" class="chip" data-example="issue">A damage claim</button>
+            <button type="button" class="chip" data-example="storage">A storage question</button>
+            <button type="button" class="chip" data-example="crew">A crew question</button>
+          </div>
           <div class="actions">
             <button type="submit" class="btn" id="sortBtn"><span class="spark" aria-hidden="true"></span>Sort it</button>
             <span class="kbd" id="kbdHint">or press ⌘ Enter</span>
@@ -438,7 +472,7 @@ footer {
           <li>An activity log with times</li>
           <li>1 person</li>
         </ul>
-        <button type="button" class="btn" data-plan="Starter"><span class="spark" aria-hidden="true"></span>Start Starter</button>
+        <button type="button" class="btn" data-plan="Starter"><span class="spark" aria-hidden="true"></span>Try Starter free</button>
       </article>
       <article class="plan" aria-labelledby="teamName2">
         <div class="plan-top"><h3 id="teamName2">Team</h3></div>
@@ -448,7 +482,7 @@ footer {
           <li>Everything in Starter</li>
           <li>Up to 5 people</li>
         </ul>
-        <button type="button" class="btn ghost" data-plan="Team">Start Team</button>
+        <button type="button" class="btn ghost" data-plan="Team">Try Team free</button>
       </article>
     </div>
     <form class="signup" id="signupForm" novalidate hidden>
@@ -494,7 +528,11 @@ const EXAMPLES = {
   order: "New order #1042 from Sam Rivera\n2 x Ethiopia Guji, 12 oz, whole bean\n1 x House Espresso, 2 lb, ground for espresso\nShip to: 18 Alder St, Portland, OR 97214\nShipping: USPS Priority",
   support: "Hi there,\nMy order #1037 was supposed to arrive on Tuesday and the tracking hasn't moved in three days. It's a birthday gift, so could you check on it?\nThanks,\nPriya",
   billing: "INVOICE INV-2291 | Harbor Green Imports | 10 bags Colombia Huila, 69 kg each | Total due $1,842.50 | Due Oct 30, 2026 | Net 30",
-  inventory: "SKU 4471 Holiday Throw Blanket, on hand: 120, avg weekly sales: 85, lead time: 3 weeks"
+  inventory: "SKU 4471 Holiday Throw Blanket, on hand: 120, avg weekly sales: 85, lead time: 3 weeks",
+  quote: "Hi, we need a quote for a 3-bedroom move from Albany to Saratoga Springs. We're moving on June 14. Could someone call me back?\nThanks,\nMaria",
+  issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
+  storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
+  crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?"
 };
 
 const RULES = {
@@ -839,11 +877,76 @@ function stockAnswer(st) {
   };
 }
 
+/* ---------- moving & storage: customer issue, quote, storage, crew ---------- */
+const MOVING_CONTEXT = /\b(mov(e|ed|es|ing|ers?)|relocat\w*|crew|truck|furniture|dresser|sofa|couch|piano|mattress|wardrobe|bookcase|armoire|boxes|packers?|packing|storage|warehouse|walk[- ]?through)\b/i;
+const ISSUE_WORDS = /\b(damage[ds]?|damaging|broken|broke|scratch(es|ed)?|dent(s|ed)?|claims?|complaint|complain(ed|ing)?|missing items?|lost items?|missing (a|my|our|the) \w+)\b/i;
+const STRONG_ISSUE = /\b(claims?|complaint|complain(ed|ing)?|scratch(es|ed)?|missing items?)\b/i;
+const QUOTE_WORDS = /\b(need a quote|get a quote|a quote for|quote for|request(ing)? a quote|free quote|estimates?|moving on|we('| a)?re moving|moving (from|to|out|in)\b|how much (would|will|does) it cost to move|price to move)\b/i;
+const STORAGE_WORDS = /\b(storage|climate[- ]controlled|units? (available|availability|sizes?|rental)|(a|your|any) units?\b|\d+\s*[x×]\s*\d+\b|store (my|our) (things|stuff|furniture|belongings))/i;
+const CREW_WORDS = /\b(crew|crew lead|foreman|dispatch|movers)\b/i;
+const INVOICE_WORDS = /\binvoice\b|\binv[-\s#]?\d+|\b(amount due|balance due|total due|net\s?\d{2})\b/i;
+const FURNITURE = ["dresser", "mirror", "sofa", "couch", "piano", "table", "chair", "bed", "mattress", "wardrobe", "bookcase", "armoire", "desk", "tv", "lamp", "cabinet", "boxes"];
+
+function movingKind(text) {
+  const t = text;
+  if (ISSUE_WORDS.test(t) && (MOVING_CONTEXT.test(t) || STRONG_ISSUE.test(t))) return "issue";
+  if (INVOICE_WORDS.test(t)) return null;
+  if (QUOTE_WORDS.test(t)) return "quote";
+  if (STORAGE_WORDS.test(t)) return "storage";
+  if (CREW_WORDS.test(t)) return "crew";
+  return null;
+}
+
+function movingAnswer(kind, text) {
+  const facts = [];
+  const who = signOff(text);
+  const lower = text.toLowerCase();
+  const items = FURNITURE.filter(f => new RegExp("\\b" + f + "s?\\b", "i").test(text));
+  if (kind === "issue") {
+    if (who) facts.push(["Customer", who]);
+    if (items.length) facts.push(["Items", items.join(", ")]);
+    const what = (text.match(ISSUE_WORDS) || [])[0];
+    if (what) facts.push(["Reported", what.toLowerCase()]);
+    return { category: "issue", label: "Customer Issue", urgency: "URGENT", urgent: true, confidence: null,
+      step: "Handle today, before new quotes",
+      why: "A damage claim or complaint. Customer issues come before new business.", facts, signals: [] };
+  }
+  if (kind === "quote") {
+    if (who) facts.push(["Customer", who]);
+    const size = text.match(/\b(\d+|one|two|three|four|five)[- ]?(bed(room)?|br)\b/i);
+    if (size) facts.push(["Size", size[0]]);
+    const route = text.match(/\bfrom\s+([A-Z][\w .'-]*?)\s+to\s+([A-Z][\w .'-]*?)(?=[.,;!?]|\s+(?:on|in|by|next|this)\b|$)/);
+    if (route) facts.push(["Route", route[1].trim() + " to " + route[2].trim()]);
+    const when = text.match(/\b(?:moving on|move on|on)\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day)\b/i);
+    if (when) facts.push(["Move date", when[1]]);
+    return { category: "quote", label: "Quote", urgency: "Today", confidence: null,
+      step: "New quote: call back today", why: "Someone wants a price for a move.", facts, signals: [] };
+  }
+  if (kind === "storage") {
+    if (who) facts.push(["Customer", who]);
+    const size = text.match(/\b\d+\s*[x×]\s*\d+\b/);
+    if (size) facts.push(["Unit size", size[0].replace(/\s+/g, "")]);
+    if (/climate[- ]controlled/i.test(text)) facts.push(["Needs", "Climate-controlled"]);
+    const span = text.match(/\b(\d+|one|two|three|six|twelve)\s+(months?|weeks?|years?)\b/i);
+    if (span) facts.push(["For", span[0]]);
+    return { category: "storage", label: "Storage", urgency: "Today", confidence: null,
+      step: "Reply with unit availability", why: "A storage question.", facts, signals: [] };
+  }
+  const crewName = text.match(/\bcrew\s*#?\s*(\d+|[A-Z]\w*)\b/i);
+  if (crewName) facts.push(["Crew", crewName[0]]);
+  const job = text.match(/\bthe\s+([A-Z][a-z]+)\s+(job|move)\b/);
+  if (job) facts.push(["Job", job[1] + " " + job[2]]);
+  return { category: "crew", label: "Crew", urgency: "Today", confidence: null,
+    step: "Answer the crew today", why: "A question from a crew about a job.", facts, signals: [] };
+}
+
 function classify(text, now = new Date()) {
   const clean = text.trim();
   if (!clean) return null;
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
+  const kind = movingKind(clean);
+  if (kind) return movingAnswer(kind, clean);
   const s = score(clean);
   const ranked = Object.entries(s).sort((a, b) => b[1].score - a[1].score);
   const [topCat, top] = ranked[0];
@@ -977,11 +1080,11 @@ function renderResult(r, fresh) {
   const box = $("result");
   box.replaceChildren();
   box.dataset.state = "filled";
-  box.classList.toggle("alert", !!r.stockout);
-  if (r.stockout) box.setAttribute("role", "alert"); else box.removeAttribute("role");
+  box.classList.toggle("alert", !!(r.stockout || r.urgent));
+  if (r.stockout || r.urgent) box.setAttribute("role", "alert"); else box.removeAttribute("role");
   const top = el("div", { class: "result-top" },
     el("span", { class: "pill " + r.category, text: r.label }),
-    r.stockout ? el("span", { class: "alert-tag", text: "Stockout risk" }) : null,
+    r.urgent ? el("span", { class: "alert-tag big", text: "URGENT" }) : r.stockout ? el("span", { class: "alert-tag", text: "Stockout risk" }) : null,
     el("span", { class: "when" }, el("b", { text: r.urgency }), document.createTextNode(r.confidence ? " · " + r.confidence : ""))
   );
   box.append(top, el("p", { class: "step", text: r.step }), el("p", { class: "why", text: r.why }));
@@ -995,10 +1098,22 @@ function renderResult(r, fresh) {
   if (fresh) { void box.offsetWidth; box.classList.add("fresh"); }
 }
 
+function markHandled(id) {
+  const e = log.find(x => x.id === id);
+  if (!e) return;
+  e.handled = true;
+  e.handledAt = new Date().toISOString();
+  saveLog();
+  renderLog();
+  say("Marked handled. Nice work.");
+}
 function renderLog(freshId) {
   const list = $("entries");
   list.replaceChildren();
-  for (const e of log) {
+  // Urgent items stay at the top, newest first, until someone marks them handled.
+  const open = log.filter(e => e.urgent && !e.handled);
+  const rest = log.filter(e => !(e.urgent && !e.handled));
+  for (const e of [...open, ...rest]) {
     const t = timeParts(e.at);
     const timeEl = el("time", { datetime: e.at, title: t.full }, document.createTextNode(t.time));
     if (t.day) timeEl.append(el("small", { text: t.day }));
@@ -1006,19 +1121,32 @@ function renderLog(freshId) {
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
-    const li = el("li", { class: "entry" + (e.stockout || String(e.step).startsWith("⚠️") ? " alert-entry" : "") + (e.id === freshId ? " fresh" : "") }, timeEl, body);
+    const pinned = e.urgent && !e.handled;
+    if (pinned) {
+      const btn = el("button", { type: "button", class: "btn", text: "Mark handled" });
+      btn.addEventListener("click", () => markHandled(e.id));
+      body.append(el("div", { class: "pin-row" }, el("span", { class: "alert-tag", text: "URGENT" }), btn));
+    } else if (e.urgent && e.handledAt) {
+      body.append(el("span", { class: "handled-note", text: "Handled " + timeParts(e.handledAt).time + (timeParts(e.handledAt).day ? ", " + timeParts(e.handledAt).day : "") }));
+    }
+    const li = el("li", { class: "entry" + (pinned ? " pinned alert-entry" : "") + (e.stockout || String(e.step).startsWith("⚠️") ? " alert-entry" : "") + (e.id === freshId ? " fresh" : "") }, timeEl, body);
     list.append(li);
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
   if (counts.support) parts.push(counts.support + " support");
   if (counts.billing) parts.push(counts.billing + " billing");
   if (counts.inventory) parts.push(counts.inventory + " inventory");
+  if (counts.quote) parts.push(counts.quote + (counts.quote === 1 ? " quote" : " quotes"));
+  if (counts.issue) parts.push(counts.issue + (counts.issue === 1 ? " customer issue" : " customer issues"));
+  if (counts.storage) parts.push(counts.storage + " storage");
+  if (counts.crew) parts.push(counts.crew + " crew");
   if (counts.other) parts.push(counts.other + " unsure");
+  if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
   const foot = $("logFoot").firstElementChild;
   foot.textContent = memoryOnly ? "This browser won't keep it after you close the page." : "Saved in this browser.";
@@ -1044,7 +1172,7 @@ function sortNow() {
   const entry = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     at: new Date().toISOString(),
-    category: r.category, label: r.label, step: r.step, stockout: !!r.stockout,
+    category: r.category, label: r.label, step: r.step, stockout: !!r.stockout, urgent: !!r.urgent, handled: false,
     snippet: oneLine.length > 140 ? oneLine.slice(0, 139) + "…" : oneLine
   };
   log.unshift(entry);
@@ -1196,6 +1324,10 @@ function hint(text) {
     support: "Sounds like a customer who needs you. Sort it and I'll suggest a reply.",
     billing: "That's a bill. Sort it and I'll find what's due and when.",
     inventory: "A stock line. Sort it and I'll check it against demand.",
+    issue: "That sounds like a customer issue. Sort it and I'll flag it urgent.",
+    quote: "New business! Sort it and I'll log the quote request.",
+    storage: "A storage question. Sort it and I'll note what they need.",
+    crew: "The crew has a question. Sort it and I'll log it.",
     other: "Hmm, I can't tell what that is yet."
   };
   say(lines[r.category]);
@@ -1213,6 +1345,10 @@ function react(r) {
     say("I need one more number to check this stock: " + r.step.replace(/^Add the | to check this stock$/g, "") + "."); mood(0, 0.6); return;
   }
   if (r.category === "other") { say("I'm not sure about this one. Best to read it yourself."); mood(0, 0.8); return; }
+  if (r.category === "issue") { say("Urgent: a customer issue. I've pinned it to the top of the log until it's handled."); mood(0, 0.9, 4200); return; }
+  if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
+  if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
+  if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
   const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
   say(lead + " Next step: " + r.step + ".");
   mood(r.category === "support" ? 0.35 : 0.9, 0); hop();
