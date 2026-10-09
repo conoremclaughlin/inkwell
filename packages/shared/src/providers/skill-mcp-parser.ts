@@ -47,6 +47,7 @@ export function parseSkillMcpContent(content: string): SkillMcpServer | null {
 
   if (!name || !command) return null;
 
+  // Inline args/env must fit one physical line; use block forms for multiline values.
   // Parse args — inline [a, b] or block-style list (- a\n- b)
   let args: string[] = [];
   const argsInlineMatch = matchLine(/^[ \t]*args:[ \t]*\[([^\]]*)\]/);

@@ -14,6 +14,25 @@ export interface SessionModelState {
   log: { append(event: Record<string, unknown>): number };
 }
 
+/** Existing /backend mutation, not permission to select that provider on a host. */
+export function applyBackendSelection(
+  runtime: SessionModelState,
+  next: string,
+  contextBudgetAuto: boolean
+): void {
+  runtime.backend = next;
+  runtime.detectedModel = undefined;
+  runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
+  if (contextBudgetAuto) {
+    // Preserve the CLI's existing behavior: unlike model selection this
+    // does not append a budget/reset event. Durable controls are a later slice.
+    runtime.maxContextTokens = defaultContextBudget(
+      runtime.backendTokenWindow,
+      promptTransportFor(runtime.backend)
+    );
+  }
+}
+
 export function applyModelSelection(
   runtime: SessionModelState,
   next: string | undefined,

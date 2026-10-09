@@ -7,6 +7,7 @@ import {
   runSessionAgentTurn,
   SessionStream,
   applyModelSelection,
+  applyBackendSelection,
   applyDetectedModel,
   createSessionCompaction,
   DEFAULT_TRIM_TARGET_PCT,
@@ -174,7 +175,7 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
-import { sessionCredentialsForProfile } from '@inklabs/shared/node-host';
+import { createSessionSkills, sessionCredentialsForProfile } from '@inklabs/shared/node-host';
 import { resolveCredentialRefs, loadKeychainCredentials } from '../repl/credential-resolver.js';
 import {
   createSignalSink,
@@ -226,7 +227,7 @@ import {
   buildPermissionGrantMetadata,
   type PermissionGrantAction,
 } from '../repl/permission-grant.js';
-import { canActivateSkill, filterSkillsByPolicy } from '../repl/skill-policy.js';
+import { filterSkillsByPolicy } from '../repl/skill-policy.js';
 import {
   formatHumanTime,
   formatNow,
@@ -2208,6 +2209,13 @@ async function runChatSession(
     runtime.toolMode,
     policyPathFromEnv ? { policyPath: policyPathFromEnv } : undefined
   );
+  const sessionSkills = createSessionSkills({
+    state: () => runtime,
+    policy: toolPolicy,
+    // Interactive host adapters only. The server must supply async, rooted I/O.
+    discover: () => discoverSkills(process.cwd()),
+    load: (skill) => loadSkillInstruction(skill),
+  });
   toolPolicy.setContext({
     sbSlug,
     studioId: runtime.studioId,
@@ -5813,16 +5821,7 @@ async function runChatSession(
             showInPanel(['Usage: /backend <claude|codex|gemini>']);
             break;
           }
-          runtime.backend = next;
-          // Detection belongs to the previous provider's session.
-          runtime.detectedModel = undefined;
-          runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
-          if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(
-              runtime.backendTokenWindow,
-              promptTransportFor(runtime.backend)
-            );
-          }
+          applyBackendSelection(runtime, next, contextBudgetAuto);
           const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
             backendLines.push(
@@ -6336,35 +6335,20 @@ async function runChatSession(
             showInPanel(['Usage: /skill-use <name>']);
             break;
           }
-          const skills = discoverSkills(process.cwd()).filter((skill) => skill.name === name);
-          if (skills.length === 0) {
-            showInPanel([`Skill not found: ${name}`]);
-            break;
-          }
-          const [skill] = skills;
-          const activation = canActivateSkill(skill, toolPolicy);
-          if (!activation.allowed) {
-            showInPanel([activation.reason || 'Skill blocked by policy']);
-            break;
-          }
-          const loaded = loadSkillInstruction(skill);
-          runtime.activeSkills = [
-            ...runtime.activeSkills.filter((entry) => entry.path !== loaded.path),
-            loaded,
-          ];
-          showInPanel([`Activated skill ${loaded.name}`]);
+          const activation = await sessionSkills.activate(name);
+          showInPanel([
+            activation.allowed ? `Activated skill ${activation.skill.name}` : activation.reason,
+          ]);
           break;
         }
         case 'skill-clear': {
           const name = slash.args.join(' ').trim();
           if (!name) {
-            runtime.activeSkills = [];
+            sessionSkills.clear();
             showInPanel(['Cleared all active skills.']);
             break;
           }
-          const before = runtime.activeSkills.length;
-          runtime.activeSkills = runtime.activeSkills.filter((skill) => skill.name !== name);
-          const removed = before - runtime.activeSkills.length;
+          const removed = sessionSkills.clear(name);
           if (removed === 0) {
             showInPanel([`No active skill matched: ${name}`]);
           } else {
