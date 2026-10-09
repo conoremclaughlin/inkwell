@@ -39,9 +39,10 @@
 html, body { margin: 0; }
 body { background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); }
 .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: flex; flex-direction: column; gap: 20px; }
-header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.mark { width: 44px; height: 44px; border-radius: 12px; flex: none; }
+.brand { min-width: 0; flex: 1 1 280px; }
 h1 { font: 600 28px/1.15 var(--serif); margin: 0; text-wrap: balance; }
-header nav { display: flex; gap: 14px; font-size: 14px; }
 a { color: inherit; }
 .sub { margin: 4px 0 0; color: var(--muted); font-size: 14px; max-width: 65ch; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -79,16 +80,30 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .fine { font-size: 13px; color: var(--muted); margin: 0; }
 footer { font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* One header nav on every Cortex page, so a click-through never gets lost. */
+.site-nav { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px; font: 500 14px var(--sans); }
+.site-nav a { color: var(--ink-soft); text-decoration: none; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
+.site-nav a:hover { background: var(--sunk); color: var(--ink); }
+.site-nav a[aria-current="page"] { background: var(--ink); color: var(--paper); }
+@media (max-width: 560px) { .site-nav { margin-left: 0; width: 100%; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <div>
+    <svg class="mark" viewBox="0 0 1024 1024" aria-hidden="true">
+      <defs><linearGradient id="sparkA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFCF5A"/><stop offset="1" stop-color="#F04E2B"/></linearGradient></defs>
+      <rect width="1024" height="1024" fill="#F5F3EC"/>
+      <circle cx="573" cy="584" r="261" fill="#151515"/>
+      <g fill="#F8F4E7"><ellipse cx="505" cy="556" rx="27" ry="40"/><ellipse cx="641" cy="556" rx="27" ry="40"/></g>
+      <circle cx="261" cy="261" r="118" fill="url(#sparkA)"/>
+    </svg>
+    <div class="brand">
       <h1>Cortex Retention</h1>
       <p class="sub">Paste a customer contact. CPF, card and phone numbers are masked the moment they land, in this browser, before anything is saved. This page sends nothing anywhere: open the network tab and check.</p>
     </div>
-    <nav><a href="../">Inbox</a><a href="../pricing/">Pricing</a></nav>
+    <nav class="site-nav" aria-label="Cortex pages"><a href="../">Inbox</a><a href="../pricing/">Pricing</a><a href="../bids/">Bid check</a><a href="../retention/" aria-current="page">Retention</a></nav>
   </header>
 
   <p class="coo" id="coo">0 at-risk contacts routed to retention.<span>Time to retention: none yet.</span></p>

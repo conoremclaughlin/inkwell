@@ -321,6 +321,13 @@ footer svg { width: 22px; height: 22px; border-radius: 6px; }
 footer b { color: var(--ink-soft); font-weight: 600; }
 @media (prefers-reduced-motion: no-preference) { .verdict.fresh { animation: settle 360ms cubic-bezier(.2,.8,.2,1); } }
 @keyframes settle { from { transform: translateY(6px); opacity: .4; } to { transform: none; opacity: 1; } }
+
+/* One header nav on every Cortex page, so a click-through never gets lost. */
+.site-nav { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px; font: 500 14px var(--sans); }
+.site-nav a { color: var(--ink-soft); text-decoration: none; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
+.site-nav a:hover { background: var(--sunk); color: var(--ink); }
+.site-nav a[aria-current="page"] { background: var(--ink); color: var(--paper); }
+@media (max-width: 560px) { .site-nav { margin-left: 0; width: 100%; } }
 </style>
 
 <div class="wrap">
@@ -336,7 +343,7 @@ footer b { color: var(--ink-soft); font-weight: 600; }
       <h1>Cortex Bid Check</h1>
       <p class="lede">The last check before a bid goes out. Cost, bid, contingency in; margin and flags out.</p>
     </div>
-    <a class="top-link" href="../">Cortex inbox</a>
+    <nav class="site-nav" aria-label="Cortex pages"><a href="../">Inbox</a><a href="../pricing/">Pricing</a><a href="../bids/" aria-current="page">Bid check</a><a href="../retention/">Retention</a></nav>
   </header>
 
   <main>
