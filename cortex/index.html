@@ -45,6 +45,7 @@
   --storage-bg: #ece6f4; --storage-fg: #4f2f7d; --storage-dot: #7d5bb5;
   --crew-bg: #e4e8ea; --crew-fg: #33434c; --crew-dot: #63757f;
   --issue-bg: #fde0da; --issue-fg: #a01d0b; --issue-dot: #d93a1f;
+  --fees-bg: #dff3e4; --fees-fg: #14632f; --fees-dot: #2fa84f;
   --shadow: 0 1px 2px rgba(32, 41, 35, 0.05), 0 6px 18px rgba(32, 41, 35, 0.06);
   --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -66,6 +67,7 @@
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #16331f; --fees-fg: #9fe2b0; --fees-dot: #4cc46c;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
     color-scheme: dark;
   }
@@ -85,6 +87,7 @@
     --storage-bg: #2a2140; --storage-fg: #cdb9ef; --storage-dot: #9b7fd6;
     --crew-bg: #232b30; --crew-fg: #c3d0d6; --crew-dot: #8aa0ab;
     --issue-bg: #44160f; --issue-fg: #ffb3a1; --issue-dot: #ff6a4d;
+    --fees-bg: #16331f; --fees-fg: #9fe2b0; --fees-dot: #4cc46c;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -231,6 +234,14 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .pill.crew::before { background: var(--crew-dot); }
 .pill.issue { background: var(--issue-bg); color: var(--issue-fg); }
 .pill.issue::before { background: var(--issue-dot); }
+.pill.fees { background: var(--fees-bg); color: var(--fees-fg); }
+.pill.fees::before { background: var(--fees-dot); }
+/* Fees: the centre-phone picker and the payment line under a log entry. */
+.centre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.centre label { font-weight: 600; color: var(--ink-soft); }
+.centre select { font: 14px/1.3 var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; }
+.centre select:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; }
+.entry-fee { color: var(--fees-fg); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
 .result.alert { background: var(--alert-bg); border: 1.5px solid var(--alert-line); }
 .alert-tag.big { font-size: 16px; padding: 9px 14px; letter-spacing: 0.08em; }
 .pinned { border-top: 0; background: var(--alert-bg); border-radius: 12px; padding: 12px 12px; margin-bottom: 8px; }
@@ -426,6 +437,23 @@ footer {
             <button type="button" class="chip" data-example="storage">A storage question</button>
             <button type="button" class="chip" data-example="crew">A crew question</button>
           </div>
+          <div class="examples" role="group" aria-label="Fill in a school fees example">
+            <span>School fees:</span>
+            <button type="button" class="chip" data-example="fees">M-Pesa payment</button>
+          </div>
+          <div class="centre">
+            <label for="centre">Received on centre phone</label>
+            <select id="centre" name="centre">
+              <option value="">Not set</option>
+              <option>Centre 1</option>
+              <option>Centre 2</option>
+              <option>Centre 3</option>
+              <option>Centre 4</option>
+              <option>Centre 5</option>
+              <option>Centre 6</option>
+            </select>
+            <span>Optional, for M-Pesa payments</span>
+          </div>
           <div class="actions">
             <button type="submit" class="btn" id="sortBtn"><span class="spark" aria-hidden="true"></span>Sort it</button>
             <span class="kbd" id="kbdHint">or press ⌘ Enter</span>
@@ -536,7 +564,8 @@ const EXAMPLES = {
   quote: "Hi, we need a quote for a 3-bedroom move from Albany to Saratoga Springs. We're moving on June 14. Could someone call me back?\nThanks,\nMaria",
   issue: "Our dresser arrived with a deep scratch and the mirror is broken. I want to file a damage claim. The crew left around 6pm yesterday.\n- Tom",
   storage: "Do you have a climate-controlled storage unit available for 3 months starting next week? Probably a 10x10.\nThanks,\nPriya",
-  crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?"
+  crew: "Crew 3 here: the Lopez job has a piano we didn't know about. Do we need a second truck for Saturday?",
+  fees: "QJD3X8K9 Confirmed. KSh 12,500 received from MARY WANJIKU 07XXXXXXXX on 09/10/2026 at 8:14 AM. New M-Pesa balance is KSh 48,200."
 };
 
 const RULES = {
@@ -944,9 +973,56 @@ function movingAnswer(kind, text) {
     step: "Answer the crew today", why: "A question from a crew about a job.", facts, signals: [] };
 }
 
-function classify(text, now = new Date()) {
+/* ---------- school fees: M-Pesa payment confirmations (Elimu Plus) ---------- */
+// An M-Pesa confirmation always says "Confirmed", "KSh" and "received from".
+function isFees(text) {
+  const t = text.toLowerCase();
+  return t.includes("confirmed") && t.includes("ksh") && t.includes("received from");
+}
+
+// Each field is read on its own, so a message that's cut short still gives what it has.
+function parseFees(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  // The transaction code is the first token, like QJD3X8K9: letters and digits only.
+  const first = (t.split(" ")[0] || "").replace(/[^A-Za-z0-9]/g, "");
+  const ref = /^(?=.*\d)[A-Za-z0-9]{6,14}$/.test(first) && !/^confirmed$/i.test(first) ? first.toUpperCase() : null;
+  // The amount paid is the one just before "received from", not the new balance after it.
+  const amt = t.match(/\bKSh\.?\s*(\d[\d,]*(?:\.\d{1,2})?)\s+received from\b/i) || t.match(/\bKSh\.?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
+  const amount = amt ? "KSh " + amt[1] : null;
+  // The payer's name runs until their phone number, "on <date>", or the end of the sentence.
+  const who = t.match(/\breceived from\s+([A-Za-z][A-Za-z'.-]*(?:\s+(?!on\s+\d)[A-Za-z][A-Za-z'.-]*)*?)(?=\s+[+\d]|\s+on\s+\d|[.,;]|\s*$)/i);
+  const payer = who ? who[1].trim() : null;
+  const day = t.match(/\bon\s+(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+  const time = t.match(/\bat\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/i);
+  const when = [day && day[1], time && time[1].toUpperCase()].filter(Boolean).join(" ") || null;
+  return { ref, amount, payer, when };
+}
+
+function feesAnswer(text, centre) {
+  const p = parseFees(text);
+  const facts = [];
+  if (p.amount) facts.push(["Amount", p.amount]);
+  if (p.payer) facts.push(["Payer", p.payer]);
+  if (p.ref) facts.push(["Ref", p.ref]);
+  if (p.when) facts.push(["Paid", p.when]);
+  facts.push(["Centre phone", centre || "Not set"]);
+  // "KSh 12,500 from MARY WANJIKU, ref QJD3X8K9, 09/10/2026 8:14 AM", with whatever was found.
+  const paid = p.amount && p.payer ? p.amount + " from " + p.payer : p.amount || (p.payer ? "from " + p.payer : null);
+  const bits = [paid, p.ref && "ref " + p.ref, p.when].filter(Boolean);
+  const missing = [!p.amount && "amount", !p.payer && "payer", !p.ref && "ref", !p.when && "date and time"].filter(Boolean);
+  return {
+    category: "fees", label: "Fees", urgency: "Today", confidence: null,
+    step: "Record in the fee register" + (bits.length ? ": " + bits.join(", ") : ""),
+    why: missing.length ? "An M-Pesa payment. I couldn't read the " + missing.join(", ") + ", so check those on the message." : "An M-Pesa payment confirmation for school fees.",
+    facts, signals: [], fee: { amount: p.amount, payer: p.payer, ref: p.ref, when: p.when, centre: centre || null }
+  };
+}
+
+function classify(text, now = new Date(), centre = "") {
   const clean = text.trim();
   if (!clean) return null;
+  // Fees come first: an M-Pesa confirmation mentions a balance and money, which other rules would also claim.
+  if (isFees(clean)) return feesAnswer(clean, centre);
   const stock = parseStock(clean);
   if (stock.isStock) return stockAnswer(stock);
   const kind = movingKind(clean);
@@ -1111,6 +1187,10 @@ function markHandled(id) {
   renderLog();
   say("Marked handled. Nice work.");
 }
+// "KSh 12,500 · MARY WANJIKU · paid 09/10/2026 8:14 AM · Centre 3"
+function feeLine(f) {
+  return [f.amount, f.payer, f.when && "paid " + f.when, f.centre || "Centre not set"].filter(Boolean).join(" · ");
+}
 function renderLog(freshId) {
   const list = $("entries");
   list.replaceChildren();
@@ -1123,6 +1203,7 @@ function renderLog(freshId) {
     if (t.day) timeEl.append(el("small", { text: t.day }));
     const body = el("div", { class: "entry-body" },
       el("div", { class: "entry-line" }, el("span", { class: "pill " + e.category, text: e.label }), el("span", { class: "entry-step", text: e.step })),
+      e.fee ? el("div", { class: "entry-fee", text: feeLine(e.fee) }) : null,
       el("div", { class: "entry-snip", text: e.snippet, title: e.snippet })
     );
     const pinned = e.urgent && !e.handled;
@@ -1138,7 +1219,7 @@ function renderLog(freshId) {
   }
   $("emptyLog").hidden = log.length > 0;
   $("logFoot").hidden = log.length === 0;
-  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, other: 0 };
+  const counts = { order: 0, support: 0, billing: 0, inventory: 0, quote: 0, issue: 0, storage: 0, crew: 0, fees: 0, other: 0 };
   for (const e of log) counts[e.category] = (counts[e.category] || 0) + 1;
   const parts = [];
   if (counts.order) parts.push(counts.order + (counts.order === 1 ? " order" : " orders"));
@@ -1149,6 +1230,7 @@ function renderLog(freshId) {
   if (counts.issue) parts.push(counts.issue + (counts.issue === 1 ? " customer issue" : " customer issues"));
   if (counts.storage) parts.push(counts.storage + " storage");
   if (counts.crew) parts.push(counts.crew + " crew");
+  if (counts.fees) parts.push(counts.fees + (counts.fees === 1 ? " fee payment" : " fee payments"));
   if (counts.other) parts.push(counts.other + " unsure");
   if (open.length) parts.unshift(open.length + " urgent");
   $("tally").textContent = parts.join(" · ");
@@ -1158,7 +1240,7 @@ function renderLog(freshId) {
 
 function sortNow() {
   const text = $("item").value;
-  const r = classify(text);
+  const r = classify(text, new Date(), $("centre").value);
   if (!r) {
     const box = $("result");
     box.replaceChildren(el("p", { class: "why", text: "Paste something first: an order, a customer email or an invoice line." }));
@@ -1179,6 +1261,7 @@ function sortNow() {
     category: r.category, label: r.label, step: r.step, stockout: !!r.stockout, urgent: !!r.urgent, handled: false,
     snippet: oneLine.length > 140 ? oneLine.slice(0, 139) + "…" : oneLine
   };
+  if (r.fee) entry.fee = r.fee;
   log.unshift(entry);
   saveLog();
   renderLog(entry.id);
@@ -1321,7 +1404,7 @@ function greet() {
 function hint(text) {
   const t = text.trim();
   if (t.length < 12) return;
-  const r = classify(t);
+  const r = classify(t, new Date(), $("centre").value);
   if (!r) return;
   const lines = {
     order: "That looks like an order. Press Sort it when you're ready.",
@@ -1332,6 +1415,7 @@ function hint(text) {
     quote: "New business! Sort it and I'll log the quote request.",
     storage: "A storage question. Sort it and I'll note what they need.",
     crew: "The crew has a question. Sort it and I'll log it.",
+    fees: "An M-Pesa payment. Sort it and I'll write up the fee register line.",
     other: "Hmm, I can't tell what that is yet."
   };
   say(lines[r.category]);
@@ -1352,6 +1436,7 @@ function react(r) {
   if (r.category === "issue") { say("Urgent: a customer issue. I've pinned it to the top of the log until it's handled."); mood(0, 0.9, 4200); return; }
   if (r.category === "quote") { say("New business! Call them back today."); mood(1, 0); hop(); return; }
   if (r.category === "storage") { say("A storage question. Reply with what units are open."); mood(0.5, 0); hop(); return; }
+  if (r.category === "fees") { say("Fees paid" + (fact("Amount") ? ": " + fact("Amount") : "") + (fact("Payer") ? " from " + fact("Payer") : "") + ". Record it in the fee register."); mood(1, 0); hop(); return; }
   if (r.category === "crew") { say("The crew needs an answer before they head out."); mood(0.3, 0); return; }
   const lead = { order: "An order" + (fact("Order") ? " (" + fact("Order") + ")" : "") + "!", support: "A customer needs you.", billing: "A bill" + (fact("Amount") ? " for " + fact("Amount") : "") + "." }[r.category];
   say(lead + " Next step: " + r.step + ".");
