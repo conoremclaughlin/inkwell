@@ -297,6 +297,8 @@ textarea:focus-visible { outline: 2px solid var(--spark); outline-offset: 1px; b
 .signed { background: var(--order-bg); color: var(--order-fg); border-radius: 18px; padding: 18px 22px; display: flex; flex-direction: column; gap: 8px; max-width: 560px; }
 .signed strong { font: 600 19px/1.25 var(--serif); }
 .signed .btn { align-self: flex-start; }
+.signed-email { font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.field .opt { font-weight: 400; opacity: 0.7; }
 .top-link { margin-left: auto; font: 500 14px var(--sans); color: var(--ink-soft); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
 .plan-badge { margin-left: auto; font: 600 12px/1 var(--sans); letter-spacing: 0.04em; color: var(--order-fg); background: var(--order-bg); border-radius: 999px; padding: 7px 11px; white-space: nowrap; }
 header { flex-wrap: wrap; }
@@ -423,14 +425,15 @@ footer {
     <form class="signup" id="signupForm" novalidate>
       <h3>Start Starter plan</h3>
       <p class="hint" id="billingLine">Annual: $3,990/year, paid upfront.</p>
-      <div class="field"><label for="signupName">Name</label><input id="signupName" autocomplete="name"><span class="err" id="nameErr" hidden>Add your name.</span></div>
-      <div class="field"><label for="signupEmail">Email</label><input id="signupEmail" type="email" autocomplete="email"><span class="err" id="emailErr" hidden>Add an email address, like you@company.com.</span></div>
-      <div class="field"><label for="signupCompany">Company</label><input id="signupCompany" autocomplete="organization"><span class="err" id="companyErr" hidden>Add your company.</span></div>
+      <div class="field"><label for="signupEmail">Work email</label><input id="signupEmail" type="email" autocomplete="email" required aria-describedby="emailErr"><span class="err" id="emailErr" hidden>Add an email address, like you@company.com.</span></div>
+      <div class="field"><label for="signupName">Name <span class="opt">(optional)</span></label><input id="signupName" autocomplete="name"></div>
+      <div class="field"><label for="signupCompany">Company <span class="opt">(optional)</span></label><input id="signupCompany" autocomplete="organization"></div>
       <button type="submit" class="btn" id="signupBtn">Start Starter plan</button>
-      <p class="fine">Demo sign-up: kept in this browser only. No account is created and no payment is taken.</p>
+      <p class="fine">Only your email is required. No payment is taken.</p>
     </form>
     <div class="signed" id="signedIn" hidden aria-live="polite">
       <strong id="signedText"></strong>
+      <span id="signedEmail" class="signed-email"></span>
       <span id="signedNote"></span>
       <div class="pin-row"><a class="btn" href="../">Go to Cortex</a><button type="button" class="link" id="cancelPlan">Cancel Starter plan</button></div>
     </div>
@@ -455,27 +458,28 @@ const KEY = "cortex-plan-v1";
 const PRICES = { monthly: "$450/month, billed monthly", annual: "$3,990/year, paid upfront" };
 let billing = "annual";
 const valid = p => !!p && p.plan === "Starter" && (p.billing === "monthly" || p.billing === "annual") &&
-  ["name", "email", "company"].every(k => typeof p[k] === "string" && p[k].trim()) && Number.isFinite(Date.parse(p.startedAt));
+  typeof p.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email) && Number.isFinite(Date.parse(p.startedAt));
 function note(t) { $("planNote").textContent = t; $("planNote").hidden = !t; }
 function show(p, saved) {
   $("signupForm").hidden = true; $("signedIn").hidden = false;
-  $("signedText").textContent = "Welcome to Cortex Starter, " + p.name + "!";
-  $("signedNote").textContent = "Starter " + p.billing + ": " + PRICES[p.billing] + ". " +
-    (saved ? "Saved in this browser only (demo): no account is created and no payment is taken." : "Not saved: refreshing or leaving this page will lose it. No account is created and no payment is taken.");
+  $("signedText").textContent = "Account created" + (p.name ? ". Welcome to Cortex Starter, " + p.name + "!" : ". Welcome to Cortex Starter!");
+  $("signedEmail").textContent = "Signed up as " + p.email + (p.company ? " (" + p.company + ")" : "");
+  $("signedNote").textContent = "Starter, " + PRICES[p.billing] + ". " +
+    (saved ? "Your account is kept in this browser. No payment is taken." : "This browser can't keep it: refreshing or leaving this page will lose it. No payment is taken.");
 }
 document.querySelectorAll("[data-billing]").forEach(b => b.addEventListener("click", () => {
   billing = b.dataset.billing;
   $("billingLine").textContent = (billing === "annual" ? "Annual: " : "Monthly: ") + PRICES[billing] + ".";
   $("signupForm").hidden = false; $("signedIn").hidden = true; note("");
-  $("signupName").focus();
+  $("signupEmail").focus();
 }));
 $("signupForm").addEventListener("submit", e => {
   e.preventDefault();
   const v = { name: $("signupName").value.trim(), email: $("signupEmail").value.trim(), company: $("signupCompany").value.trim() };
-  const ok = { name: !!v.name, email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.email), company: !!v.company };
-  $("nameErr").hidden = ok.name; $("emailErr").hidden = ok.email; $("companyErr").hidden = ok.company;
-  const bad = ["name", "email", "company"].find(k => !ok[k]);
-  if (bad) { $("signup" + bad[0].toUpperCase() + bad.slice(1)).focus(); return; }
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.email);
+  $("emailErr").hidden = emailOk;
+  $("signupEmail").setAttribute("aria-invalid", String(!emailOk));
+  if (!emailOk) { $("signupEmail").focus(); return; }
   const p = { plan: "Starter", billing, ...v, startedAt: new Date().toISOString() };
   let saved = false;
   try { localStorage.setItem(KEY, JSON.stringify(p)); saved = localStorage.getItem(KEY) === JSON.stringify(p); } catch { saved = false; }
@@ -486,7 +490,7 @@ $("cancelPlan").addEventListener("click", () => {
   try { localStorage.removeItem(KEY); gone = localStorage.getItem(KEY) === null; } catch { gone = false; }
   if (!gone) { note("This browser wouldn't remove the saved sign-up. Clear this site's data in your browser settings."); return; }
   $("signupForm").reset();
-  $("signedText").textContent = ""; $("signedNote").textContent = "";
+  $("signedText").textContent = ""; $("signedEmail").textContent = ""; $("signedNote").textContent = "";
   $("signedIn").hidden = true; $("signupForm").hidden = false;
   note("Starter plan cancelled. Nothing was charged.");
 });
