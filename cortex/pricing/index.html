@@ -378,6 +378,13 @@ footer {
 .team { display: flex; align-items: center; gap: 10px; color: var(--ink); }
 .team svg { width: 22px; height: 22px; border-radius: 6px; flex: none; }
 .team b { font: 600 15px var(--serif); }
+
+/* One header nav on every Cortex page, so a click-through never gets lost. */
+.site-nav { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px; font: 500 14px var(--sans); }
+.site-nav a { color: var(--ink-soft); text-decoration: none; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
+.site-nav a:hover { background: var(--sunk); color: var(--ink); }
+.site-nav a[aria-current="page"] { background: var(--ink); color: var(--paper); }
+@media (max-width: 560px) { .site-nav { margin-left: 0; width: 100%; } }
 </style>
 <style>
 .price-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
@@ -400,7 +407,7 @@ footer {
       <circle class="spk" cx="261" cy="261" r="118" fill="url(#sparkA)"/>
     </svg>
     <div class="brand"><h1>Cortex Pricing</h1><p class="lede">Sign yourself up. No contract and no sales call.</p></div>
-    <a class="top-link" href="../">Back to Cortex</a>
+    <nav class="site-nav" aria-label="Cortex pages"><a href="../">Inbox</a><a href="../pricing/" aria-current="page">Pricing</a><a href="../bids/">Bid check</a><a href="../retention/">Retention</a></nav>
   </header>
   <section class="plans" aria-labelledby="plansTitle">
     <div class="plan-grid price-grid">

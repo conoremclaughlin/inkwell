@@ -420,6 +420,13 @@ footer {
 .team { display: flex; align-items: center; gap: 10px; color: var(--ink); }
 .team svg { width: 22px; height: 22px; border-radius: 6px; flex: none; }
 .team b { font: 600 15px var(--serif); }
+
+/* One header nav on every Cortex page, so a click-through never gets lost. */
+.site-nav { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px; font: 500 14px var(--sans); }
+.site-nav a { color: var(--ink-soft); text-decoration: none; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
+.site-nav a:hover { background: var(--sunk); color: var(--ink); }
+.site-nav a[aria-current="page"] { background: var(--ink); color: var(--paper); }
+@media (max-width: 560px) { .site-nav { margin-left: 0; width: 100%; } }
 </style>
 
 <div class="wrap">
@@ -440,9 +447,7 @@ footer {
       <h1>Cortex</h1>
       <p class="lede">Paste one thing from the inbox. Get what it is and what to do next.</p>
     </div>
-    <a class="top-link" id="plansLink" href="pricing/">Pricing</a>
-    <a class="top-link" href="bids/" style="margin-left:14px">Bid check</a>
-    <a class="top-link" href="retention/" style="margin-left:14px">Retention</a>
+    <nav class="site-nav" aria-label="Cortex pages"><a href="./" aria-current="page">Inbox</a><a href="pricing/">Pricing</a><a href="bids/">Bid check</a><a href="retention/">Retention</a></nav>
     <span class="plan-badge" id="planBadge" hidden></span>
   </header>
 
@@ -1896,7 +1901,7 @@ $("item").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer =
 try {
   const p = JSON.parse(localStorage.getItem("cortex-plan-v1") || "null");
   if (p && p.plan === "Starter" && typeof p.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email) && Number.isFinite(Date.parse(p.startedAt))) {
-    $("planBadge").textContent = "Cortex Starter"; $("planBadge").title = "Signed up as " + p.email; $("planBadge").hidden = false; $("plansLink").hidden = true;
+    $("planBadge").textContent = "Cortex Starter"; $("planBadge").title = "Signed up as " + p.email; $("planBadge").hidden = false;
   }
 } catch {}
 
