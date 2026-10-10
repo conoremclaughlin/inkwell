@@ -1207,6 +1207,8 @@ function isOrderStatus(text) {
   const late = /\b(supposed to (arrive|be here|ship)|hasn'?t moved|not moving|stuck|late|delayed|overdue|never arrived|hasn'?t arrived|didn'?t arrive|still (hasn'?t|not) (arrived|here)|tracking hasn'?t)\b/i;
   const complaint = /\b(refund|cancel|damaged|broken|cracked|wrong|missing|complain|lost|leak(ed|ing)?)\b/i;
   const orderish = /\b(my|our|the) (order|delivery|package|parcel|shipment)\b|\border\s*#?\s*\d{3,}|#\s?\d{3,}|\btracking\b|\bshipped\b/i;
+  // An invoice number is a bill, never an order: "Invoice #3310" stays Billing.
+  if (INVOICE_WORDS.test(t)) return false;
   // A supplier's delay is Supply Risk, never a customer's order question.
   if (isSupplyRisk(t) || /\b(suppliers?|vendors?|wholesalers?|manufacturer|mill|PO\b|purchase orders?)\b/i.test(t)) return false;
   return t.length <= 400 && orderish.test(t) && (asks.test(t) || late.test(t)) && !complaint.test(t);
