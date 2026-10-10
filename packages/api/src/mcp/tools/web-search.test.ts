@@ -168,18 +168,19 @@ describe('web_search auth, policy and audit', () => {
     expect(JSON.stringify(result)).not.toContain('Untrusted title');
   });
 
-  it.each([new Error('private auth detail'), new WebSearchError('search_not_observed', true)])(
-    'audits a static provider failure without exposing its exception',
-    async (error) => {
-      search.mockRejectedValueOnce(error);
-      const result = await call();
-      expect(result.isError).toBe(true);
-      expect(parse(result)).toMatchObject({ success: false, searchMayHaveRun: true });
-      expect(JSON.stringify([result, mocks.log.mock.calls])).not.toContain('private');
-      expect(search).toHaveBeenCalledOnce();
-      expect(mocks.log.mock.calls[1][0]).toMatchObject({ responseStatus: 'error' });
-    }
-  );
+  it.each([
+    new Error('private auth detail'),
+    new WebSearchError('search_not_observed'),
+    new WebSearchError('search_not_observed', true),
+  ])('audits a static provider failure without exposing its exception', async (error) => {
+    search.mockRejectedValueOnce(error);
+    const result = await call();
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toMatchObject({ success: false, searchMayHaveRun: true });
+    expect(JSON.stringify([result, mocks.log.mock.calls])).not.toContain('private');
+    expect(search).toHaveBeenCalledOnce();
+    expect(mocks.log.mock.calls[1][0]).toMatchObject({ responseStatus: 'error' });
+  });
 
   it('audits cancellation before dispatch and passes a live signal to the backend', async () => {
     const cancelled = new AbortController();
@@ -264,7 +265,7 @@ describe('real searchWeb / handler preflight composition (no provider)', () => {
   ])('does not imply an external search on real-service %s', async (reason) => {
     const admission = new SearchAdmission();
     vi.spyOn(searchAdmission, 'acquire').mockImplementation(() => admission.acquire());
-    if (reason === 'missing_configuration') delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
+    if (reason === 'missing_configuration') delete process.env.INK_WEB_SEARCH_MODEL;
     if (reason === 'unsupported_provider') process.env.INK_WEB_SEARCH_PROVIDER = 'codex';
     const occupied =
       reason === 'capacity_exhausted' || reason === 'service_quarantined'
@@ -284,7 +285,7 @@ describe('real searchWeb / handler preflight composition (no provider)', () => {
   });
 
   it('preserves pre-launch certainty when recording the refusal fails', async () => {
-    delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
+    delete process.env.INK_WEB_SEARCH_MODEL;
     mocks.log.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('private error'));
     expect(parse(await realCall())).toMatchObject({
       reason: 'audit-unavailable',

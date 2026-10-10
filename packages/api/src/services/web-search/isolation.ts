@@ -26,35 +26,25 @@ async function absent(path: string): Promise<boolean> {
  * --setting-sources and --strict-mcp-config are NOT managed-policy bypasses.
  * Refuse known endpoint policy sources, even empty files/directories/symlinks.
  * This is a deployment precondition, not OS isolation or protection from a
- * privileged actor changing policy during a run. Windows/WSL are unreviewed.
+ * privileged actor changing policy during a run. Only the default macOS keychain
+ * login is supported; file-backed Linux and custom-config logins need an explicit
+ * design, not a credential-copy fallback.
  * Sources: code.claude.com/docs/en/managed-settings; local 2.1.294 policy loader.
  */
 export async function assertUnmanagedHost(
   platform: NodeJS.Platform = process.platform,
   isAbsent: (path: string) => Promise<boolean> = absent
 ): Promise<void> {
-  if (platform !== 'linux' && platform !== 'darwin') {
-    throw new WebSearchError('unsupported_platform');
-  }
-  const roots =
-    platform === 'darwin'
-      ? ['/Library/Application Support/ClaudeCode']
-      : ['/etc/claude-code', '/mnt/c/Program Files/ClaudeCode'];
-  const paths = roots.flatMap((root) =>
-    ['managed-settings.json', 'managed-settings.d', 'managed-mcp.json'].map((file) =>
-      join(root, file)
-    )
+  if (platform !== 'darwin') throw new WebSearchError('unsupported_platform');
+  const root = '/Library/Application Support/ClaudeCode';
+  const paths = ['managed-settings.json', 'managed-settings.d', 'managed-mcp.json'].map((file) =>
+    join(root, file)
   );
-  if (platform === 'darwin') {
-    // Claude's pinned policy loader uses os.userInfo(), not HOME/USER.
-    paths.push('/Library/Managed Preferences/com.anthropic.claudecode.plist');
-    paths.push(
-      join('/Library/Managed Preferences', userInfo().username, 'com.anthropic.claudecode.plist')
-    );
-  } else {
-    // Presence of Windows interop is enough to refuse, without querying registry.
-    paths.push('/proc/sys/fs/binfmt_misc/WSLInterop');
-  }
+  // Claude's pinned policy loader uses os.userInfo(), not HOME/USER.
+  paths.push('/Library/Managed Preferences/com.anthropic.claudecode.plist');
+  paths.push(
+    join('/Library/Managed Preferences', userInfo().username, 'com.anthropic.claudecode.plist')
+  );
   for (const path of paths) {
     if (!(await isAbsent(path))) throw new WebSearchError('managed_configuration');
   }
@@ -90,7 +80,8 @@ export async function createSandbox(): Promise<SearchSandbox> {
       mcp,
       cleanup,
       // Deliberately not process.env, buildCleanEnv, session launch settings,
-      // dotenv, user config, PATH lookup, profiles, or keychain integration.
+      // dotenv, user config, PATH lookup, or profiles. The service explicitly
+      // selects the default keychain only for inference, never capability probes.
       env: {
         HOME: home,
         PATH: '/usr/bin:/bin',
@@ -101,7 +92,6 @@ export async function createSandbox(): Promise<SearchSandbox> {
         XDG_CACHE_HOME: join(home, '.cache'),
         XDG_DATA_HOME: join(home, '.local', 'share'),
         CLAUDE_CONFIG_DIR: config,
-        CLAUDE_CODE_SIMPLE: '1',
         DISABLE_AUTOUPDATER: '1',
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
         DISABLE_TELEMETRY: '1',

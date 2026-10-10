@@ -84,33 +84,31 @@ describe('searchWeb operator configuration boundary', () => {
     }
   );
 
-  it.each([
-    'INK_WEB_SEARCH_PROVIDER',
-    'INK_WEB_SEARCH_CLAUDE_PATH',
-    'INK_WEB_SEARCH_MODEL',
-    'INK_WEB_SEARCH_CLAUDE_API_KEY',
-  ])('refuses missing %s before any spawn', async (key) => {
-    delete process.env[key];
-    await expect(searchWeb(request)).rejects.toMatchObject({
-      reason: 'missing_configuration',
-      launched: false,
-    });
-    expect(mocks.spawn).not.toHaveBeenCalled();
-  });
+  it.each(['INK_WEB_SEARCH_PROVIDER', 'INK_WEB_SEARCH_CLAUDE_PATH', 'INK_WEB_SEARCH_MODEL'])(
+    'refuses missing %s before any spawn',
+    async (key) => {
+      delete process.env[key];
+      await expect(searchWeb(request)).rejects.toMatchObject({
+        reason: 'missing_configuration',
+        launched: false,
+      });
+      expect(mocks.spawn).not.toHaveBeenCalled();
+    }
+  );
 
-  it('never falls back to ambient auth, OAuth, PATH lookup, or Codex shell-only controls', async () => {
-    delete process.env.INK_WEB_SEARCH_CLAUDE_API_KEY;
-    process.env.ANTHROPIC_API_KEY = 'synthetic-ambient-key';
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'synthetic-ambient-oauth';
-    await expect(searchWeb(request)).rejects.toMatchObject({
-      reason: 'missing_configuration',
-      launched: false,
-    });
-    process.env.INK_WEB_SEARCH_CLAUDE_OAUTH_TOKEN = 'synthetic-dedicated-oauth';
-    await expect(searchWeb(request)).rejects.toMatchObject({
-      reason: 'unsupported_credential',
-      launched: false,
-    });
+  it.each(['INK_WEB_SEARCH_CLAUDE_API_KEY', 'INK_WEB_SEARCH_CLAUDE_OAUTH_TOKEN'])(
+    'refuses obsolete %s rather than silently selecting different billing',
+    async (key) => {
+      process.env[key] = 'synthetic-legacy-credential';
+      await expect(searchWeb(request)).rejects.toMatchObject({
+        reason: 'unsupported_credential',
+        launched: false,
+      });
+      expect(mocks.spawn).not.toHaveBeenCalled();
+    }
+  );
+
+  it('refuses Codex and PATH lookup instead of falling back', async () => {
     process.env.INK_WEB_SEARCH_PROVIDER = 'codex';
     await expect(searchWeb(request)).rejects.toMatchObject({
       reason: 'unsupported_provider',
@@ -161,7 +159,7 @@ describe('searchWeb operator configuration boundary', () => {
 });
 
 describe('owned HOME/config/cwd and inert search lifecycle', () => {
-  it('probes with no credential/query; search has only the dedicated key and fixed structural flags', async () => {
+  it('probes without login/query; inference selects only the default login with fixed restrictions', async () => {
     Object.assign(process.env, {
       HOME: '/synthetic/ambient-home',
       PATH: '/synthetic/bin',
@@ -175,6 +173,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       HTTP_PROXY: 'https://proxy.example.com',
       ANTHROPIC_BASE_URL: 'https://override.example.com',
       CLAUDE_CONFIG_DIR: '/synthetic/ambient-config',
+      CLAUDE_SECURESTORAGE_CONFIG_DIR: '/synthetic/other-login',
+      CLAUDE_CODE_SIMPLE: '1',
+      ANTHROPIC_PROFILE: 'synthetic-console',
+      CLAUDE_CODE_PLUGIN_DIRS: '/synthetic/plugins',
     });
     const query = '--model synthetic-override --mcp-config synthetic-override';
     inference = (child) => {
@@ -205,7 +207,6 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
           'XDG_CACHE_HOME',
           'XDG_DATA_HOME',
           'CLAUDE_CONFIG_DIR',
-          'CLAUDE_CODE_SIMPLE',
           'DISABLE_AUTOUPDATER',
           'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
           'DISABLE_TELEMETRY',
@@ -214,7 +215,9 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
           'CLAUDE_CODE_WEB_SEARCH_REFILLS_PER_HOUR',
           'CLAUDE_CODE_MAX_RETRIES',
           'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
-          ...(child.args.includes('--print') ? ['ANTHROPIC_API_KEY'] : []),
+          ...(child.args.includes('--print')
+            ? ['CLAUDE_SECURESTORAGE_CONFIG_DIR']
+            : ['CLAUDE_CODE_SIMPLE']),
         ].sort()
       );
       expect(child.args).not.toContain(query);
@@ -229,10 +232,17 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     }
     for (const probe of children.slice(0, 2)) {
       expect(probe.options.env?.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(probe.options.env?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBeUndefined();
+      expect(probe.options.env?.CLAUDE_CODE_SIMPLE).toBe('1');
+      expect(probe.args).toContain('--bare');
       expect(probe.input).toBe('');
     }
     const child = children[2];
-    expect(child.options.env?.ANTHROPIC_API_KEY).toBe('synthetic-search-only-key');
+    expect(child.options.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(child.options.env?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(child.options.env?.CLAUDE_CODE_SIMPLE).toBeUndefined();
+    expect(child.options.env?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('');
+    expect(child.args).not.toContain('--bare');
     expect(JSON.parse(child.input)).toEqual({ query, maxResults: 2 });
     for (const [flag, value] of [
       ['--tools', 'WebSearch'],
@@ -246,12 +256,30 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
     ])
       expect(child.args[child.args.indexOf(flag) + 1]).toBe(value);
     for (const flag of [
-      '--bare',
+      '--safe-mode',
       '--strict-mcp-config',
       '--disable-slash-commands',
       '--no-session-persistence',
     ])
       expect(child.args).toContain(flag);
+    await expectRemoved();
+  });
+
+  it('does not retry or borrow ambient config when the CLI cannot use its login', async () => {
+    process.env.CLAUDE_CONFIG_DIR = '/synthetic/logged-in-config';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'synthetic-ambient-oauth';
+    inference = (child) => {
+      child.stderr.write('synthetic private login error');
+      child.finish(1);
+    };
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'provider_failed',
+      launched: true,
+      message: 'Web search refused: provider_failed',
+    });
+    expect(children).toHaveLength(3); // Two probes, exactly one inference attempt.
+    expect(children[2].options.env?.CLAUDE_CONFIG_DIR).not.toBe('/synthetic/logged-in-config');
+    expect(children[2].options.env?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     await expectRemoved();
   });
 

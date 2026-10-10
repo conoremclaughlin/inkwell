@@ -10,7 +10,6 @@ export const SYNTHETIC_ENV: NodeJS.ProcessEnv = {
   INK_WEB_SEARCH_PROVIDER: 'claude',
   INK_WEB_SEARCH_CLAUDE_PATH: '/synthetic/provider/claude',
   INK_WEB_SEARCH_MODEL: MODEL,
-  INK_WEB_SEARCH_CLAUDE_API_KEY: 'synthetic-search-only-key',
 };
 export const HELP = REQUIRED_FLAGS.map((flag) => `${flag} <value>`).join('\n');
 
@@ -22,6 +21,7 @@ export function searchEvents(
     {
       type: 'system',
       subtype: 'init',
+      apiKeySource: 'none',
       tools: ['WebSearch', 'EndConversation'],
       mcp_servers: [],
       plugins: [],

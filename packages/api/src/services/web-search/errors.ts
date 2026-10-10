@@ -30,7 +30,8 @@ export class WebSearchError extends Error {
   /** Credentialed dispatch was attempted; not proof a search completed. */
   readonly launched: boolean;
 
-  constructor(reason: WebSearchReason, launched = false) {
+  // Unknown/new callers are conservative. Only searchWeb can prove preflight.
+  constructor(reason: WebSearchReason, launched = true) {
     // Also guard callers using untyped JavaScript.
     const safeReason = WEB_SEARCH_REASONS.includes(reason) ? reason : 'internal_error';
     super(`Web search refused: ${safeReason}`);

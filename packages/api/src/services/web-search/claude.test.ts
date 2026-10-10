@@ -21,6 +21,7 @@ describe('Claude capability and native search evidence (synthetic only)', () => 
     for (const flag of [
       '--tools',
       '--bare',
+      '--safe-mode',
       '--strict-mcp-config',
       '--disallowedTools',
       '--setting-sources',
@@ -30,6 +31,15 @@ describe('Claude capability and native search evidence (synthetic only)', () => 
       ).toThrow('unsupported_capability');
     }
   });
+
+  it.each([undefined, 'ANTHROPIC_API_KEY', 'apiKeyHelper', '/login managed key', 'oauth'])(
+    'refuses unexpected init auth source %s without treating the stream as accepted',
+    (source) => {
+      const events = searchEvents();
+      events[0].apiKeySource = source;
+      expect(() => read(events)).toThrow('unsupported_capability');
+    }
+  );
 
   it('uses native links and observed queries; never assistant claims or commentary', () => {
     const events = searchEvents();

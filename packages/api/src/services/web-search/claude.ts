@@ -10,7 +10,8 @@ import type { WebSearchOutput } from './types.js';
 // https://code.claude.com/docs/en/headless
 // --allowedTools alone is NOT the tool surface; --tools does not remove MCP.
 export const REQUIRED_FLAGS = [
-  '--bare',
+  '--bare', // Capability probes only; never inference.
+  '--safe-mode',
   '--print',
   '--tools',
   '--allowedTools',
@@ -43,7 +44,8 @@ export function verifyCapabilities(version: string, help: string): void {
 
 export function claudeArgs(config: SearchConfig, sandbox: SearchSandbox): string[] {
   return [
-    '--bare',
+    // Safe mode disables discovery without bare mode's login suppression.
+    '--safe-mode',
     '--print',
     '--verbose',
     '--input-format',
@@ -179,6 +181,9 @@ export class ClaudeSearchStream {
         this.complete ||
         event.claude_code_version !== CLAUDE_VERSION ||
         event.model !== this.model ||
+        // Pinned CLI emits 'none' for OAuth, not legacy 'oauth'. This rejects
+        // API-key/helper fallback, but alone is not proof of a valid login.
+        event.apiKeySource !== 'none' ||
         !Array.isArray(event.tools) ||
         !event.tools.includes('WebSearch') ||
         event.tools.some((tool) => tool !== 'WebSearch' && tool !== 'EndConversation') ||

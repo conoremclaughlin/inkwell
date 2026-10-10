@@ -39,7 +39,7 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
             executable,
             args: ['--bare', flag],
             cwd: sandbox.cwd,
-            env: sandbox.env,
+            env: { ...sandbox.env, CLAUDE_CODE_SIMPLE: '1' },
             stdin: '',
             signal: request.signal,
             timeoutMs: Math.min(LIMITS.probeTimeoutMs, remaining()),
@@ -61,7 +61,11 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
           executable,
           args,
           cwd: sandbox.cwd,
-          env: { ...sandbox.env, ANTHROPIC_API_KEY: config.apiKey },
+          // This pinned CLI treats an explicitly empty secure-storage selector
+          // as the default macOS keychain namespace, independent of fresh config.
+          // The file fallback remains in the disposable HOME. Do not inherit or
+          // extract tokens, or retry with the caller's actual config directory.
+          env: { ...sandbox.env, CLAUDE_SECURESTORAGE_CONFIG_DIR: '' },
           stdin: JSON.stringify({ query: request.query, maxResults: request.maxResults }) + '\n',
           signal: request.signal,
           timeoutMs,

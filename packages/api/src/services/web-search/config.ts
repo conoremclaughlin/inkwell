@@ -20,16 +20,14 @@ export const LIMITS = Object.freeze({
 
 // This exact release was inspected with --help and its embedded WebSearch output
 // schema, without inference. New versions must be reviewed, not silently admitted.
-// Its --bare help explicitly says OAuth/keychain are never read and Anthropic
-// auth is ANTHROPIC_API_KEY or an explicit apiKeyHelper. We never set a helper.
-// A fresh HOME alone does NOT isolate the macOS login keychain. No supported
-// no-keychain OAuth mode was demonstrated, so OAuth is not enabled here.
+// The logged-in adapter uses this version's separate secure-storage selector.
+// It deliberately keeps settings isolated while selecting the default macOS
+// keychain login. No token is read/copied by Inkwell; live acceptance is gated.
 export const CLAUDE_VERSION = '2.1.294';
 
 export interface SearchConfig {
   executable: string;
   model: string;
-  apiKey: string;
 }
 
 export function isWebSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -46,14 +44,13 @@ export function readConfig(env: NodeJS.ProcessEnv): SearchConfig {
   if (env.INK_WEB_SEARCH_PROVIDER && env.INK_WEB_SEARCH_PROVIDER !== 'claude') {
     throw new WebSearchError('unsupported_provider');
   }
-  // --bare explicitly never reads OAuth or the keychain. Do not fall back to a
-  // less isolated launch when only a subscription token was configured.
-  if (env.INK_WEB_SEARCH_CLAUDE_OAUTH_TOKEN) {
+  // Reject obsolete dedicated credentials instead of silently changing their
+  // billing identity. Login is managed by the pinned CLI, not copied into env.
+  if (env.INK_WEB_SEARCH_CLAUDE_OAUTH_TOKEN || env.INK_WEB_SEARCH_CLAUDE_API_KEY) {
     throw new WebSearchError('unsupported_credential');
   }
   const executable = env.INK_WEB_SEARCH_CLAUDE_PATH;
   const model = env.INK_WEB_SEARCH_MODEL;
-  const apiKey = env.INK_WEB_SEARCH_CLAUDE_API_KEY;
   if (
     env.INK_WEB_SEARCH_PROVIDER !== 'claude' ||
     !executable ||
@@ -61,14 +58,11 @@ export function readConfig(env: NodeJS.ProcessEnv): SearchConfig {
     executable.length > 4096 ||
     /[\x00-\x1f]/.test(executable) ||
     !model ||
-    !/^claude-[a-z0-9][a-z0-9.-]{0,100}$/.test(model) ||
-    !apiKey ||
-    apiKey.length > 4096 ||
-    /\s|[\x00-\x1f\x7f]/.test(apiKey)
+    !/^claude-[a-z0-9][a-z0-9.-]{0,100}$/.test(model)
   ) {
     throw new WebSearchError('missing_configuration');
   }
-  return { executable, model, apiKey };
+  return { executable, model };
 }
 
 // Shared by the public tool and service so validation cannot drift at dispatch.
