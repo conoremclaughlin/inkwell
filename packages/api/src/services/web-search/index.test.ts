@@ -285,6 +285,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
 
   it('writes restrictive fresh config files, cleans each query, and never reuses a home', async () => {
     const observations: Promise<void>[] = [];
+    const observationErrors: unknown[] = [];
     inference = (child) => {
       observations.push(
         (async () => {
@@ -294,20 +295,29 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
           expect((await stat(settingsPath)).mode & 0o777).toBe(0o600);
           expect(JSON.parse(await readFile(settingsPath, 'utf8'))).toEqual({
             disableAllHooks: true,
-            enabledPlugins: {},
+            enabledPlugins: {
+              'cc-plugin-agents-md@builtin': false,
+              'cc-plugin-plugin-authoring@builtin': false,
+            },
             autoMemoryEnabled: false,
           });
           expect(JSON.parse(await readFile(`${root}/config/mcp.json`, 'utf8'))).toEqual({
             mcpServers: {},
           });
-          child.events(searchEvents());
-          child.finish();
         })()
+          .catch((error: unknown) => {
+            observationErrors.push(error);
+          })
+          .finally(() => {
+            child.events(searchEvents());
+            child.finish();
+          })
       );
     };
     await searchWeb(request);
     await searchWeb(request);
     await Promise.all(observations);
+    expect(observationErrors).toEqual([]);
     expect(rootOf(children[0])).not.toBe(rootOf(children[3]));
     await expectRemoved();
   });

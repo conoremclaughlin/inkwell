@@ -92,6 +92,30 @@ const safeText = (max: number) =>
 const idSchema = safeText(200).min(1);
 const querySchema = safeText(LIMITS.queryChars).min(1);
 
+// Pinned 2.1.294 can emit this fire-and-forget render notice before init.
+// It conveys no search evidence and does not authorize plugin/hook traffic.
+const uiInvalidationSchema = z
+  .object({
+    type: z.literal('system'),
+    subtype: z.literal('ui_invalidate'),
+    event: z.literal('ui.render'),
+    uuid: z.string().uuid(),
+    session_id: idSchema,
+    instances: z
+      .array(
+        z
+          .object({
+            surface: idSchema,
+            component: idSchema,
+            instance_id: idSchema,
+          })
+          .strict()
+      )
+      .max(32)
+      .optional(),
+  })
+  .strict();
+
 /** No network lookup: reject credentials, non-HTTP(S), IPs, and local names. */
 export function validatedUrl(value: string): string {
   try {
@@ -174,6 +198,11 @@ export class ClaudeSearchStream {
       event = record(JSON.parse(line));
     } catch {
       throw new WebSearchError('invalid_output');
+    }
+    if (this.complete) throw new WebSearchError('invalid_output');
+    if (event.type === 'system' && event.subtype === 'ui_invalidate') {
+      parse(uiInvalidationSchema, event);
+      return;
     }
     if (event.type === 'system' && event.subtype === 'init') {
       if (

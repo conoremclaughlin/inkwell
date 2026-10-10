@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ClaudeSearchStream, validatedUrl, verifyCapabilities } from './claude.js';
-import { CLAUDE_VERSION } from './config.js';
+import { CLAUDE_VERSION, LIMITS } from './config.js';
 import { WebSearchError } from './errors.js';
 import { HELP, MODEL, searchEvents } from './fixtures.test-support.js';
 
@@ -11,6 +11,60 @@ function read(events: Record<string, unknown>[], maxResults = 10) {
 }
 
 describe('Claude capability and native search evidence (synthetic only)', () => {
+  const invalidate = {
+    type: 'system',
+    subtype: 'ui_invalidate',
+    event: 'ui.render',
+    uuid: '00000000-0000-4000-8000-000000000001',
+    session_id: 'synthetic-session',
+  };
+
+  it('discards only a validated UI invalidation before init or during a search', () => {
+    const events = searchEvents();
+    expect(read([invalidate, events[0], invalidate, ...events.slice(1)])).toEqual(read(events));
+    expect(
+      read([
+        {
+          ...invalidate,
+          instances: [{ surface: 'synthetic', component: 'synthetic', instance_id: 'synthetic' }],
+        },
+        ...events,
+      ])
+    ).toEqual(read(events));
+    expect(() => read([invalidate])).toThrow('search_not_observed');
+    expect(() => read([invalidate, ...events.slice(1)])).toThrow('invalid_output');
+    expect(() => read([...events, invalidate])).toThrow('invalid_output');
+  });
+
+  it('does not turn UI tolerance into arbitrary pre-init/system/hook traffic tolerance', () => {
+    for (const patch of [
+      { event: 'tool.call' },
+      { event: undefined },
+      { uuid: 'not-a-uuid' },
+      { session_id: '' },
+      { session_id: 's'.repeat(201) },
+      { instances: [{ surface: 'synthetic' }] },
+      { instances: Array(33).fill({}) },
+      { parent_tool_use_id: 'synthetic' },
+      { extra: true },
+    ])
+      expect(() => read([{ ...invalidate, ...patch }, ...searchEvents()])).toThrow(
+        'invalid_output'
+      );
+    for (const subtype of ['hook_started', 'ui_log', 'commands_changed', 'new_event']) {
+      expect(() => read([{ ...invalidate, subtype }, ...searchEvents()])).toThrow();
+    }
+    const events = searchEvents();
+    events[0].plugins = [{ name: 'cc-plugin-agents-md', path: 'builtin' }];
+    expect(() => read([invalidate, ...events])).toThrow('unsupported_capability');
+  });
+
+  it('counts ignored UI events toward the same bounded event budget', () => {
+    const stream = new ClaudeSearchStream(MODEL, 1);
+    for (let i = 0; i < LIMITS.events; i++) stream.accept(JSON.stringify(invalidate));
+    expect(() => stream.accept(JSON.stringify(invalidate))).toThrow('output_limit');
+  });
+
   it('requires the reviewed version AND structural isolation flags', () => {
     expect(() => verifyCapabilities(`${CLAUDE_VERSION} (Claude Code)\n`, HELP)).not.toThrow();
     for (const version of ['2.1.293', '2.1.295', '3.0.0']) {

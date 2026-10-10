@@ -69,7 +69,18 @@ export async function createSandbox(): Promise<SearchSandbox> {
     const mcp = join(config, 'mcp.json');
     await writeFile(
       settings,
-      JSON.stringify({ disableAllHooks: true, enabledPlugins: {}, autoMemoryEnabled: false }),
+      JSON.stringify({
+        disableAllHooks: true,
+        // Safe mode suppresses user discovery, not these default-on builtins.
+        // agents-md installs instruction-loading hooks; authoring adds a skill.
+        // Disable only these non-security features. Never disable sec-default or
+        // managed safety policy. Unexpected init plugins still refuse the run.
+        enabledPlugins: {
+          'cc-plugin-agents-md@builtin': false,
+          'cc-plugin-plugin-authoring@builtin': false,
+        },
+        autoMemoryEnabled: false,
+      }),
       { mode: 0o600 }
     );
     await writeFile(mcp, JSON.stringify({ mcpServers: {} }), { mode: 0o600 });
