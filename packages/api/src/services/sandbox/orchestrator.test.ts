@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -18,6 +18,73 @@ import {
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
+
+// The staging functions copy credentials out of the home directory and, on
+// macOS, out of the login keychain. Every test here runs against a synthetic
+// home and a scratch tmpdir that is removed afterwards, and no test can reach
+// the real keychain: before this, each local run left copies of the machine's
+// Claude and Codex logins under $TMPDIR.
+const sandboxHost = vi.hoisted(() => {
+  const { mkdtempSync, mkdirSync } = require('fs') as typeof import('fs');
+  const { tmpdir } = require('os') as typeof import('os');
+  const { join } = require('path') as typeof import('path');
+  const root = mkdtempSync(join(tmpdir(), 'orchestrator-test-'));
+  const home = join(root, 'home');
+  const tmp = join(root, 'tmp');
+  mkdirSync(home);
+  mkdirSync(tmp);
+  return {
+    root,
+    home,
+    tmp,
+    keychain: undefined as string | undefined,
+    keychainCalls: 0,
+  };
+});
+
+vi.mock('os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('os')>();
+  return { ...actual, homedir: () => sandboxHost.home, tmpdir: () => sandboxHost.tmp };
+});
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const { promisify } = await import('util');
+  const realAsync = promisify(actual.execFile);
+  const isKeychain = (command: string) => command === 'security' || command.endsWith('/security');
+  const execFile = Object.assign(
+    (command: string, ...rest: unknown[]) => {
+      if (isKeychain(command)) throw new Error('Keychain access is blocked in tests');
+      return (actual.execFile as (...args: unknown[]) => unknown)(command, ...rest);
+    },
+    {
+      [promisify.custom]: async (command: string, args: string[], options: object) => {
+        if (!isKeychain(command)) return realAsync(command, args, options);
+        sandboxHost.keychainCalls += 1;
+        if (sandboxHost.keychain === undefined) throw new Error('No synthetic keychain entry');
+        return { stdout: sandboxHost.keychain, stderr: '' };
+      },
+    }
+  );
+  return { ...actual, execFile };
+});
+
+afterAll(() => {
+  rmSync(sandboxHost.root, { recursive: true, force: true });
+});
+
+function resetHome() {
+  rmSync(sandboxHost.home, { recursive: true, force: true });
+  mkdirSync(sandboxHost.home);
+  sandboxHost.keychain = undefined;
+  sandboxHost.keychainCalls = 0;
+}
+
+function writeHomeFile(relative: string, content: string) {
+  const path = join(sandboxHost.home, relative);
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(path, content);
+}
 
 const baseRequest: SandboxSpinUpRequest = {
   userId: 'user-123',
@@ -374,86 +441,77 @@ describe('patchMcpConfig', () => {
 });
 
 describe('stageClaudeDir', () => {
-  it('stages credentials from file when .credentials.json exists', async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'cred-stage-'));
-    // stageClaudeDir reads from the real homedir, so we test what it returns
-    const result = await stageClaudeDir(join(tmpDir, 'staging'));
-    // On this machine (macOS with active Claude session), should extract from keychain
-    // In CI or without credentials, returns undefined — both are valid
-    if (result) {
-      expect(result).toContain('claude-home');
-      expect(existsSync(join(result, '.credentials.json'))).toBe(true);
-      const creds = JSON.parse(readFileSync(join(result, '.credentials.json'), 'utf-8'));
-      expect(creds.claudeAiOauth).toBeDefined();
-    }
+  beforeEach(resetHome);
+
+  it('stages the credentials file and settings from the home directory', async () => {
+    writeHomeFile('.claude/.credentials.json', '{"claudeAiOauth":{"accessToken":"synthetic"}}');
+    writeHomeFile('.claude/settings.json', '{"theme":"dark"}');
+    const result = await stageClaudeDir(mkdtempSync(join(tmpdir(), 'cred-stage-')));
+    expect(result).toContain('claude-home');
+    expect(result!.startsWith(sandboxHost.root)).toBe(true);
+    expect(readFileSync(join(result!, '.credentials.json'), 'utf-8')).toContain('synthetic');
+    expect(readFileSync(join(result!, 'settings.json'), 'utf-8')).toBe('{"theme":"dark"}');
+    expect(sandboxHost.keychainCalls).toBe(0);
   });
 
-  it('copies settings files when they exist', async () => {
+  it('falls back to the keychain only on macOS, and only through the stub', async () => {
+    sandboxHost.keychain = '{"claudeAiOauth":{"accessToken":"from-keychain"}}';
     const result = await stageClaudeDir(mkdtempSync(join(tmpdir(), 'cred-stage-')));
-    if (result) {
-      // settings.json should be copied if it exists on the host
-      const hostSettings = join(homedir(), '.claude', 'settings.json');
-      if (existsSync(hostSettings)) {
-        expect(existsSync(join(result, 'settings.json'))).toBe(true);
-      }
+    if (process.platform !== 'darwin') {
+      expect(result).toBeUndefined();
+      expect(sandboxHost.keychainCalls).toBe(0);
+      return;
     }
+    expect(sandboxHost.keychainCalls).toBe(1);
+    const creds = JSON.parse(readFileSync(join(result!, '.credentials.json'), 'utf-8'));
+    expect(creds.claudeAiOauth.accessToken).toBe('from-keychain');
+  });
+
+  it('returns undefined when neither a file nor a keychain entry exists', async () => {
+    const result = await stageClaudeDir(mkdtempSync(join(tmpdir(), 'cred-stage-')));
+    expect(result).toBeUndefined();
   });
 });
 
 describe('stageCodexDir', () => {
-  it('stages auth.json and patched config.toml when codex home exists', async () => {
-    const codexHome = join(homedir(), '.codex');
-    if (!existsSync(join(codexHome, 'auth.json'))) return; // skip if no Codex auth
+  beforeEach(resetHome);
 
-    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
-    const result = await stageCodexDir(tmpDir);
+  const codexConfig = [
+    '[mcp_servers.inkwell]',
+    'url = "http://localhost:3001/mcp"',
+    '',
+    '[projects."/Users/someone/ws/repo"]',
+    'trust_level = "trusted"',
+    '',
+  ].join('\n');
+
+  it('stages auth.json and installation_id when codex auth exists', async () => {
+    writeHomeFile('.codex/auth.json', '{"tokens":{"access_token":"synthetic"}}');
+    writeHomeFile('.codex/installation_id', 'install-123');
+    const result = await stageCodexDir(mkdtempSync(join(tmpdir(), 'codex-stage-')));
     expect(result).toBeDefined();
-    expect(existsSync(join(result!, 'auth.json'))).toBe(true);
-
+    expect(result!.startsWith(sandboxHost.root)).toBe(true);
     const auth = JSON.parse(readFileSync(join(result!, 'auth.json'), 'utf-8'));
-    expect(auth.tokens).toBeDefined();
+    expect(auth.tokens.access_token).toBe('synthetic');
+    expect(readFileSync(join(result!, 'installation_id'), 'utf-8')).toBe('install-123');
   });
 
-  it('rewrites loopback URLs in config.toml', async () => {
-    const codexHome = join(homedir(), '.codex');
-    if (!existsSync(join(codexHome, 'config.toml'))) return;
-
-    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
-    const result = await stageCodexDir(tmpDir);
-    if (!result) return;
-
-    const config = readFileSync(join(result, 'config.toml'), 'utf-8');
-    // Loopback URLs should be rewritten
+  it('rewrites loopback URLs, strips host projects and trusts /studio', async () => {
+    writeHomeFile('.codex/auth.json', '{"tokens":{}}');
+    writeHomeFile('.codex/config.toml', codexConfig);
+    const result = await stageCodexDir(mkdtempSync(join(tmpdir(), 'codex-stage-')));
+    const config = readFileSync(join(result!, 'config.toml'), 'utf-8');
     expect(config).not.toMatch(/url\s*=\s*"https?:\/\/localhost/);
-    if (config.includes('host.docker.internal')) {
-      expect(config).toContain('host.docker.internal');
-    }
-  });
-
-  it('strips host-specific project paths and adds /studio', async () => {
-    const codexHome = join(homedir(), '.codex');
-    if (!existsSync(join(codexHome, 'config.toml'))) return;
-
-    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
-    const result = await stageCodexDir(tmpDir);
-    if (!result) return;
-
-    const config = readFileSync(join(result, 'config.toml'), 'utf-8');
-    // Host paths stripped
+    expect(config).toContain('host.docker.internal');
     expect(config).not.toContain('/Users/');
-    // Container project added
     expect(config).toContain('[projects."/studio"]');
     expect(config).toContain('trust_level = "trusted"');
   });
 
   it('returns undefined when auth.json does not exist', async () => {
-    // stageCodexDir checks for ~/.codex/auth.json before creating staging dir
-    // On a machine without Codex auth, this returns undefined
-    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-no-auth-'));
-    // We can't mock homedir easily, but verify the function doesn't throw
-    const result = await stageCodexDir(tmpDir);
-    // On this machine with Codex installed, it will succeed
-    expect(result === undefined || typeof result === 'string').toBe(true);
+    writeHomeFile('.codex/config.toml', codexConfig);
+    const result = await stageCodexDir(mkdtempSync(join(tmpdir(), 'codex-no-auth-')));
+    expect(result).toBeUndefined();
   });
 });
 
