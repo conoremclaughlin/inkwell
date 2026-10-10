@@ -1,5 +1,6 @@
 import { McpServer, InMemoryTransport, type ServerContext } from '@modelcontextprotocol/server';
 import { Client } from '@modelcontextprotocol/client';
+import { recordSearchBatch } from '../../services/web-search/batch-audit';
 import { SearchCoordinator } from '../../services/web-search/coordinator';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -114,6 +115,7 @@ describe('registered web_search path', () => {
     expect(JSON.parse(success.content[0].text!).success).toBe(true);
     expect(mocks.search).toHaveBeenCalledWith({
       accountId: userId,
+      contentRecording: true,
       queries: ['test'],
       maxResults: 5,
       signal,
@@ -152,7 +154,7 @@ describe('actual MCP SDK request dispatch (synthetic principal and inert provide
       searchQueries: queries,
       modelToolCallCount: queries.length,
     }));
-    const coordinator = new SearchCoordinator(mocks.search);
+    const coordinator = new SearchCoordinator(mocks.search, recordSearchBatch);
     const userId = '00000000-0000-4000-8000-000000000001';
     // In-memory transport supplies no HTTP auth: bind an explicit synthetic
     // principal on the SERVER, not in tool arguments. This is not an auth E2E.
@@ -181,7 +183,10 @@ describe('actual MCP SDK request dispatch (synthetic principal and inert provide
       for (const result of results) expect(result.isError).toBe(false);
       expect(mocks.search).toHaveBeenCalledOnce();
       expect(mocks.search.mock.calls[0][0].queries).toEqual(['one', 'two']);
-      expect(mocks.audit).toHaveBeenCalledTimes(4);
+      expect(mocks.audit).toHaveBeenCalledTimes(5);
+      expect(
+        mocks.audit.mock.calls.filter(([row]) => row.action === 'web_search_batch')
+      ).toHaveLength(1);
       for (const [, options] of mocks.audit.mock.calls) expect(options).toEqual({ required: true });
     } finally {
       await client.close();

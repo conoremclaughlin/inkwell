@@ -26,15 +26,23 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
 }
 
 /** The MCP coordinator supplies only audited same-account queries. */
-export async function searchWebBatch(input: WebSearchBatchInput): Promise<WebSearchBatchOutput> {
-  return runSearch(input, true);
+export async function searchWebBatch(
+  input: WebSearchBatchInput,
+  observe?: (line: string) => void
+): Promise<WebSearchBatchOutput> {
+  return runSearch(input, true, observe);
 }
 
 function runSearch(input: WebSearchInput, batch: false): Promise<WebSearchOutput>;
-function runSearch(input: WebSearchBatchInput, batch: true): Promise<WebSearchBatchOutput>;
+function runSearch(
+  input: WebSearchBatchInput,
+  batch: true,
+  observe?: (line: string) => void
+): Promise<WebSearchBatchOutput>;
 async function runSearch(
   input: WebSearchInput | WebSearchBatchInput,
-  batch: boolean
+  batch: boolean,
+  observe?: (line: string) => void
 ): Promise<WebSearchOutput | WebSearchBatchOutput> {
   let launched = false;
   try {
@@ -103,7 +111,16 @@ async function runSearch(
             }) + '\n',
           signal: request.signal,
           timeoutMs,
-          onLine: (line) => stream.accept(line),
+          onLine: (line) => {
+            // runBounded has already applied line/stream byte caps. Observation
+            // is not authority: even a broken collector cannot skip validation.
+            try {
+              observe?.(line);
+            } catch {
+              /* preserve the strict parser outcome */
+            }
+            stream.accept(line);
+          },
         });
         return batch ? stream.batchOutput() : stream.output();
       } catch (error) {

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { LIMITS, validateBatchInput, webSearchQuerySchema } from './config.js';
 import { staticError, WebSearchError, type WebSearchReason } from './errors.js';
 import { searchWebBatch } from './index.js';
+import { SearchObservations, type SearchObservationSnapshot } from './observations.js';
 import type { WebSearchBatchInput, WebSearchBatchItem, WebSearchBatchOutput } from './types.js';
 
 export const QUEUE_LIMITS = Object.freeze({
@@ -14,6 +15,8 @@ export const QUEUE_LIMITS = Object.freeze({
 export interface CoordinatedSearchInput extends WebSearchBatchInput {
   /** Resolved by the authenticated handler, NEVER forwarded from tool arguments. */
   accountId: string;
+  /** Operator policy snapshot; not a public tool argument. */
+  contentRecording: boolean;
 }
 
 export interface CoordinatedSearchOutput {
@@ -35,8 +38,18 @@ export class CoordinatedSearchError extends WebSearchError {
   }
 }
 
+export interface SearchBatchRecord {
+  accountId: string;
+  batchId: string;
+  contentRecording: boolean;
+  searchMayHaveRun: boolean;
+  reason?: WebSearchReason;
+  observations: SearchObservationSnapshot;
+}
+
 interface Pending {
   accountId: string;
+  contentRecording: boolean;
   queries: string[];
   maxResults: number;
   signal?: AbortSignal;
@@ -66,12 +79,20 @@ export class SearchCoordinator {
   private collection?: ReturnType<typeof setTimeout>;
   private quarantined = false;
 
-  constructor(private readonly run = searchWebBatch) {}
+  constructor(
+    private readonly run = searchWebBatch,
+    private readonly recordBatch?: (record: SearchBatchRecord) => Promise<void>
+  ) {}
 
   async submit(input: CoordinatedSearchInput): Promise<CoordinatedSearchOutput> {
     try {
-      const { accountId, ...providerInput } = input;
-      if (!accountId || typeof accountId !== 'string' || accountId.length > 200)
+      const { accountId, contentRecording, ...providerInput } = input;
+      if (
+        !accountId ||
+        typeof accountId !== 'string' ||
+        accountId.length > 200 ||
+        typeof contentRecording !== 'boolean'
+      )
         throw new WebSearchError('invalid_input');
       const parsed = validateBatchInput(providerInput);
       // The provider deduplicates; the caller keeps all original positions.
@@ -86,6 +107,7 @@ export class SearchCoordinator {
       return await new Promise<CoordinatedSearchOutput>((resolve, reject) => {
         const pending: Pending = {
           accountId,
+          contentRecording,
           queries,
           maxResults: parsed.maxResults,
           signal: parsed.signal,
@@ -143,10 +165,13 @@ export class SearchCoordinator {
 
   private async dispatch(): Promise<void> {
     if (this.running || !this.queue.length) return;
-    const accountId = this.queue[0].accountId;
+    const { accountId, contentRecording } = this.queue[0];
     const members: Pending[] = [];
     let queries = new Set<string>();
-    while (this.queue[0]?.accountId === accountId) {
+    while (
+      this.queue[0]?.accountId === accountId &&
+      this.queue[0]?.contentRecording === contentRecording
+    ) {
       const candidate = this.queue[0];
       const combined = new Set([...queries, ...candidate.queries]);
       if (combined.size > LIMITS.searches) break;
@@ -161,18 +186,51 @@ export class SearchCoordinator {
       clearTimeout(member.timer);
     }
     try {
-      const result = await this.run({
-        queries: [...queries],
-        maxResults: Math.max(...members.map((member) => member.maxResults)),
-        signal: batch.controller.signal,
-      });
-      const byQuery = new Map(result.items.map((item) => [item.query, item]));
-      if (
-        byQuery.size !== queries.size ||
-        result.items.length !== queries.size ||
-        [...queries].some((query) => !byQuery.has(query))
-      )
-        throw new WebSearchError('invalid_output');
+      const observations = new SearchObservations(contentRecording);
+      let result: WebSearchBatchOutput | undefined;
+      let failure: WebSearchError | undefined;
+      let byQuery = new Map<string, WebSearchBatchItem>();
+      try {
+        result = await this.run(
+          {
+            queries: [...queries],
+            maxResults: Math.max(...members.map((member) => member.maxResults)),
+            signal: batch.controller.signal,
+          },
+          (line) => observations.observe(line)
+        );
+        byQuery = new Map(result.items.map((item) => [item.query, item]));
+        if (
+          byQuery.size !== queries.size ||
+          result.items.length !== queries.size ||
+          [...queries].some((query) => !byQuery.has(query))
+        )
+          throw new WebSearchError('invalid_output');
+      } catch (error) {
+        failure = staticError(error);
+        // Latch stop uncertainty BEFORE audit; its failure must never erase it.
+        if (failure.reason === 'stop_unconfirmed' || failure.reason === 'service_quarantined') {
+          this.quarantined = true;
+          for (const queued of [...this.queue])
+            this.fail(queued, new CoordinatedSearchError('service_quarantined', false));
+        }
+      }
+      try {
+        // Also runs when every subscriber cancelled. Caller lifetime does not
+        // erase the account-level evidence. Production supplies a required sink.
+        await this.recordBatch?.({
+          accountId,
+          batchId: batch.id,
+          contentRecording,
+          searchMayHaveRun: failure?.launched ?? true,
+          ...(failure && { reason: failure.reason }),
+          observations: observations.snapshot(),
+        });
+      } catch {
+        failure = new WebSearchError('audit_unavailable', failure?.launched ?? true);
+      }
+      if (failure) throw failure;
+      if (!result) throw new WebSearchError('internal_error');
       for (const member of members) {
         const output: CoordinatedSearchOutput = {
           batchId: batch.id,

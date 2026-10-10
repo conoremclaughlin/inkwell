@@ -11,6 +11,7 @@ import { env } from '../config/env';
 
 export type AuditAction =
   | 'web_search'
+  | 'web_search_batch'
   | 'web_fetch'
   | 'bash_curl'
   | 'bash_command'

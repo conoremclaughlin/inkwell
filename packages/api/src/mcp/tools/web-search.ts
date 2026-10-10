@@ -6,7 +6,8 @@ import { wrapUntrustedData } from '../../security/untrusted-data';
 import { getAuditService, type AuditEntry } from '../../services/audit';
 import { getPermissionsService } from '../../services/permissions';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { WebSearchError } from '../../services/web-search';
+import { searchWebBatch, WebSearchError } from '../../services/web-search';
+import { recordSearchBatch } from '../../services/web-search/batch-audit';
 import { SearchCoordinator, CoordinatedSearchError } from '../../services/web-search/coordinator';
 import {
   isWebSearchEnabled,
@@ -48,7 +49,7 @@ const response = (value: object, isError = false): Response => ({
 
 // One process-wide queue. Construction does no I/O; each submit follows auth,
 // account permission and required request audit. This is not a durable job queue.
-const searchCoordinator = new SearchCoordinator();
+const searchCoordinator = new SearchCoordinator(searchWebBatch, recordSearchBatch);
 
 /** Injection seam for inert tests; registration always uses the shared queue. */
 export interface WebSearchDeps {
@@ -164,6 +165,7 @@ export async function handleWebSearch(
   try {
     result = await (deps.coordinator ?? searchCoordinator).submit({
       accountId: user.id,
+      contentRecording,
       queries,
       maxResults: params.maxResults,
       signal: deps.signal,

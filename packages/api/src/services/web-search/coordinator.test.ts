@@ -27,7 +27,7 @@ function fixture() {
   );
   const coordinator = new SearchCoordinator(run);
   const submit = (accountId: string, queries: string[], signal?: AbortSignal, maxResults = 1) =>
-    coordinator.submit({ accountId, queries, signal, maxResults }).then(
+    coordinator.submit({ accountId, queries, signal, maxResults, contentRecording: true }).then(
       (value) => ({ ok: true as const, value }),
       (error: WebSearchError & { batchId?: string }) => ({ ok: false as const, error })
     );

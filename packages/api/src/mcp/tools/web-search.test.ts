@@ -228,6 +228,7 @@ describe('web_search auth, policy and audit', () => {
     await call(undefined, live.signal);
     expect(search).toHaveBeenCalledWith({
       accountId: userId,
+      contentRecording: true,
       queries: ['question'],
       maxResults: 5,
       signal: live.signal,

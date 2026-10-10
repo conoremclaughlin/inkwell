@@ -10,6 +10,7 @@ vi.mock('node:child_process', () => ({ spawn: mocks.spawn }));
 import { searchWeb, searchWebBatch } from './index.js';
 import { LIMITS, CLAUDE_VERSION, readConfig, validateInput } from './config.js';
 import * as isolation from './isolation.js';
+import { SearchObservations } from './observations.js';
 import { runBounded } from './process.js';
 import { FakeChild, HELP, MODEL, searchEvents, SYNTHETIC_ENV } from './fixtures.test-support.js';
 import { SearchAdmission, searchAdmission } from './admission.js';
@@ -95,6 +96,34 @@ describe('internal batch dispatch (not yet a public MCP argument)', () => {
     await expect(
       searchWebBatch({ queries: ['not the native query'], maxResults: 1 })
     ).rejects.toMatchObject({ reason: 'invalid_output', launched: true });
+    await expectRemoved();
+  });
+
+  it('records a clipped overlong native query while preserving the parser refusal and cleanup', async () => {
+    const observations = new SearchObservations(true);
+    inference = (child) => {
+      child.events(searchEvents('q'.repeat(501)));
+      child.finish();
+    };
+    await expect(
+      searchWebBatch({ queries: ['q'], maxResults: 1 }, (line) => observations.observe(line))
+    ).rejects.toMatchObject({ reason: 'invalid_output', launched: true });
+    expect(observations.snapshot()).toMatchObject({
+      queryCount: 1,
+      truncated: true,
+      queries: [{ query: 'q'.repeat(500), truncated: true }],
+    });
+    await expectRemoved();
+  });
+
+  it('a throwing observer can never skip strict validation or alter its refusal', async () => {
+    const observe = vi.fn(() => {
+      throw new Error('private observer fault');
+    });
+    await expect(
+      searchWebBatch({ queries: ['not the native query'], maxResults: 1 }, observe)
+    ).rejects.toMatchObject({ reason: 'invalid_output', launched: true });
+    expect(observe).toHaveBeenCalledTimes(2); // init and rejected query; not probes
     await expectRemoved();
   });
 

@@ -9,6 +9,7 @@ export const WEB_SEARCH_REASONS = [
   'managed_configuration',
   'capacity_exhausted',
   'queue_timeout',
+  'audit_unavailable',
   'service_quarantined',
   'cancelled',
   'timeout',
