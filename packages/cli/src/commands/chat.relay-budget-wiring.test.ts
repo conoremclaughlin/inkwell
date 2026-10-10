@@ -53,7 +53,11 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
-    expect(parent).toContain('providerTurn.relayOccupancy()');
+    // The closure captures a non-optional alias, not a frozen occupancy value.
+    expect(parentComposition).toMatch(
+      /const currentProviderTurn = providerTurn;\s*const loop = await runAgentLoop\(/
+    );
+    expect(parent).toContain('currentProviderTurn.relayOccupancy()');
     expect(source).toContain('contextGeneration: () => sessionContext.generation');
     expect(source).toContain('mutationsInFlight: () => sessionContext.mutationsInFlight');
     expect(clone).toBeDefined();
