@@ -1,9 +1,11 @@
 import { Router } from 'express';
 import { addSessionControlRoute } from '../../routes/session-controls';
+import { addSessionSteeringRoute } from '../../routes/session-steering';
 import {
   registerActiveRun,
   resetActiveRuns,
   attachRunControls,
+  attachRunSteering,
   submitRunControl,
   isGenerationAdmitted,
 } from './active-runs';
@@ -16,7 +18,7 @@ import {
   createSkillInstructionHost,
   type CodingTool,
 } from '@inklabs/shared/node-host';
-import { SessionLog, ToolPolicyState } from '@inklabs/shared/runtime';
+import { SessionLog, ToolPolicyState, type SessionSteeringReceipt } from '@inklabs/shared/runtime';
 import type { BackendHost, BackendRunResult, BackendRunRequest } from '@inklabs/shared/providers';
 import { createHostedInkExecutor, type HostedInkEffects } from './hosted-ink-executor';
 import { HostedInkSessionRunner, type HostedInkTurnDependencies } from './hosted-ink-session';
@@ -523,5 +525,192 @@ describe('hosted live controls through the admitted route and real composition',
         action: 'skill_clear',
       }).status
     ).toBe('refused');
+  });
+});
+
+function steeringHarness(h: Awaited<ReturnType<typeof fixture>>) {
+  const receipts: SessionSteeringReceipt[] = [];
+  h.effects.steeringReceipt = (receipt) => receipts.push(receipt);
+  const runner = new HostedInkSessionRunner({
+    execute: createHostedInkExecutor(h.prepare),
+    forTurn: ({ sessionId, turnEpoch }) => {
+      registerActiveRun({
+        sessionId,
+        turnEpoch,
+        userId: 'fixture-owner',
+        sbSlug: 'echo',
+        backend: 'ink',
+        startedAt: Date.now(),
+      });
+      return {
+        ...h.deps(),
+        steering: {
+          assertCurrent: () => {
+            if (!isGenerationAdmitted(sessionId, turnEpoch)) throw new Error('stale');
+          },
+          bind: (enqueue) => attachRunSteering(sessionId, turnEpoch, enqueue),
+        },
+      };
+    },
+  });
+  const router = Router();
+  addSessionSteeringRoute(router, {
+    authProvider: {
+      verifyAccessToken: async () => ({ ok: true, token: { userId: 'fixture-owner' } }),
+    } as never,
+    dataComposer: {
+      getClient: () => ({
+        from: () => {
+          const query = {
+            select: () => query,
+            eq: () => query,
+            single: async () => ({
+              data: {
+                user_id: 'fixture-owner',
+                sb_id: 'fixture-sb',
+                contact_id: null,
+                cli_attached: false,
+                turn_epoch: h.config.turnEpoch,
+              },
+            }),
+            maybeSingle: async () => ({
+              data: {
+                id: 'fixture-sb',
+                user_id: 'fixture-owner',
+                agent_id: 'echo',
+                metadata: {},
+              },
+            }),
+          };
+          return query;
+        },
+      }),
+    } as never,
+  });
+  const post = async (
+    messageId = 'fixture-correction',
+    text = 'Use UPDATED instead of ORIGINAL.'
+  ) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await router.stack[0].route!.stack[0].handle(
+      {
+        headers: {},
+        params: { id: 'hosted-fixture' },
+        body: { turnEpoch: h.config.turnEpoch, messageId, text },
+      } as never,
+      res as never,
+      vi.fn()
+    );
+    return res;
+  };
+  return { runner, post, receipts };
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe('explicit steering through the route and real hosted composition', () => {
+  it('waits for the tool result, inserts once, then gives the same turn the correction', async () => {
+    const h = await fixture([tool('read', { path: 'fixture.txt' })]);
+    const c = steeringHarness(h);
+    const toolStarted = deferred<void>();
+    const releaseTool = deferred<void>();
+    const nextProviderStarted = deferred<void>();
+    const finishProvider = deferred<BackendRunResult>();
+    const read = h.effects.toolHost.dispatch.callPi;
+    h.effects.toolHost.dispatch.callPi = async (...args) => {
+      toolStarted.resolve();
+      await releaseTool.promise;
+      return read(...args);
+    };
+    h.start
+      .mockImplementationOnce(() => ({
+        result: Promise.resolve(result(tool('read', { path: 'fixture.txt' }))),
+        abort: vi.fn(),
+      }))
+      .mockImplementationOnce(() => {
+        nextProviderStarted.resolve();
+        return { result: finishProvider.promise, abort: vi.fn() };
+      });
+    const running = c.runner.run('Read fixture.txt, then answer ORIGINAL.', { config: h.config });
+    await toolStarted.promise;
+    const accepted = await c.post();
+    expect(accepted.status).toHaveBeenCalledWith(202);
+    expect(h.events.filter((e) => e.type === 'steering_request')).toHaveLength(1);
+    expect(h.events.filter((e) => e.type === 'steering_input')).toHaveLength(0);
+    expect(h.start).toHaveBeenCalledTimes(1);
+    releaseTool.resolve();
+    await nextProviderStarted.promise;
+    const repeat = await c.post();
+    expect(repeat.status).toHaveBeenCalledWith(200);
+    expect(repeat.json).toHaveBeenCalledWith(expect.objectContaining({ status: 'inserted' }));
+    const conflict = await c.post('fixture-correction', 'Changed content under the same id.');
+    expect(conflict.status).toHaveBeenCalledWith(409);
+    expect(h.events.filter((e) => e.type === 'steering_request')).toHaveLength(1);
+    expect(h.events.filter((e) => e.type === 'steering_input')).toHaveLength(1);
+    const prompt = h.start.mock.calls[1][0].prompt;
+    expect(prompt).toContain('Use UPDATED instead of ORIGINAL.');
+    expect(prompt).toContain('Hosted harmless read');
+    const insertedIndex = h.events.findIndex((e) => e.type === 'steering_input');
+    const readResultIndex = h.events.findIndex((e) => e.type === 'local_tool_call');
+    expect(readResultIndex).toBeGreaterThan(-1);
+    expect(insertedIndex).toBeGreaterThan(readResultIndex);
+    finishProvider.resolve(result('UPDATED'));
+    expect(await running).toMatchObject({ success: true, finalTextResponse: 'UPDATED' });
+    expect(h.start).toHaveBeenCalledTimes(2);
+    expect(h.events.filter((e) => e.type === 'system_turn')).toHaveLength(1);
+    expect(h.events.find((e) => e.type === 'session_pause')).toMatchObject({ turnsCompleted: 1 });
+    expect(c.receipts).toContainEqual(expect.objectContaining({ status: 'inserted' }));
+    expect((await c.post('too-late')).status).toHaveBeenCalledWith(409);
+  });
+
+  it('a no-tools final refuses pending correction without inventing a continuation or queued turn', async () => {
+    const h = await fixture([]);
+    const c = steeringHarness(h);
+    const initialStarted = deferred<void>();
+    const firstResult = deferred<BackendRunResult>();
+    h.start.mockImplementationOnce(() => {
+      initialStarted.resolve();
+      return { result: firstResult.promise, abort: vi.fn() };
+    });
+    const running = c.runner.run('Answer ORIGINAL.', { config: h.config });
+    await initialStarted.promise;
+    expect((await c.post()).status).toHaveBeenCalledWith(202);
+    firstResult.resolve(result('ORIGINAL'));
+    expect(await running).toMatchObject({ success: true, finalTextResponse: 'ORIGINAL' });
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.events.some((e) => e.type === 'steering_input')).toBe(false);
+    expect(c.receipts).toContainEqual(expect.objectContaining({ status: 'refused' }));
+    expect(h.events.find((e) => e.type === 'session_pause')).toMatchObject({ turnsCompleted: 1 });
+  });
+
+  it('Stop while a tool holds the boundary refuses pending input without another launch', async () => {
+    const h = await fixture([tool('read', { path: 'fixture.txt' })]);
+    const c = steeringHarness(h);
+    const stop = new AbortController();
+    h.config.signal = stop.signal;
+    const toolStarted = deferred<void>();
+    const releaseTool = deferred<void>();
+    const read = h.effects.toolHost.dispatch.callPi;
+    h.effects.toolHost.dispatch.callPi = async (...args) => {
+      toolStarted.resolve();
+      await releaseTool.promise;
+      return read(...args);
+    };
+    const running = c.runner.run('Read fixture.txt.', { config: h.config });
+    await toolStarted.promise;
+    expect((await c.post()).status).toHaveBeenCalledWith(202);
+    stop.abort();
+    releaseTool.resolve();
+    expect((await running).success).toBe(false);
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.events.some((e) => e.type === 'steering_input')).toBe(false);
+    expect(c.receipts).toContainEqual(expect.objectContaining({ status: 'refused' }));
+    expect(h.effects.close).toHaveBeenCalledOnce();
+    expect((await c.post('late')).status).toHaveBeenCalledWith(409);
   });
 });

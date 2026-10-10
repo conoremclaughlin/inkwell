@@ -15,6 +15,7 @@ import {
   estimateTokens,
   type SessionPromptSkill,
   type ToolCallResult,
+  type SessionSteeringReceipt,
 } from '@inklabs/shared/runtime';
 import { promptTransportFor } from '@inklabs/shared/providers';
 import { userFacingReplyText } from '@inklabs/shared';
@@ -32,6 +33,7 @@ export interface HostedInkEffects extends Pick<
   activeSkills: readonly SessionPromptSkill[];
   manualSkills?: SessionControlsPorts['skills'];
   controlReceipt?: SessionControlsPorts['receipt'];
+  steeringReceipt?(receipt: SessionSteeringReceipt): void;
   /** Host closes its private resources only after all clone runs settle. */
   close(): Promise<void>;
   /** Persist queued policy changes before admission; approvals must do the same before returning true. */
@@ -58,6 +60,7 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
     ports.signal.throwIfAborted();
     const effects = await prepare(input, ports);
     let releaseControls: (() => void) | undefined;
+    let releaseSteering: (() => void) | undefined;
     let session: Awaited<ReturnType<typeof composeInkSession>> | undefined;
     const toolCalls: ToolCall[] = [];
     const backend = input.options.backend ?? 'claude';
@@ -132,6 +135,14 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
               ports.controls?.assertCurrent();
             },
           },
+          steering: {
+            turnEpoch: input.turnEpoch,
+            receipt: effects.steeringReceipt,
+            assertCurrent: () => {
+              ports.signal.throwIfAborted();
+              ports.steering?.assertCurrent();
+            },
+          },
           callInk,
           logActivity: async (activity) => {
             // Telemetry must neither disappear on normal failure nor hold the
@@ -170,6 +181,11 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
       );
       const live = session;
       releaseControls = ports.controls?.bind((request) => live.controls.enqueue(request));
+      const steering = live.steering;
+      if (ports.steering) {
+        if (!steering) throw new Error('Hosted steering composition is unavailable');
+        releaseSteering = ports.steering.bind((request) => steering.enqueue(request));
+      }
       const outer = await runHeadlessSession(
         {
           message: [input.message, attachmentBlock].filter(Boolean).join('\n\n'),
@@ -227,6 +243,8 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
           },
         }
       );
+      await steering?.close('owner_completed');
+      releaseSteering?.();
       // Close before the final sweep: no enqueue can fall between drain and release.
       live.controls.close();
       await live.controls.drain(ports.signal);
@@ -261,13 +279,21 @@ export function createHostedInkExecutor(prepare: PrepareHostedInkEffects): Execu
         toolCalls,
       };
     } finally {
+      releaseSteering?.();
       releaseControls?.();
-      if (session) {
-        session.controls.refusePending('owner_stopped');
-        session.clones.cancel();
-        await session.clones.drain();
+      try {
+        if (session) {
+          try {
+            await session.steering?.close('owner_stopped');
+          } finally {
+            session.controls.refusePending('owner_stopped');
+            session.clones.cancel();
+            await session.clones.drain();
+          }
+        }
+      } finally {
+        await effects.close();
       }
-      await effects.close();
     }
   };
 }

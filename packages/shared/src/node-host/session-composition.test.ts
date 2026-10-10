@@ -154,6 +154,248 @@ function pressuredHistory() {
 }
 
 describe('the full shared session composition (scripted provider, real read)', () => {
+  it.each([true, false])(
+    'does not treat steering as an approval while approval is held (%s)',
+    async (approved) => {
+      const h = await fixture(`steering-approval-${approved}`, [
+        tool('read', { path: 'fixture.txt' }),
+        'After approval.',
+      ]);
+      h.ports.policy.addPromptTool('read');
+      h.ports.steering = { turnEpoch: 'fixture-approval-generation', assertCurrent: () => {} };
+      let release!: (allow: boolean) => void;
+      const held = new Promise<boolean>((resolve) => {
+        release = resolve;
+      });
+      let enter!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      h.ports.approve = vi.fn(async () => {
+        enter();
+        const allow = await held;
+        if (allow) h.ports.policy.grantToolForSession(h.ports.runtime.sessionId, 'read');
+        return allow;
+      });
+      const read = vi.spyOn(h.ports.toolHost.dispatch, 'callPi');
+      const session = await h.compose();
+      const running = session.run(
+        { raw: 'Read the fixture', source: 'user' },
+        { continueOnFailure: true }
+      );
+      await entered;
+      const correction = { messageId: 'approval-is-separate', text: 'Use the revised summary.' };
+      try {
+        expect(await session.steering!.enqueue(correction)).toMatchObject({ status: 'pending' });
+        expect(read).not.toHaveBeenCalled();
+        expect(h.start).toHaveBeenCalledOnce();
+        expect(h.events.some((e) => e.type === 'steering_input')).toBe(false);
+      } finally {
+        release(approved);
+      }
+      await running;
+      expect(read).toHaveBeenCalledTimes(approved ? 1 : 0);
+      expect(await session.steering!.enqueue(correction)).toMatchObject({
+        status: approved ? 'inserted' : 'refused',
+      });
+    }
+  );
+
+  it.each([false, true])(
+    'seeds committed steering after a crash with no result (later seed intent: %s)',
+    async (laterSeed) => {
+      const h = await fixture(
+        'steering-crash',
+        ['Explicit continuation.'],
+        [
+          { eid: 1, type: 'user', content: 'Original request.' },
+          { eid: 2, type: 'backend_session', id: 'pre-crash-native', routing: 'local' },
+          {
+            eid: 3,
+            type: 'steering_input',
+            version: 1,
+            turnEpoch: 'crashed-generation',
+            messageId: 'committed-owner-input',
+            boundary: 1,
+            text: 'Crash-surviving correction.',
+          },
+          ...(laterSeed
+            ? [
+                {
+                  eid: 4,
+                  type: 'backend_session',
+                  id: 'unconfirmed-seed',
+                  routing: 'local',
+                  recoverable: false,
+                },
+              ]
+            : []),
+        ]
+      );
+      const session = await h.compose();
+      expect(h.start).not.toHaveBeenCalled();
+      await session.run(
+        { raw: 'Continue explicitly', source: 'user' },
+        { continueOnFailure: true }
+      );
+      const request = h.start.mock.calls[0][0];
+      expect(request.backendSessionId).toBeUndefined();
+      expect(request.backendSessionSeedId).toBeDefined();
+      expect(request.prompt.split('Crash-surviving correction.')).toHaveLength(2);
+      expect(h.start).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each(['failed', 'throw'] as const)(
+    'reconstructs committed steering on reattach after a %s continuation, without retrying',
+    async (failure) => {
+      const h = await fixture(`steering-${failure}`, [tool('read', { path: 'fixture.txt' })]);
+      h.ports.steering = { turnEpoch: `fixture-${failure}-generation`, assertCurrent: () => {} };
+      const original = h.start.getMockImplementation()!;
+      let launches = 0;
+      h.start.mockImplementation((request) => {
+        if (++launches === 1) return original(request);
+        if (failure === 'throw') throw new Error('fixture dispatch failure');
+        return {
+          result: Promise.resolve({ ...outcome(''), success: false, exitCode: 1 }),
+          abort: vi.fn(),
+        };
+      });
+      const read = h.ports.toolHost.dispatch.callPi!;
+      const correction = {
+        messageId: 'persisted-correction',
+        text: 'Retain the revised owner instruction.',
+      };
+      let session: Awaited<ReturnType<typeof composeInkSession>>;
+      h.ports.toolHost.dispatch.callPi = async (...args) => {
+        expect(await session.steering!.enqueue(correction)).toMatchObject({ status: 'pending' });
+        return read(...args);
+      };
+      session = await h.compose();
+      const run = session.run(
+        { raw: 'Inspect the fixture', source: 'user' },
+        { continueOnFailure: true }
+      );
+      if (failure === 'throw') await expect(run).rejects.toThrow('fixture dispatch failure');
+      else expect((await run)?.execution.loop.success).toBe(false);
+      expect(h.start).toHaveBeenCalledTimes(2);
+      expect(session.context.provider.id).toBeUndefined();
+      expect(h.events).toContainEqual(
+        expect.objectContaining({
+          type: 'backend_session_invalidated',
+          reason: 'steering-delivery-uncertain',
+        })
+      );
+      const history = (await readFile(h.ports.log.path, 'utf8'))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+      const fresh = await fixture(`reopened-${failure}`, ['Continued explicitly.'], history);
+      const reattached = await fresh.compose();
+      await reattached.run(
+        { raw: 'Continue explicitly', source: 'user' },
+        { continueOnFailure: true }
+      );
+      const next = fresh.start.mock.calls[0][0];
+      expect(next.backendSessionId).toBeUndefined();
+      expect(next.backendSessionSeedId).toBeDefined();
+      expect(next.prompt.split(correction.text)).toHaveLength(2);
+    }
+  );
+
+  it('commits owner steering during a held read and injects it only after the tool round', async () => {
+    const h = await fixture('steering', [tool('read', { path: 'fixture.txt' }), 'Updated answer.']);
+    const receipts = vi.fn();
+    h.ports.steering = {
+      turnEpoch: 'fixture-generation',
+      assertCurrent: () => {},
+      receipt: receipts,
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const read = h.ports.toolHost.dispatch.callPi!;
+    h.ports.toolHost.dispatch.callPi = async (...args) => {
+      enter();
+      await held;
+      return read(...args);
+    };
+    const session = await h.compose();
+    const running = session.run(
+      { raw: 'Inspect the fixture', source: 'user' },
+      { continueOnFailure: true }
+    );
+    await entered;
+    const correction = { messageId: 'fixture-owner-input', text: 'Use the revised answer marker.' };
+    expect(await session.steering!.enqueue(correction)).toMatchObject({ status: 'pending' });
+    expect(h.start).toHaveBeenCalledOnce();
+    expect(h.events.some((e) => e.type === 'steering_input')).toBe(false);
+    expect(session.ledger.listEntries().some((e) => e.content === correction.text)).toBe(false);
+    release();
+    await running;
+    const continuation = h.start.mock.calls[1][0].prompt;
+    expect(continuation.split(correction.text)).toHaveLength(2);
+    expect(continuation.indexOf('steering harmless fixture contents')).toBeLessThan(
+      continuation.indexOf(correction.text)
+    );
+    expect(continuation).toContain(`USER:\n${correction.text}`);
+    expect(h.order.indexOf('committed:steering_input')).toBeLessThan(
+      h.order.lastIndexOf('provider')
+    );
+    expect(await session.steering!.enqueue(correction)).toMatchObject({ status: 'inserted' });
+    expect(
+      await session.steering!.enqueue({ messageId: 'late-owner-input', text: 'Not in this turn.' })
+    ).toMatchObject({ status: 'refused', reason: 'no_active_turn' });
+    expect(h.events.filter((e) => e.type === 'steering_input')).toHaveLength(1);
+    expect(receipts).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'inserted' }));
+  });
+
+  it('refuses input when a no-tool final wins, before the outcome observer can run', async () => {
+    const h = await fixture('steering-final', ['Next ordinary turn.']);
+    h.ports.steering = { turnEpoch: 'fixture-final-generation', assertCurrent: () => {} };
+    let release!: (value: BackendRunResult) => void;
+    const held = new Promise<BackendRunResult>((resolve) => {
+      release = resolve;
+    });
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    h.start.mockImplementationOnce(() => {
+      enter();
+      return { result: held, abort: vi.fn() };
+    });
+    const session = await h.compose();
+    const correction = { messageId: 'too-late-input', text: 'Must never spill.' };
+    let observerReceipt: unknown;
+    const running = session.run(
+      { raw: 'Finish now', source: 'user' },
+      {
+        continueOnFailure: true,
+        onOutcome: () => {
+          observerReceipt = session.steering!.enqueue(correction);
+        },
+      }
+    );
+    await entered;
+    expect(await session.steering!.enqueue(correction)).toMatchObject({ status: 'pending' });
+    release(outcome('Finished without tools.'));
+    await running;
+    expect(await observerReceipt).toMatchObject({ status: 'refused', reason: 'turn_finished' });
+    await session.run(
+      { raw: 'Next ordinary request', source: 'user' },
+      { continueOnFailure: true }
+    );
+    expect(h.start.mock.calls[1][0].prompt).not.toContain(correction.text);
+    expect(session.ledger.listEntries().some((e) => e.content === correction.text)).toBe(false);
+    expect(h.events.some((e) => e.type === 'steering_input')).toBe(false);
+  });
+
   it('bootstraps, reads a harmless file, streams and saves the final before publishing the outcome', async () => {
     const h = await fixture('one', [
       tool('read', { path: 'fixture.txt' }),

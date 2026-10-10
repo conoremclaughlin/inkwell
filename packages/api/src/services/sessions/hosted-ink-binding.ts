@@ -7,7 +7,12 @@ import {
   signInkAccessToken,
   type InkTokenPayload,
 } from '../../auth/ink-tokens';
-import { getActiveRun, isGenerationAdmitted, attachRunControls } from './active-runs';
+import {
+  getActiveRun,
+  isGenerationAdmitted,
+  attachRunControls,
+  attachRunSteering,
+} from './active-runs';
 import { createHostedInkExecutor, type PrepareHostedInkEffects } from './hosted-ink-executor';
 import { HostedInkSessionRunner } from './hosted-ink-session';
 import {
@@ -149,6 +154,19 @@ export function createBoundHostedInkRunner(input: HostedInkBinding) {
             return attachRunControls(sessionId, turnEpoch, enqueue);
           },
         },
+        // The admitted launch tier is immutable for this run. A later edit to
+        // identity metadata cannot add steering to a tools-only generation.
+        ...(config.executionTier === 'tools'
+          ? {}
+          : {
+              steering: {
+                assertCurrent: admitted,
+                bind: (enqueue) => {
+                  admitted();
+                  return attachRunSteering(sessionId, turnEpoch, enqueue);
+                },
+              },
+            }),
         inkwell,
         sessionLog,
         isHostedRefusal: (error) => error instanceof HostedSpawnRefusal,

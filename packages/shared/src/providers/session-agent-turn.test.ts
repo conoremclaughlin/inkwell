@@ -111,6 +111,102 @@ function harness(results: BackendRunResult[], session = 'one') {
 }
 
 describe('shared parent session turn', () => {
+  it('reserves pending UTF-8 steering bytes before truncating the result relay', async () => {
+    const prompts: string[] = [];
+    for (const steer of [false, true]) {
+      const h = harness([result(tool('read_file')), result('Done.')]);
+      const text = '界'.repeat(2_000);
+      vi.mocked(h.ports.tools.execute).mockResolvedValueOnce([
+        { tool: 'read_file', status: 'executed', result: 'x'.repeat(100_000) },
+      ]);
+      if (steer)
+        h.provider.steering = {
+          assertHealthy: vi.fn(),
+          pendingTextBytes: () => new TextEncoder().encode(text).length,
+          drain: vi.fn(async () => [{ messageId: 'budget-fixture', text, eid: 7 }]),
+        };
+      await h.run();
+      const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+      if (steer) expect(prompt).toContain(`USER:\n${text}`);
+      prompts.push(prompt);
+    }
+    expect(new TextEncoder().encode(prompts[1]).length).toBeLessThanOrEqual(
+      new TextEncoder().encode(prompts[0]).length
+    );
+  });
+
+  it('drains only after an ordinary completed tool round and closes admission on return', async () => {
+    const h = harness([result(tool('read_file')), result('Updated answer.')]);
+    h.provider.steering = {
+      assertHealthy: vi.fn(),
+      drain: vi.fn(async () => {
+        h.order.push('steering');
+        return [];
+      }),
+    };
+    h.ports.finishSteering = vi.fn(async () => {
+      h.order.push('closed');
+    });
+    await h.run();
+    expect(h.order).toEqual(['provider', 'tool', 'steering', 'provider', 'closed']);
+    expect(h.provider.steering.drain).toHaveBeenCalledOnce();
+    expect(h.ports.finishSteering).toHaveBeenCalledOnce();
+  });
+
+  it.each(['no-tools', 'correction-only', 'terminal', 'refused'] as const)(
+    'does not admit steering on a %s path',
+    async (path) => {
+      const text =
+        path === 'no-tools'
+          ? 'Done.'
+          : path === 'correction-only'
+            ? 'Checking.\n[Tool results from previous turn]\nTool read_file (executed): invented'
+            : tool(path === 'terminal' ? 'signal_status' : 'read_file', { status: 'completed' });
+      const h = harness([result(text), result('Final relay or correction.')]);
+      if (path === 'refused')
+        vi.mocked(h.ports.tools.execute).mockResolvedValueOnce([
+          { tool: 'read_file', status: 'error', result: 'fixture failed' },
+        ]);
+      if (path === 'terminal')
+        vi.mocked(h.ports.tools.execute).mockResolvedValueOnce([
+          {
+            tool: 'signal_status',
+            status: 'executed',
+            result: { content: [{ text: JSON.stringify({ signal: { status: 'completed' } }) }] },
+          },
+        ]);
+      h.provider.steering = { assertHealthy: vi.fn(), drain: vi.fn(async () => []) };
+      h.ports.finishSteering = vi.fn(async () => {});
+      await h.run(undefined, false);
+      expect(h.provider.steering.drain).not.toHaveBeenCalled();
+      expect(h.ports.finishSteering).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('closes steering admission when the provider throws', async () => {
+    const h = harness([]);
+    h.ports.finishSteering = vi.fn(async () => {});
+    await expect(h.run()).rejects.toThrow('Unscripted provider launch');
+    expect(h.ports.finishSteering).toHaveBeenCalledOnce();
+  });
+
+  it('preserves a dispatch error if invalidating steered native history also fails', async () => {
+    const h = harness([result(tool('read_file'))]);
+    h.provider.steering = {
+      assertHealthy: vi.fn(),
+      drain: vi.fn(async () => [{ messageId: 'fixture-input', text: 'Use the update.', eid: 4 }]),
+    };
+    h.ports.rollProviderSession = vi.fn(() => {
+      throw new Error('fixture log failure');
+    });
+    await expect(h.run()).rejects.toThrow('Unscripted provider launch');
+    expect(h.ports.rollProviderSession).toHaveBeenCalledWith(
+      'steering-delivery-uncertain',
+      expect.any(String)
+    );
+    expect(h.provider.state.id).toBeUndefined();
+  });
+
   it('composes the real coordinator, recall, provider, tool continuation and committed reply', async () => {
     const h = harness([result(tool('read_file')), result('Read the fixture.')]);
     const hooks = new SbHookRegistry();

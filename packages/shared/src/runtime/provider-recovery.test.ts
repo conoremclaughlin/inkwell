@@ -13,6 +13,7 @@ describe('provider recovery from a host-loaded snapshot', () => {
     'context_trim',
     'context_budget_changed',
     'backend_session_invalidated',
+    'steering_input',
   ])('%s invalidates both the old native session and its context measurement', (type) => {
     const events = [
       { type: 'backend_session', id: 'old', routing: 'local' },
@@ -27,6 +28,28 @@ describe('provider recovery from a host-loaded snapshot', () => {
         { type: 'backend_session', id: 'new', routing: 'local' },
       ])
     ).toEqual({ id: 'new', routing: 'local' });
+  });
+
+  it('does not treat an inserted steering receipt as proof of native provider delivery', () => {
+    const events = [
+      { type: 'backend_session', id: 'before-input', routing: 'local' },
+      {
+        type: 'steering_input',
+        version: 1,
+        messageId: 'fixture-input',
+        turnEpoch: 'fixture-generation',
+        text: 'Use the update.',
+        boundary: 1,
+      },
+      { type: 'steering_receipt', version: 1, messageId: 'fixture-input', status: 'inserted' },
+    ];
+    expect(findLastBackendSessionInEvents(events)).toBeUndefined();
+    expect(
+      findLastBackendSessionInEvents([
+        ...events,
+        { type: 'backend_session', id: 'rebuilt', routing: 'local' },
+      ])
+    ).toEqual({ id: 'rebuilt', routing: 'local' });
   });
 
   it('preserves known routing but never invents routing for a legacy or malformed marker', () => {

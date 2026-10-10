@@ -117,7 +117,7 @@ export const MID_TURN_RESEED_MAX_CHARS = 30_000;
  * model said, or what the runtime said back.
  */
 export interface ReseedDialogueEntry {
-  role: 'assistant' | 'runtime';
+  role: 'assistant' | 'runtime' | 'user';
   text: string;
 }
 
@@ -161,14 +161,19 @@ export function continuationSpawnArgs(
   return { sessionArgs: {}, deliverMedia: false };
 }
 
-export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[]): string {
+export function buildMidTurnReseedBody(
+  dialogue: readonly ReseedDialogueEntry[],
+  options: { protectedTail?: number; stateless?: boolean } = {}
+): string {
   const rendered = dialogue
     .map((entry) => {
       const text = entry.text.trim();
-      if (!text) return '';
-      return entry.role === 'assistant' ? `YOU:\n${text}` : `INK RUNTIME:\n${text}`;
+      if (!text) return undefined;
+      const label =
+        entry.role === 'assistant' ? 'YOU' : entry.role === 'user' ? 'USER' : 'INK RUNTIME';
+      return { text: `${label}:\n${text}`, user: entry.role === 'user' };
     })
-    .filter(Boolean);
+    .filter((entry): entry is { text: string; user: boolean } => entry !== undefined);
   if (rendered.length === 0) return '';
   // The LAST entry is the continuation the model is about to receive — the
   // real tool results of the iteration that just ran. It is never cut: a
@@ -176,15 +181,26 @@ export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[])
   // results and role framing (Lumen, PR #577 round 2). The budget applies to
   // the dialogue BEFORE it, whole entries from the most recent backwards;
   // what does not fit is elided, and the elision says how much.
-  const last = rendered[rendered.length - 1]!;
-  const earlier = rendered.slice(0, -1);
+  // The latest result and newly inserted user messages are one protected
+  // boundary. Earlier steering stays user-attributed even when older tool
+  // dialogue is elided. Admission bounds its cumulative size per owner.
+  const tailSize = Math.max(1, options.protectedTail ?? 1);
+  const last = rendered
+    .slice(-tailSize)
+    .map((entry) => entry.text)
+    .join('\n\n');
+  const earlier = rendered.slice(0, -tailSize);
   let budget = MID_TURN_RESEED_MAX_CHARS - last.length;
   const kept: string[] = [];
+  let eliding = false;
   for (let i = earlier.length - 1; i >= 0; i -= 1) {
     const entry = earlier[i]!;
-    if (entry.length + 2 > budget) break;
-    kept.unshift(entry);
-    budget -= entry.length + 2;
+    if (!entry.user && (eliding || entry.text.length + 2 > budget)) {
+      eliding = true;
+      continue;
+    }
+    kept.unshift(entry.text);
+    budget -= entry.text.length + 2;
   }
   const elided = earlier.length - kept.length;
   const shown = [
@@ -196,7 +212,7 @@ export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[])
   ].join('\n\n');
   return [
     '[This turn so far]',
-    'The provider session was re-seeded mid-turn after a context change on the ink side. This is the turn up to this point: what you wrote, and what the ink runtime sent back. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.',
+    `${options.stateless ? 'This stateless request carries the current turn dialogue.' : 'The provider session was re-seeded mid-turn after a context change on the ink side.'} This is the turn up to this point: what you wrote, what the ink runtime sent back, and any subsequent user messages. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.`,
     '---',
     shown,
     '---',
@@ -313,7 +329,8 @@ export function buildSessionPrompt(
    * changes every turn, and treating it as envelope shape would invalidate and
    * reseed the native session on each one.
    */
-  contextStamp?: string
+  contextStamp?: string,
+  excludeEids?: ReadonlySet<number>
 ): string {
   // Reserve bootstrap context budget (not counted against transcript budget)
   const bootstrapTokens = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
@@ -322,6 +339,7 @@ export function buildSessionPrompt(
   const transcript = ledger.buildPromptTranscript({
     maxTokens: transcriptBudget,
     includeSources: true,
+    excludeEids,
   });
 
   const toolInstruction =

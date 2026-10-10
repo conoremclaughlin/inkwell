@@ -201,6 +201,48 @@ not prescribe a datastore or database admission functions. Running two drains
 for the same session is NOT prevented by this class. Hosted recovery and
 multi-view streaming require their own integration and end-to-end tests.
 
+## Explicit hosted steering
+
+`POST /api/sessions/:id/steer` accepts only `{ turnEpoch, messageId, text }`
+from the owning user's unscoped MCP credential. It requires the current detached
+hosted owner and canonical non-contact, non-Inkling target. Observer/browser and
+SB/session/contact-scoped credentials do not grant this mutation capability.
+The binding also withholds steering from an admitted tools-only generation,
+independently of later identity metadata changes.
+There is no new UI or ordinary inbox delivery mode in this slice.
+
+`createSessionSteering` belongs to that existing owner generation. It persists
+the text intent before acknowledging `pending`; after a completed executable
+tool round, it commits a user-context entry before the provider continuation.
+It does not interrupt reasoning, a tool or an approval wait. A final response,
+terminal tool outcome or exhausted tool budget can end the turn without another
+eligible boundary; pending input is then explicitly refused rather than carried
+into another turn. Ordinary inbox mail keeps its existing queue.
+
+Receipts distinguish `pending`, `inserted`, `refused` and `unknown`. **Inserted
+means committed to the session context, not provider acknowledgment, comprehension
+or task completion.** Uncertain persistence or handoff never authorizes a retry
+as a new ordinary turn. Retries with the same ID and text reconcile within the
+generation; changed text under that ID conflicts. Intake retains at most 128
+receipts and 32 KiB of cumulative text, with an 8 KiB UTF-8 per-message limit.
+Receipt evidence is not evicted while the owner lives.
+After that owner retires, this endpoint does not retrieve its old receipts;
+`no_current_hosted_owner` refuses the new attempt, not proof that the original
+input was never inserted. Never change the epoch to retry an uncertain delivery.
+
+Only `steering_input` records hydrate user context. `steering_request` intents
+and receipts do not replay work. This uses the existing log's flush guarantee,
+not fsync or a cross-process delivery transaction. A restart cannot attach to an
+old mailbox or automatically redeliver an uncertain input. Native continuation,
+reseed and stateless prompts preserve user attribution and chronological order.
+Recovery conservatively discards an older native-session marker after a committed
+steering input. The next ordinary input seeds from the journal rather than
+assuming an interrupted provider received it; this does not rerun the old turn.
+
+The endpoint never creates an inbox wake or silently falls back to the queue.
+It does not suppress already queued inbox wakes, steer an independently launched
+native CLI, deliver media, implement reply-first, or bypass tool policy.
+
 ## Session identity bootstrap
 
 `bootstrapSessionIdentity` runs the existing CLI identity initialization through

@@ -6,6 +6,7 @@
  */
 import type { BackendRunRequest, BackendRunResult, BackendTurnHandle } from './backend-runner.js';
 import type { TurnMedia } from './types.js';
+import type { createSessionSteering } from '../runtime/session-steering.js';
 import {
   buildDeltaPrompt,
   buildContinuationPrompt,
@@ -56,7 +57,9 @@ export interface SessionProviderPorts {
   append(entry: Record<string, unknown>): number;
   /** Confirm queued history/seed writes before every provider launch. Not fsync. */
   flush(): Promise<void>;
-  buildEnvelope(body: string, stamp?: string): string;
+  buildEnvelope(body: string, stamp?: string, excludeEids?: ReadonlySet<number>): string;
+  steering?: Pick<ReturnType<typeof createSessionSteering>, 'drain' | 'assertHealthy'> &
+    Partial<Pick<ReturnType<typeof createSessionSteering>, 'pendingTextBytes'>>;
   measurement(): ProviderContextMeasurement | undefined;
   spawnContext(): Pick<
     BackendRunRequest,
@@ -99,6 +102,46 @@ export function createSessionProviderTurn(
     passthroughArgs,
     dialogue: turnDialogue,
   } = ports;
+  const unconfirmedSteeredSeeds = new Set<string>();
+  let steeringDeliveryUncertain = false;
+  const recordSeed = (id: string, reason?: string) => {
+    const hasSteering = ledger.listEntries().some((entry) => entry.source === 'steering');
+    if (hasSteering) {
+      unconfirmedSteeredSeeds.add(id);
+      steeringDeliveryUncertain = true;
+    }
+    ports.append({
+      type: 'backend_session',
+      ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
+      ...(runtime.providerRecoveryDisabled || hasSteering ? { recoverable: false } : {}),
+      id,
+      routing: runtime.toolRouting,
+      ...(reason ? { reason } : {}),
+    });
+  };
+  const confirmSteeredSeed = async (id: string | undefined, result: BackendRunResult) => {
+    if (
+      !id ||
+      !unconfirmedSteeredSeeds.has(id) ||
+      runtime.providerRecoveryDisabled ||
+      !result.success ||
+      result.childExited !== true
+    )
+      return;
+    // A seed marker is only launch intent. Restore recovery only after this
+    // exact provider session has returned successfully and confirmed its exit.
+    ports.append({
+      type: 'backend_session',
+      ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
+      id,
+      routing: runtime.toolRouting,
+      recoverable: true,
+      reason: 'steering-seed-confirmed',
+    });
+    await ports.flush();
+    unconfirmedSteeredSeeds.delete(id);
+    steeringDeliveryUncertain = false;
+  };
   const promptHookResult = prepared.promptHooks;
   const contextStamp = formatContextStamp(prepared.occupancy);
   // Provider session seed/resume decision (claude only). The first backend
@@ -145,13 +188,7 @@ export function createSessionProviderTurn(
     // and RESUMES this native session instead of fragmenting into a new jsonl.
     // routing rides along so cross-process recovery can refuse a session
     // seeded under the other instruction envelope.
-    ports.append({
-      type: 'backend_session',
-      ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
-      ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
-      id: seedProviderSessionId,
-      routing: runtime.toolRouting,
-    });
+    recordSeed(seedProviderSessionId);
   }
 
   let prompt: string;
@@ -176,6 +213,9 @@ export function createSessionProviderTurn(
   // host owns launches, cancellation, debug and activity logging. A shadow clone
   // supplies a far simpler runTurn and shares the loop unchanged.
   let lastRunResult!: BackendRunResult;
+  // These entries remain durable user context. Only this turn's full-envelope
+  // render excludes them because its ordered dialogue carries them instead.
+  const steeringEids = new Set<number>();
   // What this turn's loop has already put in the provider's context that the
   // ledger cannot see yet: every continuation body sent and every reply
   // received. The relay budget shrinks by it, or each iteration re-grants
@@ -276,13 +316,15 @@ export function createSessionProviderTurn(
 
   const beforeDispatch = async (signal?: AbortSignal): Promise<void> => {
     signal?.throwIfAborted();
+    ports.steering?.assertHealthy();
     await ports.flush();
     signal?.throwIfAborted();
+    ports.steering?.assertHealthy();
   };
 
   const runTurnForLoop = async (
     body: string,
-    ctx: { isContinuation: boolean; signal?: AbortSignal }
+    ctx: { isContinuation: boolean; signal?: AbortSignal; completedToolRound?: true }
   ): Promise<BackendTurnOutcome> => {
     if (!ctx.isContinuation) {
       const openingSessionId =
@@ -356,13 +398,7 @@ export function createSessionProviderTurn(
         const reseedId = ports.mintId();
         state.id = reseedId;
         state.shape = currentEnvelopeShape;
-        ports.append({
-          type: 'backend_session',
-          ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
-          ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
-          id: reseedId,
-          routing: runtime.toolRouting,
-        });
+        recordSeed(reseedId);
         ports.notice('resume-missing');
         // Regenerated HERE, after the new id is assigned, and never the
         // opening's contextStamp reused. The stamped resume died before a
@@ -420,6 +456,8 @@ export function createSessionProviderTurn(
 
       lastRunResult = runResult;
       noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
+      ports.steering?.assertHealthy();
+      await confirmSteeredSeed(state.id, runResult);
       return runResult;
     }
 
@@ -430,6 +468,19 @@ export function createSessionProviderTurn(
     // full envelope, the model's own output so far, and a persisted id so
     // the rest of this turn and the next resume it (#572). Stateless
     // backends re-pack the full envelope every time.
+    // A drain can commit a prefix and then throw; mark uncertainty before it
+    // starts so opaque native history is not resumed past that partial write.
+    if (ctx.completedToolRound && ports.steering) steeringDeliveryUncertain = true;
+    const inserted = ctx.completedToolRound
+      ? ((await ports.steering?.drain(ctx.signal)) ?? [])
+      : [];
+    if (ctx.completedToolRound && inserted.length === 0) steeringDeliveryUncertain = false;
+    for (const input of inserted) steeringEids.add(input.eid);
+    const additions: ReseedDialogueEntry[] = [
+      { role: 'runtime', text: body },
+      ...inserted.map((input): ReseedDialogueEntry => ({ role: 'user', text: input.text })),
+    ];
+    const delta = [body, ...inserted.map((input) => `USER:\n${input.text}`)].join('\n\n');
     const decision = decideContinuationSession(canReuseBackendSession, state.id, ports.mintId);
     if (decision.mode === 'seed') {
       state.id = decision.id;
@@ -439,14 +490,7 @@ export function createSessionProviderTurn(
       // shape made the NEXT turn roll this session again — the very
       // fragmentation this fix exists to stop (Lumen, PR #577).
       state.shape = envelopeShapeKey(runtime);
-      ports.append({
-        type: 'backend_session',
-        ...(runtime.appliedControlId ? { controlId: runtime.appliedControlId } : {}),
-        ...(runtime.providerRecoveryDisabled ? { recoverable: false } : {}),
-        id: decision.id,
-        routing: runtime.toolRouting,
-        reason: 'mid-turn-roll',
-      });
+      recordSeed(decision.id, 'mid-turn-roll');
       ports.notice('mid-turn-roll');
     }
     // Regenerated per continuation, never the opening's stamp reused: the
@@ -456,17 +500,30 @@ export function createSessionProviderTurn(
     const continuationStamp = formatContextStamp(
       turnContextOccupancy(ledger, runtime, ports.measurement())
     );
-    const continuationPrompt = buildContinuationPrompt(
-      decision.mode,
-      continuationStamp,
-      body,
-      (promptBody, stamp) => ports.buildEnvelope(promptBody, stamp),
-      () => buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
-    );
+    const renderDialogue = () =>
+      buildMidTurnReseedBody([...turnDialogue, ...additions], {
+        protectedTail: additions.length,
+        stateless: decision.mode === 'stateless',
+      });
+    const renderEnvelope = (promptBody: string, stamp?: string) =>
+      ports.buildEnvelope(promptBody, stamp, steeringEids);
+    // A stateless request also needs the ordered dialogue once steering is in
+    // play: placing the ledger's new user text before its preceding tool call
+    // would invert the correction's chronology and repeat it in the body.
+    const continuationPrompt =
+      decision.mode === 'stateless' && steeringEids.size > 0
+        ? renderEnvelope(renderDialogue(), continuationStamp)
+        : buildContinuationPrompt(
+            decision.mode,
+            continuationStamp,
+            delta,
+            renderEnvelope,
+            renderDialogue
+          );
 
     // Recorded for a later reseed in this same turn; the seed above already
     // rendered this body itself.
-    turnDialogue.push({ role: 'runtime', text: body });
+    turnDialogue.push(...additions);
 
     const contSpawn = continuationSpawnArgs(decision, turnMedia.length > 0);
     const contSessionId =
@@ -497,6 +554,9 @@ export function createSessionProviderTurn(
     ports.recordUsage(contResult.usage);
     ports.sampleContext(contResult.usage);
     noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
+    ports.steering?.assertHealthy();
+    await confirmSteeredSeed(contSessionId, contResult);
+    if (contResult.success) steeringDeliveryUncertain = false;
     return contResult;
   };
 
@@ -504,6 +564,9 @@ export function createSessionProviderTurn(
     prompt,
     runTurn: runTurnForLoop,
     relayOccupancy,
+    get steeringDeliveryUncertain(): boolean {
+      return steeringDeliveryUncertain;
+    },
     get lastRunResult(): BackendRunResult {
       return lastRunResult;
     },

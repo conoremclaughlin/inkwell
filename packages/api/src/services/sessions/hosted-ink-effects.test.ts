@@ -201,3 +201,29 @@ it('publishes generation-scoped terminal control receipts after Stop, without la
   await h.a.close();
   await h.b.close();
 });
+
+it('publishes steering receipts with the admitted generation even after Stop', async () => {
+  const h = await setup();
+  const stop = new AbortController();
+  const effects = await h.prepare(h.input('fixture'), {
+    ...h.ports('fixture'),
+    signal: stop.signal,
+  });
+  h.publish.mockClear();
+  stop.abort();
+  effects.presentation.notice('late text');
+  effects.steeringReceipt?.({
+    messageId: 'pending-at-stop',
+    status: 'refused',
+    reason: 'owner_stopped',
+  });
+  expect(h.publish).toHaveBeenCalledExactlyOnceWith('fixture-session', 'session_steering_receipt', {
+    messageId: 'pending-at-stop',
+    status: 'refused',
+    reason: 'owner_stopped',
+    turnEpoch: 'epoch',
+  });
+  await effects.close();
+  await h.a.close();
+  await h.b.close();
+});

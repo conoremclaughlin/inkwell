@@ -104,6 +104,8 @@ export interface LedgerCompactResult {
 export interface PromptBuildOptions {
   maxTokens?: number;
   includeSources?: boolean;
+  /** Entries already carried in the current chronological dialogue, not evicted. */
+  excludeEids?: ReadonlySet<number>;
 }
 
 export const DEFAULT_CHARS_PER_TOKEN = 4;
@@ -276,6 +278,7 @@ export class ContextLedger {
     let running = 0;
     for (let i = this.entries.length - 1; i >= 0; i--) {
       const entry = this.entries[i];
+      if (entry.eid !== undefined && options.excludeEids?.has(entry.eid)) continue;
       if (maxTokens && chosen.length > 0 && running + entry.approxTokens > maxTokens) {
         break;
       }

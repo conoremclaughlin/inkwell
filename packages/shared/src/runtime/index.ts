@@ -74,3 +74,4 @@ export * from './clone-policy.js';
 export * from './mcp-result.js';
 export * from './approval-sanitize.js';
 export * from './session-control.js';
+export * from './session-steering.js';

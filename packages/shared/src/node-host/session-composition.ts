@@ -55,6 +55,7 @@ import type {
 } from '../providers/session-provider.js';
 import type { TurnMedia } from '../providers/types.js';
 import type { SessionToolsPorts } from '../runtime/session-tools.js';
+import { createSessionSteering, type SessionSteeringPorts } from '../runtime/session-steering.js';
 
 export interface ComposedSessionState extends SessionProviderRuntime {
   sessionId: string;
@@ -105,6 +106,7 @@ export interface SessionCompositionPorts {
   };
   observe?: AgentLoopPorts['observe'];
   controls?: Pick<SessionControlsPorts, 'skills' | 'assertCurrent' | 'receipt'>;
+  steering?: Pick<SessionSteeringPorts, 'turnEpoch' | 'assertCurrent' | 'receipt'>;
 }
 
 export interface ComposedTurnInput extends SessionTurnInput {
@@ -329,6 +331,13 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     refs: new Set(),
   };
   let running = false;
+  const steering = ports.steering
+    ? createSessionSteering({
+        ...ports.steering,
+        log,
+        ledger,
+      })
+    : undefined;
   const run = async (
     input: ComposedTurnInput,
     options: {
@@ -344,6 +353,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     if (!input.raw.trim()) return undefined;
     running = true;
     try {
+      steering?.beginTurn();
       await controls.drain(options.signal);
       stream.resetTurn();
       stream.resetSends();
@@ -367,6 +377,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
             },
             {
               ui: presentation.ui,
+              finishSteering: () => steering?.endTurn() ?? Promise.resolve(),
               tools: {
                 execute: (calls, ctx) =>
                   tools(calls, {
@@ -392,17 +403,19 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
                 cliAttached: ports.cliAttached,
                 passthroughArgs: gate.passthroughArgs,
                 dialogue: stream.dialogue,
+                steering,
                 mintId: ports.mintId,
                 append: (event) => log.append(event),
                 flush: () => log.flush(),
-                buildEnvelope: (body, stamp) =>
+                buildEnvelope: (body, stamp, excludeEids) =>
                   buildSessionPrompt(
                     sbSlug,
                     runtime,
                     ledger,
                     body,
                     buildLocalToolInstruction({ audience: 'parent' }),
-                    stamp
+                    stamp,
+                    excludeEids
                   ),
                 measurement: () => context.measurement(),
                 spawnContext: ports.spawnContext,
@@ -483,8 +496,13 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
         options.signal
       );
     } finally {
-      await Promise.all(activityWrites);
-      running = false;
+      try {
+        // Also covers preparation failures before runSessionAgentTurn exists.
+        await steering?.endTurn();
+      } finally {
+        await Promise.all(activityWrites);
+        running = false;
+      }
     }
   };
   return {
@@ -503,6 +521,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     clones,
     cloneRegistry,
     controls,
+    steering,
     consecutiveBackendFailures: () => consecutiveBackendFailures,
   };
 }

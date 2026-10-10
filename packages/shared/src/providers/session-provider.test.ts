@@ -50,8 +50,16 @@ function harness(backend = 'claude', session = 'session-a') {
     mintId: () => `${session}-seed-${++mint}`,
     append: (entry) => events.push(entry),
     flush: vi.fn(async () => {}),
-    buildEnvelope: (body, stamp) =>
-      buildSessionPrompt('echo', ports.runtime, ports.ledger, body, 'local tools', stamp),
+    buildEnvelope: (body, stamp, excludeEids) =>
+      buildSessionPrompt(
+        'echo',
+        ports.runtime,
+        ports.ledger,
+        body,
+        'local tools',
+        stamp,
+        excludeEids
+      ),
     measurement: () => undefined,
     spawnContext: () => ({
       inkSessionId: session,
@@ -100,6 +108,122 @@ function harness(backend = 'claude', session = 'session-a') {
 }
 
 describe('shared session provider composition', () => {
+  it.each(['success', 'failed', 'throw', 'unconfirmed-exit', 'recovery-disabled'] as const)(
+    'keeps a seed containing retained steering unrecoverable until confirmed success (%s)',
+    async (path) => {
+      const h = harness();
+      h.ports.ledger.addEntry('user', 'Retained owner correction.', 'steering', 4);
+      if (path === 'recovery-disabled') h.ports.runtime.providerRecoveryDisabled = true;
+      const t = h.turn();
+      expect(h.events.at(-1)).toMatchObject({ type: 'backend_session', recoverable: false });
+      if (path === 'throw')
+        vi.mocked(h.ports.startTurn).mockImplementationOnce(() => {
+          throw new Error('seed launch refused');
+        });
+      else
+        vi.mocked(h.ports.startTurn).mockReturnValueOnce({
+          result: Promise.resolve(
+            result({ success: path !== 'failed', childExited: path !== 'unconfirmed-exit' })
+          ),
+          abort: vi.fn(),
+        });
+      if (path === 'throw')
+        await expect(t.runTurn(t.prompt, { isContinuation: false })).rejects.toThrow(
+          'seed launch refused'
+        );
+      else await t.runTurn(t.prompt, { isContinuation: false });
+      const confirmed = h.events.filter(
+        (event) => event.type === 'backend_session' && event.recoverable === true
+      );
+      expect(confirmed).toHaveLength(path === 'success' ? 1 : 0);
+      if (path === 'success')
+        expect(confirmed[0]).toMatchObject({
+          id: h.ports.state.id,
+          reason: 'steering-seed-confirmed',
+        });
+    }
+  );
+
+  it.each(['resume', 'seed', 'stateless'] as const)(
+    'inserts owner text once, after its tool results, on %s continuations',
+    async (mode) => {
+      const h = harness(mode === 'stateless' ? 'codex' : 'claude');
+      h.ports.ledger.addEntry('user', 'prior-turn correction', 'steering', 3);
+      let count = 0;
+      h.ports.steering = {
+        assertHealthy: vi.fn(),
+        drain: vi.fn(async () => {
+          const text = `correction marker ${++count}`;
+          const eid = 100 + count;
+          h.ports.ledger.addEntry('user', text, 'steering', eid);
+          return [{ messageId: `input-${count}`, text, eid }];
+        }),
+      };
+      const t = h.turn();
+      await t.runTurn(t.prompt, { isContinuation: false });
+      h.ports.dialogue.push({ role: 'assistant', text: 'first request marker' });
+      if (mode === 'seed') h.ports.state.id = undefined;
+      await t.runTurn('first result marker', { isContinuation: true, completedToolRound: true });
+      const first = vi.mocked(h.ports.startTurn).mock.calls[1][0].prompt;
+      expect(first.split('correction marker 1')).toHaveLength(2);
+      expect(first.indexOf('first result marker')).toBeLessThan(
+        first.indexOf('correction marker 1')
+      );
+      expect(first).toContain('USER:\ncorrection marker 1');
+      if (mode !== 'resume') expect(first).toContain('prior-turn correction');
+      h.ports.dialogue.push({ role: 'assistant', text: 'second request marker' });
+      if (mode === 'seed') h.ports.state.id = undefined;
+      await t.runTurn('second result marker', { isContinuation: true, completedToolRound: true });
+      const second = vi.mocked(h.ports.startTurn).mock.calls[2][0].prompt;
+      expect(second.split('correction marker 2')).toHaveLength(2);
+      if (mode === 'resume') expect(second).not.toContain('correction marker 1');
+      else {
+        expect(second.split('correction marker 1')).toHaveLength(2);
+        expect(second.indexOf('correction marker 1')).toBeLessThan(
+          second.indexOf('second request marker')
+        );
+        expect(second.indexOf('second request marker')).toBeLessThan(
+          second.indexOf('second result marker')
+        );
+      }
+      expect(second.indexOf('second result marker')).toBeLessThan(
+        second.indexOf('correction marker 2')
+      );
+      expect(h.ports.ledger.listEntries().filter((e) => e.source === 'steering')).toHaveLength(3);
+      // The next ordinary turn uses the retained ledger rather than inheriting
+      // this turn's transient exclusion set.
+      h.ports.state.id = undefined;
+      const nextPrompt = h.turn().prompt;
+      expect(nextPrompt).toContain('correction marker 1');
+      expect(nextPrompt).toContain('correction marker 2');
+    }
+  );
+
+  it('does not drain on opening, correction-only or final-relay continuations', async () => {
+    const h = harness();
+    h.ports.steering = { assertHealthy: vi.fn(), drain: vi.fn(async () => []) };
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    await t.runTurn('final relay', { isContinuation: true });
+    expect(h.ports.steering.drain).not.toHaveBeenCalled();
+  });
+
+  it('stops before continuation dispatch when steering persistence is uncertain', async () => {
+    const h = harness();
+    h.ports.steering = {
+      assertHealthy: vi.fn(),
+      drain: vi.fn(async () => {
+        throw new Error('uncertain steering write');
+      }),
+    };
+    const t = h.turn();
+    await t.runTurn(t.prompt, { isContinuation: false });
+    await expect(
+      t.runTurn('result', { isContinuation: true, completedToolRound: true })
+    ).rejects.toThrow('uncertain steering write');
+    expect(h.ports.startTurn).toHaveBeenCalledOnce();
+  });
+
   it('seeds once, resumes with recall delta, and carries explicit host routing and streams', async () => {
     const h = harness();
     const first = h.turn();

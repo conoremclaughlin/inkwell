@@ -82,6 +82,10 @@ export function createProviderRecovery(backend: string) {
           'context_budget_changed',
           'backend_session_invalidated',
           'session_control',
+          // An input commit is not a provider delivery acknowledgment. After a
+          // crash we cannot know whether the native continuation received it;
+          // rebuild the next ordinary turn unless a later seed supersedes it.
+          'steering_input',
         ].includes(event.type)
       ) {
         session = undefined;

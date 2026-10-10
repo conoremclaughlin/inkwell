@@ -34,7 +34,12 @@
  * children and must not terminalize them.
  */
 
-import type { SessionControlRequest, SessionControlReceipt } from '@inklabs/shared/runtime';
+import type {
+  SessionControlRequest,
+  SessionControlReceipt,
+  SessionSteeringRequest,
+  SessionSteeringReceipt,
+} from '@inklabs/shared/runtime';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -97,6 +102,8 @@ export interface ActiveRun {
   turnEpochCandidates?: string[];
   /** Routing only; registered by the already-admitted hosted composer, never an owner lease. */
   hostedControls?: (request: SessionControlRequest) => SessionControlReceipt;
+  /** Direct owner input only; ordinary messages retain their existing queue. */
+  hostedSteering?: (request: SessionSteeringRequest) => Promise<SessionSteeringReceipt>;
 }
 
 const active = new Map<string, ActiveRun>();
@@ -551,4 +558,56 @@ export function submitRunControl(
   )
     return { controlId: request.controlId, status: 'refused', reason: 'no_current_hosted_owner' };
   return run.hostedControls(request);
+}
+
+/** Bind direct steering to the existing generation, never a second session owner. */
+export function attachRunSteering(
+  sessionId: string,
+  turnEpoch: string,
+  enqueue: (request: SessionSteeringRequest) => Promise<SessionSteeringReceipt>
+): () => void {
+  if (!mayGenerationProceed(sessionId, turnEpoch))
+    throw new Error('Hosted steering owner not admitted');
+  const run = active.get(sessionId)!;
+  if (run.hostedSteering || run.runnerSettledAt !== undefined)
+    throw new Error('Hosted steering port unavailable');
+  run.hostedSteering = enqueue;
+  return () => {
+    if (run.hostedSteering === enqueue) delete run.hostedSteering;
+  };
+}
+
+/** A lost acknowledgment is uncertain, never permission to enqueue another turn. */
+export async function submitRunSteering(
+  sessionId: string,
+  turnEpoch: string,
+  request: SessionSteeringRequest
+): Promise<SessionSteeringReceipt> {
+  const run = active.get(sessionId);
+  const enqueue = run?.hostedSteering;
+  const current = () =>
+    mayGenerationProceed(sessionId, turnEpoch) &&
+    active.get(sessionId) === run &&
+    run?.runnerSettledAt === undefined &&
+    run?.hostedSteering === enqueue;
+  if (!enqueue || !current())
+    return { messageId: request.messageId, status: 'refused', reason: 'no_current_hosted_owner' };
+  let receipt: SessionSteeringReceipt;
+  try {
+    receipt = await enqueue(request);
+  } catch {
+    return {
+      messageId: request.messageId,
+      status: 'unknown',
+      reason: 'steering_handoff_uncertain',
+    };
+  }
+  if (!current() && receipt.status !== 'refused' && receipt.status !== 'unknown')
+    return {
+      messageId: request.messageId,
+      status: 'unknown',
+      reason: 'owner_changed_during_admission',
+      ...(receipt.eid !== undefined ? { eid: receipt.eid } : {}),
+    };
+  return receipt;
 }

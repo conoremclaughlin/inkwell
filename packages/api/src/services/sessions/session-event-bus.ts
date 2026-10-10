@@ -125,6 +125,9 @@ export const OBSERVER_PROJECTION_TYPES: ReadonlySet<string> = new Set([
   'backend_session',
   'compaction',
   'session_control',
+  'steering_request',
+  'steering_input',
+  'steering_receipt',
   'session_pause',
   'session_end',
 ]);
@@ -185,6 +188,29 @@ export function projectObserverEntry(entry: ObserverEntry): ObserverEntry | null
         ...(entry.sender !== undefined ? { sender: String(entry.sender) } : {}),
         ...(entry.subject !== undefined ? { subject: String(entry.subject) } : {}),
         preview: truncateForWire(entry.rendered ?? entry.content, 200),
+      };
+    case 'steering_request':
+    case 'steering_input':
+      // Direct owner input, not arbitrary sender-supplied provenance or control fields.
+      return {
+        ...base,
+        messageId: truncateForWire(entry.messageId, 128),
+        turnEpoch: truncateForWire(entry.turnEpoch, 128),
+        content: truncateForWire(entry.text, 400),
+        ...(entry.type === 'steering_input' && Number.isSafeInteger(entry.boundary)
+          ? { boundary: entry.boundary }
+          : {}),
+      };
+    case 'steering_receipt':
+      return {
+        ...base,
+        messageId: truncateForWire(entry.messageId, 128),
+        turnEpoch: truncateForWire(entry.turnEpoch, 128),
+        status: ['pending', 'inserted', 'refused', 'unknown'].includes(String(entry.status))
+          ? String(entry.status)
+          : 'unknown',
+        ...(typeof entry.reason === 'string' ? { reason: truncateForWire(entry.reason, 128) } : {}),
+        ...(Number.isSafeInteger(entry.inputEid) ? { inputEid: entry.inputEid } : {}),
       };
     case 'session_control':
       // Receipt only: local paths, provenance and instruction contents are not observer fields.

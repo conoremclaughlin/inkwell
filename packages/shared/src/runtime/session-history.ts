@@ -11,6 +11,7 @@ import { AUTO_EVICT_TOMBSTONE_SOURCE } from './auto-evict.js';
 import { readRecordedContextImages } from './context-media.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isCloneHandoffTool } from './spawn-agent.js';
+import { readSessionSteeringInput } from './session-steering.js';
 
 export interface HistoryHydrationResult {
   loaded: number;
@@ -198,6 +199,7 @@ function* ledgerHydration(
       type === 'context_trim' ||
       type === 'compaction' ||
       type === 'context_budget_changed' ||
+      type === 'steering_input' ||
       type === 'backend_session_invalidated'
     ) {
       // The window it measured is gone — live, the same mutations clear it.
@@ -373,6 +375,22 @@ function* ledgerHydration(
       // which is exactly this case — and it also covers an empty kept list,
       // where the summary is the whole ledger.
       if (summaryIndex >= keptEntries.length) addSummary();
+      continue;
+    }
+    if (type === 'steering_input') {
+      const input = readSessionSteeringInput(event);
+      if (!input) continue;
+      const entry = ledger.addEntry('user', input.text, 'steering', eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      messageCount += 1;
+      pushPreview(
+        'user',
+        input.text,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        'steering',
+        eid
+      );
       continue;
     }
     if (type === 'user' && typeof event.content === 'string') {

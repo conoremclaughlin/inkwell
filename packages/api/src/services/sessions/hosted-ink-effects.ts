@@ -218,6 +218,11 @@ export function createHostedInkEffects(host: HostedInkEffectHost): PrepareHosted
           ...receipt,
           turnEpoch: input.turnEpoch,
         }),
+      steeringReceipt: (receipt) =>
+        host.publish(input.sessionId, 'session_steering_receipt', {
+          ...receipt,
+          turnEpoch: input.turnEpoch,
+        }),
       mintId: randomUUID,
       // Launch profiles are per-run, not edits of a shared machine policy. Approved
       // persistent grants await their merged write above before returning true.

@@ -286,7 +286,13 @@ export interface AgentLoopPorts {
      */
     runTurn(
       body: string,
-      ctx: { iteration: number; isContinuation: boolean; signal?: AbortSignal }
+      ctx: {
+        iteration: number;
+        isContinuation: boolean;
+        signal?: AbortSignal;
+        /** Only an ordinary continuation after the completed tool round. */
+        completedToolRound?: true;
+      }
     ): Promise<BackendTurnOutcome>;
   };
   /** Parent-only observability (Ctrl+T inspector). Clones omit this entirely. */
@@ -1259,6 +1265,7 @@ export async function runAgentLoop(
           iteration,
           isContinuation: true,
           signal: input.signal,
+          completedToolRound: true,
         }
       );
     } finally {

@@ -18,6 +18,9 @@ export const OBS_PROJECTION_TYPES: ReadonlySet<string> = new Set([
   'backend_session',
   'compaction',
   'session_control',
+  'steering_request',
+  'steering_input',
+  'steering_receipt',
   'session_pause',
   'session_end',
 ]);

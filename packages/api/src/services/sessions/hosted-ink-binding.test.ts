@@ -5,7 +5,7 @@ import { mkdtemp, realpath, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createBoundHostedInkRunner, type HostedInkBinding } from './hosted-ink-binding';
-import { registerActiveRun, resetActiveRuns } from './active-runs';
+import { registerActiveRun, resetActiveRuns, submitRunSteering } from './active-runs';
 import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
 import type { ClaudeRunnerConfig } from './types';
 import type { HostedInkSessionPorts } from './hosted-ink-session';
@@ -177,4 +177,62 @@ describe('server binding, admitted identity and explicit resources', () => {
     expect(h.prepare).not.toHaveBeenCalled();
     expect(h.host.resolveBinary).not.toHaveBeenCalled();
   });
+});
+
+it('binds steering to the admitted generation and releases it when execution retires', async () => {
+  const h = await setup();
+  h.prepare.mockImplementation(async (_input, ports) => {
+    expect(ports.steering).toBeDefined();
+    ports.steering!.bind(async (request) => ({ messageId: request.messageId, status: 'pending' }));
+    expect(
+      await submitRunSteering(h.sessionId, 'fixture-epoch', {
+        messageId: 'fixture-correction',
+        text: 'New information.',
+      })
+    ).toEqual({ messageId: 'fixture-correction', status: 'pending' });
+    throw new Error('fixture stops before tools or providers');
+  });
+  const outcome = await createBoundHostedInkRunner(h.host).run('work', { config: h.config });
+  expect(outcome.success).toBe(false);
+  expect(h.host.resolveBinary).not.toHaveBeenCalled();
+  expect(
+    await submitRunSteering(h.sessionId, 'fixture-epoch', {
+      messageId: 'after-retirement',
+      text: 'Must not dispatch.',
+    })
+  ).toMatchObject({ status: 'refused' });
+});
+
+it('withholds steering from the admitted tools tier regardless of later caller changes', async () => {
+  const h = await setup();
+  h.config.executionTier = 'tools';
+  h.config.toolPolicyPath = join(h.cwd, 'tools-only-policy.json');
+  const fetch = vi.fn(async () => {
+    throw new Error('No network in this fixture');
+  });
+  vi.stubGlobal('fetch', fetch);
+  let steeringAvailable: boolean | undefined;
+  h.prepare.mockImplementation(async (_input, ports) => {
+    // The runner has already frozen its launch input. An external object or
+    // mutable identity changing afterwards must not grow this run's authority.
+    h.config.executionTier = 'full';
+    steeringAvailable = ports.steering !== undefined;
+    expect(
+      await submitRunSteering(h.sessionId, 'fixture-epoch', {
+        messageId: 'tools-only-correction',
+        text: 'Do not admit this input.',
+      })
+    ).toEqual({
+      messageId: 'tools-only-correction',
+      status: 'refused',
+      reason: 'no_current_hosted_owner',
+    });
+    throw new Error('fixture stops before tools or providers');
+  });
+  const outcome = await createBoundHostedInkRunner(h.host).run('work', { config: h.config });
+  expect(steeringAvailable).toBe(false);
+  expect(outcome.success).toBe(false);
+  expect(h.prepare).toHaveBeenCalledOnce();
+  expect(fetch).not.toHaveBeenCalled();
+  expect(h.host.resolveBinary).not.toHaveBeenCalled();
 });

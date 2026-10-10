@@ -736,3 +736,96 @@ describe('HostedInkSessionRunner: the turn’s lifetime (Lumen’s #757 review)'
     });
   });
 });
+
+describe('hosted steering lifetime fence', () => {
+  it('retires a retained mailbox and refuses without re-entering the composer', async () => {
+    let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+    const release = vi.fn();
+    const enqueue = vi.fn(async (request: { messageId: string; text: string }) => ({
+      messageId: request.messageId,
+      status: 'pending' as const,
+    }));
+    const deps = dependencies({
+      steering: {
+        assertCurrent: vi.fn(),
+        bind: (next) => {
+          bound = next;
+          return release;
+        },
+      },
+    });
+    await runner(async (_input, ports) => {
+      ports.steering!.bind(enqueue);
+      expect(await bound({ messageId: 'first', text: 'Update.' })).toEqual({
+        messageId: 'first',
+        status: 'pending',
+      });
+      return { success: true, responses: [] };
+    }, deps).run('work', { config: config() });
+    expect(release).toHaveBeenCalledOnce();
+    expect(await bound({ messageId: 'late', text: 'Never dispatch.' })).toEqual({
+      messageId: 'late',
+      status: 'refused',
+      reason: 'owner_closing',
+    });
+    expect(enqueue).toHaveBeenCalledOnce();
+  });
+
+  it.each(['pending', 'inserted', 'refused', 'unknown'] as const)(
+    'rechecks Stop across an async %s acknowledgment without changing definitive refusal',
+    async (status) => {
+      const stop = new AbortController();
+      let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+      const release = vi.fn();
+      const deps = dependencies({
+        steering: {
+          assertCurrent: vi.fn(),
+          bind: (next) => {
+            bound = next;
+            return release;
+          },
+        },
+      });
+      const outcome = await runner(async (_input, ports) => {
+        ports.steering!.bind(async (request) => {
+          await Promise.resolve();
+          stop.abort();
+          return { messageId: request.messageId, status };
+        });
+        expect(await bound({ messageId: 'in-flight', text: 'Correction.' })).toMatchObject({
+          messageId: 'in-flight',
+          status: status === 'refused' ? 'refused' : 'unknown',
+        });
+        return { success: true, responses: [] };
+      }, deps).run('work', { config: config({ signal: stop.signal }) });
+      expect(outcome.success).toBe(false);
+      expect(release).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('refuses a generation whose admission fence closes before enqueue', async () => {
+    let current = true;
+    let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+    const enqueue = vi.fn();
+    const deps = dependencies({
+      steering: {
+        assertCurrent: () => {
+          if (!current) throw new Error('retired');
+        },
+        bind: (next) => {
+          bound = next;
+          return vi.fn();
+        },
+      },
+    });
+    await runner(async (_input, ports) => {
+      ports.steering!.bind(enqueue);
+      current = false;
+      expect(await bound({ messageId: 'late', text: 'Never dispatch.' })).toMatchObject({
+        status: 'refused',
+      });
+      return { success: true, responses: [] };
+    }, deps).run('work', { config: config() });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+});

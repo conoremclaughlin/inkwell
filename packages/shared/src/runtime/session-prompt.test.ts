@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
 import {
   buildSessionPrompt,
+  buildMidTurnReseedBody,
   formatBootstrapContext,
   type SessionPromptState,
 } from './session-prompt.js';
@@ -17,6 +18,45 @@ describe('shared session prompt composition', () => {
     bootstrapContext: 'Echo identity',
     threadKey: 'task:echo-proof',
   };
+
+  it('excludes only the named chronological replay entries without changing the ledger', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'prior owner correction', 'steering', 1);
+    ledger.addEntry('user', 'current owner correction', 'steering', 2);
+    ledger.addEntry('system', 'ordinary context', 'bootstrap', 3);
+    const text = buildSessionPrompt(
+      'echo',
+      state,
+      ledger,
+      'body',
+      'tools',
+      undefined,
+      new Set([2])
+    );
+    expect(text).toContain('prior owner correction');
+    expect(text).toContain('ordinary context');
+    expect(text).not.toContain('current owner correction');
+    expect(ledger.listEntries()).toHaveLength(3);
+  });
+
+  it('preserves user attribution and the complete latest boundary when older dialogue is elided', () => {
+    const text = buildMidTurnReseedBody(
+      [
+        { role: 'user', text: 'earlier owner correction' },
+        { role: 'assistant', text: 'discardable'.repeat(4_000) },
+        { role: 'runtime', text: 'latest results'.repeat(4_000) },
+        { role: 'user', text: 'new owner correction' },
+      ],
+      { protectedTail: 2, stateless: true }
+    );
+    expect(text).toContain('USER:\nearlier owner correction');
+    expect(text).toContain('latest results'.repeat(4_000));
+    expect(text).toContain('USER:\nnew owner correction');
+    expect(text).not.toContain('discardable');
+    expect(text).toContain('earlier turn dialogue elided: 1 entry');
+    expect(text.indexOf('earlier owner correction')).toBeLessThan(text.indexOf('latest results'));
+    expect(text.indexOf('latest results')).toBeLessThan(text.indexOf('new owner correction'));
+  });
 
   it('retains identity, skills, history, tool instructions and the fresh stamp in order', () => {
     const ledger = new ContextLedger();

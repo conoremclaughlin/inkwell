@@ -1,4 +1,9 @@
-import type { SessionControlRequest, SessionControlReceipt } from '@inklabs/shared/runtime';
+import type {
+  SessionControlRequest,
+  SessionControlReceipt,
+  SessionSteeringRequest,
+  SessionSteeringReceipt,
+} from '@inklabs/shared/runtime';
 import type { BackendRunResult, SessionProviderPorts } from '@inklabs/shared/providers';
 /**
  * An `ink` session's turn run inside this server by the shared session
@@ -104,8 +109,14 @@ export interface HostedControlPort {
   bind(enqueue: (request: SessionControlRequest) => SessionControlReceipt): () => void;
 }
 
+export interface HostedSteeringPort {
+  assertCurrent(): void;
+  bind(enqueue: (request: SessionSteeringRequest) => Promise<SessionSteeringReceipt>): () => void;
+}
+
 export interface HostedInkSessionPorts {
   readonly controls?: HostedControlPort;
+  readonly steering?: HostedSteeringPort;
   /** Every Inkwell tool, bootstrap, recall and send_response included, token-scoped to the session. */
   readonly inkwell: {
     callTool(
@@ -151,6 +162,7 @@ export type ExecuteHostedInkSession = (
 /** Built once per turn, then frozen. */
 export interface HostedInkTurnDependencies {
   readonly controls?: HostedControlPort;
+  readonly steering?: HostedSteeringPort;
   readonly inkwell: HostedInkSessionPorts['inkwell'];
   /** The server host: startHostedBackendTurn(hostInput, request). Throws with nothing started when refused. */
   startProviderTurn(request: ProviderTurnRequest): ProviderTurnHandle;
@@ -563,6 +575,54 @@ export class HostedInkSessionRunner implements IRunner {
                         reason: 'owner_closing',
                       };
                     return enqueue(request);
+                  });
+                  lifetime.whenClosed(release);
+                  return release;
+                },
+              },
+            }
+          : {}),
+        ...(deps.steering
+          ? {
+              steering: {
+                assertCurrent: () => {
+                  lifetime.signal.throwIfAborted();
+                  deps.steering!.assertCurrent();
+                },
+                bind: (
+                  enqueue: (request: SessionSteeringRequest) => Promise<SessionSteeringReceipt>
+                ) => {
+                  lifetime.signal.throwIfAborted();
+                  const release = deps.steering!.bind(async (request) => {
+                    if (lifetime.closed)
+                      return {
+                        messageId: request.messageId,
+                        status: 'refused',
+                        reason: 'owner_closing',
+                      };
+                    try {
+                      deps.steering!.assertCurrent();
+                    } catch {
+                      return {
+                        messageId: request.messageId,
+                        status: 'refused',
+                        reason: 'owner_unavailable',
+                      };
+                    }
+                    const receipt = await enqueue(request);
+                    try {
+                      lifetime.signal.throwIfAborted();
+                      deps.steering!.assertCurrent();
+                    } catch {
+                      if (receipt.status !== 'refused' && receipt.status !== 'unknown')
+                        return {
+                          messageId: request.messageId,
+                          status: 'unknown',
+                          reason: 'owner_changed_during_admission',
+                          ...(receipt.eid !== undefined ? { eid: receipt.eid } : {}),
+                        };
+                    }
+                    return receipt;
                   });
                   lifetime.whenClosed(release);
                   return release;
