@@ -25,7 +25,7 @@ function fixture() {
     (input: WebSearchBatchInput) =>
       new Promise<WebSearchBatchOutput>((resolve, reject) => calls.push({ input, resolve, reject }))
   );
-  const coordinator = new SearchCoordinator(run);
+  const coordinator = new SearchCoordinator(run, async () => {});
   const submit = (accountId: string, queries: string[], signal?: AbortSignal, maxResults = 1) =>
     coordinator.submit({ accountId, queries, signal, maxResults, contentRecording: true }).then(
       (value) => ({ ok: true as const, value }),

@@ -80,8 +80,8 @@ export class SearchCoordinator {
   private quarantined = false;
 
   constructor(
-    private readonly run = searchWebBatch,
-    private readonly recordBatch?: (record: SearchBatchRecord) => Promise<void>
+    private readonly run: typeof searchWebBatch,
+    private readonly recordBatch: (record: SearchBatchRecord) => Promise<void>
   ) {}
 
   async submit(input: CoordinatedSearchInput): Promise<CoordinatedSearchOutput> {
@@ -218,7 +218,7 @@ export class SearchCoordinator {
       try {
         // Also runs when every subscriber cancelled. Caller lifetime does not
         // erase the account-level evidence. Production supplies a required sink.
-        await this.recordBatch?.({
+        await this.recordBatch({
           accountId,
           batchId: batch.id,
           contentRecording,

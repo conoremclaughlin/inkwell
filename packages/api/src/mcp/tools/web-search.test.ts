@@ -24,7 +24,7 @@ vi.mock('../../services/permissions', () => ({
   getPermissionsService: () => ({ isEnabled: mocks.isEnabled }),
 }));
 
-import { searchWeb } from '../../services/web-search';
+import { searchWeb, searchWebBatch } from '../../services/web-search';
 import { SearchAdmission, searchAdmission } from '../../services/web-search/admission';
 import { SYNTHETIC_ENV } from '../../services/web-search/fixtures.test-support';
 import { WebSearchError } from '../../services/web-search/errors';
@@ -289,7 +289,7 @@ describe('real searchWeb / handler preflight composition (no provider)', () => {
   const realCall = () =>
     runWithRequestContext({ userId }, () =>
       handleWebSearch({ query: 'private preflight query' }, composer, {
-        coordinator: new SearchCoordinator(),
+        coordinator: new SearchCoordinator(searchWebBatch, async () => {}),
       })
     );
 
@@ -449,7 +449,7 @@ function batchedFixture() {
     modelToolCallCount: input.queries.length,
     nativeSearchCount: input.queries.length * 2,
   }));
-  const coordinator = new SearchCoordinator(run);
+  const coordinator = new SearchCoordinator(run, async () => {});
   const request = (args: unknown, account = userId, signal?: AbortSignal) =>
     runWithRequestContext(
       { userId: account, tokenSessionId: 'session-' + account, tokenSbId: 'sb-' + account },
@@ -562,17 +562,20 @@ describe('handler / queue / per-caller audit composition (inert provider)', () =
   });
 
   it('keeps partial omissions per caller and distinguishes zero verified hits from a missing search', async () => {
-    const coordinator = new SearchCoordinator(async (input) => ({
-      provider: 'claude',
-      model: 'test',
-      searchQueries: ['zero'],
-      modelToolCallCount: 1,
-      items: input.queries.map((query) =>
-        query === 'zero'
-          ? { query, success: true, results: [] }
-          : { query, success: false, reason: 'search_not_observed', searchMayHaveRun: true }
-      ),
-    }));
+    const coordinator = new SearchCoordinator(
+      async (input) => ({
+        provider: 'claude',
+        model: 'test',
+        searchQueries: ['zero'],
+        modelToolCallCount: 1,
+        items: input.queries.map((query) =>
+          query === 'zero'
+            ? { query, success: true, results: [] }
+            : { query, success: false, reason: 'search_not_observed', searchMayHaveRun: true }
+        ),
+      }),
+      async () => {}
+    );
     const request = (args: unknown) =>
       runWithRequestContext({ userId }, () => handleWebSearch(args, composer, { coordinator }));
     const [a, b, c] = await Promise.all([
