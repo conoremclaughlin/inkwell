@@ -117,6 +117,7 @@ export async function runOwnedCodexAppServer(input: {
     result = await new Promise<RunnerResult>((resolve) => {
       let finishing = false,
         closed = false;
+      let terminalFailure: string | undefined;
       let release: (() => void) | undefined;
       let mailbox: ReturnType<typeof createNativeSessionSteering> | undefined;
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -194,6 +195,9 @@ export async function runOwnedCodexAppServer(input: {
       });
 
       async function finish(error?: string) {
+        // A native final frame starts cleanup, not a successful process exit.
+        // Retain failures that arrive while that cleanup is already waiting.
+        terminalFailure ??= error;
         if (finishing) return;
         finishing = true;
         clearTimeout(timeout);
@@ -247,6 +251,7 @@ export async function runOwnedCodexAppServer(input: {
         } catch {
           error ??= 'Native steering port release failed';
         }
+        error ??= terminalFailure;
         resolve({
           success: !error && !stopUnconfirmed,
           backendSessionId: protocol.threadId ?? input.backendSessionId ?? null,
@@ -301,7 +306,8 @@ export async function runOwnedCodexAppServer(input: {
       proc.on('error', () => {
         void finish('Codex app-server process failed');
       });
-      proc.on('close', () => {
+      proc.on('close', (code, signal) => {
+        if (code !== 0 || signal) terminalFailure ??= 'Codex app-server did not exit successfully';
         closed = true;
         closeProcess();
         if (!finishing) {

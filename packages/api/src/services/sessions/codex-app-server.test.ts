@@ -189,6 +189,29 @@ describe('owned Codex app-server runner', () => {
     expect(f.sent.filter((x) => x.method === 'turn/steer')).toHaveLength(1);
   });
 
+  it.each([1, null])(
+    'does not report success if native completion is followed by unsuccessful child close %s',
+    async (code) => {
+      const f = fixture();
+      f.proc.stdin.end.mockImplementation(() => {
+        f.proc.stdin.writableEnded = true;
+        queueMicrotask(() => {
+          f.proc.exitCode = code;
+          f.proc.emit('close', code, code === null ? 'SIGTERM' : null);
+        });
+      });
+      const result = f.run();
+      await tick();
+      f.complete();
+      expect(await result).toMatchObject({
+        success: false,
+        error: 'Codex app-server did not exit successfully',
+      });
+      expect(f.release).toHaveBeenCalledOnce();
+      expect(f.log.close).toHaveBeenCalledOnce();
+    }
+  );
+
   it('fails a provider initialization error without retry or exec fallback', async () => {
     const f = fixture();
     f.proc.stdin.write.mockImplementation((line: string) => {
@@ -364,5 +387,17 @@ describe('owned Codex app-server runner', () => {
     expect(await result).toMatchObject({ success: false });
     expect(f.proc.stdin.end).toHaveBeenCalledOnce();
     expect(f.release).toHaveBeenCalledOnce();
+  });
+
+  it('retains a stream failure during cleanup after native completion', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    f.complete();
+    f.proc.stdout.emit('error', new Error('Synthetic late stream failure'));
+    expect(await result).toMatchObject({
+      success: false,
+      error: 'Codex app-server output failed',
+    });
   });
 });
