@@ -3021,6 +3021,7 @@ async function runChatSession(
     tempDir: tmpdir(),
     credentials: sessionCredentials,
     coding: { load: createPiTools, readDocument: tryReadDocument },
+    logPath: runtime.log.path,
   });
   setToolDisposer(() => sessionToolHost.close());
   const toolImageCacheDir = sessionToolHost.cacheDir;
@@ -3175,6 +3176,7 @@ async function runChatSession(
     }
   }
 
+  await sessionToolHost.restoreLedgerImages(ledger);
   await sessionControls.restore(undefined, recoveredProviderControlId);
   // Explicit launch configuration wins, but is now part of the same durable
   // selection: the next host must not silently restore the previous override.
@@ -4217,7 +4219,11 @@ async function runChatSession(
     beginContextMutation: beginContextMutationFor,
     takeImages: takeCapturedImages,
     capture: (dispatch) =>
-      withImageCapture(dispatch, { cacheDir: toolImageCacheDir, delivery: parentImageDelivery }),
+      withImageCapture(dispatch, {
+        cacheDir: toolImageCacheDir,
+        delivery: parentImageDelivery,
+        retainImage: sessionToolHost.retainImage,
+      }),
     dispatch: {
       cwd: process.cwd(),
       ...sessionToolHost.dispatch,

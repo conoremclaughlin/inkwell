@@ -186,6 +186,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     controls.replay(event);
   });
   log.seed(hydrated.maxEid);
+  await toolHost.restoreLedgerImages(ledger, signal);
   const evicted: EvictedEntryRecord[] = [...hydrated.evictedEntries];
   passiveRecall.seedBootstrapIds(hydrated.recoveredMemoryIds);
   if (runtime.backend === 'claude') {
@@ -291,6 +292,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     capture: (dispatch) =>
       toolHost.images.withImageCapture(dispatch, {
         cacheDir: toolHost.cacheDir,
+        retainImage: toolHost.retainImage,
         delivery: () =>
           acceptsContextImagesFor(runtime.backend)
             ? { deliverable: true }

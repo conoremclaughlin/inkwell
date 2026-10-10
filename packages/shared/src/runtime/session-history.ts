@@ -8,6 +8,9 @@ import type { ProviderSampleScope } from './provider-sample.js';
 import { classifyActivity } from './activity-render.js';
 import { formatFanOutForLedger, MAX_CLONE_SUMMARY_CHARS } from './clone-outcomes.js';
 import { AUTO_EVICT_TOMBSTONE_SOURCE } from './auto-evict.js';
+import { readRecordedContextImages } from './context-media.js';
+import { isClientLocalTool } from './context-tools.js';
+import { isCloneHandoffTool } from './spawn-agent.js';
 
 export interface HistoryHydrationResult {
   loaded: number;
@@ -327,7 +330,15 @@ function* ledgerHydration(
           typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail';
         const keptEid = typeof keptRecord.eid === 'number' ? keptRecord.eid : undefined;
         const keptReplay = parseReplayMeta(keptRecord.replay);
-        const entry = ledger.addEntry(role, keptRecord.content, source, keptEid, keptReplay);
+        const entry = ledger.addEntry(
+          role,
+          keptRecord.content,
+          source,
+          keptEid,
+          keptReplay,
+          undefined,
+          readRecordedContextImages(keptRecord.media)
+        );
         hydratedEntryIds.push(entry.id);
         loaded += 1;
         if (keptReplay) {
@@ -490,6 +501,35 @@ function* ledgerHydration(
     }
 
     if (type === 'local_tool_call' && typeof event.tool === 'string') {
+      // Only the new path-free media envelope restores a tool ledger entry.
+      // Legacy tool results stay display-only; context/clone tools never reinsert
+      // the entries they removed or handed off. Preserve exact content and eid
+      // so unavailable-image notes cannot make durable eviction refs drift.
+      const media = event.imageContext as Record<string, unknown> | undefined;
+      if (
+        media &&
+        media.version === 1 &&
+        typeof media.content === 'string' &&
+        media.content.length <= 8192 &&
+        (event.status === 'executed' || event.status === 'approved') &&
+        !isClientLocalTool(event.tool) &&
+        !isCloneHandoffTool(event.tool)
+      ) {
+        const images = readRecordedContextImages(media.images);
+        if (images.length) {
+          const entry = ledger.addEntry(
+            'system',
+            media.content,
+            'local-tool',
+            eid,
+            undefined,
+            undefined,
+            images
+          );
+          hydratedEntryIds.push(entry.id);
+          loaded += 1;
+        }
+      }
       // Tool calls are part of the story — when the assistant says "I sent
       // him a heads-up via Telegram", the send_response call is the receipt.
       // Replay them as dim event lines (display only — tool RESULTS are not
@@ -652,6 +692,7 @@ export function keptEntriesForCompaction(ledger: ContextLedger): Array<Record<st
       source: e.source,
       ...(e.eid !== undefined ? { eid: e.eid } : {}),
       ...(e.replay !== undefined ? { replay: e.replay } : {}),
+      ...(e.media !== undefined ? { media: e.media } : {}),
     }));
 }
 

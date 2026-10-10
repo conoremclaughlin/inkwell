@@ -11,56 +11,19 @@ import { constants } from 'fs';
 import { lstat, mkdir, open, opendir, realpath, rename, unlink } from 'fs/promises';
 import { basename, dirname, isAbsolute, join } from 'path';
 import type { ContextImage } from '../runtime/context-image.js';
+import { estimateImageTokens, MAX_INLINE_IMAGE_BYTES, readImageInfo } from './tool-images.js';
+
+export {
+  parseRetainedImageDescriptor,
+  type RetainedImageDescriptor,
+} from '../runtime/context-media.js';
 import {
-  estimateImageTokens,
-  INLINE_IMAGE_MIME,
-  MAX_INLINE_IMAGE_BYTES,
-  MAX_INLINE_IMAGE_SIDE,
-  readImageInfo,
-} from './tool-images.js';
-
-/** Only this path-free shape may be persisted in a log. */
-export interface RetainedImageDescriptor {
-  version: 1;
-  sha256: string;
-  byteLength: number;
-  mimeType: string;
-  width: number;
-  height: number;
-}
-
-const FIELDS = ['version', 'sha256', 'byteLength', 'mimeType', 'width', 'height'];
+  parseRetainedImageDescriptor,
+  type RetainedImageDescriptor,
+} from '../runtime/context-media.js';
 export const SESSION_MEDIA_MAX_FILES = 64;
 export const SESSION_MEDIA_MAX_BYTES = 64 * 1024 * 1024;
 const IGNORE = '*\n';
-
-export function parseRetainedImageDescriptor(value: unknown): RetainedImageDescriptor | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const v = value as Record<string, unknown>;
-  const bounded = (n: unknown, max: number): n is number =>
-    typeof n === 'number' && Number.isSafeInteger(n) && n > 0 && n <= max;
-  if (
-    Object.keys(v).length !== FIELDS.length ||
-    Object.keys(v).some((key) => !FIELDS.includes(key)) ||
-    v.version !== 1 ||
-    typeof v.sha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(v.sha256) ||
-    !bounded(v.byteLength, MAX_INLINE_IMAGE_BYTES) ||
-    typeof v.mimeType !== 'string' ||
-    !INLINE_IMAGE_MIME.has(v.mimeType) ||
-    !bounded(v.width, MAX_INLINE_IMAGE_SIDE) ||
-    !bounded(v.height, MAX_INLINE_IMAGE_SIDE)
-  )
-    return undefined;
-  return {
-    version: 1,
-    sha256: v.sha256,
-    byteLength: v.byteLength,
-    mimeType: v.mimeType,
-    width: v.width,
-    height: v.height,
-  };
-}
 
 type Refusal = 'invalid_image' | 'invalid_descriptor' | 'quota' | 'unavailable' | 'closed';
 export type RetainedImageResult =

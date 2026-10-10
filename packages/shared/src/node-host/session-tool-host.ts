@@ -6,6 +6,9 @@ import type { LocalToolDispatchDeps } from '../runtime/tool-dispatch.js';
 import { createCodingToolHost, type CodingToolHostPorts } from './coding-tools.js';
 import { createToolImageCapture } from './tool-images.js';
 import { viewImage } from './view-image.js';
+import { SessionMediaStore } from './session-media-store.js';
+import type { ContextLedger } from '../runtime/context-ledger.js';
+import type { ContextImage } from '../runtime/context-image.js';
 
 export function createSessionToolHost(input: {
   cwd: string;
@@ -14,6 +17,9 @@ export function createSessionToolHost(input: {
   tempDir: string;
   credentials: Readonly<Record<string, string>>;
   coding: CodingToolHostPorts;
+  /** Bind only after the canonical log is selected. Absent means ephemeral-only. */
+  logPath?: string;
+  mediaLimits?: { maxFiles?: number; maxBytes?: number };
 }) {
   for (const path of [input.cwd, input.home, input.tempDir, ...input.imageRoots]) {
     if (!isAbsolute(path)) throw new Error('Session tool host paths must be absolute');
@@ -23,6 +29,9 @@ export function createSessionToolHost(input: {
   const credentials = { ...input.credentials };
   const coding = createCodingToolHost(cwd, input.coding);
   const images = createToolImageCapture();
+  const media = input.logPath
+    ? new SessionMediaStore({ logPath: input.logPath, ...input.mediaLimits })
+    : undefined;
   let cache: Promise<string> | undefined;
   let closed = false;
   const requireOpen = () => {
@@ -56,6 +65,30 @@ export function createSessionToolHost(input: {
   return {
     dispatch,
     images,
+    async retainImage(bytes: Buffer): Promise<ContextImage | undefined> {
+      requireOpen();
+      const result = await media?.put(bytes);
+      return result?.ok ? { ...result.image, retained: result.descriptor } : undefined;
+    },
+    async restoreLedgerImages(ledger: ContextLedger, signal?: AbortSignal): Promise<void> {
+      requireOpen();
+      for (const entry of ledger.listEntries()) {
+        if (!entry.media?.length) continue;
+        const restored: ContextImage[] = [];
+        const notes: string[] = [];
+        for (const image of entry.media) {
+          signal?.throwIfAborted();
+          const result = image.retained && (await media?.restore(image.retained));
+          signal?.throwIfAborted();
+          if (result && result.ok) restored.push({ ...result.image, retained: result.descriptor });
+          else
+            notes.push(
+              `[${image.ref} unavailable: an image was here, but its retained bytes could not be verified or were not retained; it has not been reattached to this context]`
+            );
+        }
+        ledger.restoreEntryImages(entry.id, restored, notes);
+      }
+    },
     cacheDir: () => {
       requireOpen();
       cache ??= mkdtemp(join(tempDir, 'ink-tool-images-'));
@@ -65,6 +98,7 @@ export function createSessionToolHost(input: {
     async close() {
       closed = true;
       for (const name of Object.keys(credentials)) delete credentials[name];
+      await media?.close();
       if (cache) await rm(await cache, { recursive: true, force: true });
     },
   };

@@ -134,6 +134,7 @@ export function createHostedInkEffects(host: HostedInkEffectHost): PrepareHosted
         imageRoots: [input.workingDirectory, host.inkFiles],
         credentials,
         coding: coding.ports,
+        logPath: ports.sessionLog.path,
       });
     } catch (error) {
       await coding.close();

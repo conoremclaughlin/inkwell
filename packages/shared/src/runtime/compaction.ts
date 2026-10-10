@@ -8,7 +8,7 @@
  * only ever "correct by inspection" (Lumen, PR #578 rounds 2–3). The policy
  * lives here; the host binds the spawn, the file, and the counters.
  */
-import { type ContextLedger, estimateTokens } from './context-ledger.js';
+import { type ContextLedger, estimateTokens, ledgerEntryText } from './context-ledger.js';
 import { compactionShrinks } from './context-tools.js';
 import type { BackendTokenUsage } from './token-usage.js';
 
@@ -134,7 +134,9 @@ export async function runCompaction(
       failure = 'cancelled';
     } else {
       const chunk = oldest
-        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
+        .map(
+          (e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${ledgerEntryText(e)}`
+        )
         .join('\n\n');
       // The dependency can REJECT, not just answer with an error: spawn
       // preparation, stream finalization, cleanup. Outside a catch that
@@ -231,6 +233,7 @@ export async function runCompaction(
         source: e.source,
         ...(e.eid !== undefined ? { eid: e.eid } : {}),
         ...(e.replay !== undefined ? { replay: e.replay } : {}),
+        ...(e.media !== undefined ? { media: e.media } : {}),
       })),
       summaryIndex,
       removedCount: removedNow.length,

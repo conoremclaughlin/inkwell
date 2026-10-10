@@ -1,6 +1,7 @@
 import type { LocalToolCall, ToolResultRecord } from './agent-loop.js';
 import { localToolLedgerLine } from './auto-evict.js';
 import type { ContextImage } from './context-image.js';
+import { recordContextImages } from './context-media.js';
 import type { ContextLedger } from './context-ledger.js';
 import { isClientLocalTool } from './context-tools.js';
 import { compactForLedger } from './session-history.js';
@@ -72,22 +73,33 @@ export async function runSessionToolBatch(
           );
           iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
         } else {
-          ports.log.append({ ...common, result: result.result });
           // Re-inserting a list/eviction result reintroduces the context that
           // was just removed. Clone handoffs already inserted their own entry.
-          if (!isClientLocalTool(result.tool) && !ports.isHandoffTool(result.tool)) {
-            const images = ports.takeImages(result.result);
+          const keep = !isClientLocalTool(result.tool) && !ports.isHandoffTool(result.tool);
+          const images = keep ? ports.takeImages(result.result) : [];
+          const content = compactForLedger(
+            compactForLedger(
+              localToolLedgerLine(result.tool, result.result, JSON.stringify(result.result)),
+              500
+            ) +
+              (images.length > 0
+                ? ` [${images.map((image) => `${image.ref} ${image.width}x${image.height}`).join(', ')} attached]`
+                : ''),
+            8192
+          );
+          const eid = ports.log.append({
+            ...common,
+            result: result.result,
+            ...(images.length
+              ? { imageContext: { version: 1, content, images: recordContextImages(images) } }
+              : {}),
+          });
+          if (keep) {
             ports.ledger.addEntry(
               'system',
-              compactForLedger(
-                localToolLedgerLine(result.tool, result.result, JSON.stringify(result.result)),
-                500
-              ) +
-                (images.length > 0
-                  ? ` [${images.map((image) => `${image.ref} ${image.width}x${image.height}`).join(', ')} attached]`
-                  : ''),
+              content,
               'local-tool',
-              undefined,
+              images.length ? eid : undefined,
               undefined,
               images
             );

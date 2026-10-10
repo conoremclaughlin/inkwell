@@ -31,22 +31,12 @@ export type { ContextImage } from '../runtime/context-image.js';
 import type { LocalToolDispatcher } from '../runtime/tool-dispatch.js';
 
 /** The types a provider accepts as an inline image block (the Anthropic API set). */
-export const INLINE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-
-/**
- * Largest image a tool may put in front of the model, in raw bytes: 3.75 MB,
- * which is the 5 MB base64 ceiling a single image block has at the Anthropic
- * API. Pi's `read` already resizes below this (4.5 MB of base64), so only an
- * image from some other tool can reach it.
- */
-export const MAX_INLINE_IMAGE_BYTES = Math.floor((5 * 1024 * 1024 * 3) / 4);
-
-/**
- * Longest side a tool image may have. 2000 px is the API's per-image limit once
- * a request carries more than 20 images, and a re-seeded session carries every
- * image still on the ledger at once. Pi's `read` resizes to this.
- */
-export const MAX_INLINE_IMAGE_SIDE = 2000;
+export {
+  INLINE_IMAGE_MIME,
+  MAX_INLINE_IMAGE_BYTES,
+  MAX_INLINE_IMAGE_SIDE,
+} from '../runtime/context-media.js';
+import { MAX_INLINE_IMAGE_BYTES, MAX_INLINE_IMAGE_SIDE } from '../runtime/context-media.js';
 
 export interface ImageInfo {
   mimeType: string;
@@ -184,6 +174,8 @@ export interface CaptureOptions {
   cacheDir: () => Promise<string>;
   /** Asked per result: a session can switch backend between calls. */
   delivery: () => ImageDelivery;
+  /** Retention failure falls back to live delivery, never a lifetime image limit. */
+  retainImage?: (bytes: Buffer) => Promise<ContextImage | undefined>;
 }
 
 interface ImageBlock {
@@ -280,7 +272,8 @@ async function captureToolImages(
       );
       continue;
     }
-    const image = await cacheImage(bytes, info, await opts.cacheDir());
+    const image =
+      (await opts.retainImage?.(bytes)) ?? (await cacheImage(bytes, info, await opts.cacheDir()));
     captured.push(image);
     blocks.push({
       type: 'image',

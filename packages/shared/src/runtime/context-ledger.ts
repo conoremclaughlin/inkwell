@@ -1,5 +1,6 @@
 import { entryRefHash } from './entry-ref-hash.js';
 import type { ContextImage } from './context-image.js';
+import { recordContextImages, type RecordedContextImage } from './context-media.js';
 
 export { entryRefHash } from './entry-ref-hash.js';
 
@@ -45,6 +46,14 @@ export interface LedgerEntry {
    * the entry's text.
    */
   images?: ContextImage[];
+  /** Path-free, survives compaction even when the bytes are unavailable. */
+  media?: RecordedContextImage[];
+  /** Restore-time delivery notes, separate from content's durable eviction identity. */
+  imageNotes?: string[];
+}
+
+export function ledgerEntryText(entry: LedgerEntry): string {
+  return [entry.content, ...(entry.imageNotes ?? [])].join('\n');
 }
 
 export interface LedgerBookmark {
@@ -117,7 +126,8 @@ export class ContextLedger {
     source?: string,
     eid?: number,
     replay?: LedgerReplayMeta,
-    images?: readonly ContextImage[]
+    images?: readonly ContextImage[],
+    media?: readonly RecordedContextImage[]
   ): LedgerEntry {
     const withImages = images && images.length > 0 ? [...images] : undefined;
     const entry: LedgerEntry = {
@@ -132,6 +142,11 @@ export class ContextLedger {
       ...(eid !== undefined ? { eid } : {}),
       ...(replay !== undefined ? { replay } : {}),
       ...(withImages ? { images: withImages } : {}),
+      ...(media?.length
+        ? { media: [...media] }
+        : withImages
+          ? { media: recordContextImages(withImages) }
+          : {}),
     };
     this.entries.push(entry);
     return entry;
@@ -140,6 +155,21 @@ export class ContextLedger {
   /** Every image the ledger currently holds, in entry order. */
   public listImages(): ContextImage[] {
     return this.entries.flatMap((entry) => entry.images ?? []);
+  }
+
+  /** Host validation runs after pure replay, before the first provider dispatch. */
+  public restoreEntryImages(
+    id: number,
+    images: readonly ContextImage[],
+    notes: readonly string[]
+  ): void {
+    const entry = this.entries.find((e) => e.id === id);
+    if (!entry) return;
+    entry.images = images.length ? [...images] : undefined;
+    entry.imageNotes = notes.length ? [...notes] : undefined;
+    entry.approxTokens =
+      estimateTokens(ledgerEntryText(entry)) +
+      images.reduce((n, image) => n + image.approxTokens, 0);
   }
 
   /**
@@ -257,7 +287,7 @@ export class ContextLedger {
     return chosen
       .map((entry) => {
         const source = includeSources && entry.source ? ` [${entry.source}]` : '';
-        return `${entry.role.toUpperCase()}${source}: ${entry.content}`;
+        return `${entry.role.toUpperCase()}${source}: ${ledgerEntryText(entry)}`;
       })
       .join('\n\n');
   }
@@ -468,6 +498,7 @@ export class ContextLedger {
     preview: string;
     /** The images this entry holds, by ref, with each one's share of approxTokens. */
     images?: Array<{ image: string; width: number; height: number; tokens: number }>;
+    imageNotes?: string[];
   }> {
     return this.entries.map((e) => ({
       id: e.id,
@@ -477,6 +508,7 @@ export class ContextLedger {
       approxTokens: e.approxTokens,
       createdAt: e.createdAt,
       preview: e.content.slice(0, 120) + (e.content.length > 120 ? '...' : ''),
+      ...(e.imageNotes ? { imageNotes: [...e.imageNotes] } : {}),
       ...(e.images
         ? {
             images: e.images.map((image) => ({

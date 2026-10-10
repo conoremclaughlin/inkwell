@@ -212,18 +212,54 @@ describe('images from tools reach the model as images', () => {
     expect(continuation).toBeDefined();
     expect(continuation!.prompt).toContain('Tool results from previous turn');
     expect(continuation!.prompt).not.toContain(pngBase64Head);
-    expect(continuation!.prompt).toMatch(/"image":"img:[0-9a-f]{16}"/);
+    expect(continuation!.prompt).toMatch(/"image":"img:[0-9a-f]{64}"/);
 
     expect(continuation!.contextImages).toHaveLength(1);
     const [image] = continuation!.contextImages!;
     expect(image).toMatchObject({ mimeType: 'image/png', width: 640, height: 480 });
     // Measure while the provider owns the input, not after session disposal.
     expect(testState.carriedBytes.get(image!.path)?.equals(png)).toBe(true);
-    expect(existsSync(image!.path)).toBe(false);
+    expect(existsSync(image!.path)).toBe(true); // owned by the log, not this CLI invocation
     // Delivered into the session the opening spawn seeded, not a new one.
     expect(opening!.backendSessionSeedId).toBeDefined();
     expect(continuation!.backendSessionId).toBe(opening!.backendSessionSeedId);
   });
+
+  it.each(['retained', 'missing'] as const)(
+    'reattaches %s media into a fresh native seed, never rereading the source',
+    async (state) => {
+      const options = {
+        agent: 'myra',
+        backend: 'claude',
+        toolRouting: 'local',
+        pollSeconds: '999',
+        sessionId: 'retention-fixture',
+      };
+      scriptBackend([toolCall('read', { path: 'shot.png' }), 'Saw it.']);
+      testState.inputs = ['look', '/quit'];
+      await runChat(options);
+      const oldSeed = spawns()[0].backendSessionSeedId;
+      const image = spawns()[1].contextImages![0];
+      expect(existsSync(image.path)).toBe(true);
+      if (state === 'missing') rmSync(image.path);
+      // If restoration rereads the source it will get a different picture.
+      writeFileSync(join(testCwd, 'shot.png'), makePng(20, 20));
+      testState.runBackendImpl.mockClear();
+      scriptBackend([toolCall('evict_context', { role: 'user' }), 'Fresh seed.']);
+      testState.inputs = ['continue', '/quit'];
+      await runChat(options);
+      const fresh = spawns()[1];
+      expect(fresh.backendSessionSeedId).toBeDefined();
+      expect(fresh.backendSessionSeedId).not.toBe(oldSeed);
+      if (state === 'retained') {
+        expect(fresh.contextImages?.map((i) => i.ref)).toEqual([image.ref]);
+        expect(testState.carriedBytes.get(fresh.contextImages![0].path)).toEqual(png);
+      } else {
+        expect(fresh.contextImages).toBeUndefined();
+        expect(fresh.prompt).toContain('unavailable: an image was here');
+      }
+    }
+  );
 
   it('view_image: the descriptor in the prompt, the image beside it, and not sent again to a session that has it', async () => {
     scriptBackend([toolCall('view_image', { path: 'shot.png' }), 'Seen.', 'Still here.']);

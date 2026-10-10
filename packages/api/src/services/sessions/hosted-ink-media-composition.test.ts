@@ -43,7 +43,7 @@ function png(shade: number) {
 }
 
 type Step = { text: string; receipt?: 'missing' | 'failed' };
-async function fixture(steps: Step[], shade = 128) {
+async function fixture(steps: Step[], shade = 128, mediaLimits?: { maxBytes?: number }) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ink-hosted-media-')));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'work');
@@ -114,6 +114,8 @@ async function fixture(steps: Step[], shade = 128) {
         imageRoots: [cwd, files],
         credentials: {},
         coding: coding.ports,
+        logPath: ports.sessionLog.path,
+        mediaLimits,
       });
       const close = vi.fn(async () => {
         await coding.close();
@@ -203,6 +205,7 @@ async function fixture(steps: Step[], shade = 128) {
     files,
     bytes,
     history,
+    logPath,
     start,
     results,
     closes,
@@ -325,6 +328,75 @@ describe('hosted coding/media through the shared loop and file log', () => {
     expect(JSON.stringify(h.results)).toContain('outside the directories');
     expect((await h.history()).some((e) => Array.isArray(e.images) && e.images.length)).toBe(false);
   });
+
+  it('restores retained bytes into a fresh seed after closing both host and original source', async () => {
+    const h = await fixture([
+      { text: tool('read', { path: 'image.png' }) },
+      { text: 'First host saw it.' },
+      { text: tool('evict_context', { source: 'server' }) },
+      { text: 'Fresh seed saw it.' },
+    ]);
+    expect(await h.run()).toMatchObject({ success: true });
+    expect(h.start.mock.calls[1][0].contextImages).toHaveLength(1);
+    const image = h.start.mock.calls[1][0].contextImages![0];
+    await rm(join(h.cwd, 'image.png'));
+    await expect(readFile(image.path)).resolves.toEqual(h.bytes);
+    expect(await h.run()).toMatchObject({ success: true });
+    const fresh = h.start.mock.calls[3][0];
+    expect(fresh.backendSessionSeedId).toBeDefined();
+    expect(fresh.backendSessionSeedId).not.toBe(h.start.mock.calls[0][0].backendSessionSeedId);
+    expect(fresh.contextImages).toEqual([image]);
+    const events = await h.history();
+    const mediaEvent = events.find((e) => e.imageContext);
+    expect(mediaEvent).toMatchObject({
+      imageContext: {
+        version: 1,
+        images: [{ retained: { version: 1, byteLength: h.bytes.length } }],
+      },
+    });
+    expect(JSON.stringify(mediaEvent?.imageContext)).not.toContain(image.path);
+    expect(JSON.stringify(events)).not.toContain(h.bytes.toString('base64'));
+  });
+
+  it.each(['missing', 'corrupt', 'quota'] as const)(
+    '%s retention leaves live delivery intact and an honest fresh-seed note',
+    async (failure) => {
+      const h = await fixture(
+        [
+          { text: tool('view_image', { path: 'image.png' }) },
+          { text: 'Live image arrived.' },
+          { text: tool('evict_context', { source: 'server' }) },
+          { text: 'No image on fresh seed.' },
+          { text: tool('evict_context', { source: 'local-tool' }) },
+          { text: 'Evicted placeholder.' },
+          { text: tool('evict_context', { source: 'server' }) },
+          { text: 'Still evicted.' },
+        ],
+        128,
+        failure === 'quota' ? { maxBytes: 1 } : undefined
+      );
+      expect(await h.run()).toMatchObject({ success: true });
+      expect(h.start.mock.calls[1][0].contextImages).toHaveLength(1);
+      const image = h.start.mock.calls[1][0].contextImages![0];
+      expect(image).toBeDefined(); // quota is NOT a live-delivery limit
+      if (failure !== 'quota') await expect(readFile(image.path)).resolves.toEqual(h.bytes);
+      if (failure === 'missing') await rm(image.path);
+      if (failure === 'corrupt') await writeFile(image.path, Buffer.alloc(h.bytes.length));
+      if (failure === 'quota')
+        await expect(readFile(image.path)).rejects.toMatchObject({ code: 'ENOENT' });
+      // The valid original remains, but replay must never reread it.
+      expect(await readFile(join(h.cwd, 'image.png'))).toEqual(h.bytes);
+      expect(await h.run()).toMatchObject({ success: true });
+      const fresh = h.start.mock.calls[3][0];
+      expect(fresh.backendSessionSeedId).toBeDefined();
+      expect(fresh.contextImages).toBeUndefined();
+      expect(fresh.prompt).toContain('unavailable: an image was here');
+      expect(await h.run()).toMatchObject({ success: true });
+      expect(await h.run()).toMatchObject({ success: true });
+      expect(h.start.mock.calls[7][0].contextImages).toBeUndefined();
+      expect(h.start.mock.calls[7][0].prompt).not.toContain('unavailable: an image was here');
+    }
+  );
 
   it('overlapping sessions deliver only their own image bytes', async () => {
     const a = await fixture(
