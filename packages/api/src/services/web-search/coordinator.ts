@@ -58,7 +58,7 @@ interface Running {
  * Bounded FIFO coalescing, not a durable job queue or retry engine. Each caller
  * must have passed permission and required request audit BEFORE submit. Only
  * consecutive same-account callers share context; never skip another account.
- * Not wired to MCP until the caller-specific audit/receipt boundary is ready.
+ * The MCP handler supplies the caller-specific audit/receipt boundary.
  */
 export class SearchCoordinator {
   private queue: Pending[] = [];

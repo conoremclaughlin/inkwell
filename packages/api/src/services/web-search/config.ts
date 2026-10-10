@@ -34,6 +34,11 @@ export function isWebSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return env.INK_WEB_SEARCH_ENABLED === 'true';
 }
 
+/** Only an explicit operator opt-out suppresses content; required receipts remain. */
+export function isWebSearchAuditContentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_WEB_SEARCH_AUDIT_CONTENT !== 'false';
+}
+
 export function readConfig(env: NodeJS.ProcessEnv): SearchConfig {
   if (!isWebSearchEnabled(env)) throw new WebSearchError('disabled');
   if (env.INK_WEB_SEARCH_PROVIDER === 'codex') {
