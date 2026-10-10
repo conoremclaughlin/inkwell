@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock('node:child_process', () => ({ spawn: mocks.spawn }));
 
-import { searchWeb } from './index.js';
+import { searchWeb, searchWebBatch } from './index.js';
 import { LIMITS, CLAUDE_VERSION, readConfig, validateInput } from './config.js';
 import * as isolation from './isolation.js';
 import { runBounded } from './process.js';
@@ -67,6 +67,53 @@ afterEach(() => {
 
 const request = { query: 'synthetic query', maxResults: 3 };
 const rootOf = (child: FakeChild) => String(child.options.cwd).replace(/\/work$/, '');
+
+describe('internal batch dispatch (not yet a public MCP argument)', () => {
+  it('shares one inference with the singleton lifecycle and reports only exact-query evidence', async () => {
+    inference = (child) => {
+      expect(JSON.parse(child.input)).toEqual({
+        queries: ['synthetic query', 'other'],
+        maxResults: 1,
+      });
+      expect(child.args[child.args.indexOf('--max-turns') + 1]).toBe(String(LIMITS.searches + 1));
+      child.events(searchEvents());
+      child.finish();
+    };
+    const result = await searchWebBatch({ queries: ['synthetic query', 'other'], maxResults: 1 });
+    expect(result.items[0].success).toBe(true);
+    expect(result.items[1]).toEqual({
+      query: 'other',
+      success: false,
+      reason: 'search_not_observed',
+      searchMayHaveRun: true,
+    });
+    expect(children).toHaveLength(3); // two query-free probes, one inference
+    await expectRemoved();
+  });
+
+  it('does not treat rewritten queries as evidence for the requested batch', async () => {
+    await expect(
+      searchWebBatch({ queries: ['not the native query'], maxResults: 1 })
+    ).rejects.toMatchObject({ reason: 'invalid_output', launched: true });
+    await expectRemoved();
+  });
+
+  it('retains prelaunch receipts on malformed, cancelled and disabled batches', async () => {
+    await expect(searchWebBatch({ queries: [], maxResults: 1 })).rejects.toMatchObject({
+      reason: 'invalid_input',
+      launched: false,
+    });
+    await expect(
+      searchWebBatch({ queries: ['q'], maxResults: 1, signal: AbortSignal.abort() })
+    ).rejects.toMatchObject({ reason: 'cancelled', launched: false });
+    delete process.env.INK_WEB_SEARCH_ENABLED;
+    await expect(searchWebBatch({ queries: ['q'], maxResults: 1 })).rejects.toMatchObject({
+      reason: 'disabled',
+      launched: false,
+    });
+    expect(children).toHaveLength(0);
+  });
+});
 
 async function expectRemoved() {
   for (const root of new Set(children.map(rootOf))) await expect(access(root)).rejects.toThrow();

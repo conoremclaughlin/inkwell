@@ -1,9 +1,14 @@
-import { readConfig, validateInput, LIMITS } from './config.js';
+import { readConfig, validateInput, validateBatchInput, LIMITS } from './config.js';
 import { claudeArgs, ClaudeSearchStream, verifyCapabilities } from './claude.js';
 import { staticError, WebSearchError } from './errors.js';
 import { assertUnmanagedHost, createSandbox, resolveExecutable } from './isolation.js';
 import { runBounded } from './process.js';
-import type { WebSearchInput, WebSearchOutput } from './types.js';
+import type {
+  WebSearchInput,
+  WebSearchOutput,
+  WebSearchBatchInput,
+  WebSearchBatchOutput,
+} from './types.js';
 import { searchAdmission } from './admission.js';
 
 export { WebSearchError } from './errors.js';
@@ -17,10 +22,25 @@ export type { WebSearchInput, WebSearchOutput } from './types.js';
  * The caller must record its required audit BEFORE invoking this function.
  */
 export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput> {
+  return runSearch(input, false);
+}
+
+/** Not wired to MCP yet: its coordinator must supply only audited same-account queries. */
+export async function searchWebBatch(input: WebSearchBatchInput): Promise<WebSearchBatchOutput> {
+  return runSearch(input, true);
+}
+
+function runSearch(input: WebSearchInput, batch: false): Promise<WebSearchOutput>;
+function runSearch(input: WebSearchBatchInput, batch: true): Promise<WebSearchBatchOutput>;
+async function runSearch(
+  input: WebSearchInput | WebSearchBatchInput,
+  batch: boolean
+): Promise<WebSearchOutput | WebSearchBatchOutput> {
   let launched = false;
   try {
     const config = readConfig(process.env);
-    const request = validateInput(input);
+    const request = batch ? validateBatchInput(input) : validateInput(input);
+    const queries = 'queries' in request ? request.queries : undefined;
     const admission = searchAdmission.acquire();
     try {
       await assertUnmanagedHost();
@@ -52,8 +72,8 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
         remaining(); // A cancellation during either capability probe stays credential-free.
         await assertUnmanagedHost();
         const timeoutMs = remaining(); // Recheck after the final asynchronous preflight.
-        const stream = new ClaudeSearchStream(config.model, request.maxResults);
-        const args = claudeArgs(config, sandbox);
+        const stream = new ClaudeSearchStream(config.model, request.maxResults, queries);
+        const args = claudeArgs(config, sandbox, batch);
         // From this call onward, failures (including cleanup) may follow an
         // external search. Credential-free probes above never set this bit.
         launched = true;
@@ -76,12 +96,16 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
             // an ambient per-session thinking budget.
             MAX_THINKING_TOKENS: '0',
           },
-          stdin: JSON.stringify({ query: request.query, maxResults: request.maxResults }) + '\n',
+          stdin:
+            JSON.stringify({
+              ...('queries' in request ? { queries: request.queries } : { query: request.query }),
+              maxResults: request.maxResults,
+            }) + '\n',
           signal: request.signal,
           timeoutMs,
           onLine: (line) => stream.accept(line),
         });
-        return stream.output();
+        return batch ? stream.batchOutput() : stream.output();
       } catch (error) {
         // Set the latch BEFORE cleanup, which can itself fail. No caller can
         // release this capacity or admit another child after an uncertain stop.

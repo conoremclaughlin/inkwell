@@ -1,7 +1,7 @@
 import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import { WebSearchError } from './errors.js';
-import type { WebSearchInput } from './types.js';
+import type { WebSearchInput, WebSearchBatchInput } from './types.js';
 
 export const LIMITS = Object.freeze({
   concurrent: 1,
@@ -81,9 +81,20 @@ const inputSchema = z
   })
   .strict();
 
-export function validateInput(input: WebSearchInput): WebSearchInput {
+export function validateInput(input: unknown): WebSearchInput {
   const parsed = inputSchema.safeParse(input);
   if (!parsed.success) throw new WebSearchError('invalid_input');
   if (parsed.data.signal?.aborted) throw new WebSearchError('cancelled');
   return parsed.data;
+}
+
+const batchInputSchema = inputSchema.omit({ query: true }).extend({
+  queries: z.array(webSearchQuerySchema).min(1).max(LIMITS.searches),
+});
+
+export function validateBatchInput(input: unknown): WebSearchBatchInput {
+  const parsed = batchInputSchema.safeParse(input);
+  if (!parsed.success) throw new WebSearchError('invalid_input');
+  if (parsed.data.signal?.aborted) throw new WebSearchError('cancelled');
+  return { ...parsed.data, queries: [...new Set(parsed.data.queries)] };
 }
