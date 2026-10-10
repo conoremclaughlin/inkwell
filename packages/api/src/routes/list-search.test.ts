@@ -23,6 +23,20 @@ describe('bounded literal list search', () => {
   ])('rejects malformed or unbounded input: %j', (value) => {
     expect(parseListSearch(value).ok).toBe(false);
   });
+  it.each(['a\uD800b', '\uD800', '\uDC00'])(
+    'refuses a lone surrogate rather than changing its search text: %j',
+    (value) => {
+      expect(parseListSearch(value).ok).toBe(false);
+    }
+  );
+  it('keeps valid supplementary Unicode characters', () => {
+    expect(parseListSearch('café 💡東京')).toEqual({ ok: true, words: ['café', '💡東京'] });
+  });
+  it('preserves the original literal wire representation for quotes, slashes and wildcards', () => {
+    expect(listSearchFilter(['a"b\\c*%_'], ['title'])).toBe(
+      String.raw`and(or(title.imatch."a\"b\\\\c\\*%_"))`
+    );
+  });
   it('requires every word across either field, not one entire-field phrase', () => {
     expect(listSearchFilter(['garden', 'paper'], ['title', 'content'])).toBe(
       'and(or(title.imatch."garden",content.imatch."garden"),or(title.imatch."paper",content.imatch."paper"))'
