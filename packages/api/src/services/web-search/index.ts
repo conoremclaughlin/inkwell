@@ -72,6 +72,9 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
             // login keychain. Probes retain the original credential-free PATH.
             PATH: `${sandbox.keychainBin}:/usr/bin:/bin`,
             USER: sandbox.keychainAccount,
+            // Search retrieval does not need extended thinking. Never borrow
+            // an ambient per-session thinking budget.
+            MAX_THINKING_TOKENS: '0',
           },
           stdin: JSON.stringify({ query: request.query, maxResults: request.maxResults }) + '\n',
           signal: request.signal,

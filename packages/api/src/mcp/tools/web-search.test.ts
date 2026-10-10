@@ -198,6 +198,20 @@ describe('web_search auth, policy and audit', () => {
     await call(undefined, live.signal);
     expect(search).toHaveBeenCalledWith({ query: 'question', maxResults: 5, signal: live.signal });
   });
+
+  it('returns and audits quota refusal distinctly without retrying or leaking provider details', async () => {
+    search.mockRejectedValueOnce(new WebSearchError('rate_limited', true));
+    expect(parse(await call())).toMatchObject({
+      success: false,
+      reason: 'rate_limited',
+      searchMayHaveRun: true,
+    });
+    expect(search).toHaveBeenCalledOnce();
+    expect(mocks.log.mock.calls[1][0]).toMatchObject({
+      responseStatus: 'error',
+      metadata: { reason: 'rate_limited', searchMayHaveRun: true },
+    });
+  });
 });
 
 describe('web_search untrusted result envelope', () => {

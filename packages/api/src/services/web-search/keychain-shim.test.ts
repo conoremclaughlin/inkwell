@@ -11,7 +11,8 @@ async function fixture(
     invoke: (
       argv: string[],
       input?: string,
-      useRealHome?: boolean
+      useRealHome?: boolean,
+      options?: { keepOpen?: boolean; env?: NodeJS.ProcessEnv }
     ) => Promise<{
       code: number | null;
       stdout: string;
@@ -19,7 +20,8 @@ async function fixture(
       invoked: boolean;
     }>,
     home: string
-  ) => Promise<void>
+  ) => Promise<void>,
+  nativeExitCode = 0
 ) {
   const root = await mkdtemp(join(tmpdir(), "ink-shim-test quote' space-"));
   const native = join(root, 'inert-native');
@@ -33,16 +35,23 @@ async function fixture(
     await writeFile(script, source.program, { mode: 0o700 });
     await writeFile(launcher, source.launcher, { mode: 0o700 });
     // Only printf/cat: no native keychain access, even if the policy fails open.
-    await writeFile(native, '#!/bin/sh\nprintf \'%s\\n\' "$HOME" "$@"\n/bin/cat\n', {
-      mode: 0o700,
-    });
-    await run(async (argv, input = '', useRealHome = false) => {
+    await writeFile(
+      native,
+      `#!/bin/sh\n[ -z "\${NODE_OPTIONS:-}\${NODE_PATH:-}" ] || exit 93\nprintf '%s\\n' "$HOME" "$@"\n/bin/cat\nexit ${nativeExitCode}\n`,
+      {
+        mode: 0o700,
+      }
+    );
+    await run(async (argv, input = '', useRealHome = false, options = {}) => {
       await rm(marker, { force: true });
       await rm(marker + '-forwarded', { force: true });
       const child = spawn(launcher, argv, {
-        env: { HOME: useRealHome ? home : root, PATH: '/usr/bin:/bin' },
+        env: { ...options.env, HOME: useRealHome ? home : root, PATH: '/usr/bin:/bin' },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
+      // Even a broken helper cannot leave this owned inert subprocess alive.
+      const deadline = setTimeout(() => child.kill('SIGKILL'), 2700);
+      child.once('close', () => clearTimeout(deadline));
       let stdout = '',
         stderr = '';
       child.stdout.on('data', (chunk) => {
@@ -52,7 +61,8 @@ async function fixture(
         stderr += chunk.toString();
       });
       child.stdin.on('error', () => {});
-      child.stdin.end(input);
+      if (options.keepOpen) child.stdin.write(input);
+      else child.stdin.end(input);
       const code = await new Promise<number | null>((resolve, reject) => {
         child.once('error', reject);
         child.once('close', resolve);
@@ -144,6 +154,40 @@ describe('keychain helper policy (inert executable only)', () => {
       expect(
         await invoke(['find-generic-password', '-a', account, '-w', '-s', service], '', true)
       ).toEqual({ code: 64, stdout: '', stderr: '', invoked: false });
+    });
+  });
+
+  it('preserves meaningful native exit codes after both read and refresh', async () => {
+    await fixture(async (invoke) => {
+      for (const [argv, input] of [
+        [['find-generic-password', '-a', account, '-w', '-s', service], ''],
+        [['-i'], line('abcd')],
+      ] as const) {
+        expect(await invoke([...argv], input)).toMatchObject({ code: 44, invoked: true });
+      }
+    }, 44);
+  });
+
+  it('refuses a complete but still-open interactive input promptly without native forwarding', async () => {
+    await fixture(async (invoke) => {
+      const started = Date.now();
+      expect(await invoke(['-i'], line('abcd'), false, { keepOpen: true })).toEqual({
+        code: 64,
+        stdout: '',
+        stderr: '',
+        invoked: false,
+      });
+      expect(Date.now() - started).toBeLessThan(2500);
+    });
+  }, 3500);
+
+  it('scrubs Node injection options at the launcher even if added by its parent CLI', async () => {
+    await fixture(async (invoke) => {
+      expect(
+        await invoke(['find-generic-password', '-a', account, '-w', '-s', service], '', false, {
+          env: { NODE_OPTIONS: '--invalid-synthetic-option', NODE_PATH: '/synthetic/modules' },
+        })
+      ).toMatchObject({ code: 0, stderr: '', invoked: true });
     });
   });
 

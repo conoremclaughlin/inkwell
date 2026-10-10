@@ -259,7 +259,10 @@ export class ClaudeSearchStream {
       return;
     }
     if (event.type === 'rate_limit_event') {
-      parse(rateLimitEventSchema, event);
+      const notice = parse(rateLimitEventSchema, event);
+      // Shared subscription quota is not a generic provider failure. Warnings
+      // are permitted, but explicit rejection stops the owned run; no retry.
+      if (notice.rate_limit_info.status === 'rejected') throw new WebSearchError('rate_limited');
       return;
     }
     if (event.type === 'assistant') {

@@ -29,7 +29,7 @@ export function keychainShim(
   )
     throw new WebSearchError('missing_configuration');
   return {
-    launcher: `#!/bin/sh\nexec ${shellQuote(nodeExecutable)} ${shellQuote(script)} "$@"\n`,
+    launcher: `#!/bin/sh\nexec /usr/bin/env -u NODE_OPTIONS -u NODE_PATH ${shellQuote(nodeExecutable)} ${shellQuote(script)} "$@"\n`,
     program:
       `// Owned per-run credential helper. Never log argv/stdin/errors.
 'use strict';
@@ -51,10 +51,17 @@ async function main() {
   if (argv.length === 1 && argv[0] === '-i') {
     const chunks = [];
     let bytes = 0;
-    for await (const chunk of process.stdin) {
-      bytes += chunk.length;
-      if (bytes > 4032) throw Error();
-      chunks.push(chunk);
+    // Pinned CLI's execa input path calls stdin.end(command). Refuse a parent
+    // that never closes input rather than wait out the outer search deadline.
+    const deadline = setTimeout(() => process.stdin.destroy(new Error()), 1000);
+    try {
+      for await (const chunk of process.stdin) {
+        bytes += chunk.length;
+        if (bytes > 4032) throw Error();
+        chunks.push(chunk);
+      }
+    } finally {
+      clearTimeout(deadline);
     }
     input = Buffer.concat(chunks);
     const text = input.toString('utf8');
@@ -72,7 +79,7 @@ async function main() {
     stdio: [input === undefined ? 'inherit' : 'pipe', 'inherit', 'inherit'],
   });
   child.on('error', () => { process.exitCode = 64; });
-  child.on('close', code => { process.exitCode = code === 0 ? 0 : 64; });
+  child.on('close', code => { process.exitCode = code ?? 64; });
   if (input !== undefined) {
     child.stdin.on('error', () => { /* Native helper refusal is reported by close. */ });
     child.stdin.end(input);

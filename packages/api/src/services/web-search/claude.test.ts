@@ -121,6 +121,16 @@ describe('Claude capability and native search evidence (synthetic only)', () => 
     };
     const events = searchEvents();
     expect(read([events[0], notice, ...events.slice(1)])).toEqual(read(events));
+    expect(() =>
+      read([
+        events[0],
+        { ...notice, rate_limit_info: { status: 'allowed_warning' } },
+        ...events.slice(1),
+      ])
+    ).not.toThrow();
+    expect(() => read([events[0], { ...notice, rate_limit_info: { status: 'rejected' } }])).toThrow(
+      'rate_limited'
+    );
     expect(() => read([notice, ...events])).toThrow('invalid_output');
     expect(() => read([...events, notice])).toThrow('invalid_output');
     expect(() => read([events[0], notice, events[3]])).toThrow('search_not_observed');

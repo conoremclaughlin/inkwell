@@ -167,6 +167,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       NODE_OPTIONS: '--synthetic',
       NODE_PATH: '/synthetic/modules',
       USER: 'synthetic-ambient-account',
+      MAX_THINKING_TOKENS: '999',
       ANTHROPIC_API_KEY: 'synthetic-ambient-key',
       CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-ambient-oauth',
       OPENAI_API_KEY: 'synthetic-openai',
@@ -199,6 +200,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       expect(env.HOME).toBe(`${rootOf(child)}/home`);
       expect(env.CLAUDE_CONFIG_DIR).toBe(`${rootOf(child)}/config`);
       expect(env.USER).toBe(child.args.includes('--print') ? userInfo().username : undefined);
+      expect(env.MAX_THINKING_TOKENS).toBe(child.args.includes('--print') ? '0' : undefined);
       expect(env.PATH).toBe(
         child.args.includes('--print') ? `${rootOf(child)}/bin:/usr/bin:/bin` : '/usr/bin:/bin'
       );
@@ -222,7 +224,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
           'CLAUDE_CODE_MAX_RETRIES',
           'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
           ...(child.args.includes('--print')
-            ? ['CLAUDE_SECURESTORAGE_CONFIG_DIR', 'USER']
+            ? ['CLAUDE_SECURESTORAGE_CONFIG_DIR', 'USER', 'MAX_THINKING_TOKENS']
             : ['CLAUDE_CODE_SIMPLE']),
         ].sort()
       );
@@ -396,6 +398,32 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       launched: true,
     });
     expect(children[2].signals).toEqual(['SIGTERM']);
+    await expectRemoved();
+  });
+
+  it('stops on explicit subscription rejection and preserves a static launched receipt', async () => {
+    inference = (child) => {
+      child.events([
+        searchEvents()[0],
+        {
+          type: 'rate_limit_event',
+          rate_limit_info: { status: 'rejected', detail: 'synthetic private account detail' },
+          uuid: '00000000-0000-4000-8000-000000000001',
+          session_id: 'synthetic-session',
+        },
+      ]);
+      // A regression reports a deterministic generic exit, not a test timeout.
+      queueMicrotask(() => {
+        if (child.groupAlive) child.finish(1);
+      });
+    };
+    await expect(searchWeb(request)).rejects.toMatchObject({
+      reason: 'rate_limited',
+      launched: true,
+      message: 'Web search refused: rate_limited',
+    });
+    expect(children[2].signals).toEqual(['SIGTERM']);
+    expect(children[2].groupAlive).toBe(false);
     await expectRemoved();
   });
 

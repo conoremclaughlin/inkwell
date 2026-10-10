@@ -14,6 +14,7 @@ export const WEB_SEARCH_REASONS = [
   'output_limit',
   'spawn_failed',
   'provider_failed',
+  'rate_limited',
   'invalid_output',
   'search_not_observed',
   'stop_unconfirmed',
