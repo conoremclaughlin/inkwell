@@ -8,6 +8,7 @@ export const WEB_SEARCH_REASONS = [
   'unsupported_capability',
   'managed_configuration',
   'capacity_exhausted',
+  'queue_timeout',
   'service_quarantined',
   'cancelled',
   'timeout',
