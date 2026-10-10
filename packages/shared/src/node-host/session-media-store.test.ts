@@ -142,18 +142,39 @@ describe('log-owned retained media (no live caller or collector)', () => {
     expect(await readdir(join(root, 'session.jsonl.media'))).toEqual(['.gitignore']);
   });
 
-  it('refuses a partial pre-existing hash file instead of deduping or repairing it silently', async () => {
+  it('restores partial hash files only by publishing verified replacement bytes atomically', async () => {
     const s = store();
     const saved = ok(await s.put(image()));
     await writeFile(saved.image.path, image().subarray(0, 12));
-    const failed = await s.put(image());
-    expect(failed).toMatchObject({ ok: false, reason: 'unavailable' });
-    expect(await readFile(saved.image.path)).toHaveLength(12);
     expect(await s.restore(saved.descriptor)).toMatchObject({
       ok: false,
       reason: 'unavailable',
       placeholder: expect.stringContaining('you have not seen it'),
     });
+    publication.inspect.mockImplementation(async (from, to) => {
+      expect(to).toBe(saved.image.path);
+      expect(await readFile(to)).toHaveLength(12);
+      expect(await readFile(from)).toEqual(image());
+    });
+    expect(ok(await s.put(image()))).toEqual(saved);
+    expect(ok(await s.restore(saved.descriptor))).toEqual(saved);
+    expect(await readFile(saved.image.path)).toEqual(image());
+  });
+
+  it('requires room for both the corrupt file and its staged replacement; a failed repair preserves the old file', async () => {
+    const s = store('session', { maxFiles: 1 });
+    const saved = ok(await s.put(image()));
+    await writeFile(saved.image.path, image().subarray(0, 12));
+    expect(await s.put(image())).toMatchObject({ ok: false, reason: 'quota' });
+    expect(await readFile(saved.image.path)).toHaveLength(12);
+    const retry = store(); // The old owner has stopped; one writer for this log.
+    await s.close();
+    publication.inspect.mockRejectedValue(new Error('synthetic repair publish failure'));
+    expect(await retry.put(image())).toMatchObject({ ok: false, reason: 'unavailable' });
+    expect(await readFile(saved.image.path)).toHaveLength(12);
+    expect((await readdir(join(root, 'session.jsonl.media'))).sort()).toEqual(
+      ['.gitignore', saved.descriptor.sha256].sort()
+    );
   });
 
   it('verifies full hash, exact length and measured metadata on every restore', async () => {

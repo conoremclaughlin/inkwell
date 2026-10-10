@@ -250,7 +250,12 @@ export class SessionMediaStore {
       const dir = await this.directory(true);
       await this.ensureIgnored(dir); // Works even in a new repo without Ink ignore rules.
       try {
-        return await this.validated(dir, descriptor); // EEXIST alone is never dedupe evidence.
+        const existing = await this.validated(dir, descriptor);
+        if (existing.ok) return existing; // EEXIST alone is never dedupe evidence.
+        // The bounded, private regular file was readable but its bytes did
+        // not match. Repair only with the just-captured exact-hash bytes, by
+        // atomic rename. Unsafe opens still refuse below, and fits charges
+        // BOTH the old file and staging copy before replacement.
       } catch (error) {
         if (!missing(error)) throw error;
       }
