@@ -48,19 +48,23 @@ async function fixture(replies: string[]) {
   const policy = new ToolPolicyState('backend');
   policy.allowTool('read');
   const pi = await import('@mariozechner/pi-coding-agent');
-  const toolHost = createSessionToolHost({
-    cwd: root,
-    home: root,
-    imageRoots: [root],
-    tempDir: root,
-    credentials: {},
-    coding: {
-      load: async (cwd) => new Map([['read', pi.createReadTool(cwd) as unknown as CodingTool]]),
-      readDocument: async () => null,
-    },
-  });
-  cleanups.unshift(() => toolHost.close());
-  const close = vi.fn(() => toolHost.close());
+  const makeToolHost = () => {
+    const toolHost = createSessionToolHost({
+      cwd: root,
+      home: root,
+      imageRoots: [root],
+      tempDir: root,
+      credentials: {},
+      coding: {
+        load: async (cwd) => new Map([['read', pi.createReadTool(cwd) as unknown as CodingTool]]),
+        readDocument: async () => null,
+      },
+    });
+    cleanups.unshift(() => toolHost.close());
+    return toolHost;
+  };
+  const toolHost = makeToolHost();
+  const close = vi.fn(() => effects.toolHost.close());
   let n = 0;
   const effects: HostedInkEffects = {
     policy,
@@ -134,7 +138,14 @@ async function fixture(replies: string[]) {
       },
     };
   };
-  const prepare = vi.fn(async () => effects);
+  let prepared = false;
+  const prepare = vi.fn(async () => {
+    // Production prepares fresh resources for each invocation, not a disposed
+    // host retained by a previous turn. Keep mutable control-test inputs only.
+    if (prepared) effects.toolHost = makeToolHost();
+    prepared = true;
+    return effects;
+  });
   const runner = new HostedInkSessionRunner({
     execute: createHostedInkExecutor(prepare),
     forTurn: deps,

@@ -261,6 +261,33 @@ describe('images from tools reach the model as images', () => {
     }
   );
 
+  it.each(['confirmed', 'missing'] as const)(
+    'reoffers on matching resume after a %s prior image receipt',
+    async (receipt) => {
+      const options = {
+        agent: 'myra',
+        backend: 'claude',
+        toolRouting: 'local',
+        pollSeconds: '999',
+        sessionId: 'resume-media-fixture',
+      };
+      scriptBackend([toolCall('read', { path: 'shot.png' }), 'Saw it.'], (images) =>
+        receipt === 'confirmed' ? images : []
+      );
+      testState.inputs = ['look', '/quit'];
+      await runChat(options);
+      const seed = spawns()[0].backendSessionSeedId;
+      const image = spawns()[1].contextImages![0];
+      testState.runBackendImpl.mockClear();
+      scriptBackend(['Resumed.']);
+      testState.inputs = ['continue', '/quit'];
+      await runChat(options);
+      expect(spawns()[0].backendSessionId).toBe(seed);
+      expect(spawns()[0].backendSessionSeedId).toBeUndefined();
+      expect(spawns()[0].contextImages?.map((i) => i.ref)).toEqual([image.ref]);
+    }
+  );
+
   it('view_image: the descriptor in the prompt, the image beside it, and not sent again to a session that has it', async () => {
     scriptBackend([toolCall('view_image', { path: 'shot.png' }), 'Seen.', 'Still here.']);
     testState.inputs = ['look at shot.png', 'and again?', '/quit'];

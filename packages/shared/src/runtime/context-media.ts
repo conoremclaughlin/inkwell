@@ -6,7 +6,7 @@ import type { ContextImage } from './context-image.js';
  * API. Pi's `read` already resizes below this (4.5 MB of base64), so only an
  * image from some other tool can reach it.
  */
-export const MAX_INLINE_IMAGE_BYTES = Math.floor((5 * 1024 * 1024 * 3) / 4);
+export const MAX_INLINE_IMAGE_BYTES = (5 * 1024 * 1024 * 3) / 4;
 /**
  * Longest side a tool image may have. 2000 px is the API's per-image limit once
  * a request carries more than 20 images, and a re-seeded session carries every

@@ -112,6 +112,6 @@ describe('chat tool-intent boundary', () => {
     expect(shared).toContain("type: 'local_tool_call'");
     expect(shared).toContain('invocationId: result.invocationId');
     expect(shared).toContain('dispatchState: result.dispatchState');
-    expect(shared.match(/ports\.log\.append\(\{ \.\.\.common,/g)).toHaveLength(3);
+    expect(shared.match(/ports\.log\.append\(\{\s*\.\.\.common,/g)).toHaveLength(3);
   });
 });

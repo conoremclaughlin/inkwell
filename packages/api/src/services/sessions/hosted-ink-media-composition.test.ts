@@ -358,6 +358,26 @@ describe('hosted coding/media through the shared loop and file log', () => {
     expect(JSON.stringify(events)).not.toContain(h.bytes.toString('base64'));
   });
 
+  it.each(['confirmed', 'missing'] as const)(
+    'reoffers restored bytes on native resume with a %s prior receipt',
+    async (receipt) => {
+      const h = await fixture([
+        { text: tool('read', { path: 'image.png' }) },
+        { text: 'First turn.', receipt: receipt === 'missing' ? 'missing' : undefined },
+        { text: 'Resumed.' },
+      ]);
+      expect(await h.run()).toMatchObject({ success: true });
+      const seed = h.start.mock.calls[0][0].backendSessionSeedId;
+      const image = h.start.mock.calls[1][0].contextImages![0];
+      expect(await h.run()).toMatchObject({ success: true });
+      const resumed = h.start.mock.calls[2][0];
+      expect(resumed.backendSessionId).toBe(seed);
+      expect(resumed.backendSessionSeedId).toBeUndefined();
+      expect(resumed.contextImages).toEqual([image]);
+      // A descriptor and backend marker are not a durable per-image delivery receipt.
+    }
+  );
+
   it.each(['missing', 'corrupt', 'quota'] as const)(
     '%s retention leaves live delivery intact and an honest fresh-seed note',
     async (failure) => {
