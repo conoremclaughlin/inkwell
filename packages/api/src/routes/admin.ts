@@ -13,6 +13,7 @@ import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callb
 import { connectorsRouter } from './admin-connectors';
 import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
+import { parseListSearch, listSearchFilter } from './list-search';
 import { afterCursorFilter, encodeTasksCursor, parseTasksPage } from './tasks-page';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
@@ -6156,19 +6157,28 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
  */
 router.get('/artifacts', async (req: Request, res: Response) => {
   try {
+    const search = parseListSearch(req.query.search);
+    if (!search.ok) {
+      res.status(400).json({ error: search.error });
+      return;
+    }
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('artifacts')
       .select(
-        'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at'
+        'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at',
+        { count: 'exact' }
       )
       .eq('user_id', authReq.inkUserId)
-      .eq('workspace_id', authReq.inkWorkspaceId)
-      .order('updated_at', { ascending: false });
+      .eq('workspace_id', authReq.inkWorkspaceId);
+    if (search.words.length) query = query.or(listSearchFilter(search.words, ['title', 'content']));
+    const { data, error, count } = await query
+      .order('updated_at', { ascending: false })
+      .limit(1000);
 
     if (error) {
       logger.error('Failed to list artifacts:', error);
@@ -6177,6 +6187,11 @@ router.get('/artifacts', async (req: Request, res: Response) => {
     }
 
     res.json({
+      meta: {
+        fetched: data?.length ?? 0,
+        total: count ?? data?.length ?? 0,
+        truncated: (count ?? 0) > (data?.length ?? 0),
+      },
       artifacts: (data || []).map((a) => ({
         id: a.id,
         uri: a.uri,
@@ -10167,6 +10182,11 @@ router.get('/media', async (req: Request, res: Response) => {
  */
 router.get('/tasks', async (req: Request, res: Response) => {
   try {
+    const search = parseListSearch(req.query.search);
+    if (!search.ok) {
+      res.status(400).json({ error: search.error });
+      return;
+    }
     const pageRequest = parseTasksPage(req.query);
     if (!pageRequest.ok) {
       res.status(400).json({ error: pageRequest.error });
@@ -10190,6 +10210,12 @@ router.get('/tasks', async (req: Request, res: Response) => {
       .from('tasks')
       .select('id', { count: 'exact', head: true })
       .eq('user_id', authReq.inkUserId);
+
+    if (search.words.length) {
+      const filter = listSearchFilter(search.words, ['title', 'description']);
+      query = query.or(filter);
+      totalQuery = totalQuery.or(filter);
+    }
 
     // Optional filters
     const { status, projectId, groupId, activeOnly } = req.query;
