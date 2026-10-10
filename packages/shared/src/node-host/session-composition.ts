@@ -317,7 +317,7 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     log,
     state: () => ({ ...runtime, sbSlug, compactionInFlight: compaction.isInFlight() }),
     occupancy: () => turnContextOccupancy(ledger, runtime, context.measurement()),
-    compact: (reason) => compaction.maybeCompactContext(reason),
+    compact: compaction.maybeCompactContext,
     recordEviction: compaction.recordEviction,
   });
   let consecutiveBackendFailures = 0;

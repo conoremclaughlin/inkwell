@@ -494,6 +494,7 @@ describe('SessionTurnCoordinator', () => {
         return error;
       });
     await writing.promise;
+    expect(h.ports.compact).toHaveBeenCalledWith('pre-turn budget check', stop.signal);
     expect(returned).toBe(false);
     expect(execute).not.toHaveBeenCalled();
     release.resolve();

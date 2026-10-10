@@ -254,7 +254,8 @@ export function createSessionCompaction(ports: SessionCompactionPorts) {
   };
 
   // ── Token-budget auto-compaction ──
-  const maybeCompactContext = async (reason: string): Promise<void> => {
+  const maybeCompactContext = async (reason: string, signal?: AbortSignal): Promise<void> => {
+    signal?.throwIfAborted();
     if (compactionInFlight) return;
     const bootstrapReserve = runtime.bootstrapContext
       ? estimateTokens(runtime.bootstrapContext)
@@ -303,7 +304,11 @@ export function createSessionCompaction(ports: SessionCompactionPorts) {
     const outcome = await compactContextNow({
       reason: `${reason}; ${pressure.reason}`,
       actor: 'system',
+      signal,
     });
+    // Stop must not roll continuity or fall back to trimming after the
+    // summarizer settles. The coordinator records the cancelled input.
+    signal?.throwIfAborted();
     // A compaction that could not shrink the ledger (a protected tail, a
     // summarizer failure) must still roll a native session the provider says
     // is over the window, or the next spawn resumes the same oversize session.

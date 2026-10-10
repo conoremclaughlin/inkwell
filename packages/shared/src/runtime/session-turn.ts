@@ -77,7 +77,7 @@ export interface SessionTurnPorts {
   occupancy(): ContextOccupancy;
   /** Host status/admission signaling. Admission itself must precede run(). */
   inputRecorded?(): Promise<void>;
-  compact(reason: string): Promise<void>;
+  compact(reason: string, signal?: AbortSignal): Promise<void>;
   /** The existing persistent eviction path also invalidates native provider history. */
   recordEviction(
     actor: 'system',
@@ -140,7 +140,7 @@ export class SessionTurnCoordinator {
       inputEid = this.recordInput(input);
       await this.ports.inputRecorded?.();
       signal?.throwIfAborted();
-      await this.ports.compact('pre-turn budget check');
+      await this.ports.compact('pre-turn budget check', signal);
       signal?.throwIfAborted();
       const occupancy = this.ports.occupancy();
       const promptHooks = await this.fireBoundedHooks(

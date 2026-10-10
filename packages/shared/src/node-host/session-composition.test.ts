@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'fs/promises';
+import { appendFile, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { composeInkSession, type SessionCompositionPorts } from './session-composition.js';
@@ -50,11 +50,13 @@ async function fixture(name: string, replies: string[], history: Record<string, 
   });
   const events: Record<string, unknown>[] = [];
   const order: string[] = [];
+  const path = join(root, 'fixture.jsonl');
+  await writeFile(path, history.map((event) => JSON.stringify(event) + '\n').join(''));
   const log = new SessionLog({
-    path: join(root, 'fixture.jsonl'),
+    path,
     sink: {
       write: async (line) => {
-        await Promise.resolve();
+        await appendFile(path, line);
         const event = JSON.parse(line) as Record<string, unknown>;
         events.push(event);
         order.push(`committed:${event.type}`);
@@ -137,6 +139,18 @@ async function fixture(name: string, replies: string[], history: Record<string, 
     },
   };
   return { ports, events, order, start, compose: () => composeInkSession(ports) };
+}
+
+function pressuredHistory() {
+  return [
+    ...Array.from({ length: 20 }, (_, i) => ({
+      eid: i + 1,
+      type: i % 2 ? 'assistant' : 'user',
+      content: `discardable old detail ${i}: ${'x'.repeat(400)}`,
+      backend: 'claude',
+    })),
+    { eid: 21, type: 'backend_session', id: 'old-native', routing: 'local' },
+  ];
 }
 
 describe('the full shared session composition (scripted provider, real read)', () => {
@@ -252,5 +266,168 @@ describe('the full shared session composition (scripted provider, real read)', (
     vi.mocked(h.ports.callInk).mockResolvedValue({ error: 'fixture unavailable' });
     await expect(h.compose()).rejects.toThrow('fixture unavailable');
     expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('compacts through the tool loop, commits before reseeding and replays the summary without old entries', async () => {
+    const h = await fixture(
+      'compact',
+      [
+        tool('compact_context', { summary: 'Keep the chosen design.', keepRecent: 2 }),
+        'Continuing from the design.',
+      ],
+      pressuredHistory()
+    );
+    const session = await h.compose();
+    await session.run(
+      { raw: 'Consolidate our earlier discussion', source: 'user' },
+      { continueOnFailure: true }
+    );
+    const [first, continuation] = h.start.mock.calls.map(([request]) => request);
+    expect(first.backendSessionId).toBe('old-native');
+    expect(continuation.backendSessionId).toBeUndefined();
+    expect(continuation.backendSessionSeedId).toBeDefined();
+    expect(continuation.prompt).toContain('Keep the chosen design.');
+    expect(continuation.prompt).toContain('Review the harmless fixture');
+    expect(continuation.prompt).not.toContain('discardable old detail 0:');
+    expect(h.order.indexOf('committed:compaction')).toBeLessThan(h.order.lastIndexOf('provider'));
+    const history = (await readFile(h.ports.log.path, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const fresh = await fixture('compact-reattached', ['Reattached.'], history);
+    const reattached = await fresh.compose();
+    // A fresh bootstrap adds its local status entry; hydration labels replayed
+    // summaries compaction-history. Compare the retained conversation itself.
+    const contents = (s: typeof session) =>
+      s.ledger
+        .listEntries()
+        .filter((entry) => entry.source !== 'bootstrap')
+        .map(({ role, content }) => ({ role, content }));
+    expect(contents(reattached)).toEqual(contents(session));
+    await reattached.run(
+      { raw: 'Continue the design', source: 'user' },
+      { continueOnFailure: true }
+    );
+    expect(fresh.start.mock.calls[0][0].backendSessionId).toBe(continuation.backendSessionSeedId);
+    expect(fresh.events[0].eid).toBe(Number(history.at(-1)?.eid) + 1);
+    expect(fresh.ports.callInk).toHaveBeenCalledWith('recall', expect.anything());
+  });
+
+  it('Stop during automatic compaction aborts and awaits the summarizer, without trimming or ordinary dispatch', async () => {
+    const h = await fixture('compact-stop', [], pressuredHistory());
+    h.ports.runtime.maxContextTokens = 1000;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let finish!: (result: BackendRunResult) => void;
+    const result = new Promise<BackendRunResult>((resolve) => {
+      finish = resolve;
+    });
+    const abort = vi.fn();
+    h.start.mockImplementation(() => {
+      entered();
+      return { result, abort };
+    });
+    const session = await h.compose();
+    session.context.sampleUsage({ backend: 'claude', source: 'json', contextTokens: 2500 });
+    const stop = new AbortController();
+    let settled = false;
+    const running = session
+      .run(
+        { raw: 'Continue with a full window', source: 'user' },
+        { signal: stop.signal, continueOnFailure: true }
+      )
+      .then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+    try {
+      await started;
+      stop.abort(new Error('fixture Stop'));
+      expect(abort).toHaveBeenCalledOnce();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+    } finally {
+      finish(outcome('This result arrived after Stop.'));
+      await running;
+    }
+    expect(await running).toEqual(new Error('fixture Stop'));
+    expect(h.start).toHaveBeenCalledOnce();
+    expect(
+      h.events.some((e) =>
+        ['compaction', 'context_trim', 'context_evict', 'assistant'].includes(String(e.type))
+      )
+    ).toBe(false);
+    expect(h.events.at(-1)).toMatchObject({
+      type: 'input_cancelled',
+      stage: 'before_ordinary_dispatch',
+    });
+    expect(session.context.provider.id).toBe('old-native');
+    expect(
+      session.ledger.listEntries().some((e) => e.content.includes('discardable old detail 0:'))
+    ).toBe(true);
+  });
+
+  it('Stop during the automatic summarizer flush prevents that provider launch', async () => {
+    const h = await fixture(
+      'compact-stop-flush',
+      ['summary that must not be requested'],
+      pressuredHistory()
+    );
+    h.ports.runtime.maxContextTokens = 1000;
+    const stop = new AbortController();
+    const flush = h.ports.log.flush.bind(h.ports.log);
+    vi.spyOn(h.ports.log, 'flush').mockImplementation(async () => {
+      await flush();
+      stop.abort(new Error('Stop at flush'));
+    });
+    const session = await h.compose();
+    await expect(
+      session.run(
+        { raw: 'Continue', source: 'user' },
+        { signal: stop.signal, continueOnFailure: true }
+      )
+    ).rejects.toThrow('Stop at flush');
+    expect(h.start).not.toHaveBeenCalled();
+    expect(
+      h.events.some((e) => ['compaction', 'context_trim', 'context_evict'].includes(String(e.type)))
+    ).toBe(false);
+    expect(h.events.at(-1)?.type).toBe('input_cancelled');
+  });
+
+  it('automatic compaction still summarizes and commits before the ordinary turn when not stopped', async () => {
+    const h = await fixture(
+      'compact-auto',
+      ['Preserve the design.', 'Ordinary answer.'],
+      pressuredHistory()
+    );
+    // Trigger at 80% before compaction while leaving room for the protected
+    // twelve-entry tail AND the new summary in the ordinary packed prompt.
+    h.ports.runtime.maxContextTokens = 1800;
+    const session = await h.compose();
+    const result = await session.run(
+      { raw: 'Continue after compaction', source: 'user' },
+      { continueOnFailure: true }
+    );
+    expect(result?.execution.loop.success).toBe(true);
+    expect(h.start).toHaveBeenCalledTimes(2);
+    const [summarizer, ordinary] = h.start.mock.calls.map(([request]) => request);
+    expect(summarizer.prompt).toContain('discardable old detail 0:');
+    expect(summarizer.prompt).not.toContain('discardable old detail 19:');
+    expect(ordinary.prompt).toContain('Preserve the design.');
+    expect(ordinary.prompt).toContain('discardable old detail 19:');
+    expect(ordinary.prompt).not.toContain('discardable old detail 0:');
+    expect(ordinary.backendSessionId).toBeUndefined();
+    expect(ordinary.backendSessionSeedId).toBeDefined();
+    expect(h.events.find((e) => e.type === 'compaction')).toMatchObject({ actor: 'system' });
+    expect(h.order.indexOf('committed:compaction')).toBeLessThan(h.order.lastIndexOf('provider'));
+    expect(h.events.at(-1)).toMatchObject({ type: 'assistant', content: 'Ordinary answer.' });
   });
 });
