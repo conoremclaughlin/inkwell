@@ -116,6 +116,32 @@ const uiInvalidationSchema = z
   })
   .strict();
 
+// Redacted-thinking progress, not reasoning content or search evidence.
+const thinkingTokensSchema = z
+  .object({
+    type: z.literal('system'),
+    subtype: z.literal('thinking_tokens'),
+    estimated_tokens: z.number().int().min(0).max(10_000_000),
+    estimated_tokens_delta: z.number().int().min(0).max(10_000_000),
+    user_message_uuid: idSchema.optional(),
+    uuid: z.string().uuid(),
+    session_id: idSchema,
+  })
+  .strict();
+
+// Provider accounting metadata is opaque and discarded, never returned as
+// search evidence. The transport already bounds the complete JSON line/body.
+const rateLimitEventSchema = z
+  .object({
+    type: z.literal('rate_limit_event'),
+    rate_limit_info: z
+      .object({ status: z.enum(['allowed', 'allowed_warning', 'rejected']) })
+      .passthrough(),
+    uuid: z.string().uuid(),
+    session_id: idSchema,
+  })
+  .strict();
+
 /** No network lookup: reject credentials, non-HTTP(S), IPs, and local names. */
 export function validatedUrl(value: string): string {
   try {
@@ -228,6 +254,14 @@ export class ClaudeSearchStream {
     }
     if (!this.initialized || this.complete) throw new WebSearchError('invalid_output');
     if (event.parent_tool_use_id != null) throw new WebSearchError('unsupported_capability');
+    if (event.type === 'system' && event.subtype === 'thinking_tokens') {
+      parse(thinkingTokensSchema, event);
+      return;
+    }
+    if (event.type === 'rate_limit_event') {
+      parse(rateLimitEventSchema, event);
+      return;
+    }
     if (event.type === 'assistant') {
       const blocks = record(event.message).content;
       if (!Array.isArray(blocks)) throw new WebSearchError('invalid_output');

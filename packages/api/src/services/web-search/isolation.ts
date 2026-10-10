@@ -2,12 +2,15 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises
 import { join } from 'node:path';
 import { tmpdir, userInfo } from 'node:os';
 import { WebSearchError } from './errors.js';
+import { keychainShim } from './keychain-shim.js';
 
 export interface SearchSandbox {
   root: string;
   cwd: string;
   settings: string;
   mcp: string;
+  keychainBin: string;
+  keychainAccount: string;
   env: NodeJS.ProcessEnv;
   cleanup(): Promise<void>;
 }
@@ -64,7 +67,19 @@ export async function createSandbox(): Promise<SearchSandbox> {
     const home = join(root, 'home');
     const config = join(root, 'config');
     const temp = join(root, 'tmp');
-    for (const dir of [cwd, home, config, temp]) await mkdir(dir, { mode: 0o700 });
+    const keychainBin = join(root, 'bin');
+    for (const dir of [cwd, home, config, temp, keychainBin]) await mkdir(dir, { mode: 0o700 });
+    const user = userInfo();
+    const script = join(keychainBin, 'security.cjs');
+    const shim = keychainShim(
+      process.execPath,
+      user.homedir,
+      user.username,
+      script,
+      join(root, 'keychain-invoked')
+    );
+    await writeFile(script, shim.program, { mode: 0o700 });
+    await writeFile(join(keychainBin, 'security'), shim.launcher, { mode: 0o700 });
     const settings = join(config, 'settings.json');
     const mcp = join(config, 'mcp.json');
     await writeFile(
@@ -89,6 +104,8 @@ export async function createSandbox(): Promise<SearchSandbox> {
       cwd,
       settings,
       mcp,
+      keychainBin,
+      keychainAccount: user.username,
       cleanup,
       // Deliberately not process.env, buildCleanEnv, session launch settings,
       // dotenv, user config, PATH lookup, or profiles. The service explicitly

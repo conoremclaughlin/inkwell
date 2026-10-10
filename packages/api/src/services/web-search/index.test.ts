@@ -1,4 +1,5 @@
 import { access, readFile, stat } from 'node:fs/promises';
+import { userInfo } from 'node:os';
 import type { SpawnOptions } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -164,6 +165,8 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       HOME: '/synthetic/ambient-home',
       PATH: '/synthetic/bin',
       NODE_OPTIONS: '--synthetic',
+      NODE_PATH: '/synthetic/modules',
+      USER: 'synthetic-ambient-account',
       ANTHROPIC_API_KEY: 'synthetic-ambient-key',
       CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-ambient-oauth',
       OPENAI_API_KEY: 'synthetic-openai',
@@ -195,7 +198,10 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
       const env = child.options.env!;
       expect(env.HOME).toBe(`${rootOf(child)}/home`);
       expect(env.CLAUDE_CONFIG_DIR).toBe(`${rootOf(child)}/config`);
-      expect(env.PATH).toBe('/usr/bin:/bin');
+      expect(env.USER).toBe(child.args.includes('--print') ? userInfo().username : undefined);
+      expect(env.PATH).toBe(
+        child.args.includes('--print') ? `${rootOf(child)}/bin:/usr/bin:/bin` : '/usr/bin:/bin'
+      );
       expect(Object.keys(env).sort()).toEqual(
         [
           'HOME',
@@ -216,7 +222,7 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
           'CLAUDE_CODE_MAX_RETRIES',
           'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
           ...(child.args.includes('--print')
-            ? ['CLAUDE_SECURESTORAGE_CONFIG_DIR']
+            ? ['CLAUDE_SECURESTORAGE_CONFIG_DIR', 'USER']
             : ['CLAUDE_CODE_SIMPLE']),
         ].sort()
       );
@@ -291,6 +297,9 @@ describe('owned HOME/config/cwd and inert search lifecycle', () => {
         (async () => {
           const root = rootOf(child);
           expect((await stat(root)).mode & 0o777).toBe(0o700);
+          for (const path of ['bin', 'bin/security', 'bin/security.cjs']) {
+            expect((await stat(`${root}/${path}`)).mode & 0o777).toBe(0o700);
+          }
           const settingsPath = `${root}/config/settings.json`;
           expect((await stat(settingsPath)).mode & 0o777).toBe(0o600);
           expect(JSON.parse(await readFile(settingsPath, 'utf8'))).toEqual({

@@ -65,6 +65,32 @@ describe('Claude capability and native search evidence (synthetic only)', () => 
     expect(() => stream.accept(JSON.stringify(invalidate))).toThrow('output_limit');
   });
 
+  it('accepts bounded thinking estimates only between init and result, never as evidence', () => {
+    const notice = {
+      type: 'system',
+      subtype: 'thinking_tokens',
+      estimated_tokens: 12,
+      estimated_tokens_delta: 2,
+      uuid: invalidate.uuid,
+      session_id: invalidate.session_id,
+    };
+    const events = searchEvents();
+    expect(read([events[0], notice, ...events.slice(1)])).toEqual(read(events));
+    expect(() => read([notice, ...events])).toThrow('invalid_output');
+    expect(() => read([...events, notice])).toThrow('invalid_output');
+    expect(() => read([events[0], notice, events[3]])).toThrow('search_not_observed');
+    for (const patch of [
+      { estimated_tokens: -1 },
+      { estimated_tokens_delta: 0.5 },
+      { estimated_tokens: 10_000_001 },
+      { estimated_tokens_delta: undefined },
+      { extra: 'synthetic' },
+    ])
+      expect(() => read([events[0], { ...notice, ...patch }, ...events.slice(1)])).toThrow(
+        'invalid_output'
+      );
+  });
+
   it('requires the reviewed version AND structural isolation flags', () => {
     expect(() => verifyCapabilities(`${CLAUDE_VERSION} (Claude Code)\n`, HELP)).not.toThrow();
     for (const version of ['2.1.293', '2.1.295', '3.0.0']) {
@@ -83,6 +109,29 @@ describe('Claude capability and native search evidence (synthetic only)', () => 
       expect(() =>
         verifyCapabilities(`${CLAUDE_VERSION} (Claude Code)`, HELP.replace(flag, 'omitted'))
       ).toThrow('unsupported_capability');
+    }
+  });
+
+  it('discards opaque rate-limit accounting only inside an initialized stream', () => {
+    const notice = {
+      type: 'rate_limit_event',
+      rate_limit_info: { status: 'allowed', utilization: 0.1 },
+      uuid: invalidate.uuid,
+      session_id: invalidate.session_id,
+    };
+    const events = searchEvents();
+    expect(read([events[0], notice, ...events.slice(1)])).toEqual(read(events));
+    expect(() => read([notice, ...events])).toThrow('invalid_output');
+    expect(() => read([...events, notice])).toThrow('invalid_output');
+    expect(() => read([events[0], notice, events[3]])).toThrow('search_not_observed');
+    for (const patch of [
+      { rate_limit_info: null },
+      { rate_limit_info: { status: 'invented' } },
+      { extra: true },
+    ]) {
+      expect(() => read([events[0], { ...notice, ...patch }, ...events.slice(1)])).toThrow(
+        'invalid_output'
+      );
     }
   });
 

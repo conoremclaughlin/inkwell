@@ -65,7 +65,14 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
           // as the default macOS keychain namespace, independent of fresh config.
           // The file fallback remains in the disposable HOME. Do not inherit or
           // extract tokens, or retry with the caller's actual config directory.
-          env: { ...sandbox.env, CLAUDE_SECURESTORAGE_CONFIG_DIR: '' },
+          env: {
+            ...sandbox.env,
+            CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
+            // The native keychain helper alone needs the OS home to find the
+            // login keychain. Probes retain the original credential-free PATH.
+            PATH: `${sandbox.keychainBin}:/usr/bin:/bin`,
+            USER: sandbox.keychainAccount,
+          },
           stdin: JSON.stringify({ query: request.query, maxResults: request.maxResults }) + '\n',
           signal: request.signal,
           timeoutMs,
