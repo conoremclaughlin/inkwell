@@ -3,6 +3,7 @@ export * from './coding-tools.js';
 export * from './view-image.js';
 export * from './tool-images.js';
 export * from './session-tool-host.js';
+export * from './session-media-store.js';
 
 export * from './session-composition.js';
 export * from './session-clones.js';
