@@ -92,6 +92,27 @@ describe('registered web_search path', () => {
     expect(handler).toHaveBeenCalledOnce();
   });
 
+  it('does not treat a supplied account as authentication on an anonymous host', async () => {
+    const real = await vi.importActual<typeof import('./web-search')>('./web-search');
+    handler.mockImplementation((args, composer, deps) =>
+      real.handleWebSearch(args, composer, { ...deps, coordinator: { submit: mocks.search } })
+    );
+    const { callback } = setup();
+    const result = await callback(
+      { userId: '00000000-0000-4000-8000-000000000001', query: 'inert query' },
+      { mcpReq: { signal: new AbortController().signal } }
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text!)).toMatchObject({
+      success: false,
+      reason: 'auth-required',
+      searchMayHaveRun: false,
+    });
+    expect(mocks.allowed).not.toHaveBeenCalled();
+    expect(mocks.audit).not.toHaveBeenCalled();
+    expect(mocks.search).not.toHaveBeenCalled();
+  });
+
   it('runs principal checks and required audit through the registered handler before the inert provider', async () => {
     const real = await vi.importActual<typeof import('./web-search')>('./web-search');
     handler.mockImplementation((args, composer, deps) =>

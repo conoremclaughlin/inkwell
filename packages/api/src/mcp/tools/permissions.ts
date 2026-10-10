@@ -42,6 +42,7 @@ export const queryAuditLogSchema = userIdentifierBaseSchema.extend({
   action: z
     .enum([
       'web_search',
+      'web_search_batch',
       'web_fetch',
       'bash_curl',
       'bash_command',

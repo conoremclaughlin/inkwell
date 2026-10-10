@@ -16,7 +16,7 @@ import {
   LIMITS,
   webSearchQuerySchema,
 } from '../../services/web-search/config';
-import { getRequestContext } from '../../utils/request-context';
+import { getAuthenticatedPrincipal, getRequestContext } from '../../utils/request-context';
 
 export const webSearchSchema = userIdentifierBaseSchema
   .extend({
@@ -63,6 +63,12 @@ export async function handleWebSearch(
   deps: WebSearchDeps = {}
 ): Promise<Response> {
   const params = webSearchSchema.parse(args);
+  // Legacy hosts can permit anonymous MCP tools, and explicit identifiers
+  // resolve users without proving ownership. Neither grants subscription use.
+  const principal = getAuthenticatedPrincipal();
+  if (!principal || (params.userId !== undefined && params.userId !== principal.userId)) {
+    return response({ success: false, reason: 'auth-required', searchMayHaveRun: false }, true);
+  }
   const queries = params.queries ?? [params.query!];
   // One policy snapshot for both records, even across async permission/queue work.
   const contentRecording = isWebSearchAuditContentEnabled();

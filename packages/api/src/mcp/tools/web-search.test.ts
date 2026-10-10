@@ -118,12 +118,17 @@ describe('web_search auth, policy and audit', () => {
     }
   });
 
-  it('refuses another account before consulting permission or dispatching', async () => {
-    await expect(
-      call({ query: 'q', userId: '00000000-0000-4000-8000-000000000002' })
-    ).rejects.toThrow('does not match');
+  it('refuses another account in the handler before lookup, permission, audit or dispatch', async () => {
+    const result = await call({ query: 'q', userId: '00000000-0000-4000-8000-000000000002' });
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toEqual({
+      success: false,
+      reason: 'auth-required',
+      searchMayHaveRun: false,
+    });
     expect(findById).not.toHaveBeenCalled();
     expect(mocks.isEnabled).not.toHaveBeenCalled();
+    expect(mocks.log).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
   });
 
@@ -665,10 +670,16 @@ describe('operator subscription account boundary', () => {
     mocks.isEnabled.mockResolvedValue(false);
     expect(parse(await call())).toMatchObject({ reason: 'permission-off' });
     expect(search).not.toHaveBeenCalled();
+    vi.clearAllMocks();
     mocks.isEnabled.mockResolvedValue(true);
-    await expect(call({ query: 'question', userId: otherUserId })).rejects.toThrow(
-      'does not match'
-    );
+    expect(parse(await call({ query: 'question', userId: otherUserId }))).toEqual({
+      success: false,
+      reason: 'auth-required',
+      searchMayHaveRun: false,
+    });
+    expect(findById).not.toHaveBeenCalled();
+    expect(mocks.isEnabled).not.toHaveBeenCalled();
+    expect(mocks.log).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
   });
 
@@ -681,4 +692,20 @@ describe('operator subscription account boundary', () => {
     });
     expect(search).not.toHaveBeenCalled();
   });
+});
+
+// Identification is not authentication, even when the HTTP host permits legacy
+// anonymous tools or this handler is invoked directly by an internal caller.
+it('refuses an explicit account without a request principal before permission or audit', async () => {
+  const result = await handleWebSearch({ userId, query: 'inert public query' }, composer);
+  expect(result.isError).toBe(true);
+  expect(parse(result)).toEqual({
+    success: false,
+    reason: 'auth-required',
+    searchMayHaveRun: false,
+  });
+  expect(findById).not.toHaveBeenCalled();
+  expect(mocks.isEnabled).not.toHaveBeenCalled();
+  expect(mocks.log).not.toHaveBeenCalled();
+  expect(mocks.spawn).not.toHaveBeenCalled();
 });
