@@ -4356,10 +4356,62 @@ async function runChatSession(
     });
   };
 
+  /** One cancellation scope covers preparation, compaction, hooks and execution. */
+  const armTurnCancellation = () => {
+    const turnAbort = new AbortController();
+    let turnCtrlCAt = 0;
+    let currentTurnAbort: (() => void) | null = null;
+
+    const abortCurrentTurn = () => {
+      // The signal reaches compaction, hooks, approvals and tools even when
+      // there is no ordinary provider child. Its handle still moves per spawn.
+      if (!turnAbort.signal.aborted) turnAbort.abort();
+      const abort = currentTurnAbort;
+      currentTurnAbort = null;
+      abort?.();
+    };
+    const onSigintDuringTurn = () => {
+      const now = Date.now();
+      if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
+        forceQuitAfterTurn = true;
+        if (inkRepl) {
+          inkRepl.printSystem('Will exit after current backend turn completes.');
+        } else {
+          statusLane.renderHint('Will exit after current backend turn completes.');
+        }
+        return;
+      }
+      turnCtrlCAt = now;
+      abortCurrentTurn();
+      if (inkRepl) {
+        inkRepl.printSystem('Cancelling turn...');
+      } else {
+        statusLane.renderHint('Cancelling turn...');
+      }
+    };
+
+    process.on('SIGINT', onSigintDuringTurn);
+    inkRepl?.setAbortHandler(abortCurrentTurn);
+    return {
+      signal: turnAbort.signal,
+      setBackendAbort: (abort: (() => void) | null) => {
+        currentTurnAbort = abort;
+        // Stop may race a synchronous provider start before its handle returns.
+        if (turnAbort.signal.aborted) abortCurrentTurn();
+      },
+      dispose: () => {
+        process.off('SIGINT', onSigintDuringTurn);
+        inkRepl?.setAbortHandler(null);
+        currentTurnAbort = null;
+      },
+    };
+  };
+
   const executeUserTurn = async (
     raw: string,
     turnMedia: TurnMedia[],
-    prepared: PreparedSessionTurn
+    prepared: PreparedSessionTurn,
+    cancellation: ReturnType<typeof armTurnCancellation>
   ) => {
     const { occupancy: turnOccupancy, promptHooks: promptHookResult } = prepared;
     // Print notifications from prompt_build hooks
@@ -4471,64 +4523,6 @@ async function runChatSession(
           renderAbovePrompt: true,
         });
     let turnDurationSeconds = 0;
-    let turnCtrlCAt = 0;
-    let currentTurnAbort: (() => void) | null = null;
-
-    /**
-     * Cancellation for everything in this turn that is NOT the backend child
-     * process. Killing the child (`currentTurnAbort`) has always ended the
-     * backend's work, but anything waiting *around* it — an approval prompt, a
-     * 2FA poll — had no way to hear about it and would sit for its full timeout.
-     * Fresh per turn, so a cancelled turn does not disarm the next one.
-     */
-    const turnAbort = new AbortController();
-
-    const abortCurrentTurn = () => {
-      // Always fire the turn signal, even between backend turns: that is the
-      // only thing that reaches an approval prompt or a 2FA poll, and those are
-      // exactly when no child process is running to kill.
-      if (!turnAbort.signal.aborted) turnAbort.abort();
-      if (currentTurnAbort) {
-        currentTurnAbort();
-        currentTurnAbort = null;
-      }
-    };
-
-    const onSigintDuringTurn = () => {
-      const now = Date.now();
-      if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
-        forceQuitAfterTurn = true;
-        if (inkRepl) {
-          inkRepl.printSystem('Will exit after current backend turn completes.');
-        } else {
-          statusLane.renderHint('Will exit after current backend turn completes.');
-        }
-        return;
-      }
-      turnCtrlCAt = now;
-      abortCurrentTurn();
-      if (inkRepl) {
-        inkRepl.printSystem('Cancelling turn...');
-      } else {
-        statusLane.renderHint('Cancelling turn...');
-      }
-    };
-
-    /**
-     * Cancellation handlers stay armed for the WHOLE turn, not per backend
-     * child.
-     *
-     * They used to be installed and torn down around each `startBackendTurn`,
-     * which left Ctrl+C unhandled during exactly the phase where a turn is most
-     * likely to be waiting on a human: tool execution and approval prompts. The
-     * AbortSignal reached the approval channels, but nothing was left alive to
-     * fire it. `currentTurnAbort` still moves per child, so a Ctrl+C during a
-     * backend turn kills the right process.
-     */
-    const disarmTurnCancellation = () => {
-      process.off('SIGINT', onSigintDuringTurn);
-      inkRepl?.setAbortHandler(null);
-    };
 
     const providerPorts: SessionProviderPorts = {
       runtime,
@@ -4551,9 +4545,7 @@ async function runChatSession(
       onEvent: handleBackendEvent,
       beginSpawn,
       endSpawn,
-      onAbortHandle: (abort) => {
-        currentTurnAbort = abort;
-      },
+      onAbortHandle: cancellation.setBackendAbort,
       onInitialSettled: () => {
         turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
         stopWaiting();
@@ -4614,9 +4606,6 @@ async function runChatSession(
         ),
     };
 
-    process.on('SIGINT', onSigintDuringTurn);
-    inkRepl?.setAbortHandler(abortCurrentTurn);
-
     let execution: Awaited<ReturnType<typeof runSessionAgentTurn>>;
     try {
       execution = await runSessionAgentTurn(
@@ -4624,7 +4613,7 @@ async function runChatSession(
           raw,
           turnMedia,
           prepared,
-          signal: turnAbort.signal,
+          signal: cancellation.signal,
           // Nobody watches a non-interactive turn, so a call that failed (an
           // invalid argument, say) gets a retry instead of ending the turn on
           // the FINAL relay. A deliberate refusal still ends it.
@@ -4709,8 +4698,7 @@ async function runChatSession(
         }
       );
     } finally {
-      // Only here — after tools and approvals, not after the last child exits.
-      disarmTurnCancellation();
+      stopWaiting();
     }
 
     return {
@@ -4812,71 +4800,80 @@ async function runChatSession(
     onReplyReady?: () => void
   ) => {
     if (!raw.trim()) return;
-    // Even an empty drain checks the persistence-uncertainty fence, including
-    // the headless path which does not go through the interactive FIFO.
-    await sessionControls.drain();
-    sessionStream.resetTurn();
-    // Attach pending files to this turn — append the block so the backend
-    // sees the paths inline with the message that delivered them. The media
-    // list rides the same turn (injected as prompt content by adapters that
-    // support it) and is consumed here so continuations don't re-inject.
-    if (pendingAttachmentBlock) {
-      raw = `${raw}\n\n${pendingAttachmentBlock}`;
-      pendingAttachmentBlock = '';
-    }
-    const turnMedia = pendingTurnMedia;
-    pendingTurnMedia = [];
-    // Display echo stays at submit time. The shared coordinator sequences
-    // context/log writes, compaction and recall with the actual execution.
-    const coordinated = await turnCoordinator.run(
-      { raw, source, displayLabel },
-      (prepared) => executeUserTurn(raw, turnMedia, prepared),
-      (execution) => presentUserTurn(execution, onReplyReady)
-    );
-    if (!coordinated) return;
-    const { endHooks: hookResult, autoEviction } = coordinated;
-    if (autoEviction) {
-      printEvent(
-        chalk.dim(
-          `  🗑 auto-cleared ${autoEviction.entries} consumed tool results (${formatTokenCount(autoEviction.removedTokens)} tok) — ${autoEviction.tools.join(', ')}`
-        )
+    // Arm before the coordinator: its pre-turn compaction can start a child
+    // before executeUserTurn is ever entered. Fresh for each queued turn.
+    const cancellation = armTurnCancellation();
+    try {
+      // Even an empty drain checks the persistence-uncertainty fence, including
+      // the headless path which does not go through the interactive FIFO.
+      await sessionControls.drain(cancellation.signal);
+      sessionStream.resetTurn();
+      // Attach pending files to this turn — append the block so the backend
+      // sees the paths inline with the message that delivered them. The media
+      // list rides the same turn (injected as prompt content by adapters that
+      // support it) and is consumed here so continuations don't re-inject.
+      if (pendingAttachmentBlock) {
+        raw = `${raw}\n\n${pendingAttachmentBlock}`;
+        pendingAttachmentBlock = '';
+      }
+      const turnMedia = pendingTurnMedia;
+      pendingTurnMedia = [];
+      // Display echo stays at submit time. The shared coordinator sequences
+      // context/log writes, compaction and recall with the actual execution.
+      const coordinated = await turnCoordinator.run(
+        { raw, source, displayLabel },
+        (prepared) => executeUserTurn(raw, turnMedia, prepared, cancellation),
+        (execution) => presentUserTurn(execution, onReplyReady),
+        cancellation.signal
       );
-    }
+      if (!coordinated) return;
+      const { endHooks: hookResult, autoEviction } = coordinated;
+      if (autoEviction) {
+        printEvent(
+          chalk.dim(
+            `  🗑 auto-cleared ${autoEviction.entries} consumed tool results (${formatTokenCount(autoEviction.removedTokens)} tok) — ${autoEviction.tools.join(', ')}`
+          )
+        );
+      }
 
-    // Notify the user about passive recall injections
-    if (hookResult.injected > 0) {
-      const recallEntries = ledger
-        .listEntries()
-        .filter((e) => e.source === 'passive-recall')
-        .slice(-hookResult.injected);
+      // Notify the user about passive recall injections
+      if (hookResult.injected > 0) {
+        const recallEntries = ledger
+          .listEntries()
+          .filter((e) => e.source === 'passive-recall')
+          .slice(-hookResult.injected);
 
-      if (recallEntries.length > 0) {
-        const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
-        if (inkRepl) {
-          const details = recallEntries.map((entry) => {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
-          });
-          inkRepl.setSurfacedMemories(details);
-          printLine(
-            chalk.dim(
-              `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
-            )
-          );
-        } else {
-          for (const entry of recallEntries) {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+        if (recallEntries.length > 0) {
+          const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+          if (inkRepl) {
+            const details = recallEntries.map((entry) => {
+              const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+              return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+            });
+            inkRepl.setSurfacedMemories(details);
             printLine(
               chalk.dim(
-                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
               )
             );
+          } else {
+            for (const entry of recallEntries) {
+              const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+              printLine(
+                chalk.dim(
+                  `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                )
+              );
+            }
           }
         }
       }
-    }
-    if (hookResult.evicted > 0) {
-      printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
+      if (hookResult.evicted > 0) {
+        printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
+      }
+    } finally {
+      // Includes preparation failures/cancellation and the bounded turn_end tail.
+      cancellation.dispose();
     }
   };
 
