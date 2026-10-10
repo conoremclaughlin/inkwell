@@ -16,7 +16,7 @@ import { INKLING_CLIENT } from '../services/inklings/inkling-client';
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-vi.mock('../config/env', async () => ({ env: (await import('../test/fake-env')).fakeEnv }));
+vi.mock('../config/env', async () => ({ env: (await import('../test/fake-env.js')).fakeEnv }));
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
     from: () => {

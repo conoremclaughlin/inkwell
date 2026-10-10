@@ -1,5 +1,14 @@
 /** Production wiring, synthetic dependencies: no process, filesystem, keychain, or network IO. */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockedFunction,
+  type MockInstance,
+} from 'vitest';
 
 // Every imported IO boundary is replaced before SessionService/CodexRunner load.
 // Keep the service, repository mapper, token signer/verifier, registry, binding,
@@ -103,7 +112,9 @@ vi.mock('../studio-lease.service.js', () => ({
 }));
 vi.mock('../thread-key/thread-key.service.js', () => ({ ThreadKeyService: class {} }));
 vi.mock('../studio-overflow.service.js', () => ({ StudioOverflowService: class {} }));
-vi.mock('../studio-complete.js', () => ({ ensureStudioComplete: vi.fn(async () => undefined) }));
+vi.mock('../studio-complete.js', () => ({
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
 vi.mock('../../data/repositories/studios.repository.js', () => ({ StudiosRepository: class {} }));
 vi.mock('../principals.js', () => ({ personalWorkspaceOf: vi.fn(), workspaceOfSb: vi.fn() }));
 vi.mock('../inklings/inkling-folder.js', () => ({
@@ -151,15 +162,49 @@ import { getActiveRun, resetActiveRuns, submitRunSteering } from './active-runs.
 import { runOwnedCodexAppServer } from './codex-app-server.js';
 import { ensureStudioComplete } from '../studio-complete.js';
 import { spawn } from 'child_process';
-import type { ClaudeRunnerConfig, Session, SessionRequest, SessionResult } from './types.js';
+import type {
+  ChannelResponse,
+  ClaudeRunnerConfig,
+  IRunner,
+  Session,
+  SessionRequest,
+  SessionResult,
+  ToolCall,
+} from './types.js';
+
+/** Only the private seams replaced by this wiring fixture, with their inert result shapes. */
+interface CodexRunnerTestPorts {
+  createIdentityPromptTempFile(
+    content: string,
+    runtimeDir?: string
+  ): {
+    promptPath: string;
+    containerPath?: string;
+    cleanup(): void;
+  };
+  spawnProcess(
+    args: string[],
+    config: ClaudeRunnerConfig
+  ): Promise<{
+    responses: ChannelResponse[];
+    toolCalls: ToolCall[];
+    sessionId?: string;
+    finalTextResponse?: string;
+  }>;
+}
+
+interface SessionServiceTestPorts {
+  releaseLeaseIfSessionTerminal(sessionId: string, expectedTurnEpoch?: string): Promise<void>;
+  processMessage(request: SessionRequest, session: Session, epoch: string): Promise<SessionResult>;
+}
 
 type Row = Record<string, unknown>;
 let row: Row;
 let identity: Row;
 let seenConfigs: ClaudeRunnerConfig[];
 let dbWrites: Row[];
-let native: ReturnType<typeof vi.mocked<typeof runOwnedCodexAppServer>>;
-let legacy: ReturnType<typeof vi.spyOn>;
+let native: MockedFunction<typeof runOwnedCodexAppServer>;
+let legacy: MockInstance<CodexRunnerTestPorts['spawnProcess']>;
 let repository: SessionRepository;
 let service: SessionService;
 const sessionId = 'synthetic-session';
@@ -269,22 +314,23 @@ beforeEach(() => {
     return success;
   });
   const runner = new CodexRunner();
-  vi.spyOn(runner as never, 'createIdentityPromptTempFile' as never).mockReturnValue({
+  const runnerTestPorts = runner as unknown as CodexRunnerTestPorts;
+  vi.spyOn(runnerTestPorts, 'createIdentityPromptTempFile').mockReturnValue({
     promptPath: '/synthetic/prompt',
     cleanup: vi.fn(),
-  } as never);
-  legacy = vi
-    .spyOn(runner as never, 'spawnProcess' as never)
-    .mockImplementation(async (_args: unknown, config: ClaudeRunnerConfig) => {
-      seenConfigs.push(config);
-      return {
-        responses: [],
-        sessionId: 'synthetic-thread',
-        finalTextResponse: 'Synthetic legacy response',
-      };
-    });
+  });
+  legacy = vi.spyOn(runnerTestPorts, 'spawnProcess').mockImplementation(async (_args, config) => {
+    seenConfigs.push(config);
+    return {
+      responses: [],
+      toolCalls: [],
+      sessionId: 'synthetic-thread',
+      finalTextResponse: 'Synthetic legacy response',
+    };
+  });
   repository = new SessionRepository(client as never);
-  const unusedRunner = {
+  const unusedRunner: IRunner = {
+    uploadMedia: 'refuse',
     run: vi.fn(async () => {
       throw new Error('Unexpected backend');
     }),
@@ -313,9 +359,10 @@ beforeEach(() => {
     unusedRunner,
     unusedRunner
   );
-  vi.spyOn(service as never, 'releaseLeaseIfSessionTerminal' as never).mockResolvedValue(
-    undefined as never
-  );
+  vi.spyOn(
+    service as unknown as SessionServiceTestPorts,
+    'releaseLeaseIfSessionTerminal'
+  ).mockResolvedValue(undefined);
 });
 afterEach(() => {
   resetActiveRuns();
@@ -325,15 +372,11 @@ afterEach(() => {
 });
 async function run(metadata: Row = {}) {
   const session = (await repository.findById(sessionId))!;
-  return (
-    service as unknown as {
-      processMessage(
-        request: SessionRequest,
-        session: Session,
-        epoch: string
-      ): Promise<SessionResult>;
-    }
-  ).processMessage({ ...request, metadata }, session, 'synthetic-epoch');
+  return (service as unknown as SessionServiceTestPorts).processMessage(
+    { ...request, metadata },
+    session,
+    'synthetic-epoch'
+  );
 }
 
 describe('production native steering selection', () => {
@@ -389,6 +432,7 @@ describe('production native steering selection', () => {
     identity.metadata = null;
     vi.mocked(ensureStudioComplete).mockImplementationOnce(async () => {
       identity.metadata = {};
+      return { ok: true, complete: true, missing: [] };
     });
     await run();
     expect(native).not.toHaveBeenCalled();
