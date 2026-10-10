@@ -920,16 +920,14 @@ export class MCPServer {
       const authHeader = req.header('authorization');
       const verdict = await this.authProvider.verifyAccessToken(authHeader);
       if (!verdict.ok) {
-        res
-          .status(verdict.status)
-          .json(
-            verdict.status === 503
-              ? {
-                  error: 'temporarily_unavailable',
-                  error_description: "The token's SB couldn't be checked",
-                }
-              : { error: 'invalid_token', error_description: 'Missing or invalid bearer token' }
-          );
+        res.status(verdict.status).json(
+          verdict.status === 503
+            ? {
+                error: 'temporarily_unavailable',
+                error_description: "The token's SB couldn't be checked",
+              }
+            : { error: 'invalid_token', error_description: 'Missing or invalid bearer token' }
+        );
         return;
       }
       const userData = verdict.token;

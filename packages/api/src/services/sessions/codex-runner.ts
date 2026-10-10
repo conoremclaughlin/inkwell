@@ -601,7 +601,7 @@ export class CodexRunner implements IRunner {
     cleanup: () => void;
   } {
     const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'ink-codex-'));
-    const filename = `identity-${process.pid}-${Date.now()}.md`;
+    const filename = `identity-${process.pid}-${randomUUID()}.md`;
     const promptPath = join(dir, filename);
     writeFileSync(promptPath, content || 'Follow system identity instructions.');
     return {

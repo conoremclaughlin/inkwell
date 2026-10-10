@@ -246,7 +246,21 @@ describe('a resolved failure is never a receipt (Lumen, PR #584 round 4)', () =>
       join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'chat.ts'),
       'utf8'
     );
-    expect(source).toContain('localToolLedgerLine(result.tool, result.result, resultJson)');
+    expect(source).toContain('const sessionTools = createSessionTools({');
+    expect(source).toContain('return sessionTools(calls, {');
+    const composition = readFileSync(
+      new URL('../../../shared/src/runtime/session-tools.ts', import.meta.url),
+      'utf8'
+    );
+    expect(composition).toContain('runSessionToolBatch(calls, {');
+    const batch = readFileSync(
+      new URL('../../../shared/src/runtime/session-tool-batch.ts', import.meta.url),
+      'utf8'
+    );
+    expect(batch).toContain(
+      'localToolLedgerLine(result.tool, result.result, JSON.stringify(result.result))'
+    );
+    expect(batch).not.toContain('`local tool ${result.tool} -> ${resultJson}`');
     expect(source).not.toContain('`local tool ${result.tool} -> ${resultJson}`');
   });
 });

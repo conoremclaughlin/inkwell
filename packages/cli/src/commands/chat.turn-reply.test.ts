@@ -11,10 +11,11 @@
  * These run the real runChat with a scripted backend, one reply per outer turn.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseTurnReplyEvent } from '@inklabs/shared';
+import { SbHookRegistry } from '@inklabs/shared/runtime';
 
 // This file's own HOME, set before any module computes a path from it. A
 // write that escapes the per-test paths lands here, where afterEach sees it,
@@ -270,6 +271,65 @@ describe('spawned ink chat: per-turn replies', () => {
   const prompts = () =>
     testState.runBackendImpl.mock.calls.map((c) => (c[0] as BackendRequest).prompt);
 
+  it('waits for turn-end recall before the next turn and before closing the transcript', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const atHook = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fire = SbHookRegistry.prototype.fire;
+    const spy = vi.spyOn(SbHookRegistry.prototype, 'fire').mockImplementation(async function (
+      this: SbHookRegistry,
+      event,
+      context
+    ) {
+      const result = await fire.call(this, event, context);
+      if (event === 'turn_end' && context.runtime.turnCount === 1) {
+        entered();
+        await gate;
+        const entry = {
+          role: 'system' as const,
+          content: 'slow recall from first turn',
+          source: 'passive-recall',
+          memoryId: 'slow-memory',
+        };
+        context.ledger.addEntry(entry.role, entry.content, entry.source);
+        result.injected++;
+        result.injectedEntries.push(entry);
+      }
+      return result;
+    });
+    const running = runThreeTurns();
+    try {
+      await atHook;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+      expect(turnReplies()).toHaveLength(1);
+      expect(turnReplies()[0]).toMatchObject({ text: SCRIPTED_TURNS[0], turn: 1 });
+    } finally {
+      release();
+      await running;
+      spy.mockRestore();
+    }
+    const dir = join(testCwd, '.ink', 'runtime', 'repl');
+    const lines = readFileSync(join(dir, readdirSync(dir)[0]!), 'utf8')
+      .trim()
+      .split('\n');
+    const events = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const injection = events.findIndex(
+      (e) => e.type === 'hook_injection' && e.memoryId === 'slow-memory'
+    );
+    const nextInput = events.findIndex(
+      (e) => e.type === 'system_turn' && e.label === 'continuation'
+    );
+    expect(injection).toBeGreaterThan(-1);
+    expect(nextInput).toBeGreaterThan(injection);
+    expect(turnReplies()).toHaveLength(3);
+  });
+
   it('prints one turn_reply per outer turn, carrying the token, before the result line', async () => {
     await runThreeTurns();
 
@@ -299,6 +359,59 @@ describe('spawned ink chat: per-turn replies', () => {
     const result = lines.find((line) => line.type === 'result');
     expect(result?.turnsCompleted).toBe(3);
     expect(lines.indexOf(result!)).toBeGreaterThan(lines.indexOf(replies[2]!));
+  });
+
+  it('finishes after the hook budget without applying a late result after shutdown', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const atHook = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fire = SbHookRegistry.prototype.fire;
+    const spy = vi.spyOn(SbHookRegistry.prototype, 'fire').mockImplementation(function (
+      this: SbHookRegistry,
+      event,
+      context
+    ) {
+      if (event === 'turn_end') {
+        this.register({
+          name: 'hung recall fixture',
+          event: 'turn_end',
+          handler: async () => {
+            entered();
+            await gate;
+            return { inject: [{ role: 'system', content: 'too late', source: 'fixture' }] };
+          },
+        });
+      }
+      return fire.call(this, event, context);
+    });
+    const running = runThreeTurns({ maxTurns: '1' });
+    try {
+      await atHook;
+      expect(turnReplies()).toHaveLength(1);
+      expect(jsonLines().some((e) => e.type === 'result')).toBe(false);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await running;
+      expect(jsonLines().some((e) => e.type === 'result')).toBe(true);
+      const dir = join(testCwd, '.ink', 'runtime', 'repl');
+      const path = join(dir, readdirSync(dir)[0]!);
+      const before = readFileSync(path, 'utf8');
+      expect(before).toContain('"type":"hook_timeout"');
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+    } finally {
+      release();
+      try {
+        await running;
+      } finally {
+        spy.mockRestore();
+      }
+    }
   });
 
   it('prints nothing per turn when the server did not mint a token', async () => {

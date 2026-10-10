@@ -136,6 +136,16 @@ class ExemptionsAreNarrow(unittest.TestCase):
             flags("scripts/lib/integration-stack.py", 'if project.startswith("pcp-"):')
         )
 
+    def test_legacy_activity_sources_follow_the_extracted_history_reader(self):
+        reader = "packages/shared/src/runtime/session-history.ts"
+        old_reader = "packages/cli/src/commands/chat.ts"
+        for source in ("'pcp-activity'", "'pcp-activity-history'"):
+            self.assertFalse(flags(reader, source))
+            self.assertTrue(flags(old_reader, source))
+            self.assertTrue(flags(PLAIN, source))
+        self.assertTrue(flags(reader, "'pcp-activity-new'"))
+        self.assertTrue(flags(reader, "'pcp-activity-history-new'"))
+
     def test_scoped_exemption_does_not_leak_to_other_files(self):
         legacy = "const header = { typ: 'PCP-DELEGATION' };"
         self.assertFalse(flags("packages/shared/src/security/delegation-token.ts", legacy))

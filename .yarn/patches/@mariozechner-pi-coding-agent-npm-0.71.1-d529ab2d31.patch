@@ -1,0 +1,241 @@
+diff --git a/dist/core/tools/bash.d.ts b/dist/core/tools/bash.d.ts
+index 34261de3759b4b6453362e25c90bf04ad356eabd..d0f1ffcb60baa8acfa13f70e35c2344d17283f15 100644
+--- a/dist/core/tools/bash.d.ts
++++ b/dist/core/tools/bash.d.ts
+@@ -48,6 +48,10 @@ export interface BashSpawnContext {
+ }
+ export type BashSpawnHook = (context: BashSpawnContext) => BashSpawnContext;
+ export interface BashToolOptions {
++    /** Hosted execution: do not copy the API process environment. */
++    env?: NodeJS.ProcessEnv;
++    /** Hosted execution: caller-owned directory for overflow output. */
++    tempDirectory?: string;
+     /** Custom operations for command execution. Default: local shell */
+     operations?: BashOperations;
+     /** Command prefix prepended to every command (for example shell setup commands) */
+diff --git a/dist/core/tools/bash.js b/dist/core/tools/bash.js
+index 2f92b9a3c7bf8d4284eb41149f43cb6c3d89ef1c..c883da282901b6c57db8ad9d534837b48500f300 100644
+--- a/dist/core/tools/bash.js
++++ b/dist/core/tools/bash.js
+@@ -16,9 +16,9 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "
+ /**
+  * Generate a unique temp file path for bash output.
+  */
+-function getTempFilePath() {
++function getTempFilePath(directory = tmpdir()) {
+     const id = randomBytes(8).toString("hex");
+-    return join(tmpdir(), `pi-bash-${id}.log`);
++    return join(directory, `pi-bash-${id}.log`);
+ }
+ const bashSchema = Type.Object({
+     command: Type.String({ description: "Bash command to execute" }),
+@@ -104,8 +104,8 @@ export function createLocalBashOperations(options) {
+         },
+     };
+ }
+-function resolveSpawnContext(command, cwd, spawnHook) {
+-    const baseContext = { command, cwd, env: { ...getShellEnv() } };
++function resolveSpawnContext(command, cwd, spawnHook, env) {
++    const baseContext = { command, cwd, env: { ...(env ?? getShellEnv()) } };
+     return spawnHook ? spawnHook(baseContext) : baseContext;
+ }
+ const BASH_PREVIEW_LINES = 5;
+@@ -197,13 +197,14 @@ export function createBashToolDefinition(cwd, options) {
+         parameters: bashSchema,
+         async execute(_toolCallId, { command, timeout }, signal, onUpdate, _ctx) {
+             const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
+-            const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
++            const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook, options?.env);
+             if (onUpdate) {
+                 onUpdate({ content: [], details: undefined });
+             }
+             return new Promise((resolve, reject) => {
+                 let tempFilePath;
+                 let tempFileStream;
++                let tempFileError;
+                 let totalBytes = 0;
+                 const chunks = [];
+                 let chunksBytes = 0;
+@@ -211,8 +212,9 @@ export function createBashToolDefinition(cwd, options) {
+                 const ensureTempFile = () => {
+                     if (tempFilePath)
+                         return;
+-                    tempFilePath = getTempFilePath();
+-                    tempFileStream = createWriteStream(tempFilePath);
++                    tempFilePath = getTempFilePath(options?.tempDirectory);
++                    tempFileStream = createWriteStream(tempFilePath, { mode: 0o600, flags: "wx" });
++                    tempFileStream.on("error", (error) => { tempFileError = error; });
+                     for (const chunk of chunks)
+                         tempFileStream.write(chunk);
+                 };
+@@ -256,7 +258,7 @@ export function createBashToolDefinition(cwd, options) {
+                     timeout,
+                     env: spawnContext.env,
+                 })
+-                    .then(({ exitCode }) => {
++                    .then(async ({ exitCode }) => {
+                     // Combine the rolling buffer chunks.
+                     const fullBuffer = Buffer.concat(chunks);
+                     const fullOutput = fullBuffer.toString("utf-8");
+@@ -266,8 +268,13 @@ export function createBashToolDefinition(cwd, options) {
+                         ensureTempFile();
+                     }
+                     // Close temp file stream before building the final result.
+-                    if (tempFileStream)
+-                        tempFileStream.end();
++                    if (tempFileStream && !tempFileStream.destroyed) {
++                        await new Promise((done) => {
++                            tempFileStream.once("close", done);
++                            tempFileStream.end();
++                        });
++                    }
++                    if (tempFileError) throw tempFileError;
+                     let outputText = truncation.content || "(no output)";
+                     let details;
+                     if (truncation.truncated) {
+@@ -295,10 +302,15 @@ export function createBashToolDefinition(cwd, options) {
+                         resolve({ content: [{ type: "text", text: outputText }], details });
+                     }
+                 })
+-                    .catch((err) => {
++                    .catch(async (err) => {
+                     // Close temp file stream and include buffered output in the error message.
+-                    if (tempFileStream)
+-                        tempFileStream.end();
++                    if (tempFileStream && !tempFileStream.destroyed) {
++                        await new Promise((done) => {
++                            tempFileStream.once("close", done);
++                            tempFileStream.end();
++                        });
++                    }
++                    if (tempFileError) err = tempFileError;
+                     const fullBuffer = Buffer.concat(chunks);
+                     let output = fullBuffer.toString("utf-8");
+                     if (err.message === "aborted") {
+diff --git a/dist/core/tools/file-mutation-queue.js b/dist/core/tools/file-mutation-queue.js
+index 8fad3b1d99dd49d7d91f0296d30448a222d884ba..6469b5c0ae95dba26b7c7825d25d58136ec3e3bd 100644
+--- a/dist/core/tools/file-mutation-queue.js
++++ b/dist/core/tools/file-mutation-queue.js
+@@ -1,10 +1,10 @@
+-import { realpathSync } from "node:fs";
++import { realpath } from "node:fs/promises";
+ import { resolve } from "node:path";
+ const fileMutationQueues = new Map();
+-function getMutationQueueKey(filePath) {
++async function getMutationQueueKey(filePath) {
+     const resolvedPath = resolve(filePath);
+     try {
+-        return realpathSync.native(resolvedPath);
++        return await realpath(resolvedPath);
+     }
+     catch {
+         return resolvedPath;
+@@ -15,7 +15,7 @@ function getMutationQueueKey(filePath) {
+  * Operations for different files still run in parallel.
+  */
+ export async function withFileMutationQueue(filePath, fn) {
+-    const key = getMutationQueueKey(filePath);
++    const key = await getMutationQueueKey(filePath);
+     const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
+     let releaseNext;
+     const nextQueue = new Promise((resolveQueue) => {
+diff --git a/dist/core/tools/find.d.ts b/dist/core/tools/find.d.ts
+index 4eeb8735c95bf09f7adc36ffa94f238d3720d4a7..a292170b9af71043b9199b498154f45645f82a78 100644
+--- a/dist/core/tools/find.d.ts
++++ b/dist/core/tools/find.d.ts
+@@ -26,6 +26,10 @@ export interface FindOperations {
+     }) => Promise<string[]> | string[];
+ }
+ export interface FindToolOptions {
++    /** Hosted execution: explicit binary resolution, without ambient download/cache lookup. */
++    resolveCommand?: () => Promise<string>;
++    /** Hosted execution: the host owns child environment, bounds and lifecycle. */
++    spawnProcess?: (file: string, args: readonly string[]) => import("node:child_process").ChildProcessWithoutNullStreams;
+     /** Custom operations for find. Default: local filesystem plus fd */
+     operations?: FindOperations;
+ }
+diff --git a/dist/core/tools/find.js b/dist/core/tools/find.js
+index 675ba36c2ad5434c0c3101f19da10fa7416c07bf..5e27ffab49a17fd0ec1c48fc6dda87aec97bcbda 100644
+--- a/dist/core/tools/find.js
++++ b/dist/core/tools/find.js
+@@ -155,7 +155,7 @@ export function createFindToolDefinition(cwd, options) {
+                             return;
+                         }
+                         // Default implementation uses fd.
+-                        const fdPath = await ensureTool("fd", true);
++                        const fdPath = options?.resolveCommand ? await options.resolveCommand() : await ensureTool("fd", true);
+                         if (signal?.aborted) {
+                             settle(() => reject(new Error("Operation aborted")));
+                             return;
+@@ -186,7 +186,7 @@ export function createFindToolDefinition(cwd, options) {
+                             }
+                         }
+                         args.push("--", effectivePattern, searchPath);
+-                        const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
++                        const child = options?.spawnProcess ? options.spawnProcess(fdPath, args) : spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+                         const rl = createInterface({ input: child.stdout });
+                         let stderr = "";
+                         const lines = [];
+diff --git a/dist/core/tools/grep.d.ts b/dist/core/tools/grep.d.ts
+index 87d399428291e136f8bf1811177427d85cfa34fd..281af9947087d161a8d097f022d0b5f0c0aaf665 100644
+--- a/dist/core/tools/grep.d.ts
++++ b/dist/core/tools/grep.d.ts
+@@ -28,6 +28,10 @@ export interface GrepOperations {
+     readFile: (absolutePath: string) => Promise<string> | string;
+ }
+ export interface GrepToolOptions {
++    /** Hosted execution: explicit binary resolution, without ambient download/cache lookup. */
++    resolveCommand?: () => Promise<string>;
++    /** Hosted execution: the host owns child environment, bounds and lifecycle. */
++    spawnProcess?: (file: string, args: readonly string[]) => import("node:child_process").ChildProcessWithoutNullStreams;
+     /** Custom operations for grep. Default: local filesystem plus ripgrep */
+     operations?: GrepOperations;
+ }
+diff --git a/dist/core/tools/grep.js b/dist/core/tools/grep.js
+index 39750bcee2ca4a8d28515023b4477197cbbe15f5..dac455c2829323db508825b6eeb0d99ecf872071 100644
+--- a/dist/core/tools/grep.js
++++ b/dist/core/tools/grep.js
+@@ -92,7 +92,7 @@ export function createGrepToolDefinition(cwd, options) {
+                 };
+                 (async () => {
+                     try {
+-                        const rgPath = await ensureTool("rg", true);
++                        const rgPath = options?.resolveCommand ? await options.resolveCommand() : await ensureTool("rg", true);
+                         if (!rgPath) {
+                             settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
+                             return;
+@@ -141,7 +141,7 @@ export function createGrepToolDefinition(cwd, options) {
+                         if (glob)
+                             args.push("--glob", glob);
+                         args.push("--", pattern, searchPath);
+-                        const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
++                        const child = options?.spawnProcess ? options.spawnProcess(rgPath, args) : spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+                         const rl = createInterface({ input: child.stdout });
+                         let stderr = "";
+                         let matchCount = 0;
+diff --git a/dist/core/tools/read.d.ts b/dist/core/tools/read.d.ts
+index cf8fa3025d096d072a4e2a2c2b5ef5e1309e3612..6e74bb6c8cdd4fb7bea64ae522e07ea8636653c5 100644
+--- a/dist/core/tools/read.d.ts
++++ b/dist/core/tools/read.d.ts
+@@ -24,6 +24,8 @@ export interface ReadOperations {
+     detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
+ }
+ export interface ReadToolOptions {
++    /** Hosted execution: async path lookup in explicit roots. */
++    resolvePath?: (path: string, cwd: string) => Promise<string>;
+     /** Whether to auto-resize images to 2000x2000 max. Default: true */
+     autoResizeImages?: boolean;
+     /** Custom operations for file reading. Default: local filesystem */
+diff --git a/dist/core/tools/read.js b/dist/core/tools/read.js
+index 7450b1077208f5d547913054e3c948682d092824..87eac0e7378533620e8bdfef049fc33c59d0f730 100644
+--- a/dist/core/tools/read.js
++++ b/dist/core/tools/read.js
+@@ -85,7 +85,7 @@ export function createReadToolDefinition(cwd, options) {
+         promptGuidelines: ["Use read to examine files instead of cat or sed."],
+         parameters: readSchema,
+         async execute(_toolCallId, { path, offset, limit }, signal, _onUpdate, ctx) {
+-            const absolutePath = resolveReadPath(path, cwd);
++            const absolutePath = options?.resolvePath ? await options.resolvePath(path, cwd) : resolveReadPath(path, cwd);
+             return new Promise((resolve, reject) => {
+                 if (signal?.aborted) {
+                     reject(new Error("Operation aborted"));

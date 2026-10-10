@@ -1,0 +1,713 @@
+/**
+ * Client-Local Context Management Tools
+ *
+ * These tools run in the session runtime — they modify its context ledger
+ * without going through the Inkwell MCP server. This gives the SB agency over
+ * its own context window: the ability to introspect what's there and
+ * surgically evict what's no longer relevant.
+ *
+ * The SB calls these the same way as Inkwell tools (via ink-tool blocks),
+ * but the host intercepts and handles them within the owning session.
+ */
+
+import {
+  entryRefHash,
+  type ContextLedger,
+  type LedgerEntry,
+  type LedgerEvictResult,
+} from './context-ledger.js';
+/** Structurally compatible with an MCP result, without importing a host client. */
+export type ContextToolResult = Record<string, unknown>;
+
+// ─── Session Status Signal ──────────────────────────────────────
+
+export type SessionStatus = 'completed' | 'blocked' | 'continuing';
+
+export interface SessionSignal {
+  status: SessionStatus;
+  reason?: string;
+  /** Timestamp of last signal */
+  signalledAt: string;
+}
+
+/** A session's status destination; never shared between parents or clones. */
+export interface SignalSink {
+  set(signal: SessionSignal): void;
+}
+
+export interface SessionSignalState extends SignalSink {
+  get(): SessionSignal | null;
+  clear(): void;
+}
+
+/** Create one per session, including every shadow clone. No process fallback. */
+export function createSignalSink(): SessionSignalState {
+  let held: SessionSignal | null = null;
+  return {
+    set(signal) {
+      held = signal;
+    },
+    get() {
+      return held;
+    },
+    clear() {
+      held = null;
+    },
+  };
+}
+
+/** Tool names that are handled client-locally, not forwarded to Inkwell */
+export const CLIENT_LOCAL_TOOLS: ReadonlySet<string> = new Set([
+  'list_context',
+  'evict_context',
+  'compact_context',
+  'signal_status',
+]);
+
+export function isClientLocalTool(toolName: string): boolean {
+  return CLIENT_LOCAL_TOOLS.has(toolName);
+}
+
+/** A persistent reference to an evicted entry — what the runtime writes to the ledger. */
+export interface EvictRef {
+  eid?: number;
+  hash: string;
+  role: LedgerEntry['role'];
+  source?: string;
+  preview: string;
+  tokens: number;
+}
+
+/**
+ * What the RUNTIME needs to know about an eviction, delivered out of band.
+ *
+ * The refs used to ride inside the tool result the model reads. That result
+ * is fed straight back into the model's context — and after an eviction of
+ * 3,000 entries it was 425K characters of hashes and previews, injected into
+ * the very window the call had just cleared (Myra, 2026-09-02; #571). The
+ * model needs a count and a handful of previews; the ledger needs every ref.
+ * Two audiences, two channels.
+ */
+export interface EvictionHooks {
+  onEvict?(eviction: {
+    args: Record<string, unknown>;
+    tokensFreed: number;
+    refs: EvictRef[];
+  }): void;
+  /**
+   * What the provider last reported it was asked to read: the window as
+   * BILLED, not as estimated. The ledger's totals are a characters-per-token
+   * guess over what ink packed; a resumed native session also carries what
+   * the provider itself accumulated. Myra's list_context said 297K of 300K
+   * while the API said 541K (task 9cf538a2). Both numbers are shown; the
+   * larger is the one the model actually occupies.
+   */
+  providerUsage?(): ProviderContextMeasurement | undefined;
+}
+
+export interface ProviderContextMeasurement {
+  /**
+   * The context the last provider request was handed — normalized per backend
+   * at the adapter boundary (BackendTokenUsage.contextTokens), never summed here.
+   */
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  model?: string;
+  /** When that request happened (ISO). */
+  measuredAt?: string;
+}
+
+/**
+ * The context size to reason with: the provider's own measurement when it is
+ * larger than the estimate (it counts what the estimate cannot see — the
+ * identity envelope, the native session's own accumulation), else the
+ * estimate. Pure so the budget check and the tool agree.
+ */
+export function effectiveContextTokens(
+  estimatedTokens: number,
+  measured: ProviderContextMeasurement | undefined
+): number {
+  return Math.max(estimatedTokens, measured?.contextTokens ?? 0);
+}
+
+/**
+ * Where the window actually sits, split by WHAT CAN REACH IT.
+ *
+ * One total is not enough, because the parts answer to different remedies — and
+ * they are not the parts an earlier draft of this comment named. It claimed the
+ * ledger half was the evictable half and that only compaction re-seeded the
+ * provider side. Both halves of that are wrong against this head (Lumen, PR #639):
+ *
+ *   ledgerTokens        transcript entries. The only bucket a tool selects
+ *                       entries from, and both `evict_context` and
+ *                       `compact_context` select from it.
+ *   fixedTokens         the identity envelope. `buildPromptEnvelope` re-renders
+ *                       `runtime.bootstrapContext` on every seed — it is marked
+ *                       "always included" there — so no context tool reclaims a
+ *                       byte of it. It is occupancy to budget around, not spend.
+ *   unaccountedTokens   the measurement minus what ink can account for. It is a
+ *                       RESIDUAL, not an inventory, and that is the whole reason
+ *                       it does not name a remedy. Some of it is native-session
+ *                       history, which any provider reseed drops — every
+ *                       eviction is one, since `recordEviction` clears
+ *                       `activeBackendSessionId` and the `providerSample`, and
+ *                       `assessContextPressure` has a `reseed` action for
+ *                       exactly this case. The rest is fixed provider overhead
+ *                       and this estimator's own drift (characters ÷ 4), which
+ *                       a reseed does NOT clear: the re-packed window is
+ *                       estimated by the same arithmetic that was wrong before.
+ *                       Naming a tool for this bucket would promise a reclaim
+ *                       nobody can compute (Lumen, PR #639).
+ *
+ * The ledger/provider gap is not a rounding error and it is not invisible — it
+ * is mis-sized. A tool result enters the ledger as a stub of at most
+ * LEDGER_COMPACT_CHARS (chat.ts) while the provider reads the whole payload.
+ * Measured 2026-09-15: one `list_tasks` reply put 125 tokens in the ledger and
+ * ~145,000 in the window. An agent that evicts that stub is told
+ * `tokensFreed: 125` — but the reseed the eviction just triggered also dropped
+ * the ~145,000. The reported figure is still wrong; it UNDERSTATES, which is
+ * the opposite of what this comment used to say, and the opposite direction of
+ * error from the one that makes an agent complacent.
+ *
+ * `splitKnown` is false when the provider has not reported yet. Then the split
+ * is genuinely unknown and the renderer must say so — reporting the estimate
+ * alone implies all of it is actionable, which is the failure this guards.
+ */
+export interface ContextOccupancy {
+  /** Transcript entries — what evict_context and compact_context actually edit. */
+  ledgerTokens: number;
+  /** The identity envelope, re-rendered on every seed. No context tool reclaims it. */
+  fixedTokens: number;
+  /**
+   * Measured minus accountable: a residual, not an inventory. Part native-session
+   * history (a reseed drops it), part provider overhead and estimator drift (a
+   * reseed does not). Deliberately names no remedy — see the note above.
+   */
+  unaccountedTokens: number;
+  /** The number to budget against — the larger of the estimate and the measurement. */
+  effectiveTokens: number;
+  limit: number;
+  /** effectiveTokens / limit, clamped at 0 but NOT at 1 — over-budget must read as over-budget. */
+  utilization: number;
+  /** False when no provider measurement exists; the split is then unknown, not zero. */
+  splitKnown: boolean;
+}
+
+/**
+ * `bootstrapTokens` is added to the estimate rather than subtracted from the
+ * limit. The provider's measurement covers the whole window including the
+ * identity envelope, so comparing it against a transcript-only estimate over a
+ * reduced limit compares two different quantities. Both sides are whole-window
+ * here, which is what makes max() meaningful.
+ *
+ * It lands in the numerator but in its OWN bucket: counting it is right,
+ * calling it reclaimable is not.
+ */
+export function computeContextOccupancy(
+  ledgerTokens: number,
+  bootstrapTokens: number,
+  limit: number,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  const ledger = Math.max(0, ledgerTokens);
+  const fixed = Math.max(0, bootstrapTokens);
+  const accountable = ledger + fixed;
+  const effectiveTokens = effectiveContextTokens(accountable, measured);
+  const safeLimit = limit > 0 ? limit : 1;
+  return {
+    ledgerTokens: ledger,
+    fixedTokens: fixed,
+    unaccountedTokens: Math.max(0, effectiveTokens - accountable),
+    effectiveTokens,
+    limit: safeLimit,
+    utilization: effectiveTokens / safeLimit,
+    splitKnown: measured !== undefined,
+  };
+}
+
+/**
+ * The per-turn stamp. Ephemeral by design: it is rendered into the prompt each
+ * turn and never added to the ledger, because an entry per turn would
+ * accumulate one stale occupancy reading per turn — context spent reporting
+ * context, growing with the thing it measures.
+ */
+export function formatContextStamp(occ: ContextOccupancy): string {
+  const pct = Math.round(occ.utilization * 100);
+  const n = (v: number) => v.toLocaleString();
+  const head = `[context] ${n(occ.effectiveTokens)} / ${n(occ.limit)} (${pct}%)`;
+  if (!occ.splitKnown) {
+    return (
+      `${head} — ledger estimate only; the provider has not reported this session, ` +
+      `so how much of this is reclaimable is unknown.`
+    );
+  }
+  // All three buckets, always, even at zero. A stamp whose shape changes per
+  // turn is one the reader has to re-parse per turn, and a zero is itself a
+  // reading ("nothing unaccounted for") rather than an absence.
+  //
+  // Only the first two name a tool. The third names its composition instead,
+  // because it is a residual: saying what it is made of is a claim we can
+  // support, and saying what reclaims it is not.
+  return (
+    `${head} — ledger ${n(occ.ledgerTokens)} (evict_context/compact_context), ` +
+    `identity envelope ${n(occ.fixedTokens)} (fixed, re-sent every seed), ` +
+    `unaccounted ${n(occ.unaccountedTokens)} (native history + estimate drift; ` +
+    `a reseed clears the history, not the drift).`
+  );
+}
+
+/**
+ * Handle a client-local tool call. Returns the result in Inkwell tool format,
+ * or null if the tool isn't recognized.
+ */
+export function handleClientLocalTool(
+  tool: string,
+  args: Record<string, unknown>,
+  ledger: ContextLedger,
+  signalSink?: SignalSink,
+  hooks: EvictionHooks = {}
+): ContextToolResult | null {
+  switch (tool) {
+    case 'list_context':
+      return handleListContext(args, ledger, hooks);
+    case 'evict_context':
+      return handleEvictContext(args, ledger, hooks);
+    case 'compact_context':
+      // Compaction needs the host: a summarizer turn, the transcript event,
+      // and the provider-session roll. The REPL intercepts this name before
+      // reaching here; anywhere else (a shadow clone's throwaway ledger) it
+      // is honestly unavailable rather than silently a no-op.
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error:
+                'compact_context is not available in this context (a shadow clone cannot compact; report what you found and let your parent act on it).',
+            }),
+          },
+        ],
+        isError: true,
+      };
+    case 'signal_status':
+      return handleSignalStatus(args, signalSink);
+    default:
+      return null;
+  }
+}
+
+// ─── compact_context ────────────────────────────────────────────
+
+/** Ceiling on an agent-written compaction summary. */
+export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
+/** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
+export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
+/**
+ * Ceiling on a ref-selected consolidation. The refs arrive in the args of a
+ * tool call the model wrote, so the list is already bounded by what it can
+ * emit; this bounds the pathological case rather than the ordinary one.
+ */
+export const COMPACT_CONTEXT_MAX_REFS = 2_000;
+
+/**
+ * A compaction must leave the window smaller than it found it. An agent may
+ * replace one tiny entry with a 20K-character "summary" and be told it
+ * compacted; the provider session would then roll for a rewrite that grew
+ * the context (Lumen, PR #578). Refused, and the refusal says by how much.
+ */
+export function compactionShrinks(removedTokens: number, summaryTokens: number): boolean {
+  return summaryTokens < removedTokens;
+}
+
+export interface CompactContextArgs {
+  /** The agent's own brief. Absent means the runtime summarizes. */
+  summary?: string;
+  /** Entries kept verbatim after the summary. Absent means the runtime default. */
+  keepRecent?: number;
+  /**
+   * Content-hash refs (the `ref` values from list_context) naming EXACTLY the
+   * entries to replace. This is the second selector, not a second verb: the
+   * operation is the same remove-and-insert `compact_context` already performs,
+   * chosen by name instead of by age — the way `evict_context` already takes
+   * refs, source or role for one eviction.
+   *
+   * Refs, never entryIds: the process ordinal renumbers on reattach, so a set
+   * captured against it can resolve to different content later and still read
+   * as correct (Myra, 2026-09-03; #570).
+   */
+  refs?: string[];
+}
+
+/**
+ * Validate a `compact_context` call. Pure, so the shape the runtime accepts
+ * is testable without the host.
+ *
+ * The agent writing its own summary is the preferred path — it knows which
+ * decisions, identifiers and open threads matter, and it costs no summarizer
+ * turn. Omitting it asks the runtime to summarize the oldest entries the
+ * same way auto-compaction does.
+ */
+export function parseCompactContextArgs(
+  args: Record<string, unknown>
+): CompactContextArgs | { error: string } {
+  const out: CompactContextArgs = {};
+  if (args.summary !== undefined) {
+    if (typeof args.summary !== 'string') return { error: 'summary must be a string' };
+    const summary = args.summary.trim();
+    if (!summary) return { error: 'summary is empty — omit it to have the runtime summarize' };
+    if (summary.length > COMPACT_CONTEXT_SUMMARY_MAX_CHARS) {
+      return {
+        error: `summary is ${summary.length} chars; the ceiling is ${COMPACT_CONTEXT_SUMMARY_MAX_CHARS} — a compaction summary should be a dense brief, not the transcript`,
+      };
+    }
+    out.summary = summary;
+  }
+  if (args.keepRecent !== undefined) {
+    const n = args.keepRecent;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+      return { error: 'keepRecent must be a non-negative number' };
+    }
+    if (n > COMPACT_CONTEXT_MAX_KEEP_RECENT) {
+      return { error: `keepRecent must be at most ${COMPACT_CONTEXT_MAX_KEEP_RECENT}` };
+    }
+    out.keepRecent = Math.floor(n);
+  }
+  if (args.refs !== undefined) {
+    if (!Array.isArray(args.refs)) return { error: 'refs must be an array of strings' };
+    const refs = args.refs.filter((r): r is string => typeof r === 'string' && r.trim() !== '');
+    if (refs.length !== args.refs.length) {
+      return {
+        error: 'refs must contain only non-empty strings (the ref values from list_context)',
+      };
+    }
+    if (refs.length === 0) {
+      return { error: 'refs is empty — omit it to compact the oldest entries instead' };
+    }
+    if (refs.length > COMPACT_CONTEXT_MAX_REFS) {
+      return {
+        error: `refs holds ${refs.length} entries; the ceiling is ${COMPACT_CONTEXT_MAX_REFS}`,
+      };
+    }
+    // The two selectors answer the same question differently — which entries
+    // go. Honouring both would mean silently picking one, and the caller could
+    // not tell which from the result.
+    if (out.keepRecent !== undefined) {
+      return {
+        error:
+          'refs and keepRecent are alternative selectors — refs names the entries to replace, keepRecent protects a recent tail of an oldest-first compaction. Pass one.',
+      };
+    }
+    out.refs = refs;
+  }
+  return out;
+}
+
+// ─── list_context ───────────────────────────────────────────────
+
+/** Entries per page unless the caller asks otherwise. */
+export const LIST_CONTEXT_DEFAULT_LIMIT = 50;
+/**
+ * Bookmarks listed in detail. Unbounded, they recreate the payload explosion
+ * through a second array — 3,500 bookmarks with 84-char labels returned
+ * 460,458 characters while the entry page was only 50 (Lumen, PR #576) — and
+ * the relay cap then cuts the JSON mid-document. The COUNT is always exact.
+ */
+export const LIST_CONTEXT_BOOKMARK_LIMIT = 20;
+/** Labels are agent-supplied; one long label must not blow the page either. */
+const BOOKMARK_LABEL_MAX_CHARS = 120;
+/** Ceiling on a single page, whatever the caller asks. */
+export const LIST_CONTEXT_MAX_LIMIT = 200;
+
+type ListContextSort = 'oldest' | 'newest' | 'largest';
+
+function intArg(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+/**
+ * The window, described — never the window, repeated.
+ *
+ * This result is fed back into the context it describes. Listing every entry
+ * of a 3,500-entry session came to 797K characters (~400K tokens) and was
+ * injected whole, which is how a call meant to find room in the window ended
+ * up as its single largest occupant (Myra, 2026-09-02; #571). The totals and
+ * per-source breakdown are always complete; the entry list is one page,
+ * filterable by source/role/minimum size and sortable so the model can go
+ * straight to what is worth evicting.
+ */
+function handleListContext(
+  args: Record<string, unknown>,
+  ledger: ContextLedger,
+  hooks: EvictionHooks = {}
+): ContextToolResult {
+  const all = ledger.summarizeEntries();
+  const totalTokens = ledger.totalTokens();
+  const measured = hooks.providerUsage?.();
+  const effectiveTokens = effectiveContextTokens(totalTokens, measured);
+  const divergent = measured !== undefined && measured.contextTokens > totalTokens * 1.25;
+  const bookmarks = ledger.listBookmarks();
+
+  // Group by source for a quick breakdown — over EVERYTHING, not the page.
+  const bySource: Record<string, { count: number; tokens: number }> = {};
+  for (const entry of all) {
+    const src = entry.source || '(none)';
+    if (!bySource[src]) bySource[src] = { count: 0, tokens: 0 };
+    bySource[src].count++;
+    bySource[src].tokens += entry.approxTokens;
+  }
+
+  const source = typeof args.source === 'string' ? args.source : undefined;
+  const role = typeof args.role === 'string' ? args.role : undefined;
+  const minTokens = intArg(args.minTokens, 0, 0, Number.MAX_SAFE_INTEGER);
+  const sort: ListContextSort =
+    args.sort === 'newest' || args.sort === 'largest' ? args.sort : 'oldest';
+  const limit = intArg(args.limit, LIST_CONTEXT_DEFAULT_LIMIT, 1, LIST_CONTEXT_MAX_LIMIT);
+  const offset = intArg(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+
+  const filtered = all.filter(
+    (e) =>
+      (source === undefined || (e.source || '(none)') === source) &&
+      (role === undefined || e.role === role) &&
+      e.approxTokens >= minTokens
+  );
+  if (sort === 'newest') filtered.reverse();
+  else if (sort === 'largest') filtered.sort((a, b) => b.approxTokens - a.approxTokens);
+  const page = filtered.slice(offset, offset + limit);
+  const remaining = Math.max(0, filtered.length - offset - page.length);
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          totalEntries: all.length,
+          /** ink's estimate of what it packed (chars ÷ 4). */
+          totalTokens,
+          /** The number to reason with: the larger of the estimate and the provider's measurement. */
+          effectiveTokens,
+          ...(measured !== undefined ? { providerMeasured: measured } : {}),
+          ...(divergent
+            ? {
+                accountingNote: `The provider last read ~${measured!.contextTokens.toLocaleString()} tokens of context; ink's estimate of the ledger is ~${totalTokens.toLocaleString()}. The larger number is the window you occupy: the estimate cannot see the identity envelope or what the native session accumulated. Budget against effectiveTokens.`,
+              }
+            : {}),
+          bySource,
+          bookmarkCount: bookmarks.length,
+          ...(bookmarks.length > LIST_CONTEXT_BOOKMARK_LIMIT
+            ? { bookmarksNotShown: bookmarks.length - LIST_CONTEXT_BOOKMARK_LIMIT }
+            : {}),
+          // The most recent ones: an older bookmark is the least likely to be
+          // what a caller is about to act on, and the count above is exact.
+          bookmarks: bookmarks.slice(-LIST_CONTEXT_BOOKMARK_LIMIT).map((b) => ({
+            id: b.id,
+            label:
+              typeof b.label === 'string' && b.label.length > BOOKMARK_LABEL_MAX_CHARS
+                ? b.label.slice(0, BOOKMARK_LABEL_MAX_CHARS) + '…'
+                : b.label,
+            entryIndex: b.entryIndex,
+          })),
+          page: {
+            matched: filtered.length,
+            offset,
+            limit,
+            returned: page.length,
+            remaining,
+            sort,
+            ...(source !== undefined ? { source } : {}),
+            ...(role !== undefined ? { role } : {}),
+            ...(minTokens > 0 ? { minTokens } : {}),
+          },
+          ...(remaining > 0
+            ? {
+                note: `${remaining} more matching entries not shown — page with offset ${offset + page.length}, narrow with source/role/minTokens, or sort by "largest" to find what is worth evicting. Evicting by source or role does not require listing the entries.`,
+              }
+            : {}),
+          // `ref` is the address: a content hash that survives reattach and
+          // eviction. The process ordinal is deliberately NOT shown — it
+          // renumbers on reattach, so a link or an evict captured against it
+          // could resolve to DIFFERENT content later, which reads as correct
+          // (Myra, 2026-09-03; #570). `entryIds` stays accepted for callers
+          // that still hold one.
+          entries: page.map((e) => ({
+            ref: e.ref,
+            role: e.role,
+            source: e.source,
+            tokens: e.approxTokens,
+            age: e.createdAt,
+            preview: e.preview,
+            // An image's cost is in `tokens` already; this says which part of
+            // it is the picture, so evicting a large entry is not a guess.
+            ...(e.images ? { images: e.images } : {}),
+          })),
+        }),
+      },
+    ],
+  };
+}
+
+// ─── evict_context ──────────────────────────────────────────────
+
+/** Previews the model gets back — enough to confirm what went, not to re-read it. */
+export const EVICT_CONTEXT_PREVIEW_LIMIT = 10;
+
+function handleEvictContext(
+  args: Record<string, unknown>,
+  ledger: ContextLedger,
+  hooks: EvictionHooks
+): ContextToolResult {
+  const refs = Array.isArray(args.refs)
+    ? (args.refs as unknown[]).filter((r): r is string => typeof r === 'string')
+    : undefined;
+  const entryIds = args.entryIds as number[] | undefined;
+  const source = args.source as string | undefined;
+  const role = args.role as string | undefined;
+
+  if (!refs && !entryIds && !source && !role) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error:
+              'Provide at least one filter: refs (string[] — the ref values from list_context), entryIds (number[]), source (string), or role (string)',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  let result: LedgerEvictResult;
+
+  if (refs) {
+    // Hash-addressed: the durable handle list_context hands out. Resolved
+    // against the live ledger at this moment, so a ref captured before an
+    // earlier eviction still names the same content or nothing at all —
+    // never a neighbour that inherited its position.
+    result = ledger.evictEntries(ledger.findEntriesByRefs(refs.map((hash) => ({ hash }))));
+  } else if (entryIds && Array.isArray(entryIds)) {
+    result = ledger.evictEntries(entryIds);
+  } else if (source) {
+    result = ledger.evictBySource(source);
+  } else if (role) {
+    result = ledger.evictByRole(role as 'system' | 'user' | 'assistant' | 'inbox');
+  } else {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ success: false, error: 'Invalid filter combination' }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Persistent eviction refs go to the RUNTIME (it writes the context_evict
+  // transcript event so the eviction survives reattach) — never into the
+  // result the model reads. See EvictionHooks.
+  if (result.removedEntries.length > 0) {
+    hooks.onEvict?.({
+      args,
+      tokensFreed: result.removedTokens,
+      refs: result.removedEntries.map((e) => ({
+        ...(e.eid !== undefined ? { eid: e.eid } : {}),
+        hash: entryRefHash(e.role, e.content),
+        role: e.role,
+        source: e.source,
+        preview: e.content.slice(0, 80),
+        tokens: e.approxTokens,
+      })),
+    });
+  }
+
+  const previews = result.removedEntries.slice(0, EVICT_CONTEXT_PREVIEW_LIMIT);
+  const notShown = result.removedEntries.length - previews.length;
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          evicted: result.removedEntries.length,
+          tokensFreed: result.removedTokens,
+          totalAfter: result.totalAfter,
+          removedPreviews: previews.map((e) => ({
+            ref: entryRefHash(e.role, e.content),
+            role: e.role,
+            source: e.source,
+            tokens: e.approxTokens,
+            preview: e.content.slice(0, 80),
+          })),
+          ...(notShown > 0 ? { removedNotShown: notShown } : {}),
+        }),
+      },
+    ],
+  };
+}
+
+// ─── signal_status ──────────────────────────────────────────────
+
+function handleSignalStatus(args: Record<string, unknown>, sink?: SignalSink): ContextToolResult {
+  // A missing binding must not acknowledge a status that no session received.
+  if (!sink) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'signal_status requires a session-local signal sink',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+  const status = args.status as string | undefined;
+  const reason = args.reason as string | undefined;
+
+  const validStatuses: SessionStatus[] = ['completed', 'blocked', 'continuing'];
+  if (!status || !validStatuses.includes(status as SessionStatus)) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`,
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const signal: SessionSignal = {
+    status: status as SessionStatus,
+    reason: reason || undefined,
+    signalledAt: new Date().toISOString(),
+  };
+  sink.set(signal);
+
+  // The RESULT is what stops the caller's own loop (isTerminalSignalToolResult
+  // reads it), so a clone halts correctly without its status ever reaching the
+  // parent's session state.
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          signal,
+        }),
+      },
+    ],
+  };
+}

@@ -11,7 +11,7 @@ import {
   playwrightBrowserAttachments,
 } from './playwright-mcp.js';
 import { syncMcpConfig } from './mcp-config-sync.js';
-import { injectSessionHeaders, readLaunchMcpServers } from '../runner/mcp-config.js';
+import { injectSessionHeaders, readLaunchMcpServers } from '../runner/mcp-config-file.js';
 
 /** The entry every studio's `.mcp.json` carries today, copied from the main worktree. */
 const STUDIO_ENTRY_BEFORE = {

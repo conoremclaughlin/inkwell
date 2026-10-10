@@ -779,3 +779,27 @@ describe('SessionEventBus observer channel — M4.5', () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
+
+describe('session control observer receipts', () => {
+  it('exposes only durable receipt identity, never skill paths/provenance or contents', () => {
+    expect(
+      projectObserverEntry({
+        eid: 19,
+        ts: 'fixture',
+        type: 'session_control',
+        controlId: 'selection',
+        selection: {
+          skills: [
+            { path: '/private/fixture', content: 'PRIVATE', provenance: { registry: 'SECRET' } },
+          ],
+        },
+      })
+    ).toEqual({
+      eid: 19,
+      ts: 'fixture',
+      type: 'session_control',
+      controlId: 'selection',
+      status: 'applied',
+    });
+  });
+});

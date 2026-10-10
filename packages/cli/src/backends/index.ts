@@ -1,77 +1,16 @@
 /**
- * Backend Registry
- *
- * Resolves backend name to adapter instance.
+ * Backend Registry — compatibility path. The registry and adapters live in
+ * @inklabs/shared/providers; resolving which SB and backend a CLI invocation
+ * means stays in ./identity.ts.
  */
 
-export type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+export type { BackendAdapter, BackendConfig, PreparedBackend } from '@inklabs/shared/providers';
 export { resolveSlug, resolveBackend } from './identity.js';
-
-import { ClaudeAdapter } from './claude.js';
-import { CodexAdapter } from './codex.js';
-import { GeminiAdapter } from './gemini.js';
-import type { BackendAdapter } from './types.js';
-
-const BACKENDS: Record<string, () => BackendAdapter> = {
-  claude: () => new ClaudeAdapter(),
-  codex: () => new CodexAdapter(),
-  gemini: () => new GeminiAdapter(),
-};
-
-export const BACKEND_NAMES = Object.keys(BACKENDS);
-
-/**
- * Backends that still resolve but are DEPRECATED FOR NOW, with the reason.
- * gemini: the Gemini CLI now requires an enterprise plan, so it is not a
- * backend an Inkling can rely on; Antigravity is the Google surface that
- * matters (Conor, 2026-09-03). The adapter stays so old transcripts and
- * configs keep working; selecting it warns once per process.
- */
-export const DEPRECATED_BACKENDS: Readonly<Record<string, string>> = {
-  gemini:
-    'the Gemini CLI backend is deprecated for now — the Gemini CLI requires an enterprise plan; use claude or codex (Antigravity is the Google surface that matters)',
-};
-
-export function deprecatedBackendReason(name: string): string | undefined {
-  // Own properties only: an ordinary object indexed by arbitrary input would
-  // hand back inherited keys — `toString` a function, `__proto__` an object
-  // (Lumen, PR #585).
-  return Object.prototype.hasOwnProperty.call(DEPRECATED_BACKENDS, name)
-    ? DEPRECATED_BACKENDS[name]
-    : undefined;
-}
-
-const warnedDeprecated = new Set<string>();
-
-export function getBackend(name: string): BackendAdapter {
-  const factory = BACKENDS[name];
-  if (!factory) {
-    throw new Error(`Unknown backend: ${name}. Available: ${BACKEND_NAMES.join(', ')}`);
-  }
-  const reason = deprecatedBackendReason(name);
-  if (reason && !warnedDeprecated.has(name)) {
-    warnedDeprecated.add(name);
-    process.stderr.write(`[ink] backend "${name}": ${reason}\n`);
-  }
-  return factory();
-}
-
-/**
- * The prompt transport a backend's adapter declares. Unknown backends fall
- * back to 'argv' — the conservative direction for context budgeting (an argv
- * transport gets the small ARG_MAX-safe budget cap).
- */
-export function promptTransportFor(name: string): 'stdin' | 'argv' {
-  const factory = BACKENDS[name];
-  return factory ? factory().promptTransport : 'argv';
-}
-
-/**
- * Whether a backend's adapter embeds tool-captured images. Unknown backends
- * answer no: saying an image was shown when it was not is the failure this
- * guards against.
- */
-export function acceptsContextImagesFor(name: string): boolean {
-  const factory = BACKENDS[name];
-  return factory ? factory().acceptsContextImages === true : false;
-}
+export {
+  BACKEND_NAMES,
+  DEPRECATED_BACKENDS,
+  deprecatedBackendReason,
+  getBackend,
+  promptTransportFor,
+  acceptsContextImagesFor,
+} from '@inklabs/shared/providers';

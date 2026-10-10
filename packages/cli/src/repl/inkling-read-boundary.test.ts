@@ -80,6 +80,7 @@ describe("an inkling's turn reads only its own folder (task 0321ccf1)", () => {
       {
         policy: inklingPolicy(),
         sessionId: 'synthetic-session',
+        commitIntent: vi.fn().mockResolvedValue(undefined),
         promptForApproval,
         callTool: createLocalToolDispatcher({
           cwd: folder,

@@ -11,6 +11,8 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import { inkSessionOptions } from './ink-session-options.js';
+export { clampMaxTurns, DEFAULT_MAX_TURNS } from './ink-session-options.js';
 import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
@@ -67,13 +69,6 @@ class BackendExitError extends Error {
 // and Stop end a stuck one. It was 4 hours.
 export const PROCESS_TIMEOUT_MS = ceilingFromEnv(process.env.INK_PROCESS_TIMEOUT_MS);
 
-// Continuation-loop turn cap when the SB's dashboard settings don't specify
-// one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
-// signal_status is the sanctioned in-loop halt, so this only bounds runaway
-// continuations — and each extra turn is a full provider spawn.
-export const DEFAULT_MAX_TURNS = 5;
-
-/** Clamp a dashboard-supplied turn cap to a sane range; default when absent. */
 /**
  * Map the ink result line's per-model block. Keys stay exactly as reported —
  * grouping (e.g. by canonicalModel) belongs to the reporting layer, not here.
@@ -112,11 +107,6 @@ export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotal
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
-}
-
-export function clampMaxTurns(value: number | undefined): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MAX_TURNS;
-  return Math.min(25, Math.max(1, Math.round(value)));
 }
 
 // Inactivity timeout — the primary liveness guard. The countdown resets on any
@@ -360,6 +350,7 @@ export class InkRunner implements IRunner {
     options: { requireBootstrap?: boolean } = {}
   ): string[] {
     const args: string[] = ['chat', '--non-interactive'];
+    const session = inkSessionOptions(config);
 
     // We omit the constitution from the prompt because this child loads its
     // own. Demand that it actually did: without this the child warns and
@@ -376,55 +367,46 @@ export class InkRunner implements IRunner {
 
     // Named only when the caller chose one (an inkling's turn always does);
     // otherwise the chat's own default provider runs, as it always has.
-    if (config.inkProvider) {
-      args.push('--backend', config.inkProvider);
+    if (session.backend) {
+      args.push('--backend', session.backend);
     }
 
-    if (config.model) {
-      args.push('--model', config.model);
+    if (session.model) {
+      // Fleet/per-SB launch configuration is not a new user selection. The
+      // session's durable model choice must win, as it does in the hosted loop.
+      args.push('--default-model', session.model);
     }
-    if (config.effort) {
-      args.push('--effort', config.effort);
+    if (session.effort) {
+      args.push('--effort', session.effort);
     }
 
     // Turn backstop only — the real limit is the CLI's token budget
     // (200K default), which auto-compacts the transcript when approached.
     // Per-SB tunable from the dashboard (runtimeConfig.maxTurns); the chat
     // loop halts earlier when the model signals completion via signal_status.
-    args.push('--max-turns', String(clampMaxTurns(config.maxTurns)));
+    args.push('--max-turns', String(session.maxTurns));
 
     // Tool routing is ALWAYS explicit for server spawns — the headless
     // boundary must not depend on worktree .ink/identity.json preferences or
     // the chat loop's own defaults. session-service resolves the SB's
     // dashboard setting (runtimeConfig.toolRouting) and fails closed to
     // 'local' (ink-owned, provider withheld).
-    args.push('--tool-routing', config.toolRouting ?? 'local');
+    args.push('--tool-routing', session.toolRouting);
 
-    // The full tier runs the safe profile with away mode, as every
-    // non-interactive spawn did. Safe allows read tools freely but requires
-    // approval for write/comms tools; away mode routes approval prompts to
-    // the user's inbox (2FA) instead of auto-denying. The tools tier runs the
-    // tools profile instead, against a policy file of its own (task
-    // 0321ccf1): the shell, file writes, shared-image reads, waking another
-    // agent and send_response are denied outright, and the machine's grants
-    // are never read. It names the profile with --require-profile, which a
-    // CLI that doesn't know the profile refuses before anything runs (Lumen,
-    // #773): --profile would warn and carry on. --no-provider-tools withholds
-    // the provider's own tools, Claude Code's native Read among them. The
-    // profile implies it; the option is for a CLI that takes the one and not
-    // the other.
-    if (config.executionTier === 'tools') {
-      if (!config.toolPolicyPath) {
-        throw new Error('The tools tier needs a tool policy of its own');
-      }
-      args.push('--require-profile', 'tools', '--no-provider-tools', '--away');
+    // Both runner modes use the same tier-derived profile. The tools tier
+    // requires its own policy file and withholds the provider's native tools;
+    // a CLI without that required profile refuses before running anything.
+    if (session.requireProfile) {
+      args.push('--require-profile', session.requireProfile);
     } else {
-      args.push('--profile', 'safe', '--away');
+      args.push('--profile', session.profile);
     }
+    if (session.withholdProviderTools) args.push('--no-provider-tools');
+    args.push('--away');
 
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").
-    args.push('--message-label', config.channel || 'server');
+    args.push('--message-label', session.messageLabel);
 
     // Forward media attachments as file paths. ink chat appends an
     // attachment block to the turn and grants its provider backend

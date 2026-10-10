@@ -42,6 +42,8 @@ import {
   type ObserverSink,
   type ObserverSinkEndReason,
 } from '../services/sessions/session-event-bus.js';
+import { addSessionControlRoute } from './session-controls.js';
+import { addSessionSteeringRoute } from './session-steering.js';
 import { logger } from '../utils/logger.js';
 
 /** Comment ping cadence — keeps the connection alive through idle proxies. */
@@ -130,15 +132,15 @@ export function createSessionsRouter(deps: {
   dataComposer: DataComposer;
 }): Router {
   const router = Router();
+  addSessionControlRoute(router, deps);
+  addSessionSteeringRoute(router, deps);
 
   router.get('/:id/events', async (req: Request, res: Response): Promise<void> => {
     const verdict = await deps.authProvider.verifyAccessToken(req.headers.authorization);
     if (!verdict.ok) {
-      res
-        .status(verdict.status)
-        .json({
-          error: verdict.status === 503 ? 'Could not check the token; try again' : 'Unauthorized',
-        });
+      res.status(verdict.status).json({
+        error: verdict.status === 503 ? 'Could not check the token; try again' : 'Unauthorized',
+      });
       return;
     }
     const auth = verdict.token;

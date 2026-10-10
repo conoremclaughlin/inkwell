@@ -3126,7 +3126,7 @@ __metadata:
     "@anthropic-ai/sdk": "npm:^0.71.2"
     "@inklabs/shared": "workspace:*"
     "@mariozechner/pi-agent-core": "npm:0.71.1"
-    "@mariozechner/pi-coding-agent": "npm:0.71.1"
+    "@mariozechner/pi-coding-agent": "patch:@mariozechner/pi-coding-agent@npm%3A0.71.1#~/.yarn/patches/@mariozechner-pi-coding-agent-npm-0.71.1-d529ab2d31.patch"
     "@modelcontextprotocol/client": "npm:^2.0.0"
     "@modelcontextprotocol/node": "npm:^2.0.0"
     "@modelcontextprotocol/server": "npm:^2.0.0"
@@ -3197,7 +3197,7 @@ __metadata:
     "@inklabs/shared": "workspace:*"
     "@inquirer/prompts": "npm:^8.2.0"
     "@mariozechner/pi-agent-core": "npm:0.71.1"
-    "@mariozechner/pi-coding-agent": "npm:0.71.1"
+    "@mariozechner/pi-coding-agent": "patch:@mariozechner/pi-coding-agent@npm%3A0.71.1#~/.yarn/patches/@mariozechner-pi-coding-agent-npm-0.71.1-d529ab2d31.patch"
     "@types/node": "npm:^20.10.0"
     "@types/react": "npm:^19.2.14"
     "@types/ws": "npm:^8.18.1"
@@ -3312,6 +3312,7 @@ __metadata:
     jest: "npm:^29.7.0"
     jsdom: "npm:^30.0.1"
     marked: "npm:^15.0.12"
+    pdf-parse: "npm:^2.4.5"
     react: "npm:^19.0.0"
     react-dom: "npm:^19.0.0"
     ts-jest: "npm:^29.1.1"
@@ -4203,6 +4204,41 @@ __metadata:
   bin:
     pi: dist/cli.js
   checksum: 10/ac868029019b9b4baf7e555a8ab29e8210b9163cd8bc203cfb70cdd8dffbb003c2c81c3b8c11ea6fabd1c80a33a4691efdf4bc33814fd171854724a423fa1cdd
+  languageName: node
+  linkType: hard
+
+"@mariozechner/pi-coding-agent@patch:@mariozechner/pi-coding-agent@npm%3A0.71.1#~/.yarn/patches/@mariozechner-pi-coding-agent-npm-0.71.1-d529ab2d31.patch":
+  version: 0.71.1
+  resolution: "@mariozechner/pi-coding-agent@patch:@mariozechner/pi-coding-agent@npm%3A0.71.1#~/.yarn/patches/@mariozechner-pi-coding-agent-npm-0.71.1-d529ab2d31.patch::version=0.71.1&hash=ce12d3"
+  dependencies:
+    "@mariozechner/clipboard": "npm:^0.3.5"
+    "@mariozechner/jiti": "npm:^2.6.2"
+    "@mariozechner/pi-agent-core": "npm:^0.71.1"
+    "@mariozechner/pi-ai": "npm:^0.71.1"
+    "@mariozechner/pi-tui": "npm:^0.71.1"
+    "@silvia-odwyer/photon-node": "npm:^0.3.4"
+    chalk: "npm:^5.5.0"
+    cli-highlight: "npm:^2.1.11"
+    diff: "npm:^8.0.2"
+    extract-zip: "npm:^2.0.1"
+    file-type: "npm:^21.1.1"
+    glob: "npm:^13.0.1"
+    hosted-git-info: "npm:^9.0.2"
+    ignore: "npm:^7.0.5"
+    marked: "npm:^15.0.12"
+    minimatch: "npm:^10.2.3"
+    proper-lockfile: "npm:^4.1.2"
+    strip-ansi: "npm:^7.1.0"
+    typebox: "npm:^1.1.24"
+    undici: "npm:^7.19.1"
+    uuid: "npm:^14.0.0"
+    yaml: "npm:^2.8.2"
+  dependenciesMeta:
+    "@mariozechner/clipboard":
+      optional: true
+  bin:
+    pi: dist/cli.js
+  checksum: 10/d4456634cc5b47016253a6899d1f1a14682ef24e480955287c7c3350d73171326dad175a540942b28d795c13300b8e58f7f253a398b41abc2540ad4b2b5a5764
   languageName: node
   linkType: hard
 
