@@ -37,6 +37,7 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
+import { createNativeSteeringBinding } from './native-steering-binding.js';
 import {
   registerActiveRun,
   clearActiveRunIfOwner,
@@ -2628,6 +2629,7 @@ export class SessionService implements ISessionService {
     let runtimeMaxTurns: number | undefined;
     // Set once an inkling's turn has passed the gate.
     let inklingTurn = false;
+    let nativeSteeringIdentityMetadata: unknown;
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
@@ -2645,6 +2647,9 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      // Snapshot the canonical, user-scoped identity at admission. Later
+      // metadata edits cannot add a port to a restricted generation.
+      nativeSteeringIdentityMetadata = identity?.metadata;
 
       // An inkling's turn starts only in the owner test, on its owner's
       // account, for its owner's own message (Lumen 97b1d66a). Refused
@@ -3306,6 +3311,25 @@ export class SessionService implements ISessionService {
           )}\n\n${uploads.note}`;
 
     try {
+      const nativeSteering =
+        resolvedBackend === 'codex-cli'
+          ? createNativeSteeringBinding({
+              sessionId: session.id,
+              turnEpoch,
+              userId,
+              sbId: session.sbId,
+              sbSlug,
+              contactId: session.contactId ?? null,
+              cliAttached: session.cliAttached,
+              identityMetadata: nativeSteeringIdentityMetadata,
+              executionTier,
+              workingDirectory: resolvedWorkingDirectory,
+              inkAccessToken,
+              container: runnerConfig.container,
+              signal: inklingTracking?.signal,
+              admitSpawn,
+            })
+          : undefined;
       result = await turnRunner
         .run(runMessage, {
           backendSessionId: session.backendSessionId || undefined,
@@ -3322,6 +3346,7 @@ export class SessionService implements ISessionService {
           config: {
             ...runnerConfig,
             turnEpoch,
+            ...(nativeSteering ? { nativeSteering } : {}),
             ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
             admitSpawn,
             ...(launch ? { launchEnv: launch.env } : {}),

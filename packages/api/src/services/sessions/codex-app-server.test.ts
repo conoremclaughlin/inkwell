@@ -1,0 +1,368 @@
+/** All process, host-state, credential, and binary effects are replaced before import. */
+import { EventEmitter } from 'events';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('child_process', () => ({ spawn: vi.fn() }));
+vi.mock('@inklabs/shared', () => ({
+  buildSessionEnv: vi.fn(() => ({ INK_CONTEXT: 'synthetic-context' })),
+  resolveSpawnTarget: vi.fn((input) => input),
+  writeRuntimeSessionHint: vi.fn(),
+}));
+vi.mock('./resolve-binary.js', () => ({
+  resolveBinaryPath: vi.fn(async () => '/synthetic/codex'),
+  buildSpawnPath: vi.fn(() => '/synthetic/bin'),
+}));
+vi.mock('./stop-process.js', () => ({ stopProcessAndWait: vi.fn(async () => ({ exited: true })) }));
+import { spawn } from 'child_process';
+import { resolveBinaryPath } from './resolve-binary.js';
+import { stopProcessAndWait } from './stop-process.js';
+import { buildCodexAppServerArgs, runOwnedCodexAppServer } from './codex-app-server.js';
+import type { NativeSteeringBinding } from './native-steering-binding.js';
+import type { SessionSteeringRequest, SessionSteeringReceipt } from '@inklabs/shared/runtime';
+
+const tick = async () => {
+  for (let i = 0; i < 30; i++) await Promise.resolve();
+};
+function fixture() {
+  const sent: Array<Record<string, any>> = [];
+  const records: Array<Record<string, unknown>> = [];
+  const release = vi.fn();
+  let submit: ((r: SessionSteeringRequest) => Promise<SessionSteeringReceipt>) | undefined;
+  let current = true;
+  const proc = Object.assign(new EventEmitter(), {
+    pid: 222222,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    stdin: Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writableEnded: false,
+      write: vi.fn(),
+      end: vi.fn(),
+    }),
+    exitCode: null as number | null,
+    signalCode: null,
+  });
+  const receive = (value: unknown) =>
+    proc.stdout.emit('data', Buffer.from(JSON.stringify(value) + '\n'));
+  const notify = (method: string, params: Record<string, unknown>) =>
+    receive({
+      method,
+      params: {
+        threadId: 'thread-synthetic',
+        turnId: 'turn-synthetic',
+        ...params,
+      },
+    });
+  proc.stdin.write.mockImplementation((line: string) => {
+    const message = JSON.parse(line);
+    sent.push(message);
+    if (message.id === undefined) return true;
+    const result =
+      message.method === 'thread/start' || message.method === 'thread/resume'
+        ? { thread: { id: 'thread-synthetic' } }
+        : message.method === 'turn/start'
+          ? { turn: { id: 'turn-synthetic' } }
+          : message.method === 'turn/steer'
+            ? { turnId: 'turn-synthetic' }
+            : {};
+    queueMicrotask(() => receive({ id: message.id, result }));
+    return true;
+  });
+  proc.stdin.end.mockImplementation(() => {
+    proc.stdin.writableEnded = true;
+    queueMicrotask(() => {
+      proc.exitCode = 0;
+      proc.emit('exit', 0);
+      proc.emit('close', 0);
+    });
+  });
+  vi.mocked(spawn).mockReturnValue(proc as never);
+  const log = {
+    path: '/synthetic/journal',
+    append: (event: Record<string, unknown>) => {
+      records.push(event);
+      return records.length;
+    },
+    flush: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
+  };
+  const binding: NativeSteeringBinding = {
+    turnEpoch: 'synthetic-epoch',
+    assertCurrent: () => {
+      if (!current) throw new Error('Retired');
+    },
+    bind: (enqueue) => {
+      submit = enqueue;
+      return release;
+    },
+    openLog: vi.fn(async () => log),
+  };
+  const config = {
+    workingDirectory: '/synthetic/work',
+    mcpConfigPath: '',
+    inkMcpUrl: 'http://127.0.0.1:45555/mcp',
+    inkSessionId: 'synthetic-session',
+    sbSlug: 'echo',
+    nativeSteering: binding,
+    onSpawned: vi.fn(),
+  };
+  const run = (extra = {}) =>
+    runOwnedCodexAppServer({
+      args: ['app-server', '--listen', 'stdio://'],
+      message: 'Initial',
+      config: { ...config, ...extra },
+    });
+  return {
+    proc,
+    run,
+    config,
+    log,
+    sent,
+    records,
+    release,
+    notify,
+    receive,
+    binding,
+    submit: (request: SessionSteeringRequest) => {
+      if (!submit) throw new Error('Not bound');
+      return submit(request);
+    },
+    retire: () => {
+      current = false;
+    },
+    complete: () =>
+      notify('turn/completed', { turn: { id: 'turn-synthetic', status: 'completed' } }),
+  };
+}
+beforeEach(() => vi.clearAllMocks());
+afterEach(() => vi.useRealTimers());
+
+describe('owned Codex app-server runner', () => {
+  it('binds the current turn, journals admission, waits for correlated insertion and exits its child', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    const request = { messageId: 'm', text: 'Revision' };
+    expect((await f.submit(request)).status).toBe('pending');
+    await tick();
+    expect((await f.submit(request)).status).toBe('pending');
+    const steering = f.sent.find((x) => x.method === 'turn/steer')!;
+    expect(steering.params.expectedTurnId).toBe('turn-synthetic');
+    expect(f.records.some((x) => x.type === 'native_steering_request')).toBe(true);
+    expect(f.records.some((x) => x.status === 'inserted')).toBe(false);
+    f.notify('item/completed', {
+      item: { id: 'input-2', type: 'userMessage', content: steering.params.input },
+    });
+    await tick();
+    expect((await f.submit(request)).status).toBe('inserted');
+    expect(f.sent.filter((x) => x.method === 'turn/steer')).toHaveLength(1);
+    f.notify('thread/tokenUsage/updated', {
+      tokenUsage: { total: { inputTokens: 100, outputTokens: 10 } },
+    });
+    f.notify('item/completed', {
+      item: { id: 'assistant-1', type: 'agentMessage', text: 'Updated' },
+    });
+    f.complete();
+    expect(await result).toMatchObject({
+      success: true,
+      finalTextResponse: 'Updated',
+      backendSessionId: 'thread-synthetic',
+      usage: { inputTokens: 100, outputTokens: 10, cumulative: true },
+    });
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+    expect(f.proc.stdin.end).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.config.onSpawned).toHaveBeenCalledWith({ pid: 222222 });
+  });
+
+  it('settles unobserved input as unknown and never sends a second turn', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    const request = { messageId: 'm', text: 'Late revision' };
+    await f.submit(request);
+    await tick();
+    f.complete();
+    await result;
+    expect((await f.submit(request)).status).toBe('unknown');
+    expect(f.sent.filter((x) => x.method === 'turn/start')).toHaveLength(1);
+    expect(f.sent.filter((x) => x.method === 'turn/steer')).toHaveLength(1);
+  });
+
+  it('fails a provider initialization error without retry or exec fallback', async () => {
+    const f = fixture();
+    f.proc.stdin.write.mockImplementation((line: string) => {
+      const message = JSON.parse(line);
+      f.sent.push(message);
+      queueMicrotask(() =>
+        f.receive({
+          id: message.id,
+          error: { code: -32600, message: 'Private provider diagnostic' },
+        })
+      );
+      return true;
+    });
+    expect(await f.run()).toMatchObject({
+      success: false,
+      error: 'Codex app-server initialization failed',
+    });
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.sent).toHaveLength(1);
+  });
+
+  it('checks ownership again after binary resolution and starts nothing if it was lost', async () => {
+    const f = fixture();
+    vi.mocked(resolveBinaryPath).mockImplementationOnce(async () => {
+      f.retire();
+      return '/synthetic/codex';
+    });
+    await expect(f.run()).rejects.toThrow('Retired');
+    expect(spawn).not.toHaveBeenCalled();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('cancels an active child and terminalizes pending steering', async () => {
+    const f = fixture(),
+      abort = new AbortController();
+    const result = f.run({ signal: abort.signal });
+    await tick();
+    const request = { messageId: 'm', text: 'Pending' };
+    await f.submit(request);
+    abort.abort();
+    expect(await result).toMatchObject({ success: false, error: 'Codex turn cancelled' });
+    expect((await f.submit(request)).status).toBe('unknown');
+    expect(f.release).toHaveBeenCalledOnce();
+  });
+
+  it('preserves an unconfirmed stop instead of treating a sent signal as an exit', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.proc.stdin.end.mockImplementation(() => {
+      f.proc.stdin.writableEnded = true;
+    });
+    vi.mocked(stopProcessAndWait).mockResolvedValueOnce({ exited: false });
+    const result = f.run();
+    await tick();
+    f.complete();
+    await vi.advanceTimersByTimeAsync(501);
+    expect(await result).toMatchObject({
+      success: false,
+      stopUnconfirmed: { leaderExited: false },
+    });
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('uses explicit endpoint, no token argv, quoted paths, and the admitted sandbox profile', () => {
+    const f = fixture();
+    const args = buildCodexAppServerArgs({
+      config: f.config,
+      promptPath: '/synthetic/space name/identity.md',
+      writableRoots: ['/synthetic/work'],
+    });
+    expect(args.slice(-3)).toEqual(['app-server', '--listen', 'stdio://']);
+    expect(args).toContain('sandbox_mode="workspace-write"');
+    expect(args).toContain('approval_policy="never"');
+    expect(args).toContain('model_instructions_file="/synthetic/space name/identity.md"');
+    expect(args).toContain('mcp_servers.inkwell.url="http://127.0.0.1:45555/mcp"');
+    expect(args).toContain('mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"');
+    expect(() =>
+      buildCodexAppServerArgs({
+        config: { ...f.config, inkMcpUrl: undefined },
+        promptPath: '/synthetic/file',
+        writableRoots: [],
+      })
+    ).toThrow('explicit MCP');
+  });
+
+  it('stops the owned child if launch tracking throws, before starting any native turn', async () => {
+    const f = fixture();
+    const result = await f.run({
+      onSpawned: () => {
+        throw new Error('Synthetic tracking failure');
+      },
+    });
+    expect(result).toMatchObject({ success: false, error: 'Codex launch tracking failed' });
+    expect(f.proc.stdin.end).toHaveBeenCalledOnce();
+    expect(f.sent).toHaveLength(0);
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('retains a surviving-process fence even if journal close fails too', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.proc.stdin.end.mockImplementation(() => {
+      f.proc.stdin.writableEnded = true;
+    });
+    vi.mocked(stopProcessAndWait).mockResolvedValueOnce({ exited: false });
+    f.log.close.mockRejectedValueOnce(new Error('Synthetic close failure'));
+    const result = f.run();
+    await tick();
+    f.complete();
+    await vi.advanceTimersByTimeAsync(501);
+    expect(await result).toMatchObject({
+      success: false,
+      stopUnconfirmed: { leaderExited: false },
+      error: 'Native steering journal close could not be confirmed',
+    });
+  });
+
+  it('requires group-empty evidence even when the leader closed normally', async () => {
+    const f = fixture();
+    vi.mocked(stopProcessAndWait).mockResolvedValueOnce({ exited: true, group: 'alive' });
+    const result = f.run({ killProcessGroup: true });
+    await tick();
+    f.complete();
+    expect(await result).toMatchObject({
+      success: false,
+      stopUnconfirmed: { leaderExited: true, group: 'alive', pgid: 222222 },
+    });
+    expect(stopProcessAndWait).toHaveBeenCalledWith(f.proc, { group: true });
+  });
+
+  it('settles conservatively when input close, group stop, or release throws', async () => {
+    const f = fixture();
+    f.proc.stdin.end.mockImplementation(() => {
+      throw new Error('Synthetic close failure');
+    });
+    vi.mocked(stopProcessAndWait).mockRejectedValueOnce(new Error('Synthetic stop failure'));
+    f.release.mockImplementation(() => {
+      throw new Error('Synthetic release failure');
+    });
+    vi.useFakeTimers();
+    const result = f.run({ killProcessGroup: true });
+    await tick();
+    f.complete();
+    await vi.advanceTimersByTimeAsync(501);
+    expect(await result).toMatchObject({
+      success: false,
+      stopUnconfirmed: { leaderExited: false, group: 'unknown' },
+    });
+  });
+
+  it('reports unknown when terminal arrives before the observation write barrier finishes', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    const request = { messageId: 'm', text: 'At the last boundary' };
+    await f.submit(request);
+    await tick();
+    const steering = f.sent.find((x) => x.method === 'turn/steer')!;
+    // Both notifications arrive synchronously, as in one stdout chunk.
+    f.notify('item/completed', {
+      item: { id: 'input-2', type: 'userMessage', content: steering.params.input },
+    });
+    f.complete();
+    await result;
+    expect((await f.submit(request)).status).toBe('unknown');
+  });
+
+  it.each(['stdout', 'stderr'])('settles on a readable %s stream error', async (name) => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    f.proc[name as 'stdout' | 'stderr'].emit('error', new Error('Synthetic stream failure'));
+    expect(await result).toMatchObject({ success: false });
+    expect(f.proc.stdin.end).toHaveBeenCalledOnce();
+    expect(f.release).toHaveBeenCalledOnce();
+  });
+});

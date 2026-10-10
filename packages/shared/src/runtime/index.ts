@@ -75,3 +75,4 @@ export * from './mcp-result.js';
 export * from './approval-sanitize.js';
 export * from './session-control.js';
 export * from './session-steering.js';
+export * from './native-session-steering.js';
