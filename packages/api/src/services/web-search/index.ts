@@ -25,7 +25,7 @@ export async function searchWeb(input: WebSearchInput): Promise<WebSearchOutput>
   return runSearch(input, false);
 }
 
-/** Not wired to MCP yet: its coordinator must supply only audited same-account queries. */
+/** The MCP coordinator supplies only audited same-account queries. */
 export async function searchWebBatch(input: WebSearchBatchInput): Promise<WebSearchBatchOutput> {
   return runSearch(input, true);
 }

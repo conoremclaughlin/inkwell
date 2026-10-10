@@ -34,6 +34,19 @@ export function isWebSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return env.INK_WEB_SEARCH_ENABLED === 'true';
 }
 
+/** Account permission alone must not grant spending on the operator's login. */
+export function isWebSearchAccountAllowed(
+  accountId: string,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  const raw = env.INK_WEB_SEARCH_ACCOUNT_IDS;
+  if (!raw || raw.length > 4096) return false;
+  const ids = raw.split(',').map((id) => id.trim().toLowerCase());
+  // Fail the whole list closed on typos, empty entries, wildcards or overflow.
+  if (ids.length > 32 || ids.some((id) => !z.string().guid().safeParse(id).success)) return false;
+  return ids.includes(accountId.toLowerCase());
+}
+
 /** Only an explicit operator opt-out suppresses content; required receipts remain. */
 export function isWebSearchAuditContentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.INK_WEB_SEARCH_AUDIT_CONTENT !== 'false';

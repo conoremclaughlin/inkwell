@@ -38,6 +38,7 @@ class FakeServer {
 }
 beforeEach(() => {
   vi.stubEnv('INK_WEB_SEARCH_ENABLED', 'true');
+  vi.stubEnv('INK_WEB_SEARCH_ACCOUNT_IDS', '00000000-0000-4000-8000-000000000001');
   handler.mockReset();
   mocks.allowed.mockReset();
   mocks.audit.mockReset();

@@ -73,7 +73,10 @@ function parse(result: Awaited<ReturnType<typeof handleWebSearch>>) {
 let originalEnv: NodeJS.ProcessEnv;
 beforeEach(() => {
   originalEnv = process.env;
-  process.env = { ...SYNTHETIC_ENV };
+  process.env = {
+    ...SYNTHETIC_ENV,
+    INK_WEB_SEARCH_ACCOUNT_IDS: userId + ',00000000-0000-4000-8000-000000000002',
+  };
   vi.clearAllMocks();
   mocks.isEnabled.mockResolvedValue(true);
   mocks.log.mockResolvedValue(undefined);
@@ -630,5 +633,48 @@ describe('handler / queue / per-caller audit composition (inert provider)', () =
     });
     expect(f.run).not.toHaveBeenCalled();
     expect(mocks.log.mock.calls[1][0].responseStatus).toBe('blocked');
+  });
+});
+
+describe('operator subscription account boundary', () => {
+  it.each([undefined, '', '*', otherUserId, userId + ',typo', userId + ','])(
+    'refuses an unlisted account with config %s before queuing or logging query content',
+    async (ids) => {
+      if (ids === undefined) delete process.env.INK_WEB_SEARCH_ACCOUNT_IDS;
+      else process.env.INK_WEB_SEARCH_ACCOUNT_IDS = ids;
+      expect(parse(await call())).toMatchObject({
+        reason: 'account-not-enabled',
+        searchMayHaveRun: false,
+      });
+      expect(search).not.toHaveBeenCalled();
+      expect(mocks.log).toHaveBeenCalledOnce();
+      expect(mocks.log.mock.calls[0][0]).toMatchObject({
+        responseStatus: 'blocked',
+        metadata: { reason: 'account-not-enabled' },
+      });
+      expect(JSON.stringify(mocks.log.mock.calls)).not.toContain('question');
+    }
+  );
+
+  it('an allowed account still requires its permission, and cannot name another account to spend', async () => {
+    process.env.INK_WEB_SEARCH_ACCOUNT_IDS = userId;
+    mocks.isEnabled.mockResolvedValue(false);
+    expect(parse(await call())).toMatchObject({ reason: 'permission-off' });
+    expect(search).not.toHaveBeenCalled();
+    mocks.isEnabled.mockResolvedValue(true);
+    await expect(call({ query: 'question', userId: otherUserId })).rejects.toThrow(
+      'does not match'
+    );
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it('treats an unavailable refusal audit as failure, not a reason to spend', async () => {
+    delete process.env.INK_WEB_SEARCH_ACCOUNT_IDS;
+    mocks.log.mockRejectedValue(new Error('private DB error'));
+    expect(parse(await call())).toMatchObject({
+      reason: 'audit-unavailable',
+      searchMayHaveRun: false,
+    });
+    expect(search).not.toHaveBeenCalled();
   });
 });
