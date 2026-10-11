@@ -125,6 +125,7 @@ import {
   reactToMessage,
   type ReactionSummary,
 } from '../services/threads/thread-reactions';
+import { PinRefusedError, parsePinBody, setThreadPin } from '../services/threads/thread-pins';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -8582,10 +8583,13 @@ router.get('/threads', async (req: Request, res: Response) => {
     const participantsByThreadId = new Map<string, string[]>();
     const peopleByThreadId = new Map<string, string[]>();
     const participantSbIds = new Set<string>();
+    // The viewer's own pin per thread, from their own participant row only.
+    const viewerPinByThreadId = new Map<string, boolean | null>();
     const participantRows: Array<{
       thread_id: string;
       sb_id: string | null;
       user_id: string | null;
+      pinned: boolean | null;
     }> = [];
     const PARTICIPANT_PAGE = 1000;
     for (let from = 0; ; from += PARTICIPANT_PAGE) {
@@ -8594,7 +8598,7 @@ router.get('/threads', async (req: Request, res: Response) => {
         // The FK is named: two relationships exist between the tables since
         // the cutover, and an unqualified embed is PGRST201-ambiguous.
         .select(
-          'thread_id, sb_id, user_id, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
+          'thread_id, sb_id, user_id, pinned, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
         )
         .eq('inbox_threads.workspace_id', workspaceId)
         .order('thread_id', { ascending: true })
@@ -8628,6 +8632,9 @@ router.get('/threads', async (req: Request, res: Response) => {
         const list = peopleByThreadId.get(row.thread_id) ?? [];
         list.push(row.user_id);
         peopleByThreadId.set(row.thread_id, list);
+        if (row.user_id === authReq.inkUserId) {
+          viewerPinByThreadId.set(row.thread_id, row.pinned ?? null);
+        }
       }
     }
 
@@ -8672,6 +8679,8 @@ router.get('/threads', async (req: Request, res: Response) => {
           t.last_message,
           (senderUserId) => describePeople([senderUserId], personNames, authReq.inkUserId)[0]
         ),
+        // The viewer's pin, only when the viewer has a row on the thread.
+        ...(viewerPinByThreadId.has(t.id) ? { pinned: viewerPinByThreadId.get(t.id) ?? null } : {}),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -9763,6 +9772,46 @@ router.post('/threads/reactions', async (req: Request, res: Response) => {
     }
     logger.error('Failed to react to a thread message:', error);
     res.status(500).json(errorJson('Failed to react to the message', error));
+  }
+});
+
+/**
+ * PUT /api/admin/threads/pin
+ * Body: { threadKey, pinned: true | false | null } → 200 { threadKey, pinned }
+ *
+ * The person's own pin on one of their threads (services/threads/thread-pins.ts):
+ * true pinned, false unpinned on purpose, null back to no choice (the app's
+ * default pins apply). 400 a malformed body; 403 a role that cannot write, or
+ * a thread the person is not in (a background thread); 404 no such thread in
+ * this workspace. Each refusal carries a stable `code`. A pin wakes nobody and
+ * moves no unread count and no thread recency.
+ */
+router.put('/threads/pin', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const { threadKey, pinned } = parsePinBody(req.body);
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'pin a thread');
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await setThreadPin(supabase, {
+      workspaceId: authReq.inkWorkspaceId,
+      userId: authReq.inkUserId,
+      threadKey,
+      pinned,
+    });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof PinRefusedError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    logger.error('Failed to set a thread pin:', error);
+    res.status(500).json(errorJson('Failed to set the pin', error));
   }
 });
 

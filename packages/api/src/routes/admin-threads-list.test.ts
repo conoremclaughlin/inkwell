@@ -228,6 +228,7 @@ interface Spine {
       preview: string;
       createdAt: string;
     } | null;
+    pinned?: boolean | null;
   } | null;
   sessions: Array<{ id: string; sbSlug: string | null; live: boolean }>;
 }
@@ -496,6 +497,75 @@ describe('GET /threads', () => {
       const spine = spines.find((s) => s.key === OLD_KEY);
       expect(spine?.thread?.lastMessage?.id).toBe('old-last');
       expect(spine?.thread?.lastMessage?.preview).toBe('still going');
+    });
+  });
+
+  /**
+   * The viewer's pin rides on the thread, read from the viewer's own
+   * participant row and nobody else's. Three states reach the client as
+   * they are stored (true, false, null), and a thread the viewer has no row
+   * on carries no `pinned` at all, so the app cannot mistake "not yours" for
+   * "no choice yet".
+   */
+  describe("the viewer's pin", () => {
+    const participant = (over: Record<string, unknown>) => ({
+      thread_id: 'thread-1',
+      sb_id: null,
+      user_id: null,
+      pinned: null,
+      principal_key: `p-${String(over.user_id ?? over.sb_id)}`,
+      ...over,
+    });
+
+    it("carries each state of the viewer's own row: true, false and null", async () => {
+      const spines = await listSpines({
+        inbox_threads: [
+          threadRow(),
+          threadRow({ id: 'thread-2', thread_key: 'inkwell:pr:2' }),
+          threadRow({ id: 'thread-3', thread_key: 'inkwell:pr:3' }),
+        ],
+        inbox_thread_participants: [
+          participant({ thread_id: 'thread-1', user_id: 'user-1', pinned: true }),
+          participant({ thread_id: 'thread-2', user_id: 'user-1', pinned: false }),
+          participant({ thread_id: 'thread-3', user_id: 'user-1', pinned: null }),
+        ],
+      });
+      const pinByKey = Object.fromEntries(spines.map((s) => [s.key, s.thread?.pinned]));
+      expect(pinByKey).toEqual({
+        'inkwell:pr:632': true,
+        'inkwell:pr:2': false,
+        'inkwell:pr:3': null,
+      });
+      // null is a value the client reads, not an absence.
+      const third = spines.find((s) => s.key === 'inkwell:pr:3');
+      expect(third?.thread && 'pinned' in third.thread).toBe(true);
+    });
+
+    it('omits pinned on a thread the viewer has no row on', async () => {
+      const [spine] = await listSpines({
+        inbox_threads: [threadRow()],
+        inbox_thread_participants: [participant({ sb_id: 'sb-wren', principal_key: 'p-wren' })],
+      });
+      expect(spine.thread).not.toBeNull();
+      expect('pinned' in (spine.thread as object)).toBe(false);
+    });
+
+    it("never reads another person's pin as the viewer's", async () => {
+      const spines = await listSpines({
+        inbox_threads: [threadRow(), threadRow({ id: 'thread-2', thread_key: 'inkwell:pr:2' })],
+        inbox_thread_participants: [
+          // Someone else pinned thread-1; the viewer made no choice there.
+          participant({ thread_id: 'thread-1', user_id: 'user-2', pinned: true }),
+          participant({ thread_id: 'thread-1', user_id: 'user-1', pinned: null }),
+          // Someone else pinned thread-2, which the viewer is not in.
+          participant({ thread_id: 'thread-2', user_id: 'user-2', pinned: true }),
+          // An SB row never carries a pin into the viewer's answer.
+          participant({ thread_id: 'thread-2', sb_id: 'sb-wren', principal_key: 'p-wren' }),
+        ],
+      });
+      const byKey = Object.fromEntries(spines.map((s) => [s.key, s.thread]));
+      expect(byKey['inkwell:pr:632']?.pinned).toBeNull();
+      expect('pinned' in (byKey['inkwell:pr:2'] as object)).toBe(false);
     });
   });
 });

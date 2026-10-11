@@ -1720,6 +1720,7 @@ export type Database = {
       inbox_thread_participants: {
         Row: {
           joined_at: string | null;
+          pinned: boolean | null;
           principal_key: string;
           sb_id: string | null;
           session_id: string | null;
@@ -1729,6 +1730,7 @@ export type Database = {
         };
         Insert: {
           joined_at?: string | null;
+          pinned?: boolean | null;
           principal_key?: string;
           sb_id?: string | null;
           session_id?: string | null;
@@ -1738,6 +1740,7 @@ export type Database = {
         };
         Update: {
           joined_at?: string | null;
+          pinned?: boolean | null;
           principal_key?: string;
           sb_id?: string | null;
           session_id?: string | null;
