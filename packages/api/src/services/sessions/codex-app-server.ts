@@ -1,12 +1,12 @@
 /** Owned app-server child for an admitted standard Codex run, never a daemon attachment. */
-import { spawn } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { randomUUID } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import { buildSessionEnv, resolveSpawnTarget, writeRuntimeSessionHint } from '@inklabs/shared';
 import { createNativeSessionSteering } from '@inklabs/shared/runtime';
 import { CodexRpcError, createCodexAppServerProtocol } from './codex-app-server-protocol.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { stopProcessAndWait } from './stop-process.js';
+import { stopProcessAndWait, probeGroup, isGroupId } from './stop-process.js';
 import type { ClaudeRunnerConfig, RunnerResult, ChannelResponse, ToolCall } from './types.js';
 
 /** Preserve the runner's MCP/auth overrides; only the transport changes. */
@@ -107,17 +107,49 @@ export async function runOwnedCodexAppServer(input: {
     // Nothing asynchronous between the final owner check and spawn.
     binding.assertCurrent();
     const killGroup = config.killProcessGroup === true;
-    const proc = spawn(target.binary, target.args, {
-      cwd: target.cwd,
-      env: target.env,
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: killGroup,
+    let stopOwned = () => {};
+    let confirmExit!: (result: { childExited: boolean }) => void;
+    const exited = new Promise<{ childExited: boolean }>((resolve) => {
+      confirmExit = resolve;
     });
+    const ownership = binding.ownChild({ abort: () => stopOwned(), settled: exited });
+    let released = false;
+    let survivorPoll: ReturnType<typeof setInterval> | undefined;
+    const giveBack = () => {
+      if (released) return;
+      released = true;
+      clearInterval(survivorPoll);
+      ownership.release();
+      confirmExit({ childExited: true });
+    };
+    // Reserve before spawn, without yielding. A failed spawn started nothing.
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(target.binary, target.args, {
+        cwd: target.cwd,
+        env: target.env,
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: killGroup,
+      });
+    } catch (error) {
+      giveBack();
+      throw error;
+    }
     result = await new Promise<RunnerResult>((resolve) => {
       let finishing = false,
         closed = false;
       let terminalFailure: string | undefined;
+      let stopAttemptFinished = false;
+      let leaderExited = false;
+      const reconcileExit = () => {
+        // Never signal a remembered group again. Only an observed leader exit
+        // and, for detached children, a read-only empty-group probe release it.
+        if (!stopAttemptFinished || released) return;
+        if (!(leaderExited || closed || proc.exitCode !== null || proc.signalCode !== null)) return;
+        if (killGroup && (!isGroupId(proc.pid) || probeGroup(proc.pid) !== 'empty')) return;
+        giveBack();
+      };
       let classification: RunnerResult['classification'];
       let release: (() => void) | undefined;
       let mailbox: ReturnType<typeof createNativeSessionSteering> | undefined;
@@ -228,6 +260,7 @@ export async function runOwnedCodexAppServer(input: {
         if (!closed || killGroup) {
           try {
             const stop = await stopProcessAndWait(proc, { group: killGroup });
+            leaderExited ||= stop.exited;
             if (!stop.exited || (killGroup && stop.group !== 'empty'))
               stopUnconfirmed = {
                 leaderExited: stop.exited,
@@ -239,6 +272,15 @@ export async function runOwnedCodexAppServer(input: {
               leaderExited: closed,
               ...(killGroup ? { pgid: proc.pid, group: 'unknown' } : {}),
             };
+          }
+        }
+        stopAttemptFinished = true;
+        if (!stopUnconfirmed) giveBack();
+        else {
+          reconcileExit();
+          if (!released) {
+            survivorPoll = setInterval(reconcileExit, 1000);
+            survivorPoll.unref();
           }
         }
         try {
@@ -270,6 +312,7 @@ export async function runOwnedCodexAppServer(input: {
       const onAbort = () => {
         void finish('Codex turn cancelled');
       };
+      stopOwned = onAbort;
       const decoder = new StringDecoder('utf8');
       let remainder = '';
       proc.stdout.on('data', (data: Buffer) => {
@@ -312,6 +355,7 @@ export async function runOwnedCodexAppServer(input: {
         if (code !== 0 || signal) terminalFailure ??= 'Codex app-server did not exit successfully';
         closed = true;
         closeProcess();
+        reconcileExit();
         if (!finishing) {
           remainder += decoder.end();
           if (remainder.trim()) {

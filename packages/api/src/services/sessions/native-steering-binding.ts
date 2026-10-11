@@ -2,13 +2,22 @@
 import { isAbsolute } from 'path';
 import type { SessionSteeringRequest, SessionSteeringReceipt } from '@inklabs/shared/runtime';
 import { verifyInkAccessToken } from '../../auth/ink-tokens';
-import { getActiveRun, mayGenerationProceed, attachRunSteering } from './active-runs';
+import {
+  getActiveRun,
+  mayGenerationProceed,
+  attachRunSteering,
+  attachRunChild,
+  type OwnedChild,
+  type ChildOwnership,
+} from './active-runs';
 import { hasOwnTurnGate } from './trigger-delivery';
 import { openNativeSteeringLog, type NativeSteeringLog } from './native-steering-log';
 
 export interface NativeSteeringBinding {
   readonly turnEpoch: string;
   assertCurrent(): void;
+  /** Reserve child ownership before spawn; only confirmed exit gives it back. */
+  ownChild(child: OwnedChild): ChildOwnership;
   /** Call only once the runner knows the exact live native provider turn. */
   bind(enqueue: (request: SessionSteeringRequest) => Promise<SessionSteeringReceipt>): () => void;
   /** Open before provider spawn. This private log has no read or resume surface. */
@@ -30,6 +39,13 @@ export interface NativeSteeringAdmission {
   container?: unknown;
   signal?: AbortSignal;
   admitSpawn?: () => string | undefined;
+}
+
+/** An eligible target lost admission; this must not select another transport. */
+export class NativeSteeringAdmissionRefused extends Error {
+  constructor() {
+    super('Native steering generation is no longer admitted');
+  }
 }
 
 /** Unsupported or unverifiable targets keep their ordinary queued-input behavior. */
@@ -102,13 +118,19 @@ export function createNativeSteeringBinding(
   try {
     assertCurrent();
   } catch {
-    return undefined;
+    throw new NativeSteeringAdmissionRefused();
   }
   let opened: Promise<NativeSteeringLog> | undefined;
   let bound = false;
   return {
     turnEpoch,
     assertCurrent,
+    ownChild(child) {
+      assertCurrent();
+      const ownership = attachRunChild(sessionId, turnEpoch, child);
+      if (!ownership) throw new NativeSteeringAdmissionRefused();
+      return ownership;
+    },
     openLog() {
       // Opening is single-shot. A failure is sticky, never a fresh empty journal.
       return (opened ??= (async () => {

@@ -462,7 +462,7 @@ export interface StopOwnedChildrenResult {
  * Stop the owned children, all of them or one generation's, and wait up to
  * `timeoutMs` for each to settle. A child is reported stopped only on a
  * confirmed exit; abort() returning, or `settled` resolving, is not one.
- * Exposed for graceful shutdown, which is not wired to it yet (P2d).
+ * Used by graceful shutdown after intake closes; surviving children remain owned.
  */
 export async function stopOwnedChildren(
   timeoutMs: number,

@@ -72,7 +72,11 @@ vi.mock('./native-steering-log.js', () => ({
     close: vi.fn(async () => {}),
   })),
 }));
-vi.mock('./stop-process.js', () => ({ stopProcessAndWait: vi.fn(async () => ({ exited: true })) }));
+vi.mock('./stop-process.js', () => ({
+  stopProcessAndWait: vi.fn(async () => ({ exited: true, group: 'empty' })),
+  isGroupId: (id: unknown) => typeof id === 'number' && Number.isInteger(id) && id > 1,
+  probeGroup: vi.fn(() => 'alive'),
+}));
 vi.mock('../graph-executor.service', () => ({
   releaseGraphClaimsForSession: vi.fn(async () => undefined),
 }));
@@ -163,13 +167,22 @@ import { SessionService } from './session-service.js';
 import { SessionRepository } from './session-repository.js';
 import { CodexRunner } from './codex-runner.js';
 import { verifyInkAccessToken } from '../../auth/ink-tokens.js';
-import { getActiveRun, resetActiveRuns, submitRunSteering } from './active-runs.js';
+import {
+  getActiveRun,
+  resetActiveRuns,
+  submitRunSteering,
+  listOwnedChildren,
+  mayGenerationProceed,
+  closeIntakeAndDrain,
+  stopOwnedChildren,
+} from './active-runs.js';
 import { runOwnedCodexAppServer } from './codex-app-server.js';
 import { ensureStudioComplete } from '../studio-complete.js';
 import { spawn } from 'child_process';
 import { resolveBinaryPath } from './resolve-binary.js';
 import { releaseGraphClaimsForSession } from '../graph-executor.service';
 import { logger } from '../../utils/logger.js';
+import { stopProcessAndWait, probeGroup } from './stop-process.js';
 import type {
   ChannelResponse,
   ClaudeRunnerConfig,
@@ -377,21 +390,30 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
-async function run(metadata: Row = {}) {
+async function run(metadata: Row = {}, epoch = 'synthetic-epoch') {
   const session = (await repository.findById(sessionId))!;
   return (service as unknown as SessionServiceTestPorts).processMessage(
     { ...request, metadata },
     session,
-    'synthetic-epoch'
+    epoch
   );
 }
 
 /** Real protocol/runner, inert child transport: all IO remains replaced above. */
-async function realNativeTransport(refusal?: { method: string; message: string }) {
+async function realNativeTransport(
+  refusal?: { method: string; message: string },
+  killGroup = false
+) {
   const implementation =
     await vi.importActual<typeof import('./codex-app-server.js')>('./codex-app-server.js');
-  native.mockImplementation(implementation.runOwnedCodexAppServer);
+  native.mockImplementation((input) =>
+    implementation.runOwnedCodexAppServer({
+      ...input,
+      config: { ...input.config, killProcessGroup: killGroup },
+    })
+  );
   vi.mocked(resolveBinaryPath).mockResolvedValue('/synthetic/codex');
   const sent: Array<{ id?: number; method: string }> = [];
   const proc = Object.assign(new EventEmitter(), {
@@ -413,7 +435,7 @@ async function realNativeTransport(refusal?: { method: string; message: string }
     const message = JSON.parse(line);
     sent.push(message);
     if (message.id === undefined) return true;
-    if (message.method === refusal?.method) {
+    if (refusal && message.method === refusal.method) {
       // A concurrent owner changed attachment/lifecycle while our rejected resume ran.
       row.cli_attached = true;
       row.lifecycle = 'idle';
@@ -497,6 +519,92 @@ describe('production native steering selection', () => {
       expect(legacy).not.toHaveBeenCalled();
     }
   );
+
+  it.each(['leader', 'group', 'unknown-group'] as const)(
+    'holds new native and exec generations after an unconfirmed %s stop until confirmed exit',
+    async (kind) => {
+      vi.useFakeTimers();
+      const grouped = kind !== 'leader';
+      const f = await realNativeTransport(undefined, grouped);
+      vi.mocked(probeGroup).mockReturnValue(kind === 'unknown-group' ? 'unknown' : 'alive');
+      f.proc.stdin.end.mockImplementation(() => {
+        f.proc.stdin.writableEnded = true;
+      });
+      vi.mocked(stopProcessAndWait).mockResolvedValueOnce(
+        grouped
+          ? { exited: true, group: kind === 'group' ? 'alive' : 'unknown' }
+          : { exited: false }
+      );
+      const running = run();
+      await vi.waitFor(() => expect(f.sent.some((m) => m.method === 'turn/start')).toBe(true));
+      if (grouped) {
+        f.proc.exitCode = 0;
+      }
+      f.receive({
+        method: 'turn/completed',
+        params: {
+          threadId: 'synthetic-thread',
+          turn: { id: 'synthetic-turn', status: 'completed' },
+        },
+      });
+      if (grouped) {
+        f.proc.emit('exit', 0);
+        f.proc.emit('close', 0);
+      }
+      await vi.advanceTimersByTimeAsync(501);
+      expect((await running).success).toBe(false);
+      expect.soft(listOwnedChildren()).toEqual([{ sessionId, turnEpoch: 'synthetic-epoch' }]);
+      expect(getActiveRun(sessionId)).toBeUndefined();
+      // An accidental launch returns immediately instead of hanging this safety test.
+      native.mockImplementationOnce(async () => success);
+      if (kind === 'unknown-group') identity.metadata = null; // No legacy escape when native is unsupported.
+      expect.soft((await run({}, 'synthetic-epoch-two')).success).toBe(false);
+      expect.soft(native).toHaveBeenCalledTimes(1);
+      expect.soft(legacy).not.toHaveBeenCalled();
+      expect.soft(spawn).toHaveBeenCalledTimes(1);
+      expect.soft(mayGenerationProceed(sessionId, 'synthetic-epoch-two')).toBe(false);
+      expect.soft(listOwnedChildren()).toHaveLength(1);
+      // Retired input is not revived while the survivor is held.
+      expect(
+        (
+          await submitRunSteering(sessionId, 'synthetic-epoch', {
+            messageId: 'late',
+            text: 'No replay',
+          })
+        ).status
+      ).toBe('refused');
+      f.proc.exitCode = 0;
+      f.proc.emit('exit', 0);
+      f.proc.emit('close', 0);
+      vi.mocked(probeGroup).mockReturnValue('empty');
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(listOwnedChildren()).toEqual([]);
+      native.mockImplementation(async () => success);
+      identity.metadata = {};
+      expect((await run({}, 'synthetic-epoch-three')).success).toBe(true);
+      expect(native).toHaveBeenCalledTimes(2);
+      expect(legacy).not.toHaveBeenCalled();
+    }
+  );
+
+  it('exposes the running native child to shutdown drain and confirms its stop', async () => {
+    const f = await realNativeTransport();
+    const running = run();
+    await vi.waitFor(() => expect(f.sent.some((m) => m.method === 'turn/start')).toBe(true));
+    const draining = closeIntakeAndDrain();
+    const stopped = await stopOwnedChildren(100);
+    expect.soft(stopped.confirmed).toEqual([{ sessionId, turnEpoch: 'synthetic-epoch' }]);
+    expect.soft(f.proc.stdin.end).toHaveBeenCalledOnce();
+    // Keep the broken-head regression bounded without a real process.
+    if (!f.proc.stdin.end.mock.calls.length) {
+      f.proc.exitCode = 0;
+      f.proc.emit('close', 0);
+    }
+    expect((await running).success).toBe(false);
+    expect((await draining).drained).toBe(true);
+    expect(listOwnedChildren()).toEqual([]);
+    expect(legacy).not.toHaveBeenCalled();
+  });
 
   it('mints the real bound credential and selects app-server after owner registration and persistence', async () => {
     expect((await run()).success).toBe(true);

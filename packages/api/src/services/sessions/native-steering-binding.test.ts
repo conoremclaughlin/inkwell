@@ -160,7 +160,9 @@ describe('native steering admission', () => {
       if (kind === 'backend') run.backend = 'ink';
       if (kind === 'aborted') abort.abort();
       if (kind === 'spawn-refused') snapshot.admitSpawn = () => 'Synthetic refusal';
-      expect(createNativeSteeringBinding(snapshot)).toBeUndefined();
+      if (['epoch', 'settled', 'aborted', 'spawn-refused'].includes(kind))
+        expect(() => createNativeSteeringBinding(snapshot)).toThrow('no longer admitted');
+      else expect(createNativeSteeringBinding(snapshot)).toBeUndefined();
     }
   );
 

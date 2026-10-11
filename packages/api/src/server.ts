@@ -108,7 +108,7 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
-import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { closeIntakeAndDrain, stopOwnedChildren } from './services/sessions/active-runs';
 import { parseHostedInkSbIds } from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
@@ -2283,7 +2283,12 @@ async function shutdown(reason: string): Promise<void> {
     // the snapshot. Snapshotting first would race the very writes it needs to
     // order against — a pending `running` write would land after our
     // interruption and restore the zombie.
-    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    const draining = closeIntakeAndDrain(); // Closes admission synchronously.
+    // A registered child is owned even after its runner returned an uncertain
+    // stop. Ask all owned children to stop while lifecycle writes drain; never
+    // infer child exit from process.exit or a detached leader's disappearance.
+    const stoppingChildren = stopOwnedChildren(7_500);
+    const { runs: interrupted, drained } = await draining;
     if (interrupted.length > 0 && dataComposer) {
       // `drained` is passed through rather than swallowed: if a lifecycle
       // write was still outstanding, whatever we record here may be
@@ -2306,6 +2311,12 @@ async function shutdown(reason: string): Promise<void> {
         logger.error('Interruption bookkeeping failed', { error: err });
       });
     }
+
+    const stoppedChildren = await stoppingChildren;
+    if (stoppedChildren.unconfirmed.length > 0)
+      logger.warn('Owned children remain unconfirmed at shutdown', {
+        count: stoppedChildren.unconfirmed.length,
+      });
 
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();

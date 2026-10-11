@@ -12,7 +12,11 @@ vi.mock('./resolve-binary.js', () => ({
   resolveBinaryPath: vi.fn(async () => '/synthetic/codex'),
   buildSpawnPath: vi.fn(() => '/synthetic/bin'),
 }));
-vi.mock('./stop-process.js', () => ({ stopProcessAndWait: vi.fn(async () => ({ exited: true })) }));
+vi.mock('./stop-process.js', () => ({
+  stopProcessAndWait: vi.fn(async () => ({ exited: true })),
+  isGroupId: (id: unknown) => typeof id === 'number' && Number.isInteger(id) && id > 1,
+  probeGroup: vi.fn(() => 'alive'),
+}));
 import { spawn } from 'child_process';
 import { resolveBinaryPath } from './resolve-binary.js';
 import { stopProcessAndWait } from './stop-process.js';
@@ -88,6 +92,11 @@ function fixture() {
   };
   const binding: NativeSteeringBinding = {
     turnEpoch: 'synthetic-epoch',
+    ownChild: () => ({
+      sessionId: 'synthetic-session',
+      turnEpoch: 'synthetic-epoch',
+      release: vi.fn(),
+    }),
     assertCurrent: () => {
       if (!current) throw new Error('Retired');
     },
@@ -134,8 +143,14 @@ function fixture() {
       notify('turn/completed', { turn: { id: 'turn-synthetic', status: 'completed' } }),
   };
 }
-beforeEach(() => vi.clearAllMocks());
-afterEach(() => vi.useRealTimers());
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
 
 describe('owned Codex app-server runner', () => {
   it('binds the current turn, journals admission, waits for correlated insertion and exits its child', async () => {

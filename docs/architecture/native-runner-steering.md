@@ -67,7 +67,20 @@ conservative result is intentional, not permission to resend.
 EOF gives the owned child a short shutdown window, followed by confirmed stop
 if necessary. When process-group ownership is enabled, leader exit alone does
 not establish group quiescence. A failed stop remains visible alongside any
-journal-close error. No receipt silently retries or becomes ordinary mail.
+journal-close error. Child ownership is reserved before spawn and outlives the
+steering port and finalized run. An unconfirmed child blocks the next session
+generation, including legacy `exec`, until observed exit (and an empty group
+when applicable). Survivor reconciliation only probes; it never signals a
+remembered group again. Shutdown closes intake and asks the owned-child registry
+to stop its children within a bounded wait. These are in-process guarantees;
+a restart still relies on the existing launched-process recovery path.
+
+A known `thread/resume` writer refusal preserves the pre-acceptance
+`owner_conflict` classification through cleanup and session finalization. Only
+the trusted method reply is classified, and only a static category/summary is
+retained, not provider diagnostics. Unrelated initialization errors and ambiguous
+`turn/start` failures do not receive this classification. No receipt silently
+retries or becomes ordinary mail.
 
 ## Verification and remaining gates
 
