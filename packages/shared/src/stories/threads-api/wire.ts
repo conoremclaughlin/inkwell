@@ -84,6 +84,12 @@ export interface ThreadSpine {
     closedAt: string | null;
     /** Newest deliverable message; absent from servers that predate it. */
     lastMessage?: ThreadLastMessage | null;
+    /**
+     * The viewer's own pin: true pinned, false explicitly unpinned, null no
+     * choice yet. Absent from servers that predate it, and on threads the
+     * viewer isn't a participant in.
+     */
+    pinned?: boolean | null;
   } | null;
   sessions: SpineSession[];
   studios: SpineStudio[];
