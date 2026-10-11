@@ -86,6 +86,12 @@ describe('executeToolCalls', () => {
       { content: 'hi' },
       { signal: undefined }
     );
+    expect(canCallInkTool).toHaveBeenNthCalledWith(1, 'send_to_inbox', 'session-1', {
+      content: 'hi',
+    });
+    expect(canCallInkTool).toHaveBeenNthCalledWith(2, 'send_to_inbox', 'session-1', {
+      content: 'hi',
+    });
   });
 
   it('reports denied when user rejects approval prompt', async () => {
@@ -232,7 +238,9 @@ describe('executeToolCalls', () => {
 
       expect(results).toHaveLength(1);
       expect(results[0].status).toBe('executed');
-      expect(canCallInkTool).toHaveBeenCalledWith('read', 'session-1');
+      expect(canCallInkTool).toHaveBeenCalledWith('read', 'session-1', {
+        file_path: '/tmp/test.ts',
+      });
     });
 
     it('prompts for write tools under safe profile', async () => {
