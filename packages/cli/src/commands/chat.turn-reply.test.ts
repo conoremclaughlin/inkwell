@@ -358,6 +358,7 @@ describe('spawned ink chat: per-turn replies', () => {
 
     const result = lines.find((line) => line.type === 'result');
     expect(result?.turnsCompleted).toBe(3);
+    expect(result?.text).toBe('Still working; nothing new for you.');
     expect(lines.indexOf(result!)).toBeGreaterThan(lines.indexOf(replies[2]!));
   });
 
@@ -418,7 +419,9 @@ describe('spawned ink chat: per-turn replies', () => {
     vi.stubEnv('INK_TURN_REPLY_TOKEN', '');
     await runThreeTurns();
     expect(turnReplies()).toEqual([]);
-    expect(jsonLines().some((line) => line.type === 'result')).toBe(true);
+    expect(jsonLines().find((line) => line.type === 'result')?.text).toBe(
+      'Still working; nothing new for you.'
+    );
   });
 
   /**

@@ -73,7 +73,7 @@ import {
   handleSendResponse,
   handleGetPendingMessages,
   handleMarkRead,
-  outboundMediaEntrySchema,
+  sendResponseSchema,
 } from './response-handlers';
 
 import {
@@ -1770,7 +1770,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'send_response',
     {
-      description: `Send a response to a specific channel (Telegram, WhatsApp, Discord, etc.).
+      description: `Send a response to a specific channel (Inkling, Telegram, WhatsApp, Discord, etc.).
+
+For an Inkling conversation, use channel: "inkling" and conversationId: the thread key or UUID. This posts as you in that existing conversation, using its membership and owner authorization. The inkling channel supports text only.
 
 This is the PRIMARY way to send messages to users on external channels. You MUST call this tool — just outputting text does nothing.
 
@@ -1794,37 +1796,7 @@ Supported types: image, video, audio, document. The \`content\` field is sent as
 
 Set \`voiceReply: true\` to send content as a voice note instead of text. Uses on-device TTS (zero cost).
 Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default), vivian, sohee, ono_anna, ryan, aiden, eric.`,
-      inputSchema: z.object({
-        channel: z
-          .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
-          .describe('Channel to send the response to'),
-        conversationId: z.string().describe('Conversation ID to route the response to'),
-        content: z.string().describe('The response content to send'),
-        format: z
-          .enum(['text', 'markdown', 'code', 'json'])
-          .optional()
-          .describe('Format of the response content'),
-        replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
-        voiceReply: z
-          .boolean()
-          .optional()
-          .describe(
-            'Send as a voice note instead of text (Telegram only). Uses on-device TTS, zero API cost.'
-          ),
-        ttsVoice: z
-          .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric'])
-          .optional()
-          .describe('Voice for TTS synthesis. Only used when voiceReply is true. Default: serena.'),
-        // Shared with sendResponseSchema (response-handlers.ts) so the
-        // registered validation and the handler's type can't drift: bare
-        // string entries are coerced to {type, path|url} objects.
-        media: z
-          .array(outboundMediaEntrySchema)
-          .optional()
-          .describe(
-            'Media attachments to send. Each entry is {type, path|url, ...} — a bare path/URL string is also accepted and coerced.'
-          ),
-      }),
+      inputSchema: sendResponseSchema,
     },
     async (args) => {
       try {

@@ -72,7 +72,7 @@ import {
   type TurnBoundary,
 } from './inkling-closing-text';
 import { resetReplyChains } from './inkling-reply-chain';
-import type { SessionResult } from '../sessions/types';
+import type { SessionResult, SessionRequest } from '../sessions/types';
 import { logger } from '../../utils/logger';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
@@ -314,7 +314,14 @@ describe('nothing is posted', () => {
   it('when the turn ended with no text', async () => {
     const wake = await ownerStarts();
     const boundary = await turnStarts(wake);
-    for (const finalTextResponse of [undefined, '', ' \n\t ']) {
+    for (const finalTextResponse of [
+      undefined,
+      '',
+      ' \n\t ',
+      '(local tool call emitted; see tool results above)',
+      '<invoke name="signal_status"><parameter name="status">completed</parameter></invoke>',
+      '<invoke name="signal_status"></invoke>',
+    ]) {
       expect(await turnEnds(wake, boundary, { ...SILENT, finalTextResponse })).toEqual({
         posted: false,
         skipped: 'empty',
@@ -542,5 +549,170 @@ describe('the text', () => {
     expect(Array.from(cut)).toHaveLength(CLOSING_TEXT_MAX);
     expect(cut.endsWith('😀…')).toBe(true);
     expect(closingText('b'.repeat(CLOSING_TEXT_MAX))).toBe('b'.repeat(CLOSING_TEXT_MAX));
+  });
+});
+
+describe('the common send_response inkling channel', () => {
+  async function send(conversationId: string, content = 'An invented reply.', extra = {}) {
+    const { handleSendResponse } = await import('../../mcp/tools/response-handlers');
+    const { runWithRequestContext } = await import('../../utils/request-context');
+    return runWithRequestContext(
+      { userId: ME, sbId: 'sb-pip', sbSlug: 'pip', workspaceId: WS },
+      () =>
+        handleSendResponse({ channel: 'inkling', conversationId, content, ...extra }, dataComposer)
+    );
+  }
+
+  it('does not retain an external-listener delivery mark for an Inkling conversation', async () => {
+    const { consumeExplicitResponse } = await import('../../mcp/tools/response-handlers');
+    const key = 'chat:synthetic-no-external-mark';
+    await ownerStarts(['pip'], key);
+    expect((await send(key)).isError).not.toBe(true);
+    expect(consumeExplicitResponse('inkling', key)).toBe(false);
+  });
+
+  it('stores as the caller through the real thread gate, wakes nobody, and suppresses fallback', async () => {
+    const wake = await ownerStarts();
+    const boundary = await turnStarts(wake);
+    gateway.dispatchTrigger.mockClear();
+    const result = await send(KEY);
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      success: true,
+      channel: 'inkling',
+      conversationId: KEY,
+    });
+    expect(messages().at(-1)).toMatchObject({
+      sender_sb_id: 'sb-pip',
+      content: 'An invented reply.',
+    });
+    expect(woken()).toEqual([]);
+    expect(await turnEnds(wake, boundary)).toEqual({ posted: false, skipped: 'replied' });
+  });
+
+  it('does not send to another conversation, create one, or add the caller', async () => {
+    await ownerStarts(['moss']);
+    const before = messages().length;
+    for (const key of [KEY, 'chat:conversation-missing'])
+      expect((await send(key)).isError).toBe(true);
+    expect(messages()).toHaveLength(before);
+    expect(db.rows('inbox_threads')).toHaveLength(1);
+  });
+
+  it('keeps owner-test and current write-role checks', async () => {
+    await ownerStarts();
+    const before = messages().length;
+    ownerMembership().role = 'viewer';
+    expect((await send(KEY)).isError).toBe(true);
+    ownerMembership().role = 'owner';
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    expect((await send(KEY)).isError).toBe(true);
+    expect(messages()).toHaveLength(before);
+  });
+
+  it('accepts the conversation UUID but refuses another workspace or an unmarked thread', async () => {
+    await ownerStarts();
+    const thread = threadOf(KEY);
+    const uuid = '99999999-9999-4999-8999-999999999999';
+    const previousId = thread.id;
+    thread.id = uuid;
+    for (const row of db.rows('inbox_thread_participants')) {
+      if (row.thread_id === previousId) row.thread_id = uuid;
+    }
+    expect((await send(uuid)).isError).not.toBe(true);
+    expect(messages().at(-1)?.thread_id).toBe(uuid);
+    const before = messages().length;
+    thread.workspace_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    expect((await send(uuid)).isError).toBe(true);
+    expect((await send(KEY)).isError).toBe(true);
+    thread.workspace_id = WS;
+    thread.metadata = {};
+    expect((await send(KEY)).isError).toBe(true);
+    expect(messages()).toHaveLength(before);
+  });
+
+  it('refuses unsupported media and empty content instead of claiming delivery', async () => {
+    await ownerStarts();
+    const before = messages().length;
+    expect((await send(KEY, ' ')).isError).toBe(true);
+    expect(
+      (await send(KEY, 'Caption', { media: [{ type: 'image', path: '/invented.jpg' }] })).isError
+    ).toBe(true);
+    expect((await send(KEY, 'Voice', { voiceReply: true })).isError).toBe(true);
+    expect(messages()).toHaveLength(before);
+  });
+});
+
+describe('consecutive owner messages through the real session queue and closing hooks', () => {
+  it('stores the follow-ups while busy, then answers their verified batch once', async () => {
+    const { SessionService } = await import('../sessions/session-service');
+    const firstWake = await ownerStarts();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const processMessage = vi.fn(async (request: SessionRequest) => {
+      if (processMessage.mock.calls.length === 1) await held;
+      return {
+        success: true,
+        sessionId: SILENT.sessionId!,
+        responses: [],
+        finalTextResponse: request.content.includes('Wake 2')
+          ? 'Reply to both follow-ups.'
+          : 'First reply.',
+        sessionStatus: 'active',
+        compactionTriggered: false,
+      } as SessionResult;
+    });
+    // No constructor: only the real queue and hook methods run. Routing,
+    // activity persistence and provider execution are inert mocks; all thread
+    // reads and writes use the fake database already used by this suite.
+    const service = Object.assign(Object.create(SessionService.prototype) as SessionService, {
+      supabase: db,
+      activityStream: { logMessage: vi.fn(async () => ({})) },
+      processingLocks: new Set<string>(),
+      pendingQueues: new Map<string, unknown[]>(),
+      getOrCreateSession: vi.fn(async () => ({ id: SILENT.sessionId!, sbId: 'sb-pip' })),
+      classifyTurnIdentity: vi.fn(async () => ({ kind: 'inkling', id: 'sb-pip', userId: ME })),
+      leaseTurnEpochs: vi.fn(async () => new Set()),
+      processMessage,
+    });
+    const request = (wake: ClosingTextWake, content: string): SessionRequest => ({
+      userId: ME,
+      sbSlug: 'pip',
+      channel: 'agent',
+      content,
+      sender: { id: 'user', name: 'user' },
+      metadata: {
+        threadKey: KEY,
+        triggerThreadMessageId: wake.threadMessageId,
+        wakeCoalescible: true,
+      },
+      turnHooks: closingTextTurnHooks(dataComposer, wake),
+    });
+    const first = service.handleMessage(request(firstWake, 'First synthetic wake.'));
+    await vi.waitFor(() => expect(processMessage).toHaveBeenCalledTimes(1));
+    const secondWake = await ownerWrites('Second invented message.');
+    const thirdWake = await ownerWrites('Third invented message.');
+    const second = service.handleMessage(request(secondWake, 'Second synthetic wake.'));
+    const third = service.handleMessage(request(thirdWake, 'Third synthetic wake.'));
+    const queue = service as unknown as { pendingQueues: Map<string, unknown[]> };
+    await vi.waitFor(() => expect([...queue.pendingQueues.values()][0]).toHaveLength(2));
+    expect(messages().filter((m) => m.sender_kind === 'user')).toHaveLength(3);
+    expect(processMessage).toHaveBeenCalledTimes(1);
+    release();
+    const results = await Promise.all([first, second, third]);
+    expect(processMessage).toHaveBeenCalledTimes(2);
+    expect(processMessage.mock.calls[1][0].metadata?.coalescedSources).toEqual([
+      secondWake.threadMessageId,
+      thirdWake.threadMessageId,
+    ]);
+    expect(results[2].wake).toEqual({ coalescedInto: secondWake.threadMessageId });
+    expect(
+      messages()
+        .filter((m) => m.sender_kind === 'sb')
+        .map((m) => m.content)
+    ).toEqual(['First reply.', 'Reply to both follow-ups.']);
+    expect(queue.pendingQueues.size).toBe(0);
   });
 });

@@ -94,8 +94,8 @@ it('an approval is not permission unless the same session policy recheck allows 
   });
   const [result] = await executeToolCalls([{ ...call, tool: 'mcp__inkwell__read' }], p);
   expect(result).toMatchObject({ status: 'blocked', reason: 'denied override' });
-  expect(policy).toHaveBeenNthCalledWith(1, 'read', 'session-a');
-  expect(policy).toHaveBeenNthCalledWith(2, 'read', 'session-a');
+  expect(policy).toHaveBeenNthCalledWith(1, 'read', 'session-a', call.args);
+  expect(policy).toHaveBeenNthCalledWith(2, 'read', 'session-a', call.args);
   expect(p.commitIntent).not.toHaveBeenCalled();
   expect(p.callTool).not.toHaveBeenCalled();
 });
@@ -128,6 +128,6 @@ it('concurrent sessions keep invocation identity, log and policy scope separate'
   expect(br[0].invocationId).toBe('invocation-b');
   expect(a.commitIntent).toHaveBeenCalledWith(call, 'invocation-a');
   expect(b.commitIntent).toHaveBeenCalledWith(call, 'invocation-b');
-  expect(a.policy.canCallInkTool).toHaveBeenCalledWith('read', 'a');
-  expect(b.policy.canCallInkTool).toHaveBeenCalledWith('read', 'b');
+  expect(a.policy.canCallInkTool).toHaveBeenCalledWith('read', 'a', call.args);
+  expect(b.policy.canCallInkTool).toHaveBeenCalledWith('read', 'b', call.args);
 });

@@ -86,3 +86,12 @@ export function inklingRuntime(input: InklingRuntimeInput): InklingRuntimeDecisi
 
   return { ok: true, provider: 'claude' };
 }
+
+/** Explicit delivery, the same tool contract used by other channels. */
+export function inklingReplyPrompt(threadKey: string | undefined): string {
+  if (!threadKey) return '';
+  return `
+
+### Replying in this Inkling conversation
+Read the new messages in this conversation before answering. Send each conversational reply with send_response, channel: "inkling", conversationId: ${JSON.stringify(threadKey)}, and content: your reply. Several human messages may arrive together; answer them as a conversation, not separate isolated jobs. This is the same send_response tool used by other channels. A successful send is the delivery receipt. signal_status only controls your work state; it does not deliver a reply. Do not rely on the closing-text fallback to send your answer.`;
+}

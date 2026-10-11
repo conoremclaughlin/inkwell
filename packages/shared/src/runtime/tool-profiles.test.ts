@@ -75,6 +75,12 @@ describe('shared launch profiles', () => {
       }
       expect(policy.snapshot().scopes?.global?.permanentGrants).toContain('bash');
       expect(policy.listAllowTools()).toEqual([]);
+      expect(
+        policy.canCallInkTool('send_response', undefined, { channel: 'inkling' }).allowed
+      ).toBe(true);
+      expect(
+        policy.canCallInkTool('send_response', undefined, { channel: 'telegram' })
+      ).toMatchObject({ allowed: false, promptable: false });
     }
   );
 

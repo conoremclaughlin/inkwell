@@ -28,6 +28,7 @@ export interface ToolProfile {
    * ink's, under this profile's rules.
    */
   withholdProviderTools?: true;
+  inklingRepliesOnly?: true;
 }
 
 /**
@@ -36,8 +37,8 @@ export interface ToolProfile {
  * outright, so no grant in the policy file can open them: the shell, which
  * is not confined to the working directory; view_image, whose roots include
  * the shared ~/.ink/files (Lumen, #773: another account's image was
- * reachable); file edits and writes; trigger_agent; and send_response, which
- * a turn answering in its own conversation thread never needs. Its reply,
+ * reachable); file edits and writes; trigger_agent; and external-channel send_response. Its inkling channel is allowed, but
+ * a per-call policy check refuses every other channel before spending grants. Its reply,
  * send_to_inbox, stays allowed: whom it may reach, and whether it wakes them,
  * is the server's own authorization, never this profile's (an inkling's owner
  * and thread rules are enforced there). The Pi reads (read, grep, find,
@@ -59,12 +60,13 @@ export interface ToolProfile {
 const TOOLS_TIER: ToolProfile = {
   label: 'Tools only',
   description:
-    "The tools execution tier: no shell, no file edits or writes, no shared-image reads, no trigger_agent or send_response; send_to_inbox stays, under the server's own authorization.",
+    "The tools execution tier: no shell, no file edits or writes, no shared-image reads, no trigger_agent or external-channel sends; inkling replies and send_to_inbox stay, under the server's own authorization.",
   mode: 'backend',
   safeSpecs: ['group:ink-safe'],
   allowSpecs: [],
   promptSpecs: [],
-  denySpecs: ['group:write', 'view_image', 'trigger_agent', 'send_response'],
+  denySpecs: ['group:write', 'view_image', 'trigger_agent'],
+  inklingRepliesOnly: true,
   withholdProviderTools: true,
 };
 
@@ -144,6 +146,8 @@ export function applyProfile(
 
   // Clear existing rules on the target scope
   policy.clearScopeRules(scope);
+
+  if (profile.inklingRepliesOnly) policy.restrictToInklingReplies(scope);
 
   // Set mode
   policy.setMode(profile.mode, scope);
