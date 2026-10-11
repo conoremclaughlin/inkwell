@@ -150,7 +150,6 @@ export async function runOwnedCodexAppServer(input: {
         if (killGroup && (!isGroupId(proc.pid) || probeGroup(proc.pid) !== 'empty')) return;
         giveBack();
       };
-      let classification: RunnerResult['classification'];
       let release: (() => void) | undefined;
       let mailbox: ReturnType<typeof createNativeSessionSteering> | undefined;
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -295,6 +294,7 @@ export async function runOwnedCodexAppServer(input: {
           error ??= 'Native steering port release failed';
         }
         error ??= terminalFailure;
+        const classification = protocol.refusalClassification;
         resolve({
           success: !error && !stopUnconfirmed,
           backendSessionId: protocol.threadId ?? input.backendSessionId ?? null,
@@ -405,7 +405,8 @@ export async function runOwnedCodexAppServer(input: {
           })
           .catch((error: unknown) => {
             if (finishing) return;
-            if (error instanceof CodexRpcError) classification = error.classification;
+            const classification =
+              error instanceof CodexRpcError ? error.classification : undefined;
             void finish(classification?.summary ?? 'Codex app-server initialization failed');
           });
     });

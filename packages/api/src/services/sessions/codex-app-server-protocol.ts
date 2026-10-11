@@ -34,6 +34,7 @@ export interface CodexAppServerPorts {
 export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
   let serial = 0;
   let closed = false;
+  let refusalClassification: ErrorClassification | undefined;
   let started = false;
   let startingTurn = false;
   let sawTurnStarted = false;
@@ -129,16 +130,16 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
           typeof error.message === 'string' &&
           classifyError({ errorText: `thread/resume: ${error.message}`, backend: 'codex-cli' })
             .category === 'owner_conflict';
+        if (ownerConflict)
+          refusalClassification = {
+            category: 'owner_conflict',
+            summary: 'Codex thread resume refused: another writer holds the thread',
+            retryable: false,
+          };
         waiting.reject(
           new CodexRpcError(
             typeof error.code === 'number' ? error.code : -32603,
-            ownerConflict
-              ? {
-                  category: 'owner_conflict',
-                  summary: 'Codex thread resume refused: another writer holds the thread',
-                  retryable: false,
-                }
-              : undefined
+            refusalClassification
           )
         );
       } else if (result) {
@@ -298,6 +299,11 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
         // contract says so. No resend, fresh turn, or ordinary-inbox fallback.
         return { status: 'unknown', reason: 'provider_outcome_uncertain' };
       }
+    },
+    // Captured synchronously with the trusted refusal frame, before a close
+    // in the same chunk can overtake start()'s promise rejection handler.
+    get refusalClassification() {
+      return refusalClassification ? { ...refusalClassification } : undefined;
     },
     get threadId() {
       return threadId;

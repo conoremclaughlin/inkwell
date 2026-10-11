@@ -403,7 +403,7 @@ async function run(metadata: Row = {}, epoch = 'synthetic-epoch') {
 
 /** Real protocol/runner, inert child transport: all IO remains replaced above. */
 async function realNativeTransport(
-  refusal?: { method: string; message: string },
+  refusal?: { method: string; message: string; close?: boolean },
   killGroup = false
 ) {
   const implementation =
@@ -439,9 +439,14 @@ async function realNativeTransport(
       // A concurrent owner changed attachment/lifecycle while our rejected resume ran.
       row.cli_attached = true;
       row.lifecycle = 'idle';
-      queueMicrotask(() =>
-        receive({ id: message.id, error: { code: -32600, message: refusal.message } })
-      );
+      queueMicrotask(() => {
+        receive({ id: message.id, error: { code: -32600, message: refusal.message } });
+        if (refusal.close) {
+          proc.exitCode = 1;
+          proc.emit('exit', 1);
+          proc.emit('close', 1);
+        }
+      });
     } else {
       const result = message.method.startsWith('thread/')
         ? { thread: { id: 'synthetic-thread' } }
@@ -465,42 +470,46 @@ async function realNativeTransport(
 }
 
 describe('production native steering selection', () => {
-  it('preserves a real thread/resume owner refusal through classification and finalization', async () => {
-    row.message_count = 7;
-    const f = await realNativeTransport({
-      method: 'thread/resume',
-      message: 'thread synthetic-thread already has an active writer. Synthetic private detail.',
-    });
-    const result = await run();
-    expect(result.success).toBe(false);
-    expect(result.classification?.category).toBe('owner_conflict');
-    expect(f.sent.map((message) => message.method)).toEqual([
-      'initialize',
-      'initialized',
-      'thread/resume',
-    ]);
-    expect(legacy).not.toHaveBeenCalled();
-    expect(row.message_count).toBe(7);
-    expect(row.cli_attached).toBe(true);
-    expect(row.lifecycle).toBe('idle');
-    for (const write of dbWrites.slice(1)) {
-      expect(write).not.toHaveProperty('lifecycle');
-      expect(write).not.toHaveProperty('cli_attached');
-      expect(write).not.toHaveProperty('message_count');
+  it.each([false, true])(
+    'preserves a real thread/resume owner refusal through finalization, immediate close: %s',
+    async (close) => {
+      row.message_count = 7;
+      const f = await realNativeTransport({
+        method: 'thread/resume',
+        message: 'thread synthetic-thread already has an active writer. Synthetic private detail.',
+        close,
+      });
+      const result = await run();
+      expect(result.success).toBe(false);
+      expect(result.classification?.category).toBe('owner_conflict');
+      expect(f.sent.map((message) => message.method)).toEqual([
+        'initialize',
+        'initialized',
+        'thread/resume',
+      ]);
+      expect(legacy).not.toHaveBeenCalled();
+      expect(row.message_count).toBe(7);
+      expect(row.cli_attached).toBe(true);
+      expect(row.lifecycle).toBe('idle');
+      for (const write of dbWrites.slice(1)) {
+        expect(write).not.toHaveProperty('lifecycle');
+        expect(write).not.toHaveProperty('cli_attached');
+        expect(write).not.toHaveProperty('message_count');
+      }
+      expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+      expect(
+        (service as unknown as SessionServiceTestPorts).releaseLeaseIfSessionTerminal
+      ).not.toHaveBeenCalled();
+      expect(
+        JSON.stringify([
+          result,
+          dbWrites,
+          vi.mocked(logger.error).mock.calls,
+          vi.mocked(logger.warn).mock.calls,
+        ])
+      ).not.toContain('Synthetic private detail');
     }
-    expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
-    expect(
-      (service as unknown as SessionServiceTestPorts).releaseLeaseIfSessionTerminal
-    ).not.toHaveBeenCalled();
-    expect(
-      JSON.stringify([
-        result,
-        dbWrites,
-        vi.mocked(logger.error).mock.calls,
-        vi.mocked(logger.warn).mock.calls,
-      ])
-    ).not.toContain('Synthetic private detail');
-  });
+  );
 
   it.each([
     ['initialize', 'thread synthetic-thread already has an active writer'],
