@@ -1,5 +1,6 @@
 /** One owned stdio connection, one native turn. Never attach, retry, or queue a turn. */
 import { randomUUID } from 'crypto';
+import { classifyError, type ErrorClassification } from '@inklabs/shared';
 import type { SessionSteeringRequest } from '@inklabs/shared/runtime';
 
 type ObjectValue = Record<string, unknown>;
@@ -10,7 +11,10 @@ const object = (value: unknown): ObjectValue | undefined =>
 const id = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
 export class CodexRpcError extends Error {
-  constructor(readonly code: number) {
+  constructor(
+    readonly code: number,
+    readonly classification?: ErrorClassification
+  ) {
     // Provider error bodies can contain prompts, arguments, or credentials.
     super(`Codex app-server request failed (${code})`);
   }
@@ -41,6 +45,7 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
   const pending = new Map<
     number,
     {
+      method: string;
       resolve(value: ObjectValue): void;
       reject(error: Error): void;
       timer: ReturnType<typeof setTimeout>;
@@ -87,7 +92,7 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
         pending.delete(requestId);
         reject(new Error('Codex app-server request acknowledgment timed out'));
       }, ports.requestTimeoutMs ?? 10_000);
-      pending.set(requestId, { resolve, reject, timer, accept });
+      pending.set(requestId, { method, resolve, reject, timer, accept });
       try {
         ports.write(JSON.stringify({ id: requestId, method, params }) + '\n');
       } catch (error) {
@@ -115,9 +120,28 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
       clearTimeout(waiting.timer);
       const error = object(message.error);
       const result = object(message.result);
-      if (error)
-        waiting.reject(new CodexRpcError(typeof error.code === 'number' ? error.code : -32603));
-      else if (result) {
+      if (error) {
+        // Only the trusted reply to thread/resume can establish this known
+        // pre-acceptance refusal. Inspect the diagnostic transiently; never
+        // retain its body or the classifier's raw-text summary on the Error.
+        const ownerConflict =
+          waiting.method === 'thread/resume' &&
+          typeof error.message === 'string' &&
+          classifyError({ errorText: `thread/resume: ${error.message}`, backend: 'codex-cli' })
+            .category === 'owner_conflict';
+        waiting.reject(
+          new CodexRpcError(
+            typeof error.code === 'number' ? error.code : -32603,
+            ownerConflict
+              ? {
+                  category: 'owner_conflict',
+                  summary: 'Codex thread resume refused: another writer holds the thread',
+                  retryable: false,
+                }
+              : undefined
+          )
+        );
+      } else if (result) {
         try {
           // Identity validation must be synchronous with the response, not in
           // a later promise continuation after subsequent stream frames ran.

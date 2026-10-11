@@ -2,7 +2,8 @@
 import { EventEmitter } from 'events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('child_process', () => ({ spawn: vi.fn() }));
-vi.mock('@inklabs/shared', () => ({
+vi.mock('@inklabs/shared', async () => ({
+  ...(await import('../../../../shared/src/errors/classify-error.js')),
   buildSessionEnv: vi.fn(() => ({ INK_CONTEXT: 'synthetic-context' })),
   resolveSpawnTarget: vi.fn((input) => input),
   writeRuntimeSessionHint: vi.fn(),

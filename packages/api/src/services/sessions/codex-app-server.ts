@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import { buildSessionEnv, resolveSpawnTarget, writeRuntimeSessionHint } from '@inklabs/shared';
 import { createNativeSessionSteering } from '@inklabs/shared/runtime';
-import { createCodexAppServerProtocol } from './codex-app-server-protocol.js';
+import { CodexRpcError, createCodexAppServerProtocol } from './codex-app-server-protocol.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { stopProcessAndWait } from './stop-process.js';
 import type { ClaudeRunnerConfig, RunnerResult, ChannelResponse, ToolCall } from './types.js';
@@ -118,6 +118,7 @@ export async function runOwnedCodexAppServer(input: {
       let finishing = false,
         closed = false;
       let terminalFailure: string | undefined;
+      let classification: RunnerResult['classification'];
       let release: (() => void) | undefined;
       let mailbox: ReturnType<typeof createNativeSessionSteering> | undefined;
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -260,6 +261,7 @@ export async function runOwnedCodexAppServer(input: {
           finalTextResponse,
           usage,
           ...(error ? { error } : {}),
+          ...(classification ? { classification } : {}),
           ...(stopUnconfirmed
             ? { stopUnconfirmed, error: error ?? 'Codex process stop was not confirmed' }
             : {}),
@@ -357,8 +359,10 @@ export async function runOwnedCodexAppServer(input: {
             });
             release = binding.bind(mailbox.submit);
           })
-          .catch(() => {
-            if (!finishing) void finish('Codex app-server initialization failed');
+          .catch((error: unknown) => {
+            if (finishing) return;
+            if (error instanceof CodexRpcError) classification = error.classification;
+            void finish(classification?.summary ?? 'Codex app-server initialization failed');
           });
     });
     return result;

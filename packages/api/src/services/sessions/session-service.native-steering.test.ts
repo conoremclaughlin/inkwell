@@ -1,4 +1,5 @@
 /** Production wiring, synthetic dependencies: no process, filesystem, keychain, or network IO. */
+import { EventEmitter } from 'events';
 import {
   afterEach,
   beforeEach,
@@ -54,20 +55,24 @@ vi.mock('@supabase/supabase-js', () => ({
     throw new Error('No database permitted');
   }),
 }));
-vi.mock('@inklabs/shared', () => ({
-  classifyError: vi.fn(() => ({
-    category: 'unknown',
-    summary: 'Synthetic failure',
-    retryable: false,
-  })),
+vi.mock('@inklabs/shared', async () => ({
+  ...(await import('../../../../shared/src/errors/classify-error.js')),
   isPathWithinWorkspaceAsync: vi.fn(),
-  isPreAcceptanceRefusal: vi.fn(() => false),
   studioPermissionProfile: vi.fn(),
-  buildSessionEnv: vi.fn(),
+  buildSessionEnv: vi.fn(() => ({})),
   writeRuntimeSessionHint: vi.fn(),
-  resolveSpawnTarget: vi.fn(),
+  resolveSpawnTarget: vi.fn((input) => input),
   CONTAINER_RUNNER_FILES: '/synthetic/container',
 }));
+vi.mock('./native-steering-log.js', () => ({
+  openNativeSteeringLog: vi.fn(async () => ({
+    path: '/synthetic/journal',
+    append: vi.fn(() => 1),
+    flush: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
+  })),
+}));
+vi.mock('./stop-process.js', () => ({ stopProcessAndWait: vi.fn(async () => ({ exited: true })) }));
 vi.mock('../graph-executor.service', () => ({
   releaseGraphClaimsForSession: vi.fn(async () => undefined),
 }));
@@ -162,6 +167,9 @@ import { getActiveRun, resetActiveRuns, submitRunSteering } from './active-runs.
 import { runOwnedCodexAppServer } from './codex-app-server.js';
 import { ensureStudioComplete } from '../studio-complete.js';
 import { spawn } from 'child_process';
+import { resolveBinaryPath } from './resolve-binary.js';
+import { releaseGraphClaimsForSession } from '../graph-executor.service';
+import { logger } from '../../utils/logger.js';
 import type {
   ChannelResponse,
   ClaudeRunnerConfig,
@@ -379,7 +387,117 @@ async function run(metadata: Row = {}) {
   );
 }
 
+/** Real protocol/runner, inert child transport: all IO remains replaced above. */
+async function realNativeTransport(refusal?: { method: string; message: string }) {
+  const implementation =
+    await vi.importActual<typeof import('./codex-app-server.js')>('./codex-app-server.js');
+  native.mockImplementation(implementation.runOwnedCodexAppServer);
+  vi.mocked(resolveBinaryPath).mockResolvedValue('/synthetic/codex');
+  const sent: Array<{ id?: number; method: string }> = [];
+  const proc = Object.assign(new EventEmitter(), {
+    pid: 222222,
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    stdin: Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writableEnded: false,
+      write: vi.fn(),
+      end: vi.fn(),
+    }),
+    exitCode: null as number | null,
+    signalCode: null,
+  });
+  const receive = (value: unknown) =>
+    proc.stdout.emit('data', Buffer.from(JSON.stringify(value) + '\n'));
+  proc.stdin.write.mockImplementation((line: string) => {
+    const message = JSON.parse(line);
+    sent.push(message);
+    if (message.id === undefined) return true;
+    if (message.method === refusal?.method) {
+      // A concurrent owner changed attachment/lifecycle while our rejected resume ran.
+      row.cli_attached = true;
+      row.lifecycle = 'idle';
+      queueMicrotask(() =>
+        receive({ id: message.id, error: { code: -32600, message: refusal.message } })
+      );
+    } else {
+      const result = message.method.startsWith('thread/')
+        ? { thread: { id: 'synthetic-thread' } }
+        : message.method === 'turn/start'
+          ? { turn: { id: 'synthetic-turn' } }
+          : {};
+      queueMicrotask(() => receive({ id: message.id, result }));
+    }
+    return true;
+  });
+  proc.stdin.end.mockImplementation(() => {
+    proc.stdin.writableEnded = true;
+    queueMicrotask(() => {
+      proc.exitCode = 0;
+      proc.emit('exit', 0);
+      proc.emit('close', 0);
+    });
+  });
+  vi.mocked(spawn).mockReturnValue(proc as never);
+  return { proc, receive, sent };
+}
+
 describe('production native steering selection', () => {
+  it('preserves a real thread/resume owner refusal through classification and finalization', async () => {
+    row.message_count = 7;
+    const f = await realNativeTransport({
+      method: 'thread/resume',
+      message: 'thread synthetic-thread already has an active writer. Synthetic private detail.',
+    });
+    const result = await run();
+    expect(result.success).toBe(false);
+    expect(result.classification?.category).toBe('owner_conflict');
+    expect(f.sent.map((message) => message.method)).toEqual([
+      'initialize',
+      'initialized',
+      'thread/resume',
+    ]);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(row.message_count).toBe(7);
+    expect(row.cli_attached).toBe(true);
+    expect(row.lifecycle).toBe('idle');
+    for (const write of dbWrites.slice(1)) {
+      expect(write).not.toHaveProperty('lifecycle');
+      expect(write).not.toHaveProperty('cli_attached');
+      expect(write).not.toHaveProperty('message_count');
+    }
+    expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+    expect(
+      (service as unknown as SessionServiceTestPorts).releaseLeaseIfSessionTerminal
+    ).not.toHaveBeenCalled();
+    expect(
+      JSON.stringify([
+        result,
+        dbWrites,
+        vi.mocked(logger.error).mock.calls,
+        vi.mocked(logger.warn).mock.calls,
+      ])
+    ).not.toContain('Synthetic private detail');
+  });
+
+  it.each([
+    ['initialize', 'thread synthetic-thread already has an active writer'],
+    ['turn/start', 'thread synthetic-thread already has an active writer'],
+    ['thread/resume', 'Synthetic initialization failure'],
+  ])(
+    'does not turn an ambiguous %s error into a pre-acceptance refusal',
+    async (method, message) => {
+      row.message_count = 7;
+      await realNativeTransport({ method, message });
+      const result = await run();
+      expect(result.success).toBe(false);
+      expect(result.classification?.category).not.toBe('owner_conflict');
+      expect(row.message_count).toBe(8);
+      expect(row.lifecycle).toBe('failed');
+      expect(legacy).not.toHaveBeenCalled();
+    }
+  );
+
   it('mints the real bound credential and selects app-server after owner registration and persistence', async () => {
     expect((await run()).success).toBe(true);
     expect(native).toHaveBeenCalledOnce();
