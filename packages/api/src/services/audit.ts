@@ -11,6 +11,7 @@ import { env } from '../config/env';
 
 export type AuditAction =
   | 'web_search'
+  | 'web_search_batch'
   | 'web_fetch'
   | 'bash_curl'
   | 'bash_command'
@@ -25,7 +26,9 @@ export type AuditAction =
   | 'trusted_user_remove';
 
 export type AuditCategory = 'network' | 'filesystem' | 'permission' | 'auth' | 'execution';
-export type AuditStatus = 'success' | 'blocked' | 'error';
+// A pending entry records intent, not a successful external action. A later
+// entry carries the outcome and the same metadata.requestId.
+export type AuditStatus = 'pending' | 'success' | 'blocked' | 'error';
 
 export interface AuditEntry {
   // Who
@@ -70,13 +73,15 @@ export class AuditService {
   private supabase: SupabaseClient;
 
   constructor() {
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
   }
 
   /**
    * Log an audit entry
    */
-  async log(entry: AuditEntry): Promise<void> {
+  async log(entry: AuditEntry, options: { required?: boolean } = {}): Promise<void> {
     const record = {
       user_id: entry.userId || null,
       platform: entry.platform || null,
@@ -93,13 +98,20 @@ export class AuditService {
       metadata: entry.metadata || {},
     };
 
-    const { error } = await this.supabase.from('audit_log').insert(record);
-
-    if (error) {
-      // Don't throw - audit failures shouldn't break the main flow
-      logger.error('Failed to write audit log', { error, entry });
-    } else {
-      logger.debug('Audit logged', { action: entry.action, target: entry.target });
+    try {
+      const query = this.supabase.from('audit_log').insert(record);
+      // Required callers must not wait forever before (or after) an external
+      // effect. A timeout is unknown persistence, never proof of no insertion.
+      const { error } = await (options.required
+        ? query.abortSignal(AbortSignal.timeout(5000))
+        : query);
+      if (error) throw new Error('Audit write failed');
+      logger.debug('Audit logged', { action: entry.action });
+    } catch {
+      // Queries/results can contain private text. Neither the entry nor a
+      // database/provider exception belongs in global diagnostic logs.
+      logger.error('Failed to write audit log', { action: entry.action });
+      if (options.required) throw new Error('Required audit persistence unavailable');
     }
   }
 

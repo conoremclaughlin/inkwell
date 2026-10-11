@@ -1,5 +1,6 @@
 'use client';
 
+import { ListSearch, useListSearch } from '@/components/list-search';
 import { useState, useMemo, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
@@ -57,6 +58,7 @@ interface Task {
 
 interface TasksResponse {
   tasks: Task[];
+  meta?: { fetched: number; total: number; truncated: boolean };
   stats: {
     total: number;
     pending: number;
@@ -811,12 +813,17 @@ function UngroupedStatusSection({
 const STATUS_DISPLAY_ORDER: Task['status'][] = ['in_progress', 'pending', 'blocked', 'completed'];
 
 export default function TasksPage() {
+  const search = useListSearch();
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const queryClient = useQueryClient();
 
-  const { data, isLoading, error } = useApiQuery<TasksResponse>(['tasks'], '/api/admin/tasks', {
-    refetchInterval: 30000,
-  });
+  const { data, isLoading, error } = useApiQuery<TasksResponse>(
+    ['tasks', { search: search.query }],
+    `/api/admin/tasks${search.query ? `?search=${encodeURIComponent(search.query)}` : ''}`,
+    {
+      refetchInterval: 30000,
+    }
+  );
 
   const { data: groupsData } = useApiQuery<TaskGroupsResponse>(
     ['task-groups'],
@@ -836,6 +843,7 @@ export default function TasksPage() {
     [updateTask]
   );
 
+  const waiting = isLoading || search.pending;
   const allTasks = data?.tasks ?? [];
   const groupsMap = useMemo(() => {
     const m = new Map<string, TaskGroupData>();
@@ -957,8 +965,28 @@ export default function TasksPage() {
         <p className="mt-1 text-muted-foreground">Track work across projects and agents.</p>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-lg bg-red-50 border border-red-200 p-4 text-sm text-red-800 dark:bg-red-900/20 dark:border-red-800 dark:text-red-300">
+      <ListSearch
+        label="Search tasks"
+        hint="Search titles and descriptions. Every word must match."
+        value={search.value}
+        onChange={search.setValue}
+      />
+      {!waiting && !error && (
+        <p role="status" className="mt-3 text-sm text-muted-foreground">
+          {filtered.length}{' '}
+          {search.query ? (filtered.length === 1 ? 'match shown' : 'matches shown') : 'tasks shown'}{' '}
+          in this view.
+          {data?.meta?.truncated
+            ? ` Only ${data.meta.fetched} of ${data.meta.total} results are loaded. Narrow your search to see other matches.`
+            : ''}
+        </p>
+      )}
+
+      {!search.pending && error && (
+        <div
+          role="alert"
+          className="mt-4 rounded-lg bg-red-50 border border-red-200 p-4 text-sm text-red-800 dark:bg-red-900/20 dark:border-red-800 dark:text-red-300"
+        >
           {error.message}
         </div>
       )}
@@ -999,14 +1027,16 @@ export default function TasksPage() {
               <span className={clsx('inline-block h-2 w-2 rounded-full', stat.dotColor)} />
               <span className="text-xs text-muted-foreground">{stat.label}</span>
             </div>
-            <div className={clsx('text-2xl font-semibold mt-0.5', stat.color)}>{stat.value}</div>
+            <div className={clsx('text-2xl font-semibold mt-0.5', stat.color)}>
+              {waiting || (error && !data) ? '—' : stat.value}
+            </div>
           </div>
         ))}
       </div>
 
       {/* Filter pills */}
       <div className="mt-6 flex items-center">
-        <div className="flex gap-1">
+        <div className="flex flex-wrap gap-1">
           {filterButtons.map((btn) => (
             <button
               key={btn.key}
@@ -1019,7 +1049,7 @@ export default function TasksPage() {
               )}
             >
               {btn.label}
-              {btn.count > 0 && (
+              {!waiting && btn.count > 0 && (
                 <span
                   className={clsx(
                     'ml-1.5 tabular-nums',
@@ -1038,21 +1068,31 @@ export default function TasksPage() {
 
       {/* Content */}
       <div className="mt-4 space-y-3">
-        {isLoading ? (
+        {waiting ? (
           <Card>
             <CardContent className="py-12 text-center text-muted-foreground">
-              Loading...
+              {search.query || search.pending ? 'Searching…' : 'Loading…'}
             </CardContent>
           </Card>
-        ) : !hasVisibleTasks ? (
+        ) : !hasVisibleTasks && error ? null : !hasVisibleTasks ? (
           <Card>
             <CardContent className="py-12 text-center">
               <ListTodo className="h-10 w-10 mx-auto text-muted-foreground/70 mb-3" />
-              <p className="text-muted-foreground">No tasks yet.</p>
-              <p className="text-sm text-muted-foreground/70 mt-1">
-                Use <code className="bg-muted px-1.5 py-0.5 rounded text-xs">create_task</code> to
-                create one.
+              <p className="text-muted-foreground break-words">
+                {data?.meta?.truncated
+                  ? 'No tasks in the loaded results for this view. Narrow your search to check other matches.'
+                  : search.query
+                    ? `No tasks match “${search.query}” in this view.`
+                    : statusFilter !== 'all'
+                      ? 'No tasks in this view.'
+                      : 'No tasks yet.'}
               </p>
+              {!search.query && statusFilter === 'all' && (
+                <p className="text-sm text-muted-foreground/70 mt-1">
+                  Use <code className="bg-muted px-1.5 py-0.5 rounded text-xs">create_task</code> to
+                  create one.
+                </p>
+              )}
             </CardContent>
           </Card>
         ) : (
@@ -1064,11 +1104,11 @@ export default function TasksPage() {
               const allComplete = tasks.every((t) => t.status === 'completed');
               return (
                 <TaskGroupSection
-                  key={groupId}
+                  key={`${groupId}:${search.query}`}
                   group={group}
                   tasks={tasks}
                   onStatusChange={handleStatusChange}
-                  defaultCollapsed={allComplete}
+                  defaultCollapsed={!search.query && allComplete}
                 />
               );
             })}
@@ -1083,11 +1123,11 @@ export default function TasksPage() {
             )}
             {ungroupedSections.map((status) => (
               <UngroupedStatusSection
-                key={status}
+                key={`${status}:${search.query}`}
                 status={status}
                 tasks={ungroupedByStatus[status] ?? []}
                 onStatusChange={handleStatusChange}
-                defaultCollapsed={status === 'completed'}
+                defaultCollapsed={!search.query && status === 'completed'}
               />
             ))}
           </>

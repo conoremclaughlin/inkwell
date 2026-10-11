@@ -13,6 +13,8 @@ import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callb
 import { connectorsRouter } from './admin-connectors';
 import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
+import { parseListSearch, listSearchFilter } from './list-search';
+import { afterCursorFilter, encodeTasksCursor, parseTasksPage } from './tasks-page';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
@@ -123,6 +125,7 @@ import {
   reactToMessage,
   type ReactionSummary,
 } from '../services/threads/thread-reactions';
+import { PinRefusedError, parsePinBody, setThreadPin } from '../services/threads/thread-pins';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -6155,19 +6158,28 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
  */
 router.get('/artifacts', async (req: Request, res: Response) => {
   try {
+    const search = parseListSearch(req.query.search);
+    if (!search.ok) {
+      res.status(400).json({ error: search.error });
+      return;
+    }
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('artifacts')
       .select(
-        'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at'
+        'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at',
+        { count: 'exact' }
       )
       .eq('user_id', authReq.inkUserId)
-      .eq('workspace_id', authReq.inkWorkspaceId)
-      .order('updated_at', { ascending: false });
+      .eq('workspace_id', authReq.inkWorkspaceId);
+    if (search.words.length) query = query.or(listSearchFilter(search.words, ['title', 'content']));
+    const { data, error, count } = await query
+      .order('updated_at', { ascending: false })
+      .limit(1000);
 
     if (error) {
       logger.error('Failed to list artifacts:', error);
@@ -6176,6 +6188,11 @@ router.get('/artifacts', async (req: Request, res: Response) => {
     }
 
     res.json({
+      meta: {
+        fetched: data?.length ?? 0,
+        total: count ?? data?.length ?? 0,
+        truncated: (count ?? 0) > (data?.length ?? 0),
+      },
       artifacts: (data || []).map((a) => ({
         id: a.id,
         uri: a.uri,
@@ -8566,10 +8583,13 @@ router.get('/threads', async (req: Request, res: Response) => {
     const participantsByThreadId = new Map<string, string[]>();
     const peopleByThreadId = new Map<string, string[]>();
     const participantSbIds = new Set<string>();
+    // The viewer's own pin per thread, from their own participant row only.
+    const viewerPinByThreadId = new Map<string, boolean | null>();
     const participantRows: Array<{
       thread_id: string;
       sb_id: string | null;
       user_id: string | null;
+      pinned: boolean | null;
     }> = [];
     const PARTICIPANT_PAGE = 1000;
     for (let from = 0; ; from += PARTICIPANT_PAGE) {
@@ -8578,7 +8598,7 @@ router.get('/threads', async (req: Request, res: Response) => {
         // The FK is named: two relationships exist between the tables since
         // the cutover, and an unqualified embed is PGRST201-ambiguous.
         .select(
-          'thread_id, sb_id, user_id, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
+          'thread_id, sb_id, user_id, pinned, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
         )
         .eq('inbox_threads.workspace_id', workspaceId)
         .order('thread_id', { ascending: true })
@@ -8612,6 +8632,9 @@ router.get('/threads', async (req: Request, res: Response) => {
         const list = peopleByThreadId.get(row.thread_id) ?? [];
         list.push(row.user_id);
         peopleByThreadId.set(row.thread_id, list);
+        if (row.user_id === authReq.inkUserId) {
+          viewerPinByThreadId.set(row.thread_id, row.pinned ?? null);
+        }
       }
     }
 
@@ -8656,6 +8679,8 @@ router.get('/threads', async (req: Request, res: Response) => {
           t.last_message,
           (senderUserId) => describePeople([senderUserId], personNames, authReq.inkUserId)[0]
         ),
+        // The viewer's pin, only when the viewer has a row on the thread.
+        ...(viewerPinByThreadId.has(t.id) ? { pinned: viewerPinByThreadId.get(t.id) ?? null } : {}),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -9751,6 +9776,46 @@ router.post('/threads/reactions', async (req: Request, res: Response) => {
 });
 
 /**
+ * PUT /api/admin/threads/pin
+ * Body: { threadKey, pinned: true | false | null } → 200 { threadKey, pinned }
+ *
+ * The person's own pin on one of their threads (services/threads/thread-pins.ts):
+ * true pinned, false unpinned on purpose, null back to no choice (the app's
+ * default pins apply). 400 a malformed body; 403 a role that cannot write, or
+ * a thread the person is not in (a background thread); 404 no such thread in
+ * this workspace. Each refusal carries a stable `code`. A pin wakes nobody and
+ * moves no unread count and no thread recency.
+ */
+router.put('/threads/pin', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const { threadKey, pinned } = parsePinBody(req.body);
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'pin a thread');
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await setThreadPin(supabase, {
+      workspaceId: authReq.inkWorkspaceId,
+      userId: authReq.inkUserId,
+      threadKey,
+      pinned,
+    });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof PinRefusedError) {
+      res.status(error.status).json({ error: error.message, code: error.code });
+      return;
+    }
+    logger.error('Failed to set a thread pin:', error);
+    res.status(500).json(errorJson('Failed to set the pin', error));
+  }
+});
+
+/**
  * POST /api/admin/threads/reopen
  * Body: { key } → { success, threadKey, reopened, alreadyOpen }
  *
@@ -10155,10 +10220,29 @@ router.get('/media', async (req: Request, res: Response) => {
 
 /**
  * GET /api/admin/tasks
- * List tasks for the active user with optional filters
+ * List tasks for the active user with optional filters.
+ *
+ * Paging (task 0ed92d60) is opt-in: `limit` (1–1000) and `before` (a
+ * `meta.nextBefore` from an earlier page). A paged answer comes newest first
+ * by (created_at, id) and is not re-sorted, because a status-and-priority
+ * order can't hold across pages. `meta.total` stays the filter's exact count
+ * whatever the cursor, and `meta.nextBefore` is null on the last page.
+ * Without either parameter the answer is exactly what it was before paging.
  */
 router.get('/tasks', async (req: Request, res: Response) => {
   try {
+    const search = parseListSearch(req.query.search);
+    if (!search.ok) {
+      res.status(400).json({ error: search.error });
+      return;
+    }
+    const pageRequest = parseTasksPage(req.query);
+    if (!pageRequest.ok) {
+      res.status(400).json({ error: pageRequest.error });
+      return;
+    }
+    const page = pageRequest.page;
+
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
@@ -10168,20 +10252,37 @@ router.get('/tasks', async (req: Request, res: Response) => {
       .from('tasks')
       .select('*, projects(name), task_groups(title)', { count: 'exact' })
       .eq('user_id', authReq.inkUserId);
+    // A paged answer behind a cursor counts its filter's total on its own.
+    // Every filter goes on both, in the same branch, so the two can't drift.
+    // Nothing is sent for it unless it's awaited.
+    let totalQuery = supabase
+      .from('tasks')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', authReq.inkUserId);
+
+    if (search.words.length) {
+      const filter = listSearchFilter(search.words, ['title', 'description']);
+      query = query.or(filter);
+      totalQuery = totalQuery.or(filter);
+    }
 
     // Optional filters
     const { status, projectId, groupId, activeOnly } = req.query;
     if (status) {
       query = query.eq('status', status as string);
+      totalQuery = totalQuery.eq('status', status as string);
     }
     if (projectId) {
       query = query.eq('project_id', projectId as string);
+      totalQuery = totalQuery.eq('project_id', projectId as string);
     }
     if (groupId) {
       query = query.eq('task_group_id', groupId as string);
+      totalQuery = totalQuery.eq('task_group_id', groupId as string);
     }
     if (activeOnly === 'true') {
       query = query.in('status', ['pending', 'in_progress', 'blocked']);
+      totalQuery = totalQuery.in('status', ['pending', 'in_progress', 'blocked']);
     }
 
     // Order before capping: the old unordered .limit(200) silently dropped an
@@ -10190,22 +10291,59 @@ router.get('/tasks', async (req: Request, res: Response) => {
     // so truncation is REPORTED, never silent: beyond the cap, an omitted
     // active blocker would otherwise read as satisfied downstream.
     const TASKS_CAP = 1000;
+    if (page.paged && page.before) {
+      query = query.or(afterCursorFilter(page.before));
+    }
     const {
       data,
       error,
       count: totalMatched,
-    } = await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
+    } = page.paged
+      ? await query
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .limit(page.limit)
+      : await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list tasks', error));
       return;
     }
     const fetchedCount = (data || []).length;
-    const meta = {
+    let meta: {
+      fetched: number;
+      total: number;
+      truncated: boolean;
+      nextBefore?: string | null;
+    } = {
       fetched: fetchedCount,
       total: totalMatched ?? fetchedCount,
       truncated: (totalMatched ?? fetchedCount) > fetchedCount,
     };
+    if (page.paged) {
+      // Behind a cursor, the count above is what remains from it on (this
+      // page included), and the filter's total is counted on its own.
+      const remaining = totalMatched ?? fetchedCount;
+      let total = remaining;
+      if (page.before) {
+        const { count, error: countError } = await totalQuery;
+        if (countError) {
+          res.status(500).json(errorJson('Failed to list tasks', countError));
+          return;
+        }
+        total = count ?? remaining;
+      }
+      const last = data?.[fetchedCount - 1];
+      meta = {
+        fetched: fetchedCount,
+        total,
+        truncated: total > fetchedCount,
+        nextBefore:
+          last && remaining > fetchedCount
+            ? encodeTasksCursor({ createdAt: last.created_at, id: last.id })
+            : null,
+      };
+    }
 
     // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
     const tasks = await applyGraphBlockedBy(supabase, data || []);
@@ -10248,13 +10386,16 @@ router.get('/tasks', async (req: Request, res: Response) => {
       low: 3,
     };
 
-    tasks.sort((a, b) => {
-      const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
-      if (statusDiff !== 0) return statusDiff;
-      const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
-      if (priorityDiff !== 0) return priorityDiff;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+    // A paged answer keeps its keyset order; archived blockers follow its rows.
+    if (!page.paged) {
+      tasks.sort((a, b) => {
+        const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
+        if (statusDiff !== 0) return statusDiff;
+        const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
+        if (priorityDiff !== 0) return priorityDiff;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+    }
 
     // Compute stats
     const stats = {

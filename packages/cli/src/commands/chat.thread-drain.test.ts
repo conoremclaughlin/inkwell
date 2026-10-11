@@ -41,6 +41,12 @@ const testState = vi.hoisted(() => ({
   runBackendImpl: vi.fn(),
 }));
 
+// runChat loads ink:-namespaced secrets from the login keychain at startup
+// (security dump-keychain). A test must never read the machine's keychain.
+vi.mock('../repl/credential-resolver.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../repl/credential-resolver.js')>()),
+  loadKeychainCredentials: vi.fn(async () => ({})),
+}));
 vi.mock('../backends/identity.js', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backends/identity.js')>();
   return {

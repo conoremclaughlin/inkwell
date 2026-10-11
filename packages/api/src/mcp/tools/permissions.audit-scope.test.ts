@@ -47,6 +47,16 @@ describe('query_audit_log with an authenticated principal', () => {
     expect(auditQuery.mock.calls[0][0].userId).toBe(ALPHA.id);
   });
 
+  it('accepts the batch search action filter without broadening the authenticated account', async () => {
+    await asAlpha(() => handleQueryAuditLog({ action: 'web_search_batch' }, dc));
+    expect(auditQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: ALPHA.id,
+        action: 'web_search_batch',
+      })
+    );
+  });
+
   it('refuses another account’s identifier and runs no query', async () => {
     await expect(asAlpha(() => handleQueryAuditLog({ userId: BETA.id }, dc))).rejects.toThrow(
       PrincipalMismatchError
