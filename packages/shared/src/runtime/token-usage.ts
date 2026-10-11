@@ -128,6 +128,7 @@ function normalizeUsageObject(
   const cacheReadTokens = pick(
     usageCandidate.cache_read_tokens,
     usageCandidate.cached_tokens,
+    usageCandidate.cached_input_tokens,
     usageCandidate.cacheReadTokens,
     usageCandidate.cachedTokens,
     (usageCandidate.prompt_tokens_details as Record<string, unknown> | undefined)?.cached_tokens,
@@ -146,6 +147,7 @@ function normalizeUsageObject(
   const separateThoughts = toNumber(usageCandidate.thoughtsTokenCount);
   const reasoningTokens = pick(
     usageCandidate.reasoning_tokens,
+    usageCandidate.reasoning_output_tokens,
     usageCandidate.reasoningTokens,
     usageCandidate.thoughtsTokenCount,
     (usageCandidate.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens
@@ -319,7 +321,11 @@ export function extractBackendTokenUsage(
       })();
   if (!parsed) return undefined;
 
-  // A buffered report is one usage object, so its parts are the request's.
+  // Codex's terminal exec report covers a whole turn, potentially several
+  // model requests. It does not establish the FINAL request's context window.
+  if (backend === 'codex' && parsed.raw?.type === 'turn.completed') return parsed;
+
+  // Other buffered reports retain their existing per-request interpretation.
   const parts: ContextParts = {
     ...(parsed.inputTokens !== undefined ? { inputTokens: parsed.inputTokens } : {}),
     ...(parsed.cacheReadTokens !== undefined ? { cacheReadTokens: parsed.cacheReadTokens } : {}),

@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { ListSearch, useListSearch } from '@/components/list-search';
+import { useState, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -19,7 +20,8 @@ import {
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
-import { useApiQuery } from '@/lib/api';
+import { useWorkspaceApiQuery } from '@/lib/api';
+import { getSelectedWorkspaceId, subscribeSelectedWorkspace } from '@/lib/workspace-selection';
 import { groupByNamespace } from '@/lib/artifacts/namespace';
 import clsx from 'clsx';
 
@@ -39,6 +41,7 @@ interface Artifact {
 
 interface ArtifactsResponse {
   artifacts: Artifact[];
+  meta?: { fetched: number; total: number; truncated: boolean };
 }
 
 const typeConfig = {
@@ -158,12 +161,20 @@ function ArtifactRow({ artifact }: { artifact: Artifact }) {
 }
 
 export default function LibraryPage() {
-  const { data, isLoading, error } = useApiQuery<ArtifactsResponse>(
-    ['artifacts'],
-    '/api/admin/artifacts'
+  const search = useListSearch();
+  const workspaceId = useSyncExternalStore(
+    subscribeSelectedWorkspace,
+    getSelectedWorkspaceId,
+    () => null
+  );
+  const { data, isLoading, error } = useWorkspaceApiQuery<ArtifactsResponse>(
+    ['artifacts', { search: search.query }],
+    `/api/admin/artifacts${search.query ? `?search=${encodeURIComponent(search.query)}` : ''}`,
+    workspaceId
   );
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
+  const waiting = isLoading || search.pending;
   const artifacts = data?.artifacts ?? [];
   const shelves = groupByNamespace(artifacts);
 
@@ -189,7 +200,31 @@ export default function LibraryPage() {
         </div>
       </div>
 
-      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
+      <ListSearch
+        label="Search Library"
+        hint="Search titles and document content. Every word must match."
+        value={search.value}
+        onChange={search.setValue}
+      />
+      {!waiting && !error && (
+        <p role="status" className="mt-3 text-sm text-muted-foreground">
+          {artifacts.length}{' '}
+          {search.query
+            ? artifacts.length === 1
+              ? 'match shown'
+              : 'matches shown'
+            : 'documents shown'}
+          {data?.meta?.truncated
+            ? ` of ${data.meta.total}. Narrow your search to see other matches.`
+            : '.'}
+        </p>
+      )}
+
+      {!search.pending && error && (
+        <div role="alert" className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
+          {error.message}
+        </div>
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-3 gap-4 mt-6 lg:grid-cols-6">
@@ -200,7 +235,9 @@ export default function LibraryPage() {
             <Card key={type}>
               <CardContent className="p-4 text-center">
                 <TypeIcon className={clsx('h-5 w-5 mx-auto mb-1', config.color)} />
-                <div className={clsx('text-2xl font-bold', config.color)}>{count}</div>
+                <div className={clsx('text-2xl font-bold', config.color)}>
+                  {waiting || (error && !data) ? '—' : count}
+                </div>
                 <div className="text-xs text-gray-500">{config.label}s</div>
               </CardContent>
             </Card>
@@ -209,45 +246,53 @@ export default function LibraryPage() {
         <Card>
           <CardContent className="p-4 text-center">
             <FileText className="h-5 w-5 mx-auto text-gray-600 mb-1" />
-            <div className="text-2xl font-bold text-gray-600">{stats.total}</div>
+            <div className="text-2xl font-bold text-gray-600">
+              {waiting || (error && !data) ? '—' : stats.total}
+            </div>
             <div className="text-xs text-gray-500">Total</div>
           </CardContent>
         </Card>
       </div>
 
       {/* Shelves */}
-      {isLoading ? (
+      {waiting ? (
         <Card className="mt-6">
           <CardContent className="py-8">
-            <p className="text-gray-500">Loading...</p>
+            <p className="text-gray-500">
+              {search.query || search.pending ? 'Searching…' : 'Loading…'}
+            </p>
           </CardContent>
         </Card>
-      ) : shelves.length === 0 ? (
+      ) : shelves.length === 0 && error ? null : shelves.length === 0 ? (
         <Card className="mt-6">
           <CardContent className="py-8">
             <div className="text-center">
               <FileText className="h-12 w-12 mx-auto text-gray-300 mb-3" />
-              <p className="text-gray-500">The Library is empty.</p>
-              <p className="text-sm text-gray-400 mt-1">
-                Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to
-                add the first document.
+              <p className="text-gray-500 break-words">
+                {search.query ? `No documents match “${search.query}”.` : 'The Library is empty.'}
               </p>
+              {!search.query && (
+                <p className="text-sm text-gray-400 mt-1">
+                  Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to
+                  add the first document.
+                </p>
+              )}
             </div>
           </CardContent>
         </Card>
       ) : (
         <div className="mt-6 space-y-4">
           {shelves.map((shelf) => {
-            const isCollapsed = collapsed[shelf.namespace] ?? false;
+            const collapseKey = JSON.stringify([workspaceId, search.query, shelf.namespace]);
+            const isCollapsed = collapsed[collapseKey] ?? false;
             const FolderIcon = isCollapsed ? Folder : FolderOpen;
             const Chevron = isCollapsed ? ChevronRight : ChevronDown;
             return (
               <Card key={shelf.namespace}>
                 <button
                   type="button"
-                  onClick={() =>
-                    setCollapsed((prev) => ({ ...prev, [shelf.namespace]: !isCollapsed }))
-                  }
+                  aria-expanded={!isCollapsed}
+                  onClick={() => setCollapsed((prev) => ({ ...prev, [collapseKey]: !isCollapsed }))}
                   className="w-full flex items-center gap-2 px-6 py-4 text-left hover:bg-gray-50 transition-colors rounded-t-lg"
                 >
                   <Chevron className="h-4 w-4 text-gray-400" />

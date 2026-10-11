@@ -37,6 +37,11 @@ export interface SpineThreadRow {
   lastMessage?: ThreadLastMessage | null;
   /** People on the thread, named for the viewer — never woken, never in `participants`. */
   people?: SpinePerson[];
+  /**
+   * The viewer's own pin: true pinned, false explicitly unpinned, null no
+   * choice yet. Absent on threads the viewer isn't a participant in.
+   */
+  pinned?: boolean | null;
 }
 
 export interface SpinePerson {
@@ -106,6 +111,11 @@ export interface ThreadSpine {
     closedAt: string | null;
     /** Newest deliverable (non-system) message; null when there is none. */
     lastMessage: ThreadLastMessage | null;
+    /**
+     * The viewer's own pin: true pinned, false explicitly unpinned, null no
+     * choice yet. Absent on threads the viewer isn't a participant in.
+     */
+    pinned?: boolean | null;
   } | null;
   sessions: Array<{
     id: string;
@@ -394,6 +404,8 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       people: t.people ?? [],
       closedAt: t.closedAt,
       lastMessage: t.lastMessage ?? null,
+      // Only the viewer's own row carries a pin; no row, no field.
+      ...(t.pinned !== undefined ? { pinned: t.pinned } : {}),
     };
     // Pinned identity is authoritative even when all three components are
     // null (a pre-pinning thread awaiting reconciliation stays "unknown",

@@ -8,6 +8,7 @@
  */
 
 import { mkdir } from 'fs/promises';
+import { CodexStreamParser } from './codex-stream.js';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
 import { runProbe, type ProbeFailure } from '../runner/probe.js';
@@ -56,6 +57,10 @@ export class CodexAdapter implements BackendAdapter {
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
   readonly acceptsContextImages = true;
+
+  createStreamParser(): CodexStreamParser {
+    return new CodexStreamParser();
+  }
 
   /**
    * Codex's own view of its merged MCP config, judged before the spawn
@@ -116,10 +121,13 @@ export class CodexAdapter implements BackendAdapter {
       ownConfig.push('-c', value);
     };
 
-    // Resume MUST come before --config flags. Codex treats `resume` as a
+    const promptParts = config.promptParts || [];
+    const exec = promptParts[0]?.toLowerCase() === 'exec';
+
+    // Interactive resume MUST come before --config flags. Codex treats it as a
     // subcommand with its own `-c` flag — config flags before `resume`
     // are root-level and don't apply to the resumed session.
-    if (config.backendSessionId) {
+    if (config.backendSessionId && !exec) {
       args.push('resume', config.backendSessionId);
     }
 
@@ -175,9 +183,8 @@ export class CodexAdapter implements BackendAdapter {
     //
     // Preserve general behavior for non-exec prompt parts, but when promptParts
     // starts with `exec`, place passthrough args immediately after `exec`.
-    const promptParts = config.promptParts || [];
     let contextImagesDelivered: TurnMedia[] = [];
-    if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
+    if (exec) {
       // The prompt is data, and always follows one `--`: without it, prompt
       // text beginning with a dash reads as an option, and `--config=…` as a
       // config override the effective-config check never saw (Lumen, #701,
@@ -189,11 +196,14 @@ export class CodexAdapter implements BackendAdapter {
       const passthroughPositionals =
         terminator === -1 ? [] : config.passthroughArgs.slice(terminator + 1);
       args.push(promptParts[0]);
+      if (config.stream) args.push('--json');
       args.push(...passthroughOptions);
+      // Non-interactive resumes are exec's subcommand, not root resume.
+      if (config.backendSessionId) args.push('resume');
       // Media injection (spec:provider-media-injection): codex attaches
       // images to the initial prompt natively — an exec-scoped option, so
-      // it must sit after `exec` and before the `--`. Codex is stateless per
-      // spawn, so media is (re)attached on every spawn of the logical turn.
+      // it must sit after `exec` (and `resume`, if present), before `--`.
+      // Media is (re)attached on every spawn of the logical turn.
       // The single-value `--image=<path>` binding keeps each flag to one
       // path (Lumen, review 4900120086 — variadic `-i <FILE>...` swallows
       // the following positional prompt). Non-image media stays on the
@@ -205,8 +215,9 @@ export class CodexAdapter implements BackendAdapter {
       for (const m of imageMedia) {
         args.push(`--image=${m.path}`);
       }
-      args.push('--', ...passthroughPositionals);
-      args.push(...promptParts.slice(1));
+      args.push('--');
+      if (config.backendSessionId) args.push(config.backendSessionId);
+      args.push(...passthroughPositionals, ...promptParts.slice(1));
       contextImagesDelivered = [...(config.contextImages ?? [])];
     } else {
       // Passthrough flags

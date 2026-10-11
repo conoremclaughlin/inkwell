@@ -17,3 +17,6 @@ export function threadMessagesPath(threadKey: string, beforeId?: string): string
 
 /** POST: add or take back the viewer's reaction on one message (spec inkling-reactions). */
 export const THREAD_REACTIONS_PATH = '/api/admin/threads/reactions';
+
+/** PUT: the viewer's pin on one of their threads, { threadKey, pinned: true | false | null }. */
+export const THREAD_PIN_PATH = '/api/admin/threads/pin';

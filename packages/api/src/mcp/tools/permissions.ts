@@ -42,6 +42,7 @@ export const queryAuditLogSchema = userIdentifierBaseSchema.extend({
   action: z
     .enum([
       'web_search',
+      'web_search_batch',
       'web_fetch',
       'bash_curl',
       'bash_command',
@@ -61,7 +62,10 @@ export const queryAuditLogSchema = userIdentifierBaseSchema.extend({
     .enum(['network', 'filesystem', 'permission', 'auth', 'execution'])
     .optional()
     .describe('Filter by category'),
-  status: z.enum(['success', 'blocked', 'error']).optional().describe('Filter by status'),
+  status: z
+    .enum(['pending', 'success', 'blocked', 'error'])
+    .optional()
+    .describe('Filter by status'),
   hoursBack: z.number().positive().default(24).describe('How many hours back to query'),
   limit: z.number().positive().max(100).default(50).describe('Max results'),
 });

@@ -138,6 +138,7 @@ import {
 } from './permissions';
 
 import { handleWebFetch, webFetchSchema, WEB_FETCH_DESCRIPTION } from './web-fetch';
+import { handleWebSearch, webSearchSchema, WEB_SEARCH_DESCRIPTION } from './web-search';
 
 import {
   handleChooseName,
@@ -3024,8 +3025,30 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
   registerMiniAppRecordTools(server, dataComposer);
 
   // =====================================================
-  // WEB FETCH
+  // WEB SEARCH / FETCH
   // =====================================================
+
+  server.registerTool(
+    'web_search',
+    { description: WEB_SEARCH_DESCRIPTION, inputSchema: webSearchSchema },
+    async (args, extra) => {
+      try {
+        return await handleWebSearch(args, dataComposer, { signal: extra.mcpReq.signal });
+      } catch {
+        // Never serialize/log provider output, input identifiers, or queries
+        // from a validation/authentication exception at this boundary.
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, reason: 'invalid-or-unauthorized-request' }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
 
   server.registerTool(
     'web_fetch',

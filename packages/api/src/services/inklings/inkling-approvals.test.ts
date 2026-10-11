@@ -87,7 +87,9 @@ describe('which requests are listed', () => {
 
   it('returns exactly the allowlisted fields: never the input, the grant or who decided', async () => {
     const { inkling } = await service.awaken(ME, REQUEST);
-    request({ sb_id: inkling.id });
+    // The id CI drew on Oct 8: it contains "5555", which a bare /5555/ took
+    // for the studio id.
+    request({ sb_id: inkling.id, id: '8d3abe1f-36dc-4a58-984b-55550c7d4b0a' });
     const [approval] = (await call(inkling.id)).approvals;
     expect(Object.keys(approval).sort()).toEqual([
       'createdAt',
@@ -98,7 +100,11 @@ describe('which requests are listed', () => {
       'status',
       'tool',
     ]);
-    expect(JSON.stringify(approval)).not.toMatch(/secret|telegram|clone|4444|5555/);
+    // The session and studio ids are matched whole, so a row id that merely
+    // contains a run of 4s or 5s isn't mistaken for them.
+    expect(JSON.stringify(approval)).not.toMatch(
+      /secret|telegram|clone|44444444-4444-4444-8444-444444444444|55555555-5555-4555-8555-555555555555/
+    );
   });
 
   it("is the same 404 as the profile for anything that isn't one of my inklings", async () => {

@@ -203,6 +203,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   // Streaming accumulators, populated as events arrive.
   let accumulatedText = '';
   let finalText: string | undefined;
+  let streamError: string | undefined;
   let streamedUsage: BackendTokenUsage | undefined;
   let resumeFailedNoSession = false;
 
@@ -211,7 +212,8 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       if (e.kind === 'text') {
         accumulatedText += e.text;
       } else if (e.kind === 'result') {
-        if (e.text) finalText = e.text;
+        if (typeof e.text === 'string') finalText = e.text;
+        if (e.error) streamError ??= e.error;
         if (e.usage) streamedUsage = e.usage;
         if (e.resumeFailedNoSession) resumeFailedNoSession = true;
       }
@@ -446,10 +448,12 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       // event arrived (e.g. the turn was reaped mid-flight).
       const responseText = streaming ? (finalText ?? accumulatedText) : undefined;
       return {
-        success: spawnResult.exitCode === 0,
+        success: spawnResult.exitCode === 0 && streamError === undefined,
         stdout: spawnResult.stdout,
-        stderr: spawnResult.stderr,
-        exitCode: spawnResult.exitCode,
+        stderr: streamError
+          ? [spawnResult.stderr, streamError].filter(Boolean).join('\n')
+          : spawnResult.stderr,
+        exitCode: spawnResult.exitCode === 0 && streamError ? 1 : spawnResult.exitCode,
         durationMs: spawnResult.durationMs,
         command,
         usage:
