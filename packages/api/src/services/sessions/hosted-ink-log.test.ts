@@ -6,6 +6,9 @@ import {
   ContextLedger,
   hydrateLedgerFromEvents,
   hydrateLedgerFromEventStream,
+  recoverSessionContext,
+  sessionContextNote,
+  SESSION_CONTEXT_NOTE_MAX_BYTES,
 } from '@inklabs/shared/runtime';
 import { openHostedInkLog, hostedCloneLog } from './hosted-ink-log';
 const roots: string[] = [];
@@ -25,6 +28,42 @@ async function fixture() {
   return { cwd, dir };
 }
 describe('hosted JSONL continuity', () => {
+  it.each([1000, 100000])(
+    'reopens recovery notes through the bounded hosted reader (%i records chars)',
+    async (size) => {
+      const { cwd } = await fixture();
+      const input = { cwd, sessionId: 'session', project: vi.fn(), register: vi.fn() };
+      const note = sessionContextNote(
+        recoverSessionContext({
+          success: true,
+          context: [{ type: 'message_in', content: '<雪>'.repeat(size) }],
+        })
+      );
+      const first = await openHostedInkLog(input);
+      first.append(note);
+      await first.flush();
+      const bytes = Buffer.byteLength(await readFile(first.path, 'utf8'));
+      expect(bytes).toBeLessThan(SESSION_CONTEXT_NOTE_MAX_BYTES + 128);
+      expect(bytes).toBeLessThan(1024 * 1024);
+      const reopened = await openHostedInkLog(input);
+      const sync = new ContextLedger();
+      const asyncLedger = new ContextLedger();
+      const syncResult = hydrateLedgerFromEvents(sync, await read(reopened));
+      const asyncResult = await hydrateLedgerFromEventStream(asyncLedger, await reopened.read());
+      expect(asyncResult).toEqual(syncResult);
+      // Ledger creation timestamps belong to this replay pass, not the transcript.
+      const projection = (ledger: ContextLedger) =>
+        ledger
+          .listEntries()
+          .map(({ role, source, content, eid }) => ({ role, source, content, eid }));
+      expect(projection(asyncLedger)).toEqual(projection(sync));
+      expect(asyncResult.activityContext).toEqual(note.activityContext);
+      expect(asyncResult.activityContext?.status).toBe(size === 1000 ? 'loaded' : 'unavailable');
+      if (size === 100000) expect(asyncResult.activityContext?.reason).toBe('size_limit');
+      expect(asyncResult.messageCount).toBe(0);
+      expect(asyncResult.tailPreview).toEqual([]);
+    }
+  );
   it('reopens the CLI parent, never a newer clone; flush precedes live projection', async () => {
     const { cwd, dir } = await fixture();
     const parent = join(dir, 'session-100.jsonl');

@@ -12,6 +12,7 @@ import { readRecordedContextImages } from './context-media.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isCloneHandoffTool } from './spawn-agent.js';
 import { readSessionSteeringInput } from './session-steering.js';
+import { SESSION_CONTEXT_SOURCE, type SessionContextStatus } from './session-context-recovery.js';
 
 export interface HistoryHydrationResult {
   loaded: number;
@@ -33,6 +34,8 @@ export interface HistoryHydrationResult {
   }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
+  /** Original lookup provenance; not a claim that the note is still in the window. */
+  activityContext?: SessionContextStatus;
   /** True when hydration collapsed history at a compaction event */
   compactionCollapsed?: boolean;
 }
@@ -48,13 +51,6 @@ export interface EvictedEntryRecord {
 }
 
 export const EVICTED_DISPLAY_MAX = 100;
-
-export interface SessionContextMessage {
-  role: 'user' | 'assistant' | 'inbox' | 'system';
-  content: string;
-  ts?: string;
-  source: string;
-}
 
 const LEDGER_COMPACT_CHARS = 420;
 const HISTORY_PREVIEW_MAX = 200;
@@ -105,6 +101,7 @@ export type LedgerHydration = {
   seenInboxIds: string[];
   seenActivityIds: string[];
   recoveredMemoryIds: string[];
+  activityContext?: SessionContextStatus;
   compactionCollapsed: boolean;
   /** Entries excluded by context_evict events — for evicted-content display */
   evictedEntries: EvictedEntryRecord[];
@@ -155,6 +152,7 @@ function* ledgerHydration(
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
+  let activityContext: SessionContextStatus | undefined;
   let maxEid = 0;
   let providerSample: PersistedProviderSample | undefined;
   const preview: HistoryHydrationResult['tailPreview'] = [];
@@ -451,6 +449,23 @@ function* ledgerHydration(
       // tombstone. Replayed as the system entry it was live, so a reattached
       // process knows why earlier tool results are missing (PR #584).
       const source = typeof event.source === 'string' ? event.source : 'context-note';
+      if (source === SESSION_CONTEXT_SOURCE) {
+        const recovery = event.activityContext as SessionContextStatus | undefined;
+        if (
+          recovery &&
+          ['loaded', 'empty', 'unavailable'].includes(recovery.status) &&
+          Number.isInteger(recovery.count) &&
+          recovery.count >= 0
+        ) {
+          activityContext = {
+            status: recovery.status,
+            count: recovery.count,
+            ...(recovery.status === 'unavailable' && recovery.reason === 'size_limit'
+              ? { reason: recovery.reason }
+              : {}),
+          };
+        }
+      }
       const entry = ledger.addEntry('system', event.content, source, eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
@@ -661,6 +676,7 @@ function* ledgerHydration(
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
     recoveredMemoryIds,
+    activityContext,
     compactionCollapsed,
     evictedEntries,
     toolCalls,
@@ -715,6 +731,7 @@ export function keptEntriesForCompaction(ledger: ContextLedger): Array<Record<st
 }
 
 const INTERNAL_SYSTEM_SOURCES: ReadonlySet<string> = new Set([
+  SESSION_CONTEXT_SOURCE,
   'continuation',
   'compaction-tail',
   'compaction-history',
@@ -750,126 +767,4 @@ function compactForHistoryPreview(
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-}
-
-export function extractSessionContextMessages(
-  result: Record<string, unknown> | null | undefined
-): SessionContextMessage[] {
-  if (!result) return [];
-  const candidate = (Array.isArray(result.context) ? result.context : undefined) || [];
-
-  return candidate
-    .map((entry): SessionContextMessage | undefined => {
-      const row = entry as Record<string, unknown>;
-      const content = typeof row.content === 'string' ? row.content.trim() : '';
-      if (!content) return undefined;
-
-      const type =
-        typeof row.type === 'string'
-          ? row.type
-          : typeof row.activityType === 'string'
-            ? row.activityType
-            : 'unknown';
-      const source =
-        typeof row.subtype === 'string'
-          ? `${type}:${row.subtype}`
-          : typeof row.source === 'string'
-            ? row.source
-            : type;
-      const ts =
-        typeof row.createdAt === 'string'
-          ? row.createdAt
-          : typeof row.created_at === 'string'
-            ? row.created_at
-            : undefined;
-
-      if (type === 'message_in' || type === 'user') {
-        return {
-          role: 'user',
-          content,
-          ts,
-          source,
-        };
-      }
-      if (type === 'message_out' || type === 'assistant') {
-        return {
-          role: 'assistant',
-          content,
-          ts,
-          source,
-        };
-      }
-      if (
-        type === 'inbox' ||
-        type === 'notification' ||
-        type === 'task_request' ||
-        type === 'session_resume'
-      ) {
-        return {
-          role: 'inbox',
-          content,
-          ts,
-          source,
-        };
-      }
-
-      return {
-        role: 'system',
-        content,
-        ts,
-        source,
-      };
-    })
-    .filter((entry): entry is SessionContextMessage => Boolean(entry));
-}
-
-export function hydrateLedgerFromSessionContext(
-  ledger: ContextLedger,
-  messages: SessionContextMessage[]
-): HistoryHydrationResult {
-  let loaded = 0;
-  let messageCount = 0;
-  const preview: HistoryHydrationResult['tailPreview'] = [];
-  const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
-    if (preview.length > HISTORY_PREVIEW_MAX) preview.shift();
-  };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      ledger.addEntry('user', message.content, `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('user', message.content, message.ts);
-      continue;
-    }
-    if (message.role === 'assistant') {
-      ledger.addEntry('assistant', message.content, `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('assistant', message.content, message.ts);
-      continue;
-    }
-    if (message.role === 'inbox') {
-      ledger.addEntry('inbox', compactForLedger(message.content), `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('inbox', message.content, message.ts);
-      continue;
-    }
-
-    ledger.addEntry(
-      'system',
-      compactForLedger(message.content, 320),
-      `ink-history:${message.source}`
-    );
-    loaded += 1;
-  }
-
-  return {
-    loaded,
-    messageCount,
-    source: 'ink-session-context',
-    tailPreview: preview,
-  };
 }

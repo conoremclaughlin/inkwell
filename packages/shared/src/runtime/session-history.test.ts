@@ -2,11 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ContextLedger, entryRefHash } from './context-ledger.js';
 import { runCompaction } from './compaction.js';
 import { SessionLog } from './session-log.js';
-import {
-  extractSessionContextMessages,
-  hydrateLedgerFromEvents,
-  hydrateLedgerFromSessionContext,
-} from './session-history.js';
+import { hydrateLedgerFromEvents } from './session-history.js';
 
 describe('host-independent session restoration', () => {
   it('keeps independently loaded sessions and recall/inbox/activity cursors separate', async () => {
@@ -167,31 +163,5 @@ describe('host-independent session restoration', () => {
       { type: 'compaction', summary: 'combined brief', keptEntries: [] },
     ]);
     expect(restored.listEntries().map((e) => e.content)).toEqual(['combined brief']);
-  });
-
-  it('keeps the session-context fallback roles, source attribution and bounded inbox preview', () => {
-    const messages = extractSessionContextMessages({
-      context: [
-        { type: 'message_in', content: ' question ', createdAt: 'fixture-time' },
-        { activityType: 'message_out', content: 'answer', created_at: 'fixture-time' },
-        { type: 'task_request', subtype: 'fixture', content: 'x'.repeat(500) },
-        { type: 'state_change', content: 'bookkeeping' },
-        { type: 'user', content: '  ' },
-      ],
-    });
-    const ledger = new ContextLedger();
-    const restored = hydrateLedgerFromSessionContext(ledger, messages);
-    expect(restored.source).toBe('ink-session-context');
-    expect(restored.loaded).toBe(4);
-    expect(restored.messageCount).toBe(3);
-    expect(ledger.listEntries().map((e) => e.role)).toEqual([
-      'user',
-      'assistant',
-      'inbox',
-      'system',
-    ]);
-    expect(ledger.listEntries()[2].source).toBe('ink-history:task_request:fixture');
-    expect(ledger.listEntries()[2].content).toHaveLength(420);
-    expect(restored.tailPreview[2].content).toHaveLength(180);
   });
 });
