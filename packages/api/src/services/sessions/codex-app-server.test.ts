@@ -400,4 +400,148 @@ describe('owned Codex app-server runner', () => {
       error: 'Codex app-server output failed',
     });
   });
+
+  it('decodes split UTF-8 frames without losing native output or terminal identity', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    const text = 'Synthetic output: café 🌙';
+    const frames = Buffer.from(
+      [
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-synthetic',
+            turnId: 'turn-synthetic',
+            item: { id: 'assistant-synthetic', type: 'agentMessage', text },
+          },
+        },
+        {
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-synthetic',
+            turn: { id: 'turn-synthetic', status: 'completed' },
+          },
+        },
+      ]
+        .map((frame) => JSON.stringify(frame) + '\n')
+        .join('')
+    );
+    // One byte per chunk deliberately splits every multibyte character.
+    for (const byte of frames) f.proc.stdout.emit('data', Buffer.from([byte]));
+    expect(await result).toMatchObject({ success: true, finalTextResponse: text });
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it.each(['malformed', 'oversized-frame', 'oversized-remainder'] as const)(
+    'closes on a %s stream and settles pending steering without a resend',
+    async (shape) => {
+      const f = fixture();
+      const result = f.run();
+      await tick();
+      const request = { messageId: 'pending-synthetic', text: 'One revision' };
+      await f.submit(request);
+      await tick();
+      const frame =
+        shape === 'malformed'
+          ? '{invalid}\n'
+          : 'x'.repeat(4 * 1024 * 1024 + 1) + (shape === 'oversized-frame' ? '\n' : '');
+      f.proc.stdout.emit('data', Buffer.from(frame));
+      expect(await result).toMatchObject({
+        success: false,
+        error:
+          shape === 'malformed'
+            ? 'Invalid Codex app-server stream'
+            : 'Codex frame exceeded its bound',
+      });
+      expect((await f.submit(request)).status).toBe('unknown');
+      expect(f.sent.filter((message) => message.method === 'turn/start')).toHaveLength(1);
+      expect(f.sent.filter((message) => message.method === 'turn/steer')).toHaveLength(1);
+      expect(f.proc.stdin.end).toHaveBeenCalledOnce();
+      expect(f.release).toHaveBeenCalledOnce();
+      expect(f.log.close).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('closes a stalled handshake without binding a mailbox or starting a turn', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.proc.stdin.write.mockImplementation((line: string) => {
+      f.sent.push(JSON.parse(line));
+      return true;
+    });
+    const result = f.run();
+    await tick();
+    await vi.advanceTimersByTimeAsync(10_001);
+    expect(await result).toMatchObject({
+      success: false,
+      error: 'Codex app-server initialization failed',
+    });
+    expect(f.sent.map((message) => message.method)).toEqual(['initialize']);
+    expect(() => f.submit({ messageId: 'late', text: 'No native turn' })).toThrow('Not bound');
+    expect(f.release).not.toHaveBeenCalled();
+    expect(f.proc.stdin.end).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('enforces a configured ceiling and settles unobserved steering as unknown', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const result = runOwnedCodexAppServer({
+      args: ['app-server', '--listen', 'stdio://'],
+      message: 'Initial',
+      config: f.config,
+      ceilingMs: 50,
+    });
+    await tick();
+    const request = { messageId: 'pending-synthetic', text: 'One revision' };
+    await f.submit(request);
+    await vi.advanceTimersByTimeAsync(51);
+    expect(await result).toMatchObject({
+      success: false,
+      error: 'Codex timeout: configured ceiling exceeded',
+    });
+    expect((await f.submit(request)).status).toBe('unknown');
+    expect(f.sent.filter((message) => message.method === 'turn/start')).toHaveLength(1);
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('does not mistake a clean child exit for native turn completion', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    f.proc.exitCode = 0;
+    f.proc.emit('close', 0, null);
+    expect(await result).toMatchObject({
+      success: false,
+      error: 'Codex exited before its native turn completed',
+    });
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a complete final frame without a newline on clean child close', async () => {
+    const f = fixture();
+    const result = f.run();
+    await tick();
+    f.proc.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-synthetic',
+            turn: { id: 'turn-synthetic', status: 'completed' },
+          },
+        })
+      )
+    );
+    f.proc.exitCode = 0;
+    f.proc.emit('close', 0, null);
+    expect(await result).toMatchObject({ success: true });
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.log.close).toHaveBeenCalledOnce();
+  });
 });
