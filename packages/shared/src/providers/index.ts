@@ -15,6 +15,7 @@ export * from './stream.js';
 export * from './claude-stream.js';
 export * from './claude.js';
 export * from './codex.js';
+export * from './codex-stream.js';
 export * from './gemini.js';
 export * from './registry.js';
 export * from './identity-prompt.js';

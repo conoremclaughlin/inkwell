@@ -251,3 +251,42 @@ describe('text usage fallback — linear scans of provider output', () => {
     ).toMatchObject({ inputTokens: 12, outputTokens: 3, reasoningTokens: 2, totalTokens: 17 });
   });
 });
+
+describe('Codex exec turn usage', () => {
+  it('keeps cached and reasoning input spellings without double-counting the total', () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1200,
+          cached_input_tokens: 1000,
+          output_tokens: 300,
+          reasoning_output_tokens: 200,
+        },
+      }),
+      ''
+    );
+    expect(usage).toMatchObject({
+      inputTokens: 1200,
+      cacheReadTokens: 1000,
+      outputTokens: 300,
+      reasoningTokens: 200,
+      totalTokens: 1500,
+    });
+  });
+
+  it('does not promote a turn aggregate to the final request context window', () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 1200, output_tokens: 300 },
+      }),
+      ''
+    );
+    expect(usage).toBeDefined();
+    expect(usage?.contextTokens).toBeUndefined();
+    expect(usage?.contextParts).toBeUndefined();
+  });
+});

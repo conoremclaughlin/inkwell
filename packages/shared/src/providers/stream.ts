@@ -3,14 +3,14 @@
  *
  * A backend adapter MAY implement `createStreamParser()` to declare that it
  * emits a parseable event stream (claude: `--output-format stream-json` today;
- * codex/gemini can follow). The parser turns raw stdout chunks into NORMALIZED
- * turn events, which the runner uses for three things at once:
+ * codex: `exec --json`; gemini can follow). The parser turns stdout chunks
+ * into NORMALIZED turn events, which the runner uses for three things at once:
  *   1. per-event liveness (resets the idle/token-flow timeout),
  *   2. live emission (CLI + website streaming), and
  *   3. final-response + usage extraction.
  *
  * Kept intentionally minimal — four event kinds. We do NOT over-generalize
- * across providers yet; codex/gemini parsers will map their own stdout into the
+ * across providers yet; other parsers can map their own stdout into the
  * same union without touching this contract.
  */
 
@@ -46,6 +46,8 @@ export type BackendTurnEvent =
       kind: 'result';
       text?: string;
       usage?: BackendTokenUsage;
+      /** A terminal provider/protocol failure, even if the child exits zero. */
+      error?: string;
       /** The resumed provider session no longer exists (roll to a fresh seed). */
       resumeFailedNoSession?: boolean;
     };
