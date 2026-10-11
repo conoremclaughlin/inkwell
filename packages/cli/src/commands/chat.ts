@@ -55,11 +55,9 @@ import {
   type PreparedSessionTurn,
   type SessionTurnExecution,
   InputDrainRefusal,
-  extractSessionContextMessages,
   findLastBackendSessionInEvents,
   findLastDetectedModelInEvents,
   hydrateLedgerFromEvents,
-  hydrateLedgerFromSessionContext,
   type EvictedEntryRecord,
   type HistoryHydrationResult,
   type RecoveredBackendSession,
@@ -127,6 +125,12 @@ import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purit
 import { completeStudioAtLaunch, type LaunchStudioDeps } from '../lib/launch-studio.js';
 import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
+import {
+  loadSessionContext,
+  sessionContextNote,
+  sessionContextStatusText,
+  SESSION_CONTEXT_SOURCE,
+} from '../repl/session-context.js';
 import { toolIntentCommitter } from '../session/tool-intent.js';
 import {
   ensureBackendAuthReady,
@@ -3149,6 +3153,7 @@ async function runChatSession(
       seenInboxIds: hydrated.seenInboxIds,
       seenActivityIds: hydrated.seenActivityIds,
       compactionCollapsed: hydrated.compactionCollapsed,
+      activityContext: hydrated.activityContext,
     };
     for (const inboxId of hydrated.seenInboxIds) {
       seenInboxIds.add(inboxId);
@@ -3160,20 +3165,22 @@ async function runChatSession(
       passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
     }
   } else if (attachedToExistingSession && runtime.sessionId) {
-    const sessionContextResult = (await inkClient
-      .callTool('get_session_context', { sessionId: runtime.sessionId, limit: 120 })
-      .catch(() => null)) as Record<string, unknown> | null;
-    const contextMessages = extractSessionContextMessages(sessionContextResult);
-    if (contextMessages.length > 0) {
-      historyHydration = hydrateLedgerFromSessionContext(ledger, contextMessages);
-    } else {
-      historyHydration = {
-        loaded: 0,
-        messageCount: 0,
-        source: 'none',
-        tailPreview: [],
-      };
-    }
+    const recovered = await loadSessionContext(inkClient, runtime.sessionId);
+    const note = sessionContextNote(recovered);
+    const { activityContext } = note;
+    // One ordinary context note is persisted before it enters the live ledger.
+    // A later process/reseed reads the same bounded, explicitly untrusted tail;
+    // it does not fabricate authoritative user/assistant transcript events.
+    const eid = runtime.log.append(note);
+    await runtime.log.flush();
+    ledger.addEntry('system', recovered.note, SESSION_CONTEXT_SOURCE, eid);
+    historyHydration = {
+      loaded: 1,
+      messageCount: 0,
+      source: 'ink-session-context',
+      activityContext,
+      tailPreview: [],
+    };
   }
 
   await sessionToolHost.restoreLedgerImages(ledger);
@@ -3218,6 +3225,7 @@ async function runChatSession(
     sessionId: runtime.sessionId || null,
     studioId: runtime.studioId || null,
     historySource: historyHydration?.source || null,
+    activityContext: historyHydration?.activityContext || null,
     attachedBackend: attachedSessionSummary?.backend || null,
     attachedModel: attachedSessionSummary?.model || null,
   });
@@ -3483,6 +3491,12 @@ async function runChatSession(
       );
     }
     console.log(chalk.dim(`  history: ${historyHydration.messageCount} prior message(s) loaded`));
+  }
+  if (historyHydration?.activityContext) {
+    const prefix = historyHydration.source === 'repl-transcript' ? 'original recovery: ' : '';
+    console.log(
+      chalk.dim(`  ${prefix}${sessionContextStatusText(historyHydration.activityContext)}`)
+    );
   }
   console.log(chalk.dim('  /help for commands\n'));
 

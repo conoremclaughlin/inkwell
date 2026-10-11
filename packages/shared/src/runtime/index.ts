@@ -32,6 +32,7 @@ export * from './provider-sample.js';
 export * from './auto-evict.js';
 export * from './clone-outcomes.js';
 export * from './session-history.js';
+export * from './session-context-recovery.js';
 export * from './provider-recovery.js';
 export * from './serial-input-drain.js';
 export * from './session-turn.js';
