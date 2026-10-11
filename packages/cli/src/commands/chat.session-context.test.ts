@@ -279,6 +279,70 @@ describe('ink chat bounded session-context recovery', () => {
     );
   });
 
+  it.each(['codex', 'claude'])(
+    'persists a visible oversized-tail refusal and reopens %s without retry or partial records',
+    async (backend) => {
+      state.context.mockResolvedValue({
+        success: true,
+        context: [...records, { type: 'message_in', content: 'x'.repeat(256 * 1024) }],
+      });
+      await turn('Oversized recovery fixture turn.', backend);
+      const path = transcriptPath();
+      const ledger = new ContextLedger();
+      const hydrated = hydrateLedgerFromTranscript(ledger, path);
+      expect(hydrated.activityContext).toEqual({
+        status: 'unavailable',
+        count: 0,
+        reason: 'size_limit',
+      });
+      const notes = readFileSync(path, 'utf8')
+        .trim()
+        .split('\n')
+        .filter((line) => {
+          const event = JSON.parse(line);
+          return event.type === 'context_note' && event.source === SESSION_CONTEXT_SOURCE;
+        });
+      expect(notes).toHaveLength(1);
+      expect(new TextEncoder().encode(notes[0] + '\n').byteLength).toBeLessThan(1024);
+      expect(notes[0]).not.toContain('fictional amber kite');
+
+      if (backend === 'claude') {
+        const writer = new SessionLog({ path });
+        writer.seed(hydrated.maxEid);
+        writer.append({
+          type: 'backend_session_invalidated',
+          reason: 'synthetic-size-refusal-reseed',
+        });
+        await writer.flush();
+        expect(state.run.mock.calls[0][0].backendSessionSeedId).toEqual(expect.any(String));
+      }
+      state.context.mockRejectedValue(new Error('No retry after the original refusal.'));
+      await turn('Reopen oversized recovery fixture.', backend);
+      if (backend === 'claude') {
+        const request = state.run.mock.calls[1][0];
+        expect(request.backendSessionId).toBeUndefined();
+        expect(request.backendSessionSeedId).toEqual(expect.any(String));
+        expect(request.backendSessionSeedId).not.toBe(
+          state.run.mock.calls[0][0].backendSessionSeedId
+        );
+      }
+      expect(state.context).toHaveBeenCalledOnce();
+      for (const [request] of state.run.mock.calls) {
+        expect(request.prompt).toContain('exceeded the 256 KiB recovery budget');
+        expect(request.prompt).toContain('no activity records imported');
+        expect(request.prompt).toContain('prior history is unknown');
+        expect(request.prompt).not.toContain('fictional amber kite');
+        expect(request.prompt).not.toContain('<untrusted-session-activity>');
+      }
+      expect(log.mock.calls.flat().join('\n')).toContain(
+        'original recovery: activity context unavailable: operational tail exceeded the 256 KiB recovery budget'
+      );
+      const replayed = readFileSync(path, 'utf8');
+      expect(replayed.split('"source":"ink-session-context"')).toHaveLength(2);
+      expect(replayed).not.toContain('fictional amber kite');
+    }
+  );
+
   it('reseeds a provider from the persisted note after an explicit native-session invalidation', async () => {
     await turn('First native fixture turn.', 'claude');
     const initial = state.run.mock.calls[0][0];

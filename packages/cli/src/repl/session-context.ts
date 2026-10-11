@@ -1,10 +1,13 @@
 /** The API's get_session_context limit is 50 activities, not conversation turns. */
 export const SESSION_CONTEXT_LIMIT = 50;
 export const SESSION_CONTEXT_SOURCE = 'ink-session-context';
+/** UTF-8 bytes of the fully serialized context_note payload, not raw activity. */
+export const SESSION_CONTEXT_NOTE_MAX_BYTES = 256 * 1024;
 
 export interface SessionContextStatus {
   status: 'loaded' | 'empty' | 'unavailable';
   count: number;
+  reason?: 'size_limit';
 }
 
 interface ActivityRecord {
@@ -21,8 +24,26 @@ export interface RecoveredSessionContext extends SessionContextStatus {
   note: string;
 }
 
+/** One payload for both size accounting and the eventual transcript append. */
+export function sessionContextNote(result: RecoveredSessionContext) {
+  const activityContext: SessionContextStatus = {
+    status: result.status,
+    count: result.count,
+    ...(result.reason ? { reason: result.reason } : {}),
+  };
+  return {
+    type: 'context_note',
+    source: SESSION_CONTEXT_SOURCE,
+    content: result.note,
+    activityContext,
+  };
+}
+
 export function sessionContextStatusText(result: SessionContextStatus): string {
   if (result.status === 'unavailable') {
+    if (result.reason === 'size_limit') {
+      return 'activity context unavailable: operational tail exceeded the 256 KiB recovery budget; no activity records imported; prior history is unknown';
+    }
     return 'activity context unavailable; prior history is unknown';
   }
   if (result.status === 'empty') {
@@ -90,5 +111,20 @@ export async function loadSessionContext(
           '</untrusted-session-activity>',
         ].join('\n')
       : header;
-  return { ...result, note };
+  const recovered = { ...result, note };
+  // Measure after delimiter escaping AND the outer event serialization. The
+  // log adds only ts/eid/newline; the budget leaves ample room below hosted
+  // replay's 1 MiB entry limit. Never silently truncate or import a subset.
+  if (
+    new TextEncoder().encode(JSON.stringify(sessionContextNote(recovered))).byteLength >
+    SESSION_CONTEXT_NOTE_MAX_BYTES
+  ) {
+    const refused: SessionContextStatus = {
+      status: 'unavailable',
+      count: 0,
+      reason: 'size_limit',
+    };
+    return { ...refused, note: `[Session recovery: ${sessionContextStatusText(refused)}.]` };
+  }
+  return recovered;
 }

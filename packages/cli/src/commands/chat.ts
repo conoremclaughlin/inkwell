@@ -61,6 +61,7 @@ import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
 import {
   loadSessionContext,
+  sessionContextNote,
   sessionContextStatusText,
   SESSION_CONTEXT_SOURCE,
   type SessionContextStatus,
@@ -1100,7 +1101,13 @@ export function hydrateLedgerFromTranscript(
           Number.isInteger(recovery.count) &&
           recovery.count >= 0
         ) {
-          activityContext = recovery;
+          activityContext = {
+            status: recovery.status,
+            count: recovery.count,
+            ...(recovery.status === 'unavailable' && recovery.reason === 'size_limit'
+              ? { reason: recovery.reason }
+              : {}),
+          };
         }
       }
       const entry = ledger.addEntry('system', event.content, source, eid);
@@ -4926,16 +4933,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   } else if (attachedToExistingSession && runtime.sessionId) {
     const recovered = await loadSessionContext(inkClient, runtime.sessionId);
-    const activityContext = { status: recovered.status, count: recovered.count };
+    const note = sessionContextNote(recovered);
+    const { activityContext } = note;
     // One ordinary context note is persisted before it enters the live ledger.
     // A later process/reseed reads the same bounded, explicitly untrusted tail;
     // it does not fabricate authoritative user/assistant transcript events.
-    const eid = runtime.log.append({
-      type: 'context_note',
-      source: SESSION_CONTEXT_SOURCE,
-      content: recovered.note,
-      activityContext,
-    });
+    const eid = runtime.log.append(note);
     await runtime.log.flush();
     ledger.addEntry('system', recovered.note, SESSION_CONTEXT_SOURCE, eid);
     historyHydration = {
