@@ -661,6 +661,9 @@ describe('the full shared session composition (scripted provider, real read)', (
     expect(result?.execution.loop.success).toBe(true);
     expect(h.start).toHaveBeenCalledTimes(2);
     const [summarizer, ordinary] = h.start.mock.calls.map(([request]) => request);
+    expect(summarizer.toolRouting).toBe('local');
+    expect(summarizer.passthroughArgs).toEqual(['--allowedTools', '']);
+    expect(summarizer.passthroughArgs).toEqual(ordinary.passthroughArgs);
     expect(summarizer.prompt).toContain('discardable old detail 0:');
     expect(summarizer.prompt).not.toContain('discardable old detail 19:');
     expect(ordinary.prompt).toContain('Preserve the design.');

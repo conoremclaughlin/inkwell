@@ -3525,6 +3525,13 @@ async function runChatSession(
     sbSlug,
     cliAttached,
     contextBudgetAuto: () => contextBudgetAuto,
+    passthroughArgs: () =>
+      buildBackendToolPassthrough(
+        runtime.backend,
+        runtime.toolRouting,
+        toolPolicy.getBackendToolGate(),
+        runtime.strictTools
+      ).passthroughArgs,
     append: (entry) => runtime.log.append(entry),
     flush: () => runtime.log.flush(),
     spawnContext: providerSpawnContext,

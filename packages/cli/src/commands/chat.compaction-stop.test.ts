@@ -385,6 +385,10 @@ describe('CLI Stop includes pre-turn automatic compaction', () => {
     try {
       await started.promise;
       fixture.abortHandler!();
+      const [summarizer, ordinary] = fixture.start.mock.calls.map(([request]) => request);
+      expect(summarizer.toolRouting).toBe('local');
+      expect(summarizer.passthroughArgs).toEqual(['--allowedTools', '']);
+      expect(summarizer.passthroughArgs).toEqual(ordinary.passthroughArgs);
       expect(abortChild).toHaveBeenCalledOnce();
       expect(abortSummary).not.toHaveBeenCalled();
       await checkpoint();

@@ -38,6 +38,8 @@ export interface SessionCompactionPorts {
   sbSlug: string;
   cliAttached: boolean;
   contextBudgetAuto(): boolean;
+  /** Resolve the current host policy for each summarizer, just like ordinary turns. */
+  passthroughArgs(): string[];
   append(event: Record<string, unknown>): number;
   flush(): Promise<void>;
   spawnContext(): Pick<
@@ -197,6 +199,8 @@ export function createSessionCompaction(ports: SessionCompactionPorts) {
             sbSlug,
             model: runtime.model,
             effort: runtime.effort,
+            toolRouting: runtime.toolRouting,
+            passthroughArgs: ports.passthroughArgs(),
             prompt: buildCompactionPrompt(chunk),
             // Compaction is a backend turn like any other, so it goes through
             // adapter.prepare() and would otherwise regenerate the default
