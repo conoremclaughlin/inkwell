@@ -38,6 +38,7 @@ describe('Codex non-interactive resume argument scope', () => {
     const prepared = await prepare({
       sbSlug: 'synthetic-sb',
       promptParts: ['exec', 'continue'],
+      cliAttached: false,
       passthroughArgs: ['--sandbox', 'read-only', '--skip-git-repo-check'],
       backendSessionId: 'synthetic-session',
       stream: true,
@@ -65,6 +66,7 @@ describe('Codex non-interactive resume argument scope', () => {
     const prepared = await prepare({
       sbSlug: 'synthetic-sb',
       promptParts: ['exec', '--not-a-real-option'],
+      cliAttached: false,
       passthroughArgs: ['--color', 'never', '--'],
       backendSessionId: 'synthetic-session',
       media: [{ path: '/synthetic/attachment.png', mimeType: 'image/png' }],
@@ -95,6 +97,7 @@ describe('Codex non-interactive resume argument scope', () => {
       const prepared = await prepare({
         sbSlug: 'synthetic-sb',
         promptParts: ['exec', '--not-a-real-option'],
+        cliAttached: false,
         passthroughArgs: ['--color', 'never', '--'],
         media,
         stream: true,
@@ -120,6 +123,7 @@ describe('Codex non-interactive resume argument scope', () => {
       sbSlug: 'synthetic-sb',
       promptParts: ['exec', '--not-a-real-option'],
       passthroughArgs: [],
+      cliAttached: false,
     });
     try {
       expect(prepared.args.slice(-3)).toEqual(['exec', '--', '--not-a-real-option']);
@@ -132,6 +136,7 @@ describe('Codex non-interactive resume argument scope', () => {
     const prepared = await prepare({
       sbSlug: 'synthetic-sb',
       promptParts: ['continue'],
+      cliAttached: true,
       passthroughArgs: [],
       backendSessionId: 'synthetic-session',
     });
@@ -156,6 +161,7 @@ describe('Codex stream preparation', () => {
       const prepared = await prepare({
         sbSlug: 'synthetic-sb',
         promptParts: [...promptParts],
+        cliAttached: promptParts[0] !== 'exec',
         passthroughArgs: [],
         stream,
       });
