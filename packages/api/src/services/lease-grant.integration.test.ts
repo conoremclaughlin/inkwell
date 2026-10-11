@@ -70,8 +70,38 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     return data.id;
   }
 
+  /**
+   * Every write that ESTABLISHES state for an assertion goes through here.
+   *
+   * A discarded error on a fixture write does not fail where it happened. It
+   * fails later, in an assertion about something else, wearing a shape that
+   * reads as "the feature is broken" — which is exactly what #662's post-merge
+   * CI failure was. A `clearLeases()` whose error went in the bin left round 2
+   * of the concurrency test starting on round 1's lease; the stale holder's own
+   * vacant CAS was then refused (`lease IS NULL` fails, migration
+   * 20260820191613:111) and its sibling reported path-conflict, so the suite
+   * printed `0 granted / 1 conflict` — a serialization verdict — about a setup
+   * write that never landed.
+   *
+   * Cleanup writes in `finally` blocks and the deliberately-raced path update
+   * in the r4 P0-2 test are NOT wrapped: a throw from a `finally` replaces the
+   * assertion error that sent us there, and the raced write's failure is part
+   * of the interleaving under test.
+   */
+  async function must<T extends { error: { message: string } | null }>(
+    op: PromiseLike<T>,
+    what: string
+  ): Promise<T> {
+    const res = await op;
+    if (res.error) throw new Error(`fixture write failed (${what}): ${res.error.message}`);
+    return res;
+  }
+
   async function clearLeases() {
-    await client.from('studios').update({ lease: null }).in('id', [studioA, studioB]);
+    await must(
+      client.from('studios').update({ lease: null }).in('id', [studioA, studioB]),
+      'clearLeases'
+    );
   }
 
   beforeAll(async () => {
@@ -146,10 +176,13 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     // reproduced live). Stale is not proof of departure; the sweep rescues.
     await clearLeases();
     const stale = new Date(Date.now() - 45 * 60 * 1000).toISOString();
-    await client
-      .from('studios')
-      .update({ lease: lease('pr:4000', 'sess-stale', stale) as never })
-      .eq('id', studioA);
+    await must(
+      client
+        .from('studios')
+        .update({ lease: lease('pr:4000', 'sess-stale', stale) as never })
+        .eq('id', studioA),
+      'plant stale sibling lease'
+    );
 
     const result = await grantStudioLease(client, {
       studioId: studioB,
@@ -164,10 +197,13 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     // rows both granted (Lumen, reproduced live). The v14 adoption rule
     // refuses fresh same-thread holders at row level; path level is no freer.
     await clearLeases();
-    await client
-      .from('studios')
-      .update({ lease: lease('pr:5000', 'sess-x') as never })
-      .eq('id', studioA);
+    await must(
+      client
+        .from('studios')
+        .update({ lease: lease('pr:5000', 'sess-x') as never })
+        .eq('id', studioA),
+      'plant same-thread sibling lease'
+    );
 
     const result = await grantStudioLease(client, {
       studioId: studioB,
@@ -402,15 +438,21 @@ d('grant_studio_lease — path serialization (real DB)', () => {
       .update({ worktree_path: `${PATH}/` })
       .eq('id', studioA);
     expect(sameBacking).toBeNull();
-    await client.from('studios').update({ worktree_path: PATH }).eq('id', studioA);
+    await must(
+      client.from('studios').update({ worktree_path: PATH }).eq('id', studioA),
+      'restore studioA path spelling'
+    );
   });
 
   it('studio_path_conflict reports the sibling for the pre-rescue fence (r2)', async () => {
     await clearLeases();
-    await client
-      .from('studios')
-      .update({ lease: lease('pr:9500', 'sess-fence') as never })
-      .eq('id', studioA);
+    await must(
+      client
+        .from('studios')
+        .update({ lease: lease('pr:9500', 'sess-fence') as never })
+        .eq('id', studioA),
+      'plant fence holder lease'
+    );
     const conflicted = await studioPathConflict(client, { studioId: studioB, userId });
     expect(conflicted).toMatchObject({
       conflict: true,
@@ -425,10 +467,13 @@ d('grant_studio_lease — path serialization (real DB)', () => {
   it('handover with a mismatched expected prior is LOST, never granted', async () => {
     await clearLeases();
     const holder = lease('pr:6000', 'sess-holder');
-    await client
-      .from('studios')
-      .update({ lease: holder as never })
-      .eq('id', studioA);
+    await must(
+      client
+        .from('studios')
+        .update({ lease: holder as never })
+        .eq('id', studioA),
+      'plant handover prior lease'
+    );
 
     const result = await grantStudioLease(client, {
       studioId: studioA,
@@ -441,13 +486,22 @@ d('grant_studio_lease — path serialization (real DB)', () => {
 
   it('vacant grant refuses non-acquirable statuses', async () => {
     await clearLeases();
-    await client.from('studios').update({ status: 'cleaned' }).eq('id', studioB);
+    // Unasserted, this write failing would leave the row 'active', the grant
+    // would be GRANTED, and the `lost` expectation below would report a broken
+    // status check instead of a fixture that never applied.
+    await must(
+      client.from('studios').update({ status: 'cleaned' }).eq('id', studioB),
+      'set non-acquirable status'
+    );
     const result = await grantStudioLease(client, {
       studioId: studioB,
       userId,
       lease: lease('pr:7000', 'sess-z'),
     });
     expect(result.outcome).toBe('lost');
-    await client.from('studios').update({ status: 'active' }).eq('id', studioB);
+    await must(
+      client.from('studios').update({ status: 'active' }).eq('id', studioB),
+      'restore acquirable status'
+    );
   });
 });

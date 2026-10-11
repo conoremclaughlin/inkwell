@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { grantStudioLease, studioPathConflict } from './lease-grant';
+import { logger } from '../utils/logger';
 import type { StudioLease } from './studio-lease.service';
 
 vi.mock('../utils/logger', () => ({
@@ -87,6 +88,102 @@ describe('grantStudioLease', () => {
     await expect(
       grantStudioLease(client, { studioId: 's-1', userId: 'u-1', lease: LEASE })
     ).resolves.toEqual({ outcome: 'lost' });
+  });
+});
+
+/**
+ * The three tests above pin that every refusal RETURNS `lost`. They do not ask
+ * whether a reader can tell afterwards WHICH refusal it was, and until #662 the
+ * answer was no: two sinks logged and the third returned silently.
+ *
+ * That third sink is the one the DB actually uses. grant_studio_lease returns
+ * exactly granted | path-conflict | lost (migration 20260820191613), so a
+ * deliberate refusal — a vacant CAS finding `lease IS NOT NULL` — arrives as
+ * `{outcome:'lost'}`, matches neither branch, and falls through. On #662's
+ * post-merge run that surfaced as `0 granted / 1 conflict` in a concurrency
+ * assertion with nothing anywhere naming the cause, and cost three agents
+ * ninety minutes. studioPathConflict had logged its analogous branch all along.
+ */
+describe('grantStudioLease — a refusal records which refusal it was', () => {
+  beforeEach(() => {
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  /**
+   * winston's LeveledLogMethod resolves to a one-argument overload under
+   * vi.mocked, so the (message, meta) pair the whole logger is called with is
+   * not indexable without this cast. One cast, here, rather than per assertion.
+   */
+  function warnCalls(): Array<[string, Record<string, unknown> | undefined]> {
+    return vi.mocked(logger.warn).mock.calls as unknown as Array<
+      [string, Record<string, unknown> | undefined]
+    >;
+  }
+
+  /** (message, rpcOutcome) per warn call, in order — the reader's whole view. */
+  function warnSignatures(): Array<{ message: unknown; rpcOutcome: unknown }> {
+    return warnCalls().map(([message, meta]) => ({ message, rpcOutcome: meta?.rpcOutcome }));
+  }
+
+  it("records the RPC's OWN lost verdict, carrying the outcome it returned", async () => {
+    const { client } = rpcClient({ data: { outcome: 'lost' } });
+    await expect(
+      grantStudioLease(client, { studioId: 's-1', userId: 'u-1', lease: LEASE })
+    ).resolves.toEqual({ outcome: 'lost' });
+
+    expect(warnSignatures()).toHaveLength(1);
+    expect(warnCalls()[0][1]).toMatchObject({
+      studioId: 's-1',
+      rpcOutcome: 'lost',
+    });
+  });
+
+  it('distinguishes an unparseable payload from the DB deciding lost', async () => {
+    // Same return value, different cause: one is the database refusing, the
+    // other is this boundary failing to understand the answer. A single
+    // undifferentiated `lost` sent the #662 investigation at the wire when the
+    // refusal was a stale lease.
+    for (const data of [{ something: 'else' }, null, 'garbage']) {
+      vi.mocked(logger.warn).mockClear();
+      const { client } = rpcClient({ data });
+      await grantStudioLease(client, { studioId: 's-1', userId: 'u-1', lease: LEASE });
+      expect(warnSignatures()).toEqual([
+        { message: expect.stringContaining('[LeaseGrant]'), rpcOutcome: null },
+      ]);
+    }
+  });
+
+  it('leaves all three lost causes separable from the log alone', async () => {
+    // The contract, not the wording: a reader holding only the log can tell a
+    // DB refusal from a wire error from a throw. Three causes, three distinct
+    // signatures — which is exactly what "no [LeaseGrant] warning in the job"
+    // was able to rule out once the third one existed.
+    const cases: Array<[string, { data?: unknown; error?: { message: string } } | 'throw']> = [
+      ['db refused', { data: { outcome: 'lost' } }],
+      [
+        'wire error',
+        { error: { message: 'An invalid response was received from the upstream server' } },
+      ],
+      ['threw', 'throw'],
+    ];
+
+    const seen: string[] = [];
+    for (const [, result] of cases) {
+      vi.mocked(logger.warn).mockClear();
+      const client =
+        result === 'throw'
+          ? { rpc: vi.fn().mockRejectedValue(new Error('socket hang up')) }
+          : rpcClient(result).client;
+      await expect(
+        grantStudioLease(client, { studioId: 's-1', userId: 'u-1', lease: LEASE })
+      ).resolves.toEqual({ outcome: 'lost' });
+
+      const sigs = warnSignatures();
+      expect(sigs).toHaveLength(1);
+      seen.push(JSON.stringify(sigs[0]));
+    }
+
+    expect(new Set(seen).size).toBe(3);
   });
 });
 
