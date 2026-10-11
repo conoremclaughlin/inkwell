@@ -60,6 +60,12 @@ import { completeStudioAtLaunch, type LaunchStudioDeps } from '../lib/launch-stu
 import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
 import {
+  loadSessionContext,
+  sessionContextStatusText,
+  SESSION_CONTEXT_SOURCE,
+  type SessionContextStatus,
+} from '../repl/session-context.js';
+import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
   getBackendAuthStatus,
@@ -536,6 +542,8 @@ interface HistoryHydrationResult {
   }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
+  /** Original fallback lookup, retained as provenance even after later compaction. */
+  activityContext?: SessionContextStatus;
   /** True when hydration collapsed history at a compaction event */
   compactionCollapsed?: boolean;
 }
@@ -551,13 +559,6 @@ interface EvictedEntryRecord {
 }
 
 const EVICTED_DISPLAY_MAX = 100;
-
-interface SessionContextMessage {
-  role: 'user' | 'assistant' | 'inbox' | 'system';
-  content: string;
-  ts?: string;
-  source: string;
-}
 
 const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
@@ -800,6 +801,7 @@ export function hydrateLedgerFromTranscript(
   seenInboxIds: string[];
   seenActivityIds: string[];
   recoveredMemoryIds: string[];
+  activityContext?: SessionContextStatus;
   compactionCollapsed: boolean;
   /** Entries excluded by context_evict events — for evicted-content display */
   evictedEntries: EvictedEntryRecord[];
@@ -818,6 +820,7 @@ export function hydrateLedgerFromTranscript(
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
+  let activityContext: SessionContextStatus | undefined;
   let maxEid = 0;
   let providerSample: PersistedProviderSample | undefined;
   const preview: HistoryHydrationResult['tailPreview'] = [];
@@ -1089,6 +1092,17 @@ export function hydrateLedgerFromTranscript(
       // tombstone. Replayed as the system entry it was live, so a reattached
       // process knows why earlier tool results are missing (PR #584).
       const source = typeof event.source === 'string' ? event.source : 'context-note';
+      if (source === SESSION_CONTEXT_SOURCE) {
+        const recovery = event.activityContext as SessionContextStatus | undefined;
+        if (
+          recovery &&
+          ['loaded', 'empty', 'unavailable'].includes(recovery.status) &&
+          Number.isInteger(recovery.count) &&
+          recovery.count >= 0
+        ) {
+          activityContext = recovery;
+        }
+      }
       const entry = ledger.addEntry('system', event.content, source, eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
@@ -1270,6 +1284,7 @@ export function hydrateLedgerFromTranscript(
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
     recoveredMemoryIds,
+    activityContext,
     compactionCollapsed,
     evictedEntries,
     toolCalls,
@@ -1397,6 +1412,7 @@ export function keptEntriesForCompaction(ledger: ContextLedger): Array<Record<st
 }
 
 const INTERNAL_SYSTEM_SOURCES = new Set([
+  SESSION_CONTEXT_SOURCE,
   'continuation',
   'compaction-tail',
   'compaction-history',
@@ -1861,128 +1877,6 @@ function extractActivitySummaries(
       };
     })
     .filter((activity): activity is ActivitySummary => Boolean(activity));
-}
-
-function extractSessionContextMessages(
-  result: Record<string, unknown> | null | undefined
-): SessionContextMessage[] {
-  if (!result) return [];
-  const candidate = (Array.isArray(result.context) ? result.context : undefined) || [];
-
-  return candidate
-    .map((entry): SessionContextMessage | undefined => {
-      const row = entry as Record<string, unknown>;
-      const content = typeof row.content === 'string' ? row.content.trim() : '';
-      if (!content) return undefined;
-
-      const type =
-        typeof row.type === 'string'
-          ? row.type
-          : typeof row.activityType === 'string'
-            ? row.activityType
-            : 'unknown';
-      const source =
-        typeof row.subtype === 'string'
-          ? `${type}:${row.subtype}`
-          : typeof row.source === 'string'
-            ? row.source
-            : type;
-      const ts =
-        typeof row.createdAt === 'string'
-          ? row.createdAt
-          : typeof row.created_at === 'string'
-            ? row.created_at
-            : undefined;
-
-      if (type === 'message_in' || type === 'user') {
-        return {
-          role: 'user',
-          content,
-          ts,
-          source,
-        };
-      }
-      if (type === 'message_out' || type === 'assistant') {
-        return {
-          role: 'assistant',
-          content,
-          ts,
-          source,
-        };
-      }
-      if (
-        type === 'inbox' ||
-        type === 'notification' ||
-        type === 'task_request' ||
-        type === 'session_resume'
-      ) {
-        return {
-          role: 'inbox',
-          content,
-          ts,
-          source,
-        };
-      }
-
-      return {
-        role: 'system',
-        content,
-        ts,
-        source,
-      };
-    })
-    .filter((entry): entry is SessionContextMessage => Boolean(entry));
-}
-
-function hydrateLedgerFromSessionContext(
-  ledger: ContextLedger,
-  messages: SessionContextMessage[]
-): HistoryHydrationResult {
-  let loaded = 0;
-  let messageCount = 0;
-  const preview: HistoryHydrationResult['tailPreview'] = [];
-  const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
-    if (preview.length > HISTORY_PREVIEW_MAX) preview.shift();
-  };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      ledger.addEntry('user', message.content, `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('user', message.content, message.ts);
-      continue;
-    }
-    if (message.role === 'assistant') {
-      ledger.addEntry('assistant', message.content, `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('assistant', message.content, message.ts);
-      continue;
-    }
-    if (message.role === 'inbox') {
-      ledger.addEntry('inbox', compactForLedger(message.content), `ink-history:${message.source}`);
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('inbox', message.content, message.ts);
-      continue;
-    }
-
-    ledger.addEntry(
-      'system',
-      compactForLedger(message.content, 320),
-      `ink-history:${message.source}`
-    );
-    loaded += 1;
-  }
-
-  return {
-    loaded,
-    messageCount,
-    source: 'ink-session-context',
-    tailPreview: preview,
-  };
 }
 
 function summarizeForSessionEnd(ledger: ContextLedger): string {
@@ -5019,6 +4913,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       seenInboxIds: hydrated.seenInboxIds,
       seenActivityIds: hydrated.seenActivityIds,
       compactionCollapsed: hydrated.compactionCollapsed,
+      activityContext: hydrated.activityContext,
     };
     for (const inboxId of hydrated.seenInboxIds) {
       seenInboxIds.add(inboxId);
@@ -5030,20 +4925,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
       passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
     }
   } else if (attachedToExistingSession && runtime.sessionId) {
-    const sessionContextResult = (await inkClient
-      .callTool('get_session_context', { sessionId: runtime.sessionId, limit: 120 })
-      .catch(() => null)) as Record<string, unknown> | null;
-    const contextMessages = extractSessionContextMessages(sessionContextResult);
-    if (contextMessages.length > 0) {
-      historyHydration = hydrateLedgerFromSessionContext(ledger, contextMessages);
-    } else {
-      historyHydration = {
-        loaded: 0,
-        messageCount: 0,
-        source: 'none',
-        tailPreview: [],
-      };
-    }
+    const recovered = await loadSessionContext(inkClient, runtime.sessionId);
+    const activityContext = { status: recovered.status, count: recovered.count };
+    // One ordinary context note is persisted before it enters the live ledger.
+    // A later process/reseed reads the same bounded, explicitly untrusted tail;
+    // it does not fabricate authoritative user/assistant transcript events.
+    const eid = runtime.log.append({
+      type: 'context_note',
+      source: SESSION_CONTEXT_SOURCE,
+      content: recovered.note,
+      activityContext,
+    });
+    await runtime.log.flush();
+    ledger.addEntry('system', recovered.note, SESSION_CONTEXT_SOURCE, eid);
+    historyHydration = {
+      loaded: 1,
+      messageCount: 0,
+      source: 'ink-session-context',
+      activityContext,
+      tailPreview: [],
+    };
   }
 
   runtime.log.append({
@@ -5055,6 +4956,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     sessionId: runtime.sessionId || null,
     studioId: runtime.studioId || null,
     historySource: historyHydration?.source || null,
+    activityContext: historyHydration?.activityContext || null,
     attachedBackend: attachedSessionSummary?.backend || null,
     attachedModel: attachedSessionSummary?.model || null,
   });
@@ -5320,6 +5222,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
     console.log(chalk.dim(`  history: ${historyHydration.messageCount} prior message(s) loaded`));
+  }
+  if (historyHydration?.activityContext) {
+    const prefix = historyHydration.source === 'repl-transcript' ? 'original recovery: ' : '';
+    console.log(
+      chalk.dim(`  ${prefix}${sessionContextStatusText(historyHydration.activityContext)}`)
+    );
   }
   console.log(chalk.dim('  /help for commands\n'));
 

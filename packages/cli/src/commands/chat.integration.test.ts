@@ -692,6 +692,7 @@ describe('runChat integration', () => {
           return { user: { timezone: 'America/Los_Angeles' } };
         case 'get_session_context':
           return {
+            success: true,
             context: [
               {
                 id: 'ctx-1',
@@ -723,7 +724,7 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('history: 2 prior message(s) loaded');
+    expect(logText).toContain('activity context: 2 entries loaded from a bounded operational tail');
   });
 
   it('supports interactive attach picker from active sessions', async () => {
