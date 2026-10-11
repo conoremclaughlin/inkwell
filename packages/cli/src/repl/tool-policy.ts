@@ -80,6 +80,7 @@ export interface SessionAccessQuery {
 }
 
 export interface ToolPolicyScopeSnapshot {
+  inklingRepliesOnly?: boolean;
   scope: ToolPolicyScopeRef;
   label: string;
   mode?: ToolMode;
@@ -115,6 +116,8 @@ export interface ToolPolicyOptions {
 }
 
 interface PersistedToolPolicyRules {
+  /** The send_response channel is limited to existing Inkling conversations. */
+  inklingRepliesOnly?: boolean;
   mode?: ToolMode;
   skillTrustMode?: SkillTrustMode;
   sessionVisibility?: SessionVisibility;
@@ -144,6 +147,7 @@ interface PersistedToolPolicyV2 {
 }
 
 interface ToolPolicyRulesState {
+  inklingRepliesOnly?: boolean;
   mode?: ToolMode;
   skillTrustMode?: SkillTrustMode;
   sessionVisibility?: SessionVisibility;
@@ -313,6 +317,7 @@ function hasAnyRules(rule: ToolPolicyRulesState): boolean {
     rule.skillTrustMode ||
     rule.sessionVisibility ||
     rule.allowTools.size ||
+    rule.inklingRepliesOnly ||
     rule.denyTools.size ||
     rule.promptTools.size ||
     rule.permanentGrants.size ||
@@ -448,6 +453,7 @@ export class ToolPolicyState {
     data: PersistedToolPolicyRules | undefined
   ): void {
     if (!data) return;
+    if (data.inklingRepliesOnly === true) target.inklingRepliesOnly = true;
 
     if (data.mode === 'backend' || data.mode === 'off' || data.mode === 'privileged') {
       target.mode = data.mode;
@@ -474,6 +480,7 @@ export class ToolPolicyState {
 
   private serializeRules(rules: ToolPolicyRulesState): PersistedToolPolicyRules {
     return {
+      ...(rules.inklingRepliesOnly ? { inklingRepliesOnly: true } : {}),
       mode: rules.mode,
       skillTrustMode: rules.skillTrustMode,
       sessionVisibility: rules.sessionVisibility,
@@ -841,6 +848,7 @@ export class ToolPolicyState {
       .map((ref) => {
         const rules = this.getRulesForScope(ref, false) || createRules();
         return {
+          ...(rules.inklingRepliesOnly ? { inklingRepliesOnly: true } : {}),
           scope: { ...ref },
           label: normalizeScopeLabel(ref),
           mode: rules.mode,
@@ -1062,6 +1070,11 @@ export class ToolPolicyState {
     this.saveToDisk();
   }
 
+  public restrictToInklingReplies(scope?: ToolPolicyScopeRef): void {
+    this.resolveRulesForMutation(scope).inklingRepliesOnly = true;
+    this.saveToDisk();
+  }
+
   public denyTool(tool: string, scope?: ToolPolicyScopeRef): void {
     const rules = this.resolveRulesForMutation(scope);
     const expanded = expandToolSpec(tool);
@@ -1255,7 +1268,22 @@ export class ToolPolicyState {
    * makes it possible. Call this exactly once per actual call — it is the
    * authorization, not a query about one.
    */
-  public canCallInkTool(tool: string, sessionId?: string): ToolPolicyDecision {
+  public canCallInkTool(
+    tool: string,
+    sessionId?: string,
+    args?: Record<string, unknown>
+  ): ToolPolicyDecision {
+    if (
+      normalizeToolName(tool) === 'send_response' &&
+      this.getActiveScopeRules().some(({ rules }) => rules.inklingRepliesOnly) &&
+      args?.channel !== 'inkling'
+    ) {
+      return {
+        allowed: false,
+        promptable: false,
+        reason: 'This tools profile permits send_response only with channel: inkling.',
+      };
+    }
     return this.evaluateInkTool(tool, sessionId, true);
   }
 

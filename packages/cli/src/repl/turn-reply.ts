@@ -100,3 +100,11 @@ export function localDeliveredSend(input: {
 export function backendSendTarget(name: string, input: unknown): TurnSend | null {
   return isSendResponseTool(name) ? sendTarget(input) : null;
 }
+
+/** Keep only reply text produced by this run, not the hydrated transcript. */
+export function collectFinalReplyText(
+  previous: string | null,
+  current: string | null
+): string | null {
+  return userFacingReplyText(current) ?? previous;
+}

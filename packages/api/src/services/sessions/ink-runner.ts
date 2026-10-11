@@ -37,6 +37,7 @@ import {
   TURN_REPLY_TOKEN_ENV,
   TURN_REPLY_EVENT,
   parseTurnReplyEvent,
+  userFacingReplyText,
   writeRuntimeSessionHint,
   describeExitResult,
   type ErrorClassification,
@@ -1018,7 +1019,7 @@ export class InkRunner implements IRunner {
             input: parsed.input || {},
           });
         } else if (parsed.type === 'result') {
-          if (parsed.text) finalTextResponse = parsed.text;
+          finalTextResponse = userFacingReplyText(parsed.text) ?? undefined;
           if (parsed.phase) exitPhase = parsed.phase;
           if (parsed.signal) exitSignal = parsed.signal;
           if (parsed.reason) exitReason = parsed.reason;

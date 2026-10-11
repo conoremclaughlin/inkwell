@@ -24,6 +24,8 @@ import {
   isImitationResultLine,
   type OpenFence,
 } from './imitation-grammar.js';
+import { findInvokeToolBlocks, stripInvokeToolBlocks } from './invoke-tool-blocks.js';
+import { findLegacyToolBlocks, stripLegacyToolBlocks } from './legacy-tool-blocks.js';
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from './local-tool-placeholder.js';
 
 export interface LocalToolCall {
@@ -1958,8 +1960,8 @@ export function extractToolBlocks(responseText: string): {
   // via the fallback router, and text-form signal_status never halted the
   // continuation loop). Parse and execute the variant so the turn WORKS;
   // the continuation prompt separately steers the model back to the fence.
-  for (const match of responseText.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
-    const payload = (match[1] || '').trim();
+  for (const block of findLegacyToolBlocks(responseText)) {
+    const payload = responseText.slice(block.payloadStart, block.payloadEnd).trim();
     if (!payload) continue;
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
@@ -1973,8 +1975,8 @@ export function extractToolBlocks(responseText: string): {
           ? (parsed.arguments as Record<string, unknown>)
           : {};
       indexed.push({
-        index: match.index ?? 0,
-        call: { tool, args, raw: match[0] || '', variantFormat: true },
+        index: block.start,
+        call: { tool, args, raw: responseText.slice(block.start, block.end), variantFormat: true },
       });
     } catch (error) {
       // Same invariant as the fence path. The variant is deprecated, which is
@@ -1988,6 +1990,19 @@ export function extractToolBlocks(responseText: string): {
         fenceClosed: true,
       });
     }
+  }
+
+  // A provider-native XML spelling is not executable ink syntax. Feed a
+  // refusal back through the existing bounded correction path, rather than
+  // treating it as prose or silently accepting a second argument language.
+  for (const block of findInvokeToolBlocks(responseText)) {
+    malformed.push({
+      tool: block.tool,
+      error:
+        'Unsupported invoke XML. Use a fenced ink-tool JSON object with tool and args; this XML was not executed.',
+      payloadLength: block.end - block.start,
+      fenceClosed: block.closed,
+    });
   }
 
   // Preserve the model's emission order across both formats.
@@ -2025,7 +2040,7 @@ export function stripLocalToolBlocks(responseText: string): string {
     cursor = block.end;
   }
   out += responseText.slice(cursor);
-  return out.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '').trim();
+  return stripInvokeToolBlocks(stripLegacyToolBlocks(out)).trim();
 }
 
 /**

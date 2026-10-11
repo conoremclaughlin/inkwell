@@ -138,7 +138,7 @@ async function executeOneToolCall(
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup
   const policyToolName = call.tool.replace(/^mcp__inkwell__/, '');
-  const decision = policy.canCallInkTool(policyToolName, sessionId);
+  const decision = policy.canCallInkTool(policyToolName, sessionId, call.args);
 
   if (decision.allowed) {
     // Allowed — execute immediately
@@ -178,7 +178,7 @@ async function executeOneToolCall(
 
   // Re-check policy after approval (the grant was applied by the prompt handler)
   // Use the stripped name — same as the initial policy check above
-  const postApprovalDecision = policy.canCallInkTool(policyToolName, sessionId);
+  const postApprovalDecision = policy.canCallInkTool(policyToolName, sessionId, call.args);
   if (!postApprovalDecision.allowed) {
     // Edge case: approval was granted but policy still blocks (e.g., deny overrides grant)
     return {
