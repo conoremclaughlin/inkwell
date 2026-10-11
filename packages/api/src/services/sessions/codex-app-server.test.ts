@@ -153,6 +153,169 @@ afterEach(() => {
 });
 
 describe('owned Codex app-server runner', () => {
+  describe.each(['completed', 'notification'] as const)('failure from %s', (source) => {
+    it.each([
+      { category: 'quota', retryable: false, codexErrorInfo: 'usageLimitExceeded' },
+      { category: 'auth', retryable: false, codexErrorInfo: 'unauthorized' },
+      {
+        category: 'network',
+        retryable: true,
+        codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+      },
+    ])('preserves $category without retaining private diagnostics', async (expected) => {
+      const f = fixture();
+      const running = f.run();
+      await tick();
+      // Camel-case variants match the captured app-server v2 wire schema.
+      const error = {
+        codexErrorInfo: expected.codexErrorInfo,
+        message: 'Synthetic private diagnostic',
+        additionalDetails: 'Synthetic private detail',
+      };
+      if (source === 'notification') f.notify('error', { error, willRetry: false });
+      f.notify('turn/completed', {
+        turn: {
+          id: 'turn-synthetic',
+          status: 'failed',
+          error: source === 'completed' ? error : null,
+        },
+      });
+      const result = await running;
+      expect(result).toMatchObject({
+        success: false,
+        classification: { category: expected.category, retryable: expected.retryable },
+      });
+      expect(JSON.stringify(result)).not.toContain('Synthetic private');
+      expect(f.sent.filter((message) => message.method === 'turn/start')).toHaveLength(1);
+    });
+  });
+
+  it.each([
+    ['quota', 'Usage limit reached'],
+    ['auth', 'Unauthorized'],
+    ['network', 'Stream disconnected'],
+  ])('classifies a message-only %s failure without retaining its text', async (category, text) => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('turn/completed', {
+      turn: {
+        id: 'turn-synthetic',
+        status: 'failed',
+        error: { message: `${text}: synthetic-private-detail`, codexErrorInfo: null },
+      },
+    });
+    const result = await running;
+    expect(result.classification?.category).toBe(category);
+    expect(JSON.stringify(result)).not.toContain('synthetic-private-detail');
+  });
+
+  it('does not carry a recovered notification failure into success', async () => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('error', {
+      error: { codexErrorInfo: 'unauthorized', message: 'Synthetic private diagnostic' },
+      willRetry: false,
+    });
+    f.complete();
+    const result = await running;
+    expect(result.success).toBe(true);
+    expect(result.classification).toBeUndefined();
+  });
+
+  it.each(['retrying', 'foreign-turn', 'foreign-thread', 'assistant-text'] as const)(
+    'does not classify %s diagnostics as the owned turn failure',
+    async (source) => {
+      const f = fixture();
+      const running = f.run();
+      await tick();
+      const error = { codexErrorInfo: 'unauthorized', message: 'Unauthorized' };
+      if (source === 'assistant-text')
+        f.notify('item/completed', {
+          item: { id: 'synthetic-item', type: 'agentMessage', text: 'Unauthorized' },
+        });
+      else
+        f.notify('error', {
+          error,
+          willRetry: source === 'retrying',
+          ...(source === 'foreign-turn' ? { turnId: 'another-turn' } : {}),
+          ...(source === 'foreign-thread' ? { threadId: 'another-thread' } : {}),
+        });
+      f.notify('turn/completed', { turn: { id: 'turn-synthetic', status: 'failed' } });
+      const result = await running;
+      expect(result.success).toBe(false);
+      expect(result.classification).toBeUndefined();
+    }
+  );
+
+  it('never promotes a post-acceptance error to a pre-acceptance owner refusal', async () => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('turn/completed', {
+      turn: {
+        id: 'turn-synthetic',
+        status: 'failed',
+        error: { message: 'thread/resume: thread synthetic already has an active writer' },
+      },
+    });
+    expect((await running).classification).toBeUndefined();
+  });
+
+  it('prefers structured HTTP auth failure to diagnostic quota words', async () => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('turn/completed', {
+      turn: {
+        id: 'turn-synthetic',
+        status: 'failed',
+        error: {
+          message: 'Usage limit reached: synthetic-private-detail',
+          codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } },
+        },
+      },
+    });
+    const result = await running;
+    expect(result.classification).toMatchObject({ category: 'auth', retryable: false });
+    expect(JSON.stringify(result)).not.toContain('synthetic-private-detail');
+  });
+
+  it('does not reuse an earlier classification when the final error is explicitly unknown', async () => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('error', {
+      error: { codexErrorInfo: 'usageLimitExceeded', message: 'Usage limit' },
+      willRetry: false,
+    });
+    f.notify('turn/completed', {
+      turn: {
+        id: 'turn-synthetic',
+        status: 'failed',
+        error: { codexErrorInfo: 'other', message: 'Unrecognized synthetic failure' },
+      },
+    });
+    expect((await running).classification).toBeUndefined();
+  });
+
+  it('retains a scoped terminal error notification when the child closes immediately', async () => {
+    const f = fixture();
+    const running = f.run();
+    await tick();
+    f.notify('error', {
+      error: { codexErrorInfo: 'usageLimitExceeded', message: 'Synthetic private diagnostic' },
+      willRetry: false,
+    });
+    f.proc.exitCode = 0;
+    f.proc.emit('close', 0, null);
+    expect(await running).toMatchObject({
+      success: false,
+      classification: { category: 'quota', retryable: false },
+    });
+  });
+
   it('binds the current turn, journals admission, waits for correlated insertion and exits its child', async () => {
     const f = fixture();
     const result = f.run();

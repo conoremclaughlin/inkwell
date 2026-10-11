@@ -294,7 +294,7 @@ export async function runOwnedCodexAppServer(input: {
           error ??= 'Native steering port release failed';
         }
         error ??= terminalFailure;
-        const classification = protocol.refusalClassification;
+        const classification = protocol.refusalClassification ?? protocol.failureClassification;
         resolve({
           success: !error && !stopUnconfirmed,
           backendSessionId: protocol.threadId ?? input.backendSessionId ?? null,

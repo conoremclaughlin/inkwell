@@ -10,6 +10,56 @@ const object = (value: unknown): ObjectValue | undefined =>
     : undefined;
 const id = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
+/** Classify only a scoped provider failure; never retain its diagnostic text. */
+function classifyTurnFailure(value: unknown): ErrorClassification | undefined {
+  const error = object(value);
+  if (!error) return undefined;
+  const info = error.codexErrorInfo;
+  const variant = typeof info === 'string' ? info : undefined;
+  const details = object(info);
+  const connection =
+    object(details?.httpConnectionFailed) ??
+    object(details?.responseStreamConnectionFailed) ??
+    object(details?.responseStreamDisconnected) ??
+    object(details?.responseTooManyFailedAttempts);
+  const status = connection?.httpStatusCode;
+  // These are the camel-case v2 wire variants, not display names. Prefer
+  // structured evidence over incidental words in the provider's message.
+  const signal =
+    variant === 'usageLimitExceeded' ||
+    variant === 'sessionBudgetExceeded' ||
+    variant === 'rateLimitExceeded' ||
+    status === 429
+      ? 'usage limit'
+      : variant === 'unauthorized' || status === 401 || status === 403
+        ? 'unauthorized'
+        : variant === 'serverOverloaded' ||
+            variant === 'flexUnavailable' ||
+            status === 503 ||
+            status === 529
+          ? 'overloaded'
+          : connection
+            ? 'network error'
+            : typeof error.message === 'string'
+              ? error.message
+              : '';
+  const classification = classifyError({ errorText: signal, backend: 'codex-cli' });
+  // A turn already began. Even matching diagnostic text cannot manufacture
+  // the pre-acceptance owner refusal reserved for a thread/resume RPC reply.
+  if (classification.category === 'owner_conflict' || classification.category === 'unknown')
+    return undefined;
+  const summaries = {
+    quota: 'Codex provider usage limit reached',
+    auth: 'Codex provider authentication failed',
+    network: 'Codex provider network request failed',
+    capacity: 'Codex provider capacity unavailable',
+    timeout: 'Codex provider request timed out',
+    config: 'Codex provider configuration failed',
+    crash: 'Codex provider crashed',
+  };
+  return { ...classification, summary: summaries[classification.category] };
+}
+
 export class CodexRpcError extends Error {
   constructor(
     readonly code: number,
@@ -35,6 +85,7 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
   let serial = 0;
   let closed = false;
   let refusalClassification: ErrorClassification | undefined;
+  let failureClassification: ErrorClassification | undefined;
   let started = false;
   let startingTurn = false;
   let sawTurnStarted = false;
@@ -208,9 +259,22 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
         }
       }
     }
+    if (message.method === 'error') {
+      // Retrying notifications are not the turn's final outcome. A terminal
+      // notification can still explain an EOF before turn/completed arrives.
+      failureClassification =
+        params.willRetry === false ? classifyTurnFailure(params.error) : undefined;
+    }
     ports.event(message.method, params);
     if (message.method === 'turn/completed') {
-      const status = object(params.turn)?.status;
+      const turn = object(params.turn);
+      const status = turn?.status;
+      failureClassification =
+        status === 'failed'
+          ? turn?.error == null
+            ? failureClassification
+            : classifyTurnFailure(turn.error)
+          : undefined;
       terminal(status === 'completed' ? undefined : 'Codex turn did not complete successfully');
     }
   }
@@ -304,6 +368,9 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
     // in the same chunk can overtake start()'s promise rejection handler.
     get refusalClassification() {
       return refusalClassification ? { ...refusalClassification } : undefined;
+    },
+    get failureClassification() {
+      return failureClassification ? { ...failureClassification } : undefined;
     },
     get threadId() {
       return threadId;

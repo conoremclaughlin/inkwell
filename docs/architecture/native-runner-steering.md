@@ -82,6 +82,15 @@ retained, not provider diagnostics. Unrelated initialization errors and ambiguou
 `turn/start` failures do not receive this classification. No receipt silently
 retries or becomes ordinary mail.
 
+Scoped provider turn failures preserve actionable quota, authentication and
+network classifications without retaining diagnostic text. The v2 wire error
+variant takes precedence over message matching; only a non-retrying error
+notification or the failed turn's own error contributes a classification.
+A successful turn clears an earlier notification, and an explicit final error
+replaces it. These post-acceptance errors cannot become an owner-conflict
+refusal. Session finalization therefore keeps its existing queue policy without
+replaying uncertain steering.
+
 ## Verification and remaining gates
 
 Focused checks cover mailbox durability and races, binding and journal refusal,
