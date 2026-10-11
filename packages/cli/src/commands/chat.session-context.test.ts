@@ -281,18 +281,35 @@ describe('ink chat bounded session-context recovery', () => {
 
   it('reseeds a provider from the persisted note after an explicit native-session invalidation', async () => {
     await turn('First native fixture turn.', 'claude');
+    const initial = state.run.mock.calls[0][0];
+    const initialSeed = initial.backendSessionSeedId;
+    expect(initialSeed).toEqual(expect.any(String));
+    expect(initialSeed.length).toBeGreaterThan(0);
+    expect(initial.backendSessionId).toBeUndefined();
+    state.context.mockRejectedValue(new Error('No second import.'));
+
+    // Positive control: the persisted seed really is eligible for native
+    // resume before the invalidation, rather than this harness always reseeding.
+    await turn('Resume control fixture turn.', 'claude');
+    const control = state.run.mock.calls[1][0];
+    expect(control.backendSessionId).toBe(initialSeed);
+    expect(control.backendSessionSeedId).toBeUndefined();
+
     const path = transcriptPath();
     const ledger = new ContextLedger();
     const hydrated = hydrateLedgerFromTranscript(ledger, path);
     const writer = new SessionLog({ path });
     writer.seed(hydrated.maxEid);
     writer.append({ type: 'backend_session_invalidated', reason: 'synthetic-reseed' });
-    state.context.mockRejectedValue(new Error('No second import.'));
+    await writer.flush();
     await turn('Reseed fixture turn.', 'claude');
-    const request = state.run.mock.calls[1][0];
+    const request = state.run.mock.calls[2][0];
+    expect(request.backendSessionId).toBeUndefined();
+    expect(request.backendSessionSeedId).toEqual(expect.any(String));
+    expect(request.backendSessionSeedId.length).toBeGreaterThan(0);
+    expect(request.backendSessionSeedId).not.toBe(initialSeed);
     expect(request.prompt).toContain('fictional amber kite');
-    expect(request.prompt).toContain('<untrusted-session-activity>');
-    expect(request.sessionId).toBeUndefined();
+    expect(request.prompt.split('<untrusted-session-activity>')).toHaveLength(2);
     expect(state.context).toHaveBeenCalledOnce();
   });
 
