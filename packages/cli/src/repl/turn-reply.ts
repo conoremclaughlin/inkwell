@@ -34,4 +34,9 @@ export function turnReplyEvent(input: {
   };
 }
 
-export { isSendResponseTool, localDeliveredSend, backendSendTarget } from '@inklabs/shared';
+export {
+  isSendResponseTool,
+  localDeliveredSend,
+  backendSendTarget,
+  collectFinalReplyText,
+} from '@inklabs/shared';

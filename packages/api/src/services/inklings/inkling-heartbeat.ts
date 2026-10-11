@@ -297,7 +297,7 @@ export function inklingHeartbeatPrompt(input: {
   timezone: string;
   quietUntil?: string;
 }): string {
-  const { sbSlug, threadKey } = input;
+  const { threadKey } = input;
   const time = localTime(input.now, input.timezone);
   const document = typeof input.heartbeat === 'string' ? input.heartbeat.trim() : INKLING_HEARTBEAT;
   const lines = [
@@ -323,7 +323,7 @@ export function inklingHeartbeatPrompt(input: {
   lines.push(
     '',
     `Your conversation with them is "${threadKey}". If something needs them now, send them one message there:`,
-    `send_to_inbox(threadKey: "${threadKey}", recipientSlug: "${sbSlug}", content: "...")`,
+    `send_response(channel: "inkling", conversationId: "${threadKey}", content: "...")`,
     'If nothing does, end without sending anything. Nothing else you write in this turn reaches them.'
   );
   return lines.join('\n');

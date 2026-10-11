@@ -40,6 +40,7 @@ export {
   TURN_REPLY_TOKEN_ENV,
   LOCAL_TOOL_CALL_PLACEHOLDER,
   userFacingReplyText,
+  collectFinalReplyText,
   parseTurnReplyEvent,
   isSendResponseTool,
   localDeliveredSend,

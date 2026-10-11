@@ -24,6 +24,8 @@ import {
   isImitationResultLine,
   type OpenFence,
 } from './imitation-grammar.js';
+import { findInvokeToolBlocks, stripInvokeToolBlocks } from './invoke-tool-blocks.js';
+import { findLegacyToolBlocks, stripLegacyToolBlocks } from './legacy-tool-blocks.js';
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from './local-tool-placeholder.js';
 
 export interface LocalToolCall {
@@ -1973,7 +1975,7 @@ export function extractToolBlocks(responseText: string): {
   // via the fallback router, and text-form signal_status never halted the
   // continuation loop). Parse and execute the variant so the turn WORKS;
   // the continuation prompt separately steers the model back to the fence.
-  for (const block of findXmlToolBlocks(responseText)) {
+  for (const block of findLegacyToolBlocks(responseText)) {
     const payload = responseText.slice(block.payloadStart, block.payloadEnd).trim();
     if (!payload) continue;
     try {
@@ -2005,6 +2007,19 @@ export function extractToolBlocks(responseText: string): {
     }
   }
 
+  // A provider-native XML spelling is not executable ink syntax. Feed a
+  // refusal back through the existing bounded correction path, rather than
+  // treating it as prose or silently accepting a second argument language.
+  for (const block of findInvokeToolBlocks(responseText)) {
+    malformed.push({
+      tool: block.tool,
+      error:
+        'Unsupported invoke XML. Use a fenced ink-tool JSON object with tool and args; this XML was not executed.',
+      payloadLength: block.end - block.start,
+      fenceClosed: block.closed,
+    });
+  }
+
   // Preserve the model's emission order across both formats.
   indexed.sort((a, b) => a.index - b.index);
   return { calls: indexed.map((entry) => entry.call), malformed, repaired };
@@ -2029,23 +2044,6 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
   return extractToolBlocks(responseText).calls;
 }
 
-/** One monotonic tag scan, including when thousands of open tags lack a close. */
-function* findXmlToolBlocks(text: string) {
-  let start: number | undefined;
-  let payloadStart = 0;
-  for (const tag of text.matchAll(/<\/?tool_call>/gi)) {
-    if (tag[0][1] !== '/') {
-      if (start === undefined) {
-        start = tag.index;
-        payloadStart = tag.index + tag[0].length;
-      }
-    } else if (start !== undefined) {
-      yield { start, payloadStart, payloadEnd: tag.index, end: tag.index + tag[0].length };
-      start = undefined;
-    }
-  }
-}
-
 export function stripLocalToolBlocks(responseText: string): string {
   // Remove ink-tool blocks by the SAME scan the extractor uses — a regex
   // here would disagree with extraction on payloads containing ``` and leak
@@ -2057,13 +2055,7 @@ export function stripLocalToolBlocks(responseText: string): string {
     cursor = block.end;
   }
   out += responseText.slice(cursor);
-  let visible = '';
-  cursor = 0;
-  for (const block of findXmlToolBlocks(out)) {
-    visible += out.slice(cursor, block.start);
-    cursor = block.end;
-  }
-  return (visible + out.slice(cursor)).trim();
+  return stripInvokeToolBlocks(stripLegacyToolBlocks(out)).trim();
 }
 
 /**

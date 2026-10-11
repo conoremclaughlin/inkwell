@@ -298,10 +298,10 @@ describe('what a beat says to the inkling', () => {
     expect(prompt).toContain('---\nWatch the garden.\n---');
     expect(prompt).toContain('Thursday, October 8 at 9:00 AM (America/Los_Angeles)');
     expect(prompt).toContain(
-      `send_to_inbox(threadKey: "chat:conversation-own", recipientSlug: "${SLUG}", content: "...")`
+      `send_response(channel: "inkling", conversationId: "chat:conversation-own", content: "...")`
     );
     expect(prompt).toMatch(/If nothing does, end without sending anything\./);
-    expect(prompt).not.toMatch(/send_response/);
+    expect(prompt).not.toMatch(/send_to_inbox/);
   });
 
   it('the starter text when no heartbeat was ever written, and none when it emptied its own', () => {
@@ -310,7 +310,9 @@ describe('what a beat says to the inkling', () => {
     );
     const emptied = inklingHeartbeatPrompt({ ...base, heartbeat: '   ' });
     expect(emptied).not.toContain('Your heartbeat document follows');
-    expect(emptied).toContain('send_to_inbox(threadKey: "chat:conversation-own"');
+    expect(emptied).toContain(
+      'send_response(channel: "inkling", conversationId: "chat:conversation-own"'
+    );
   });
 
   it('reads the time in UTC when the person’s timezone is not one', () => {
