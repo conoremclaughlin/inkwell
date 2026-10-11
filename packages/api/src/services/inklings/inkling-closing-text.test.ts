@@ -563,6 +563,14 @@ describe('the common send_response inkling channel', () => {
     );
   }
 
+  it('does not retain an external-listener delivery mark for an Inkling conversation', async () => {
+    const { consumeExplicitResponse } = await import('../../mcp/tools/response-handlers');
+    const key = 'chat:synthetic-no-external-mark';
+    await ownerStarts(['pip'], key);
+    expect((await send(key)).isError).not.toBe(true);
+    expect(consumeExplicitResponse('inkling', key)).toBe(false);
+  });
+
   it('stores as the caller through the real thread gate, wakes nobody, and suppresses fallback', async () => {
     const wake = await ownerStarts();
     const boundary = await turnStarts(wake);

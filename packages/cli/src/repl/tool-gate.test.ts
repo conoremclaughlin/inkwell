@@ -1,8 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { ToolPolicyState } from './tool-policy.js';
 import { ensureInkToolAllowed } from './tool-gate.js';
+import { applyProfile } from './tool-profiles.js';
 
 describe('ensureInkToolAllowed', () => {
+  it('uses parsed arguments for typed Inkling sends without opening external channels', async () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    applyProfile(policy, 'tools');
+    const request = (channel: string) => ({
+      policy,
+      tool: 'send_response',
+      args: { channel },
+      prompt: async () => {
+        throw new Error('Channel restrictions must not prompt');
+      },
+    });
+    expect(await ensureInkToolAllowed(request('inkling'))).toBe(true);
+    expect(await ensureInkToolAllowed(request('telegram'))).toBe(false);
+  });
   it('allows already-allowed tools without prompting', async () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     let prompted = false;

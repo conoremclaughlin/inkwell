@@ -9536,6 +9536,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const approved = await ensureInkToolAllowed({
               policy: toolPolicy,
               tool,
+              args: inkArgs,
               sessionId: runtime.sessionId,
               prompt: (reason) =>
                 promptForToolApproval(
@@ -9657,6 +9658,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const approved = await ensureInkToolAllowed({
             policy: toolPolicy,
             tool,
+            args: inkArgs,
             sessionId: runtime.sessionId,
             prompt: (reason) =>
               promptForToolApproval(

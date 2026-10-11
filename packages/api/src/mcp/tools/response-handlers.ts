@@ -255,7 +255,8 @@ export async function handleSendResponse(
       }
       const { sendInklingResponse } = await import('./inkling-response.js');
       const result = await sendInklingResponse(_dataComposer, args);
-      markExplicitResponse(args.channel, args.conversationId);
+      // Inkling fallback suppression reads durable thread messages. No
+      // external listener consumes a delivery marker for this channel.
       return mcpResponse(result);
     }
     logger.info(`send_response called for channel: ${args.channel}`, {
