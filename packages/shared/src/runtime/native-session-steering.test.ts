@@ -342,6 +342,85 @@ describe('native generation steering, with only in-memory log and fake dispatch'
     expect(next.dispatch).not.toHaveBeenCalled();
   });
 
+  it.each(['end', 'close'] as const)(
+    'persists refusal when %s races a successful initial pending receipt flush',
+    async (action) => {
+      const writing = deferred(),
+        gate = deferred();
+      const f = fixture(async (event) => {
+        if (event.type === 'native_steering_receipt' && event.status === 'pending') {
+          writing.resolve();
+          await gate.promise;
+        }
+      });
+      const admission = f.steering.submit(request());
+      await writing.promise;
+      expect(f.dispatch).not.toHaveBeenCalled();
+      const end = f.steering[action]();
+      gate.resolve();
+      const receipt = {
+        messageId: request().messageId,
+        status: 'refused',
+        reason: action === 'end' ? 'turn_finished' : 'owner_stopped',
+      };
+      expect(await admission).toEqual(receipt);
+      await end;
+      expect(await f.steering.submit(request())).toEqual(receipt);
+      expect(f.events.at(-1)).toMatchObject({ type: 'native_steering_receipt', ...receipt });
+      expect(f.receipts).toEqual([receipt]);
+      expect(f.dispatch).not.toHaveBeenCalled();
+      expect(() => f.steering.assertHealthy()).not.toThrow();
+    }
+  );
+
+  it.each(['pending', 'refused', 'retired-owner'] as const)(
+    'keeps the outcome unknown when a terminal pending flush encounters %s uncertainty',
+    async (failure) => {
+      const writing = deferred(),
+        gate = deferred();
+      const f = fixture(async (event) => {
+        if (event.type !== 'native_steering_receipt') return;
+        if (event.status === 'pending') {
+          writing.resolve();
+          await gate.promise;
+        }
+        if (event.status === failure) throw new Error('Synthetic terminal persistence failure');
+      });
+      const admission = f.steering.submit(request());
+      await writing.promise;
+      const end = f.steering.end();
+      if (failure === 'retired-owner') f.retire();
+      gate.resolve();
+      expect(await admission).toMatchObject({ status: 'unknown' });
+      await end;
+      expect(await f.steering.submit(request())).toMatchObject({ status: 'unknown' });
+      expect(f.receipts.every((receipt) => receipt.status === 'unknown')).toBe(true);
+      expect(f.dispatch).not.toHaveBeenCalled();
+    }
+  );
+
+  it('keeps a dispatched request unknown when end races its accepted pending receipt flush', async () => {
+    const writing = deferred(),
+      gate = deferred();
+    const f = fixture(async (event) => {
+      if (event.type === 'native_steering_receipt' && event.reason === 'provider_accepted') {
+        writing.resolve();
+        await gate.promise;
+      }
+    });
+    await f.steering.submit(request());
+    f.rpc.resolve({ status: 'accepted' });
+    await writing.promise;
+    const end = f.steering.end();
+    gate.resolve();
+    await end;
+    await f.steering.settled();
+    expect(await f.steering.submit(request())).toMatchObject({ status: 'unknown' });
+    expect(f.events.at(-1)).toMatchObject({ type: 'native_steering_receipt', status: 'unknown' });
+    expect(f.receipts.some((receipt) => receipt.status === 'refused')).toBe(false);
+    expect(f.dispatch).toHaveBeenCalledOnce();
+  });
+
   it.each(['native_steering_observation', 'native_steering_receipt'])(
     'records uncertainty if Stop races the %s insertion barrier',
     async (type) => {

@@ -241,9 +241,14 @@ export function createNativeSessionSteering(ports: NativeSessionSteeringPorts) {
           await flush();
           assertHealthy();
           if (!accepting) return await refuse(entry, endReason);
-          await recordReceipt(entry, receipt);
+          // This first receipt precedes dispatch. A clean terminal crossing
+          // its flush can still be refused definitively; it is not the
+          // uncertainty of a post-dispatch receipt crossing the same fence.
+          append('native_steering_receipt', { ...receipt });
+          await flush();
           assertHealthy();
           if (!accepting) return await refuse(entry, endReason);
+          publish(entry, receipt);
           dispatch(entry);
           assertHealthy();
           if (!accepting) return await unknown(entry, endReason);
