@@ -176,9 +176,21 @@ export const outboundMediaEntrySchema = z.union([
 
 export const sendResponseSchema = z.object({
   channel: z
-    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'agent'])
+    .enum([
+      'telegram',
+      'terminal',
+      'discord',
+      'whatsapp',
+      'slack',
+      'http',
+      'api',
+      'agent',
+      'inkling',
+    ])
     .describe('Channel to send the response to'),
-  conversationId: z.string().describe('Conversation ID to route the response to'),
+  conversationId: z
+    .string()
+    .describe('Conversation ID; for inkling, the existing conversation thread key or UUID'),
   content: z.string().describe('The response content to send'),
   format: z
     .enum(['text', 'markdown', 'code', 'json'])
@@ -229,6 +241,23 @@ export async function handleSendResponse(
   _dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
+    if (args.channel === 'inkling') {
+      if (
+        args.media?.length ||
+        args.voiceReply ||
+        args.ttsVoice ||
+        args.replyToMessageId ||
+        Object.keys(args.metadata ?? {}).length
+      ) {
+        throw new Error(
+          'The inkling channel currently supports text only; media, voice and reply metadata are not supported'
+        );
+      }
+      const { sendInklingResponse } = await import('./inkling-response.js');
+      const result = await sendInklingResponse(_dataComposer, args);
+      markExplicitResponse(args.channel, args.conversationId);
+      return mcpResponse(result);
+    }
     logger.info(`send_response called for channel: ${args.channel}`, {
       conversationId: args.conversationId,
       contentLength: args.content.length,

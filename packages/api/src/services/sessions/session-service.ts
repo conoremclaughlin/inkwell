@@ -118,7 +118,7 @@ import {
   fenceInkling,
   inklingFenceHolds,
 } from '../inklings/inkling-stop-fence.js';
-import { inklingRuntime } from '../inklings/inkling-runtime.js';
+import { inklingRuntime, inklingReplyPrompt } from '../inklings/inkling-runtime.js';
 import { inkProviderFor, type InkProvider } from './ink-provider.js';
 import { inklingOwnerTestUserIds, inklingTurnTimeoutMs } from '../../config/inkling-flags.js';
 import {
@@ -2936,7 +2936,9 @@ export class SessionService implements ISessionService {
             studioId: session.studioId || undefined,
             threadKey: session.threadKey || undefined,
           }
-        ) + executionTierPrompt(executionTier),
+        ) +
+        executionTierPrompt(executionTier) +
+        (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : ''),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       ...(inkAccessToken ? { inkAccessToken } : {}),

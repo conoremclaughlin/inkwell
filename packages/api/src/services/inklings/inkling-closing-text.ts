@@ -32,6 +32,7 @@
  * but two server processes could still each post one.
  */
 
+import { userFacingReplyText } from '@inklabs/shared';
 import type { DataComposer } from '../../data/composer';
 import { handleSendToInbox } from '../../mcp/tools/inbox-handlers';
 import { logger } from '../../utils/logger';
@@ -108,8 +109,9 @@ export interface ClosingTextTurn extends ClosingTextWake {
 
 /** The closing text as posted: trimmed, and cut by code points so a pair is never split. */
 export function closingText(text: string | undefined): string | null {
-  if (typeof text !== 'string') return null;
-  const trimmed = text.trim();
+  const visible = userFacingReplyText(text);
+  if (visible === null) return null;
+  const trimmed = visible.trim();
   if (trimmed === '') return null;
   const points = Array.from(trimmed);
   return points.length <= CLOSING_TEXT_MAX

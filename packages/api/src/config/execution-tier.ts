@@ -5,7 +5,7 @@
  * tools are available and the setting we put on the deployment").
  *
  * - `tools`: Inkwell's tools, and reads inside the SB's own folder. No shell,
- *   no file edits or writes, no shared-image reads, no trigger_agent, no
+ *   no file edits or writes, no shared-image reads, no trigger_agent, no external-channel
  *   send_response, no tools of the model provider's own, and none of this
  *   machine's tool grants. It runs only on ink, which enforces it. These are
  *   limits on the turn's local tools only: send_to_inbox stays, and whom it
@@ -144,5 +144,5 @@ export function executionTierPrompt(tier: ExecutionTier): string {
   return `
 
 ### Your environment
-This server runs your turns on its tools tier. You have Inkwell's tools, and you can read files in your own folder. There is no shell, and you can't edit or write files. Reply in your conversation with \`send_to_inbox\`. When something needs more than these tools, say so plainly rather than looking for another way.`;
+This server runs your turns on its tools tier. You have Inkwell's tools, and you can read files in your own folder. There is no shell, and you can't edit or write files. For an Inkling conversation, reply with \`send_response\` using \`channel: "inkling"\` and its thread key as \`conversationId\`. The inkling channel supports text only; other send_response channels are unavailable on this tier. For ordinary SB threads use send_to_inbox. When something needs more than these tools, say so plainly rather than looking for another way.`;
 }

@@ -23,6 +23,7 @@ import { acceptsContextImagesFor, promptTransportFor } from '../backends/index.j
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
+  collectFinalReplyText,
   backendSendTarget,
   continuationPrompt,
   localDeliveredSend,
@@ -8526,6 +8527,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Only the last turn's text used to survive the run (turn-reply.ts). The
     // server mints the token only when it forwards these lines, so without one
     // nothing is printed.
+    let finalReplyText: string | null = null;
     const runTurnAndReport = async (
       turn: number,
       raw: string,
@@ -8536,6 +8538,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       turnSends = [];
       pendingBackendSends.clear();
       await enqueueTurn(raw, source, label);
+      finalReplyText = collectFinalReplyText(finalReplyText, lastTurnAssistantText);
       if (!turnReplyToken) return;
       console.log(
         JSON.stringify(
@@ -8627,10 +8630,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Emit structured result for machine consumers (InkRunner, etc.).
     // Must come before human-readable status lines so parsers can
     // distinguish the assistant's response from CLI chrome.
-    const lastAssistant = ledger
-      .listEntries()
-      .filter((e) => e.role === 'assistant')
-      .pop();
     // Context utilization from our budget's view: transcript + identity.
     // The server (InkRunner) persists this so session-level token tracking
     // works for the ink backend — without it, sessions report 0 context
@@ -8641,7 +8640,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log(
       JSON.stringify({
         type: 'result',
-        text: lastAssistant?.content || null,
+        text: isBackendFailure ? null : finalReplyText,
         sessionId: runtime.sessionId || null,
         phase,
         signal: finalSignal?.status || null,

@@ -26,6 +26,7 @@
  *   sends each turn made; it says so on the same line as the text.
  */
 
+import { stripLocalToolBlocks } from '../runtime/agent-loop.js';
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from '../runtime/local-tool-placeholder.js';
 
 export { LOCAL_TOOL_CALL_PLACEHOLDER };
@@ -81,8 +82,9 @@ export interface TurnReplyEvent extends TurnReply {
 export function userFacingReplyText(text: string | null | undefined): string | null {
   if (typeof text !== 'string') return null;
   const trimmed = text.trim();
-  if (!trimmed || trimmed === LOCAL_TOOL_CALL_PLACEHOLDER) return null;
-  return text;
+  const visible = stripLocalToolBlocks(text);
+  if (!visible || visible === LOCAL_TOOL_CALL_PLACEHOLDER) return null;
+  return visible === trimmed ? text : visible;
 }
 
 function isTurnSend(value: unknown): value is TurnSend {
