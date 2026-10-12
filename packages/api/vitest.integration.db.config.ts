@@ -1,6 +1,14 @@
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@inklabs/shared/node-host': path.resolve(__dirname, '../shared/src/node-host/index.ts'),
+      '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
+      '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
+    },
+  },
   test: {
     globals: true,
     environment: 'node',
