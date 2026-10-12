@@ -799,8 +799,12 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
     const consumerPolicy = new ToolPolicyState('backend', {
       context: { sbSlug: inkling.sbSlug },
     });
-    consumerPolicy.persistentGrant('bash', { scope: 'sb', id: inkling.sbSlug });
-    expect(consumerPolicy.inspectInkTool('bash').allowed).toBe(true);
+    consumerPolicy.addPromptTool('bash');
+    consumerPolicy.persistentGrant('bash', { scope: 'agent', id: inkling.sbSlug });
+    expect(consumerPolicy.inspectInkTool('bash')).toEqual({
+      allowed: true,
+      reason: 'Tool explicitly allowed by scoped policy.',
+    });
     const consumerPolicyPath = inklingToolPolicyPath(inkling.sbId, join(root, 'inklings'));
     await mkdir(join(root, 'inklings', '.tool-policy'), { recursive: true });
     await writeFile(consumerPolicyPath, JSON.stringify(consumerPolicy.snapshot()));
