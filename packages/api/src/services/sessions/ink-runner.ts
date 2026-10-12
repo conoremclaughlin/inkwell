@@ -13,6 +13,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import type {
+  CacheEvidence,
   InjectedContext,
   ClaudeRunnerConfig,
   RunnerResult,
@@ -180,9 +181,31 @@ interface InkRunUsage {
   cacheWriteTokens?: number;
   modelUsage?: Record<string, ModelUsageTotals>;
   providerContextTokens?: number;
-  cacheTtlSeconds?: number;
+  cacheEvidence?: CacheEvidence;
   lastRequestStartedAt?: string;
   providerSessionId?: string;
+}
+
+/**
+ * The CLI's cache evidence, or undefined when it is missing or malformed.
+ * Undefined reads as unknown downstream, which arms nothing.
+ */
+function parseCacheEvidence(value: unknown): CacheEvidence | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const scope = {
+    ...(typeof raw.providerSessionId === 'string' && raw.providerSessionId.trim()
+      ? { providerSessionId: raw.providerSessionId }
+      : {}),
+    ...(typeof raw.model === 'string' && raw.model.trim() ? { model: raw.model } : {}),
+  };
+  if (raw.kind === 'unknown') return { kind: 'unknown' };
+  if (raw.kind === 'read-only') return { kind: 'read-only', ...scope };
+  if (raw.kind === 'ttl') {
+    const seconds = positiveNumber(raw.seconds);
+    return seconds === undefined ? undefined : { kind: 'ttl', seconds, ...scope };
+  }
+  return undefined;
 }
 
 /** A positive finite number from the CLI's JSON, else undefined. Older builds omit these fields. */
@@ -1037,7 +1060,7 @@ export class InkRunner implements IRunner {
             // builds omit it; the field is simply absent then, never faked.
             const modelUsage = parseInkModelUsage(parsed.modelUsage);
             const providerContextTokens = positiveNumber(parsed.usage.providerContextTokens);
-            const cacheTtlSeconds = positiveNumber(parsed.usage.cacheTtlSeconds);
+            const cacheEvidence = parseCacheEvidence(parsed.usage.cacheEvidence);
             const providerSessionId =
               typeof parsed.usage.providerSessionId === 'string' &&
               parsed.usage.providerSessionId.trim()
@@ -1057,7 +1080,7 @@ export class InkRunner implements IRunner {
               cacheWriteTokens,
               ...(modelUsage ? { modelUsage } : {}),
               ...(providerContextTokens !== undefined ? { providerContextTokens } : {}),
-              ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
+              ...(cacheEvidence !== undefined ? { cacheEvidence } : {}),
               ...(lastRequestStartedAt !== undefined ? { lastRequestStartedAt } : {}),
               ...(providerSessionId !== undefined ? { providerSessionId } : {}),
             };

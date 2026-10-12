@@ -78,6 +78,14 @@ function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {})
   };
 }
 
+const SCOPE = { providerSessionId: 'native-1', model: 'claude-opus-5-5' };
+const ttl = (seconds: number) => ({ kind: 'ttl' as const, seconds, ...SCOPE });
+const readOnly = (scope: { providerSessionId?: string; model?: string } = {}) => ({
+  kind: 'read-only' as const,
+  ...SCOPE,
+  ...scope,
+});
+
 function run(overrides: Partial<IdleRunReport> = {}): IdleRunReport {
   return {
     sessionId: 'session-a',
@@ -85,10 +93,8 @@ function run(overrides: Partial<IdleRunReport> = {}): IdleRunReport {
     sbSlug: 'myra',
     sbId: 'sb-1',
     providerContextTokens: 292_000,
-    cacheTtlSeconds: HOUR,
+    cacheEvidence: ttl(HOUR),
     lastRequestStartedAt: new Date(T0).toISOString(),
-    providerSessionId: 'native-1',
-    model: 'claude-opus-5-5',
     ...overrides,
   };
 }
@@ -126,7 +132,7 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
     expect(
       h.scheduler.noteRunFinished(
         run({
-          cacheTtlSeconds: 300,
+          cacheEvidence: ttl(300),
           lastRequestStartedAt: new Date(T0 - 270 * 1000).toISOString(),
         })
       )
@@ -169,7 +175,7 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
 
   it('caps the margin at a fifth of a five-minute lifetime', () => {
     const h = harness();
-    const decision = h.scheduler.noteRunFinished(run({ cacheTtlSeconds: 300 }));
+    const decision = h.scheduler.noteRunFinished(run({ cacheEvidence: ttl(300) }));
     expect(decision).toMatchObject({ armed: true, fireAt: T0 + 240 * 1000 });
   });
 
@@ -189,15 +195,33 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
       reason: 'no provider measurement',
     });
     expect(
-      h.scheduler.noteRunFinished(run({ sessionId: 'session-b', cacheTtlSeconds: undefined }))
+      h.scheduler.noteRunFinished(run({ sessionId: 'session-b', cacheEvidence: undefined }))
     ).toEqual({ armed: false, reason: 'cache lifetime unknown' });
   });
 
   it("keeps the session's last written lifetime through a run that only read the cache", () => {
     const h = harness();
     h.scheduler.noteRunFinished(run({ providerContextTokens: 90_000 }));
-    const decision = h.scheduler.noteRunFinished(run({ cacheTtlSeconds: undefined }));
+    const decision = h.scheduler.noteRunFinished(run({ cacheEvidence: readOnly() }));
     expect(decision).toMatchObject({ armed: true, expiresAt: T0 + HOUR * 1000 });
+  });
+
+  // Lumen, #845 r3: an unknown write may have replaced what was cached, so it
+  // inherits nothing and forgets what was learned; absent evidence is unknown.
+  it('an unknown or absent write inherits nothing, and forgets the learned lifetime', () => {
+    for (const unknown of [{ kind: 'unknown' as const }, undefined]) {
+      const h = harness();
+      h.scheduler.noteRunFinished(run({ providerContextTokens: 90_000 }));
+      expect(h.scheduler.noteRunFinished(run({ cacheEvidence: unknown }))).toEqual({
+        armed: false,
+        reason: 'cache lifetime unknown',
+      });
+      // A read-only run after it has nothing left to inherit.
+      expect(h.scheduler.noteRunFinished(run({ cacheEvidence: readOnly() }))).toEqual({
+        armed: false,
+        reason: 'cache lifetime unknown',
+      });
+    }
   });
 
   // Lumen, #845 r2: a lifetime learned under one native session or model says
@@ -211,7 +235,7 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
     ] as const) {
       const h = harness();
       h.scheduler.noteRunFinished(run({ providerContextTokens: 90_000 }));
-      const decision = h.scheduler.noteRunFinished(run({ cacheTtlSeconds: undefined, ...later }));
+      const decision = h.scheduler.noteRunFinished(run({ cacheEvidence: readOnly(later) }));
       expect(decision.armed, what).toBe(expected);
       if (!expected)
         expect(decision, what).toEqual({ armed: false, reason: 'cache lifetime unknown' });

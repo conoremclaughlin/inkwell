@@ -37,6 +37,8 @@
  * bounds how often this runs.
  */
 
+import type { CacheEvidence } from './types.js';
+
 export interface IdleCompactionConfig {
   enabled: boolean;
   /** Provider context below which a compaction is not worth what it loses. */
@@ -71,16 +73,10 @@ export interface IdleRunReport {
   /** The session's contact scope, so the turn is admitted in that scope only. */
   contactId?: string;
   providerContextTokens?: number;
-  cacheTtlSeconds?: number;
+  /** What the run left in its prompt cache, with its scope. Absent is unknown. */
+  cacheEvidence?: CacheEvidence;
   /** When the run's last provider invocation began (ISO): the cache's clock. */
   lastRequestStartedAt?: string;
-  /**
-   * The native provider session and the model the run ended on. A cache
-   * lifetime learned under one pair says nothing about another, so a run
-   * that reports no lifetime of its own inherits one only when both match.
-   */
-  providerSessionId?: string;
-  model?: string;
   /** The run was itself an idle compaction. */
   idleCompaction?: boolean;
 }
@@ -140,10 +136,10 @@ interface LearnedLifetime {
 export class IdleCompactionScheduler {
   private readonly timers = new Map<string, ArmedTimer>();
   /**
-   * The last cache lifetime each session reported, with the native session
-   * and model it was written under. A run that only read the cache reports
-   * none, and the lifetime it read under is still the last one written, but
-   * only for the same native session and model.
+   * The last cache lifetime each session wrote, with the native session and
+   * model it was written under. A read-only run inherits it only in that same
+   * scope; an unknown run forgets it, since whatever it wrote may have
+   * replaced it (Lumen, #845 r3).
    */
   private readonly lifetimes = new Map<string, LearnedLifetime>();
   /**
@@ -165,17 +161,11 @@ export class IdleCompactionScheduler {
     // Any run supersedes the timer an earlier one armed: it used the cache,
     // so the earlier expiry no longer holds.
     this.cancel(report.sessionId);
-    if (report.cacheTtlSeconds !== undefined) {
-      this.lifetimes.set(report.sessionId, {
-        ttl: report.cacheTtlSeconds,
-        providerSessionId: report.providerSessionId,
-        model: report.model,
-      });
-    }
+    const ttl = this.resolveLifetime(report);
     if (report.idleCompaction && report.providerContextTokens !== undefined) {
       this.baselines.set(report.sessionId, report.providerContextTokens);
     }
-    const decision = this.decide(report);
+    const decision = this.decide(report, ttl);
     if (!decision.armed) {
       this.deps.log('idle compaction not armed', {
         sessionId: report.sessionId,
@@ -184,7 +174,7 @@ export class IdleCompactionScheduler {
       return decision;
     }
     const providerContextTokens = report.providerContextTokens as number;
-    const cacheTtlSeconds = this.lifetimeFor(report) as number;
+    const cacheTtlSeconds = ttl as number;
     const handle = this.deps.setTimer(() => {
       void this.fire(report.sessionId).catch((error) => {
         this.deps.log('idle compaction failed', {
@@ -278,22 +268,35 @@ export class IdleCompactionScheduler {
     return this.generations.get(sessionId) ?? 0;
   }
 
-  private lifetimeFor(report: IdleRunReport): number | undefined {
-    if (report.cacheTtlSeconds !== undefined) return report.cacheTtlSeconds;
+  /** Learns from, or forgets on, this run's evidence; returns the lifetime it supports. */
+  private resolveLifetime(report: IdleRunReport): number | undefined {
+    const evidence = report.cacheEvidence ?? { kind: 'unknown' as const };
+    if (evidence.kind === 'ttl') {
+      this.lifetimes.set(report.sessionId, {
+        ttl: evidence.seconds,
+        providerSessionId: evidence.providerSessionId,
+        model: evidence.model,
+      });
+      return evidence.seconds;
+    }
+    if (evidence.kind === 'unknown') {
+      this.lifetimes.delete(report.sessionId);
+      return undefined;
+    }
     const learned = this.lifetimes.get(report.sessionId);
-    if (!learned || report.providerSessionId === undefined) return undefined;
-    return learned.providerSessionId === report.providerSessionId && learned.model === report.model
+    if (!learned || evidence.providerSessionId === undefined) return undefined;
+    return learned.providerSessionId === evidence.providerSessionId &&
+      learned.model === evidence.model
       ? learned.ttl
       : undefined;
   }
 
-  private decide(report: IdleRunReport): IdleArmDecision {
+  private decide(report: IdleRunReport, ttl: number | undefined): IdleArmDecision {
     if (!this.config.enabled) return { armed: false, reason: 'disabled' };
     if (this.stopped) return { armed: false, reason: 'stopped' };
     if (report.idleCompaction) {
       return { armed: false, reason: 'this run was an idle compaction' };
     }
-    const ttl = this.lifetimeFor(report);
     if (ttl === undefined) return { armed: false, reason: 'cache lifetime unknown' };
     const startedAt =
       report.lastRequestStartedAt !== undefined ? Date.parse(report.lastRequestStartedAt) : NaN;

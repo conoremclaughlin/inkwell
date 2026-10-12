@@ -12,6 +12,17 @@ import type { InkProvider } from './ink-provider';
 // ─── Channel Types ───
 
 // Keep aligned with src/agent/types.ts ChannelType
+/**
+ * What a run left in its session's prompt cache, as ink chat reports it: a
+ * lifetime it wrote, provably nothing (read-only), or unknown. The native
+ * session and model travel with it, since a lifetime is a fact about one
+ * cache entry (Lumen, #845 r3).
+ */
+export type CacheEvidence =
+  | { kind: 'ttl'; seconds: number; providerSessionId?: string; model?: string }
+  | { kind: 'read-only'; providerSessionId?: string; model?: string }
+  | { kind: 'unknown' };
+
 export type ChannelType =
   | 'telegram'
   | 'terminal'
@@ -428,8 +439,11 @@ export interface SessionResult {
      * covers the native session history the ledger no longer holds.
      */
     providerContextTokens?: number;
-    /** The prompt-cache lifetime the run last wrote at (ink on Claude only). */
-    cacheTtlSeconds?: number;
+    /**
+     * What the run left in its prompt cache, scoped to the native session and
+     * model it ran under (ink on Claude only). Absent reads as unknown.
+     */
+    cacheEvidence?: CacheEvidence;
     /** The native provider session the run ended on (ink only). */
     providerSessionId?: string;
     /**

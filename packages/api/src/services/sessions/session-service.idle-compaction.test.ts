@@ -155,7 +155,7 @@ describe('SessionService idle compaction', () => {
       run: vi.fn(async () =>
         inkResult({
           providerContextTokens: 292_000,
-          cacheTtlSeconds: 3600,
+          cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
           lastRequestStartedAt: new Date().toISOString(),
         })
       ),
@@ -199,7 +199,10 @@ describe('SessionService idle compaction', () => {
 
     // The compaction turn leaves the context small, as compact_context does.
     (inkRunner.run as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      inkResult({ providerContextTokens: 86_000, cacheTtlSeconds: 3600 })
+      inkResult({
+        providerContextTokens: 86_000,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      })
     );
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
@@ -261,7 +264,10 @@ describe('SessionService idle compaction', () => {
 
   it('does not arm when the provider context is under the floor', async () => {
     (inkRunner.run as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      inkResult({ providerContextTokens: 117_319, cacheTtlSeconds: 3600 })
+      inkResult({
+        providerContextTokens: 117_319,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      })
     );
     await service.handleMessage(message());
     await vi.advanceTimersByTimeAsync(2 * HOUR_MS);
@@ -307,7 +313,7 @@ describe('SessionService idle compaction', () => {
       if (starts.length === 1) await new Promise((resolve) => setTimeout(resolve, 4 * 60 * 1000));
       return inkResult({
         providerContextTokens: 292_000,
-        cacheTtlSeconds: 300,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 300 },
         lastRequestStartedAt: new Date(startedAt).toISOString(),
       });
     });
@@ -377,7 +383,10 @@ describe('SessionService idle compaction', () => {
 
     (inkRunner.run as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
       await realHeld;
-      return inkResult({ providerContextTokens: 100_000, cacheTtlSeconds: 3600 });
+      return inkResult({
+        providerContextTokens: 100_000,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      });
     });
     const real = service.handleMessage(message('A real message'));
     await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
