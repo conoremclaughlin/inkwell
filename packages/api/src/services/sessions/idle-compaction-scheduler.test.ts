@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_IDLE_COMPACTION_CONFIG,
-  effectiveWakeAt,
   IdleCompactionScheduler,
   type IdleCompactionDeps,
   type IdleRunReport,
@@ -17,16 +16,19 @@ interface Harness {
   timers: Array<{ fn: () => void; ms: number; cleared: boolean }>;
   delivered: Array<Parameters<IdleCompactionDeps['deliver']>[0]>;
   setState(state: IdleSessionState | null): void;
-  setWake(wake: Date | null | Error): void;
+  /** Hold the next session-state read open until the returned release is called. */
+  holdStateRead(): () => void;
+  setNow(ms: number): void;
 }
 
 function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {}): Harness {
   const timers: Harness['timers'] = [];
   const delivered: Harness['delivered'] = [];
   let state: IdleSessionState | null = { busy: false, ended: false };
-  let wake: Date | null | Error = null;
+  let held: Promise<void> | null = null;
+  let now = T0;
   const deps: IdleCompactionDeps = {
-    now: () => T0,
+    now: () => now,
     setTimer: (fn, ms) => {
       const timer = { fn, ms, cleared: false };
       timers.push(timer);
@@ -35,11 +37,10 @@ function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {})
     clearTimer: (handle) => {
       (handle as { cleared: boolean }).cleared = true;
     },
-    nextScheduledWakeAt: async () => {
-      if (wake instanceof Error) throw wake;
-      return wake;
+    sessionState: async () => {
+      if (held) await held;
+      return state;
     },
-    sessionState: async () => state,
     deliver: async (input) => {
       delivered.push(input);
     },
@@ -56,8 +57,18 @@ function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {})
     setState: (next) => {
       state = next;
     },
-    setWake: (next) => {
-      wake = next;
+    holdStateRead: () => {
+      let release!: () => void;
+      held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return () => {
+        held = null;
+        release();
+      };
+    },
+    setNow: (ms) => {
+      now = ms;
     },
   };
 }
@@ -217,22 +228,69 @@ describe('IdleCompactionScheduler.fire', () => {
     expect(h.scheduler.armedSessionIds()).toEqual([]);
   });
 
-  it('delivers when the next reminder falls after the cache expires', async () => {
+  it('skips a timer that fires after the cache has already expired', async () => {
     const h = harness();
-    h.setWake(new Date(T0 + 61 * 60 * 1000));
     h.scheduler.noteRunFinished(run());
-    await expect(h.scheduler.fire('session-a')).resolves.toEqual({ delivered: true });
-  });
-
-  it('skips when a reminder is due before the cache expires: that wake reads it warm', async () => {
-    const h = harness();
-    h.setWake(new Date(T0 + 58 * 60 * 1000));
-    h.scheduler.noteRunFinished(run());
+    h.setNow(T0 + HOUR * 1000);
     await expect(h.scheduler.fire('session-a')).resolves.toEqual({
       delivered: false,
-      reason: 'a reminder is due at 2026-10-12T06:58:00.000Z, before the cache expires',
+      reason: 'the cache has already expired',
     });
     expect(h.delivered).toEqual([]);
+  });
+
+  it('skips when the cache expires while the session state is being read', async () => {
+    const h = harness();
+    h.scheduler.noteRunFinished(run());
+    const release = h.holdStateRead();
+    const fired = h.scheduler.fire('session-a');
+    h.setNow(T0 + HOUR * 1000);
+    release();
+    await expect(fired).resolves.toEqual({
+      delivered: false,
+      reason: 'the cache has already expired',
+    });
+    expect(h.delivered).toEqual([]);
+  });
+
+  // Lumen, #845 r1: the candidate used to leave the map before its awaited
+  // checks, so nothing that happened during them could void it.
+  for (const [what, interrupt] of [
+    ['a cancel', (h: Harness) => h.scheduler.cancel('session-a')],
+    ['a stop', (h: Harness) => h.scheduler.stop()],
+    ['a newer run', (h: Harness) => h.scheduler.noteRunFinished(run())],
+  ] as const) {
+    it(`does not deliver when ${what} lands while it is being checked`, async () => {
+      const h = harness();
+      h.scheduler.noteRunFinished(run());
+      const release = h.holdStateRead();
+      const fired = h.scheduler.fire('session-a');
+      interrupt(h);
+      release();
+      await expect(fired).resolves.toEqual({
+        delivered: false,
+        reason: 'superseded while it was checked',
+      });
+      expect(h.delivered).toEqual([]);
+    });
+  }
+
+  it('a newer run during the check keeps its own timer armed', async () => {
+    const h = harness();
+    h.scheduler.noteRunFinished(run());
+    const release = h.holdStateRead();
+    const fired = h.scheduler.fire('session-a');
+    h.scheduler.noteRunFinished(run());
+    release();
+    await fired;
+    expect(h.scheduler.armedSessionIds()).toEqual(['session-a']);
+  });
+
+  it('arms nothing after a stop', () => {
+    const h = harness();
+    h.scheduler.stop();
+    expect(h.scheduler.noteRunFinished(run())).toEqual({ armed: false, reason: 'stopped' });
+    expect(h.timers).toHaveLength(0);
   });
 
   it('skips a busy, ended or vanished session', async () => {
@@ -249,9 +307,11 @@ describe('IdleCompactionScheduler.fire', () => {
     }
   });
 
-  it('does not deliver when the reminder schedule cannot be read', async () => {
+  it('does not deliver when the session state cannot be read', async () => {
     const h = harness();
-    h.setWake(new Error('could not read reminders: boom'));
+    h.deps.sessionState = async () => {
+      throw new Error('boom');
+    };
     h.scheduler.noteRunFinished(run());
     await expect(h.scheduler.fire('session-a')).rejects.toThrow('boom');
     expect(h.delivered).toEqual([]);
@@ -274,62 +334,5 @@ describe('IdleCompactionScheduler.fire', () => {
     h.scheduler.noteRunFinished(run());
     h.timers[0].fn();
     await vi.waitFor(() => expect(deliver).toHaveBeenCalledTimes(1));
-  });
-});
-
-describe('effectiveWakeAt', () => {
-  // 22:00–08:00 Pacific; on 2026-10-11/12 that is UTC-7.
-  const overnight = { start: '22:00', end: '08:00', timezone: 'America/Los_Angeles' };
-  const morning = '2026-10-12T15:00:00.000Z'; // 08:00 PDT
-
-  it('is the earliest due time, and an overdue reminder wakes now', () => {
-    const now = new Date('2026-10-12T19:30:00.000Z'); // 12:30 PDT
-    expect(
-      effectiveWakeAt(
-        [
-          { next_run_at: '2026-10-12T21:00:00Z' },
-          { next_run_at: '2026-10-12T20:00:00Z' },
-          { next_run_at: '2026-10-12T22:00:00Z' },
-        ],
-        overnight,
-        now
-      )?.toISOString()
-    ).toBe('2026-10-12T20:00:00.000Z');
-    expect(
-      effectiveWakeAt([{ next_run_at: '2026-10-12T19:00:00Z' }], overnight, now)?.toISOString()
-    ).toBe(now.toISOString());
-  });
-
-  it('a beat held in quiet hours wakes when they end, not at its stale due time', () => {
-    const now = new Date('2026-10-12T06:30:00.000Z'); // 23:30 PDT
-    expect(
-      effectiveWakeAt([{ next_run_at: '2026-10-12T06:00:00Z' }], overnight, now)?.toISOString()
-    ).toBe(morning);
-  });
-
-  it('a beat that comes due inside the coming quiet window is held to its end', () => {
-    const now = new Date('2026-10-12T04:50:00.000Z'); // 21:50 PDT
-    expect(
-      effectiveWakeAt([{ next_run_at: '2026-10-12T05:00:00Z' }], overnight, now)?.toISOString()
-    ).toBe(morning);
-  });
-
-  it('a reminder allowed to run in quiet hours wakes on time', () => {
-    const now = new Date('2026-10-12T06:30:00.000Z');
-    expect(
-      effectiveWakeAt(
-        [{ next_run_at: '2026-10-12T07:00:00Z', run_during_quiet_hours: true }],
-        overnight,
-        now
-      )?.toISOString()
-    ).toBe('2026-10-12T07:00:00.000Z');
-  });
-
-  it('without a quiet window, or without reminders', () => {
-    const now = new Date('2026-10-12T06:30:00.000Z');
-    expect(
-      effectiveWakeAt([{ next_run_at: '2026-10-12T07:00:00Z' }], null, now)?.toISOString()
-    ).toBe('2026-10-12T07:00:00.000Z');
-    expect(effectiveWakeAt([], overnight, now)).toBeNull();
   });
 });

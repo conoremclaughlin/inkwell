@@ -82,7 +82,6 @@ import {
   type ErrorClassification,
 } from '@inklabs/shared';
 import {
-  effectiveWakeAt,
   IdleCompactionScheduler,
   type IdleCompactionConfig,
   type IdleRunReport,
@@ -322,6 +321,9 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     recipientSessionId: metadata?.recipientSessionId,
     recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
     recipientSessionNamed: metadata?.recipientSessionNamed === true,
+    // The server's idle compaction is maintenance for a live session: it
+    // never reopens one that ended (idle-compaction-scheduler.ts).
+    recipientSessionNoReopen: request.idleCompaction === true,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -647,7 +649,8 @@ export interface ExplicitAddressHold {
     | 'contact-scope'
     | 'session-key-miss'
     | 'session-key-held'
-    | 'binding-held';
+    | 'binding-held'
+    | 'ended-session';
 }
 
 /**
@@ -732,6 +735,7 @@ export class RoutingRefusedError extends Error {
         'binding-held':
           `but the thread's binding could not be moved to it and another session ` +
           `holds it, so delivery would have gone to a session you did not name`,
+        'ended-session': `which has ended, and this message may not reopen it`,
       };
       return (
         `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
@@ -907,7 +911,6 @@ export class SessionService implements ISessionService {
             return timer;
           },
           clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-          nextScheduledWakeAt: (input) => this.nextScheduledWakeAt(input),
           sessionState: (sessionId) => this.idleSessionState(sessionId),
           deliver: (input) => this.deliverIdleCompaction(input),
           log: (event, detail) => logger.info(`[IdleCompaction] ${event}`, detail),
@@ -918,40 +921,6 @@ export class SessionService implements ISessionService {
   /** Stops every armed idle compaction. For shutdown and tests. */
   stopIdleCompaction(): void {
     this.idleCompaction?.stop();
-  }
-
-  /**
-   * When the SB's reminders will next wake it, quiet hours included: a wake
-   * that will read the cache first.
-   */
-  private async nextScheduledWakeAt(input: { userId: string; sbId: string }): Promise<Date | null> {
-    if (!this.supabase) return null;
-    const [reminders, quiet] = await Promise.all([
-      this.supabase
-        .from('scheduled_reminders')
-        .select('next_run_at, run_during_quiet_hours, metadata')
-        .eq('user_id', input.userId)
-        .eq('sb_id', input.sbId)
-        .eq('status', 'active'),
-      this.supabase
-        .from('heartbeat_state')
-        .select('quiet_start, quiet_end, timezone')
-        .eq('user_id', input.userId)
-        .maybeSingle(),
-    ]);
-    // An unreadable schedule is treated as a wake that may come first: the
-    // compaction is skipped rather than run beside a beat it cannot see.
-    if (reminders.error) throw new Error(`could not read reminders: ${reminders.error.message}`);
-    if (quiet.error) throw new Error(`could not read quiet hours: ${quiet.error.message}`);
-    const window =
-      quiet.data?.quiet_start && quiet.data?.quiet_end
-        ? {
-            start: quiet.data.quiet_start,
-            end: quiet.data.quiet_end,
-            timezone: quiet.data.timezone,
-          }
-        : null;
-    return effectiveWakeAt(reminders.data ?? [], window, new Date());
   }
 
   private async idleSessionState(sessionId: string): Promise<IdleSessionState | null> {
@@ -990,11 +959,16 @@ export class SessionService implements ISessionService {
         providerContextTokens: input.providerContextTokens,
         cacheTtlSeconds: input.cacheTtlSeconds,
       }),
+      // Named, so a session that cannot take it refuses rather than letting the
+      // ladder pick another; in its own contact scope, so a contact's session
+      // is never resumed as the owner's (Lumen, #845 r1).
       metadata: {
         triggerType: 'heartbeat',
         chatType: 'direct',
         recipientSessionId: report.sessionId,
         recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+        ...(report.contactId ? { contactId: report.contactId } : {}),
       },
       idleCompaction: true,
     });
@@ -3952,6 +3926,7 @@ export class SessionService implements ISessionService {
           userId,
           sbSlug,
           sbId: session.sbId ?? null,
+          ...(session.contactId ? { contactId: session.contactId } : {}),
           providerContextTokens: result.usage.providerContextTokens,
           cacheTtlSeconds: result.usage.cacheTtlSeconds,
           lastRequestStartedAt: result.usage.lastRequestStartedAt,
@@ -4332,6 +4307,8 @@ export class SessionService implements ISessionService {
        * refused, never dropped. Ended: reopened. Implies explicit.
        */
       recipientSessionNamed?: boolean;
+      /** A named session that has ended is refused instead of reopened. */
+      recipientSessionNoReopen?: boolean;
       /**
        * The session that wrote the message a channel reply answers. Tried
        * after recipientSessionId and before every other rung, but only
@@ -4688,6 +4665,7 @@ export class SessionService implements ISessionService {
         // A plan resolution writes nothing; the spawn path's resolution, which
         // carries the same named flag, reopens it.
         if (recipientSession?.endedAt && recipientSessionNamed) {
+          if (options?.recipientSessionNoReopen === true) refuseNamedSession('ended-session');
           const reopened =
             options?.planOnly === true
               ? { session: recipientSession }

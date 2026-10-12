@@ -12,7 +12,7 @@
  *   kept state but paraphrased the rules lost them exactly when the next
  *   action needed them (Myra, 2026-10-04);
  * - who is owed an answer and where it routes, conversation id included: a
- *   brief that kept thread keys and session ids but not a Telegram
+ *   brief that kept thread keys and session ids but not the channel's
  *   conversation id cost four tool calls to recover it (Myra, 2026-10-11);
  * - the specific resource, not the bug class: "create_artifact failing"
  *   without naming the artifact cost a whole session (Wren, 2026-04-16);

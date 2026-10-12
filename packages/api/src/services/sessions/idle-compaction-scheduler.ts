@@ -3,14 +3,13 @@
  *
  * A provider keeps a prompt prefix cached for a fixed lifetime from the START
  * of the request that last used it: five minutes or an hour on Anthropic, so
- * generation time already spends it (Lumen, from Anthropic's caching docs). A
- * turn that
- * arrives after that writes the whole context to the cache again, at the
- * write price, and an SB at 300k tokens pays that for every turn that follows
- * a long gap. Compacting just before the cache expires reads the history at
- * the cache-read price instead, and leaves the next cold turn only the small
- * seed to write (Conor, 2026-10-11, after Claude Code's "Compacted while
- * idle, before the prompt cache expired").
+ * generation time already spends it (Anthropic's prompt-caching docs). A
+ * turn that arrives after that writes the whole context to the cache again,
+ * at the write price, and a large session pays that for every turn that
+ * follows a long gap. Compacting just before the cache expires reads the
+ * history at the cache-read price instead, and leaves the next cold turn
+ * only the small seed to write. Claude Code does the same for its own
+ * sessions ("Compacted while idle, before the prompt cache expired").
  *
  * The compaction is a turn in the session itself, never a separate
  * summarizer: a fresh request shares no cached prefix, and it would see only
@@ -24,47 +23,19 @@
  * three unknown, or the window already gone, it arms nothing. A newer run
  * replaces the timer. It arms only when the context is above a floor and has
  * grown since the last idle compaction, so a large fixed prefix is not
- * summarized again and again. When it fires, the turn is skipped if the
- * session is busy, if it ended, or if one of the SB's reminders will wake it
- * before the cache expires: that wake reads the cache warm and arms a new
- * timer when it ends. A failed or refused compaction leaves the context as it
- * was; nothing here trims. Timers live in this process, so a restart forgets
- * them; the next run arms again.
+ * summarized again and again. When it fires it is skipped if the session is
+ * busy or ended, or if the cache has already expired. A cancel, a newer run
+ * or a stop that lands while it is checking voids it. A failed or refused
+ * compaction leaves the context as it was; nothing here trims. Timers live in
+ * this process, so a restart forgets them; the next run arms again.
+ *
+ * A reminder due before expiry does not suppress it. Which session a
+ * reminder wakes is decided by heartbeat routing (channel routes, default
+ * session, studio hints), and a reminder that wakes another session leaves
+ * this one's cache to expire. Suppressing on an SB's reminders without
+ * proving the session was wrong (Lumen, #845 r1); the growth gate is what
+ * bounds how often this runs.
  */
-
-import { quietHoursAt, type QuietHoursWindow } from '../quiet-hours.js';
-import { mayRunDuringQuietHours } from '../reminder-quiet-hours.js';
-
-/** An active reminder, as far as when it will next wake its SB. */
-export interface WakeReminder {
-  next_run_at: string;
-  run_during_quiet_hours?: boolean | null;
-  metadata?: unknown;
-}
-
-/**
- * When the earliest of these reminders will actually wake its SB. A reminder
- * that comes due in quiet hours is held until they end, and its next_run_at
- * stays where it was, so a held overnight beat reads as overdue all night.
- * Taken at face value it would be "a wake before the cache expires" every
- * night, which is exactly when a long gap makes compacting worth it.
- */
-export function effectiveWakeAt(
-  reminders: readonly WakeReminder[],
-  window: QuietHoursWindow | null,
-  now: Date
-): Date | null {
-  let earliest: Date | null = null;
-  for (const reminder of reminders) {
-    const dueMs = Date.parse(reminder.next_run_at);
-    if (!Number.isFinite(dueMs)) continue;
-    const due = new Date(Math.max(dueMs, now.getTime()));
-    const quiet = window ? quietHoursAt(due, window) : { quiet: false as const };
-    const wake = quiet.quiet && !mayRunDuringQuietHours(reminder) ? quiet.until : due;
-    if (!earliest || wake < earliest) earliest = wake;
-  }
-  return earliest;
-}
 
 export interface IdleCompactionConfig {
   enabled: boolean;
@@ -78,8 +49,8 @@ export interface IdleCompactionConfig {
 
 export const DEFAULT_IDLE_COMPACTION_CONFIG: IdleCompactionConfig = {
   enabled: true,
-  // A fresh ink session on Claude measured ~86k right after a reseed (Myra,
-  // 2026-10-11 05:52Z): identity envelope, provider prompt and tools. A floor
+  // A freshly reseeded ink session on Claude already carries tens of
+  // thousands of tokens (identity envelope, provider prompt, tools). A floor
   // near that would compact for almost nothing.
   minContextTokens: 150_000,
   minGrowthTokens: 50_000,
@@ -92,6 +63,8 @@ export interface IdleRunReport {
   userId: string;
   sbSlug: string;
   sbId: string | null;
+  /** The session's contact scope, so the turn is admitted in that scope only. */
+  contactId?: string;
   providerContextTokens?: number;
   cacheTtlSeconds?: number;
   /** When the run's last provider invocation began (ISO): the cache's clock. */
@@ -109,8 +82,6 @@ export interface IdleCompactionDeps {
   now(): number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
-  /** The SB's earliest active reminder, or null when it has none. */
-  nextScheduledWakeAt(input: { userId: string; sbId: string }): Promise<Date | null>;
   /** Null when the session no longer exists. */
   sessionState(sessionId: string): Promise<IdleSessionState | null>;
   deliver(input: {
@@ -145,6 +116,8 @@ export class IdleCompactionScheduler {
   private readonly lifetimes = new Map<string, number>();
   /** The provider context each session's last idle compaction left. */
   private readonly baselines = new Map<string, number>();
+  /** Set by stop(): nothing arms or delivers after it. */
+  private stopped = false;
 
   constructor(
     private readonly config: IdleCompactionConfig,
@@ -203,6 +176,7 @@ export class IdleCompactionScheduler {
   }
 
   stop(): void {
+    this.stopped = true;
     for (const sessionId of [...this.timers.keys()]) this.cancel(sessionId);
   }
 
@@ -215,11 +189,17 @@ export class IdleCompactionScheduler {
   async fire(sessionId: string): Promise<IdleFireOutcome> {
     const armed = this.timers.get(sessionId);
     if (!armed) return { delivered: false, reason: 'not armed' };
-    this.timers.delete(sessionId);
+    // The candidate stays registered while it is checked, so a cancel, a
+    // newer run or a stop during the awaited reads replaces or removes it, and
+    // the identity check below sees that (Lumen, #845 r1). A stop removes
+    // every candidate, so it is covered by the same check.
     const outcome = await this.check(armed);
-    if (!outcome.delivered) {
-      this.deps.log('idle compaction skipped', { sessionId, reason: outcome.reason });
-      return outcome;
+    const current = this.timers.get(sessionId) === armed;
+    if (current) this.timers.delete(sessionId);
+    if (!outcome.delivered || !current) {
+      const reason = outcome.delivered ? 'superseded while it was checked' : outcome.reason;
+      this.deps.log('idle compaction skipped', { sessionId, reason });
+      return { delivered: false, reason };
     }
     this.deps.log('idle compaction delivering', {
       sessionId,
@@ -236,6 +216,7 @@ export class IdleCompactionScheduler {
 
   private decide(report: IdleRunReport): IdleArmDecision {
     if (!this.config.enabled) return { armed: false, reason: 'disabled' };
+    if (this.stopped) return { armed: false, reason: 'stopped' };
     if (report.idleCompaction) {
       return { armed: false, reason: 'this run was an idle compaction' };
     }
@@ -272,22 +253,18 @@ export class IdleCompactionScheduler {
 
   private async check(armed: ArmedTimer): Promise<IdleFireOutcome> {
     const { report } = armed;
+    // A timer that ran late (a blocked event loop, a sleeping machine) would
+    // read a cold cache, which is no cheaper than the next real turn.
+    if (this.deps.now() >= armed.expiresAt) {
+      return { delivered: false, reason: 'the cache has already expired' };
+    }
     const state = await this.deps.sessionState(report.sessionId);
     if (!state) return { delivered: false, reason: 'session gone' };
     if (state.ended) return { delivered: false, reason: 'session ended' };
     // A running turn uses the cache and arms a new timer when it ends.
     if (state.busy) return { delivered: false, reason: 'session busy' };
-    if (report.sbId) {
-      const wake = await this.deps.nextScheduledWakeAt({
-        userId: report.userId,
-        sbId: report.sbId,
-      });
-      if (wake && wake.getTime() < armed.expiresAt) {
-        return {
-          delivered: false,
-          reason: `a reminder is due at ${wake.toISOString()}, before the cache expires`,
-        };
-      }
+    if (this.deps.now() >= armed.expiresAt) {
+      return { delivered: false, reason: 'the cache has already expired' };
     }
     return { delivered: true };
   }

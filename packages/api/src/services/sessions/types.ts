@@ -493,7 +493,8 @@ export interface SessionResult {
           | 'contact-scope'
           | 'session-key-miss'
           | 'session-key-held'
-          | 'binding-held';
+          | 'binding-held'
+          | 'ended-session';
       };
     };
   };

@@ -264,4 +264,79 @@ describe('SessionService idle compaction', () => {
     await vi.advanceTimersByTimeAsync(2 * HOUR_MS);
     expect(runPrompts()).toHaveLength(1);
   });
+
+  // Lumen, #845 r1: the idle turn carried no contact scope, so a contact's
+  // session was resumed as the owner's.
+  it("sends a contact session's turn to that session, never the owner's", async () => {
+    session = inkSession({ contactId: 'contact-synthetic' });
+    const owner = inkSession({ id: 'session-owner', backendSessionId: 'native-owner' });
+    (repository.findById as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) =>
+      id === session.id ? session : id === owner.id ? owner : null
+    );
+    (repository.findByUserAndAgent as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_user: string, _slug: string, options?: { contactId?: string }) =>
+        options?.contactId === 'contact-synthetic' ? session : owner
+    );
+    (repository.update as ReturnType<typeof vi.fn>).mockImplementation(
+      async (id: string, updates: Partial<Session>) => {
+        if (id === session.id) {
+          session = { ...session, ...updates };
+          return session;
+        }
+        Object.assign(owner, updates);
+        return owner;
+      }
+    );
+    await service.handleMessage({ ...message(), metadata: { contactId: 'contact-synthetic' } });
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+    const options = (inkRunner.run as ReturnType<typeof vi.fn>).mock.calls[1][1];
+    expect(options.backendSessionId).toBe('claude-native-1');
+  });
+
+  // Lumen, #845 r1: four minutes of generation on a five-minute cache leaves no
+  // warm window; the turn must not be sent after the cache expired.
+  it('sends nothing when the run used up a five-minute cache', async () => {
+    const starts: number[] = [];
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      const startedAt = Date.now();
+      starts.push(startedAt);
+      if (starts.length === 1) await new Promise((resolve) => setTimeout(resolve, 4 * 60 * 1000));
+      return inkResult({
+        providerContextTokens: 292_000,
+        cacheTtlSeconds: 300,
+        lastRequestStartedAt: new Date(startedAt).toISOString(),
+      });
+    });
+    const turn = service.handleMessage(message());
+    await vi.waitFor(() => expect(starts).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+    await turn;
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(starts.slice(1).every((t) => t < starts[0] + 5 * 60 * 1000)).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith('[IdleCompaction] idle compaction not armed', {
+      sessionId: 'session-ink',
+      reason: 'the cache window passed during the run',
+    });
+  });
+
+  it('refuses a session that ended after the check, rather than reopening it', async () => {
+    await service.handleMessage(message());
+    // The scheduler's own check reads it live; routing then reads it ended.
+    let reads = 0;
+    (repository.findById as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) => {
+      if (id !== session.id) return null;
+      reads += 1;
+      return reads === 1 ? session : { ...session, endedAt: new Date() };
+    });
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith(
+        '[IdleCompaction] turn finished',
+        expect.objectContaining({ sessionId: 'session-ink', success: false })
+      )
+    );
+    expect(repository.reopenEnded).not.toHaveBeenCalled();
+    expect(runPrompts()).toHaveLength(1);
+  });
 });
