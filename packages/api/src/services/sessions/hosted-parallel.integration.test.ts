@@ -792,6 +792,18 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
       threadKey: inklingThread,
     });
     inkling.sessionId = session.id;
+    // Equalize standing permission so only the enforced tools profile explains
+    // the refusal. Its non-promptable deny wins over this SB-scoped grant.
+    const { ToolPolicyState } = await import('@inklabs/shared/runtime');
+    const { inklingToolPolicyPath } = await import('../inklings/inkling-folder');
+    const consumerPolicy = new ToolPolicyState('backend', {
+      context: { sbSlug: inkling.sbSlug },
+    });
+    consumerPolicy.persistentGrant('bash', { scope: 'sb', id: inkling.sbSlug });
+    expect(consumerPolicy.inspectInkTool('bash').allowed).toBe(true);
+    const consumerPolicyPath = inklingToolPolicyPath(inkling.sbId, join(root, 'inklings'));
+    await mkdir(join(root, 'inklings', '.tool-policy'), { recursive: true });
+    await writeFile(consumerPolicyPath, JSON.stringify(consumerPolicy.snapshot()));
     await writeFile(
       join(cwd, 'parallel-fixture.json'),
       JSON.stringify({ ...inkling, nativeId: randomUUID(), threadKey: inklingThread })
@@ -888,6 +900,10 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
         expect.objectContaining({ type: 'local_tool_call', tool: 'bash', status: 'blocked' }),
       ])
     );
+    const refusal = entries.find((e) => e.type === 'local_tool_call' && e.tool === 'bash');
+    expect(JSON.stringify(refusal)).toContain('Tool is explicitly denied by policy.');
+    // The launch profile is per-run; it does not erase the stored scoped grant.
+    expect(await readJson(consumerPolicyPath)).toEqual(consumerPolicy.snapshot());
     expect(codingInvocations).toEqual([rows[2]!.sessionId]);
     expect(executionTiers.get(session.id)).toBe('tools');
     for (const row of rows) expect(executionTiers.get(row.sessionId)).toBe('full');
