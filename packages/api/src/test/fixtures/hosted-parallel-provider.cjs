@@ -55,7 +55,7 @@ async function main() {
     n % 2 === 0
       ? tool('remember', { sbSlug: fixture.sbSlug, content: fixture.marker, salience: 'low' }) +
         (fixture.failTool ? tool('remember', { sbSlug: fixture.sbSlug, content: 17 }) : '') +
-        (fixture.threadKey ? tool('bash', { command: 'true' }) : '') +
+        (fixture.threadKey || fixture.tryBash ? tool('bash', { command: 'true' }) : '') +
         tool('send_to_inbox', {
           senderSlug: fixture.sbSlug,
           recipientSlug: fixture.threadKey ? fixture.sbSlug : 'sink',

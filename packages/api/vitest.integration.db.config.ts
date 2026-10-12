@@ -7,6 +7,8 @@ export default defineConfig({
       '@inklabs/shared/node-host': path.resolve(__dirname, '../shared/src/node-host/index.ts'),
       '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
       '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
+      // Keep root and subpaths in one source graph, even when local dist is stale.
+      '@inklabs/shared': path.resolve(__dirname, '../shared/src/index.ts'),
     },
   },
   test: {

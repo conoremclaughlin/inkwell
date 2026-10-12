@@ -55,6 +55,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
   const ownedPids = new Set<number>();
   const controllers = new Map<string, AbortController>();
   const codingInvocations: string[] = [];
+  const executionTiers = new Map<string, string | undefined>();
   const allowlist = new Set<string>();
   let inkling: Row | undefined;
   const inklingThread = `thread:parallel-${userId}`;
@@ -202,6 +203,8 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
     const policy = new ToolPolicyState('backend');
     for (const row of rows)
       policy.persistentGrant('send_to_inbox', { scope: 'studio', id: row.studioId });
+    // Positive tier control: only this synthetic studio may reach the inert bash sentinel.
+    policy.persistentGrant('bash', { scope: 'studio', id: rows[2]!.studioId });
     await writeFile(join(root, 'policy.json'), JSON.stringify(policy.snapshot()));
     // Copy the token-free program into owned executable paths; never PATH-resolve
     // a provider on CI. The production adapters and spawn/parse code stay real.
@@ -342,6 +345,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
           run: async (...args: Parameters<IRunner['run']>) => {
             const [message, options] = args;
             const id = options.config.inkSessionId!;
+            executionTiers.set(id, options.config.executionTier);
             const controller = new AbortController();
             controllers.set(id, controller);
             try {
@@ -476,7 +480,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
         .map((file) => readJson(join(row.cwd, file)))
     );
   const release = (row: Row) => writeFile(join(row.cwd, 'release'), 'go');
-  const prepareWave = async (failTool?: Row) => {
+  const prepareWave = async (failTool?: Row, tryBash?: Row) => {
     for (const row of rows) {
       for (const file of await readdir(row.cwd))
         if (file.startsWith('launch-') || ['counter', 'release'].includes(file))
@@ -487,6 +491,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
         JSON.stringify({
           ...fixture,
           failTool: row === failTool,
+          tryBash: row === tryBash,
         })
       );
     }
@@ -505,15 +510,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
     const complete = Promise.all(running);
     void complete.catch(() => {});
     try {
-      await expect
-        .poll(
-          async () =>
-            (await Promise.all(rows.map((row) => readdir(row.cwd)))).map(
-              (files) => files.filter((f) => f.startsWith('launch-')).length
-            ),
-          { timeout: 30000 }
-        )
-        .toEqual([1, 1, 1]);
+      await barrier();
     } finally {
       await Promise.all(rows.map((row) => writeFile(join(row.cwd, 'release'), 'go')));
     }
@@ -675,7 +672,11 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
         const [child] = await launches(victim);
         expect(child).toBeDefined();
         if (fault === 'Stop') controllers.get(victim.sessionId)!.abort();
-        else process.kill(Number(child!.pid), 'SIGKILL');
+        else {
+          const pid = Number(child!.pid);
+          expect(ownedPids.has(pid)).toBe(true);
+          process.kill(pid, 'SIGKILL');
+        }
         const result = await running[0]!;
         expect(result.result).toMatchObject({ success: false, sessionId: victim.sessionId });
         expect(() => process.kill(Number(child!.pid), 0)).toThrow();
@@ -830,7 +831,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
       void turn.catch(() => {});
       await turn;
     });
-    await prepareWave();
+    await prepareWave(undefined, rows[2]);
     const siblings = Promise.all(rows.map(post));
     void siblings.catch(() => {});
     try {
@@ -887,7 +888,9 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
         expect.objectContaining({ type: 'local_tool_call', tool: 'bash', status: 'blocked' }),
       ])
     );
-    expect(codingInvocations).toEqual([]);
+    expect(codingInvocations).toEqual([rows[2]!.sessionId]);
+    expect(executionTiers.get(session.id)).toBe('tools');
+    for (const row of rows) expect(executionTiers.get(row.sessionId)).toBe('full');
     expect(
       calls.some((call) => call.name === 'remember' && call.token.sessionId === session.id)
     ).toBe(true);
@@ -905,6 +908,7 @@ describe.skipIf(!enabled)('hosted parallel turns over real HTTP and isolated DB'
     for (const other of rows) expect(log).not.toContain(other.marker);
   }, 90000);
 
+  // Stateful continuation: run with the preceding consumer-admission case, not in isolation.
   it('consumer HTTP Stop waits for its child exit without stopping siblings; an owner reply resumes the same row', async () => {
     expect(inkling).toBeDefined();
     const row = inkling!;
