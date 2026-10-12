@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { PathContainmentError, validatePathArgs } from '@inklabs/shared';
 import type { InkToolCallResult } from '../lib/ink-client.js';
+import { BASH_TIMEOUT_BOUNDS, boundedBashTimeout, type BashTimeoutBounds } from './bash-timeout.js';
 
 // Pi tool types — we use the AgentTool shape from pi-agent-core
 interface PiToolResult {
@@ -30,6 +31,42 @@ interface PiAgentTool {
 }
 
 const PI_TOOL_NAMES = new Set(['read', 'edit', 'write', 'bash', 'grep', 'find', 'ls']);
+
+/**
+ * Pi's bash tool with its timeout bounded, and a schema that tells the model
+ * the real limits instead of pi's "no default timeout".
+ */
+export function boundBashTool(
+  tool: PiAgentTool,
+  bounds: BashTimeoutBounds = BASH_TIMEOUT_BOUNDS
+): PiAgentTool {
+  return {
+    ...tool,
+    parameters: describeTimeout(tool.parameters, bounds),
+    execute: (toolCallId, params, signal) =>
+      tool.execute(
+        toolCallId,
+        { ...params, timeout: boundedBashTimeout(params.timeout, bounds) },
+        signal
+      ),
+  };
+}
+
+function describeTimeout(parameters: unknown, bounds: BashTimeoutBounds): unknown {
+  const schema = parameters as { properties?: Record<string, Record<string, unknown>> } | null;
+  const timeout = schema?.properties?.timeout;
+  if (!schema || !timeout) return parameters;
+  return {
+    ...schema,
+    properties: {
+      ...schema.properties,
+      timeout: {
+        ...timeout,
+        description: `Timeout in seconds (optional; default ${bounds.defaultSeconds}, max ${bounds.maxSeconds}). The command's process group is killed when it expires.`,
+      },
+    },
+  };
+}
 
 let cachedTools: Map<string, PiAgentTool> | null = null;
 let cachedCwd: string | null = null;
@@ -53,7 +90,7 @@ export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>
     pi.createReadTool(cwd),
     pi.createEditTool(cwd),
     pi.createWriteTool(cwd),
-    pi.createBashTool(cwd),
+    boundBashTool(pi.createBashTool(cwd) as unknown as PiAgentTool),
     pi.createGrepTool(cwd),
     pi.createFindTool(cwd),
     pi.createLsTool(cwd),
