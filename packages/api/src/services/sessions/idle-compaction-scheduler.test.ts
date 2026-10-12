@@ -21,6 +21,14 @@ interface Harness {
   setNow(ms: number): void;
 }
 
+// The mechanics under test, at fixed values, not the shipped defaults.
+const CONFIG = {
+  ...DEFAULT_IDLE_COMPACTION_CONFIG,
+  enabled: true,
+  minContextTokens: 150_000,
+  minGrowthTokens: 50_000,
+};
+
 function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {}): Harness {
   const timers: Harness['timers'] = [];
   const delivered: Harness['delivered'] = [];
@@ -47,10 +55,7 @@ function harness(overrides: Partial<typeof DEFAULT_IDLE_COMPACTION_CONFIG> = {})
     log: () => undefined,
   };
   return {
-    scheduler: new IdleCompactionScheduler(
-      { ...DEFAULT_IDLE_COMPACTION_CONFIG, ...overrides },
-      deps
-    ),
+    scheduler: new IdleCompactionScheduler({ ...CONFIG, ...overrides }, deps),
     deps,
     timers,
     delivered,
@@ -82,6 +87,8 @@ function run(overrides: Partial<IdleRunReport> = {}): IdleRunReport {
     providerContextTokens: 292_000,
     cacheTtlSeconds: HOUR,
     lastRequestStartedAt: new Date(T0).toISOString(),
+    providerSessionId: 'native-1',
+    model: 'claude-opus-5-5',
     ...overrides,
   };
 }
@@ -193,6 +200,24 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
     expect(decision).toMatchObject({ armed: true, expiresAt: T0 + HOUR * 1000 });
   });
 
+  // Lumen, #845 r2: a lifetime learned under one native session or model says
+  // nothing about another.
+  it('inherits a learned lifetime only for the same native session and model', () => {
+    for (const [what, later, expected] of [
+      ['the same session and model', {}, true],
+      ['a reseeded native session', { providerSessionId: 'native-2' }, false],
+      ['another model', { model: 'claude-fable-5' }, false],
+      ['an unreported native session', { providerSessionId: undefined }, false],
+    ] as const) {
+      const h = harness();
+      h.scheduler.noteRunFinished(run({ providerContextTokens: 90_000 }));
+      const decision = h.scheduler.noteRunFinished(run({ cacheTtlSeconds: undefined, ...later }));
+      expect(decision.armed, what).toBe(expected);
+      if (!expected)
+        expect(decision, what).toEqual({ armed: false, reason: 'cache lifetime unknown' });
+    }
+  });
+
   it('never arms after an idle compaction turn, however large the context stays', () => {
     const h = harness();
     expect(h.scheduler.noteRunFinished(run({ idleCompaction: true }))).toEqual({
@@ -223,7 +248,12 @@ describe('IdleCompactionScheduler.fire', () => {
     h.scheduler.noteRunFinished(run());
     await expect(h.scheduler.fire('session-a')).resolves.toEqual({ delivered: true });
     expect(h.delivered).toEqual([
-      { report: run(), providerContextTokens: 292_000, cacheTtlSeconds: HOUR },
+      {
+        report: run(),
+        providerContextTokens: 292_000,
+        cacheTtlSeconds: HOUR,
+        ticket: { generation: expect.any(Number), expiresAt: T0 + HOUR * 1000 },
+      },
     ]);
     expect(h.scheduler.armedSessionIds()).toEqual([]);
   });
@@ -334,5 +364,47 @@ describe('IdleCompactionScheduler.fire', () => {
     h.scheduler.noteRunFinished(run());
     h.timers[0].fn();
     await vi.waitFor(() => expect(deliver).toHaveBeenCalledTimes(1));
+  });
+});
+
+// Lumen, #845 r2: the turn is fenced where it takes the session's lock, not
+// only while the timer checks it.
+describe('IdleCompactionScheduler.admissionRefusal', () => {
+  async function ticketFor(h: Harness) {
+    h.scheduler.noteRunFinished(run());
+    await h.scheduler.fire('session-a');
+    return h.delivered[0].ticket;
+  }
+
+  it('admits the ticket it just issued', async () => {
+    const h = harness();
+    const ticket = await ticketFor(h);
+    expect(h.scheduler.admissionRefusal('session-a', ticket)).toBeNull();
+  });
+
+  it('refuses once a run has started or finished since the ticket was issued', async () => {
+    for (const interrupt of [
+      (h: Harness) => h.scheduler.cancel('session-a'),
+      (h: Harness) => h.scheduler.noteRunFinished(run({ providerContextTokens: 1_000 })),
+    ]) {
+      const h = harness();
+      const ticket = await ticketFor(h);
+      interrupt(h);
+      expect(h.scheduler.admissionRefusal('session-a', ticket)).toBe('superseded before admission');
+    }
+  });
+
+  it('refuses after a stop, and once the cache has expired', async () => {
+    const stopped = harness();
+    const stoppedTicket = await ticketFor(stopped);
+    stopped.scheduler.stop();
+    expect(stopped.scheduler.admissionRefusal('session-a', stoppedTicket)).toBe('stopped');
+
+    const late = harness();
+    const lateTicket = await ticketFor(late);
+    late.setNow(T0 + HOUR * 1000);
+    expect(late.scheduler.admissionRefusal('session-a', lateTicket)).toBe(
+      'the cache has already expired'
+    );
   });
 });

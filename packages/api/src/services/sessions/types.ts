@@ -351,11 +351,14 @@ export interface SessionRequest {
 
   /**
    * The server's own idle-compaction turn (idle-compaction-scheduler.ts). Set
-   * only by the scheduler, in this process. A turn carrying it never arms
-   * another one, so a compaction that leaves the context large is not retried
-   * every cache lifetime; the session's next ordinary turn arms again.
+   * only by the scheduler, in this process, with the ticket the session's lock
+   * checks before admitting it: the turn never queues behind real work, and
+   * runs only while its candidate is current and its cache unexpired. A turn
+   * carrying it never arms another one, so a compaction that leaves the
+   * context large is not retried every cache lifetime; the session's next
+   * ordinary turn arms again.
    */
-  idleCompaction?: true;
+  idleCompaction?: { generation: number; expiresAt: number };
 }
 
 /**
@@ -427,6 +430,8 @@ export interface SessionResult {
     providerContextTokens?: number;
     /** The prompt-cache lifetime the run last wrote at (ink on Claude only). */
     cacheTtlSeconds?: number;
+    /** The native provider session the run ended on (ink only). */
+    providerSessionId?: string;
     /**
      * When the run's last provider invocation began (ISO, ink only). The
      * cache's lifetime runs from a request's start, so this is its clock.
@@ -923,6 +928,12 @@ export interface ClaudeRunnerConfig {
   sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;
+  /**
+   * The run is the server's idle compaction (ink only). ink chat then skips
+   * its pre-turn system compaction, which could trim history on a failed
+   * summary before the agent has read the request to compact its own.
+   */
+  idleCompaction?: boolean;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */

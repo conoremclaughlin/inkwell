@@ -182,6 +182,7 @@ interface InkRunUsage {
   providerContextTokens?: number;
   cacheTtlSeconds?: number;
   lastRequestStartedAt?: string;
+  providerSessionId?: string;
 }
 
 /** A positive finite number from the CLI's JSON, else undefined. Older builds omit these fields. */
@@ -444,6 +445,9 @@ export class InkRunner implements IRunner {
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").
     args.push('--message-label', config.channel || 'server');
+    // Maintenance: no pre-turn system compaction, so nothing is trimmed
+    // before the agent reads the request to compact its own context.
+    if (config.idleCompaction) args.push('--idle-compaction');
 
     // Forward media attachments as file paths. ink chat appends an
     // attachment block to the turn and grants its provider backend
@@ -1034,6 +1038,11 @@ export class InkRunner implements IRunner {
             const modelUsage = parseInkModelUsage(parsed.modelUsage);
             const providerContextTokens = positiveNumber(parsed.usage.providerContextTokens);
             const cacheTtlSeconds = positiveNumber(parsed.usage.cacheTtlSeconds);
+            const providerSessionId =
+              typeof parsed.usage.providerSessionId === 'string' &&
+              parsed.usage.providerSessionId.trim()
+                ? (parsed.usage.providerSessionId as string)
+                : undefined;
             const lastRequestStartedAt =
               typeof parsed.usage.lastRequestStartedAt === 'string' &&
               Number.isFinite(Date.parse(parsed.usage.lastRequestStartedAt))
@@ -1050,6 +1059,7 @@ export class InkRunner implements IRunner {
               ...(providerContextTokens !== undefined ? { providerContextTokens } : {}),
               ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
               ...(lastRequestStartedAt !== undefined ? { lastRequestStartedAt } : {}),
+              ...(providerSessionId !== undefined ? { providerSessionId } : {}),
             };
           }
           if (typeof parsed.model === 'string' && parsed.model.trim()) {

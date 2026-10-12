@@ -83,6 +83,7 @@ import {
 } from '@inklabs/shared';
 import {
   IdleCompactionScheduler,
+  type IdleAdmissionTicket,
   type IdleCompactionConfig,
   type IdleRunReport,
   type IdleSessionState,
@@ -323,7 +324,7 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     recipientSessionNamed: metadata?.recipientSessionNamed === true,
     // The server's idle compaction is maintenance for a live session: it
     // never reopens one that ended (idle-compaction-scheduler.ts).
-    recipientSessionNoReopen: request.idleCompaction === true,
+    recipientSessionNoReopen: request.idleCompaction !== undefined,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -947,6 +948,7 @@ export class SessionService implements ISessionService {
     report: IdleRunReport;
     providerContextTokens: number;
     cacheTtlSeconds: number;
+    ticket: IdleAdmissionTicket;
   }): Promise<void> {
     const { report } = input;
     const result = await this.handleMessage({
@@ -970,7 +972,7 @@ export class SessionService implements ISessionService {
         recipientSessionNamed: true,
         ...(report.contactId ? { contactId: report.contactId } : {}),
       },
-      idleCompaction: true,
+      idleCompaction: input.ticket,
     });
     logger.info('[IdleCompaction] turn finished', {
       sessionId: report.sessionId,
@@ -2073,6 +2075,34 @@ export class SessionService implements ISessionService {
       // 3. Build lock key - must be per agent + session to support sub-agents
       const lockKey = `${sbSlug}:${session.id}`;
 
+      // The idle compaction turn is maintenance: it never queues behind real
+      // work, and runs only while the candidate that sent it is current and
+      // its cache unexpired. Checked here, with no await between the check and
+      // taking the lock below (Lumen, #845 r2).
+      if (request.idleCompaction) {
+        const refusal = this.processingLocks.has(lockKey)
+          ? 'session busy'
+          : !this.idleCompaction
+            ? 'idle compaction is off'
+            : this.idleCompaction.admissionRefusal(session.id, request.idleCompaction);
+        if (refusal) {
+          logger.info('[IdleCompaction] refused at admission', {
+            sessionId: session.id,
+            reason: refusal,
+          });
+          return {
+            success: false,
+            sessionId: session.id,
+            backendSessionId: session.backendSessionId ?? null,
+            responses: [],
+            sessionStatus: session.status,
+            compactionTriggered: false,
+            finalTextResponse: undefined,
+            error: `Idle compaction refused: ${refusal}`,
+          };
+        }
+      }
+
       // 4. Check if session is already being processed
       if (this.processingLocks.has(lockKey)) {
         logger.info('Session is processing, queuing message', {
@@ -3041,6 +3071,7 @@ export class SessionService implements ISessionService {
       inkSessionId: session.id,
       sbSlug,
       channel: request.channel,
+      ...(request.idleCompaction ? { idleCompaction: true } : {}),
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       // An inkling's outer cycles follow its runtimeConfig as any SB's do
@@ -3930,7 +3961,11 @@ export class SessionService implements ISessionService {
           providerContextTokens: result.usage.providerContextTokens,
           cacheTtlSeconds: result.usage.cacheTtlSeconds,
           lastRequestStartedAt: result.usage.lastRequestStartedAt,
-          idleCompaction: request.idleCompaction === true,
+          ...(result.usage.providerSessionId
+            ? { providerSessionId: result.usage.providerSessionId }
+            : {}),
+          ...(result.servedModel ? { model: result.servedModel } : {}),
+          idleCompaction: request.idleCompaction !== undefined,
         });
       }
 

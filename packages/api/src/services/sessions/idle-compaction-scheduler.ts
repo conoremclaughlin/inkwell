@@ -48,12 +48,17 @@ export interface IdleCompactionConfig {
 }
 
 export const DEFAULT_IDLE_COMPACTION_CONFIG: IdleCompactionConfig = {
-  enabled: true,
+  // Off until a deployment turns it on: the turn's "do not message anyone"
+  // is a prompt, not an enforced maintenance mode (Lumen, #845 r2).
+  enabled: false,
   // A freshly reseeded ink session on Claude already carries tens of
-  // thousands of tokens (identity envelope, provider prompt, tools). A floor
-  // near that would compact for almost nothing.
-  minContextTokens: 150_000,
-  minGrowthTokens: 50_000,
+  // thousands of tokens (identity envelope, provider prompt, tools), and a
+  // session past a few hundred thousand is where it gets unwieldy. The floor
+  // sits well above the first and below the second.
+  minContextTokens: 250_000,
+  // Not every cache lifetime: another compaction waits for this much new
+  // context past what the last one left.
+  minGrowthTokens: 100_000,
   marginSeconds: 300,
 };
 
@@ -69,8 +74,26 @@ export interface IdleRunReport {
   cacheTtlSeconds?: number;
   /** When the run's last provider invocation began (ISO): the cache's clock. */
   lastRequestStartedAt?: string;
+  /**
+   * The native provider session and the model the run ended on. A cache
+   * lifetime learned under one pair says nothing about another, so a run
+   * that reports no lifetime of its own inherits one only when both match.
+   */
+  providerSessionId?: string;
+  model?: string;
   /** The run was itself an idle compaction. */
   idleCompaction?: boolean;
+}
+
+/**
+ * What the idle turn carries to its admission. The session service checks it
+ * where the turn takes the session's lock, with no await in between: a
+ * candidate that a cancel, a newer run or a stop has superseded, or whose
+ * cache has expired, is refused there rather than queued (Lumen, #845 r2).
+ */
+export interface IdleAdmissionTicket {
+  generation: number;
+  expiresAt: number;
 }
 
 export interface IdleSessionState {
@@ -88,6 +111,7 @@ export interface IdleCompactionDeps {
     report: IdleRunReport;
     providerContextTokens: number;
     cacheTtlSeconds: number;
+    ticket: IdleAdmissionTicket;
   }): Promise<void>;
   log(event: string, detail: Record<string, unknown>): void;
 }
@@ -104,16 +128,29 @@ interface ArmedTimer {
   providerContextTokens: number;
   cacheTtlSeconds: number;
   expiresAt: number;
+  generation: number;
+}
+
+interface LearnedLifetime {
+  ttl: number;
+  providerSessionId?: string;
+  model?: string;
 }
 
 export class IdleCompactionScheduler {
   private readonly timers = new Map<string, ArmedTimer>();
   /**
-   * The last cache lifetime each session reported. A run that only read the
-   * cache reports none, and the lifetime it read under is still the last one
-   * written.
+   * The last cache lifetime each session reported, with the native session
+   * and model it was written under. A run that only read the cache reports
+   * none, and the lifetime it read under is still the last one written, but
+   * only for the same native session and model.
    */
-  private readonly lifetimes = new Map<string, number>();
+  private readonly lifetimes = new Map<string, LearnedLifetime>();
+  /**
+   * Bumped by every cancel, so a ticket issued before a later run started or
+   * finished no longer matches at admission.
+   */
+  private readonly generations = new Map<string, number>();
   /** The provider context each session's last idle compaction left. */
   private readonly baselines = new Map<string, number>();
   /** Set by stop(): nothing arms or delivers after it. */
@@ -129,7 +166,11 @@ export class IdleCompactionScheduler {
     // so the earlier expiry no longer holds.
     this.cancel(report.sessionId);
     if (report.cacheTtlSeconds !== undefined) {
-      this.lifetimes.set(report.sessionId, report.cacheTtlSeconds);
+      this.lifetimes.set(report.sessionId, {
+        ttl: report.cacheTtlSeconds,
+        providerSessionId: report.providerSessionId,
+        model: report.model,
+      });
     }
     if (report.idleCompaction && report.providerContextTokens !== undefined) {
       this.baselines.set(report.sessionId, report.providerContextTokens);
@@ -143,7 +184,7 @@ export class IdleCompactionScheduler {
       return decision;
     }
     const providerContextTokens = report.providerContextTokens as number;
-    const cacheTtlSeconds = this.lifetimes.get(report.sessionId) as number;
+    const cacheTtlSeconds = this.lifetimeFor(report) as number;
     const handle = this.deps.setTimer(() => {
       void this.fire(report.sessionId).catch((error) => {
         this.deps.log('idle compaction failed', {
@@ -158,6 +199,7 @@ export class IdleCompactionScheduler {
       providerContextTokens,
       cacheTtlSeconds,
       expiresAt: decision.expiresAt,
+      generation: this.generationOf(report.sessionId),
     });
     this.deps.log('idle compaction armed', {
       sessionId: report.sessionId,
@@ -169,10 +211,27 @@ export class IdleCompactionScheduler {
   }
 
   cancel(sessionId: string): void {
+    // Always, armed or not: an idle turn already on its way to admission is
+    // no longer in the map, and only the generation can void it.
+    this.generations.set(sessionId, this.generationOf(sessionId) + 1);
     const armed = this.timers.get(sessionId);
     if (!armed) return;
     this.deps.clearTimer(armed.handle);
     this.timers.delete(sessionId);
+  }
+
+  /**
+   * Why an idle turn holding this ticket may not run now, or null when it may.
+   * Synchronous, so the caller can check it and take the session's lock with
+   * nothing in between.
+   */
+  admissionRefusal(sessionId: string, ticket: IdleAdmissionTicket): string | null {
+    if (this.stopped) return 'stopped';
+    if (this.generationOf(sessionId) !== ticket.generation) {
+      return 'superseded before admission';
+    }
+    if (this.deps.now() >= ticket.expiresAt) return 'the cache has already expired';
+    return null;
   }
 
   stop(): void {
@@ -210,8 +269,22 @@ export class IdleCompactionScheduler {
       report: armed.report,
       providerContextTokens: armed.providerContextTokens,
       cacheTtlSeconds: armed.cacheTtlSeconds,
+      ticket: { generation: armed.generation, expiresAt: armed.expiresAt },
     });
     return outcome;
+  }
+
+  private generationOf(sessionId: string): number {
+    return this.generations.get(sessionId) ?? 0;
+  }
+
+  private lifetimeFor(report: IdleRunReport): number | undefined {
+    if (report.cacheTtlSeconds !== undefined) return report.cacheTtlSeconds;
+    const learned = this.lifetimes.get(report.sessionId);
+    if (!learned || report.providerSessionId === undefined) return undefined;
+    return learned.providerSessionId === report.providerSessionId && learned.model === report.model
+      ? learned.ttl
+      : undefined;
   }
 
   private decide(report: IdleRunReport): IdleArmDecision {
@@ -220,7 +293,7 @@ export class IdleCompactionScheduler {
     if (report.idleCompaction) {
       return { armed: false, reason: 'this run was an idle compaction' };
     }
-    const ttl = this.lifetimes.get(report.sessionId);
+    const ttl = this.lifetimeFor(report);
     if (ttl === undefined) return { armed: false, reason: 'cache lifetime unknown' };
     const startedAt =
       report.lastRequestStartedAt !== undefined ? Date.parse(report.lastRequestStartedAt) : NaN;

@@ -237,6 +237,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       ...(env.IDLE_COMPACTION_MIN_CONTEXT_TOKENS
         ? { minContextTokens: env.IDLE_COMPACTION_MIN_CONTEXT_TOKENS }
         : {}),
+      ...(env.IDLE_COMPACTION_MIN_GROWTH_TOKENS
+        ? { minGrowthTokens: env.IDLE_COMPACTION_MIN_GROWTH_TOKENS }
+        : {}),
     },
     responseHandler: async (responses, sessionId) => routeResponses(responses, sessionId),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),

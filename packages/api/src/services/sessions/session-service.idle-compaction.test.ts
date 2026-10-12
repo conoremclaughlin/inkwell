@@ -173,7 +173,7 @@ describe('SessionService idle compaction', () => {
       {
         defaultWorkingDirectory: '/test',
         mcpConfigPath: '/test/.mcp.json',
-        idleCompaction: DEFAULT_IDLE_COMPACTION_CONFIG,
+        idleCompaction: { ...DEFAULT_IDLE_COMPACTION_CONFIG, enabled: true },
       },
       undefined,
       undefined,
@@ -235,7 +235,10 @@ describe('SessionService idle compaction', () => {
     await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
     await vi.waitFor(() => expect(handle).toHaveBeenCalledTimes(2));
     const idle = handle.mock.calls[1][0];
-    expect(idle.idleCompaction).toBe(true);
+    expect(idle.idleCompaction).toEqual({
+      generation: expect.any(Number),
+      expiresAt: Date.parse('2026-10-12T07:00:00.000Z'),
+    });
     expect(idle.metadata).toMatchObject({
       recipientSessionId: 'session-ink',
       recipientSessionExplicit: true,
@@ -338,5 +341,57 @@ describe('SessionService idle compaction', () => {
     );
     expect(repository.reopenEnded).not.toHaveBeenCalled();
     expect(runPrompts()).toHaveLength(1);
+  });
+
+  // Lumen, #845 r2: the timer's own checks end before the turn is admitted.
+  // A real turn that takes the lock while the idle turn is still on its way
+  // (here, held at activity logging) wins, and the idle turn is refused there
+  // rather than queued behind it.
+  it('refuses the idle turn when a real turn takes the lock first', async () => {
+    await service.handleMessage(message());
+
+    let releaseIdle!: () => void;
+    const idleHeld = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const activity = (service as any).activityStream as IActivityStream;
+    (activity.logMessage as ReturnType<typeof vi.fn>).mockImplementation(
+      async (params: { content: string }) => {
+        if (params.content.includes('[IDLE COMPACTION]')) await idleHeld;
+        return { id: 'msg-1' };
+      }
+    );
+    let releaseReal!: () => void;
+    const realHeld = new Promise<void>((resolve) => {
+      releaseReal = resolve;
+    });
+
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith(
+        '[IdleCompaction] idle compaction delivering',
+        expect.objectContaining({ sessionId: 'session-ink' })
+      )
+    );
+
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      await realHeld;
+      return inkResult({ providerContextTokens: 100_000, cacheTtlSeconds: 3600 });
+    });
+    const real = service.handleMessage(message('A real message'));
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+
+    releaseIdle();
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith('[IdleCompaction] refused at admission', {
+        sessionId: 'session-ink',
+        reason: 'session busy',
+      })
+    );
+    releaseReal();
+    await real;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(runPrompts().some((p) => p.includes('[IDLE COMPACTION]'))).toBe(false);
   });
 });
