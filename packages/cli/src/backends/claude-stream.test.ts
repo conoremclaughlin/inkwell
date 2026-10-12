@@ -662,3 +662,58 @@ describe('the prompt-cache lifetime the run wrote at', () => {
     expect(r.usage).not.toHaveProperty('cacheTtlSeconds');
   });
 });
+
+// Lumen, #845 r1: the run's aggregate counts every request, so an earlier
+// request's one-hour writes said nothing about the five-minute suffix the
+// final request left.
+describe("the cache lifetime comes from the final request's own writes", () => {
+  const finalRequest = (cacheCreation: Record<string, number>) => ({
+    type: 'assistant',
+    message: {
+      id: 'main-last',
+      content: [],
+      usage: {
+        input_tokens: 1,
+        cache_read_input_tokens: 200_000,
+        cache_creation_input_tokens: 1_000,
+        cache_creation: cacheCreation,
+      },
+    },
+  });
+  const aggregate = {
+    type: 'result',
+    subtype: 'success',
+    usage: {
+      input_tokens: 2,
+      cache_read_input_tokens: 200_000,
+      cache_creation_input_tokens: 201_000,
+      cache_creation: { ephemeral_5m_input_tokens: 1_000, ephemeral_1h_input_tokens: 200_000 },
+    },
+  };
+
+  it('a final request that wrote at five minutes reports five minutes', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 1_000, ephemeral_1h_input_tokens: 0 })));
+    // The aggregate alone would say an hour: only earlier requests wrote at 1h.
+    const r = p.push(
+      line({
+        ...aggregate,
+        usage: {
+          ...aggregate.usage,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 200_000 },
+        },
+      })
+    )[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.contextTokens).toBe(201_001);
+    expect(r.usage?.cacheTtlSeconds).toBe(300);
+  });
+
+  it('a final request that only read falls back to the aggregate, shorter bucket first', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 })));
+    const r = p.push(line(aggregate))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheTtlSeconds).toBe(300);
+  });
+});

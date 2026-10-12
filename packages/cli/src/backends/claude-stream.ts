@@ -138,7 +138,11 @@ function lastMessageIteration(raw: unknown): ContextParts | undefined {
  * UNKNOWN — the aggregate is never a stand-in for enforcement (Lumen, PR
  * #583 rounds 2–3).
  */
-function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): BackendTokenUsage {
+function toUsage(
+  u: Record<string, unknown>,
+  lastRequest?: ContextParts,
+  lastRequestCacheTtl?: number
+): BackendTokenUsage {
   const inputTokens = num(u.input_tokens);
   const outputTokens = num(u.output_tokens);
   const cacheReadTokens = num(u.cache_read_input_tokens);
@@ -148,7 +152,9 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
   const window = request
     ? { contextTokens: providerContextTokens('claude', request), contextParts: request }
     : undefined;
-  const cacheTtlSeconds = promptCacheTtlSeconds(u);
+  // The final request's own split when it wrote anything: the run's aggregate
+  // also counts earlier requests, which may have cached at another lifetime.
+  const cacheTtlSeconds = lastRequestCacheTtl ?? promptCacheTtlSeconds(u);
   return {
     backend: 'claude',
     source: 'json',
@@ -190,6 +196,8 @@ export class ClaudeStreamParser implements BackendStreamParser {
    */
   private lastRequestUsage: ContextParts | undefined;
   private lastRequestMessageId: string | undefined;
+  /** The cache lifetime that same request wrote at, when it wrote anything. */
+  private lastRequestCacheTtl: number | undefined;
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
@@ -231,6 +239,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
           if (parts) {
             this.lastRequestUsage = parts;
             this.lastRequestMessageId = messageId;
+            this.lastRequestCacheTtl = promptCacheTtlSeconds(ev.message?.usage);
           } else if (messageId === undefined || messageId !== this.lastRequestMessageId) {
             // A NEWER message that reported nothing usable: the previous
             // message's measurement no longer describes the window, and
@@ -239,6 +248,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
             // message keeps what that message already reported.
             this.lastRequestUsage = undefined;
             this.lastRequestMessageId = messageId;
+            this.lastRequestCacheTtl = undefined;
           }
         }
         const content = ev.message?.content;
@@ -317,7 +327,10 @@ export class ClaudeStreamParser implements BackendStreamParser {
           kind: 'result',
           text,
           usage: ev.usage
-            ? { ...toUsage(ev.usage, this.lastRequestUsage), ...(modelUsage ? { modelUsage } : {}) }
+            ? {
+                ...toUsage(ev.usage, this.lastRequestUsage, this.lastRequestCacheTtl),
+                ...(modelUsage ? { modelUsage } : {}),
+              }
             : undefined,
           resumeFailedNoSession: resumeFailedNoSession || undefined,
         });

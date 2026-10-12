@@ -265,9 +265,12 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
 /**
  * The prompt-cache lifetime an Anthropic usage object wrote at, in seconds.
  * The object splits cache writes into `ephemeral_5m_input_tokens` and
- * `ephemeral_1h_input_tokens`; when both are present the longer one is what
- * keeps the prefix warm. Undefined when nothing was written, since a turn
- * that only read the cache says nothing about how long the entry lives.
+ * `ephemeral_1h_input_tokens`. When both are present the SHORTER one is the
+ * answer: a request can cache its tools and system prompt for an hour and the
+ * conversation after them for five minutes, and once that suffix expires the
+ * prefix that holds the history is cold (Lumen, #845 r1). Undefined when
+ * nothing was written, since a request that only read the cache says nothing
+ * about how long the entry lives.
  */
 export function promptCacheTtlSeconds(usage: unknown): number | undefined {
   if (!usage || typeof usage !== 'object') return undefined;
@@ -277,8 +280,8 @@ export function promptCacheTtlSeconds(usage: unknown): number | undefined {
     const value = (split as Record<string, unknown>)[key];
     return typeof value === 'number' && value > 0;
   };
-  if (written('ephemeral_1h_input_tokens')) return 3600;
   if (written('ephemeral_5m_input_tokens')) return 300;
+  if (written('ephemeral_1h_input_tokens')) return 3600;
   return undefined;
 }
 
