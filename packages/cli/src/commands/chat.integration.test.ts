@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
+import {
+  buildIdleCompactionPrompt,
+  mintDelegationToken,
+  verifyDelegationToken,
+} from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
@@ -372,6 +376,96 @@ describe('runChat integration', () => {
     const lastStart = Date.parse(resultLine.usage.lastRequestStartedAt);
     expect(lastStart).toBeGreaterThanOrEqual(callStartedAt[0] + 20);
     expect(lastStart).toBeLessThanOrEqual(callStartedAt[1]);
+  });
+
+  /**
+   * Lumen, #845 r2: the pre-turn budget check runs before the agent reads the
+   * idle prompt, and on an over-budget ledger with a failing summarizer it
+   * hard-trims history. The idle turn must not take that path. The second
+   * case is the control: the same transcript without the flag does trim, so
+   * the first case can see a trim when there is one.
+   */
+  describe('the idle compaction turn and the pre-turn trim', () => {
+    const sessionId = 'synthetic-idle-preflight';
+    const seedOverBudgetTranscript = (): string => {
+      const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+      mkdirSync(replDir, { recursive: true });
+      writeFileSync(
+        join(replDir, `${sessionId}-1700000000000.jsonl`),
+        Array.from({ length: 30 }, (_, i) =>
+          JSON.stringify({
+            ts: '2026-02-25T07:00:00.000Z',
+            type: i % 2 ? 'assistant' : 'user',
+            content: `Synthetic retained fact ${i}: ` + 'context '.repeat(1000),
+          })
+        ).join('\n') + '\n'
+      );
+      return replDir;
+    };
+    const runIdleTurn = async (idleCompaction: boolean) => {
+      const replDir = seedOverBudgetTranscript();
+      const summarizer = vi.fn();
+      testState.runBackendImpl.mockImplementation(async (request: Record<string, unknown>) => {
+        if (String(request.prompt).startsWith('You are compacting a conversation transcript')) {
+          summarizer();
+          return {
+            success: false,
+            stdout: '',
+            stderr: 'synthetic summarizer failure',
+            exitCode: 1,
+            durationMs: 1,
+            command: 'mock',
+          };
+        }
+        return {
+          success: true,
+          stdout: 'no changes',
+          stderr: '',
+          exitCode: 0,
+          durationMs: 1,
+          command: 'mock',
+        };
+      });
+      await runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        model: 'claude-opus-5',
+        sessionId,
+        nonInteractive: true,
+        messageLabel: 'heartbeat',
+        pollSeconds: '999',
+        maxContextTokens: '6000',
+        ...(idleCompaction ? { idleCompaction: true } : {}),
+        message: buildIdleCompactionPrompt({
+          providerContextTokens: 292000,
+          cacheTtlSeconds: 3600,
+        }),
+      });
+      const events = readdirSync(replDir)
+        .filter((p) => p.endsWith('.jsonl'))
+        .flatMap((p) =>
+          readFileSync(join(replDir, p), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>)
+        );
+      const trims = events.filter(
+        (e) => e.type === 'context_trim' && String(e.reason).includes('compaction fallback')
+      );
+      return { trims, summarizer };
+    };
+
+    it('an idle compaction turn neither summarizes nor trims before the agent reads it', async () => {
+      const { trims, summarizer } = await runIdleTurn(true);
+      expect(summarizer).not.toHaveBeenCalled();
+      expect(trims).toHaveLength(0);
+    });
+
+    it('control: the same over-budget transcript without the flag is trimmed', async () => {
+      const { trims, summarizer } = await runIdleTurn(false);
+      expect(summarizer).toHaveBeenCalled();
+      expect(trims.length).toBeGreaterThan(0);
+    });
   });
 
   /**

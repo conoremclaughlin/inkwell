@@ -128,6 +128,22 @@ function lastMessageIteration(raw: unknown): ContextParts | undefined {
   return undefined;
 }
 
+/** What one request wrote to the prompt cache, as far as its usage says. */
+type RequestCacheWrite =
+  | { kind: 'ttl'; seconds: number }
+  | { kind: 'read-only' }
+  | { kind: 'unknown' };
+
+function requestCacheWrite(usage: Record<string, unknown> | undefined): RequestCacheWrite {
+  if (!usage) return { kind: 'unknown' };
+  const seconds = promptCacheTtlSeconds(usage);
+  if (seconds !== undefined) return { kind: 'ttl', seconds };
+  // Wrote nothing: the lifetime it read under was set by earlier writes.
+  if (num(usage.cache_creation_input_tokens) === 0) return { kind: 'read-only' };
+  // Wrote something, or did not say, with no readable split.
+  return { kind: 'unknown' };
+}
+
 /**
  * Map Claude's `result.usage` object to BackendTokenUsage with the REAL field
  * names. The top-level fields are the agent run's AGGREGATE — one CLI spawn
@@ -141,7 +157,7 @@ function lastMessageIteration(raw: unknown): ContextParts | undefined {
 function toUsage(
   u: Record<string, unknown>,
   lastRequest?: ContextParts,
-  lastRequestCacheTtl?: number
+  lastRequestCache: RequestCacheWrite = { kind: 'unknown' }
 ): BackendTokenUsage {
   const inputTokens = num(u.input_tokens);
   const outputTokens = num(u.output_tokens);
@@ -154,7 +170,14 @@ function toUsage(
     : undefined;
   // The final request's own split when it wrote anything: the run's aggregate
   // also counts earlier requests, which may have cached at another lifetime.
-  const cacheTtlSeconds = lastRequestCacheTtl ?? promptCacheTtlSeconds(u);
+  // Only a final request that provably wrote nothing falls back to that
+  // aggregate; one whose writes carry no split is unknown (Lumen, #845 r2).
+  const cacheTtlSeconds =
+    lastRequestCache.kind === 'ttl'
+      ? lastRequestCache.seconds
+      : lastRequestCache.kind === 'read-only'
+        ? promptCacheTtlSeconds(u)
+        : undefined;
   return {
     backend: 'claude',
     source: 'json',
@@ -196,8 +219,8 @@ export class ClaudeStreamParser implements BackendStreamParser {
    */
   private lastRequestUsage: ContextParts | undefined;
   private lastRequestMessageId: string | undefined;
-  /** The cache lifetime that same request wrote at, when it wrote anything. */
-  private lastRequestCacheTtl: number | undefined;
+  /** What that same request wrote to the cache. */
+  private lastRequestCache: RequestCacheWrite = { kind: 'unknown' };
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
@@ -239,7 +262,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
           if (parts) {
             this.lastRequestUsage = parts;
             this.lastRequestMessageId = messageId;
-            this.lastRequestCacheTtl = promptCacheTtlSeconds(ev.message?.usage);
+            this.lastRequestCache = requestCacheWrite(ev.message?.usage);
           } else if (messageId === undefined || messageId !== this.lastRequestMessageId) {
             // A NEWER message that reported nothing usable: the previous
             // message's measurement no longer describes the window, and
@@ -248,7 +271,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
             // message keeps what that message already reported.
             this.lastRequestUsage = undefined;
             this.lastRequestMessageId = messageId;
-            this.lastRequestCacheTtl = undefined;
+            this.lastRequestCache = { kind: 'unknown' };
           }
         }
         const content = ev.message?.content;
@@ -328,7 +351,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
           text,
           usage: ev.usage
             ? {
-                ...toUsage(ev.usage, this.lastRequestUsage, this.lastRequestCacheTtl),
+                ...toUsage(ev.usage, this.lastRequestUsage, this.lastRequestCache),
                 ...(modelUsage ? { modelUsage } : {}),
               }
             : undefined,

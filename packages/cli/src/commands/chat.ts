@@ -282,6 +282,12 @@ type ChatOptions = {
   providerTools?: boolean;
   message?: string;
   messageLabel?: string;
+  /**
+   * The run is the server's idle compaction: skip the pre-turn system
+   * compaction, which can trim history when its summary fails, before the
+   * agent has read the request to compact its own (Lumen, #845 r2).
+   */
+  idleCompaction?: boolean;
   attachFile?: string[];
   nonInteractive?: boolean;
   requireBootstrap?: boolean;
@@ -7224,7 +7230,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // ── Token-budget enforcement: compact before building the prompt ──
     // If the transcript has grown past the compaction threshold, summarize
     // the oldest entries into a new start state before this turn spends them.
-    await maybeCompactContext('pre-turn budget check');
+    if (!options.idleCompaction) await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
     // Occupancy comes from turnContextOccupancy, which prefers the provider's
@@ -8592,6 +8598,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ...(runLastRequestStartedAt !== undefined
             ? { lastRequestStartedAt: runLastRequestStartedAt }
             : {}),
+          // The native session the run ended on: a cache lifetime learned
+          // under another one does not carry over.
+          ...(activeBackendSessionId ? { providerSessionId: activeBackendSessionId } : {}),
         },
         // Only what the provider reported during THIS process. Requested and
         // transcript-hydrated models are excluded — reporting either would
@@ -10270,6 +10279,10 @@ export function registerChatCommand(program: Command): void {
       .option(
         '--message-label <label>',
         'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
+      )
+      .option(
+        '--idle-compaction',
+        "Run --message as the server's idle compaction: no pre-turn system compaction, so history is never trimmed before the agent compacts its own"
       )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
       .option(
