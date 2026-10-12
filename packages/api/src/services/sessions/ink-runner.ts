@@ -181,9 +181,10 @@ interface InkRunUsage {
   modelUsage?: Record<string, ModelUsageTotals>;
   providerContextTokens?: number;
   cacheTtlSeconds?: number;
+  lastRequestStartedAt?: string;
 }
 
-/** A positive finite number from the CLI's JSON, else undefined. Older builds omit both fields. */
+/** A positive finite number from the CLI's JSON, else undefined. Older builds omit these fields. */
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
@@ -1033,6 +1034,11 @@ export class InkRunner implements IRunner {
             const modelUsage = parseInkModelUsage(parsed.modelUsage);
             const providerContextTokens = positiveNumber(parsed.usage.providerContextTokens);
             const cacheTtlSeconds = positiveNumber(parsed.usage.cacheTtlSeconds);
+            const lastRequestStartedAt =
+              typeof parsed.usage.lastRequestStartedAt === 'string' &&
+              Number.isFinite(Date.parse(parsed.usage.lastRequestStartedAt))
+                ? (parsed.usage.lastRequestStartedAt as string)
+                : undefined;
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
               inputTokens:
@@ -1043,6 +1049,7 @@ export class InkRunner implements IRunner {
               ...(modelUsage ? { modelUsage } : {}),
               ...(providerContextTokens !== undefined ? { providerContextTokens } : {}),
               ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
+              ...(lastRequestStartedAt !== undefined ? { lastRequestStartedAt } : {}),
             };
           }
           if (typeof parsed.model === 'string' && parsed.model.trim()) {

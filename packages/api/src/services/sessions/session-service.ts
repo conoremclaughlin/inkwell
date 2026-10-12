@@ -3954,6 +3954,7 @@ export class SessionService implements ISessionService {
           sbId: session.sbId ?? null,
           providerContextTokens: result.usage.providerContextTokens,
           cacheTtlSeconds: result.usage.cacheTtlSeconds,
+          lastRequestStartedAt: result.usage.lastRequestStartedAt,
           idleCompaction: request.idleCompaction === true,
         });
       }

@@ -151,7 +151,14 @@ describe('SessionService idle compaction', () => {
     };
     inkRunner = {
       uploadMedia: 'grant',
-      run: vi.fn(async () => inkResult({ providerContextTokens: 292_000, cacheTtlSeconds: 3600 })),
+      // The run's last provider request starts as it is called (fake clock).
+      run: vi.fn(async () =>
+        inkResult({
+          providerContextTokens: 292_000,
+          cacheTtlSeconds: 3600,
+          lastRequestStartedAt: new Date().toISOString(),
+        })
+      ),
     };
     const activityStream = {
       logMessage: vi.fn(async () => ({ id: 'msg-1' })),

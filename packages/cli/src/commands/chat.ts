@@ -4070,7 +4070,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // it had already recorded (Lumen, PR #577 round 2).
   let spawnSaid = '';
   let spawnEntryIndex = -1;
+  // When the current spawn began. A prompt-cache entry lives from the START of
+  // the request that last used it, and every request a spawn makes starts at
+  // or after this, so it is the conservative bound for the cache's clock.
+  let spawnStartedAt = new Date().toISOString();
   const beginSpawn = (): void => {
+    spawnStartedAt = new Date().toISOString();
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
     turnDialogueMuted = false;
@@ -4144,14 +4149,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // backend reported them. Carries the backend's own costUSD, which is what
   // makes spend answerable in dollars without a price table on our side.
   const runModelUsage: Record<string, BackendModelUsage> = {};
-  // The prompt-cache lifetime the newest invocation that wrote to the cache
-  // used. The server reads it to time an idle compaction before that cache
-  // expires; an invocation that only read the cache leaves it as it was.
+  // The session's own prompt cache, for the server's idle compaction: the
+  // lifetime the newest invocation that wrote to it used (one that only read
+  // it leaves this as it was), and when the newest invocation that reported
+  // usage began. Set from this session's spawns only, never a clone's, whose
+  // requests use a cache of their own.
   let runCacheTtlSeconds: number | undefined;
+  let runLastRequestStartedAt: string | undefined;
 
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
-    if (usage.cacheTtlSeconds !== undefined) runCacheTtlSeconds = usage.cacheTtlSeconds;
     runUsageTotals.inputTokens += usage.inputTokens || 0;
     runUsageTotals.outputTokens += usage.outputTokens || 0;
     runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
@@ -4353,6 +4360,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
+    if (usage.cacheTtlSeconds !== undefined) runCacheTtlSeconds = usage.cacheTtlSeconds;
+    runLastRequestStartedAt = spawnStartedAt;
     const scope = providerScope();
     const at = new Date().toISOString();
     providerSample.record(usage, scope, at);
@@ -8580,6 +8589,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           cacheWriteTokens: runUsageTotals.cacheWriteTokens,
           ...(providerContext !== undefined ? { providerContextTokens: providerContext } : {}),
           ...(runCacheTtlSeconds !== undefined ? { cacheTtlSeconds: runCacheTtlSeconds } : {}),
+          ...(runLastRequestStartedAt !== undefined
+            ? { lastRequestStartedAt: runLastRequestStartedAt }
+            : {}),
         },
         // Only what the provider reported during THIS process. Requested and
         // transcript-hydrated models are excluded — reporting either would

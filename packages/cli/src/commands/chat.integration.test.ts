@@ -312,16 +312,23 @@ describe('runChat integration', () => {
 
   /**
    * What the server arms an idle compaction on (idle-compaction-scheduler.ts):
-   * the provider's own count of the last request, and the cache lifetime the
-   * run last wrote at, kept through an invocation that only read the cache.
+   * the provider's own count of the last request, the cache lifetime the run
+   * last wrote at (kept through an invocation that only read the cache), and
+   * when the last invocation began, since the cache's clock runs from a
+   * request's start, not its end.
    */
   it("reports the provider's last context count and the run's cache lifetime", async () => {
     const usageByCall = [
       { contextTokens: 280_000, cacheTtlSeconds: 3600 },
       { contextTokens: 292_002 },
     ];
+    const callStartedAt: number[] = [];
     let call = 0;
     testState.runBackendImpl.mockImplementation(async () => {
+      callStartedAt.push(Date.now());
+      // Every invocation takes measurable time, so a start can be told apart
+      // from the previous invocation's start and from its own end.
+      await new Promise((resolve) => setTimeout(resolve, 25));
       const usage = usageByCall[Math.min(call, usageByCall.length - 1)];
       const stdout = call === 0 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done';
       call += 1;
@@ -360,6 +367,11 @@ describe('runChat integration', () => {
 
     expect(resultLine.usage.providerContextTokens).toBe(292_002);
     expect(resultLine.usage.cacheTtlSeconds).toBe(3600);
+    // The second invocation's start: after the first one's work, and before
+    // its own 25ms of work ended.
+    const lastStart = Date.parse(resultLine.usage.lastRequestStartedAt);
+    expect(lastStart).toBeGreaterThanOrEqual(callStartedAt[0] + 20);
+    expect(lastStart).toBeLessThanOrEqual(callStartedAt[1]);
   });
 
   /**

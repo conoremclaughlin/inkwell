@@ -1,8 +1,10 @@
 /**
  * Compact an idle ink session before its prompt cache expires.
  *
- * A provider keeps a prompt prefix cached for a fixed lifetime after the
- * request that last used it: five minutes or an hour on Anthropic. A turn that
+ * A provider keeps a prompt prefix cached for a fixed lifetime from the START
+ * of the request that last used it: five minutes or an hour on Anthropic, so
+ * generation time already spends it (Lumen, from Anthropic's caching docs). A
+ * turn that
  * arrives after that writes the whole context to the cache again, at the
  * write price, and an SB at 300k tokens pays that for every turn that follows
  * a long gap. Compacting just before the cache expires reads the history at
@@ -16,13 +18,18 @@
  * own brief (buildIdleCompactionPrompt) and calls compact_context, which
  * reseeds the native session from the compacted ledger.
  *
- * Every ink run reports the provider's context and the cache lifetime it wrote
- * at; this arms one timer per session at that lifetime less a margin. A newer
- * run replaces the timer. When it fires, the turn is skipped if the session is
- * busy, if it ended, or if one of the SB's reminders is due before the cache
- * expires: that wake reads the cache warm and arms a new timer when it ends.
- * Timers live in this process, so a restart forgets them; the next run arms
- * again.
+ * Every ink run reports the provider's context, the cache lifetime it wrote
+ * at, and when its last provider invocation began. This arms one timer per
+ * session at that start plus the lifetime, less a margin; with any of the
+ * three unknown, or the window already gone, it arms nothing. A newer run
+ * replaces the timer. It arms only when the context is above a floor and has
+ * grown since the last idle compaction, so a large fixed prefix is not
+ * summarized again and again. When it fires, the turn is skipped if the
+ * session is busy, if it ended, or if one of the SB's reminders will wake it
+ * before the cache expires: that wake reads the cache warm and arms a new
+ * timer when it ends. A failed or refused compaction leaves the context as it
+ * was; nothing here trims. Timers live in this process, so a restart forgets
+ * them; the next run arms again.
  */
 
 import { quietHoursAt, type QuietHoursWindow } from '../quiet-hours.js';
@@ -63,6 +70,8 @@ export interface IdleCompactionConfig {
   enabled: boolean;
   /** Provider context below which a compaction is not worth what it loses. */
   minContextTokens: number;
+  /** Growth since the last idle compaction needed before another one. */
+  minGrowthTokens: number;
   /** How long before expiry to compact, at most. A fifth of the lifetime caps it. */
   marginSeconds: number;
 }
@@ -73,6 +82,7 @@ export const DEFAULT_IDLE_COMPACTION_CONFIG: IdleCompactionConfig = {
   // 2026-10-11 05:52Z): identity envelope, provider prompt and tools. A floor
   // near that would compact for almost nothing.
   minContextTokens: 150_000,
+  minGrowthTokens: 50_000,
   marginSeconds: 300,
 };
 
@@ -84,6 +94,8 @@ export interface IdleRunReport {
   sbId: string | null;
   providerContextTokens?: number;
   cacheTtlSeconds?: number;
+  /** When the run's last provider invocation began (ISO): the cache's clock. */
+  lastRequestStartedAt?: string;
   /** The run was itself an idle compaction. */
   idleCompaction?: boolean;
 }
@@ -131,6 +143,8 @@ export class IdleCompactionScheduler {
    * written.
    */
   private readonly lifetimes = new Map<string, number>();
+  /** The provider context each session's last idle compaction left. */
+  private readonly baselines = new Map<string, number>();
 
   constructor(
     private readonly config: IdleCompactionConfig,
@@ -143,6 +157,9 @@ export class IdleCompactionScheduler {
     this.cancel(report.sessionId);
     if (report.cacheTtlSeconds !== undefined) {
       this.lifetimes.set(report.sessionId, report.cacheTtlSeconds);
+    }
+    if (report.idleCompaction && report.providerContextTokens !== undefined) {
+      this.baselines.set(report.sessionId, report.providerContextTokens);
     }
     const decision = this.decide(report);
     if (!decision.armed) {
@@ -224,6 +241,9 @@ export class IdleCompactionScheduler {
     }
     const ttl = this.lifetimes.get(report.sessionId);
     if (ttl === undefined) return { armed: false, reason: 'cache lifetime unknown' };
+    const startedAt =
+      report.lastRequestStartedAt !== undefined ? Date.parse(report.lastRequestStartedAt) : NaN;
+    if (!Number.isFinite(startedAt)) return { armed: false, reason: 'request start unknown' };
     const context = report.providerContextTokens;
     if (context === undefined) return { armed: false, reason: 'no provider measurement' };
     if (context < this.config.minContextTokens) {
@@ -232,13 +252,22 @@ export class IdleCompactionScheduler {
         reason: `context ${context} below ${this.config.minContextTokens}`,
       };
     }
-    const now = this.deps.now();
+    const baseline = this.baselines.get(report.sessionId);
+    if (baseline !== undefined && context < baseline + this.config.minGrowthTokens) {
+      return {
+        armed: false,
+        reason: `context ${context} has not grown ${this.config.minGrowthTokens} since the last idle compaction left ${baseline}`,
+      };
+    }
     const marginSeconds = Math.min(this.config.marginSeconds, ttl / 5);
-    return {
-      armed: true,
-      fireAt: now + (ttl - marginSeconds) * 1000,
-      expiresAt: now + ttl * 1000,
-    };
+    const expiresAt = startedAt + ttl * 1000;
+    const fireAt = expiresAt - marginSeconds * 1000;
+    // The turn ran so long that the useful window is gone. A late compaction
+    // would read a cold cache, which is no cheaper than the next real turn.
+    if (fireAt <= this.deps.now()) {
+      return { armed: false, reason: 'the cache window passed during the run' };
+    }
+    return { armed: true, fireAt, expiresAt };
   }
 
   private async check(armed: ArmedTimer): Promise<IdleFireOutcome> {

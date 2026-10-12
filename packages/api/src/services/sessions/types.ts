@@ -427,6 +427,11 @@ export interface SessionResult {
     providerContextTokens?: number;
     /** The prompt-cache lifetime the run last wrote at (ink on Claude only). */
     cacheTtlSeconds?: number;
+    /**
+     * When the run's last provider invocation began (ISO, ink only). The
+     * cache's lifetime runs from a request's start, so this is its clock.
+     */
+    lastRequestStartedAt?: string;
   };
 
   // Session state after processing

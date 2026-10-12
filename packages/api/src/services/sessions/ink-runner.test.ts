@@ -394,6 +394,7 @@ describe('InkRunner usage parsing', () => {
         cacheWriteTokens: 4_000,
         providerContextTokens: 292_002,
         cacheTtlSeconds: 3600,
+        lastRequestStartedAt: '2026-10-12T05:54:24.132Z',
       },
     });
 
@@ -403,6 +404,25 @@ describe('InkRunner usage parsing', () => {
     expect(result.usage.contextTokens).toBe(72_000);
     expect(result.usage.providerContextTokens).toBe(292_002);
     expect(result.usage.cacheTtlSeconds).toBe(3600);
+    expect(result.usage.lastRequestStartedAt).toBe('2026-10-12T05:54:24.132Z');
+  });
+
+  it('drops a request start that is not a time, rather than arming on it', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: {
+        contextTokens: 1_000,
+        inputTokens: 1,
+        outputTokens: 1,
+        lastRequestStartedAt: 'yesterday',
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage).not.toHaveProperty('lastRequestStartedAt');
   });
 });
 

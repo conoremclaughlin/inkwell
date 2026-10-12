@@ -70,6 +70,7 @@ function run(overrides: Partial<IdleRunReport> = {}): IdleRunReport {
     sbId: 'sb-1',
     providerContextTokens: 292_000,
     cacheTtlSeconds: HOUR,
+    lastRequestStartedAt: new Date(T0).toISOString(),
     ...overrides,
   };
 }
@@ -85,6 +86,67 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
     });
     expect(h.timers).toHaveLength(1);
     expect(h.timers[0].ms).toBe(55 * 60 * 1000);
+  });
+
+  it("counts from the last request's start: generation time already spent the cache", () => {
+    const h = harness();
+    // The run's last invocation began 20 minutes ago and ran until now.
+    const decision = h.scheduler.noteRunFinished(
+      run({ lastRequestStartedAt: new Date(T0 - 20 * 60 * 1000).toISOString() })
+    );
+    expect(decision).toEqual({
+      armed: true,
+      fireAt: T0 + 35 * 60 * 1000,
+      expiresAt: T0 + 40 * 60 * 1000,
+    });
+    expect(h.timers[0].ms).toBe(35 * 60 * 1000);
+  });
+
+  it('does not arm once the useful window has passed during the run', () => {
+    const h = harness();
+    // Four and a half minutes of generation on a five-minute cache.
+    expect(
+      h.scheduler.noteRunFinished(
+        run({
+          cacheTtlSeconds: 300,
+          lastRequestStartedAt: new Date(T0 - 270 * 1000).toISOString(),
+        })
+      )
+    ).toEqual({ armed: false, reason: 'the cache window passed during the run' });
+    expect(h.timers).toHaveLength(0);
+  });
+
+  it('does not arm without knowing when the last request started', () => {
+    const h = harness();
+    expect(h.scheduler.noteRunFinished(run({ lastRequestStartedAt: undefined }))).toEqual({
+      armed: false,
+      reason: 'request start unknown',
+    });
+    expect(h.scheduler.noteRunFinished(run({ lastRequestStartedAt: 'not a time' }))).toEqual({
+      armed: false,
+      reason: 'request start unknown',
+    });
+  });
+
+  it('after an idle compaction, arms again only once the context has grown', () => {
+    const h = harness();
+    // The compaction itself left 160k: above the floor, but it is the new baseline.
+    h.scheduler.noteRunFinished(run({ idleCompaction: true, providerContextTokens: 160_000 }));
+    expect(h.scheduler.noteRunFinished(run({ providerContextTokens: 209_999 }))).toEqual({
+      armed: false,
+      reason: 'context 209999 has not grown 50000 since the last idle compaction left 160000',
+    });
+    expect(h.scheduler.noteRunFinished(run({ providerContextTokens: 210_000 }))).toMatchObject({
+      armed: true,
+    });
+  });
+
+  it('a refused compaction that left the context large does not buy another attempt', () => {
+    const h = harness();
+    h.scheduler.noteRunFinished(run({ idleCompaction: true, providerContextTokens: 292_000 }));
+    expect(h.scheduler.noteRunFinished(run({ providerContextTokens: 300_000 }))).toMatchObject({
+      armed: false,
+    });
   });
 
   it('caps the margin at a fifth of a five-minute lifetime', () => {
