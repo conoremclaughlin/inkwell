@@ -4,6 +4,7 @@
  * output is never replaced, and normal login stays in the provider's HOME.
  */
 import { syncBuiltinESMExports } from 'node:module';
+import { userInfo } from 'node:os';
 import { expect, vi } from 'vitest';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -22,6 +23,7 @@ export interface ParallelLivePlan {
 export interface ParallelLiveDriver {
   enabled: boolean;
   providerHome: string;
+  providerUser: string;
   install(input: { root: string; serverUrl: string; onViolation(): void }): Promise<void>;
   binary(name: 'claude' | 'codex'): string;
   launches(sessionId: string): Json[];
@@ -36,6 +38,8 @@ export interface ParallelLiveDriver {
 }
 
 export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): ParallelLiveDriver {
+  // Native login selects the OS account as well as its HOME. Never copy auth.
+  const providerUser = userInfo().username;
   const records: Json[] = [];
   const offsets = new Map<string, number>();
   const violations: string[] = [];
@@ -48,6 +52,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
   return {
     enabled,
     providerHome: plan.providerHome,
+    providerUser,
     binary(name) {
       if (violations.length) throw new Error('Live provider configuration was not accepted');
       return binaries[name];
@@ -164,6 +169,12 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
       ) => {
         if (binary !== binaries.codex || args[0] !== 'mcp' || args[1] !== 'list')
           return execFile(binary, args, options, callback);
+        if (
+          options.env?.HOME !== plan.providerHome ||
+          options.env.USER !== providerUser ||
+          options.env.LOGNAME !== providerUser
+        )
+          throw new Error('Unexpected live config probe authority');
         return execFile(binary, args, options, (error, stdout, stderr) => {
           if (error) return callback(error, stdout, stderr);
           try {
@@ -195,6 +206,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
                 }
                 probes.push({
                   cwd: String(options.cwd),
+                  normalAccountSelector: true,
                   servers: servers.map((server) => ({ name: String(server.name), enabled: false })),
                   features: { shell_tool: false, unified_exec: unified === 'true' },
                 });
@@ -224,6 +236,8 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
         if (
           !ownPath(root, cwd) ||
           env.HOME !== plan.providerHome ||
+          env.USER !== providerUser ||
+          env.LOGNAME !== providerUser ||
           env.SUPABASE_SECRET_KEY ||
           env.JWT_SECRET ||
           env.ANTHROPIC_API_KEY ||
@@ -275,6 +289,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           mcpConfig: args.includes('--mcp-config') ? args[args.indexOf('--mcp-config') + 1] : null,
           nativeTools: args.includes('--tools') ? args[args.indexOf('--tools') + 1] : null,
           leakedServerCredential: false,
+          normalAccountSelector: true,
           observedBinary: binary,
           initStatus: name === 'claude' ? 'unverified' : 'not-applicable',
           codexSandbox,

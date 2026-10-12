@@ -44,6 +44,8 @@ async function setup(fakeChild?: childProcess.ChildProcess) {
   const token = { sub: 'fixture-owner', sessionId: 'fixture-session', sbSlug: 'fixture' };
   const env = {
     HOME: plan.providerHome,
+    USER: driver.providerUser,
+    LOGNAME: driver.providerUser,
     INK_ACCESS_TOKEN: `fixture.${Buffer.from(JSON.stringify(token)).toString('base64url')}.fixture`,
     INK_CONTEXT: Buffer.from(
       JSON.stringify({ sessionId: token.sessionId, sbSlug: 'fixture', studioId: 'fixture-studio' })
@@ -156,7 +158,11 @@ describe('opt-in live acceptance observer (without real providers)', () => {
       const run = await setup();
       const options = {
         cwd: run.cwd,
-        env: { HOME: run.plan.providerHome },
+        env: {
+          HOME: run.plan.providerHome,
+          USER: run.driver.providerUser,
+          LOGNAME: run.driver.providerUser,
+        },
         encoding: 'utf8' as const,
         timeout: 1000,
       };
@@ -350,12 +356,43 @@ describe('opt-in live acceptance observer (without real providers)', () => {
       sessionId: 'fixture-session',
       cwd,
       leakedServerCredential: false,
+      normalAccountSelector: true,
     });
     expect(record!.endedAt).toBeGreaterThanOrEqual(Number(record!.startedAt));
     expect(JSON.stringify(record)).not.toContain(env.INK_ACCESS_TOKEN);
     driver.clear('fixture-session');
     expect(driver.launches('fixture-session')).toEqual([]);
   });
+  it.each(['USER', 'LOGNAME'] as const)(
+    'requires the normal account selector %s before spawn',
+    async (key) => {
+      const run = await setup(new EventEmitter() as childProcess.ChildProcess);
+      expect(() =>
+        childProcess.spawn(run.driver.binary('codex'), codexArgs, {
+          cwd: run.cwd,
+          env: { ...run.env, [key]: undefined },
+        })
+      ).toThrow('Unexpected live provider authority');
+      expect(run.driver.launches('fixture-session')).toEqual([]);
+      expect(() =>
+        childProcess.execFile(
+          run.driver.binary('codex'),
+          ['mcp', 'list', '--json'],
+          {
+            cwd: run.cwd,
+            env: {
+              ...run.env,
+              INK_ACCESS_TOKEN: undefined,
+              INK_CONTEXT: undefined,
+              [key]: undefined,
+            },
+            encoding: 'utf8',
+          },
+          () => undefined
+        )
+      ).toThrow('Unexpected live config probe authority');
+    }
+  );
   it('refuses an inherited server credential before starting the harmless native program', async () => {
     const { driver, cwd, env } = await setup();
     expect(() =>
@@ -381,7 +418,7 @@ describe('opt-in live acceptance observer (without real providers)', () => {
         ['mcp', 'list', '--json'],
         {
           cwd,
-          env: { HOME: plan.providerHome },
+          env: { HOME: plan.providerHome, USER: driver.providerUser, LOGNAME: driver.providerUser },
           encoding: 'utf8',
           timeout: 1000,
         },

@@ -319,6 +319,7 @@ export function registerHostedParallelAcceptance(live?: ParallelLiveDriver): voi
       const runner = createBoundHostedInkRunner({
         baseEnv: {
           HOME: live?.providerHome ?? join(root, 'home'),
+          ...(live ? { USER: live.providerUser, LOGNAME: live.providerUser } : {}),
           PATH: process.env.PATH,
           TMPDIR: join(root, 'tmp'),
         },
