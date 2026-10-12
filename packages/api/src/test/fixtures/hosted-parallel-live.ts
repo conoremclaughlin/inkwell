@@ -137,6 +137,9 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
         // together. The inkwell entry is disabled: local Ink executes its calls.
         const overrides = [
           ...plan.codexConfig,
+          // Acceptance-only master switch for both shell implementations.
+          // unified_exec=false alone falls back to one-shot execution (0.160).
+          'features.shell_tool=false',
           `mcp_servers.inkwell.url=${JSON.stringify(`${serverUrl}/mcp`)}`,
           'mcp_servers.inkwell.enabled=false',
           'mcp_servers.inkwell.http_headers={}',
@@ -168,11 +171,34 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
               servers.some((server) => !server || server.enabled !== false)
             )
               throw new Error('Effective Codex MCP inventory was not wholly disabled');
-            probes.push({
-              cwd: String(options.cwd),
-              servers: servers.map((server) => ({ name: String(server.name), enabled: false })),
-            });
-            callback(null, stdout, stderr); // original adapter still judges the real answer
+            // Same credential-free environment and ordered configuration as
+            // mcp-list and the eventual launch; never read credential material.
+            execFile(
+              binary,
+              ['features', 'list', ...args.slice(3)],
+              options,
+              (featureError, listing) => {
+                const shell = /^shell_tool[ \t]+[^\r\n]+[ \t]+(true|false)\r?$/m.exec(listing)?.[1];
+                const unified = /^unified_exec[ \t]+[^\r\n]+[ \t]+(true|false)\r?$/m.exec(
+                  listing
+                )?.[1];
+                if (featureError || shell !== 'false' || !unified) {
+                  refuse('Effective Codex shell feature inventory was not accepted');
+                  callback(
+                    new Error('Live acceptance refused effective shell configuration'),
+                    '',
+                    ''
+                  );
+                  return;
+                }
+                probes.push({
+                  cwd: String(options.cwd),
+                  servers: servers.map((server) => ({ name: String(server.name), enabled: false })),
+                  features: { shell_tool: false, unified_exec: unified === 'true' },
+                });
+                callback(null, stdout, stderr); // real adapter still judges the MCP answer
+              }
+            );
           } catch {
             refuse('Effective Codex MCP inventory was not accepted');
             callback(new Error('Live acceptance refused effective MCP configuration'), '', '');
@@ -206,6 +232,33 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           Buffer.from(env.INK_ACCESS_TOKEN.split('.')[1]!, 'base64url').toString()
         ) as Json;
         const context = JSON.parse(Buffer.from(env.INK_CONTEXT!, 'base64url').toString()) as Json;
+        let codexSandbox: string | null = null;
+        if (name === 'codex') {
+          const modes = args.flatMap((arg, i) =>
+            arg === '--sandbox' || arg === '-s'
+              ? [args[i + 1]]
+              : arg.startsWith('--sandbox=')
+                ? [arg.slice('--sandbox='.length)]
+                : []
+          );
+          const config = args.flatMap((arg, i) =>
+            arg === '-c' || arg === '--config' ? [args[i + 1]] : []
+          );
+          if (
+            modes.length !== 1 ||
+            modes[0] !== 'read-only' ||
+            args.some((arg) =>
+              ['--dangerously-bypass-approvals-and-sandbox', '--yolo', '--full-auto'].includes(arg)
+            ) ||
+            !args.includes('--json') ||
+            config.filter((value) => value?.startsWith('features.shell_tool=')).at(-1) !==
+              'features.shell_tool=false'
+          ) {
+            refuse('Codex launch did not disable native shell with explicit read-only sandbox');
+            throw new Error('Codex acceptance launch configuration refused');
+          }
+          codexSandbox = modes[0];
+        }
         const child = spawn(binary, args, options);
         const record: Json = {
           pid: child.pid,
@@ -222,6 +275,9 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           leakedServerCredential: false,
           observedBinary: binary,
           initStatus: name === 'claude' ? 'unverified' : 'not-applicable',
+          codexSandbox,
+          codexRequestedShellConfig: name === 'codex' ? { shell_tool: false } : null,
+          nativeToolStatus: name === 'codex' ? 'observing' : 'not-applicable',
         };
         child.once('spawn', () => {
           record.startedAt = Date.now(); // real native executable exec succeeded
@@ -232,7 +288,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           record.exitCode = code;
           record.signal = signal;
         });
-        // Inspect only Claude's initialization metadata, never rewrite its stream.
+        // Inspect provider metadata only; never rewrite either provider's stream.
         let pending = '';
         let observedBytes = 0;
         const stopInspection = () => {
@@ -240,20 +296,47 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           child.stdout?.off('data', inspect);
         };
         const invalid = (reason: string) => {
-          record.initStatus = 'invalid';
+          if (name === 'claude') record.initStatus = 'invalid';
+          else record.nativeToolStatus = 'invalid';
           stopInspection();
           refuse(reason);
+        };
+        const inspectCodex = (line: string) => {
+          let event: Json;
+          try {
+            event = JSON.parse(line) as Json;
+          } catch {
+            invalid('Codex native event stream was not readable JSON');
+            return;
+          }
+          const item = event?.item as Json | undefined;
+          if (
+            item &&
+            ['command_execution', 'file_change', 'mcp_tool_call', 'web_search'].includes(
+              String(item.type)
+            )
+          ) {
+            // Observe started/updated/completed variants alike. This is a tripwire,
+            // NOT a pre-execution permission check; an event may arrive afterward.
+            record.nativeToolViolation = { eventType: event.type, itemType: item.type };
+            invalid('Codex emitted a native tool item during local-tool acceptance');
+          }
         };
         const inspect = (chunk: Buffer) => {
           observedBytes += chunk.length;
           if (observedBytes > 1_048_576) {
-            invalid('initialization metadata exceeded bound');
+            invalid('provider observation metadata exceeded bound');
             return;
           }
           pending += chunk.toString();
           const lines = pending.split('\n');
           pending = lines.pop()!;
           for (const line of lines) {
+            if (name === 'codex') {
+              if (line.trim()) inspectCodex(line);
+              if (record.nativeToolStatus === 'invalid') return;
+              continue;
+            }
             let event: Json;
             try {
               event = JSON.parse(line) as Json;
@@ -280,10 +363,16 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
             return;
           }
         };
-        if (name === 'claude') child.stdout?.on('data', inspect);
+        child.stdout?.on('data', inspect);
         // exit can precede the last stdout chunk. close is the output boundary.
         // A deliberately interrupted child is still unverified, not clean.
         child.once('close', (code, signal) => {
+          if (name === 'codex' && record.nativeToolStatus === 'observing') {
+            if (code === 0 && signal === null) {
+              if (pending.trim()) inspectCodex(pending);
+              if (record.nativeToolStatus === 'observing') record.nativeToolStatus = 'complete';
+            } else record.nativeToolStatus = 'interrupted';
+          }
           stopInspection();
           if (
             name === 'claude' &&
@@ -331,6 +420,14 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
             calls,
             ledgers: Object.fromEntries(ledgers),
             violations,
+            knownProviderHomeWrites: [
+              'Claude project transcripts and ~/.claude.json',
+              'Codex session state under normal HOME',
+            ],
+            nativeFileWriteBoundary:
+              'Explicit read-only CLI sandbox; apply_patch is not disabled. file_change items trip the observer, which is not a pre-effect fence.',
+            observationLimits:
+              'Native item tripwire is not a pre-execution fence or filesystem isolation; unreported tools are not proven absent.',
             limits: { turnMs: 120000, providerRoundsPerTurn: 4, caseMs: 180000, suiteMs: 900000 },
             substitutes: [
               'inert coding sentinel',

@@ -640,22 +640,22 @@ export function registerHostedParallelAcceptance(live?: ParallelLiveDriver): voi
               .eq('recipient_user_id', userId)
               .eq('sender_agent_id', row.sbSlug)
           );
-          expect(mail).toEqual([
-            expect.objectContaining({
+          expect(mail).toMatchObject([
+            {
               sender_agent_id: row.sbSlug,
               sender_sb_id: row.sbId,
               recipient_agent_id: 'sink',
               content: row.marker,
-              metadata: expect.objectContaining({
-                pcp: expect.objectContaining({
-                  sender: expect.objectContaining({
+              metadata: {
+                pcp: {
+                  sender: {
                     sbSlug: row.sbSlug,
                     sessionId: row.sessionId,
                     studioId: row.studioId,
-                  }),
-                }),
-              }),
-            }),
+                  },
+                },
+              },
+            },
           ]);
         }
         const firstLaunches = await Promise.all(
