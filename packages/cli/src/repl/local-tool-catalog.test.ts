@@ -108,7 +108,7 @@ describe('the prompt and the catalog describe the same surface', () => {
         '- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).',
         '- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).',
         '- write: Create or overwrite a file. Args: path (string), content (string).',
-        '- bash: Execute a shell command. Args: command (string), timeout (number, optional).',
+        '- bash: Execute a shell command. Args: command (string), timeout (seconds, optional; default 600, max 1800).',
         '- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).',
         '- find: Find files by name/pattern. Args: pattern (string), path (string, optional).',
         '- ls: List directory contents. Args: path (string, optional).',

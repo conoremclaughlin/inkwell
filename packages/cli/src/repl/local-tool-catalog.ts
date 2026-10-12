@@ -24,6 +24,7 @@
  */
 
 import { isForbiddenInClone } from './clone-policy.js';
+import { BASH_TIMEOUT_BOUNDS } from './bash-timeout.js';
 import { initPiTools, isPiTool } from './pi-tools.js';
 import { isClientLocalTool } from './context-tools.js';
 import { COLLECT_AGENTS_TOOL, MAX_CLONES_PER_SPAWN, SPAWN_AGENT_TOOL } from './spawn-agent.js';
@@ -90,7 +91,7 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     name: 'bash',
     group: 'coding',
     summary: 'Execute a shell command.',
-    args: 'command (string), timeout (number, optional)',
+    args: `command (string), timeout (seconds, optional; default ${BASH_TIMEOUT_BOUNDS.defaultSeconds}, max ${BASH_TIMEOUT_BOUNDS.maxSeconds})`,
   },
   {
     name: 'grep',
