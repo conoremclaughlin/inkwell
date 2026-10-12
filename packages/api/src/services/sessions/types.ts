@@ -348,6 +348,14 @@ export interface SessionRequest {
    * admits the turn (isOwnersHeartbeat).
    */
   inklingHeartbeat?: { reminderId: string };
+
+  /**
+   * The server's own idle-compaction turn (idle-compaction-scheduler.ts). Set
+   * only by the scheduler, in this process. A turn carrying it never arms
+   * another one, so a compaction that leaves the context large is not retried
+   * every cache lifetime; the session's next ordinary turn arms again.
+   */
+  idleCompaction?: true;
 }
 
 /**
@@ -411,6 +419,14 @@ export interface SessionResult {
      * The repository must diff against its checkpoint rather than add.
      */
     cumulative?: boolean;
+    /**
+     * The provider's own count of the last request (ink only). Unlike
+     * `contextTokens`, which ink reports from its ledger and identity, this
+     * covers the native session history the ledger no longer holds.
+     */
+    providerContextTokens?: number;
+    /** The prompt-cache lifetime the run last wrote at (ink on Claude only). */
+    cacheTtlSeconds?: number;
   };
 
   // Session state after processing

@@ -171,6 +171,23 @@ const CANCELLED_UNCONFIRMED =
   'ink chat turn cancelled; its processes did not confirm they had stopped';
 const UNCONFIRMED_SUFFIX = ', but its processes did not confirm they had stopped';
 
+/** What one `ink chat` run reports in its result line. */
+interface InkRunUsage {
+  contextTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  modelUsage?: Record<string, ModelUsageTotals>;
+  providerContextTokens?: number;
+  cacheTtlSeconds?: number;
+}
+
+/** A positive finite number from the CLI's JSON, else undefined. Older builds omit both fields. */
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 export class InkRunner implements IRunner {
   // ink chat reads each --attach-file itself, as this user, and grants its
   // backend only the file's own directory (packages/cli repl/attachments.ts),
@@ -448,14 +465,7 @@ export class InkRunner implements IRunner {
     config: ClaudeRunnerConfig
   ): Promise<{
     responses: ChannelResponse[];
-    usage?: {
-      contextTokens: number;
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      modelUsage?: Record<string, ModelUsageTotals>;
-    };
+    usage?: InkRunUsage;
     servedModel?: string;
     resumeFailedNoSession?: boolean;
     bootstrapRequiredFailure?: boolean;
@@ -962,14 +972,7 @@ export class InkRunner implements IRunner {
     _stderr: string
   ): {
     responses: ChannelResponse[];
-    usage?: {
-      contextTokens: number;
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      modelUsage?: Record<string, ModelUsageTotals>;
-    };
+    usage?: InkRunUsage;
     servedModel?: string;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
@@ -980,16 +983,7 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
-    let usage:
-      | {
-          contextTokens: number;
-          inputTokens: number;
-          outputTokens: number;
-          cacheReadTokens?: number;
-          cacheWriteTokens?: number;
-          modelUsage?: Record<string, ModelUsageTotals>;
-        }
-      | undefined;
+    let usage: InkRunUsage | undefined;
     let servedModel: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
@@ -1037,6 +1031,8 @@ export class InkRunner implements IRunner {
             // Per-model breakdown with the backend's own costUSD. Older ink
             // builds omit it; the field is simply absent then, never faked.
             const modelUsage = parseInkModelUsage(parsed.modelUsage);
+            const providerContextTokens = positiveNumber(parsed.usage.providerContextTokens);
+            const cacheTtlSeconds = positiveNumber(parsed.usage.cacheTtlSeconds);
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
               inputTokens:
@@ -1045,6 +1041,8 @@ export class InkRunner implements IRunner {
               cacheReadTokens,
               cacheWriteTokens,
               ...(modelUsage ? { modelUsage } : {}),
+              ...(providerContextTokens !== undefined ? { providerContextTokens } : {}),
+              ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
             };
           }
           if (typeof parsed.model === 'string' && parsed.model.trim()) {

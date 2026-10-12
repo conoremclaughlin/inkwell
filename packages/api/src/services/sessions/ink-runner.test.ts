@@ -375,6 +375,34 @@ describe('InkRunner usage parsing', () => {
     expect(result.usage.inputTokens).toBe(120);
     expect(result.usage.cacheReadTokens).toBe(0);
     expect(result.servedModel).toBeUndefined();
+    expect(result.usage).not.toHaveProperty('providerContextTokens');
+    expect(result.usage).not.toHaveProperty('cacheTtlSeconds');
+  });
+
+  // What the idle-compaction scheduler arms on: the provider's own count,
+  // which covers the native history ink's ledger figure does not, and the
+  // cache lifetime that count was written at.
+  it("passes the provider's context count and cache lifetime through", () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: {
+        contextTokens: 72_000,
+        inputTokens: 2,
+        outputTokens: 900,
+        cacheReadTokens: 288_000,
+        cacheWriteTokens: 4_000,
+        providerContextTokens: 292_002,
+        cacheTtlSeconds: 3600,
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.contextTokens).toBe(72_000);
+    expect(result.usage.providerContextTokens).toBe(292_002);
+    expect(result.usage.cacheTtlSeconds).toBe(3600);
   });
 });
 

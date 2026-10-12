@@ -107,6 +107,7 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { DEFAULT_IDLE_COMPACTION_CONFIG } from './services/sessions/idle-compaction-scheduler';
 import {
   HostedInkSessionRunner,
   parseHostedInkSbIds,
@@ -230,6 +231,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,
     compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
+    idleCompaction: {
+      ...DEFAULT_IDLE_COMPACTION_CONFIG,
+      enabled: env.IDLE_COMPACTION_ENABLED,
+      ...(env.IDLE_COMPACTION_MIN_CONTEXT_TOKENS
+        ? { minContextTokens: env.IDLE_COMPACTION_MIN_CONTEXT_TOKENS }
+        : {}),
+    },
     responseHandler: async (responses, sessionId) => routeResponses(responses, sessionId),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
@@ -2268,6 +2276,9 @@ async function shutdown(reason: string): Promise<void> {
     process.exit(1);
   }, 10_000);
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
+
+  // No idle compaction may start a turn while intake closes.
+  sessionService?.stopIdleCompaction();
 
   try {
     // Before anything is torn down: the agent CLIs we spawned are our children

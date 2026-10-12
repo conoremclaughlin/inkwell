@@ -253,6 +253,15 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   COMPACTION_THRESHOLD: optionalNumber,
 
+  // Compact an idle ink session shortly before its prompt cache expires, when
+  // its provider context is at least IDLE_COMPACTION_MIN_CONTEXT_TOKENS
+  // (default 150000). On by default; an isolated test server sets it false.
+  IDLE_COMPACTION_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  IDLE_COMPACTION_MIN_CONTEXT_TOKENS: optionalNumber,
+
   // The in-process ink runtime, for these agents only (comma-separated
   // agent identity UUIDs). Unset by default: every ink turn spawns ink chat.
   INK_RUNTIME_IN_PROCESS_SB_IDS: optionalString,
