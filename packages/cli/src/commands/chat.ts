@@ -4144,9 +4144,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // backend reported them. Carries the backend's own costUSD, which is what
   // makes spend answerable in dollars without a price table on our side.
   const runModelUsage: Record<string, BackendModelUsage> = {};
+  // The prompt-cache lifetime the newest invocation that wrote to the cache
+  // used. The server reads it to time an idle compaction before that cache
+  // expires; an invocation that only read the cache leaves it as it was.
+  let runCacheTtlSeconds: number | undefined;
 
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
+    if (usage.cacheTtlSeconds !== undefined) runCacheTtlSeconds = usage.cacheTtlSeconds;
     runUsageTotals.inputTokens += usage.inputTokens || 0;
     runUsageTotals.outputTokens += usage.outputTokens || 0;
     runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
@@ -8548,6 +8553,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const reportedContextTokens =
       ledger.totalTokens() +
       (runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0);
+    // The provider's own count of the last request, which also covers the
+    // native session history the ledger no longer holds. Undefined after a
+    // compaction cleared the sample and before the next spawn measured again.
+    const providerContext = providerContextMeasurement()?.contextTokens;
     console.log(
       JSON.stringify({
         type: 'result',
@@ -8569,6 +8578,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           outputTokens: runUsageTotals.outputTokens,
           cacheReadTokens: runUsageTotals.cacheReadTokens,
           cacheWriteTokens: runUsageTotals.cacheWriteTokens,
+          ...(providerContext !== undefined ? { providerContextTokens: providerContext } : {}),
+          ...(runCacheTtlSeconds !== undefined ? { cacheTtlSeconds: runCacheTtlSeconds } : {}),
         },
         // Only what the provider reported during THIS process. Requested and
         // transcript-hydrated models are excluded — reporting either would

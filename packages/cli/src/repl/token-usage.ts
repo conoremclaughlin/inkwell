@@ -26,6 +26,12 @@ export interface BackendTokenUsage {
    * which for an agent run are the run's aggregate (Lumen, PR #583 round 3).
    */
   contextParts?: ContextParts;
+  /**
+   * How long the provider keeps what this invocation wrote to its prompt
+   * cache, read from Anthropic's `cache_creation` split. Absent when the
+   * invocation wrote nothing or the backend does not report it.
+   */
+  cacheTtlSeconds?: number;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.
@@ -254,6 +260,26 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
     cacheWriteTokens,
     reasoningTokens,
   };
+}
+
+/**
+ * The prompt-cache lifetime an Anthropic usage object wrote at, in seconds.
+ * The object splits cache writes into `ephemeral_5m_input_tokens` and
+ * `ephemeral_1h_input_tokens`; when both are present the longer one is what
+ * keeps the prefix warm. Undefined when nothing was written, since a turn
+ * that only read the cache says nothing about how long the entry lives.
+ */
+export function promptCacheTtlSeconds(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const split = (usage as Record<string, unknown>).cache_creation;
+  if (!split || typeof split !== 'object') return undefined;
+  const written = (key: string): boolean => {
+    const value = (split as Record<string, unknown>)[key];
+    return typeof value === 'number' && value > 0;
+  };
+  if (written('ephemeral_1h_input_tokens')) return 3600;
+  if (written('ephemeral_5m_input_tokens')) return 300;
+  return undefined;
 }
 
 /** Backends whose prompt caching is reported as parts DISJOINT from input. */

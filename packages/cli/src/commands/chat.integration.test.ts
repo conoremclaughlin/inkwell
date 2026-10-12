@@ -311,6 +311,58 @@ describe('runChat integration', () => {
   });
 
   /**
+   * What the server arms an idle compaction on (idle-compaction-scheduler.ts):
+   * the provider's own count of the last request, and the cache lifetime the
+   * run last wrote at, kept through an invocation that only read the cache.
+   */
+  it("reports the provider's last context count and the run's cache lifetime", async () => {
+    const usageByCall = [
+      { contextTokens: 280_000, cacheTtlSeconds: 3600 },
+      { contextTokens: 292_002 },
+    ];
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      const usage = usageByCall[Math.min(call, usageByCall.length - 1)];
+      const stdout = call === 0 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done';
+      call += 1;
+      return {
+        success: true,
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: { backend: 'claude', source: 'json', inputTokens: 2, outputTokens: 10, ...usage },
+        model: 'claude-fable-5',
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'how large am I',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl.mock.calls.length).toBeGreaterThan(1);
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine.usage.providerContextTokens).toBe(292_002);
+    expect(resultLine.usage.cacheTtlSeconds).toBe(3600);
+  });
+
+  /**
    * `model` on the result line must be evidence from THIS run. runtime.model is
    * what was requested and runtime.detectedModel can be hydrated from a prior
    * process's transcript on reattach — reporting either would attribute usage

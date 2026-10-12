@@ -637,3 +637,28 @@ describe('result usage carries the context the FINAL request was handed (Lumen, 
     expect(usageOf(events)?.contextTokens).toBe(40_010);
   });
 });
+
+describe('the prompt-cache lifetime the run wrote at', () => {
+  it('is carried on the result usage from its cache_creation split', () => {
+    const p = new ClaudeStreamParser();
+    const evs = p.push(
+      line({
+        ...resultWithUsage,
+        usage: {
+          ...resultWithUsage.usage,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 4500 },
+        },
+      })
+    );
+    const r = evs[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheTtlSeconds).toBe(3600);
+  });
+
+  it('is absent when the result reports no split', () => {
+    const p = new ClaudeStreamParser();
+    const r = p.push(line(resultWithUsage))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage).not.toHaveProperty('cacheTtlSeconds');
+  });
+});

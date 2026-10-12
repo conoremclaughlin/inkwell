@@ -15,6 +15,7 @@
  */
 
 import {
+  promptCacheTtlSeconds,
   providerContextTokens,
   type BackendTokenUsage,
   type BackendModelUsage,
@@ -147,6 +148,7 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
   const window = request
     ? { contextTokens: providerContextTokens('claude', request), contextParts: request }
     : undefined;
+  const cacheTtlSeconds = promptCacheTtlSeconds(u);
   return {
     backend: 'claude',
     source: 'json',
@@ -155,6 +157,7 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
     cacheReadTokens,
     cacheWriteTokens,
     ...(window?.contextTokens !== undefined ? window : {}),
+    ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
     totalTokens:
       inputTokens !== undefined && outputTokens !== undefined
         ? inputTokens + outputTokens
