@@ -151,8 +151,10 @@ describe('a bounded pi bash call (real processes)', () => {
     // Pi kills a timed-out command with process.kill(-pid, 'SIGKILL'). Watching
     // every kill sent while the call runs and through the 1 s bound after it
     // is what shows the timer was cleared; a late kill at an exited group can
-    // otherwise fail silently and look like nothing happened.
-    const kills = vi.spyOn(process, 'kill');
+    // otherwise fail silently and look like nothing happened. The spy never
+    // signals: a late kill would target an exited group, then a PID that may
+    // have been reused.
+    const kills = vi.spyOn(process, 'kill').mockImplementation(() => true);
     try {
       const result = await bash().execute('t5', { command: 'echo finished' });
       expect(result.content.map((part) => part.text).join('')).toContain('finished');
