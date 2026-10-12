@@ -99,6 +99,7 @@ vi.mock('readline/promises', () => ({
 }));
 
 import { runChat } from './chat.js';
+import { ClaudeStreamParser } from '../backends/claude-stream.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -323,8 +324,9 @@ describe('runChat integration', () => {
    */
   it("reports the provider's last context count and the run's cache lifetime", async () => {
     const usageByCall = [
-      { contextTokens: 280_000, cacheTtlSeconds: 3600 },
-      { contextTokens: 292_002 },
+      { contextTokens: 280_000, cacheWrite: { kind: 'ttl' as const, seconds: 3600 } },
+      // Only read: it keeps the lifetime written in the same scope.
+      { contextTokens: 292_002, cacheWrite: { kind: 'read-only' as const } },
     ];
     const callStartedAt: number[] = [];
     let call = 0;
@@ -370,7 +372,7 @@ describe('runChat integration', () => {
       .find((parsed) => parsed && parsed.type === 'result');
 
     expect(resultLine.usage.providerContextTokens).toBe(292_002);
-    expect(resultLine.usage.cacheTtlSeconds).toBe(3600);
+    expect(resultLine.usage.cacheEvidence).toMatchObject({ kind: 'ttl', seconds: 3600 });
     // The second invocation's start: after the first one's work, and before
     // its own 25ms of work ended.
     const lastStart = Date.parse(resultLine.usage.lastRequestStartedAt);
@@ -385,6 +387,101 @@ describe('runChat integration', () => {
    * case is the control: the same transcript without the flag does trim, so
    * the first case can see a trim when there is one.
    */
+  // Lumen, #845 r3: the run's cache evidence keeps its scope through the
+  // runtime. Real parser, real runChat; only the backend spawn is mocked. The
+  // first invocation writes at an hour, then asks for a tool; the second is
+  // the scenario.
+  describe('cache evidence keeps its scope through the run', () => {
+    const parsedUsage = (kind: 'long' | 'short' | 'unknown' | 'read-only') => {
+      const usage = {
+        input_tokens: 2,
+        output_tokens: 10,
+        cache_read_input_tokens: 290000,
+        cache_creation_input_tokens: kind === 'read-only' ? 0 : 2000,
+        ...(kind === 'long' ? { cache_creation: { ephemeral_1h_input_tokens: 2000 } } : {}),
+        ...(kind === 'short' ? { cache_creation: { ephemeral_5m_input_tokens: 2000 } } : {}),
+      };
+      const p = new ClaudeStreamParser();
+      p.push(
+        JSON.stringify({
+          type: 'assistant',
+          message: { id: 'synthetic-last', content: [], usage },
+        }) + '\n'
+      );
+      const event = p.push(JSON.stringify({ type: 'result', subtype: 'success', usage }) + '\n')[0];
+      if (event.kind !== 'result') throw new Error('expected a result');
+      return event.usage;
+    };
+
+    it.each([
+      ['unknown-write', { kind: 'unknown' }],
+      ['model-change', { kind: 'read-only', model: 'claude-fable-5' }],
+      ['native-roll', { kind: 'read-only' }],
+      ['same-scope read', { kind: 'ttl', seconds: 3600 }],
+      ['known-short write', { kind: 'ttl', seconds: 300 }],
+    ] as const)('after a %s the result carries %o', async (scenario, expected) => {
+      let count = 0;
+      testState.runBackendImpl.mockImplementation(async (request: Record<string, unknown>) => {
+        const first = count++ === 0;
+        const model = !first && scenario === 'model-change' ? 'claude-fable-5' : 'claude-opus-5';
+        (request.onEvent as ((e: unknown) => void) | undefined)?.({ kind: 'model', model });
+        const usage = parsedUsage(
+          first
+            ? 'long'
+            : scenario === 'known-short write'
+              ? 'short'
+              : scenario === 'unknown-write'
+                ? 'unknown'
+                : 'read-only'
+        );
+        const tool =
+          scenario === 'native-roll'
+            ? { tool: 'evict_context', args: { role: 'user' } }
+            : { tool: 'get_timezone', args: {} };
+        return {
+          success: true,
+          stdout: first ? '```ink-tool\n' + JSON.stringify(tool) + '\n```' : 'done',
+          stderr: '',
+          exitCode: 0,
+          durationMs: 1,
+          command: 'mock',
+          usage,
+          model,
+        };
+      });
+      await runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        toolRouting: 'local',
+        nonInteractive: true,
+        message: 'Synthetic cache scope check',
+        pollSeconds: '999',
+      });
+      expect(count).toBe(2);
+      const calls = testState.runBackendImpl.mock.calls.map((c) => c[0] as Record<string, unknown>);
+      const result = logSpy.mock.calls
+        .map((args) => String(args[0] ?? ''))
+        .filter((l) => l.startsWith('{'))
+        .map((l) => {
+          try {
+            return JSON.parse(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((r) => r?.type === 'result');
+      expect(result.usage.cacheEvidence).toMatchObject(expected);
+      if (expected.kind !== 'unknown') {
+        expect(result.usage.cacheEvidence.providerSessionId).toBe(result.usage.providerSessionId);
+      }
+      if (scenario === 'native-roll') {
+        // A new native session: its own id, not the one the hour was written under.
+        expect(calls[1].backendSessionSeedId).toBeTruthy();
+        expect(result.usage.cacheEvidence.providerSessionId).toBe(calls[1].backendSessionSeedId);
+      }
+    });
+  });
+
   describe('the idle compaction turn and the pre-turn trim', () => {
     const sessionId = 'synthetic-idle-preflight';
     const seedOverBudgetTranscript = (): string => {

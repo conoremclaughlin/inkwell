@@ -658,7 +658,7 @@ describe('the prompt-cache lifetime the run wrote at', () => {
     );
     const r = p.push(line(resultWithUsage))[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
-    expect(r.usage?.cacheTtlSeconds).toBe(3600);
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 3600 });
   });
 
   // Lumen, #845 r2: with no request of its own to bind it to, the run's
@@ -675,14 +675,14 @@ describe('the prompt-cache lifetime the run wrote at', () => {
       })
     )[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
-    expect(r.usage).not.toHaveProperty('cacheTtlSeconds');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
   });
 
   it('is absent when the result reports no split', () => {
     const p = new ClaudeStreamParser();
     const r = p.push(line(resultWithUsage))[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
-    expect(r.usage).not.toHaveProperty('cacheTtlSeconds');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
   });
 });
 
@@ -729,7 +729,7 @@ describe("the cache lifetime comes from the final request's own writes", () => {
     )[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
     expect(r.usage?.contextTokens).toBe(201_001);
-    expect(r.usage?.cacheTtlSeconds).toBe(300);
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 300 });
   });
 
   it('a final request that only read falls back to the aggregate, shorter bucket first', () => {
@@ -737,7 +737,7 @@ describe("the cache lifetime comes from the final request's own writes", () => {
     p.push(line(finalRequest({ ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, 0)));
     const r = p.push(line(aggregate))[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
-    expect(r.usage?.cacheTtlSeconds).toBe(300);
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 300 });
   });
 
   // Lumen, #845 r2: wrote to the cache but gave no split. The aggregate's
@@ -747,6 +747,19 @@ describe("the cache lifetime comes from the final request's own writes", () => {
     p.push(line(finalRequest(undefined, 1_000)));
     const r = p.push(line(aggregate))[0]!;
     if (r.kind !== 'result') throw new Error('expected a result event');
-    expect(r.usage).not.toHaveProperty('cacheTtlSeconds');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
+  });
+
+  it('a final request and a run that both wrote nothing are read-only', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, 0)));
+    const r = p.push(
+      line({
+        ...aggregate,
+        usage: { ...aggregate.usage, cache_creation_input_tokens: 0, cache_creation: undefined },
+      })
+    )[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'read-only' });
   });
 });

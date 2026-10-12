@@ -155,6 +155,7 @@ import {
 } from '../repl/context-tools.js';
 import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
 import { assessContextPressure } from '../repl/context-pressure.js';
+import { nextRunCacheEvidence, type RunCacheEvidence } from '../repl/cache-evidence.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import {
@@ -4155,12 +4156,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // backend reported them. Carries the backend's own costUSD, which is what
   // makes spend answerable in dollars without a price table on our side.
   const runModelUsage: Record<string, BackendModelUsage> = {};
-  // The session's own prompt cache, for the server's idle compaction: the
-  // lifetime the newest invocation that wrote to it used (one that only read
-  // it leaves this as it was), and when the newest invocation that reported
-  // usage began. Set from this session's spawns only, never a clone's, whose
-  // requests use a cache of their own.
-  let runCacheTtlSeconds: number | undefined;
+  // The session's own prompt cache, for the server's idle compaction: what
+  // the newest invocation that reported usage left in it, scoped to the
+  // native session and model it ran under, and when that invocation began.
+  // A read-only invocation keeps a lifetime learned in the same scope; any
+  // other change of scope, or an unknown write, drops it (Lumen, #845 r3).
+  // Set from this session's spawns only, never a clone's, whose requests use
+  // a cache of their own.
+  let runCacheEvidence: RunCacheEvidence | undefined;
   let runLastRequestStartedAt: string | undefined;
 
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
@@ -4366,7 +4369,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
-    if (usage.cacheTtlSeconds !== undefined) runCacheTtlSeconds = usage.cacheTtlSeconds;
+    runCacheEvidence = nextRunCacheEvidence(runCacheEvidence, usage.cacheWrite, {
+      providerSessionId: activeBackendSessionId,
+      model: runtime.detectedModel || runtime.model,
+    });
     runLastRequestStartedAt = spawnStartedAt;
     const scope = providerScope();
     const at = new Date().toISOString();
@@ -8594,7 +8600,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           cacheReadTokens: runUsageTotals.cacheReadTokens,
           cacheWriteTokens: runUsageTotals.cacheWriteTokens,
           ...(providerContext !== undefined ? { providerContextTokens: providerContext } : {}),
-          ...(runCacheTtlSeconds !== undefined ? { cacheTtlSeconds: runCacheTtlSeconds } : {}),
+          ...(runCacheEvidence !== undefined ? { cacheEvidence: runCacheEvidence } : {}),
           ...(runLastRequestStartedAt !== undefined
             ? { lastRequestStartedAt: runLastRequestStartedAt }
             : {}),

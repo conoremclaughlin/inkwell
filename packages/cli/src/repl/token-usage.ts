@@ -1,3 +1,14 @@
+/**
+ * What an invocation's final request wrote to the provider's prompt cache:
+ * a lifetime read from its own split, provably nothing (read-only, so the
+ * lifetime it read under was set by earlier writes), or unknown. Absence of
+ * a lifetime is never left to mean both of the last two (Lumen, #845 r3).
+ */
+export type CacheWriteEvidence =
+  | { kind: 'ttl'; seconds: number }
+  | { kind: 'read-only' }
+  | { kind: 'unknown' };
+
 export interface ContextParts {
   inputTokens?: number;
   cacheReadTokens?: number;
@@ -27,11 +38,10 @@ export interface BackendTokenUsage {
    */
   contextParts?: ContextParts;
   /**
-   * How long the provider keeps what this invocation wrote to its prompt
-   * cache, read from Anthropic's `cache_creation` split. Absent when the
-   * invocation wrote nothing or the backend does not report it.
+   * What this invocation's final request wrote to the prompt cache. Absent
+   * when the backend does not report it, which reads as unknown.
    */
-  cacheTtlSeconds?: number;
+  cacheWrite?: CacheWriteEvidence;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.

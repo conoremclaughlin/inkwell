@@ -18,6 +18,7 @@ import {
   promptCacheTtlSeconds,
   providerContextTokens,
   type BackendTokenUsage,
+  type CacheWriteEvidence,
   type BackendModelUsage,
   type ContextParts,
 } from '../repl/token-usage.js';
@@ -129,12 +130,7 @@ function lastMessageIteration(raw: unknown): ContextParts | undefined {
 }
 
 /** What one request wrote to the prompt cache, as far as its usage says. */
-type RequestCacheWrite =
-  | { kind: 'ttl'; seconds: number }
-  | { kind: 'read-only' }
-  | { kind: 'unknown' };
-
-function requestCacheWrite(usage: Record<string, unknown> | undefined): RequestCacheWrite {
+function requestCacheWrite(usage: Record<string, unknown> | undefined): CacheWriteEvidence {
   if (!usage) return { kind: 'unknown' };
   const seconds = promptCacheTtlSeconds(usage);
   if (seconds !== undefined) return { kind: 'ttl', seconds };
@@ -157,7 +153,7 @@ function requestCacheWrite(usage: Record<string, unknown> | undefined): RequestC
 function toUsage(
   u: Record<string, unknown>,
   lastRequest?: ContextParts,
-  lastRequestCache: RequestCacheWrite = { kind: 'unknown' }
+  lastRequestCache: CacheWriteEvidence = { kind: 'unknown' }
 ): BackendTokenUsage {
   const inputTokens = num(u.input_tokens);
   const outputTokens = num(u.output_tokens);
@@ -170,14 +166,11 @@ function toUsage(
     : undefined;
   // The final request's own split when it wrote anything: the run's aggregate
   // also counts earlier requests, which may have cached at another lifetime.
-  // Only a final request that provably wrote nothing falls back to that
-  // aggregate; one whose writes carry no split is unknown (Lumen, #845 r2).
-  const cacheTtlSeconds =
-    lastRequestCache.kind === 'ttl'
-      ? lastRequestCache.seconds
-      : lastRequestCache.kind === 'read-only'
-        ? promptCacheTtlSeconds(u)
-        : undefined;
+  // Only a final request that provably wrote nothing looks at that aggregate,
+  // which this same invocation wrote; one whose writes carry no split is
+  // unknown (Lumen, #845 r2).
+  const cacheWrite: CacheWriteEvidence =
+    lastRequestCache.kind !== 'read-only' ? lastRequestCache : requestCacheWrite(u);
   return {
     backend: 'claude',
     source: 'json',
@@ -186,7 +179,7 @@ function toUsage(
     cacheReadTokens,
     cacheWriteTokens,
     ...(window?.contextTokens !== undefined ? window : {}),
-    ...(cacheTtlSeconds !== undefined ? { cacheTtlSeconds } : {}),
+    cacheWrite,
     totalTokens:
       inputTokens !== undefined && outputTokens !== undefined
         ? inputTokens + outputTokens
@@ -220,7 +213,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
   private lastRequestUsage: ContextParts | undefined;
   private lastRequestMessageId: string | undefined;
   /** What that same request wrote to the cache. */
-  private lastRequestCache: RequestCacheWrite = { kind: 'unknown' };
+  private lastRequestCache: CacheWriteEvidence = { kind: 'unknown' };
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
