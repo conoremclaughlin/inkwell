@@ -100,6 +100,12 @@ vi.mock('readline/promises', () => ({
 
 import { runChat } from './chat.js';
 import { ClaudeStreamParser } from '../backends/claude-stream.js';
+// The machine consumer of the result line, for the end-to-end scope check.
+import { InkRunner } from '../../../api/src/services/sessions/ink-runner.js';
+import {
+  IdleCompactionScheduler,
+  DEFAULT_IDLE_COMPACTION_CONFIG,
+} from '../../../api/src/services/sessions/idle-compaction-scheduler.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -330,8 +336,14 @@ describe('runChat integration', () => {
     ];
     const callStartedAt: number[] = [];
     let call = 0;
-    testState.runBackendImpl.mockImplementation(async () => {
+    testState.runBackendImpl.mockImplementation(async (request: Record<string, unknown>) => {
       callStartedAt.push(Date.now());
+      // The provider reports its model each spawn, as Claude's stream does; a
+      // read-only spawn inherits a lifetime only in a known scope.
+      (request.onEvent as ((e: unknown) => void) | undefined)?.({
+        kind: 'model',
+        model: 'claude-fable-5',
+      });
       // Every invocation takes measurable time, so a start can be told apart
       // from the previous invocation's start and from its own end.
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -556,6 +568,125 @@ describe('runChat integration', () => {
       expect(await runSequence(['unknown', 'long'])).toMatchObject({ kind: 'ttl', seconds: 3600 });
     });
   });
+
+  // Lumen, #845 r4: requested model A, fallback B, return to A. An event that
+  // confirms a pinned model skips applyDetectedModel, so the detected model
+  // still named B and the final read inherited B's hour for A's five-minute
+  // cache. Real parser, runChat, the emitted line, the real runner parse and
+  // the scheduler; only the backend spawn is mocked.
+  it.each([false, true])(
+    'A, then B, then a read on A is scoped to A end to end (A pinned: %s)',
+    async (pinned) => {
+      const models = ['claude-opus-5', 'claude-fable-5', 'claude-opus-5'];
+      const lifetimes = [300, 3600, undefined];
+      let call = 0;
+      testState.runBackendImpl.mockImplementation(async (request: Record<string, unknown>) => {
+        const index = call++;
+        const model = models[index];
+        (request.onEvent as ((e: unknown) => void) | undefined)?.({ kind: 'model', model });
+        const lifetime = lifetimes[index];
+        const usage = {
+          input_tokens: 2,
+          output_tokens: 10,
+          cache_read_input_tokens: 290000,
+          cache_creation_input_tokens: lifetime ? 2000 : 0,
+          ...(lifetime
+            ? {
+                cache_creation: {
+                  [lifetime === 300 ? 'ephemeral_5m_input_tokens' : 'ephemeral_1h_input_tokens']:
+                    2000,
+                },
+              }
+            : {}),
+        };
+        const parser = new ClaudeStreamParser();
+        parser.push(
+          JSON.stringify({
+            type: 'assistant',
+            message: { id: `synthetic-${index}`, content: [], usage },
+          }) + '\n'
+        );
+        const result = parser.push(
+          JSON.stringify({ type: 'result', subtype: 'success', usage }) + '\n'
+        )[0];
+        if (result.kind !== 'result') throw new Error('expected a result');
+        return {
+          success: true,
+          stdout: index < 2 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done',
+          stderr: '',
+          exitCode: 0,
+          durationMs: 1,
+          command: 'mock',
+          usage: result.usage,
+          model,
+        };
+      });
+      await runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        ...(pinned ? { model: models[0] } : {}),
+        toolRouting: 'local',
+        nonInteractive: true,
+        message: 'Synthetic fallback then recovery',
+        pollSeconds: '999',
+      });
+      expect(call).toBe(3);
+      const line = logSpy.mock.calls
+        .map((args) => String(args[0] ?? ''))
+        .filter((l) => l.startsWith('{'))
+        .map((l) => {
+          try {
+            return JSON.parse(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((r) => r?.type === 'result');
+      expect(line.model).toBe(models[2]);
+      expect(line.usage.cacheEvidence).toMatchObject({ kind: 'read-only', model: models[2] });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const parsed = (new InkRunner() as any).parseOutput(JSON.stringify(line), '').usage;
+      const now = Date.now();
+      const scheduler = new IdleCompactionScheduler(
+        { ...DEFAULT_IDLE_COMPACTION_CONFIG, enabled: true },
+        {
+          now: () => now,
+          setTimer: () => 0,
+          clearTimer: () => undefined,
+          sessionState: async () => ({ busy: false, ended: false }),
+          deliver: async () => undefined,
+          log: () => undefined,
+        }
+      );
+      const report = {
+        sessionId: 'synthetic-ink',
+        userId: 'synthetic-user',
+        sbSlug: 'lumen',
+        sbId: 'synthetic-sb',
+        providerContextTokens: parsed.providerContextTokens,
+        lastRequestStartedAt: parsed.lastRequestStartedAt,
+      };
+      // The server learned A's five-minute cache on this native session earlier.
+      scheduler.noteRunFinished({
+        ...report,
+        cacheEvidence: {
+          kind: 'ttl',
+          seconds: 300,
+          providerSessionId: parsed.providerSessionId,
+          model: models[0],
+        },
+      });
+      const decision = scheduler.noteRunFinished({
+        ...report,
+        cacheEvidence: parsed.cacheEvidence,
+      });
+      expect(decision).toMatchObject({
+        armed: true,
+        expiresAt: Date.parse(parsed.lastRequestStartedAt) + 300_000,
+      });
+    }
+  );
 
   describe('the idle compaction turn and the pre-turn trim', () => {
     const sessionId = 'synthetic-idle-preflight';

@@ -243,6 +243,22 @@ describe('IdleCompactionScheduler.noteRunFinished', () => {
     }
   });
 
+  // Lumen, #845 r4: two unreported models are not the same model.
+  it('a lifetime learned without a model is not inherited by a read without one', () => {
+    const h = harness();
+    h.scheduler.noteRunFinished(
+      run({
+        providerContextTokens: 90_000,
+        cacheEvidence: { kind: 'ttl', seconds: HOUR, providerSessionId: 'native-1' },
+      })
+    );
+    expect(
+      h.scheduler.noteRunFinished(
+        run({ cacheEvidence: { kind: 'read-only', providerSessionId: 'native-1' } })
+      )
+    ).toEqual({ armed: false, reason: 'cache lifetime unknown' });
+  });
+
   it('never arms after an idle compaction turn, however large the context stays', () => {
     const h = harness();
     expect(h.scheduler.noteRunFinished(run({ idleCompaction: true }))).toEqual({

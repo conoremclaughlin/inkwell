@@ -54,4 +54,16 @@ describe('nextRunCacheEvidence', () => {
       ...scope,
     });
   });
+
+  // Lumen, #845 r4: a lifetime is kept only in a scope that is known.
+  it('an unreported model or native session is never the same scope', () => {
+    const noModel: RunCacheEvidence = { kind: 'ttl', seconds: 3600, providerSessionId: 'native-1' };
+    expect(
+      nextRunCacheEvidence(noModel, { kind: 'read-only' }, { providerSessionId: 'native-1' })
+    ).toEqual({ kind: 'read-only', providerSessionId: 'native-1' });
+    const noSession: RunCacheEvidence = { kind: 'ttl', seconds: 3600, model: 'claude-opus-5-5' };
+    expect(
+      nextRunCacheEvidence(noSession, { kind: 'read-only' }, { model: 'claude-opus-5-5' })
+    ).toEqual({ kind: 'read-only', model: 'claude-opus-5-5' });
+  });
 });

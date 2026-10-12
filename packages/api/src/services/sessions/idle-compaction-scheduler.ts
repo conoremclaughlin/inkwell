@@ -284,7 +284,10 @@ export class IdleCompactionScheduler {
       return undefined;
     }
     const learned = this.lifetimes.get(report.sessionId);
-    if (!learned || evidence.providerSessionId === undefined) return undefined;
+    // An unreported session or model is never the same scope.
+    if (!learned || evidence.providerSessionId === undefined || evidence.model === undefined) {
+      return undefined;
+    }
     return learned.providerSessionId === evidence.providerSessionId &&
       learned.model === evidence.model
       ? learned.ttl

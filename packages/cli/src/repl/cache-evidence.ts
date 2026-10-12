@@ -19,10 +19,12 @@ export type RunCacheEvidence =
   | ({ kind: 'read-only' } & CacheScope)
   | { kind: 'unknown' };
 
+/** Both halves known and equal: an unreported session or model is never the same scope. */
 function sameScope(a: CacheScope, b: CacheScope): boolean {
   return (
     a.providerSessionId !== undefined &&
     a.providerSessionId === b.providerSessionId &&
+    a.model !== undefined &&
     a.model === b.model
   );
 }

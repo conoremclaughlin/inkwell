@@ -4370,9 +4370,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
     // Ahead of the early return: a spawn that reported no usage still used
     // the cache, and what it left there is unknown (Lumen, #845 r3).
+    // Scoped to the model the provider last reported in this process, never
+    // to what was requested or hydrated. runtime.detectedModel is not it: an
+    // event that confirms a pinned model skips applyDetectedModel, so after a
+    // fallback and a return it still names the fallback (Lumen, #845 r4).
+    // With no report, the scope has no model and a read-only spawn inherits
+    // nothing.
     runCacheEvidence = nextRunCacheEvidence(runCacheEvidence, usage?.cacheWrite, {
       providerSessionId: activeBackendSessionId,
-      model: runtime.detectedModel || runtime.model,
+      model: currentRunModel,
     });
     runLastRequestStartedAt = spawnStartedAt;
     if (!usage) return;
