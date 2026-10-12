@@ -8,6 +8,7 @@
  * only ever "correct by inspection" (Lumen, PR #578 rounds 2–3). The policy
  * lives here; the host binds the spawn, the file, and the counters.
  */
+import { renderContinuationBriefTemplate } from '@inklabs/shared';
 import { type ContextLedger, estimateTokens } from './context-ledger.js';
 import { compactionShrinks } from './context-tools.js';
 import type { BackendTokenUsage } from './token-usage.js';
@@ -72,10 +73,8 @@ export type CompactionOutcome =
 export function buildCompactionPrompt(chunk: string): string {
   return [
     'You are compacting a conversation transcript into a dense continuation brief.',
-    'Summarize the conversation below, preserving: decisions and their rationale,',
-    'completed and in-progress work, key facts and constraints, open questions,',
-    'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
-    'Write compact bullet points. Output ONLY the summary — no preamble.',
+    renderContinuationBriefTemplate(),
+    'Output ONLY the brief — no preamble.',
     '',
     '<conversation>',
     chunk,
