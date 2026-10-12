@@ -85,6 +85,8 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           enabledPlugins: {
             'cc-plugin-agents-md@builtin': false,
             'cc-plugin-plugin-authoring@builtin': false,
+            // Optional analytics, not the separately managed security plugin.
+            'cc-plugin-telemetry@builtin': false,
           },
           autoMemoryEnabled: false,
         }),
@@ -420,6 +422,8 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
             calls,
             ledgers: Object.fromEntries(ledgers),
             violations,
+            acceptanceOnlySettings:
+              'Optional builtin telemetry analytics disabled via owned settings; security plugin and managed policy unchanged.',
             knownProviderHomeWrites: [
               'Claude project transcripts and ~/.claude.json',
               'Codex session state under normal HOME',

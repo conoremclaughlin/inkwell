@@ -84,6 +84,16 @@ async function observeProvider(
 const emptyInit = { type: 'system', subtype: 'init', tools: [], plugins: [], mcp_servers: [] };
 
 describe('opt-in live acceptance observer (without real providers)', () => {
+  it('disables only named optional builtins in owned settings, never the security plugin', async () => {
+    const run = await setup();
+    const settings = JSON.parse(await readFile(join(run.root, 'claude-settings.json'), 'utf8'));
+    expect(settings.enabledPlugins).toEqual({
+      'cc-plugin-agents-md@builtin': false,
+      'cc-plugin-plugin-authoring@builtin': false,
+      'cc-plugin-telemetry@builtin': false,
+    });
+    expect(settings.enabledPlugins).not.toHaveProperty('cc-plugin-sec-default@builtin');
+  });
   it('passes the master switch last through the real adapter and its config-check record', async () => {
     const run = await setup();
     const host: BackendHost = {
