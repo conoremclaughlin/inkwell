@@ -248,7 +248,14 @@ export function registerHostedParallelAcceptance(live?: ParallelLiveDriver): voi
       serverUrl = `http://127.0.0.1:${server.getPort()}`;
       expect(server.getPort()).not.toBe(3001);
       if (live) {
-        await live.install({ root, serverUrl });
+        await live.install({
+          root,
+          serverUrl,
+          onViolation: () => {
+            expired = true;
+            for (const controller of controllers.values()) controller.abort();
+          },
+        });
         suiteCeiling = setTimeout(() => {
           expired = true;
           for (const controller of controllers.values()) controller.abort();

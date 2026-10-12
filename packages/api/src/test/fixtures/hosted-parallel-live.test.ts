@@ -2,20 +2,24 @@
 import { syncBuiltinESMExports } from 'node:module';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import childProcess from 'node:child_process';
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { mkdtemp, mkdir, realpath, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnBackend } from '@inklabs/shared';
 import { parallelLiveDriver } from './hosted-parallel-live';
 
 const roots: string[] = [];
+const originalSpawn = childProcess.spawn;
 afterEach(async () => {
   vi.restoreAllMocks();
+  childProcess.spawn = originalSpawn;
   syncBuiltinESMExports();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
-async function setup() {
+async function setup(fakeChild?: childProcess.ChildProcess) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ink-live-driver-unit-')));
   roots.push(root);
   const cwd = join(root, 'cwd');
@@ -29,7 +33,11 @@ async function setup() {
     codexConfig: ['features.hooks=false', 'plugins."fixture@builtin".enabled=false'],
   };
   const driver = parallelLiveDriver(plan, true);
-  await driver.install({ root, serverUrl: 'http://127.0.0.1:49001' });
+  // A plain lower-level port, not another spy: vi.spyOn reuses an existing
+  // mock, which would make the observer's captured delegate call itself.
+  if (fakeChild) childProcess.spawn = (() => fakeChild) as typeof childProcess.spawn;
+  const onViolation = vi.fn();
+  await driver.install({ root, serverUrl: 'http://127.0.0.1:49001', onViolation });
   const token = { sub: 'fixture-owner', sessionId: 'fixture-session', sbSlug: 'fixture' };
   const env = {
     HOME: plan.providerHome,
@@ -38,10 +46,89 @@ async function setup() {
       JSON.stringify({ sessionId: token.sessionId, sbSlug: 'fixture', studioId: 'fixture-studio' })
     ).toString('base64url'),
   };
-  return { root, cwd, plan, driver, env };
+  return { root, cwd, plan, driver, env, onViolation };
 }
 
+async function observeClaude() {
+  // The native-executable forwarding test below is separate. These adversarial
+  // protocol inputs never launch any process or touch a provider account.
+  const stdout = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    pid: 4242,
+    stdout,
+  }) as unknown as childProcess.ChildProcess;
+  const fixture = await setup(child);
+  childProcess.spawn(fixture.driver.binary('claude'), [], { cwd: fixture.cwd, env: fixture.env });
+  child.emit('spawn');
+  const finish = () =>
+    fixture.driver.finish({ root: fixture.root, cleaned: true, calls: [], ledgers: new Map() });
+  const evidence = async () =>
+    JSON.parse(await readFile(join(fixture.root, 'acceptance-evidence.json'), 'utf8')) as {
+      records: Array<Record<string, unknown>>;
+    };
+  const close = (code: number | null, signal: string | null = null) => {
+    child.emit('exit', code, signal);
+    child.emit('close', code, signal);
+  };
+  return { ...fixture, stdout, close, finish, evidence };
+}
+
+const emptyInit = { type: 'system', subtype: 'init', tools: [], plugins: [], mcp_servers: [] };
+
 describe('opt-in live acceptance observer (without real providers)', () => {
+  it('verifies only complete empty Claude initialization inventories', async () => {
+    const run = await observeClaude();
+    run.stdout.write(JSON.stringify(emptyInit) + '\n');
+    run.close(0);
+    await run.finish();
+    expect(run.onViolation).not.toHaveBeenCalled();
+    expect((await run.evidence()).records[0]).toMatchObject({
+      initStatus: 'verified',
+      exitCode: 0,
+    });
+  });
+  it.each([
+    ['missing fields', { type: 'system', subtype: 'init' }],
+    ['malformed inventory', { ...emptyInit, plugins: {} }],
+    ['nonempty inventory', { ...emptyInit, tools: ['unexpected'] }],
+  ])('refuses %s immediately, before the Claude child exits', async (_label, init) => {
+    const run = await observeClaude();
+    run.stdout.write(JSON.stringify(init) + '\n');
+    expect(run.onViolation).toHaveBeenCalledTimes(1);
+    expect(() => run.driver.binary('claude')).toThrow('configuration was not accepted');
+    run.close(0);
+    await expect(run.finish()).rejects.toThrow();
+    expect((await run.evidence()).records[0].initStatus).toBe('invalid');
+    expect(run.onViolation).toHaveBeenCalledTimes(1);
+  });
+  it('refuses successful completion without observed init rather than calling it verified', async () => {
+    const run = await observeClaude();
+    run.close(0);
+    expect(run.onViolation).toHaveBeenCalledTimes(1);
+    await expect(run.finish()).rejects.toThrow('initialization');
+    expect((await run.evidence()).records[0].initStatus).toBe('unverified');
+  });
+  it('records interrupted-before-init children as unverified, not as a clean init', async () => {
+    const run = await observeClaude();
+    run.close(null, 'SIGTERM');
+    await run.finish();
+    expect(run.onViolation).not.toHaveBeenCalled();
+    expect((await run.evidence()).records[0]).toMatchObject({
+      initStatus: 'unverified',
+      signal: 'SIGTERM',
+    });
+  });
+  it('aborts on oversized initialization and removes its buffer listener immediately', async () => {
+    const run = await observeClaude();
+    run.stdout.write(Buffer.alloc(1_048_577, 32));
+    expect(run.onViolation).toHaveBeenCalledTimes(1);
+    expect(run.stdout.listenerCount('data')).toBe(0);
+    run.stdout.write(JSON.stringify(emptyInit) + '\n');
+    run.close(0);
+    await expect(run.finish()).rejects.toThrow('bound');
+    expect((await run.evidence()).records[0].initStatus).toBe('invalid');
+    expect(run.onViolation).toHaveBeenCalledTimes(1);
+  });
   it('forwards the real native spawn and records its exact PID/exit without wrapping stdout', async () => {
     const { driver, cwd, env } = await setup();
     const spawned = spawnBackend({
@@ -80,9 +167,9 @@ describe('opt-in live acceptance observer (without real providers)', () => {
   it('does not accept table clearing as a substitute for explicit configuration switches', async () => {
     const { root, plan } = await setup();
     const invalid = parallelLiveDriver({ ...plan, codexConfig: ['hooks={}'] }, true);
-    await expect(invalid.install({ root, serverUrl: 'http://127.0.0.1:49001' })).rejects.toThrow(
-      'Unexpected acceptance configuration override'
-    );
+    await expect(
+      invalid.install({ root, serverUrl: 'http://127.0.0.1:49001', onViolation: vi.fn() })
+    ).rejects.toThrow('Unexpected acceptance configuration override');
   });
   it('refuses a config-only probe that returns no readable MCP inventory', async () => {
     const { driver, cwd, plan } = await setup();

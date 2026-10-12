@@ -22,7 +22,7 @@ export interface ParallelLivePlan {
 export interface ParallelLiveDriver {
   enabled: boolean;
   providerHome: string;
-  install(input: { root: string; serverUrl: string }): Promise<void>;
+  install(input: { root: string; serverUrl: string; onViolation(): void }): Promise<void>;
   binary(name: 'claude' | 'codex'): string;
   launches(sessionId: string): Json[];
   clear(sessionId: string): void;
@@ -52,7 +52,13 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
       if (violations.length) throw new Error('Live provider configuration was not accepted');
       return binaries[name];
     },
-    async install({ root, serverUrl }) {
+    async install({ root, serverUrl, onViolation }) {
+      const refuse = (reason: string) => {
+        violations.push(reason);
+        // The owning suite closes intake and aborts its own controllers now,
+        // not at the next assertion poll or the end of a 120-second turn.
+        onViolation();
+      };
       if (!enabled || process.env.INK_LIVE_TESTS !== '1' || process.env.INK_PARALLEL_LIVE !== '1')
         throw new Error('Live acceptance was not explicitly enabled');
       if (!isAbsolute(plan.providerHome) || ownPath(root, plan.providerHome))
@@ -168,7 +174,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
             });
             callback(null, stdout, stderr); // original adapter still judges the real answer
           } catch {
-            violations.push('Effective Codex MCP inventory was not accepted');
+            refuse('Effective Codex MCP inventory was not accepted');
             callback(new Error('Live acceptance refused effective MCP configuration'), '', '');
           }
         });
@@ -215,23 +221,36 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
           nativeTools: args.includes('--tools') ? args[args.indexOf('--tools') + 1] : null,
           leakedServerCredential: false,
           observedBinary: binary,
+          initStatus: name === 'claude' ? 'unverified' : 'not-applicable',
         };
         child.once('spawn', () => {
           record.startedAt = Date.now(); // real native executable exec succeeded
           records.push(record);
         });
-        child.once('exit', () => {
+        child.once('exit', (code, signal) => {
           record.endedAt = Date.now();
+          record.exitCode = code;
+          record.signal = signal;
         });
         // Inspect only Claude's initialization metadata, never rewrite its stream.
         let pending = '';
-        child.stdout?.on('data', (chunk: Buffer) => {
-          if (name !== 'claude' || record.initChecked) return;
-          pending += chunk.toString();
-          if (pending.length > 1_048_576) {
-            violations.push('initialization metadata exceeded bound');
+        let observedBytes = 0;
+        const stopInspection = () => {
+          pending = '';
+          child.stdout?.off('data', inspect);
+        };
+        const invalid = (reason: string) => {
+          record.initStatus = 'invalid';
+          stopInspection();
+          refuse(reason);
+        };
+        const inspect = (chunk: Buffer) => {
+          observedBytes += chunk.length;
+          if (observedBytes > 1_048_576) {
+            invalid('initialization metadata exceeded bound');
             return;
           }
+          pending += chunk.toString();
           const lines = pending.split('\n');
           pending = lines.pop()!;
           for (const line of lines) {
@@ -241,8 +260,7 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
             } catch {
               continue;
             }
-            if (event.type !== 'system' || event.subtype !== 'init') continue;
-            record.initChecked = true;
+            if (!event || event.type !== 'system' || event.subtype !== 'init') continue;
             record.init = Object.fromEntries(
               ['tools', 'plugins', 'mcp_servers'].map((key) => [
                 key,
@@ -250,12 +268,30 @@ export function parallelLiveDriver(plan: ParallelLivePlan, enabled: boolean): Pa
               ])
             );
             if (
-              ![event.tools ?? [], event.plugins ?? [], event.mcp_servers ?? []].every(
+              ![event.tools, event.plugins, event.mcp_servers].every(
                 (value) => Array.isArray(value) && value.length === 0
               )
             )
-              violations.push('Claude initialized unexpected tools/plugins/MCP');
+              invalid('Claude initialization inventories were missing, malformed or nonempty');
+            else {
+              record.initStatus = 'verified';
+              stopInspection();
+            }
+            return;
           }
+        };
+        if (name === 'claude') child.stdout?.on('data', inspect);
+        // exit can precede the last stdout chunk. close is the output boundary.
+        // A deliberately interrupted child is still unverified, not clean.
+        child.once('close', (code, signal) => {
+          stopInspection();
+          if (
+            name === 'claude' &&
+            code === 0 &&
+            signal === null &&
+            record.initStatus === 'unverified'
+          )
+            refuse('Claude completed without verified initialization metadata');
         });
         return child;
       }) as typeof childProcess.spawn);
