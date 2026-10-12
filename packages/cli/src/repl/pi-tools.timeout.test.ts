@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { createBashTool } from '@mariozechner/pi-coding-agent';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BASH_TIMEOUT_BOUNDS, boundedBashTimeout } from './bash-timeout.js';
 import { boundBashTool } from './pi-tools.js';
 
@@ -147,11 +147,20 @@ describe('a bounded pi bash call (real processes)', () => {
     expect(message).toContain('Command timed out after 1 seconds');
   }, 10_000);
 
-  it('returns a command that finishes first, and the timer does not fire afterwards', async () => {
-    const result = await bash().execute('t5', { command: 'echo finished' });
-    expect(result.content.map((part) => part.text).join('')).toContain('finished');
-    // Outlive the 1 s bound: a late kill or rejection would surface here.
-    await new Promise((settle) => setTimeout(settle, 1500));
+  it('returns a command that finishes first, and sends no kill after it has finished', async () => {
+    // Pi kills a timed-out command with process.kill(-pid, 'SIGKILL'). Watching
+    // every kill sent while the call runs and through the 1 s bound after it
+    // is what shows the timer was cleared; a late kill at an exited group can
+    // otherwise fail silently and look like nothing happened.
+    const kills = vi.spyOn(process, 'kill');
+    try {
+      const result = await bash().execute('t5', { command: 'echo finished' });
+      expect(result.content.map((part) => part.text).join('')).toContain('finished');
+      await new Promise((settle) => setTimeout(settle, 1500));
+      expect(kills).not.toHaveBeenCalled();
+    } finally {
+      kills.mockRestore();
+    }
   }, 10_000);
 
   it('stops at once when the call is already aborted', async () => {
