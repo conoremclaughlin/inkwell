@@ -223,6 +223,36 @@ describe('handleSendResponse — delivery evidence', () => {
     expect(JSON.parse(res.content[0]!.text).success).toBe(true);
     expect(consumeExplicitResponse('telegram', conversationId)).toBe(true);
   });
+
+  // The result is the delivery record, so the sender needs no read-after-write
+  // check to learn what the platform accepted.
+  it('returns the platform message ids the gateway reported', async () => {
+    setResponseCallback(async () => ({ platformMessageIds: ['4242'] }));
+    const res = await handleSendResponse(
+      { channel: 'telegram', conversationId, content: 'hello' } as Parameters<
+        typeof handleSendResponse
+      >[0],
+      composer
+    );
+
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.success).toBe(true);
+    expect(body.platformMessageIds).toEqual(['4242']);
+  });
+
+  it('omits platformMessageIds when the gateway reported none', async () => {
+    setResponseCallback(async () => undefined);
+    const res = await handleSendResponse(
+      { channel: 'telegram', conversationId, content: 'hello' } as Parameters<
+        typeof handleSendResponse
+      >[0],
+      composer
+    );
+
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.success).toBe(true);
+    expect(body).not.toHaveProperty('platformMessageIds');
+  });
 });
 
 /**

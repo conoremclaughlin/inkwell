@@ -709,6 +709,10 @@ export class ChannelGateway extends EventEmitter {
 
     // Track media results across channels for caller visibility
     let mediaResult: { sent: number; failed: number; errors: string[] } | undefined;
+    // Ids the platform assigned to the text messages it accepted, so the
+    // caller's own send result can say what was delivered without a second
+    // lookup. Only channels whose listener returns an id contribute.
+    const platformMessageIds: string[] = [];
 
     switch (channel) {
       case 'telegram': {
@@ -724,11 +728,12 @@ export class ChannelGateway extends EventEmitter {
         }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
-            await this.sendTelegramMessage(conversationId, content, {
+            const textMessageId = await this.sendTelegramMessage(conversationId, content, {
               format,
               replyToMessageId,
               sessionId,
             });
+            if (textMessageId) platformMessageIds.push(textMessageId);
           } else {
             await this.logOutgoingTelegram(conversationId, content, undefined, sessionId);
           }
@@ -737,18 +742,20 @@ export class ChannelGateway extends EventEmitter {
 
         // Send text first (if any meaningful content), then media
         if (content && (!media || media.length === 0)) {
-          await this.sendTelegramMessage(conversationId, content, {
+          const textMessageId = await this.sendTelegramMessage(conversationId, content, {
             format,
             replyToMessageId,
             sessionId,
           });
+          if (textMessageId) platformMessageIds.push(textMessageId);
         } else if (media && media.length > 0) {
           if (content) {
-            await this.sendTelegramMessage(conversationId, content, {
+            const textMessageId = await this.sendTelegramMessage(conversationId, content, {
               format,
               replyToMessageId,
               sessionId,
             });
+            if (textMessageId) platformMessageIds.push(textMessageId);
           }
           mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
@@ -975,12 +982,17 @@ export class ChannelGateway extends EventEmitter {
     // responses. The single release point is releaseConversation(), called from
     // server.ts after the full message handler completes.
 
-    // Return media delivery results so callers (send_response) can report them
-    if (mediaResult) {
+    // Return delivery results so callers (send_response) can report them
+    if (mediaResult || platformMessageIds.length > 0) {
       return {
-        mediaSent: mediaResult.sent,
-        mediaFailed: mediaResult.failed,
-        mediaErrors: mediaResult.errors.length > 0 ? mediaResult.errors : undefined,
+        ...(mediaResult
+          ? {
+              mediaSent: mediaResult.sent,
+              mediaFailed: mediaResult.failed,
+              mediaErrors: mediaResult.errors.length > 0 ? mediaResult.errors : undefined,
+            }
+          : {}),
+        ...(platformMessageIds.length > 0 ? { platformMessageIds } : {}),
       };
     }
   }
@@ -1071,8 +1083,8 @@ export class ChannelGateway extends EventEmitter {
     conversationId: string,
     content: string,
     options?: { format?: string; replyToMessageId?: string; sessionId?: string }
-  ): Promise<void> {
-    if (!this.telegramListener) return;
+  ): Promise<string | undefined> {
+    if (!this.telegramListener) return undefined;
 
     // Auto-detect markdown syntax and convert for Telegram
     const hasMarkdown = /\*\*.+?\*\*|\*.+?\*|`.+?`|^#{1,6}\s/m.test(content);
@@ -1108,6 +1120,7 @@ export class ChannelGateway extends EventEmitter {
       options?.sessionId,
       platformMessageId
     );
+    return platformMessageId;
   }
 
   /**

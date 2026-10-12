@@ -19,6 +19,12 @@ export interface ResponseResult {
   mediaSent?: number;
   mediaFailed?: number;
   mediaErrors?: string[];
+  /**
+   * Ids the platform assigned to the text messages it accepted, in send order.
+   * Absent when the channel's listener reports none. Proof the platform took
+   * the message, not that anyone has read it.
+   */
+  platformMessageIds?: string[];
 }
 
 // Response handler callback type
@@ -411,11 +417,16 @@ export async function handleSendResponse(
       mediaRequested: args.media?.length || 0,
     };
 
-    // Surface media delivery counters from the gateway if available
+    // Surface the gateway's delivery record if available. The platform message
+    // ids make this result the delivery record itself, so a caller has no
+    // reason to look the send up again in the activity stream.
     if (callbackResult) {
       if (callbackResult.mediaSent !== undefined) result.mediaSent = callbackResult.mediaSent;
       if (callbackResult.mediaFailed !== undefined) result.mediaFailed = callbackResult.mediaFailed;
       if (callbackResult.mediaErrors?.length) result.mediaErrors = callbackResult.mediaErrors;
+      if (callbackResult.platformMessageIds?.length) {
+        result.platformMessageIds = callbackResult.platformMessageIds;
+      }
     }
 
     return mcpResponse(result);
