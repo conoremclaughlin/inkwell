@@ -4368,12 +4368,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     envelopeShape: envelopeShapeKey(runtime),
   });
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
-    if (!usage) return;
-    runCacheEvidence = nextRunCacheEvidence(runCacheEvidence, usage.cacheWrite, {
+    // Ahead of the early return: a spawn that reported no usage still used
+    // the cache, and what it left there is unknown (Lumen, #845 r3).
+    runCacheEvidence = nextRunCacheEvidence(runCacheEvidence, usage?.cacheWrite, {
       providerSessionId: activeBackendSessionId,
       model: runtime.detectedModel || runtime.model,
     });
     runLastRequestStartedAt = spawnStartedAt;
+    if (!usage) return;
     const scope = providerScope();
     const at = new Date().toISOString();
     providerSample.record(usage, scope, at);

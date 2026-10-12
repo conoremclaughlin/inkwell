@@ -35,7 +35,10 @@ function sameScope(a: CacheScope, b: CacheScope): boolean {
  *   it read under it; otherwise it is read-only in its own scope, and the
  *   server decides whether anything it learned earlier still applies.
  * - An unknown write, or an invocation that reports nothing, is unknown, and
- *   no earlier lifetime survives it.
+ *   no earlier lifetime survives it. Unknown stays until a fresh lifetime is
+ *   written: a read-only invocation after it read under whatever the unknown
+ *   write left, and calling that read-only would let the server inherit a
+ *   lifetime from before it (Lumen, #845 r3).
  */
 export function nextRunCacheEvidence(
   previous: RunCacheEvidence | undefined,
@@ -48,6 +51,7 @@ export function nextRunCacheEvidence(
   };
   if (!write || write.kind === 'unknown') return { kind: 'unknown' };
   if (write.kind === 'ttl') return { kind: 'ttl', seconds: write.seconds, ...ownScope };
+  if (previous?.kind === 'unknown') return previous;
   if (previous?.kind === 'ttl' && sameScope(previous, ownScope)) return previous;
   return { kind: 'read-only', ...ownScope };
 }

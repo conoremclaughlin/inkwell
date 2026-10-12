@@ -6,6 +6,7 @@ import {
   type IdleRunReport,
   type IdleSessionState,
 } from './idle-compaction-scheduler.js';
+import { InkRunner } from './ink-runner.js';
 
 const HOUR = 3600;
 const T0 = Date.parse('2026-10-12T06:00:00.000Z');
@@ -430,5 +431,43 @@ describe('IdleCompactionScheduler.admissionRefusal', () => {
     expect(late.scheduler.admissionRefusal('session-a', lateTicket)).toBe(
       'the cache has already expired'
     );
+  });
+});
+
+// Lumen, #845 r3: across the result-line boundary. A server that learned an
+// hour from an earlier run reads this run's line through the real runner
+// parse. The run wrote without a split and then only read, so ink chat
+// reports unknown (chat.integration.test.ts pins that line): nothing arms,
+// and a later read-only run has nothing left to inherit.
+describe('unknown evidence across the result-line boundary', () => {
+  it('a line reporting unknown arms nothing after a learned hour, and leaves nothing to inherit', () => {
+    const h = harness();
+    expect(h.scheduler.noteRunFinished(run()).armed).toBe(true);
+    const line = JSON.stringify({
+      type: 'result',
+      usage: {
+        contextTokens: 72_000,
+        inputTokens: 2,
+        outputTokens: 10,
+        providerContextTokens: 292_002,
+        cacheEvidence: { kind: 'unknown' },
+        lastRequestStartedAt: new Date(T0).toISOString(),
+        providerSessionId: 'native-1',
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = (new InkRunner() as any).parseOutput(line, '').usage;
+    expect(
+      h.scheduler.noteRunFinished(
+        run({
+          providerContextTokens: parsed.providerContextTokens,
+          cacheEvidence: parsed.cacheEvidence,
+        })
+      )
+    ).toEqual({ armed: false, reason: 'cache lifetime unknown' });
+    expect(h.scheduler.noteRunFinished(run({ cacheEvidence: readOnly() }))).toEqual({
+      armed: false,
+      reason: 'cache lifetime unknown',
+    });
   });
 });

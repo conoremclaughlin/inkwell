@@ -482,6 +482,81 @@ describe('runChat integration', () => {
     });
   });
 
+  // Lumen, #845 r3: two sequences that report no lifetime of their own.
+  describe('cache evidence through invocations that report no lifetime', () => {
+    const usageFor = (kind: 'long' | 'unknown' | 'read-only') => {
+      const usage = {
+        input_tokens: 2,
+        output_tokens: 10,
+        cache_read_input_tokens: 290000,
+        cache_creation_input_tokens: kind === 'read-only' ? 0 : 2000,
+        ...(kind === 'long' ? { cache_creation: { ephemeral_1h_input_tokens: 2000 } } : {}),
+      };
+      const p = new ClaudeStreamParser();
+      p.push(
+        JSON.stringify({
+          type: 'assistant',
+          message: { id: 'synthetic-last', content: [], usage },
+        }) + '\n'
+      );
+      const event = p.push(JSON.stringify({ type: 'result', subtype: 'success', usage }) + '\n')[0];
+      if (event.kind !== 'result') throw new Error('expected a result');
+      return event.usage;
+    };
+    const resultLine = () =>
+      logSpy.mock.calls
+        .map((args) => String(args[0] ?? ''))
+        .filter((l) => l.startsWith('{'))
+        .map((l) => {
+          try {
+            return JSON.parse(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((r) => r?.type === 'result');
+    const runSequence = async (steps: Array<'long' | 'unknown' | 'read-only' | 'no-usage'>) => {
+      let count = 0;
+      testState.runBackendImpl.mockImplementation(async () => {
+        const step = steps[count];
+        count += 1;
+        const last = count === steps.length;
+        return {
+          success: true,
+          stdout: last ? 'done' : '```ink-tool\n{"tool":"get_timezone","args":{}}\n```',
+          stderr: '',
+          exitCode: 0,
+          durationMs: 1,
+          command: 'mock',
+          ...(step === 'no-usage' ? {} : { usage: usageFor(step) }),
+          model: 'claude-opus-5',
+        };
+      });
+      await runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        toolRouting: 'local',
+        nonInteractive: true,
+        message: 'Synthetic cache sequence',
+        pollSeconds: '999',
+      });
+      expect(count).toBe(steps.length);
+      return resultLine().usage.cacheEvidence;
+    };
+
+    it('a spawn that reports no usage leaves the run unknown', async () => {
+      expect(await runSequence(['long', 'no-usage'])).toEqual({ kind: 'unknown' });
+    });
+
+    it('an unknown write stays unknown through a read-only continuation', async () => {
+      expect(await runSequence(['long', 'unknown', 'read-only'])).toEqual({ kind: 'unknown' });
+    });
+
+    it('control: a fresh lifetime after the unknown write is reported', async () => {
+      expect(await runSequence(['unknown', 'long'])).toMatchObject({ kind: 'ttl', seconds: 3600 });
+    });
+  });
+
   describe('the idle compaction turn and the pre-turn trim', () => {
     const sessionId = 'synthetic-idle-preflight';
     const seedOverBudgetTranscript = (): string => {

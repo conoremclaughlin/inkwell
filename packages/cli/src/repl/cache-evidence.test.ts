@@ -34,4 +34,24 @@ describe('nextRunCacheEvidence', () => {
     expect(nextRunCacheEvidence(hour, { kind: 'unknown' }, scope)).toEqual({ kind: 'unknown' });
     expect(nextRunCacheEvidence(hour, undefined, scope)).toEqual({ kind: 'unknown' });
   });
+
+  // Lumen, #845 r3: what a read-only invocation read was left by the unknown
+  // write before it, so it cannot reopen a lifetime from before that write.
+  it('unknown stays unknown through read-only invocations, until a lifetime is written', () => {
+    const afterUnknown = nextRunCacheEvidence(hour, { kind: 'unknown' }, scope);
+    const afterRead = nextRunCacheEvidence(afterUnknown, { kind: 'read-only' }, scope);
+    expect(afterRead).toEqual({ kind: 'unknown' });
+    expect(nextRunCacheEvidence(afterRead, { kind: 'ttl', seconds: 300 }, scope)).toEqual({
+      kind: 'ttl',
+      seconds: 300,
+      ...scope,
+    });
+  });
+
+  it('a run that starts read-only is read-only in its scope: the server decides', () => {
+    expect(nextRunCacheEvidence(undefined, { kind: 'read-only' }, scope)).toEqual({
+      kind: 'read-only',
+      ...scope,
+    });
+  });
 });
