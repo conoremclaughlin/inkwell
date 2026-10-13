@@ -27,6 +27,7 @@ import { getBackend, resolveSlug } from '../backends/index.js';
 import { createCliBackendHost } from '../backends/cli-host.js';
 import { onceAsync } from '../lib/once-async.js';
 import { classifyError, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
+import { resolveParentJournalSync } from '@inklabs/shared/node-host';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
@@ -1121,21 +1122,13 @@ function findLatestInkReplTranscriptForSession(
     }
   }
 
-  const prefix = `${sessionId}-`;
+  // Each root's own journal for the session, never a clone's (task 65f3be41);
+  // then the newest across roots, as before.
   const candidates: string[] = [];
   for (const root of searchRoots) {
-    const dir = join(root, '.ink', 'runtime', 'repl');
-    if (!existsSync(dir)) continue;
     try {
-      for (const entry of readdirSync(dir)) {
-        if (!entry.startsWith(prefix) || !entry.endsWith('.jsonl')) continue;
-        const fullPath = join(dir, entry);
-        try {
-          if (statSync(fullPath).isFile()) candidates.push(fullPath);
-        } catch {
-          // Ignore unreadable candidate files
-        }
-      }
+      const journal = resolveParentJournalSync(join(root, '.ink', 'runtime', 'repl'), sessionId);
+      if (journal.path) candidates.push(journal.path);
     } catch {
       // Ignore unreadable repl directories
     }
