@@ -172,15 +172,22 @@ async function executeWithConcurrentReads(
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult[]> {
   const results: ToolCallResult[] = [];
-  const settle = (result: ToolCallResult) => {
-    results.push(result);
-    deps.onResult?.(result);
-  };
   // A throw from a port is the batch failing, as it is serially. Calls that
   // had already started still settle, so their intents are closed, and the
   // batch rethrows the first failure to arrive. Two overlapping reads that
   // both throw can arrive out of emission order.
   let failure: { error: unknown } | undefined;
+  // `onResult` is a port too. Its throw is kept, never thrown into the
+  // settlement chain: a rejected chain would skip every later settlement and
+  // let the batch return while admitted reads are still running.
+  const settle = (result: ToolCallResult) => {
+    results.push(result);
+    try {
+      deps.onResult?.(result);
+    } catch (error) {
+      failure ??= { error };
+    }
+  };
   let settled: Promise<void> = Promise.resolve();
 
   for (const call of calls) {

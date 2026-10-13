@@ -349,6 +349,59 @@ describe('concurrent reads', () => {
     expect(gate.entered).toEqual(['read']);
   });
 
+  it('a throwing onResult fails the batch only after every admitted read has settled', async () => {
+    const gate = gatedDispatcher();
+    const settled: string[] = [];
+    let batchFinished = false;
+    const run = executeToolCalls([named('read'), named('grep'), named('send_response')], {
+      ...ports({
+        concurrentReads: true,
+        callTool: gate.callTool,
+        onResult: (result) => {
+          settled.push(result.tool);
+          if (result.tool === 'read') throw new Error('result sink failed');
+        },
+      }),
+    });
+    const failed = expect(run).rejects.toThrow('result sink failed');
+    void run.then(
+      () => (batchFinished = true),
+      () => (batchFinished = true)
+    );
+    await vi.waitFor(() => expect(gate.entered).toEqual(['read', 'grep']));
+    await gate.answer('read');
+    await drain();
+    expect(batchFinished).toBe(false);
+    await gate.answer('grep');
+    await failed;
+    // grep was admitted before the failure, so it still settles; the write
+    // after it was not, so it never starts.
+    expect(settled).toEqual(['read', 'grep']);
+    expect(gate.entered).toEqual(['read', 'grep']);
+  });
+
+  it('one approval granted for the session covers a later call of the same tool', async () => {
+    let granted = false;
+    const prompt = vi.fn(async () => {
+      // A person answers later than the next call could start.
+      await drain();
+      granted = true;
+      return true;
+    });
+    const results = await executeToolCalls([named('read'), named('read')], {
+      ...ports({ concurrentReads: true }),
+      policy: {
+        canCallInkTool: () =>
+          granted
+            ? { allowed: true, reason: '' }
+            : { allowed: false, promptable: true, reason: 'ask' },
+      },
+      promptForApproval: prompt,
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(results.map((r) => r.status)).toEqual(['approved', 'executed']);
+  });
+
   it('settles the same results, in the same order, as the serial batch', async () => {
     const delays: Record<string, number> = { read: 15, grep: 1, recall: 5, send_response: 1 };
     const callTool = async (tool: string) => {
