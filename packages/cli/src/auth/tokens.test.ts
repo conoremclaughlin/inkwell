@@ -2,7 +2,7 @@
  * Tests for auth/tokens.ts — PKCE, token storage, JWT decode, expiry.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import crypto from 'crypto';
 import { mkdirSync, existsSync, readFileSync, statSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
@@ -343,6 +343,40 @@ describe('getValidAccessToken', () => {
     process.env.INK_ACCESS_TOKEN = envJwt;
     const token = await getValidAccessToken('http://localhost:3001');
     expect(token).toBe(envJwt);
+  });
+
+  it('overlapping callers share one refresh of the same refresh token', async () => {
+    delete process.env.INK_ACCESS_TOKEN;
+    saveAuth({
+      access_token: 'expired-token',
+      refresh_token: 'refresh-once',
+      expires_in: 60,
+      scope: 'mcp:tools',
+      issued_at: Date.now() - 3600 * 1000,
+    });
+    let answer!: (response: Response) => void;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const first = getValidAccessToken('http://localhost:3001', { allowEnvToken: false });
+      const second = getValidAccessToken('http://localhost:3001', { allowEnvToken: false });
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      answer(
+        new Response(JSON.stringify({ access_token: 'refreshed-token', expires_in: 3600 }), {
+          status: 200,
+        })
+      );
+      expect(await Promise.all([first, second])).toEqual(['refreshed-token', 'refreshed-token']);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(loadAuth()?.access_token).toBe('refreshed-token');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

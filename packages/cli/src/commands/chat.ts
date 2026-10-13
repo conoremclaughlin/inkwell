@@ -4265,6 +4265,8 @@ async function runChatSession(
     collectAgents: runCollectAgents,
     compact: runSbCompaction,
     measurement: providerContextMeasurement,
+    // Opt-in while it is new: a batch's audited reads overlap each other.
+    concurrentReads: process.env.INK_CONCURRENT_READS === 'true',
     recordEviction,
   });
   const runIterationTools = async (
