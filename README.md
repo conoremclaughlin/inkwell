@@ -372,4 +372,8 @@ Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aste
 
 ## License
 
-All packages are [MIT](./LICENSE). The Inkwell server (`packages/api`) is [FSL-1.1-MIT](./packages/api/LICENSE), converting to MIT after 2 years.
+The Inkwell server (`packages/api`) uses the [Inkwell Server License](./packages/api/LICENSE), an **extension of FSL 1.1** with additional commercial hosting and server-backed application restrictions. Each server version becomes available under MIT on the second anniversary of when that version was made available.
+
+The runtime, providers, and node-host exports in `packages/shared`, the CLI, and other first-party files outside the server remain [MIT](./LICENSE) unless separately marked. Their MIT permissions apply immediately, including commercial use. Third-party components retain their own licenses.
+
+See the [license scope and usage examples](./docs/licensing.md) for the distinction between permitted self-hosting and commercial server offerings. This is a modified, source-available server license, not unmodified FSL-1.1-MIT.
