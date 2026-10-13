@@ -375,6 +375,64 @@ describe('InkRunner usage parsing', () => {
     expect(result.usage.inputTokens).toBe(120);
     expect(result.usage.cacheReadTokens).toBe(0);
     expect(result.servedModel).toBeUndefined();
+    expect(result.usage).not.toHaveProperty('providerContextTokens');
+    expect(result.usage).not.toHaveProperty('cacheEvidence');
+  });
+
+  // What the idle-compaction scheduler arms on: the provider's own count,
+  // which covers the native history ink's ledger figure does not, and the
+  // cache lifetime that count was written at.
+  it("passes the provider's context count and cache lifetime through", () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: {
+        contextTokens: 72_000,
+        inputTokens: 2,
+        outputTokens: 900,
+        cacheReadTokens: 288_000,
+        cacheWriteTokens: 4_000,
+        providerContextTokens: 292_002,
+        cacheEvidence: {
+          kind: 'ttl',
+          seconds: 3600,
+          providerSessionId: 'native-1',
+          model: 'claude-opus-5-5',
+        },
+        lastRequestStartedAt: '2026-10-12T05:54:24.132Z',
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.contextTokens).toBe(72_000);
+    expect(result.usage.providerContextTokens).toBe(292_002);
+    expect(result.usage.cacheEvidence).toEqual({
+      kind: 'ttl',
+      seconds: 3600,
+      providerSessionId: 'native-1',
+      model: 'claude-opus-5-5',
+    });
+    expect(result.usage.lastRequestStartedAt).toBe('2026-10-12T05:54:24.132Z');
+  });
+
+  it('drops a request start that is not a time, rather than arming on it', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: {
+        contextTokens: 1_000,
+        inputTokens: 1,
+        outputTokens: 1,
+        lastRequestStartedAt: 'yesterday',
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage).not.toHaveProperty('lastRequestStartedAt');
   });
 });
 
@@ -927,5 +985,28 @@ describe('InkRunner — chained failures', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBeTruthy();
+  });
+
+  it('passes read-only and unknown evidence through, and drops a malformed one', () => {
+    const runner = new InkRunner();
+    const parse = (cacheEvidence: unknown) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (runner as any).parseOutput(
+        JSON.stringify({
+          type: 'result',
+          usage: { contextTokens: 1, inputTokens: 1, outputTokens: 1, cacheEvidence },
+        }),
+        ''
+      ).usage.cacheEvidence;
+    expect(parse({ kind: 'read-only', providerSessionId: 'native-1', model: 'm' })).toEqual({
+      kind: 'read-only',
+      providerSessionId: 'native-1',
+      model: 'm',
+    });
+    expect(parse({ kind: 'unknown' })).toEqual({ kind: 'unknown' });
+    expect(parse({ kind: 'ttl' })).toBeUndefined();
+    expect(parse({ kind: 'ttl', seconds: -5 })).toBeUndefined();
+    expect(parse({ kind: 'forever' })).toBeUndefined();
+    expect(parse('3600')).toBeUndefined();
   });
 });

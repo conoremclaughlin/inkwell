@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   extractBackendTokenUsage,
   formatBackendTokenUsage,
+  promptCacheTtlSeconds,
   providerContextTokens,
 } from './token-usage.js';
 
@@ -188,5 +189,41 @@ describe('providerContextTokens — the context a request was handed, per backen
   it('is absent when nothing about the input was reported', () => {
     expect(providerContextTokens('claude', {})).toBeUndefined();
     expect(providerContextTokens('codex', { cacheReadTokens: 5 })).toBeUndefined();
+  });
+});
+
+describe('promptCacheTtlSeconds', () => {
+  it('reads the lifetime from the cache_creation split Claude reports', () => {
+    expect(
+      promptCacheTtlSeconds({
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 3720 },
+      })
+    ).toBe(3600);
+    expect(
+      promptCacheTtlSeconds({
+        cache_creation: { ephemeral_5m_input_tokens: 812, ephemeral_1h_input_tokens: 0 },
+      })
+    ).toBe(300);
+  });
+
+  // Lumen, #845 r1: tools and system prompt cached for an hour, the
+  // conversation after them for five minutes. When the suffix expires, the
+  // history is cold, so the shorter lifetime is the answer.
+  it('takes the shorter lifetime when one request wrote both', () => {
+    expect(
+      promptCacheTtlSeconds({
+        cache_creation: { ephemeral_1h_input_tokens: 80_000, ephemeral_5m_input_tokens: 220_000 },
+      })
+    ).toBe(300);
+  });
+
+  it('is unknown when nothing was written or the split is absent', () => {
+    expect(
+      promptCacheTtlSeconds({
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+      })
+    ).toBeUndefined();
+    expect(promptCacheTtlSeconds({ cache_creation_input_tokens: 4500 })).toBeUndefined();
+    expect(promptCacheTtlSeconds(undefined)).toBeUndefined();
   });
 });

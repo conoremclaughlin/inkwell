@@ -155,6 +155,7 @@ import {
 } from '../repl/context-tools.js';
 import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
 import { assessContextPressure } from '../repl/context-pressure.js';
+import { nextRunCacheEvidence, type RunCacheEvidence } from '../repl/cache-evidence.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import {
@@ -282,6 +283,12 @@ type ChatOptions = {
   providerTools?: boolean;
   message?: string;
   messageLabel?: string;
+  /**
+   * The run is the server's idle compaction: skip the pre-turn system
+   * compaction, which can trim history when its summary fails, before the
+   * agent has read the request to compact its own (Lumen, #845 r2).
+   */
+  idleCompaction?: boolean;
   attachFile?: string[];
   nonInteractive?: boolean;
   requireBootstrap?: boolean;
@@ -4070,7 +4077,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // it had already recorded (Lumen, PR #577 round 2).
   let spawnSaid = '';
   let spawnEntryIndex = -1;
+  // When the current spawn began. A prompt-cache entry lives from the START of
+  // the request that last used it, and every request a spawn makes starts at
+  // or after this, so it is the conservative bound for the cache's clock.
+  let spawnStartedAt = new Date().toISOString();
   const beginSpawn = (): void => {
+    spawnStartedAt = new Date().toISOString();
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
     turnDialogueMuted = false;
@@ -4144,6 +4156,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // backend reported them. Carries the backend's own costUSD, which is what
   // makes spend answerable in dollars without a price table on our side.
   const runModelUsage: Record<string, BackendModelUsage> = {};
+  // The session's own prompt cache, for the server's idle compaction: what
+  // the newest invocation that reported usage left in it, scoped to the
+  // native session and model it ran under, and when that invocation began.
+  // A read-only invocation keeps a lifetime learned in the same scope; any
+  // other change of scope, or an unknown write, drops it (Lumen, #845 r3).
+  // Set from this session's spawns only, never a clone's, whose requests use
+  // a cache of their own.
+  let runCacheEvidence: RunCacheEvidence | undefined;
+  let runLastRequestStartedAt: string | undefined;
 
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
@@ -4347,6 +4368,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
     envelopeShape: envelopeShapeKey(runtime),
   });
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
+    // Ahead of the early return: a spawn that reported no usage still used
+    // the cache, and what it left there is unknown (Lumen, #845 r3).
+    // Scoped to the model the provider last reported in this process, never
+    // to what was requested or hydrated. runtime.detectedModel is not it: an
+    // event that confirms a pinned model skips applyDetectedModel, so after a
+    // fallback and a return it still names the fallback (Lumen, #845 r4).
+    // With no report, the scope has no model and a read-only spawn inherits
+    // nothing.
+    runCacheEvidence = nextRunCacheEvidence(runCacheEvidence, usage?.cacheWrite, {
+      providerSessionId: activeBackendSessionId,
+      model: currentRunModel,
+    });
+    runLastRequestStartedAt = spawnStartedAt;
     if (!usage) return;
     const scope = providerScope();
     const at = new Date().toISOString();
@@ -7210,7 +7244,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // ── Token-budget enforcement: compact before building the prompt ──
     // If the transcript has grown past the compaction threshold, summarize
     // the oldest entries into a new start state before this turn spends them.
-    await maybeCompactContext('pre-turn budget check');
+    if (!options.idleCompaction) await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
     // Occupancy comes from turnContextOccupancy, which prefers the provider's
@@ -8548,6 +8582,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const reportedContextTokens =
       ledger.totalTokens() +
       (runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0);
+    // The provider's own count of the last request, which also covers the
+    // native session history the ledger no longer holds. Undefined after a
+    // compaction cleared the sample and before the next spawn measured again.
+    const providerContext = providerContextMeasurement()?.contextTokens;
     console.log(
       JSON.stringify({
         type: 'result',
@@ -8569,6 +8607,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
           outputTokens: runUsageTotals.outputTokens,
           cacheReadTokens: runUsageTotals.cacheReadTokens,
           cacheWriteTokens: runUsageTotals.cacheWriteTokens,
+          ...(providerContext !== undefined ? { providerContextTokens: providerContext } : {}),
+          ...(runCacheEvidence !== undefined ? { cacheEvidence: runCacheEvidence } : {}),
+          ...(runLastRequestStartedAt !== undefined
+            ? { lastRequestStartedAt: runLastRequestStartedAt }
+            : {}),
+          // The native session the run ended on: a cache lifetime learned
+          // under another one does not carry over.
+          ...(activeBackendSessionId ? { providerSessionId: activeBackendSessionId } : {}),
         },
         // Only what the provider reported during THIS process. Requested and
         // transcript-hydrated models are excluded — reporting either would
@@ -10247,6 +10293,10 @@ export function registerChatCommand(program: Command): void {
       .option(
         '--message-label <label>',
         'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
+      )
+      .option(
+        '--idle-compaction',
+        "Run --message as the server's idle compaction: no pre-turn system compaction, so history is never trimmed before the agent compacts its own"
       )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
       .option(

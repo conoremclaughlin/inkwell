@@ -12,6 +12,17 @@ import type { InkProvider } from './ink-provider';
 // ─── Channel Types ───
 
 // Keep aligned with src/agent/types.ts ChannelType
+/**
+ * What a run left in its session's prompt cache, as ink chat reports it: a
+ * lifetime it wrote, provably nothing (read-only), or unknown. The native
+ * session and model travel with it, since a lifetime is a fact about one
+ * cache entry (Lumen, #845 r3).
+ */
+export type CacheEvidence =
+  | { kind: 'ttl'; seconds: number; providerSessionId?: string; model?: string }
+  | { kind: 'read-only'; providerSessionId?: string; model?: string }
+  | { kind: 'unknown' };
+
 export type ChannelType =
   | 'telegram'
   | 'terminal'
@@ -348,6 +359,17 @@ export interface SessionRequest {
    * admits the turn (isOwnersHeartbeat).
    */
   inklingHeartbeat?: { reminderId: string };
+
+  /**
+   * The server's own idle-compaction turn (idle-compaction-scheduler.ts). Set
+   * only by the scheduler, in this process, with the ticket the session's lock
+   * checks before admitting it: the turn never queues behind real work, and
+   * runs only while its candidate is current and its cache unexpired. A turn
+   * carrying it never arms another one, so a compaction that leaves the
+   * context large is not retried every cache lifetime; the session's next
+   * ordinary turn arms again.
+   */
+  idleCompaction?: { generation: number; expiresAt: number };
 }
 
 /**
@@ -411,6 +433,24 @@ export interface SessionResult {
      * The repository must diff against its checkpoint rather than add.
      */
     cumulative?: boolean;
+    /**
+     * The provider's own count of the last request (ink only). Unlike
+     * `contextTokens`, which ink reports from its ledger and identity, this
+     * covers the native session history the ledger no longer holds.
+     */
+    providerContextTokens?: number;
+    /**
+     * What the run left in its prompt cache, scoped to the native session and
+     * model it ran under (ink on Claude only). Absent reads as unknown.
+     */
+    cacheEvidence?: CacheEvidence;
+    /** The native provider session the run ended on (ink only). */
+    providerSessionId?: string;
+    /**
+     * When the run's last provider invocation began (ISO, ink only). The
+     * cache's lifetime runs from a request's start, so this is its clock.
+     */
+    lastRequestStartedAt?: string;
   };
 
   // Session state after processing
@@ -472,7 +512,8 @@ export interface SessionResult {
           | 'contact-scope'
           | 'session-key-miss'
           | 'session-key-held'
-          | 'binding-held';
+          | 'binding-held'
+          | 'ended-session';
       };
     };
   };
@@ -901,6 +942,12 @@ export interface ClaudeRunnerConfig {
   sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;
+  /**
+   * The run is the server's idle compaction (ink only). ink chat then skips
+   * its pre-turn system compaction, which could trim history on a failed
+   * summary before the agent has read the request to compact its own.
+   */
+  idleCompaction?: boolean;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */

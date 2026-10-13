@@ -637,3 +637,129 @@ describe('result usage carries the context the FINAL request was handed (Lumen, 
     expect(usageOf(events)?.contextTokens).toBe(40_010);
   });
 });
+
+describe('the prompt-cache lifetime the run wrote at', () => {
+  it("is carried on the result usage from the final request's split", () => {
+    const p = new ClaudeStreamParser();
+    p.push(
+      line({
+        type: 'assistant',
+        message: {
+          id: 'main-last',
+          content: [],
+          usage: {
+            input_tokens: 1,
+            cache_read_input_tokens: 18_000,
+            cache_creation_input_tokens: 4_500,
+            cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 4_500 },
+          },
+        },
+      })
+    );
+    const r = p.push(line(resultWithUsage))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 3600 });
+  });
+
+  // Lumen, #845 r2: with no request of its own to bind it to, the run's
+  // aggregate split is not evidence about the cache the final request left.
+  it('is unknown when no request reported usage, whatever the aggregate says', () => {
+    const p = new ClaudeStreamParser();
+    const r = p.push(
+      line({
+        ...resultWithUsage,
+        usage: {
+          ...resultWithUsage.usage,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 4500 },
+        },
+      })
+    )[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
+  });
+
+  it('is absent when the result reports no split', () => {
+    const p = new ClaudeStreamParser();
+    const r = p.push(line(resultWithUsage))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
+  });
+});
+
+// Lumen, #845 r1: the run's aggregate counts every request, so an earlier
+// request's one-hour writes said nothing about the five-minute suffix the
+// final request left.
+describe("the cache lifetime comes from the final request's own writes", () => {
+  const finalRequest = (cacheCreation: Record<string, number> | undefined, written = 1_000) => ({
+    type: 'assistant',
+    message: {
+      id: 'main-last',
+      content: [],
+      usage: {
+        input_tokens: 1,
+        cache_read_input_tokens: 200_000,
+        cache_creation_input_tokens: written,
+        ...(cacheCreation ? { cache_creation: cacheCreation } : {}),
+      },
+    },
+  });
+  const aggregate = {
+    type: 'result',
+    subtype: 'success',
+    usage: {
+      input_tokens: 2,
+      cache_read_input_tokens: 200_000,
+      cache_creation_input_tokens: 201_000,
+      cache_creation: { ephemeral_5m_input_tokens: 1_000, ephemeral_1h_input_tokens: 200_000 },
+    },
+  };
+
+  it('a final request that wrote at five minutes reports five minutes', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 1_000, ephemeral_1h_input_tokens: 0 })));
+    // The aggregate alone would say an hour: only earlier requests wrote at 1h.
+    const r = p.push(
+      line({
+        ...aggregate,
+        usage: {
+          ...aggregate.usage,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 200_000 },
+        },
+      })
+    )[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.contextTokens).toBe(201_001);
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 300 });
+  });
+
+  it('a final request that only read falls back to the aggregate, shorter bucket first', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, 0)));
+    const r = p.push(line(aggregate))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'ttl', seconds: 300 });
+  });
+
+  // Lumen, #845 r2: wrote to the cache but gave no split. The aggregate's
+  // earlier writes say nothing about what this request left.
+  it('a final request that wrote without a split is unknown', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest(undefined, 1_000)));
+    const r = p.push(line(aggregate))[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'unknown' });
+  });
+
+  it('a final request and a run that both wrote nothing are read-only', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(finalRequest({ ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, 0)));
+    const r = p.push(
+      line({
+        ...aggregate,
+        usage: { ...aggregate.usage, cache_creation_input_tokens: 0, cache_creation: undefined },
+      })
+    )[0]!;
+    if (r.kind !== 'result') throw new Error('expected a result event');
+    expect(r.usage?.cacheWrite).toEqual({ kind: 'read-only' });
+  });
+});

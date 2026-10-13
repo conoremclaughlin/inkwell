@@ -506,6 +506,7 @@ ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
 ENABLE_GRAPH_SWEEP=false \
 ALERT_STALENESS_SWEEP_SECONDS=0 \
+IDLE_COMPACTION_ENABLED=false \
 INK_PORT_BASE=4001 \
 yarn dev
 
@@ -515,7 +516,7 @@ INK_SERVER_URL=http://localhost:4001 ink mission
 
 **Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
 
-**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`), and the alert staleness sweep (`ALERT_STALENESS_SWEEP_SECONDS=0`) should stay off on isolated servers — the main server already owns those connections and those sweeps' dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers and duplicate alert notifications). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`), the alert staleness sweep (`ALERT_STALENESS_SWEEP_SECONDS=0`), and idle compaction (`IDLE_COMPACTION_ENABLED=false`) should stay off on isolated servers — the main server already owns those connections and those sweeps' dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers and duplicate alert notifications). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
 
 Note that the alert sweep is **on by default** — unlike `ENABLE_*` flags, omitting `ALERT_STALENESS_SWEEP_SECONDS` runs it every 300s rather than disabling it. A long-running review server that leaves it unset will emit real alert notifications. Only an explicit `0` turns it off.
 
@@ -762,6 +763,9 @@ Optional:
 - `SENTRY_DSN` - Error tracking (optional)
 - `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
+- `IDLE_COMPACTION_ENABLED` - `true` to let the server compact an idle ink session shortly before its prompt cache expires (default `false`; `packages/api/src/services/sessions/idle-compaction-scheduler.ts`). The turn's "do not message anyone" is a prompt, not an enforced maintenance mode, so turning it on is a deployment decision. Keep it `false` on an isolated test server: a turn that server ran would otherwise arm a compaction turn into a real session.
+- `IDLE_COMPACTION_MIN_CONTEXT_TOKENS` - provider-context floor below which an idle session is not compacted (default 250000)
+- `IDLE_COMPACTION_MIN_GROWTH_TOKENS` - growth past what the last idle compaction left before another one arms (default 100000)
 - `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 - `INK_EXECUTION_TIER` - the deployment's execution tier, which decides the tools a turn is offered for any SB: `tools` (Inkwell's tools and reads in the SB's own folder; no shell, file writes or provider tools, on ink only) or `full` (the `safe` profile and this machine's tool policy). Default `full`. `INK_EXECUTION_TIER_CLIENTS` (`<identity client>=<tier>`, default `inkling-mobile=tools`) and `INK_EXECUTION_TIER_SBS` (`<identity uuid>=<tier>`) take precedence, the SB's first. A value that doesn't parse runs the turn `tools`. See `packages/api/src/config/execution-tier.ts`.
 - `INK_INKLING_ACCOUNT_TOOLS` - the tools that may use an inkling owner's connected accounts (Google today: Gmail, Calendar, Docs, Drive, Sheets) during the inkling's turn, by tool name, comma-separated (`list_email_labels,list_calendar_events`). Unset is none: the server refuses an inkling's turn any connected-account token, before the account is read, whatever its execution tier. No wildcard; an entry that isn't a tool name is left out. See `packages/api/src/services/inklings/inkling-account-gate.ts`.

@@ -1,0 +1,406 @@
+/**
+ * The idle-compaction wiring in SessionService: an ink run that ends large
+ * arms a compaction turn for just before its prompt cache expires, the turn
+ * goes to that same session, and the compaction turn itself never arms
+ * another (idle-compaction-scheduler.ts covers the timing rules).
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SessionService, type IActivityStream } from './session-service.js';
+import { resetActiveRuns } from './active-runs.js';
+import { resetLaunchHolds } from './launched-processes.js';
+import { DEFAULT_IDLE_COMPACTION_CONFIG } from './idle-compaction-scheduler.js';
+import { logger } from '../../utils/logger.js';
+import type {
+  ClaudeRunnerResult,
+  IClaudeRunner,
+  IContextBuilder,
+  InjectedContext,
+  ISessionRepository,
+  Session,
+} from './types.js';
+
+vi.mock('../principals.js', () => ({
+  workspaceOfSb: vi.fn(async () => 'ws-1'),
+  personalWorkspaceOf: vi.fn(async () => 'ws-1'),
+}));
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock('./claude-runner.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, buildIdentityPrompt: vi.fn(() => 'mocked-identity-prompt') };
+});
+
+const HOUR_MS = 60 * 60 * 1000;
+
+const inkSession = (overrides: Partial<Session> = {}): Session =>
+  ({
+    id: 'session-ink',
+    userId: 'user-456',
+    sbSlug: 'myra',
+    backendSessionId: 'claude-native-1',
+    type: 'primary',
+    status: 'active',
+    lifecycle: 'idle',
+    contextTokens: 1000,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    messageCount: 0,
+    tokenCount: 0,
+    backend: 'ink',
+    model: null,
+    lastCompactionAt: null,
+    compactionCount: 0,
+    endedAt: null,
+    metadata: {},
+    startedAt: new Date(),
+    lastActivityAt: new Date(),
+    ...overrides,
+  }) as Session;
+
+const context = (): InjectedContext =>
+  ({
+    agent: {
+      sbSlug: 'myra',
+      name: 'Myra',
+      role: 'assistant',
+      values: [],
+      capabilities: [],
+      relationships: {},
+      backend: 'ink',
+    },
+    user: {
+      id: 'user-456',
+      timezone: 'America/Los_Angeles',
+      contacts: {},
+      preferences: {},
+    },
+    temporal: {
+      currentTime: '10:00 AM',
+      currentDate: '2026-10-11',
+      dayOfWeek: 'Sunday',
+      timezone: 'America/Los_Angeles',
+      greeting: 'Good evening',
+    },
+    recentMemories: [],
+    activeProjects: [],
+  }) as unknown as InjectedContext;
+
+const inkResult = (
+  usage: Partial<NonNullable<ClaudeRunnerResult['usage']>>
+): ClaudeRunnerResult => ({
+  success: true,
+  backendSessionId: 'claude-native-1',
+  responses: [],
+  usage: { contextTokens: 72_000, inputTokens: 1000, outputTokens: 500, ...usage },
+  finalTextResponse: 'ok',
+});
+
+describe('SessionService idle compaction', () => {
+  let session: Session;
+  let repository: ISessionRepository;
+  let inkRunner: IClaudeRunner;
+  let service: SessionService;
+
+  const message = (content = 'Hello, Myra!') => ({
+    userId: 'user-456',
+    sbSlug: 'myra',
+    channel: 'telegram' as const,
+    conversationId: 'chat-123',
+    sender: { id: '123456789', name: 'TestUser' },
+    content,
+    metadata: {},
+  });
+
+  beforeEach(() => {
+    // The logger mock outlives a test; one test's log must not satisfy the next.
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-12T06:00:00.000Z'));
+    resetActiveRuns();
+    resetLaunchHolds();
+    session = inkSession();
+    repository = {
+      findByUserAndAgent: vi.fn(async () => session),
+      findById: vi.fn(async (id: string) => (id === session.id ? session : null)),
+      findByUser: vi.fn(async () => [session]),
+      create: vi.fn(async () => session),
+      update: vi.fn(async (_id: string, updates: Partial<Session>) => {
+        session = { ...session, ...updates };
+        return session;
+      }),
+      reopenEnded: vi.fn(async () => ({ kind: 'reopened', session })),
+      updateTokenUsage: vi.fn(async () => undefined),
+      markCompacted: vi.fn(async () => undefined),
+      tryAcquireCompactionLock: vi.fn(async () => true),
+      releaseCompactionLock: vi.fn(async () => undefined),
+    } as unknown as ISessionRepository;
+    const contextBuilder = {
+      buildContext: vi.fn(async () => context()),
+      buildMinimalContext: vi.fn(async () => ({
+        temporal: context().temporal,
+        agent: context().agent,
+      })),
+      getAgentBackend: vi.fn(async () => ({ backend: 'ink', provider: null })),
+    } as unknown as IContextBuilder;
+    const claudeRunner: IClaudeRunner = {
+      uploadMedia: 'grant',
+      run: vi.fn(async () => inkResult({})),
+    };
+    inkRunner = {
+      uploadMedia: 'grant',
+      // The run's last provider request starts as it is called (fake clock).
+      run: vi.fn(async () =>
+        inkResult({
+          providerContextTokens: 292_000,
+          cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+          lastRequestStartedAt: new Date().toISOString(),
+        })
+      ),
+    };
+    const activityStream = {
+      logMessage: vi.fn(async () => ({ id: 'msg-1' })),
+      logActivity: vi.fn(async () => ({ id: 'activity-1' })),
+      tagActivityTaskGroup: vi.fn(async () => undefined),
+    } as unknown as IActivityStream;
+    service = new SessionService(
+      repository,
+      contextBuilder,
+      claudeRunner,
+      activityStream,
+      {
+        defaultWorkingDirectory: '/test',
+        mcpConfigPath: '/test/.mcp.json',
+        idleCompaction: { ...DEFAULT_IDLE_COMPACTION_CONFIG, enabled: true },
+      },
+      undefined,
+      undefined,
+      undefined,
+      inkRunner
+    );
+  });
+
+  afterEach(() => {
+    service.stopIdleCompaction();
+    vi.useRealTimers();
+  });
+
+  const runPrompts = () =>
+    (inkRunner.run as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[0]));
+
+  it('sends the session a compaction turn five minutes before its one-hour cache expires', async () => {
+    await service.handleMessage(message());
+    expect(runPrompts()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000 - 1);
+    expect(runPrompts()).toHaveLength(1);
+
+    // The compaction turn leaves the context small, as compact_context does.
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      inkResult({
+        providerContextTokens: 86_000,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      })
+    );
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+    expect(runPrompts()[1]).toContain('[IDLE COMPACTION]');
+    expect(runPrompts()[1]).toContain('about 292k tokens');
+    expect(runPrompts()[1]).toContain('compact_context');
+    // Resumed on the same native session, so it reads the cache warm.
+    const options = (inkRunner.run as ReturnType<typeof vi.fn>).mock.calls[1][1];
+    expect(options.backendSessionId).toBe('claude-native-1');
+  });
+
+  it('a compaction turn that leaves the context large does not arm another', async () => {
+    await service.handleMessage(message());
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+
+    // A positive signal that the compaction turn finished and declined to arm:
+    // fake timers do not flush the turn's real I/O, so "no third run yet"
+    // alone would pass before a re-armed turn had time to land.
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith('[IdleCompaction] idle compaction not armed', {
+        sessionId: 'session-ink',
+        reason: 'this run was an idle compaction',
+      })
+    );
+    await vi.advanceTimersByTimeAsync(3 * HOUR_MS);
+    expect(runPrompts()).toHaveLength(2);
+  });
+
+  it('addresses the turn to the session it was armed for, by id', async () => {
+    const handle = vi.spyOn(service, 'handleMessage');
+    await service.handleMessage(message());
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() => expect(handle).toHaveBeenCalledTimes(2));
+    const idle = handle.mock.calls[1][0];
+    expect(idle.idleCompaction).toEqual({
+      generation: expect.any(Number),
+      expiresAt: Date.parse('2026-10-12T07:00:00.000Z'),
+    });
+    expect(idle.metadata).toMatchObject({
+      recipientSessionId: 'session-ink',
+      recipientSessionExplicit: true,
+    });
+  });
+
+  it('a later turn moves the compaction out to its own expiry', async () => {
+    await service.handleMessage(message());
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    await service.handleMessage(message('Still there?'));
+    expect(runPrompts()).toHaveLength(2);
+
+    // 55 minutes after the FIRST turn: nothing, because the second reset it.
+    await vi.advanceTimersByTimeAsync(25 * 60 * 1000);
+    expect(runPrompts()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(3));
+    expect(runPrompts()[2]).toContain('[IDLE COMPACTION]');
+  });
+
+  it('does not arm when the provider context is under the floor', async () => {
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      inkResult({
+        providerContextTokens: 117_319,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      })
+    );
+    await service.handleMessage(message());
+    await vi.advanceTimersByTimeAsync(2 * HOUR_MS);
+    expect(runPrompts()).toHaveLength(1);
+  });
+
+  // Lumen, #845 r1: the idle turn carried no contact scope, so a contact's
+  // session was resumed as the owner's.
+  it("sends a contact session's turn to that session, never the owner's", async () => {
+    session = inkSession({ contactId: 'contact-synthetic' });
+    const owner = inkSession({ id: 'session-owner', backendSessionId: 'native-owner' });
+    (repository.findById as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) =>
+      id === session.id ? session : id === owner.id ? owner : null
+    );
+    (repository.findByUserAndAgent as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_user: string, _slug: string, options?: { contactId?: string }) =>
+        options?.contactId === 'contact-synthetic' ? session : owner
+    );
+    (repository.update as ReturnType<typeof vi.fn>).mockImplementation(
+      async (id: string, updates: Partial<Session>) => {
+        if (id === session.id) {
+          session = { ...session, ...updates };
+          return session;
+        }
+        Object.assign(owner, updates);
+        return owner;
+      }
+    );
+    await service.handleMessage({ ...message(), metadata: { contactId: 'contact-synthetic' } });
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+    const options = (inkRunner.run as ReturnType<typeof vi.fn>).mock.calls[1][1];
+    expect(options.backendSessionId).toBe('claude-native-1');
+  });
+
+  // Lumen, #845 r1: four minutes of generation on a five-minute cache leaves no
+  // warm window; the turn must not be sent after the cache expired.
+  it('sends nothing when the run used up a five-minute cache', async () => {
+    const starts: number[] = [];
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      const startedAt = Date.now();
+      starts.push(startedAt);
+      if (starts.length === 1) await new Promise((resolve) => setTimeout(resolve, 4 * 60 * 1000));
+      return inkResult({
+        providerContextTokens: 292_000,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 300 },
+        lastRequestStartedAt: new Date(startedAt).toISOString(),
+      });
+    });
+    const turn = service.handleMessage(message());
+    await vi.waitFor(() => expect(starts).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+    await turn;
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(starts.slice(1).every((t) => t < starts[0] + 5 * 60 * 1000)).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith('[IdleCompaction] idle compaction not armed', {
+      sessionId: 'session-ink',
+      reason: 'the cache window passed during the run',
+    });
+  });
+
+  it('refuses a session that ended after the check, rather than reopening it', async () => {
+    await service.handleMessage(message());
+    // The scheduler's own check reads it live; routing then reads it ended.
+    let reads = 0;
+    (repository.findById as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) => {
+      if (id !== session.id) return null;
+      reads += 1;
+      return reads === 1 ? session : { ...session, endedAt: new Date() };
+    });
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith(
+        '[IdleCompaction] turn finished',
+        expect.objectContaining({ sessionId: 'session-ink', success: false })
+      )
+    );
+    expect(repository.reopenEnded).not.toHaveBeenCalled();
+    expect(runPrompts()).toHaveLength(1);
+  });
+
+  // Lumen, #845 r2: the timer's own checks end before the turn is admitted.
+  // A real turn that takes the lock while the idle turn is still on its way
+  // (here, held at activity logging) wins, and the idle turn is refused there
+  // rather than queued behind it.
+  it('refuses the idle turn when a real turn takes the lock first', async () => {
+    await service.handleMessage(message());
+
+    let releaseIdle!: () => void;
+    const idleHeld = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const activity = (service as any).activityStream as IActivityStream;
+    (activity.logMessage as ReturnType<typeof vi.fn>).mockImplementation(
+      async (params: { content: string }) => {
+        if (params.content.includes('[IDLE COMPACTION]')) await idleHeld;
+        return { id: 'msg-1' };
+      }
+    );
+    let releaseReal!: () => void;
+    const realHeld = new Promise<void>((resolve) => {
+      releaseReal = resolve;
+    });
+
+    await vi.advanceTimersByTimeAsync(55 * 60 * 1000);
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith(
+        '[IdleCompaction] idle compaction delivering',
+        expect.objectContaining({ sessionId: 'session-ink' })
+      )
+    );
+
+    (inkRunner.run as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      await realHeld;
+      return inkResult({
+        providerContextTokens: 100_000,
+        cacheEvidence: { kind: 'ttl' as const, seconds: 3600 },
+      });
+    });
+    const real = service.handleMessage(message('A real message'));
+    await vi.waitFor(() => expect(runPrompts()).toHaveLength(2));
+
+    releaseIdle();
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith('[IdleCompaction] refused at admission', {
+        sessionId: 'session-ink',
+        reason: 'session busy',
+      })
+    );
+    releaseReal();
+    await real;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(runPrompts().some((p) => p.includes('[IDLE COMPACTION]'))).toBe(false);
+  });
+});

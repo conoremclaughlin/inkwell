@@ -74,12 +74,20 @@ import {
 import { selectInkRunner, type HostedInkSelection } from './hosted-ink-session.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import {
+  buildIdleCompactionPrompt,
   classifyError,
   isPathWithinWorkspaceAsync,
   isPreAcceptanceRefusal,
   studioPermissionProfile,
   type ErrorClassification,
 } from '@inklabs/shared';
+import {
+  IdleCompactionScheduler,
+  type IdleAdmissionTicket,
+  type IdleCompactionConfig,
+  type IdleRunReport,
+  type IdleSessionState,
+} from './idle-compaction-scheduler.js';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -160,6 +168,11 @@ export interface SessionServiceConfig {
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
   responseHandler?: (responses: ChannelResponse[], sessionId?: string) => Promise<void>;
+  /**
+   * Compacting an idle ink session before its prompt cache expires
+   * (idle-compaction-scheduler.ts). Absent or disabled means no timers.
+   */
+  idleCompaction?: IdleCompactionConfig;
   /**
    * The in-process ink runtime (hosted-ink-session.ts), for the agents named
    * here only: an `ink` turn of any other agent still spawns `ink chat`.
@@ -309,6 +322,9 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     recipientSessionId: metadata?.recipientSessionId,
     recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
     recipientSessionNamed: metadata?.recipientSessionNamed === true,
+    // The server's idle compaction is maintenance for a live session: it
+    // never reopens one that ended (idle-compaction-scheduler.ts).
+    recipientSessionNoReopen: request.idleCompaction !== undefined,
     replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
@@ -634,7 +650,8 @@ export interface ExplicitAddressHold {
     | 'contact-scope'
     | 'session-key-miss'
     | 'session-key-held'
-    | 'binding-held';
+    | 'binding-held'
+    | 'ended-session';
 }
 
 /**
@@ -719,6 +736,7 @@ export class RoutingRefusedError extends Error {
         'binding-held':
           `but the thread's binding could not be moved to it and another session ` +
           `holds it, so delivery would have gone to a session you did not name`,
+        'ended-session': `which has ended, and this message may not reopen it`,
       };
       return (
         `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
@@ -840,6 +858,7 @@ export class SessionService implements ISessionService {
   private leaseService: StudioLeaseService | null = null;
   private overflowService: StudioOverflowService | null = null;
   private studiosRepo: StudiosRepository | null = null;
+  private idleCompaction: IdleCompactionScheduler | null;
 
   /**
    * Processing lock per agent session.
@@ -883,6 +902,84 @@ export class SessionService implements ISessionService {
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+    this.idleCompaction = this.config.idleCompaction?.enabled
+      ? new IdleCompactionScheduler(this.config.idleCompaction, {
+          now: () => Date.now(),
+          setTimer: (fn, ms) => {
+            const timer = setTimeout(fn, Math.max(0, ms));
+            // A pending compaction must not keep the process alive.
+            timer.unref?.();
+            return timer;
+          },
+          clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+          sessionState: (sessionId) => this.idleSessionState(sessionId),
+          deliver: (input) => this.deliverIdleCompaction(input),
+          log: (event, detail) => logger.info(`[IdleCompaction] ${event}`, detail),
+        })
+      : null;
+  }
+
+  /** Stops every armed idle compaction. For shutdown and tests. */
+  stopIdleCompaction(): void {
+    this.idleCompaction?.stop();
+  }
+
+  private async idleSessionState(sessionId: string): Promise<IdleSessionState | null> {
+    const session = await this.repository.findById(sessionId);
+    if (!session) return null;
+    const lockKey = `${session.sbSlug}:${sessionId}`;
+    return {
+      busy:
+        this.processingLocks.has(lockKey) ||
+        (this.pendingQueues.get(lockKey)?.length ?? 0) > 0 ||
+        launchHoldFor(sessionId) !== undefined ||
+        session.lifecycle === 'running',
+      ended: session.endedAt !== null && session.endedAt !== undefined,
+    };
+  }
+
+  /**
+   * The idle compaction turn, sent to the session it was armed for through the
+   * same path as any other message, so it runs with the session's own model,
+   * identity and tools: anything else changes the prompt prefix and misses the
+   * cache it exists to read.
+   */
+  private async deliverIdleCompaction(input: {
+    report: IdleRunReport;
+    providerContextTokens: number;
+    cacheTtlSeconds: number;
+    ticket: IdleAdmissionTicket;
+  }): Promise<void> {
+    const { report } = input;
+    const result = await this.handleMessage({
+      userId: report.userId,
+      sbSlug: report.sbSlug,
+      channel: 'heartbeat',
+      conversationId: `idle-compaction:${report.sessionId}`,
+      sender: { id: 'system', name: 'idle-compaction' },
+      content: buildIdleCompactionPrompt({
+        providerContextTokens: input.providerContextTokens,
+        cacheTtlSeconds: input.cacheTtlSeconds,
+      }),
+      // Named, so a session that cannot take it refuses rather than letting the
+      // ladder pick another; in its own contact scope, so a contact's session
+      // is never resumed as the owner's (Lumen, #845 r1).
+      metadata: {
+        triggerType: 'heartbeat',
+        chatType: 'direct',
+        recipientSessionId: report.sessionId,
+        recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+        ...(report.contactId ? { contactId: report.contactId } : {}),
+      },
+      idleCompaction: input.ticket,
+    });
+    logger.info('[IdleCompaction] turn finished', {
+      sessionId: report.sessionId,
+      success: result.success,
+      providerContextTokensAfter: result.usage?.providerContextTokens,
+      ...(result.error ? { error: result.error } : {}),
+    });
   }
 
   /** The runner for an `ink` turn: in process for the agents opted in, else `ink chat`. */
@@ -1978,6 +2075,34 @@ export class SessionService implements ISessionService {
       // 3. Build lock key - must be per agent + session to support sub-agents
       const lockKey = `${sbSlug}:${session.id}`;
 
+      // The idle compaction turn is maintenance: it never queues behind real
+      // work, and runs only while the candidate that sent it is current and
+      // its cache unexpired. Checked here, with no await between the check and
+      // taking the lock below (Lumen, #845 r2).
+      if (request.idleCompaction) {
+        const refusal = this.processingLocks.has(lockKey)
+          ? 'session busy'
+          : !this.idleCompaction
+            ? 'idle compaction is off'
+            : this.idleCompaction.admissionRefusal(session.id, request.idleCompaction);
+        if (refusal) {
+          logger.info('[IdleCompaction] refused at admission', {
+            sessionId: session.id,
+            reason: refusal,
+          });
+          return {
+            success: false,
+            sessionId: session.id,
+            backendSessionId: session.backendSessionId ?? null,
+            responses: [],
+            sessionStatus: session.status,
+            compactionTriggered: false,
+            finalTextResponse: undefined,
+            error: `Idle compaction refused: ${refusal}`,
+          };
+        }
+      }
+
       // 4. Check if session is already being processed
       if (this.processingLocks.has(lockKey)) {
         logger.info('Session is processing, queuing message', {
@@ -2946,6 +3071,7 @@ export class SessionService implements ISessionService {
       inkSessionId: session.id,
       sbSlug,
       channel: request.channel,
+      ...(request.idleCompaction ? { idleCompaction: true } : {}),
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       // An inkling's outer cycles follow its runtimeConfig as any SB's do
@@ -3307,6 +3433,9 @@ export class SessionService implements ISessionService {
             injectedContext.user.timezone
           )}\n\n${uploads.note}`;
 
+    // This turn uses the prompt cache, so an idle compaction armed for the
+    // expiry before it no longer applies; the turn arms its own when it ends.
+    this.idleCompaction?.cancel(session.id);
     try {
       result = await turnRunner
         .run(runMessage, {
@@ -3818,6 +3947,24 @@ export class SessionService implements ISessionService {
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
       );
 
+      // An ink session that ends its turn large is compacted shortly before
+      // its prompt cache expires, if nothing wakes it first
+      // (idle-compaction-scheduler.ts). Inklings are left out, as they are
+      // from triggerCompaction: the turn would run outside their bounds.
+      if (resolvedBackend === 'ink' && !inklingTurn) {
+        this.idleCompaction?.noteRunFinished({
+          sessionId: session.id,
+          userId,
+          sbSlug,
+          sbId: session.sbId ?? null,
+          ...(session.contactId ? { contactId: session.contactId } : {}),
+          providerContextTokens: result.usage.providerContextTokens,
+          ...(result.usage.cacheEvidence ? { cacheEvidence: result.usage.cacheEvidence } : {}),
+          lastRequestStartedAt: result.usage.lastRequestStartedAt,
+          idleCompaction: request.idleCompaction !== undefined,
+        });
+      }
+
       // 6. Check if compaction is needed — only for claude-code backend, and
       // only when the gate is EXPLICITLY enabled: Claude Code auto-compacts
       // natively (--autocompact), so the server's rotate-at-threshold is
@@ -4191,6 +4338,8 @@ export class SessionService implements ISessionService {
        * refused, never dropped. Ended: reopened. Implies explicit.
        */
       recipientSessionNamed?: boolean;
+      /** A named session that has ended is refused instead of reopened. */
+      recipientSessionNoReopen?: boolean;
       /**
        * The session that wrote the message a channel reply answers. Tried
        * after recipientSessionId and before every other rung, but only
@@ -4547,6 +4696,7 @@ export class SessionService implements ISessionService {
         // A plan resolution writes nothing; the spawn path's resolution, which
         // carries the same named flag, reopens it.
         if (recipientSession?.endedAt && recipientSessionNamed) {
+          if (options?.recipientSessionNoReopen === true) refuseNamedSession('ended-session');
           const reopened =
             options?.planOnly === true
               ? { session: recipientSession }

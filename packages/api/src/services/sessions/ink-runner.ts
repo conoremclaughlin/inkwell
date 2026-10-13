@@ -13,6 +13,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import type {
+  CacheEvidence,
   InjectedContext,
   ClaudeRunnerConfig,
   RunnerResult,
@@ -170,6 +171,47 @@ const CANCELLED = 'ink chat turn cancelled, process stopped';
 const CANCELLED_UNCONFIRMED =
   'ink chat turn cancelled; its processes did not confirm they had stopped';
 const UNCONFIRMED_SUFFIX = ', but its processes did not confirm they had stopped';
+
+/** What one `ink chat` run reports in its result line. */
+interface InkRunUsage {
+  contextTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  modelUsage?: Record<string, ModelUsageTotals>;
+  providerContextTokens?: number;
+  cacheEvidence?: CacheEvidence;
+  lastRequestStartedAt?: string;
+  providerSessionId?: string;
+}
+
+/**
+ * The CLI's cache evidence, or undefined when it is missing or malformed.
+ * Undefined reads as unknown downstream, which arms nothing.
+ */
+function parseCacheEvidence(value: unknown): CacheEvidence | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const scope = {
+    ...(typeof raw.providerSessionId === 'string' && raw.providerSessionId.trim()
+      ? { providerSessionId: raw.providerSessionId }
+      : {}),
+    ...(typeof raw.model === 'string' && raw.model.trim() ? { model: raw.model } : {}),
+  };
+  if (raw.kind === 'unknown') return { kind: 'unknown' };
+  if (raw.kind === 'read-only') return { kind: 'read-only', ...scope };
+  if (raw.kind === 'ttl') {
+    const seconds = positiveNumber(raw.seconds);
+    return seconds === undefined ? undefined : { kind: 'ttl', seconds, ...scope };
+  }
+  return undefined;
+}
+
+/** A positive finite number from the CLI's JSON, else undefined. Older builds omit these fields. */
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
 
 export class InkRunner implements IRunner {
   // ink chat reads each --attach-file itself, as this user, and grants its
@@ -426,6 +468,9 @@ export class InkRunner implements IRunner {
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").
     args.push('--message-label', config.channel || 'server');
+    // Maintenance: no pre-turn system compaction, so nothing is trimmed
+    // before the agent reads the request to compact its own context.
+    if (config.idleCompaction) args.push('--idle-compaction');
 
     // Forward media attachments as file paths. ink chat appends an
     // attachment block to the turn and grants its provider backend
@@ -448,14 +493,7 @@ export class InkRunner implements IRunner {
     config: ClaudeRunnerConfig
   ): Promise<{
     responses: ChannelResponse[];
-    usage?: {
-      contextTokens: number;
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      modelUsage?: Record<string, ModelUsageTotals>;
-    };
+    usage?: InkRunUsage;
     servedModel?: string;
     resumeFailedNoSession?: boolean;
     bootstrapRequiredFailure?: boolean;
@@ -962,14 +1000,7 @@ export class InkRunner implements IRunner {
     _stderr: string
   ): {
     responses: ChannelResponse[];
-    usage?: {
-      contextTokens: number;
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      modelUsage?: Record<string, ModelUsageTotals>;
-    };
+    usage?: InkRunUsage;
     servedModel?: string;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
@@ -980,16 +1011,7 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
-    let usage:
-      | {
-          contextTokens: number;
-          inputTokens: number;
-          outputTokens: number;
-          cacheReadTokens?: number;
-          cacheWriteTokens?: number;
-          modelUsage?: Record<string, ModelUsageTotals>;
-        }
-      | undefined;
+    let usage: InkRunUsage | undefined;
     let servedModel: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
@@ -1037,6 +1059,18 @@ export class InkRunner implements IRunner {
             // Per-model breakdown with the backend's own costUSD. Older ink
             // builds omit it; the field is simply absent then, never faked.
             const modelUsage = parseInkModelUsage(parsed.modelUsage);
+            const providerContextTokens = positiveNumber(parsed.usage.providerContextTokens);
+            const cacheEvidence = parseCacheEvidence(parsed.usage.cacheEvidence);
+            const providerSessionId =
+              typeof parsed.usage.providerSessionId === 'string' &&
+              parsed.usage.providerSessionId.trim()
+                ? (parsed.usage.providerSessionId as string)
+                : undefined;
+            const lastRequestStartedAt =
+              typeof parsed.usage.lastRequestStartedAt === 'string' &&
+              Number.isFinite(Date.parse(parsed.usage.lastRequestStartedAt))
+                ? (parsed.usage.lastRequestStartedAt as string)
+                : undefined;
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
               inputTokens:
@@ -1045,6 +1079,10 @@ export class InkRunner implements IRunner {
               cacheReadTokens,
               cacheWriteTokens,
               ...(modelUsage ? { modelUsage } : {}),
+              ...(providerContextTokens !== undefined ? { providerContextTokens } : {}),
+              ...(cacheEvidence !== undefined ? { cacheEvidence } : {}),
+              ...(lastRequestStartedAt !== undefined ? { lastRequestStartedAt } : {}),
+              ...(providerSessionId !== undefined ? { providerSessionId } : {}),
             };
           }
           if (typeof parsed.model === 'string' && parsed.model.trim()) {

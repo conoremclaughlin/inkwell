@@ -50,3 +50,12 @@ export {
   type FailureExcerptOptions,
   type ExitDescription,
 } from './terminal-output.js';
+
+export {
+  CONTINUATION_BRIEF_SECTIONS,
+  CONTINUATION_BRIEF_DROP,
+  renderContinuationBriefTemplate,
+  buildIdleCompactionPrompt,
+  type ContinuationBriefSection,
+  type IdleCompactionPromptInput,
+} from './continuation-brief.js';

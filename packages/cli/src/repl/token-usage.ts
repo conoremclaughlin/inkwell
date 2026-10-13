@@ -1,3 +1,14 @@
+/**
+ * What an invocation's final request wrote to the provider's prompt cache:
+ * a lifetime read from its own split, provably nothing (read-only, so the
+ * lifetime it read under was set by earlier writes), or unknown. Absence of
+ * a lifetime is never left to mean both of the last two (Lumen, #845 r3).
+ */
+export type CacheWriteEvidence =
+  | { kind: 'ttl'; seconds: number }
+  | { kind: 'read-only' }
+  | { kind: 'unknown' };
+
 export interface ContextParts {
   inputTokens?: number;
   cacheReadTokens?: number;
@@ -26,6 +37,11 @@ export interface BackendTokenUsage {
    * which for an agent run are the run's aggregate (Lumen, PR #583 round 3).
    */
   contextParts?: ContextParts;
+  /**
+   * What this invocation's final request wrote to the prompt cache. Absent
+   * when the backend does not report it, which reads as unknown.
+   */
+  cacheWrite?: CacheWriteEvidence;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.
@@ -254,6 +270,29 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
     cacheWriteTokens,
     reasoningTokens,
   };
+}
+
+/**
+ * The prompt-cache lifetime an Anthropic usage object wrote at, in seconds.
+ * The object splits cache writes into `ephemeral_5m_input_tokens` and
+ * `ephemeral_1h_input_tokens`. When both are present the SHORTER one is the
+ * answer: a request can cache its tools and system prompt for an hour and the
+ * conversation after them for five minutes, and once that suffix expires the
+ * prefix that holds the history is cold (Lumen, #845 r1). Undefined when
+ * nothing was written, since a request that only read the cache says nothing
+ * about how long the entry lives.
+ */
+export function promptCacheTtlSeconds(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const split = (usage as Record<string, unknown>).cache_creation;
+  if (!split || typeof split !== 'object') return undefined;
+  const written = (key: string): boolean => {
+    const value = (split as Record<string, unknown>)[key];
+    return typeof value === 'number' && value > 0;
+  };
+  if (written('ephemeral_5m_input_tokens')) return 300;
+  if (written('ephemeral_1h_input_tokens')) return 3600;
+  return undefined;
 }
 
 /** Backends whose prompt caching is reported as parts DISJOINT from input. */
