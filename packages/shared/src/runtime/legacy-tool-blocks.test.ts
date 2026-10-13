@@ -1,6 +1,6 @@
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { extractToolBlocks, stripLocalToolBlocks } from './agent-loop';
+import { extractToolBlocks, stripLocalToolBlocks } from './agent-loop.js';
 
 // Pure string parsing only. No tools, models, files, or executors are invoked.
 describe('legacy tool_call scanning', () => {

@@ -12,17 +12,26 @@ import { dirname, join } from 'path';
  * owner was lost on Oct 7, and it is the same for every SB on ink.
  */
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'chat.ts'), 'utf8');
+const source =
+  readFileSync(join(here, 'chat.ts'), 'utf8') +
+  '\n' +
+  readFileSync(join(here, '../../../shared/src/node-host/session-clones.ts'), 'utf8');
 
+const parentComposition = readFileSync(
+  join(here, '../../../shared/src/providers/session-agent-turn.ts'),
+  'utf8'
+);
 const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\},\s*\{/g)].map(
   (m) => m[1]!
 );
-const parent = loopCalls.find((c) => c.includes('relayOccupancy()'));
+const parent = source.match(/await runSessionAgentTurn\(\s*\{([\s\S]*?)\n\s*\},\s*\{/)?.[1];
 const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'));
 
 describe('which runAgentLoop host retries after a refused iteration', () => {
   it('finds both hosts, the parent turn and the clone', () => {
-    expect(loopCalls).toHaveLength(2);
+    expect(loopCalls).toHaveLength(1);
+    expect(parentComposition).toContain('continueOnFailure: input.continueOnFailure,');
+    expect(parentComposition.match(/await runAgentLoop\(/g)).toHaveLength(1);
     expect(parent).toBeDefined();
     expect(clone).toBeDefined();
   });

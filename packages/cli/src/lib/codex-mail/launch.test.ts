@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { BackendHost } from '@inklabs/shared/providers';
 import { splitCodexMailArgs } from './launch.js';
 import { hasTrustedCodexMailHooks, modernCodexMailHooks, codexMailHooks } from './hooks.js';
 
@@ -89,18 +90,32 @@ describe('native Codex live-mail launch mapping', () => {
     vi.stubEnv('TMPDIR', dir);
     vi.stubEnv('INK_STUDIOS_ROOT', join(dir, 'studios'));
     const { CodexAdapter } = await import('../../backends/codex.js');
-    const prepared = new CodexAdapter().prepare({
-      sbSlug: 'fixture',
-      inkSessionId: id,
-      studioId: id,
-      cliAttached: true,
-      systemPromptOverride: 'Synthetic fixture identity',
-      model: 'fixture-model',
-      promptParts: [],
-      passthroughArgs: ['--no-alt-screen'],
-      dangerous: true,
-      ...(resume ? { backendSessionId: id } : {}),
-    });
+    const host: BackendHost = {
+      paths: { inkFiles: join(dir, 'files'), studiosRoot: join(dir, 'studios'), tempDir: dir },
+      ambientSession: () => ({}),
+      claudeSupportsPartialMessages: async () => false,
+      skillMcpServers: async () => [],
+      sessionEnv: async () => ({}),
+      baseEnv: async () => ({ HOME: dir, INK_CODEX_INKMAIL: '1' }),
+      inkwellMcpUrl: 'http://127.0.0.1:9/mcp',
+      resolveBinary: async () => '/synthetic/codex',
+      warn: () => undefined,
+    };
+    const prepared = await new CodexAdapter().prepare(
+      {
+        sbSlug: 'fixture',
+        inkSessionId: id,
+        studioId: id,
+        cliAttached: true,
+        systemPromptOverride: 'Synthetic fixture identity',
+        model: 'fixture-model',
+        promptParts: [],
+        passthroughArgs: ['--no-alt-screen'],
+        dangerous: true,
+        ...(resume ? { backendSessionId: id } : {}),
+      },
+      host
+    );
     try {
       const result = splitCodexMailArgs(prepared.args, dir);
       expect(result.tuiArgs).toEqual(
@@ -125,7 +140,7 @@ describe('native Codex live-mail launch mapping', () => {
         INK_CODEX_INKMAIL: '0',
       });
     } finally {
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   });
 });

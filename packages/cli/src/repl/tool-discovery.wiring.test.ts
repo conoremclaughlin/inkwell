@@ -122,6 +122,7 @@ async function runDiscoveryTurn(opts: {
         execute: async (calls, ctx) => {
           const results: ToolResultRecord[] = [];
           await executeToolCalls(calls, {
+            commitIntent: async () => {},
             policy,
             sessionId: 'sess-discovery',
             signal: ctx.signal,

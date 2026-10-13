@@ -8,27 +8,14 @@
  * The key insight: Claude Code resolves ${VAR} in header values at runtime
  * from its own env. So we inject the header template AND set the env var
  * in the spawn env.
+ *
+ * Every provider's preparation imports this file, so it does no IO: the
+ * synchronous, file-based injectSessionHeaders is in mcp-config-file.ts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import { pinIsolatedPlaywright } from '../studio/playwright-mcp.js';
+import { pinIsolatedPlaywright, type PlaywrightServerShape } from './playwright-mcp.js';
 
 // ─── Types ──────────────────────────────────────────────────────
-
-interface McpServerConfig {
-  type?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
-}
-
-interface McpJsonConfig {
-  mcpServers: Record<string, McpServerConfig>;
-}
 
 export interface InjectSessionHeadersOptions {
   /** Path to the .mcp.json file to read as base config */
@@ -43,148 +30,72 @@ export interface InjectSessionHeadersOptions {
   outputDir?: string;
 }
 
-export interface InjectSessionHeadersResult {
-  /** Path to the (possibly temp) MCP config file with headers injected */
-  mcpConfigPath: string;
-  /** Call this to clean up any temp files */
-  cleanup: () => void;
-  /** Whether a temp file was created (vs returning original path) */
-  modified: boolean;
-}
-
 // ─── Core ───────────────────────────────────────────────────────
 
 /**
- * Inject Ink session headers into an MCP config file.
- *
- * Reads the given .mcp.json, adds x-ink-session-id (and optionally
- * x-ink-studio-id) headers to the "inkwell" server entry, and writes
- * a temp file if modifications were needed.
- *
- * The header values use ${VAR} interpolation so Claude Code resolves
- * them from the spawned process's env vars at runtime.
- *
- * The same pass pins a Playwright MCP server to the default launch
- * (headless, isolated; studio/playwright-mcp.ts), with or without an
- * "inkwell" entry to decorate.
- *
- * If nothing needed adding, or the file doesn't exist or can't be parsed,
- * returns the original path unchanged.
+ * The header injection itself, on a parsed config and without IO: adds the
+ * session, studio, authorization and context headers to the "inkwell"
+ * server where they are missing. Returns whether it changed anything. The
+ * file-based injectSessionHeaders (mcp-config-file.ts) and the providers'
+ * asynchronous config builder both use it, so the two cannot drift.
  */
-export function injectSessionHeaders(
-  options: InjectSessionHeadersOptions
-): InjectSessionHeadersResult {
-  const { mcpConfigPath, inkSessionId, studioId, accessToken } = options;
-
-  // Missing config file — nothing to inject into. Note: we still inject the
-  // other headers (studio, context, authorization) when inkSessionId is
-  // absent — x-ink-context carries sbSlug/studioId/runtime which are useful
-  // independently of session identity.
-  if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
-
-  let config: McpJsonConfig;
-  try {
-    const parsed = JSON.parse(readFileSync(mcpConfigPath, 'utf-8'));
-    config = { mcpServers: {}, ...parsed };
-  } catch {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
-
-  // Every session launches Playwright headless and on a throwaway profile,
-  // whatever the studio's own file says, unless the entry names a browser
-  // of its own (studio/playwright-mcp.ts).
-  const playwright = pinIsolatedPlaywright(config.mcpServers);
-  config.mcpServers = playwright.servers;
-  let modified = playwright.pinned.length > 0;
+export function applySessionHeaders(
+  config: {
+    mcpServers: Record<string, PlaywrightServerShape & { headers?: Record<string, string> }>;
+  },
+  options: Pick<InjectSessionHeadersOptions, 'inkSessionId' | 'studioId' | 'accessToken'>
+): boolean {
+  const { inkSessionId, studioId, accessToken } = options;
 
   // Session headers are injected only into the canonical 'inkwell' server. The
   // legacy 'pcp' server name is retired — no code should create or feed it.
   const serverKey = 'inkwell';
-  if (config.mcpServers[serverKey]) {
-    // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
-    // Only when we actually have a session — otherwise the rendered header
-    // would be an empty string which muddies server-side logs.
-    if (inkSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
-      config.mcpServers[serverKey].headers = {
-        ...config.mcpServers[serverKey].headers,
-        'x-ink-session-id': '${INK_SESSION_ID}',
-      };
-      modified = true;
-    }
+  const playwright = pinIsolatedPlaywright(config.mcpServers);
+  config.mcpServers = playwright.servers;
+  let modified = playwright.pinned.length > 0;
+  if (!config.mcpServers[serverKey]) return modified;
 
-    // Inject studio ID header
-    if (studioId && !config.mcpServers[serverKey].headers?.['x-ink-studio-id']) {
-      config.mcpServers[serverKey].headers = {
-        ...config.mcpServers[serverKey].headers,
-        'x-ink-studio-id': '${INK_STUDIO_ID}',
-      };
-      modified = true;
-    }
-
-    // Inject Authorization header for triggered sessions.
-    // Uses ${VAR} interpolation so the token is resolved from INK_ACCESS_TOKEN
-    // env var at runtime, not hardcoded in the config file.
-    if (accessToken && !config.mcpServers[serverKey].headers?.['Authorization']) {
-      config.mcpServers[serverKey].headers = {
-        ...config.mcpServers[serverKey].headers,
-        Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-      };
-      modified = true;
-    }
-
-    // Inject consolidated context token (Phase 1 — alongside individual headers)
-    if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
-      config.mcpServers[serverKey].headers = {
-        ...config.mcpServers[serverKey].headers,
-        'x-ink-context': '${INK_CONTEXT}',
-      };
-      modified = true;
-    }
+  // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
+  // Only when we actually have a session — otherwise the rendered header
+  // would be an empty string which muddies server-side logs.
+  if (inkSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
+    config.mcpServers[serverKey].headers = {
+      ...config.mcpServers[serverKey].headers,
+      'x-ink-session-id': '${INK_SESSION_ID}',
+    };
+    modified = true;
   }
 
-  if (!modified) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
+  // Inject studio ID header
+  if (studioId && !config.mcpServers[serverKey].headers?.['x-ink-studio-id']) {
+    config.mcpServers[serverKey].headers = {
+      ...config.mcpServers[serverKey].headers,
+      'x-ink-studio-id': '${INK_STUDIO_ID}',
+    };
+    modified = true;
   }
 
-  // Write modified config to temp file (or outputDir for container execution)
-  const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
-  mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${Date.now()}.json`);
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
-
-  return {
-    mcpConfigPath: tmpPath,
-    cleanup: () => {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // Best-effort cleanup
-      }
-    },
-    modified: true,
-  };
-}
-
-/**
- * The MCP servers a backend launch takes from a `.mcp.json`: its server
- * map, with the Playwright server pinned to the default launch (headless,
- * isolated; studio/playwright-mcp.ts). Empty when the file is absent,
- * cannot be parsed, or has no server map. For launchers that build their
- * own settings from the file (Gemini's) instead of passing it through
- * injectSessionHeaders.
- */
-export function readLaunchMcpServers(mcpJsonPath: string): Record<string, unknown> {
-  if (!existsSync(mcpJsonPath)) return {};
-  let servers: unknown;
-  try {
-    servers = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'))?.mcpServers;
-  } catch {
-    return {};
+  // Inject Authorization header for triggered sessions.
+  // Uses ${VAR} interpolation so the token is resolved from INK_ACCESS_TOKEN
+  // env var at runtime, not hardcoded in the config file.
+  if (accessToken && !config.mcpServers[serverKey].headers?.['Authorization']) {
+    config.mcpServers[serverKey].headers = {
+      ...config.mcpServers[serverKey].headers,
+      Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
+    };
+    modified = true;
   }
-  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return {};
-  return pinIsolatedPlaywright(servers as Record<string, McpServerConfig>).servers;
+
+  // Inject consolidated context token (Phase 1 — alongside individual headers)
+  if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
+    config.mcpServers[serverKey].headers = {
+      ...config.mcpServers[serverKey].headers,
+      'x-ink-context': '${INK_CONTEXT}',
+    };
+    modified = true;
+  }
+
+  return modified;
 }
 
 // ─── Context Token ──────────────────────────────────────────

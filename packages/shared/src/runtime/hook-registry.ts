@@ -1,0 +1,248 @@
+/**
+ * SB Runtime Hook Registry
+ *
+ * Internal hook system for the ink chat REPL. Hooks are in-process TypeScript
+ * functions that fire at lifecycle events. They can inject context into the
+ * ledger, evict entries, or block pre-* pipeline stages.
+ *
+ * Uses our canonical hook naming (on-session-start, on-turn-end, on-prompt, etc.)
+ * which maps to backend-specific events via the adaptor in hooks.ts.
+ */
+
+import type { ContextLedger, LedgerRole } from './context-ledger.js';
+
+// ─── Types ──────────────────────────────────────────────────────
+
+export type SbHookEvent =
+  | 'session_start'
+  | 'session_end'
+  | 'prompt_build'
+  | 'turn_start'
+  | 'turn_end'
+  | 'tool_pre'
+  | 'tool_post'
+  | 'compact_pre'
+  | 'compact_post'
+  | 'evict_post'
+  | 'budget_warning'
+  | 'idle';
+
+export interface HookContext {
+  event: SbHookEvent;
+  /** Cancel async work where possible. Return mutations; do not mutate the ledger after cancellation. */
+  signal?: AbortSignal;
+  ledger: ContextLedger;
+  runtime: HookRuntimeState;
+  /** Last turn content — available on on-turn-end, on-prompt */
+  lastTurn?: {
+    userInput: string;
+    assistantResponse: string;
+    turnIndex: number;
+  };
+  /** Event-specific data */
+  trigger?: Record<string, unknown>;
+}
+
+export interface HookRuntimeState {
+  sessionId?: string;
+  sbSlug?: string;
+  backend?: string;
+  budgetUtilization?: number; // 0-1
+  turnCount: number;
+}
+
+export interface InjectedLedgerEntry {
+  role: LedgerRole;
+  content: string;
+  source: string;
+  /** Hook that produced this injection */
+  hookName?: string;
+  /** Inkwell memory ID if this came from recall */
+  memoryId?: string;
+  /** Relevance score if available */
+  score?: number;
+}
+
+export interface HookResult {
+  /** Entries to inject into the ledger */
+  inject?: InjectedLedgerEntry[];
+  /** Entry IDs to evict from the ledger */
+  evict?: number[];
+  /** Block the pipeline (only for pre-* hooks) */
+  block?: boolean;
+  blockReason?: string;
+}
+
+export interface SbHook {
+  name: string;
+  event: SbHookEvent;
+  /** Lower = earlier. Default 100. */
+  priority: number;
+  handler: (ctx: HookContext) => Promise<HookResult | void>;
+}
+
+// ─── Pre-* events that support blocking ─────────────────────────
+
+const BLOCKING_EVENTS: ReadonlySet<SbHookEvent> = new Set<SbHookEvent>(['tool_pre', 'compact_pre']);
+
+/** Supplied by the host; diagnostic failure must not change hook semantics. */
+export type HookErrorReporter = (hook: string, event: SbHookEvent, error: unknown) => void;
+
+/** A late handler result is observed, but cannot resume this fire's application path. */
+function awaitHook(
+  handler: () => Promise<HookResult | void>,
+  signal?: AbortSignal
+): Promise<HookResult | void> {
+  if (!signal) return handler();
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const stop = () => {
+      signal.removeEventListener('abort', stop);
+      resolve();
+    };
+    signal.addEventListener('abort', stop, { once: true });
+    Promise.resolve()
+      .then(() => (signal.aborted ? undefined : handler()))
+      .then(
+        (result) => {
+          signal.removeEventListener('abort', stop);
+          resolve(result);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', stop);
+          reject(error);
+        }
+      );
+  });
+}
+
+// ─── Registry ───────────────────────────────────────────────────
+
+export class SbHookRegistry {
+  private hooks: SbHook[] = [];
+  private _fireLog: Array<{ event: SbHookEvent; hookName: string; timestamp: string }> = [];
+
+  constructor(private readonly reportError?: HookErrorReporter) {}
+
+  register(hook: Omit<SbHook, 'priority'> & { priority?: number }): void {
+    this.hooks.push({
+      ...hook,
+      priority: hook.priority ?? 100,
+    });
+    // Keep sorted by priority (lower first)
+    this.hooks.sort((a, b) => a.priority - b.priority);
+  }
+
+  unregister(name: string): boolean {
+    const before = this.hooks.length;
+    this.hooks = this.hooks.filter((h) => h.name !== name);
+    return this.hooks.length < before;
+  }
+
+  listHooks(): Array<{ name: string; event: SbHookEvent; priority: number }> {
+    return this.hooks.map((h) => ({
+      name: h.name,
+      event: h.event,
+      priority: h.priority,
+    }));
+  }
+
+  /** Get the fire log (for testing/debugging) */
+  getFireLog(): typeof this._fireLog {
+    return [...this._fireLog];
+  }
+
+  /** Clear the fire log */
+  clearFireLog(): void {
+    this._fireLog = [];
+  }
+
+  /**
+   * Fire all hooks registered for an event.
+   *
+   * Hooks run sequentially in priority order. Each hook can:
+   * - Inject entries (applied to ledger immediately, visible to subsequent hooks)
+   * - Evict entries (applied to ledger immediately)
+   * - Block the pipeline (only for pre-* events)
+   *
+   * Returns aggregated results from all hooks.
+   */
+  async fire(
+    event: SbHookEvent,
+    ctx: Omit<HookContext, 'event'>
+  ): Promise<{
+    injected: number;
+    injectedEntries: InjectedLedgerEntry[];
+    evicted: number;
+    blocked: boolean;
+    blockReason?: string;
+    interrupted?: boolean;
+  }> {
+    const eventHooks = this.hooks.filter((h) => h.event === event);
+    if (eventHooks.length === 0) {
+      return { injected: 0, injectedEntries: [], evicted: 0, blocked: false };
+    }
+
+    const fullCtx: HookContext = { event, ...ctx };
+    let totalInjected = 0;
+    let totalEvicted = 0;
+    const allInjected: InjectedLedgerEntry[] = [];
+
+    for (const hook of eventHooks) {
+      if (ctx.signal?.aborted) break;
+      try {
+        const result = await awaitHook(() => hook.handler(fullCtx), ctx.signal);
+        if (ctx.signal?.aborted) break;
+        this._fireLog.push({
+          event,
+          hookName: hook.name,
+          timestamp: new Date().toISOString(),
+        });
+
+        if (!result) continue;
+
+        // Apply injections immediately — later hooks see them
+        if (result.inject && result.inject.length > 0) {
+          for (const entry of result.inject) {
+            ctx.ledger.addEntry(entry.role, entry.content, entry.source);
+            allInjected.push(entry);
+            totalInjected++;
+          }
+        }
+
+        // Apply evictions immediately
+        if (result.evict && result.evict.length > 0) {
+          const evictResult = ctx.ledger.evictEntries(result.evict);
+          totalEvicted += evictResult.removedEntries.length;
+        }
+
+        // Block check (only for pre-* events)
+        if (result.block && BLOCKING_EVENTS.has(event)) {
+          return {
+            injected: totalInjected,
+            injectedEntries: allInjected,
+            evicted: totalEvicted,
+            blocked: true,
+            blockReason: result.blockReason || `Blocked by hook: ${hook.name}`,
+          };
+        }
+      } catch (err) {
+        // Preserve the existing fail-open hook behavior. The host supplies
+        // diagnostics; one session's reporter must not stop another hook.
+        try {
+          this.reportError?.(hook.name, event, err);
+        } catch {
+          // Diagnostics are not a control channel.
+        }
+      }
+    }
+
+    return {
+      injected: totalInjected,
+      injectedEntries: allInjected,
+      evicted: totalEvicted,
+      blocked: false,
+      ...(ctx.signal?.aborted ? { interrupted: true } : {}),
+    };
+  }
+}

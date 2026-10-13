@@ -331,6 +331,112 @@ describe('attached REPL thread delivery', () => {
     expect(acks).toEqual([]);
   });
 
+  it('reports a permanently oversized auto-run, acks delivery, and does not retry it', async () => {
+    const { acks } = threadsServer({
+      [THREAD]: [
+        threadRow('tm-too-large', 'x'.repeat(8 * 1024 * 1024)),
+        { ...threadRow('tm-after-large', 'SMALL-TASK'), createdAt: '2026-02-26T23:59:30.000Z' },
+      ],
+    });
+    testState.inputs = [
+      async () => {
+        expect(acks).toHaveLength(1);
+        expect(printed()).toContain('Inbox auto-run refused for tm-too-large');
+        expect(prompts()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(10_000);
+        return '/quit';
+      },
+    ];
+
+    await runChat({ agent: 'myra', backend: 'claude', pollSeconds: '5', autoRun: true });
+
+    expect(acks).toEqual([
+      expect.objectContaining({ threadKey: THREAD, throughMessageId: 'tm-after-large' }),
+    ]);
+    expect(prompts()).toHaveLength(1);
+    expect(prompts()[0]).toContain('SMALL-TASK');
+    const refusals = logSpy.mock.calls.filter((args) =>
+      args.some((value) => String(value).includes('Inbox auto-run refused for tm-too-large'))
+    );
+    expect(refusals).toHaveLength(1);
+    expect(printed()).toContain('Message delivered, but no turn queued.');
+    const logDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const entries = readdirSync(logDir)
+      .filter((name) => name.endsWith('.jsonl'))
+      .flatMap((name) =>
+        readFileSync(join(logDir, name), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      );
+    expect(entries.filter((entry) => entry.type === 'inbox_auto_run_refused')).toEqual([
+      expect.objectContaining({
+        messageId: 'tm-too-large',
+        reason: 'too-large',
+        threadKey: THREAD,
+      }),
+    ]);
+  });
+
+  it('does not ack an oversized auto-run until its failure notice can be displayed', async () => {
+    const { acks } = threadServer(threadRow('tm-large-notice', 'x'.repeat(8 * 1024 * 1024)));
+    logSpy.mockImplementation((...args: unknown[]) => {
+      if (
+        args.some((value) => String(value).includes('Inbox auto-run refused for tm-large-notice'))
+      ) {
+        throw new Error('failure notice unavailable');
+      }
+    });
+    testState.inputs = ['/quit'];
+
+    await runChat({ agent: 'myra', backend: 'claude', pollSeconds: '999', autoRun: true });
+
+    expect(acks).toEqual([]);
+    expect(prompts()).toHaveLength(0);
+  });
+
+  it('leaves temporary byte-capacity refusal unread and retries after the active input finishes', async () => {
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const { acks } = threadsServer({
+      [THREAD]: [
+        threadRow('tm-capacity-first', 'a'.repeat(5 * 1024 * 1024)),
+        {
+          ...threadRow('tm-capacity-next', 'b'.repeat(5 * 1024 * 1024)),
+          createdAt: '2026-02-26T23:59:30.000Z',
+        },
+      ],
+    });
+    const serve = testState.callToolImpl.getMockImplementation()!;
+    testState.callToolImpl.mockImplementation(
+      async (tool: string, args: Record<string, unknown>) => {
+        if (tool === 'mark_thread_read') releaseFirst();
+        return serve(tool, args);
+      }
+    );
+    testState.runBackendImpl.mockImplementationOnce(async () => {
+      await firstHeld;
+      return reply('first reply');
+    });
+    testState.inputs = [
+      async () => {
+        expect(acks).toEqual([
+          expect.objectContaining({ threadKey: THREAD, throughMessageId: 'tm-capacity-first' }),
+        ]);
+        expect(prompts()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.waitFor(() => expect(acks).toHaveLength(2));
+        return '/quit';
+      },
+    ];
+
+    await runChat({ agent: 'myra', backend: 'claude', pollSeconds: '5', autoRun: true });
+
+    expect(acks[1]).toMatchObject({ threadKey: THREAD, throughMessageId: 'tm-capacity-next' });
+    expect(prompts()).toHaveLength(2);
+    expect(printed()).not.toContain('Inbox auto-run refused');
+  });
+
   it('retries a message whose intake stopped part-way, and acks it once intake completes', async () => {
     // The first render throws after intake has already written the ledger
     // and transcript, and before the auto-run queue. The retry must deliver
@@ -614,5 +720,12 @@ describe('attached REPL thread delivery', () => {
       expect.objectContaining({ threadKey: THREAD, throughMessageId: 'tm-16' }),
     ]);
     expect(prompts()[0]).toContain('QUEUE-ME');
+    // A failed preparation must release the UI's pending count, not only
+    // the drain's capacity. Otherwise this successful retry leaves queue:1.
+    const statuses = printed()
+      .split('\n')
+      .filter((line) => line.includes('status>'));
+    expect(statuses.some((line) => line.includes('queue:2'))).toBe(false);
+    expect(statuses.at(-1)).toContain('idle');
   });
 });

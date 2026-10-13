@@ -3435,3 +3435,41 @@ describe('runAgentLoop — the most backend calls one loop makes', () => {
     expect(harness.prompts).toHaveLength(3);
   });
 });
+
+describe('linear XML tool variant scan', () => {
+  it('preserves mixed-case tags, raw spans and emission order with fences', () => {
+    const xml =
+      '<TOOL_CALL> \n{"name":"mcp__inkwell__recall","arguments":{"query":"x"}} \n</Tool_Call>';
+    const fence = '```ink-tool\n{"tool":"read","args":{"path":"x"}}\n```';
+    const text = `before ${xml} middle\n${fence}\nafter`;
+    const parsed = extractToolBlocks(text);
+    expect(parsed.calls.map((c) => c.tool)).toEqual(['recall', 'read']);
+    expect(parsed.calls[0]).toMatchObject({ raw: xml, args: { query: 'x' }, variantFormat: true });
+    expect(stripLocalToolBlocks(text).split(/\s+/)).toEqual(['before', 'middle', 'after']);
+  });
+  it('keeps unmatched openings visible, ignores orphan closes and reports malformed closed blocks', () => {
+    expect(stripLocalToolBlocks('before <tool_call>unfinished')).toBe(
+      'before <tool_call>unfinished'
+    );
+    expect(
+      extractToolBlocks('</tool_call><tool_call>bad<tool_call>nested</tool_call>')
+    ).toMatchObject({ calls: [], malformed: [expect.objectContaining({ fenceClosed: true })] });
+    expect(
+      stripLocalToolBlocks('</tool_call><tool_call>bad<tool_call>nested</tool_call>tail')
+    ).toBe('</tool_call>tail');
+  });
+  it('handles whitespace-only payloads without overlapping quantifiers', () => {
+    const text = `<tool_call>${' \n'.repeat(40_000)}</tool_call>`;
+    const start = performance.now();
+    expect(extractToolBlocks(text)).toMatchObject({ calls: [], malformed: [] });
+    expect(stripLocalToolBlocks(text)).toBe('');
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+  it('does not rescan the suffix for each unclosed opening', () => {
+    const text = '<tool_call>'.repeat(30_000);
+    const start = performance.now();
+    expect(extractToolBlocks(text)).toMatchObject({ calls: [], malformed: [] });
+    expect(stripLocalToolBlocks(text)).toBe(text);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});

@@ -29,17 +29,10 @@ interface PiAgentTool {
   ) => Promise<PiToolResult>;
 }
 
-const PI_TOOL_NAMES = new Set(['read', 'edit', 'write', 'bash', 'grep', 'find', 'ls']);
+export { isPiTool, getPiToolNames } from '@inklabs/shared/runtime';
 
 let cachedTools: Map<string, PiAgentTool> | null = null;
 let cachedCwd: string | null = null;
-
-/**
- * Check if a tool name is a Pi coding tool.
- */
-export function isPiTool(toolName: string): boolean {
-  return PI_TOOL_NAMES.has(toolName);
-}
 
 /**
  * Initialize Pi coding tools for a working directory.
@@ -48,6 +41,13 @@ export function isPiTool(toolName: string): boolean {
 export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>> {
   if (cachedTools && cachedCwd === cwd) return cachedTools;
 
+  cachedTools = await createPiTools(cwd);
+  cachedCwd = cwd;
+  return cachedTools;
+}
+
+/** Fresh tool set for a session host; never changes the compatibility cache. */
+export async function createPiTools(cwd: string): Promise<Map<string, PiAgentTool>> {
   const pi = await import('@mariozechner/pi-coding-agent');
   const tools = [
     pi.createReadTool(cwd),
@@ -58,13 +58,7 @@ export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>
     pi.createFindTool(cwd),
     pi.createLsTool(cwd),
   ] as unknown as PiAgentTool[];
-
-  cachedTools = new Map();
-  for (const tool of tools) {
-    cachedTools.set(tool.name, tool);
-  }
-  cachedCwd = cwd;
-  return cachedTools;
+  return new Map(tools.map((tool) => [tool.name, tool]));
 }
 
 // PathContainmentError, validatePathArgs, assertContainedPath imported from @inklabs/shared
@@ -73,7 +67,10 @@ const DOCUMENT_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
 };
 
-async function tryReadDocument(filePath: string, cwd: string): Promise<InkToolCallResult | null> {
+export async function tryReadDocument(
+  filePath: string,
+  cwd: string
+): Promise<InkToolCallResult | null> {
   const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
   if (!DOCUMENT_EXTENSIONS[ext]) return null;
 
@@ -162,13 +159,6 @@ export async function callPiTool(
     text: textContent,
     success: true,
   };
-}
-
-/**
- * Get the list of available Pi tool names (for system prompt injection).
- */
-export function getPiToolNames(): string[] {
-  return [...PI_TOOL_NAMES];
 }
 
 /**

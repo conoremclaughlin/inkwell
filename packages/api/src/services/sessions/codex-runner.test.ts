@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { EventEmitter } from 'events';
-import { mkdtempSync, existsSync, readdirSync, rmSync } from 'fs';
-import { join } from 'path';
+import { mkdtempSync, existsSync, readdirSync, readFileSync, rmSync } from 'fs';
+import { basename, join } from 'path';
 import { tmpdir } from 'os';
 
 vi.mock('child_process', async (importOriginal) => {
@@ -814,6 +814,32 @@ describe('CodexRunner ephemeral-studio root grant', () => {
     } finally {
       if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
       else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+});
+
+describe('CodexRunner identity prompt file', () => {
+  // A container's runtime dir is shared by the spawns routed into it, and the
+  // server spawns concurrently. Two spawns in one millisecond must not write
+  // the same file, or one session's identity prompt replaces the other's.
+  it('gives each spawn its own file in a shared runtime dir, even within one millisecond', () => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), 'codex-runtime-'));
+    const runner = new CodexRunner() as unknown as {
+      createIdentityPromptTempFile(
+        content: string,
+        runtimeDir?: string
+      ): { promptPath: string; containerPath?: string; cleanup: () => void };
+    };
+    vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+    try {
+      const first = runner.createIdentityPromptTempFile('identity for session a', runtimeDir);
+      const second = runner.createIdentityPromptTempFile('identity for session b', runtimeDir);
+      expect(second.promptPath).not.toBe(first.promptPath);
+      expect(readFileSync(first.promptPath, 'utf8')).toBe('identity for session a');
+      expect(second.containerPath?.endsWith(`/${basename(second.promptPath)}`)).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 });

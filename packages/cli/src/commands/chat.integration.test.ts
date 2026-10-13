@@ -1,8 +1,33 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
+
+// Real skill discovery must never inspect the runner's home. Set HOME before
+// imports, since configuration readers can capture it at module initialization.
+const isolatedHome = await vi.hoisted(async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const previous = process.env.HOME;
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ink-chat-home-')));
+  process.env.HOME = home;
+  return { home, previous };
+});
+afterAll(() => {
+  if (isolatedHome.previous === undefined) delete process.env.HOME;
+  else process.env.HOME = isolatedHome.previous;
+  rmSync(isolatedHome.home, { recursive: true, force: true });
+});
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
@@ -10,8 +35,6 @@ const testState = vi.hoisted(() => ({
   identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
-  discoverSkillsImpl: vi.fn(),
-  loadSkillInstructionImpl: vi.fn(),
 }));
 
 vi.mock('../backends/identity.js', async (importOriginal) => {
@@ -40,10 +63,11 @@ vi.mock('../repl/backend-runner.js', () => ({
   }),
 }));
 
-vi.mock('../repl/skills.js', () => ({
-  discoverSkills: (cwd: string) => testState.discoverSkillsImpl(cwd),
-  loadSkillInstruction: (skill: Record<string, unknown>, maxChars?: number) =>
-    testState.loadSkillInstructionImpl(skill, maxChars),
+// Startup credential acquisition is unrelated to these scripted turns. HOME
+// isolation alone does not isolate the macOS login keychain.
+vi.mock('../repl/credential-resolver.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../repl/credential-resolver.js')>()),
+  loadKeychainCredentials: async () => ({}),
 }));
 
 // The turn lease signal is a direct fetch to /api/hooks/lifecycle, outside
@@ -115,8 +139,6 @@ describe('runChat integration', () => {
     testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
     testState.runBackendImpl.mockReset();
-    testState.discoverSkillsImpl.mockReset();
-    testState.loadSkillInstructionImpl.mockReset();
 
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
@@ -143,14 +165,10 @@ describe('runChat integration', () => {
       command: 'mock',
     });
 
-    testState.discoverSkillsImpl.mockReturnValue([]);
-    testState.loadSkillInstructionImpl.mockImplementation((skill: Record<string, unknown>) => ({
-      ...skill,
-      content: 'skill content',
-    }));
-
-    testCwd = mkdtempSync(join(tmpdir(), 'ink-chat-int-'));
+    testCwd = realpathSync(mkdtempSync(join(tmpdir(), 'ink-chat-int-')));
     process.chdir(testCwd);
+    process.env.HOME = join(testCwd, 'home');
+    mkdirSync(process.env.HOME);
     process.env.INK_TOOL_POLICY_PATH = join(testCwd, '.ink', 'security', 'tool-policy.json');
     process.env.INK_DELEGATION_SECRET = 'ink-delegation-test-secret';
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -164,8 +182,29 @@ describe('runChat integration', () => {
     if (originalDelegationSecret === undefined) delete process.env.INK_DELEGATION_SECRET;
     else process.env.INK_DELEGATION_SECRET = originalDelegationSecret;
     process.chdir(originalCwd);
+    process.env.HOME = isolatedHome.home;
     rmSync(testCwd, { recursive: true, force: true });
   });
+
+  const writeSkill = (root: string, name: string, content: string): string => {
+    const path = join(root, '.ink', 'skills', name);
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, 'SKILL.md'), content);
+    return path;
+  };
+
+  const requireSendApproval = (): void => {
+    // Unlisted tools are permitted by the default policy on both parent and
+    // extraction heads. These approval fixtures need an explicit *restriction*,
+    // not an allow/grant or a change to production defaults/host permissions.
+    const path = process.env.INK_TOOL_POLICY_PATH!;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 2, scopes: { global: { promptTools: ['send_to_inbox'] } } }),
+      { mode: 0o600 }
+    );
+  };
 
   it('runs a real user message turn and writes transcript entries', async () => {
     testState.inputs = ['hello from test', '/quit'];
@@ -1116,7 +1155,18 @@ describe('runChat integration', () => {
     }
   });
 
+  it('allows an unlisted tool by default without silently requiring approval', async () => {
+    testState.inputs = ['/ink send_to_inbox {"recipientSlug":"wren"}', '/quit'];
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+    expect(testState.inkCalls.filter((call) => call.tool === 'send_to_inbox')).toEqual([
+      { tool: 'send_to_inbox', args: { recipientSlug: 'wren' } },
+    ]);
+    expect(testState.runBackendImpl).not.toHaveBeenCalled();
+    expect(stripAnsi(logSpy.mock.calls.flat().join('\n'))).not.toContain('Granted once.');
+  });
+
   it('supports gated /ink tool execution with inline approval', async () => {
+    requireSendApproval();
     testState.inputs = ['/ink send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
@@ -1410,49 +1460,59 @@ describe('runChat integration', () => {
   });
 
   it('applies read-path policy to skill listing and activation', async () => {
-    testState.discoverSkillsImpl.mockReturnValue([
-      { name: 'allowed-skill', path: '/allowed/skills/a', source: 'test', trustLevel: 'trusted' },
-      { name: 'blocked-skill', path: '/blocked/skills/b', source: 'test', trustLevel: 'trusted' },
-    ]);
-
+    const allowed = writeSkill(testCwd, 'allowed-skill', 'ALLOWED_SKILL_INSTRUCTION');
+    writeSkill(testCwd, 'blocked-skill', 'BLOCKED_SKILL_INSTRUCTION');
     testState.inputs = [
-      '/path-allow-read /allowed/**',
+      `/path-allow-read ${allowed}*`,
       '/skills',
       '/skill-use blocked-skill',
+      '/skill-use allowed-skill',
+      'Exercise the active skill',
       '/quit',
     ];
 
-    await runChat({
-      agent: 'lumen',
-      backend: 'claude',
-      pollSeconds: '999',
-    });
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('allowed-skill [test]');
+    expect(logText).toContain('allowed-skill [repo:.ink/skills]');
     expect(logText).toContain('1 hidden by read-path allowlist');
-    expect(logText).toContain('Skill path blocked by read allowlist policy: /blocked/skills/b');
+    // The durable control boundary deliberately reports a static refusal code,
+    // not the loader's arbitrary error text. Listing and dispatch still prove
+    // which policy denied the selection.
+    expect(logText).toContain('Control not applied: control_not_allowed');
+    expect(logText).not.toContain('Activated skill blocked-skill');
+    expect(logText).toContain('Activated skill allowed-skill');
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const prompt = testState.runBackendImpl.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('ALLOWED_SKILL_INSTRUCTION');
+    expect(prompt).not.toContain('BLOCKED_SKILL_INSTRUCTION');
   });
 
   it('enforces skill trust mode in REPL skill activation', async () => {
-    testState.discoverSkillsImpl.mockReturnValue([
-      { name: 'local-skill', path: '/allowed/skills/a', source: 'test', trustLevel: 'local' },
-    ]);
+    // Repository skills are trusted; a home skill without trusted provenance is local.
+    writeSkill(process.env.HOME!, 'local-skill', 'LOCAL_SKILL_MUST_STAY_OUT');
+    writeSkill(testCwd, 'trusted-skill', 'TRUSTED_SKILL_INSTRUCTION');
+    testState.inputs = [
+      '/skill-trust trusted-only',
+      '/skills',
+      '/skill-use local-skill',
+      '/skill-use trusted-skill',
+      'Exercise the trusted skill',
+      '/quit',
+    ];
 
-    testState.inputs = ['/skill-trust trusted-only', '/skills', '/skill-use local-skill', '/quit'];
-
-    await runChat({
-      agent: 'lumen',
-      backend: 'claude',
-      pollSeconds: '999',
-    });
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Skill trust mode set to trusted-only');
     expect(logText).toContain('1 hidden by trust policy');
-    expect(logText).toContain(
-      'Skill blocked by trust policy (local); set /skill-trust all to allow.'
-    );
+    expect(logText).toContain('Control not applied: control_not_allowed');
+    expect(logText).not.toContain('Activated skill local-skill');
+    expect(logText).toContain('trusted-skill [repo:.ink/skills] trust=trusted');
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const prompt = testState.runBackendImpl.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('TRUSTED_SKILL_INSTRUCTION');
+    expect(prompt).not.toContain('LOCAL_SKILL_MUST_STAY_OUT');
   });
 
   it('renders backend token usage when available', async () => {
@@ -1500,14 +1560,7 @@ describe('runChat integration', () => {
         2
       )
     );
-    testState.discoverSkillsImpl.mockReturnValue([
-      {
-        name: 'playwright',
-        source: 'local',
-        path: '/tmp/playwright',
-        trustLevel: 'trusted',
-      },
-    ]);
+    writeSkill(testCwd, 'playwright', 'Synthetic browser guidance; no MCP configuration.');
     testState.inputs = ['/capabilities', '/quit'];
 
     await runChat({
@@ -1664,6 +1717,7 @@ describe('runChat integration', () => {
   });
 
   it('applies policy gate to /mcp call with inline approval', async () => {
+    requireSendApproval();
     testState.inputs = ['/mcp call send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
@@ -1945,7 +1999,8 @@ describe('runChat integration', () => {
   });
 
   it('stops tool loop at max iterations', async () => {
-    // Backend always emits a tool call — should stop at MAX_TOOL_LOOP_ITERATIONS (5)
+    // Five tool rounds plus one final result relay. Tools emitted by that final
+    // relay must never execute, even though the provider returns another block.
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
@@ -1982,15 +2037,24 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    // Should be called 5 times: 1 initial + 4 continuations. The 5th iteration
-    // increments toolLoopIteration to 5 which hits MAX_TOOL_LOOP_ITERATIONS (5)
-    // and breaks BEFORE making another backend call.
-    expect(testState.runBackendImpl).toHaveBeenCalledTimes(5);
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(6);
+    const executed = testState.inkCalls.filter(
+      (call) =>
+        call.tool === 'get_inbox' &&
+        call.args.sbSlug === 'wren' &&
+        call.args.status === 'unread' &&
+        call.args.limit === 1
+    );
+    expect(executed).toHaveLength(5);
+    const finalPrompt = testState.runBackendImpl.mock.calls[5][0].prompt as string;
+    expect(finalPrompt).toContain('[Tool results from previous turn — FINAL]');
+    expect(finalPrompt).toContain('no further tool calls will be executed this turn.');
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('tool loop limit reached');
   });
 
   it('handles non-interactive local tool blocks without readline crashes', async () => {
+    requireSendApproval();
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
@@ -2016,7 +2080,7 @@ describe('runChat integration', () => {
     // instead of crashing from an uninitialized readline reference.
     expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('Local tool denied (send_to_inbox)');
+    expect(logText).toContain('send_to_inbox (denied)');
   });
 
   it('grants promptable tool via approval channel and executes in tool loop', async () => {
@@ -2083,6 +2147,7 @@ describe('runChat integration', () => {
   });
 
   it('auto-denies tool calls in non-interactive jsonl approval mode when no response arrives', async () => {
+    requireSendApproval();
     // In non-interactive mode with jsonl, tools should auto-deny (AutoApprovalChannel)
     testState.runBackendImpl.mockResolvedValue({
       success: true,
@@ -2110,6 +2175,7 @@ describe('runChat integration', () => {
   });
 
   it('emits JSONL approval_request on stderr and executes tool when response arrives on stdin', async () => {
+    requireSendApproval();
     // Verify the JSONL wire protocol end-to-end through runChat:
     // approval_request emitted on stderr → response piped to stdin → tool executes
     let backendCallCount = 0;
@@ -2191,7 +2257,7 @@ describe('runChat integration', () => {
         return false;
       }
     });
-    expect(approvalRequests.length).toBeGreaterThan(0);
+    expect(approvalRequests).toHaveLength(1);
 
     const request = JSON.parse(approvalRequests[0]) as {
       type: string;
@@ -2204,7 +2270,7 @@ describe('runChat integration', () => {
     expect(request.id).toBeTruthy();
 
     // send_to_inbox should have been executed after approval response was piped to stdin
-    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
+    expect(testState.inkCalls.filter((call) => call.tool === 'send_to_inbox')).toHaveLength(1);
   }, 10_000);
 
   it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
@@ -2367,7 +2433,18 @@ describe('runChat integration', () => {
 
   it('requires confirmation before large context ejection and allows cancel', async () => {
     const huge = 'x'.repeat(7000);
-    testState.inputs = [huge, '/bookmark heavy', 'follow-up', '/eject heavy', 'n', '/quit'];
+    // Input is queued, not awaited by readline. /usage drains it on both heads,
+    // so the bookmark covers settled history instead of racing an empty ledger.
+    testState.inputs = [
+      huge,
+      '/usage',
+      '/bookmark heavy',
+      'follow-up',
+      '/usage',
+      '/eject heavy',
+      'n',
+      '/quit',
+    ];
 
     await runChat({
       agent: 'lumen',
@@ -2383,6 +2460,10 @@ describe('runChat integration', () => {
     const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
     const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
     expect(transcript).not.toContain('"type":"context_eject"');
+    expect(transcript).toContain(huge);
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(2);
+    expect(testState.inputs).toEqual([]);
+    expect(testState.inkCalls.some((call) => call.tool === 'remember')).toBe(false);
   });
 
   it('sends delegated inbox message with signed token metadata', async () => {

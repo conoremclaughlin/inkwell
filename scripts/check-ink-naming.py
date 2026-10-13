@@ -119,6 +119,10 @@ FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
     "packages/cli/src/commands/chat.ts": [
         (r"case 'pcp'", "keeps /pcp as a silent alias for /ink"),
         (r"'pcp' kept as a silent alias", "the comment explaining that alias"),
+    ],
+    # The history reader moved out of chat.ts; these are old stored values,
+    # not names for newly written entries. Keep this scoped to the reader.
+    "packages/shared/src/runtime/session-history.ts": [
         (r"'pcp-activity'", "persisted ledger source, replayed"),
         (r"'pcp-activity-history'", "persisted ledger source, replayed"),
     ],

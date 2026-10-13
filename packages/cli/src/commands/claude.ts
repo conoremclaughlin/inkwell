@@ -24,6 +24,8 @@ import {
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveSlug } from '../backends/index.js';
+import { createCliBackendHost } from '../backends/cli-host.js';
+import { onceAsync } from '../lib/once-async.js';
 import { classifyError, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
@@ -4054,17 +4056,24 @@ export async function runClaude(
     inkSessionId: sessionContext.inkSessionId,
   });
 
-  const prepared = adapter.prepare({
-    sbSlug,
-    model: options.model,
-    prompt,
-    promptParts,
-    passthroughArgs,
-    ...(startupContextBlock ? { startupContextBlock } : {}),
-    ...sessionContext,
-    ...(studioId ? { studioId } : {}),
-    ...(options.dangerous ? { dangerous: true } : {}),
-  });
+  const prepared = await adapter.prepare(
+    {
+      sbSlug,
+      model: options.model,
+      prompt,
+      promptParts,
+      passthroughArgs,
+      ...(startupContextBlock ? { startupContextBlock } : {}),
+      ...sessionContext,
+      ...(studioId ? { studioId } : {}),
+      ...(options.dangerous ? { dangerous: true } : {}),
+      // A launcher runs in the user's own directory and terminal. Last, so
+      // no spread above can replace them with undefined.
+      cwd: process.cwd(),
+      cliAttached: true,
+    },
+    createCliBackendHost()
+  );
 
   if (options.verbose) {
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
@@ -4099,13 +4108,10 @@ export async function runClaude(
     : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let stdoutLineBuffer = '';
-  let cleanedUp = false;
   let finalizedExecution = false;
-  const ensureCleanup = (): void => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    prepared.cleanup();
-  };
+  // One removal, shared: the close and error handlers can both run, and the
+  // second must wait for it rather than exit while it is pending.
+  const ensureCleanup = onceAsync(() => prepared.cleanup());
   const finalizeExecution = async (exitCode: number | null, error?: string): Promise<void> => {
     if (finalizedExecution) return;
     finalizedExecution = true;
@@ -4184,7 +4190,7 @@ export async function runClaude(
   child.on('close', async (code) => {
     await takeoverWatcher?.stop();
     await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
-    ensureCleanup();
+    await ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
@@ -4220,7 +4226,7 @@ export async function runClaude(
   });
 
   child.on('error', async (err) => {
-    ensureCleanup();
+    await ensureCleanup();
     await finalizeExecution(null, err.message || 'spawn failed');
     process.exit(1);
   });
@@ -4314,18 +4320,27 @@ export async function runClaudeInteractive(
   let finalCapturedBackendSessionId = sessionContext.backendSessionId;
 
   const runAttempt = async (): Promise<{ code: number | null; stderrText: string }> => {
-    const prepared = adapter.prepare({
-      sbSlug,
-      model: options.model,
-      promptParts: [],
-      passthroughArgs,
-      ...(startupContextBlock ? { startupContextBlock } : {}),
-      ...sessionContext,
-      ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
-      ...(attemptBackendSessionSeedId ? { backendSessionSeedId: attemptBackendSessionSeedId } : {}),
-      ...(studioId ? { studioId } : {}),
-      ...(options.dangerous ? { dangerous: true } : {}),
-    });
+    const prepared = await adapter.prepare(
+      {
+        sbSlug,
+        model: options.model,
+        promptParts: [],
+        passthroughArgs,
+        ...(startupContextBlock ? { startupContextBlock } : {}),
+        ...sessionContext,
+        ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
+        ...(attemptBackendSessionSeedId
+          ? { backendSessionSeedId: attemptBackendSessionSeedId }
+          : {}),
+        ...(studioId ? { studioId } : {}),
+        ...(options.dangerous ? { dangerous: true } : {}),
+        // A launcher runs in the user's own directory and terminal. Last, so
+        // no spread above can replace them with undefined.
+        cwd: process.cwd(),
+        cliAttached: true,
+      },
+      createCliBackendHost()
+    );
 
     if (options.verbose) {
       console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
@@ -4423,7 +4438,7 @@ export async function runClaudeInteractive(
           console.error('To use the normal Codex launcher, rerun with --no-codex-inkmail.');
         }
       } finally {
-        prepared.cleanup();
+        await prepared.cleanup();
         await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
         await logBackendExecutionResult({
           context: executionContext,
@@ -4456,7 +4471,7 @@ export async function runClaudeInteractive(
       });
 
       child.on('close', async (code) => {
-        prepared.cleanup();
+        await prepared.cleanup();
         // `ink -b claude -p …` reaches here with the print flag in passthrough,
         // and every interactive Codex or Gemini exits here.
         await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
@@ -4481,7 +4496,7 @@ export async function runClaudeInteractive(
       });
 
       child.on('error', async (err) => {
-        prepared.cleanup();
+        await prepared.cleanup();
         const errorText = err.message || 'spawn failed';
         await logBackendExecutionResult({
           context: executionContext,

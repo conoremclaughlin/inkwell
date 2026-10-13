@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import path from 'path';
 
 /**
  * LIVE test project — suites that call a real LLM backend and consume real
@@ -19,6 +20,14 @@ import { defineConfig } from 'vitest/config';
  * INK_LIVE_TESTS gate runs (Lumen, PR #439 round 3).
  */
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@inklabs/shared/node-host': path.resolve(__dirname, '../shared/src/node-host/index.ts'),
+      '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
+      '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
+      '@inklabs/shared': path.resolve(__dirname, '../shared/src/index.ts'),
+    },
+  },
   test: {
     globals: true,
     environment: 'node',

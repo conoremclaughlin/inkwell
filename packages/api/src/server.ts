@@ -19,6 +19,8 @@
  */
 
 import path from 'path';
+import { homedir, tmpdir } from 'os';
+import { createLocalHostedInkRunner } from './services/sessions/hosted-ink-local-host';
 import { getDataComposer, DataComposer } from './data/composer';
 import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
@@ -107,10 +109,7 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
-import {
-  HostedInkSessionRunner,
-  parseHostedInkSbIds,
-} from './services/sessions/hosted-ink-session';
+import { parseHostedInkSbIds } from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import {
@@ -121,7 +120,6 @@ import { closeDeletionsInProgress } from './services/account-deletion/worker';
 import { configureDeletionWorker, nudgeDeletionWorker } from './services/account-deletion/runtime';
 import { cancelInklingTurns } from './services/inklings/inkling-turns';
 import { inklingsRoot } from './services/inklings/inkling-folder';
-import { homedir } from 'os';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -214,17 +212,26 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   // 2. Create SessionService (stateless, queries DB per-request)
   logger.info('Creating SessionService...');
-  // Opt-in only. No composition is bound yet (pr:701), so a listed agent's
-  // ink turns are refused, never sent to ink chat in its place.
+  // Opt-in only: the existing shared loop and concrete local effects, not ink chat.
   const hostedInkSbIds = parseHostedInkSbIds(env.INK_RUNTIME_IN_PROCESS_SB_IDS);
-  if (hostedInkSbIds.size > 0) {
-    logger.warn(
-      "In-process ink runtime selected, with no composition bound: these agents' ink turns are refused",
-      {
-        sbIds: [...hostedInkSbIds],
-      }
-    );
-  }
+  // Third-party module initialization belongs before the HTTP listener, never in a request.
+  if (hostedInkSbIds.size > 0) await import('@mariozechner/pi-coding-agent');
+  const hostedInkRunner =
+    hostedInkSbIds.size > 0
+      ? createLocalHostedInkRunner({
+          home: homedir(),
+          tempDir: tmpdir(),
+          studiosRoot: process.env.INK_STUDIOS_ROOT || path.join(homedir(), '.ink', 'studios'),
+          baseEnv: { ...process.env },
+          mcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
+          platform: process.platform,
+          warn: (message) => logger.warn(message),
+        })
+      : undefined;
+  if (hostedInkRunner)
+    logger.info('In-process Ink runtime selected for explicit SB ids', {
+      sbIds: [...hostedInkSbIds],
+    });
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
@@ -241,9 +248,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
-    ...(hostedInkSbIds.size > 0
-      ? { hostedInk: { runner: new HostedInkSessionRunner({}), sbIds: hostedInkSbIds } }
-      : {}),
+    ...(hostedInkRunner ? { hostedInk: { runner: hostedInkRunner, sbIds: hostedInkSbIds } } : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');

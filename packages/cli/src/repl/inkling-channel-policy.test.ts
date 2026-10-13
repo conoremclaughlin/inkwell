@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ToolPolicyState } from './tool-policy';
-import { applyProfile } from './tool-profiles';
-import { executeToolCalls } from './tool-call-executor';
+import { ToolPolicyState } from './tool-policy.js';
+import { applyProfile } from './tool-profiles.js';
+import { executeToolCalls } from './tool-call-executor.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +21,13 @@ describe('tools-tier reply channels', () => {
         args: { channel, conversationId: 'chat:synthetic', content: 'Example' },
         raw: '',
       })),
-      { policy, callTool, sessionId: 'synthetic', promptForApproval: vi.fn(async () => true) }
+      {
+        policy,
+        callTool,
+        sessionId: 'synthetic',
+        promptForApproval: vi.fn(async () => true),
+        commitIntent: vi.fn(async () => undefined),
+      }
     );
     expect(results.map((r) => r.status)).toEqual([
       'blocked',

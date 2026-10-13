@@ -12,13 +12,39 @@
 import { EventEmitter } from 'events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Every process and credential is synthetic; no CLI host/config discovery.
+const spawnContext = {
+  cliAttached: false,
+  workingDirectory: '/synthetic/studio',
+  inkSessionId: 'sess-from-parent',
+  studioId: 'studio-from-parent',
+  host: {
+    paths: {
+      inkFiles: '/synthetic/files',
+      studiosRoot: '/synthetic/studios',
+      tempDir: '/synthetic/tmp',
+    },
+    ambientSession: () => ({}),
+    claudeSupportsPartialMessages: async () => false,
+    skillMcpServers: async () => [],
+    sessionEnv: async () => ({
+      INK_ACCESS_TOKEN: 'child-session-token',
+      INK_DELEGATION_SECRET: 'synthetic-derived-secret',
+    }),
+    baseEnv: async () => ({ HOME: '/synthetic/home' }),
+    inkwellMcpUrl: 'http://localhost:3001/mcp',
+    resolveBinary: async (name: string) => name,
+    warn: () => undefined,
+  },
+};
+
 const state = vi.hoisted(() => ({
   prepareConfigs: [] as Array<Record<string, unknown>>,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock('../backends/index.js', () => ({
+vi.mock('../../../shared/src/providers/registry.js', () => ({
   getBackend: (backend: string) => ({
     name: backend,
     binary: 'mock-backend',
@@ -60,6 +86,7 @@ describe('startBackendTurn with provider tools withheld', () => {
     const runner = await freshRunner();
     expect(runner.providerToolsWithheldForThisProcess()).toBe(false);
     await runner.runBackendTurn({
+      ...spawnContext,
       backend: 'claude',
       sbSlug: 'kindle-0a1b2c3d',
       prompt: 'ping',
@@ -90,6 +117,7 @@ describe('startBackendTurn with provider tools withheld', () => {
     ];
     for (const extra of requests) {
       await runner.runBackendTurn({
+        ...spawnContext,
         backend: 'claude',
         sbSlug: 'kindle-0a1b2c3d',
         prompt: 'ping',
@@ -111,6 +139,7 @@ describe('startBackendTurn with provider tools withheld', () => {
     runner.withholdProviderToolsForThisProcess();
     for (const backend of ['codex', 'gemini']) {
       const result = await runner.runBackendTurn({
+        ...spawnContext,
         backend,
         sbSlug: 'kindle-0a1b2c3d',
         prompt: 'ping',
@@ -123,5 +152,26 @@ describe('startBackendTurn with provider tools withheld', () => {
     }
     expect(state.prepareConfigs).toEqual([]);
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+  it('does not contaminate shared hosted sessions when the CLI latch is set', async () => {
+    const runner = await freshRunner();
+    runner.withholdProviderToolsForThisProcess();
+    const shared = await import('../../../shared/src/providers/backend-runner.js');
+    await runner.runBackendTurn({
+      ...spawnContext,
+      backend: 'claude',
+      sbSlug: 'cli',
+      prompt: 'cli',
+    });
+    await shared.runBackendTurn({
+      ...spawnContext,
+      backend: 'claude',
+      sbSlug: 'hosted',
+      prompt: 'hosted',
+      toolRouting: 'backend',
+    });
+    expect(state.prepareConfigs[0]?.withholdProviderTools).toBe(true);
+    expect(state.prepareConfigs[1]?.withholdProviderTools).toBeUndefined();
+    expect(state.prepareConfigs[1]?.toolRouting).toBe('backend');
   });
 });

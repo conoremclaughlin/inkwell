@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { collectFinalReplyText } from './turn-reply';
+import { collectFinalReplyText } from './turn-reply.js';
 
 describe('the non-interactive run reply', () => {
   it('retains the reply when a later outer turn only signals completion', () => {

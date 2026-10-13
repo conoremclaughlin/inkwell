@@ -20,7 +20,7 @@ import {
   isPlaywrightMcpServer,
   playwrightBrowserAttachments,
 } from '@inklabs/shared';
-import { buildMergedMcpConfig, parseSkillMcpConfig } from './skill-mcp.js';
+import { buildMergedMcpConfig, parseSkillMcpConfig, discoverSkillMcpServers } from './skill-mcp.js';
 import { completeStudio, type StepResult } from './studio-complete.js';
 import { injectMcpServers } from '../commands/skills.js';
 import { buildGeminiSettings } from '../backends/gemini.js';
@@ -75,7 +75,7 @@ afterEach(() => {
 });
 
 describe('the bundled playwright-mcp skill (the template every sync copies)', () => {
-  it('launches the default: npx @playwright/mcp --headless --isolated', () => {
+  it('launches the default: npx @playwright/mcp --headless --isolated', async () => {
     const mcp = parseSkillMcpConfig(BUNDLED_SKILL);
     expect(mcp).not.toBeNull();
     expect(mcp!.name).toBe('playwright');
@@ -85,7 +85,7 @@ describe('the bundled playwright-mcp skill (the template every sync copies)', ()
 });
 
 describe('buildMergedMcpConfig (sessions the CLI launches)', () => {
-  it("pins the studio's own Playwright entry", () => {
+  it("pins the studio's own Playwright entry", async () => {
     writeFileSync(
       join(root, '.mcp.json'),
       JSON.stringify({
@@ -95,18 +95,22 @@ describe('buildMergedMcpConfig (sessions the CLI launches)', () => {
         },
       })
     );
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(root, { inkSessionId: 's-1' });
+    const { mcpConfigPath, cleanup } = await buildMergedMcpConfig(root, {
+      inkSessionId: 's-1',
+      tempDir: root,
+      skillServers: discoverSkillMcpServers(root),
+    });
     try {
       expectDefaultLaunch(readJson(mcpConfigPath!).mcpServers.playwright);
       expect(readJson(join(root, '.mcp.json')).mcpServers.playwright.args).toEqual(
         STUDIO_ENTRY_BEFORE.args
       );
     } finally {
-      cleanup();
+      await cleanup();
     }
   });
 
-  it('pins a Playwright server merged from a skill copy synced before the pin', () => {
+  it('pins a Playwright server merged from a skill copy synced before the pin', async () => {
     const skillDir = join(root, '.ink', 'skills', 'playwright-mcp');
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(
@@ -130,15 +134,18 @@ mcp:
         mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
       })
     );
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(root);
+    const { mcpConfigPath, cleanup } = await buildMergedMcpConfig(root, {
+      tempDir: root,
+      skillServers: discoverSkillMcpServers(root),
+    });
     try {
       expectDefaultLaunch(readJson(mcpConfigPath!).mcpServers.playwright);
     } finally {
-      cleanup();
+      await cleanup();
     }
   });
 
-  it('keeps an explicit browser opt-in as written', () => {
+  it('keeps an explicit browser opt-in as written', async () => {
     writeFileSync(
       join(root, '.mcp.json'),
       JSON.stringify({
@@ -148,33 +155,37 @@ mcp:
         },
       })
     );
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(root, { inkSessionId: 's-1' });
+    const { mcpConfigPath, cleanup } = await buildMergedMcpConfig(root, {
+      inkSessionId: 's-1',
+      tempDir: root,
+      skillServers: discoverSkillMcpServers(root),
+    });
     try {
       expect(readJson(mcpConfigPath!).mcpServers.playwright.args).toEqual(ATTACHED_ENTRY.args);
     } finally {
-      cleanup();
+      await cleanup();
     }
   });
 });
 
 describe('ink gemini (the settings file the CLI hands Gemini)', () => {
-  it("pins the studio's Playwright entry", () => {
+  it("pins the studio's Playwright entry", async () => {
     writeFileSync(
       join(root, '.mcp.json'),
       JSON.stringify({ mcpServers: { playwright: STUDIO_ENTRY_BEFORE } })
     );
-    const settings = buildGeminiSettings(root, 'context-token');
+    const settings = await buildGeminiSettings(root, root, 'context-token');
     try {
       expect(settings).not.toBeNull();
       expectDefaultLaunch(readJson(settings!.path).mcpServers.playwright);
     } finally {
-      settings?.cleanup();
+      await settings?.cleanup();
     }
   });
 });
 
 describe('ink skills sync (writes a missing server into .mcp.json)', () => {
-  it('writes the Playwright server pinned, even from a skill served with the old arguments', () => {
+  it('writes the Playwright server pinned, even from a skill served with the old arguments', async () => {
     const mcpPath = join(root, '.mcp.json');
     writeFileSync(mcpPath, JSON.stringify({ mcpServers: {} }));
     const { added } = injectMcpServers(mcpPath, [
@@ -194,7 +205,7 @@ describe('ink skills sync (writes a missing server into .mcp.json)', () => {
     expectDefaultLaunch(readJson(mcpPath).mcpServers.playwright);
   });
 
-  it('leaves an existing entry alone, as it always has', () => {
+  it('leaves an existing entry alone, as it always has', async () => {
     const mcpPath = join(root, '.mcp.json');
     writeFileSync(mcpPath, JSON.stringify({ mcpServers: { playwright: STUDIO_ENTRY_BEFORE } }));
     const { existed } = injectMcpServers(mcpPath, [

@@ -122,6 +122,7 @@ describe('2FA Flow Phase 2: executeToolCalls prompts for blocked tools', () => {
     ];
 
     const results = await executeToolCalls(calls, {
+      commitIntent: async () => {},
       policy,
       callTool: async (tool) => {
         executedTools.push(tool);

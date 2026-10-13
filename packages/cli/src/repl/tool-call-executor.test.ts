@@ -9,6 +9,7 @@ import { applyProfile } from './tool-profiles.js';
 
 function makeDeps(overrides: Partial<ToolCallExecutorDeps> = {}): ToolCallExecutorDeps {
   return {
+    commitIntent: async () => {},
     policy: {
       canCallInkTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
     } as unknown as ToolCallExecutorDeps['policy'],

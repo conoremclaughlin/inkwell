@@ -39,6 +39,26 @@
         "types": "./dist/cjs/runtime/index.d.ts",
         "default": "./dist/cjs/runtime/index.js"
       }
+    },
+    "./providers": {
+      "import": {
+        "types": "./dist/providers/index.d.ts",
+        "default": "./dist/providers/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/providers/index.d.ts",
+        "default": "./dist/cjs/providers/index.js"
+      }
+    },
+    "./node-host": {
+      "import": {
+        "types": "./dist/node-host/index.d.ts",
+        "default": "./dist/node-host/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/node-host/index.d.ts",
+        "default": "./dist/cjs/node-host/index.js"
+      }
     }
   },
   "scripts": {
@@ -50,7 +70,8 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "marked": "^15.0.12"
+    "marked": "^15.0.12",
+    "pdf-parse": "^2.4.5"
   },
   "peerDependencies": {
     "react": ">=18.0.0"

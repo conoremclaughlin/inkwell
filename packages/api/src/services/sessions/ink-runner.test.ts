@@ -101,7 +101,7 @@ describe('InkRunner', () => {
       expect(unnamed).not.toContain('--backend');
     });
 
-    it('includes --model when specified', () => {
+    it('passes the configured model as a non-persisted launch default', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-789', {
         workingDirectory: '/tmp',
@@ -109,7 +109,8 @@ describe('InkRunner', () => {
         model: 'claude-sonnet-4-20250514',
       });
 
-      expect(args).toContain('--model');
+      expect(args).toContain('--default-model');
+      expect(args).not.toContain('--model');
       expect(args).toContain('claude-sonnet-4-20250514');
     });
 

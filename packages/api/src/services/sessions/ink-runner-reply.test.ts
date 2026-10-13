@@ -4,7 +4,7 @@ vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 vi.mock('../../config/env', async () => ({
-  env: (await import('../../test/fake-env')).fakeEnv,
+  env: (await import('../../test/fake-env.js')).fakeEnv,
   isDevelopment: () => false,
 }));
 vi.mock('child_process', () => ({

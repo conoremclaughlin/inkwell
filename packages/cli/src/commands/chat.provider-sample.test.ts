@@ -12,23 +12,44 @@ import { dirname, join } from 'path';
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, 'chat.ts'), 'utf8');
 
+const provider = readFileSync(
+  join(here, '../../../shared/src/providers/session-provider.ts'),
+  'utf8'
+);
+
+const context = readFileSync(
+  join(here, '../../../shared/src/runtime/session-context-state.ts'),
+  'utf8'
+);
+
+const compaction = readFileSync(
+  join(here, '../../../shared/src/providers/session-compaction.ts'),
+  'utf8'
+);
+
 describe('chat.ts provider-sample wiring', () => {
-  const cloneStart = source.indexOf('const cloneRunTurn = async (');
-  const cloneEnd = source.indexOf('\n    };\n', cloneStart);
-  const cloneTurn = source.slice(cloneStart, cloneEnd);
-  const parent = source.slice(0, cloneStart) + source.slice(cloneEnd);
+  const cloneSource = readFileSync(
+    join(here, '../../../shared/src/node-host/session-clones.ts'),
+    'utf8'
+  );
+  const cloneStart = cloneSource.indexOf('const cloneRunTurn = async (');
+  const cloneEnd = cloneSource.indexOf('\n    };\n', cloneStart);
+  const cloneTurn = cloneSource.slice(cloneStart, cloneEnd);
+  const parent = source;
 
   it("samples usage where each of the parent's spawn results lands — right after it is recorded, before the loop goes on", () => {
-    const sites = [...parent.matchAll(/recordRunUsage\((\w+)\.usage\);\n\s*(\S[^\n]*)/g)];
+    const sites = [...provider.matchAll(/ports\.recordUsage\((\w+)\.usage\);\n\s*(\S[^\n]*)/g)];
     expect(sites.length).toBeGreaterThanOrEqual(3);
+    expect(parent).toContain('recordUsage: recordRunUsage');
+    expect(parent).toContain('sampleContext: sampleProviderContext');
     for (const [, result, nextLine] of sites) {
-      expect(nextLine).toBe(`sampleProviderContext(${result}.usage);`);
+      expect(nextLine).toBe(`ports.sampleContext(${result}.usage);`);
     }
   });
 
   it("a clone's turn is costed but never sampled — its window is not the parent's", () => {
     expect(cloneStart).toBeGreaterThan(0);
-    expect(cloneTurn).toContain('recordRunUsage(result.usage)');
+    expect(cloneTurn).toContain('ports.recordUsage(result.usage)');
     expect(cloneTurn).not.toContain('sampleProviderContext');
   });
 
@@ -38,28 +59,31 @@ describe('chat.ts provider-sample wiring', () => {
   });
 
   it('provider-only excess rolls the native session; a compaction that did not shrink the ledger rolls it too', () => {
-    const rolls = source.match(/rollProviderSession\(\s*'provider-context-over-budget'/g) ?? [];
+    const rolls =
+      compaction.match(/sessionContext\.roll\(\s*'provider-context-over-budget'/g) ?? [];
     expect(rolls.length).toBe(2);
-    expect(source).toContain('hasProviderSession: activeBackendSessionId !== undefined');
-    expect(source).toMatch(
-      /if \(!outcome\.ok && pressure\.providerOver && activeBackendSessionId !== undefined\)/
+    expect(compaction).toContain('hasProviderSession: sessionContext.provider.id !== undefined');
+    expect(compaction).toMatch(
+      /if \(!outcome\.ok && pressure\.providerOver && sessionContext\.provider\.id !== undefined\)/
     );
   });
 
   it('the sample is scoped to the LIVE envelope key, so stateless providers are scoped too', () => {
-    const scope = source.slice(
-      source.indexOf('const providerScope = ('),
-      source.indexOf('const sampleProviderContext = (')
+    const scope = context.slice(
+      context.indexOf('scope(): ProviderSampleScope'),
+      context.indexOf('sampleUsage(')
     );
+    expect(source).toContain('runtime: () => runtime');
     expect(scope).toContain('envelopeShape: envelopeShapeKey(runtime)');
     expect(scope).not.toContain('activeBackendSessionShape');
   });
 
   it('every sample is persisted, and the next process replays it', () => {
-    const sampler = source.slice(
-      source.indexOf('const sampleProviderContext = ('),
-      source.indexOf('const providerContextMeasurement = (')
+    const sampler = context.slice(
+      context.indexOf('sampleUsage('),
+      context.indexOf('measurement():')
     );
+    expect(source).toContain('sessionContext.sampleUsage(usage)');
     expect(sampler).toContain("type: 'provider_sample'");
     // A report with no usable measurement is persisted as a tombstone too,
     // so replay cannot resurrect the sample it hid live (Lumen, round 3).
@@ -68,19 +92,23 @@ describe('chat.ts provider-sample wiring', () => {
   });
 
   it('an eviction (and so a trim) drops the sample', () => {
-    const eviction = source.slice(
-      source.indexOf('const recordEviction = ('),
-      source.indexOf('const trimContextToPercent = async (')
+    const eviction = compaction.slice(
+      compaction.indexOf('const recordEviction = ('),
+      compaction.indexOf('const trimContextToPercent = async (')
     );
-    expect(eviction).toContain('providerSample.clear();');
+    expect(source).toMatch(/createSessionCompaction\(\{\s*runtime,\s*ledger,\s*sessionContext,/);
+    expect(eviction).toContain('sessionContext.clearProvider();');
   });
 
   it('every path that rolls the session also drops the sample it measured', () => {
-    const helper = source.slice(
-      source.indexOf('const rollProviderSession = '),
-      source.indexOf('printEvent(chalk.yellow(`  ⛁ provider session rolled')
+    expect(source).toContain('sessionContext.roll(reason, note)');
+    expect(context).toContain('this.clearProvider();');
+    const helper = context.slice(
+      context.indexOf('clearProvider(): void'),
+      context.indexOf('roll(reason:')
     );
-    expect(helper).toContain('providerSample.clear();');
-    expect(helper).toContain('activeBackendSessionId = undefined;');
+    expect(helper).toContain('this.sample.clear();');
+    expect(helper).toContain('this.provider.id = undefined;');
+    expect(helper).toContain('this.provider.shape = undefined;');
   });
 });

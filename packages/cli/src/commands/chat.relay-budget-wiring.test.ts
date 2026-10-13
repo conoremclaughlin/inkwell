@@ -12,19 +12,37 @@ import { dirname, join } from 'path';
  * wiring a unit test cannot reach.
  */
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'chat.ts'), 'utf8');
-
-const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\},\s*\{/g)].map(
-  (m) => m[1]!
+const cli = readFileSync(join(here, 'chat.ts'), 'utf8');
+const clones = readFileSync(join(here, '../../../shared/src/node-host/session-clones.ts'), 'utf8');
+const source = cli + '\n' + clones;
+const provider = readFileSync(
+  join(here, '../../../shared/src/providers/session-provider.ts'),
+  'utf8'
 );
-const noteSpawn = source.slice(
-  source.indexOf('const noteSpawn = ('),
-  source.indexOf('/** The continuation spawn')
+
+const parentComposition = readFileSync(
+  join(here, '../../../shared/src/providers/session-agent-turn.ts'),
+  'utf8'
+);
+const loopCalls = [
+  ...`${source}\n${parentComposition}`.matchAll(
+    /await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\},\s*\{/g
+  ),
+].map((m) => m[1]!);
+const noteSpawn = provider.slice(
+  provider.indexOf('const noteSpawn = ('),
+  provider.indexOf('/** The continuation spawn')
 );
 
 describe('runAgentLoop hosts and their relay budgets', () => {
   it('there are exactly two production hosts: the parent turn and the clone', () => {
     expect(loopCalls).toHaveLength(2);
+    expect(cli).toMatch(
+      /createSessionClones\(\{[\s\S]*?registry: cloneRegistry,\s*sessionContext,/
+    );
+    expect(source.match(/await runSessionAgentTurn\(/g)).toHaveLength(1);
+    expect(source).not.toContain('createSessionProviderTurn(');
+    expect(parentComposition).toContain('backend: { runTurn: providerTurn.runTurn }');
   });
 
   it('every host supplies a live relay budget — none takes the static default', () => {
@@ -35,9 +53,16 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
+    // The closure captures a non-optional alias, not a frozen occupancy value.
+    expect(parentComposition).toMatch(
+      /const currentProviderTurn = providerTurn;\s*const loop = await runAgentLoop\(/
+    );
+    expect(parent).toContain('currentProviderTurn.relayOccupancy()');
+    expect(source).toContain('contextGeneration: () => sessionContext.generation');
+    expect(source).toContain('mutationsInFlight: () => sessionContext.mutationsInFlight');
     expect(clone).toBeDefined();
-    expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(mutationsInFlight > 0 \|\| statelessGenerationAtReport !== contextGeneration\) \{\s*return undefined;\s*\}\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
+    expect(provider).toMatch(
+      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(\s*ports\.mutationsInFlight\(\) > 0 \|\|\s*statelessGenerationAtReport !== ports\.contextGeneration\(\)\s*\) \{\s*return undefined;\s*\}\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
     );
     // Never a net total: an eviction of older entries cannot hide an addition.
     expect(source).not.toMatch(/ledger\.totalTokens\(\) - ledgerTokensAtReport/);
@@ -45,21 +70,20 @@ describe('runAgentLoop hosts and their relay budgets', () => {
   });
 
   it("the continuation spawn goes through the request builder WITH the decision's session args and delivery (Lumen, PR #577 final pass)", () => {
-    expect(source).toMatch(
-      /const contTurn = startBackendTurn\(\s*continuationRequest\(continuationPrompt, contSpawn, contImages\)\s*\);/
+    expect(provider).toMatch(
+      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
-    // The spawn args are still the decision's, taken whole — the property this
-    // pin exists for. They are named so the images can go to the same session.
-    expect(source).toContain(
+    // Keep the main-branch image delivery target coupled to the shared decision.
+    expect(provider).toContain(
       'const contSpawn = continuationSpawnArgs(decision, turnMedia.length > 0);'
     );
-    expect(source).toMatch(
-      /const contSessionId =\s*contSpawn\.sessionArgs\.backendSessionId \?\? contSpawn\.sessionArgs\.backendSessionSeedId;\s*const contImages = contextImagesFor\(contSessionId\);/
+    expect(provider).toMatch(
+      /const contSessionId =\s*contSpawn\.sessionArgs\.backendSessionId \?\? contSpawn\.sessionArgs\.backendSessionSeedId;\s*const contImages = ports\.contextImagesFor\?\.\(contSessionId\);/
     );
-    expect(source).toContain('const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));');
-    const builder = source.slice(
-      source.indexOf('const continuationRequest = ('),
-      source.indexOf('/**\n     * What the window holds for the next relay')
+    expect(source).toContain('const turn = ports.startTurn(cloneRequest(prompt, sessionArgs));');
+    const builder = provider.slice(
+      provider.indexOf('const continuationRequest = ('),
+      provider.indexOf('const relayOccupancy =')
     );
     expect(builder).toContain('...spawn.sessionArgs,');
     expect(builder).toMatch(/\.\.\.\(spawn\.deliverMedia \? \{ deliverMedia: true \} : \{\}\),/);
@@ -74,8 +98,10 @@ describe('runAgentLoop hosts and their relay budgets', () => {
   });
 
   it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count, the high-water id and the generation captured BEFORE the spawn (Lumen, rounds 7–13)', () => {
-    expect(source).toContain('noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);');
-    expect(source).toContain('noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);');
+    expect(provider).toContain('noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);');
+    expect(provider).toContain(
+      'noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);'
+    );
     expect(noteSpawn).toMatch(
       /if \(nativeSession\(\)\) \{\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);\s*return;\s*\}/
     );
@@ -83,20 +109,24 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);[\s\S]*?ledgerMaxIdAtReport = ledgerIdBeforeSpawn;\s*statelessGenerationAtReport = generationBeforeSpawn;/
     );
     // Captured with request construction, before the awaited spawn — both paths.
-    const initialCapture = source.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
-    const initialSpawn = source.indexOf('const turn = startBackendTurn({', initialCapture);
+    const initialCapture = provider.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
+    const initialSpawn = provider.indexOf('const turn = ports.startTurn({', initialCapture);
     expect(initialCapture).toBeGreaterThan(0);
-    expect(initialSpawn - initialCapture).toBeLessThan(200);
-    const contCapture = source.indexOf(
+    expect(provider.slice(initialCapture, initialSpawn).replace(/\s+/g, ' ').trim()).toBe(
+      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); let runResult: BackendRunResult; await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
+    );
+    const contCapture = provider.indexOf(
       'const ledgerIdBeforeSpawn = maxLedgerId();',
       initialCapture + 1
     );
-    const contSpawn = source.search(
-      /const contTurn = startBackendTurn\(\s*continuationRequest\(continuationPrompt, contSpawn, contImages\)\s*\);/
+    const contSpawn = provider.search(
+      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(contCapture).toBeGreaterThan(0);
     expect(contSpawn).toBeGreaterThan(contCapture);
-    expect(contSpawn - contCapture).toBeLessThan(200);
+    expect(provider.slice(contCapture, contSpawn).replace(/\s+/g, ' ').trim()).toBe(
+      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
+    );
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
       /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
@@ -109,27 +139,36 @@ describe('runAgentLoop hosts and their relay budgets', () => {
 
   it('a session-wide context generation covers the whole mutation lifetime — bumped before a mutating call runs and again when it settles, in both executors, with no count trusted while one is in flight (Lumen, rounds 13–14)', () => {
     expect(source).toMatch(
-      /const beginContextMutationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): \(\(\) => void\) => \{\s*if \(!calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\) return \(\) => \{\};\s*contextGeneration \+= 1;\s*mutationsInFlight \+= 1;\s*return \(\) => \{\s*mutationsInFlight -= 1;\s*contextGeneration \+= 1;\s*\};/
+      /const beginContextMutationFor = [\s\S]*?sessionContext\.beginMutation\(calls\);/
     );
+    // Lifetime accounting is exercised directly in session-context-state.test;
+    // these pins ensure both real executors share that same session object.
     const wraps =
       source.match(
-        /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
+        /const settleContextMutation = sessionContext\.beginMutation\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
       ) ?? [];
-    expect(wraps).toHaveLength(2);
-    expect(source).toMatch(
-      /const generationBeforeSpawn = contextGeneration;\s*(?:beginSpawn\(\);\s*)?const turn = startBackendTurn\(\{/
+    expect(wraps).toHaveLength(1); // Clone and parent share one mutation state across the extracted compositions.
+    expect(source).toContain('beginContextMutation: beginContextMutationFor,');
+    const batch = readFileSync(
+      join(here, '../../../shared/src/runtime/session-tool-batch.ts'),
+      'utf8'
+    );
+    expect(batch).toMatch(/const settleMutation = ports\.beginContextMutation\(calls\);\s*try \{/);
+    expect(batch).toMatch(/finally \{\s*settleMutation\(\);\s*\}/);
+    expect(provider).toMatch(
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
+    );
+    expect(provider).toMatch(
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
-      /const generationBeforeSpawn = contextGeneration;\s*const contTurn = startBackendTurn\(\s*continuationRequest\(continuationPrompt, contSpawn, contImages\)\s*\);/
+      /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = ports\.startTurn\(cloneRequest\(prompt, sessionArgs\)\);/
+    );
+    expect(provider).toMatch(
+      /if \(\s*ports\.mutationsInFlight\(\) > 0 \|\|\s*statelessGenerationAtReport !== ports\.contextGeneration\(\)\s*\) \{\s*return undefined;/
     );
     expect(source).toMatch(
-      /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
-    );
-    expect(source).toMatch(
-      /if \(mutationsInFlight > 0 \|\| statelessGenerationAtReport !== contextGeneration\) \{\s*return undefined;/
-    );
-    expect(source).toMatch(
-      /cloneCanReuseSession \|\|\s*\(mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration\)\s*\? cloneOccupancyTokens\s*: undefined/
+      /cloneCanReuseSession \|\|\s*\(sessionContext\.mutationsInFlight === 0 &&\s*cloneGenerationAtReport === sessionContext\.generation\)\s*\? cloneOccupancyTokens\s*: undefined/
     );
     expect(source).not.toMatch(/statelessPromptTokens = undefined;\s*\}\s*iterationResults\.push/);
   });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { extractToolBlocks, stripLocalToolBlocks, runAgentLoop } from './agent-loop';
-import { userFacingReplyText } from '../runner/turn-reply';
+import { extractToolBlocks, stripLocalToolBlocks, runAgentLoop } from './agent-loop.js';
+import { userFacingReplyText } from '../runner/turn-reply.js';
 
 // Invented control-only outputs. No provider, process, account, or network is used.
 const invocation =

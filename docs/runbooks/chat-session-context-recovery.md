@@ -33,3 +33,8 @@ preserves it verbatim; compaction may instead summarize it, and explicit evictio
 or trimming may remove it. It is not an immutable or exhaustive recovery archive.
 The CLI labels replayed recovery status as **original recovery**, not as a fresh
 lookup or a guarantee that all imported content remains in the active window.
+
+In the extracted runtime, the recovery format and byte budget are host-independent.
+The CLI owns the MCP lookup and transcript write; both synchronous CLI replay and
+asynchronous hosted replay use the same history reducer. Hosted replay preserves
+the persisted note and its original status, not a new activity lookup.

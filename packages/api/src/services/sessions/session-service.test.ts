@@ -2072,6 +2072,20 @@ describe('SessionService', () => {
         });
 
         describe('launch recording for the restart sweep (launched-processes.ts)', () => {
+          const launchPid = process.pid + 1;
+          let processProbe: ReturnType<typeof vi.spyOn>;
+          beforeEach(() => {
+            // 4242 is a fixture, not an unused OS pid. On CI that pid can
+            // belong to a live process, correctly keeping the row open.
+            // Model the kernel here; never send signals to either fixture.
+            processProbe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+              if (signal !== 0) throw new Error('this test permits liveness probes only');
+              if (pid === process.pid) return true;
+              if (pid === launchPid)
+                throw Object.assign(new Error('synthetic exit'), { code: 'ESRCH' });
+              throw new Error('unexpected process probe');
+            });
+          });
           const fromSystem = { sender: { id: 'system', name: 'x' } };
           const launchSession = { backend: 'ink', id: 'launch-session' };
           const fakeStore = () => ({
@@ -2092,10 +2106,11 @@ describe('SessionService', () => {
               }
             ) => {
               envs.push(options.config.launchEnv);
-              options.config.onSpawned?.({ pid: 4242 });
+              options.config.onSpawned?.({ pid: launchPid });
               return result;
             }) as never);
           afterEach(() => {
+            processProbe.mockRestore();
             configureLaunchRecording(undefined);
             resetLaunchHolds();
           });
@@ -2116,7 +2131,7 @@ describe('SessionService', () => {
             await vi.waitFor(() =>
               expect(store.attach).toHaveBeenCalledWith(
                 'row-1',
-                expect.objectContaining({ pid: 4242 })
+                expect.objectContaining({ pid: launchPid })
               )
             );
             await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-1']));
@@ -3979,40 +3994,57 @@ describe('SessionService', () => {
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
-    it('records the compaction run’s launch, so a restart can stop it too', async () => {
-      const store = {
-        reserve: vi.fn(async () => 'row-compaction'),
-        attach: vi.fn(async () => undefined),
-        markExited: vi.fn(async () => undefined),
-        listOpen: vi.fn(async () => []),
-      };
-      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
-      try {
-        const session = createMockSession({ backendSessionId: 'claude-abc' });
-        vi.mocked(mockRepository.findById).mockResolvedValue(session);
-        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
-        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
-          _message: string,
-          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
-        ) => {
-          options.config.onSpawned?.({ pid: 4343 });
-          return createMockClaudeResult({ success: true });
-        }) as never);
-        await sessionService.triggerCompaction('session-123');
-        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
-        expect(store.reserve).toHaveBeenCalledWith(
-          expect.objectContaining({ sessionId: 'session-123' })
-        );
-        await vi.waitFor(() =>
-          expect(store.attach).toHaveBeenCalledWith(
-            'row-compaction',
-            expect.objectContaining({ pid: 4343 })
-          )
-        );
-      } finally {
-        configureLaunchRecording(undefined);
+    it.each(['alive', 'gone'] as const)(
+      'records the compaction run’s launch, so a restart can stop it too (pid %s)',
+      async (pidState) => {
+        const store = {
+          reserve: vi.fn(async () => 'row-compaction'),
+          attach: vi.fn(async () => undefined),
+          markExited: vi.fn(async () => undefined),
+          listOpen: vi.fn(async () => []),
+        };
+        // 4343 is a fixture, not an unused OS pid. Stub liveness so neither
+        // outcome depends on the host's process table, and never send a signal.
+        const processProbe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+          if (pid !== 4343 || signal !== 0) throw new Error('unexpected process probe');
+          if (pidState === 'alive') return true;
+          throw Object.assign(new Error('synthetic exit'), { code: 'ESRCH' });
+        });
+        try {
+          configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+          const session = createMockSession({ backendSessionId: 'claude-abc' });
+          vi.mocked(mockRepository.findById).mockResolvedValue(session);
+          vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+          vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+            _message: string,
+            options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+          ) => {
+            options.config.onSpawned?.({ pid: 4343 });
+            return createMockClaudeResult({ success: true });
+          }) as never);
+          await sessionService.triggerCompaction('session-123');
+          // Assert outside the probe: pidAlive catches thrown errors.
+          expect(processProbe.mock.calls).toEqual([[4343, 0]]);
+          if (pidState === 'gone') {
+            expect(store.markExited).toHaveBeenCalledExactlyOnceWith(['row-compaction']);
+          } else {
+            expect(store.markExited).not.toHaveBeenCalled();
+          }
+          expect(store.reserve).toHaveBeenCalledWith(
+            expect.objectContaining({ sessionId: 'session-123' })
+          );
+          await vi.waitFor(() =>
+            expect(store.attach).toHaveBeenCalledWith(
+              'row-compaction',
+              expect.objectContaining({ pid: 4343 })
+            )
+          );
+        } finally {
+          processProbe.mockRestore();
+          configureLaunchRecording(undefined);
+        }
       }
-    });
+    );
 
     it('does not compact when a hold lands while the compaction lock is taken', async () => {
       try {

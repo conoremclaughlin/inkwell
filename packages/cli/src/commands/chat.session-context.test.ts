@@ -113,6 +113,12 @@ vi.mock('../repl/ink/index.js', () => ({
 }));
 vi.mock('../repl/pi-tools.js', () => ({
   isPiTool: () => false,
+  createPiTools: () => {
+    throw new Error('Unexpected coding tools');
+  },
+  tryReadDocument: () => {
+    throw new Error('Unexpected document read');
+  },
   callPiTool: () => {
     throw new Error('Unexpected local tool');
   },
@@ -164,6 +170,7 @@ describe('ink chat bounded session-context recovery', () => {
       stderr: '',
       exitCode: 0,
       durationMs: 1,
+      childExited: true,
       command: 'synthetic',
     });
     state.context.mockReset().mockResolvedValue({ success: true, context: records });
@@ -392,6 +399,8 @@ describe('ink chat bounded session-context recovery', () => {
           cacheDir: join(dir, 'vite-cache'),
           resolve: {
             alias: {
+              '@inklabs/shared/node-host': join(root, 'packages/shared/src/node-host/index.ts'),
+              '@inklabs/shared/providers': join(root, 'packages/shared/src/providers/index.ts'),
               '@inklabs/shared/runtime': join(root, 'packages/shared/src/runtime/index.ts'),
               '@inklabs/shared': join(root, 'packages/shared/src/index.ts'),
             },

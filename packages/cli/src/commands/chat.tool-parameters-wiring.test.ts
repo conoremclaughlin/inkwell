@@ -13,6 +13,9 @@ import { buildLocalToolInstruction } from './chat.js';
  */
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, 'chat.ts'), 'utf8');
+const parent = readFileSync(join(here, '../../../shared/src/runtime/session-tools.ts'), 'utf8');
+
+const clone = readFileSync(join(here, '../../../shared/src/node-host/session-clones.ts'), 'utf8');
 
 describe('Inkwell tool parameters in local routing', () => {
   it('builds one lookup per run, through describe_tool', () => {
@@ -23,17 +26,27 @@ describe('Inkwell tool parameters in local routing', () => {
   });
 
   it('gives it to both dispatchers, the parent turn and the clone', () => {
-    expect(source.match(/createLocalToolDispatcher\(\{/g)).toHaveLength(2);
-    expect(source.match(/toolParameters: inkToolParameters,/g)).toHaveLength(2);
+    expect(clone.match(/createLocalToolDispatcher\(\{/g)).toHaveLength(1);
+    expect(source.match(/createSessionTools\(\{/g)).toHaveLength(1);
+    expect(source.match(/createSessionClones\(\{/g)).toHaveLength(1);
+    expect(clone).toContain('toolParameters: opts.toolParameters');
+    expect(parent.match(/createLocalToolDispatcher\(\{/g)).toHaveLength(1);
+    expect(source.match(/toolParameters: inkToolParameters,/g)).toHaveLength(1);
+    expect(clone).toMatch(
+      /createToolParametersLookup\(\(tool\) =>\s*callInk\('describe_tool', \{ name: tool \}\)\s*\)/
+    );
+    expect(clone).toContain('const callInk = ports.bindInk(cloneSpawnContext);');
+    expect(source).toContain('sessionId: context.inkSessionId');
   });
 
   it("asks each dispatcher's own policy, without spending a grant, before any lookup", () => {
-    expect(source.match(/mayLookUpParameters: \(\) => \{/g)).toHaveLength(2);
-    expect(source).toMatch(
-      /mayLookUpParameters: \(\) => \{\s*const decision = opts\.policy\.inspectInkTool\('describe_tool', runtime\.sessionId\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
+    expect(clone.match(/mayLookUpParameters: \(\) => \{/g)).toHaveLength(1);
+    expect(parent.match(/mayLookUpParameters: \(\) => \{/g)).toHaveLength(1);
+    expect(clone).toMatch(
+      /mayLookUpParameters: \(\) => \{\s*const decision = opts\.policy\.inspectInkTool\('describe_tool', opts\.sessionId\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
     );
-    expect(source).toMatch(
-      /mayLookUpParameters: \(\) => \{\s*const decision = toolPolicy\.inspectInkTool\('describe_tool', runtime\.sessionId\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
+    expect(parent).toMatch(
+      /mayLookUpParameters: \(\) => \{\s*const decision = ports\.policy\.inspectInkTool\('describe_tool', ports\.sessionId\(\)\);\s*return decision\.allowed && !decision\.wouldConsumeGrant;\s*\}/
     );
   });
 

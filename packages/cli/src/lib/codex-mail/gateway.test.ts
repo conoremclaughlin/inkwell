@@ -32,13 +32,37 @@ function temp() {
   dirs.push(d);
   return d;
 }
-const alive = (pid: number) => {
+const alive = (
+  pid: number,
+  readStat: (() => string) | undefined = process.platform === 'linux'
+    ? () => readFileSync(`/proc/${pid}/stat`, 'utf8')
+    : undefined
+) => {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  if (readStat) {
+    try {
+      const text = readStat();
+      // kill(pid,0) also sees an exited orphan until init reaps it. That is
+      // not a live provider. comm can contain spaces and closing parentheses.
+      const boundary = text.lastIndexOf(')');
+      const state =
+        boundary < 0
+          ? undefined
+          : text
+              .slice(boundary + 1)
+              .trimStart()
+              .split(' ', 1)[0];
+      if (state === 'Z' || state === 'X') return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      // Unreadable state isn't evidence that the fixture has stopped.
+    }
+  }
+  return true;
 };
 afterEach(async () => {
   for (const ws of sockets.splice(0)) ws.terminate();
@@ -87,6 +111,27 @@ async function setup() {
   return { gateway, ws, call, received, events, bound, dir, unhealthy: () => unhealthy };
 }
 describe('owned native Codex gateway', () => {
+  it.each(['Z', 'X', 'S', 'R', 'D'])(
+    'the fixture liveness check distinguishes Linux state %s from PID existence',
+    (state) => {
+      expect(alive(process.pid, () => `${process.pid} (fixture ) name)) ${state} 1 1 1`)).toBe(
+        state !== 'Z' && state !== 'X'
+      );
+    }
+  );
+  it('treats missing proc entries as gone, but malformed/unreadable state conservatively', () => {
+    expect(alive(process.pid, () => 'Z')).toBe(true);
+    expect(
+      alive(process.pid, () => {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      })
+    ).toBe(false);
+    expect(
+      alive(process.pid, () => {
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      })
+    ).toBe(true);
+  });
   it('keeps exact native ids and binds only persistent threads, not TUI title agents', async () => {
     const f = await setup();
     const response = await f.call('thread/start', {

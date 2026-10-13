@@ -1,6 +1,32 @@
 import { EventEmitter } from 'events';
 import { describe, expect, it, vi } from 'vitest';
 
+// Every process and credential is synthetic; no CLI host/config discovery.
+const spawnContext = {
+  cliAttached: false,
+  workingDirectory: '/synthetic/studio',
+  inkSessionId: 'sess-from-parent',
+  studioId: 'studio-from-parent',
+  host: {
+    paths: {
+      inkFiles: '/synthetic/files',
+      studiosRoot: '/synthetic/studios',
+      tempDir: '/synthetic/tmp',
+    },
+    ambientSession: () => ({}),
+    claudeSupportsPartialMessages: async () => false,
+    skillMcpServers: async () => [],
+    sessionEnv: async () => ({
+      INK_ACCESS_TOKEN: 'child-session-token',
+      INK_DELEGATION_SECRET: 'synthetic-derived-secret',
+    }),
+    baseEnv: async () => ({ HOME: '/synthetic/home' }),
+    inkwellMcpUrl: 'http://localhost:3001/mcp',
+    resolveBinary: async (name: string) => name,
+    warn: () => undefined,
+  },
+};
+
 const state = vi.hoisted(() => ({
   prepareCalls: [] as Array<{ backend: string; promptParts: string[] }>,
   prepareConfigs: [] as Array<Record<string, unknown>>,
@@ -8,7 +34,7 @@ const state = vi.hoisted(() => ({
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock('../backends/index.js', () => ({
+vi.mock('../../../shared/src/providers/registry.js', () => ({
   getBackend: (backend: string) => ({
     name: backend,
     binary: 'mock-backend',
@@ -18,7 +44,11 @@ vi.mock('../backends/index.js', () => ({
       return {
         binary: 'mock-backend',
         args: [...config.promptParts],
-        env: {},
+        env: {
+          INK_SESSION_ID: 'sess-from-parent',
+          INK_STUDIO_ID: 'studio-from-parent',
+          INK_CONTEXT: 'context-from-parent',
+        },
         cleanup: () => undefined,
         // An adapter that carries only the first image it is offered, the way
         // a request budget or a vanished file makes a real one refuse the rest.
@@ -82,11 +112,7 @@ describe('runBackendTurn', () => {
     vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
     vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
     try {
-      await runBackendTurn({
-        backend: 'claude',
-        sbSlug: 'wren',
-        prompt: 'ping',
-      });
+      await runBackendTurn({ ...spawnContext, backend: 'claude', sbSlug: 'wren', prompt: 'ping' });
       const [, , options] = spawnMock.mock.calls[0] as [
         string,
         string[],
@@ -109,11 +135,7 @@ describe('runBackendTurn', () => {
     state.prepareCalls = [];
     spawnMock.mockImplementation(() => createMockChild(0));
 
-    await runBackendTurn({
-      backend: 'codex',
-      sbSlug: 'lumen',
-      prompt: 'ping',
-    });
+    await runBackendTurn({ ...spawnContext, backend: 'codex', sbSlug: 'lumen', prompt: 'ping' });
 
     expect(state.prepareCalls[0]).toEqual({ backend: 'codex', promptParts: ['exec', 'ping'] });
     expect(spawnMock).toHaveBeenCalledWith(
@@ -127,11 +149,7 @@ describe('runBackendTurn', () => {
     state.prepareCalls = [];
     spawnMock.mockImplementation(() => createMockChild(0));
 
-    await runBackendTurn({
-      backend: 'claude',
-      sbSlug: 'wren',
-      prompt: 'ping',
-    });
+    await runBackendTurn({ ...spawnContext, backend: 'claude', sbSlug: 'wren', prompt: 'ping' });
 
     expect(state.prepareCalls[0]).toEqual({ backend: 'claude', promptParts: ['ping'] });
     expect(spawnMock).toHaveBeenCalledWith(
@@ -148,7 +166,13 @@ describe('runBackendTurn', () => {
     spawnMock.mockImplementation(() => createMockChild(0));
     for (const cliAttached of [false, true]) {
       state.prepareConfigs = [];
-      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      await runBackendTurn({
+        ...spawnContext,
+        backend: 'claude',
+        sbSlug: 'myra',
+        prompt: 'ping',
+        cliAttached,
+      });
       expect(state.prepareConfigs[0]?.cliAttached).toBe(cliAttached);
     }
   });
@@ -163,6 +187,7 @@ describe('runBackendTurn', () => {
       { path: '/virtual/b.png', mimeType: 'image/png' },
     ];
     const result = await runBackendTurn({
+      ...spawnContext,
       backend: 'claude',
       sbSlug: 'myra',
       prompt: 'ping',
@@ -173,6 +198,7 @@ describe('runBackendTurn', () => {
     expect(result.contextImagesDelivered).toEqual([offered[0]]);
 
     const none = await runBackendTurn({
+      ...spawnContext,
       backend: 'claude',
       sbSlug: 'myra',
       prompt: 'ping',
@@ -188,7 +214,13 @@ describe('runBackendTurn', () => {
     for (const cliAttached of [false, true]) {
       spawnMock.mockReset();
       spawnMock.mockImplementation(() => createMockChild(0));
-      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      await runBackendTurn({
+        ...spawnContext,
+        backend: 'claude',
+        sbSlug: 'myra',
+        prompt: 'ping',
+        cliAttached,
+      });
       const env = (spawnMock.mock.calls[0]?.[2] as { env?: Record<string, string> })?.env;
       expect(env?.INK_TURN_OWNER).toBe('parent');
     }
@@ -218,6 +250,7 @@ describe('runBackendTurn', () => {
       spawnMock.mockImplementation(() => child);
 
       const resultPromise = runBackendTurn({
+        ...spawnContext,
         backend: 'claude',
         sbSlug: 'wren',
         prompt: 'marathon',
@@ -247,6 +280,7 @@ describe('runBackendTurn', () => {
       spawnMock.mockImplementation(() => child);
 
       const resultPromise = runBackendTurn({
+        ...spawnContext,
         backend: 'claude',
         sbSlug: 'wren',
         prompt: 'bounded',
@@ -257,6 +291,7 @@ describe('runBackendTurn', () => {
       expect(child.kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(2);
       expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      child.emit('close', null, 'SIGTERM');
       const result = await resultPromise;
       expect(result.timedOut).toBe(true);
       expect(result.timeoutType).toBe('hard');

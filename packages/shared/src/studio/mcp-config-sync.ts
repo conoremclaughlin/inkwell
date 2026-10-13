@@ -142,6 +142,31 @@ function injectEnvLocal(
 // Format converters
 // ============================================================================
 
+/** Headers that say which session and studio a request serves. */
+const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
+  'x-ink-session-id',
+  'x-ink-studio-id',
+  'x-ink-context',
+]);
+
+/**
+ * The headers a generated backend config may carry: every configured header
+ * except routing ones. Routing is per session, and the adapters supply it
+ * from the spawn's own env (Codex: env_http_headers; Gemini: its generated
+ * system settings). Baked into a studio file it is one session's value,
+ * sent on behalf of every session that runs there. Names match
+ * case-insensitively, as HTTP does.
+ */
+function withoutRoutingHeaders(
+  headers: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const kept = Object.entries(headers).filter(
+    ([name]) => !ROUTING_HEADER_NAMES.has(name.toLowerCase())
+  );
+  return kept.length > 0 ? Object.fromEntries(kept) : undefined;
+}
+
 /**
  * Convert .mcp.json servers to Codex TOML format.
  * Only emits the [mcp_servers.*] sections.
@@ -181,15 +206,16 @@ function toCodexToml(servers: Record<string, McpServerConfig>): string {
       lines.push(`env = { ${pairs} }`);
     }
 
-    if (config.headers) {
+    const headers = withoutRoutingHeaders(config.headers);
+    if (headers) {
       // Detect "Authorization: Bearer ${ENV_VAR}" pattern → Codex bearer_token_env_var
-      const authHeader = config.headers['Authorization'] || config.headers['authorization'];
+      const authHeader = headers['Authorization'] || headers['authorization'];
       const bearerMatch = authHeader?.match(/^Bearer \$\{(\w+)\}$/);
 
       if (bearerMatch) {
         lines.push(`bearer_token_env_var = ${tomlString(bearerMatch[1])}`);
         // Emit remaining non-auth headers as http_headers if any
-        const remaining = Object.entries(config.headers).filter(
+        const remaining = Object.entries(headers).filter(
           ([k]) => k.toLowerCase() !== 'authorization'
         );
         if (remaining.length > 0) {
@@ -197,7 +223,7 @@ function toCodexToml(servers: Record<string, McpServerConfig>): string {
           lines.push(`http_headers = { ${pairs} }`);
         }
       } else {
-        const pairs = Object.entries(config.headers)
+        const pairs = Object.entries(headers)
           .map(([k, v]) => `${tomlString(k)} = ${tomlString(v)}`)
           .join(', ');
         lines.push(`http_headers = { ${pairs} }`);
@@ -412,8 +438,9 @@ function toGeminiSettings(
       server.env = config.env;
     }
 
-    if (config.headers) {
-      server.headers = config.headers;
+    const headers = withoutRoutingHeaders(config.headers);
+    if (headers) {
+      server.headers = headers;
     }
 
     geminiServers[name] = server;

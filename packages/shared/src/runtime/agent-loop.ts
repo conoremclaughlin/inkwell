@@ -288,7 +288,13 @@ export interface AgentLoopPorts {
      */
     runTurn(
       body: string,
-      ctx: { iteration: number; isContinuation: boolean; signal?: AbortSignal }
+      ctx: {
+        iteration: number;
+        isContinuation: boolean;
+        signal?: AbortSignal;
+        /** Only an ordinary continuation after the completed tool round. */
+        completedToolRound?: true;
+      }
     ): Promise<BackendTurnOutcome>;
   };
   /** Parent-only observability (Ctrl+T inspector). Clones omit this entirely. */
@@ -1153,6 +1159,14 @@ export async function runAgentLoop(
       break;
     }
 
+    // A provider can resolve after cancellation (including a successful final
+    // frame racing abort). Do not hand its calls to a new host's executor.
+    // The executor must still fence each approval/commit/dispatch await.
+    if (input.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
+
     const executed = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...executed);
     for (const r of executed) ports.observe?.recordToolCall(r);
@@ -1253,6 +1267,7 @@ export async function runAgentLoop(
           iteration,
           isContinuation: true,
           signal: input.signal,
+          completedToolRound: true,
         }
       );
     } finally {

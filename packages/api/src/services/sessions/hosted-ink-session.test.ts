@@ -1,10 +1,11 @@
+import type { BackendRunResult } from '@inklabs/shared/providers';
 /**
  * The in-process ink runner's side of the boundary (hosted-ink-session.ts):
  * what it refuses, what it hands the composition, and what it reports, with a
  * fake composition and fake provider launches. This is contract evidence, not
  * parity or a live run: the real composition is bound separately (pr:701).
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import {
   HOSTED_INK_REFUSALS,
   HostedInkSessionRunner,
@@ -39,14 +40,23 @@ class RefusedByHost extends Error {}
 function launch() {
   let settle!: (value: { childExited: boolean }) => void;
   let fail!: (error: unknown) => void;
-  const result = new Promise<{ childExited: boolean }>((resolve, reject) => {
-    settle = resolve;
+  const result = new Promise<BackendRunResult>((resolve, reject) => {
+    settle = (value) =>
+      resolve({
+        success: true,
+        stdout: '',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 1,
+        command: 'fixture',
+        ...value,
+      });
     fail = reject;
   });
   result.catch(() => undefined);
-  const handle: ProviderTurnHandle & { abort: ReturnType<typeof vi.fn> } = {
+  const handle: ProviderTurnHandle & { abort: Mock<() => void> } = {
     result,
-    abort: vi.fn(),
+    abort: vi.fn<() => void>(),
   };
   return { handle, settle, fail };
 }
@@ -62,6 +72,8 @@ function dependencies(over: Partial<HostedInkTurnDependencies> = {}): HostedInkT
     isHostedRefusal: (error) => error instanceof RefusedByHost,
     // SessionLog's shape: append returns the entry's eid synchronously.
     sessionLog: {
+      path: '/fixture/session.jsonl',
+      seed: vi.fn(),
       append: vi.fn(() => 7),
       flush: vi.fn(async () => {}),
       read: vi.fn(async () => []),
@@ -126,6 +138,39 @@ describe('selectInkRunner', () => {
 });
 
 describe('HostedInkSessionRunner', () => {
+  it('contains an awaited execution failure to its session without stopping a concurrent sibling', async () => {
+    const failedLaunch = launch();
+    const siblingLaunch = launch();
+    failedLaunch.handle.abort.mockImplementation(() => failedLaunch.settle({ childExited: true }));
+    const failedDeps = dependencies({ startProviderTurn: () => failedLaunch.handle });
+    const siblingDeps = dependencies({ startProviderTurn: () => siblingLaunch.handle });
+    const host = new HostedInkSessionRunner({
+      forTurn: ({ sessionId }) => (sessionId === 'failed-session' ? failedDeps : siblingDeps),
+      execute: async (input, ports) => {
+        const child = ports.provider.startTurn({ inkSessionId: input.sessionId });
+        if (input.sessionId === 'failed-session') throw new Error('synthetic session failure');
+        await child.result;
+        ports.sessionLog.append({ type: 'assistant', content: 'sibling reply' });
+        await ports.sessionLog.flush();
+        return { success: true, responses: [], finalTextResponse: 'sibling reply' };
+      },
+    });
+    const sibling = host.run('work', { config: config({ inkSessionId: 'sibling-session' }) });
+    const failed = await host.run('fail', { config: config({ inkSessionId: 'failed-session' }) });
+    expect(failed).toMatchObject({ success: false, error: 'synthetic session failure' });
+    expect(failedLaunch.handle.abort).toHaveBeenCalledOnce();
+    expect(siblingLaunch.handle.abort).not.toHaveBeenCalled();
+    siblingLaunch.settle({ childExited: true });
+    expect(await sibling).toMatchObject({ success: true, finalTextResponse: 'sibling reply' });
+    expect(failedDeps.sessionLog.append).not.toHaveBeenCalled();
+    expect(siblingDeps.sessionLog.append).toHaveBeenCalledExactlyOnceWith({
+      type: 'assistant',
+      content: 'sibling reply',
+    });
+    // This is cooperative asynchronous failure containment, not a claim to
+    // survive a busy loop, an unobserved rejection, or process-wide OOM.
+  });
+
   it('refuses, starting nothing, while no composition or dependencies are bound', async () => {
     const forTurn = vi.fn(() => dependencies());
     for (const options of [{}, { forTurn }, { execute: succeed }]) {
@@ -210,6 +255,7 @@ describe('HostedInkSessionRunner', () => {
         maxTurns: 3,
         toolRouting: 'local',
         profile: 'safe',
+        withholdProviderTools: false,
         away: true,
         messageLabel: 'telegram',
       },
@@ -222,6 +268,64 @@ describe('HostedInkSessionRunner', () => {
     expect(onTurnReply).not.toHaveBeenCalled();
     expect(JSON.stringify(process.env)).toBe(before);
     expect(process.cwd()).toBe(cwd);
+  });
+
+  it('carries the named provider and tools-tier restrictions without changing the next session', async () => {
+    const seen: HostedInkSessionInput[] = [];
+    const hosted = runner(async (input, ports) => {
+      seen.push(input);
+      return succeed(input, ports);
+    });
+    await hosted.run('inkling', {
+      config: config({
+        inkProvider: 'claude',
+        executionTier: 'tools',
+        toolPolicyPath: '/isolated/inkling-policy.json',
+        maxTurns: 7,
+        effort: 'high',
+        channel: 'agent',
+      }),
+    });
+    await hosted.run('ordinary SB', { config: config({ inkProvider: 'codex' }) });
+    expect(seen[0].options).toEqual({
+      backend: 'claude',
+      maxTurns: 7,
+      effort: 'high',
+      toolRouting: 'local',
+      profile: 'tools',
+      requireProfile: 'tools',
+      toolPolicyPath: '/isolated/inkling-policy.json',
+      withholdProviderTools: true,
+      away: true,
+      messageLabel: 'agent',
+    });
+    expect(seen[1].options).toEqual({
+      backend: 'codex',
+      maxTurns: 5,
+      toolRouting: 'local',
+      profile: 'safe',
+      withholdProviderTools: false,
+      away: true,
+      messageLabel: 'server',
+    });
+  });
+
+  it.each([
+    [undefined, 5],
+    [Number.NaN, 5],
+    [Number.POSITIVE_INFINITY, 5],
+    [0, 1],
+    [-3, 1],
+    [99, 25],
+    [7.6, 8],
+  ])('uses the existing outer-turn bound for %s: %s', async (maxTurns, expected) => {
+    let seen: HostedInkSessionInput | undefined;
+    await runner(async (input, ports) => {
+      seen = input;
+      return succeed(input, ports);
+    }).run('hello', { config: config({ maxTurns }) });
+    expect(seen!.options.maxTurns).toBe(expected);
+    expect(seen!.options).not.toHaveProperty('backend');
   });
 
   it('asks the caller’s admission before each launch', async () => {
@@ -630,5 +734,98 @@ describe('HostedInkSessionRunner: the turn’s lifetime (Lumen’s #757 review)'
       error: HOSTED_INK_REFUSALS.exitUnconfirmed,
       stopUnconfirmed: { leaderExited: false },
     });
+  });
+});
+
+describe('hosted steering lifetime fence', () => {
+  it('retires a retained mailbox and refuses without re-entering the composer', async () => {
+    let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+    const release = vi.fn();
+    const enqueue = vi.fn(async (request: { messageId: string; text: string }) => ({
+      messageId: request.messageId,
+      status: 'pending' as const,
+    }));
+    const deps = dependencies({
+      steering: {
+        assertCurrent: vi.fn(),
+        bind: (next) => {
+          bound = next;
+          return release;
+        },
+      },
+    });
+    await runner(async (_input, ports) => {
+      ports.steering!.bind(enqueue);
+      expect(await bound({ messageId: 'first', text: 'Update.' })).toEqual({
+        messageId: 'first',
+        status: 'pending',
+      });
+      return { success: true, responses: [] };
+    }, deps).run('work', { config: config() });
+    expect(release).toHaveBeenCalledOnce();
+    expect(await bound({ messageId: 'late', text: 'Never dispatch.' })).toEqual({
+      messageId: 'late',
+      status: 'refused',
+      reason: 'owner_closing',
+    });
+    expect(enqueue).toHaveBeenCalledOnce();
+  });
+
+  it.each(['pending', 'inserted', 'refused', 'unknown'] as const)(
+    'rechecks Stop across an async %s acknowledgment without changing definitive refusal',
+    async (status) => {
+      const stop = new AbortController();
+      let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+      const release = vi.fn();
+      const deps = dependencies({
+        steering: {
+          assertCurrent: vi.fn(),
+          bind: (next) => {
+            bound = next;
+            return release;
+          },
+        },
+      });
+      const outcome = await runner(async (_input, ports) => {
+        ports.steering!.bind(async (request) => {
+          await Promise.resolve();
+          stop.abort();
+          return { messageId: request.messageId, status };
+        });
+        expect(await bound({ messageId: 'in-flight', text: 'Correction.' })).toMatchObject({
+          messageId: 'in-flight',
+          status: status === 'refused' ? 'refused' : 'unknown',
+        });
+        return { success: true, responses: [] };
+      }, deps).run('work', { config: config({ signal: stop.signal }) });
+      expect(outcome.success).toBe(false);
+      expect(release).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('refuses a generation whose admission fence closes before enqueue', async () => {
+    let current = true;
+    let bound!: Parameters<NonNullable<HostedInkTurnDependencies['steering']>['bind']>[0];
+    const enqueue = vi.fn();
+    const deps = dependencies({
+      steering: {
+        assertCurrent: () => {
+          if (!current) throw new Error('retired');
+        },
+        bind: (next) => {
+          bound = next;
+          return vi.fn();
+        },
+      },
+    });
+    await runner(async (_input, ports) => {
+      ports.steering!.bind(enqueue);
+      current = false;
+      expect(await bound({ messageId: 'late', text: 'Never dispatch.' })).toMatchObject({
+        status: 'refused',
+      });
+      return { success: true, responses: [] };
+    }, deps).run('work', { config: config() });
+    expect(enqueue).not.toHaveBeenCalled();
   });
 });

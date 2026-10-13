@@ -218,6 +218,48 @@ describe('syncMcpConfig', () => {
     expect(toml).not.toContain('bearer_token_env_var');
   });
 
+  // Routing is per session: the adapters supply it from each spawn's env. A
+  // studio file would carry one session's value for every session that runs
+  // there, so the sync never writes it (PR #701, Myra's review of 74fff0d8).
+  it('never writes a routing header into the Codex or Gemini config', () => {
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+            headers: {
+              Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
+              'X-Ink-Session-Id': 'stale-configured-session',
+              'x-ink-studio-id': 'stale-configured-studio',
+              'x-ink-context': 'stale-configured-context',
+              'X-Api-Key': 'keep-me',
+            },
+          },
+          'routing-only': {
+            url: 'https://example.com/mcp',
+            headers: { 'x-ink-session-id': 'stale-configured-session' },
+          },
+        },
+      })
+    );
+
+    syncMcpConfig(TEST_DIR);
+
+    const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('bearer_token_env_var = "INK_ACCESS_TOKEN"');
+    expect(toml).toContain('"X-Api-Key" = "keep-me"');
+    expect(toml.toLowerCase()).not.toContain('x-ink-');
+    expect(toml).not.toContain('stale-configured');
+    const gemini = JSON.parse(readFileSync(join(TEST_DIR, '.gemini', 'settings.json'), 'utf-8'));
+    expect(gemini.mcpServers.inkwell.headers).toEqual({
+      Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
+      'X-Api-Key': 'keep-me',
+    });
+    expect(gemini.mcpServers['routing-only'].headers).toBeUndefined();
+  });
+
   it('should write to a custom target directory', () => {
     const subDir = join(TEST_DIR, 'my-workspace');
     mkdirSync(subDir, { recursive: true });

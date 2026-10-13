@@ -108,6 +108,40 @@ describe('SessionLog — the ledger and its live mirror agree (spec:observer-att
     expect(written.map((l) => JSON.parse(l).content)).toEqual(['one', 'three']);
   });
 
+  it('keeps a fresh line boundary through repeated partial synchronous write failures', () => {
+    const writes: string[] = [];
+    const observed: unknown[] = [];
+    let bytes = '';
+    const log = new SessionLog({
+      path: 'unused',
+      sink: {
+        write: (line) => {
+          writes.push(line);
+          if (writes.length <= 2) {
+            bytes += line.slice(0, line.length / 2);
+            throw new Error('partial write');
+          }
+          bytes += line;
+        },
+      },
+      onProjection: (e) => observed.push(e),
+    });
+    expect(() => log.append({ type: 'assistant', content: 'one' })).toThrow('partial write');
+    expect(() => log.append({ type: 'assistant', content: 'two' })).toThrow('partial write');
+    log.append({ type: 'assistant', content: 'three' });
+    log.append({ type: 'assistant', content: 'four' });
+    expect(writes.map((line) => line.startsWith('\n'))).toEqual([false, true, true, false]);
+    const readable = bytes.split('\n').flatMap((line) => {
+      try {
+        return [JSON.parse(line)];
+      } catch {
+        return [];
+      }
+    });
+    expect(readable.map((e) => e.eid)).toEqual([3, 4]);
+    expect(observed).toEqual(readable);
+  });
+
   it('an observer that throws never breaks the write path', () => {
     setup();
     const path = join(dir, 'session.jsonl');
@@ -128,6 +162,26 @@ describe('SessionLog — the ledger and its live mirror agree (spec:observer-att
     log.seed(41);
     log.seed(10);
     expect(log.append({ type: 'user' })).toBe(42);
+  });
+
+  it('reattach separates the first new entry from a previous process torn tail', () => {
+    let bytes = '{"eid":41,"type":"tool_intent"';
+    const log = new SessionLog({
+      path: 'unused',
+      sink: {
+        write: (line) => {
+          bytes += line;
+        },
+      },
+    });
+    log.seed(40);
+    log.append({ type: 'user', content: 'next process' });
+    expect(bytes.split('\n')).toHaveLength(3);
+    expect(JSON.parse(bytes.split('\n')[1])).toMatchObject({
+      eid: 41,
+      type: 'user',
+      content: 'next process',
+    });
   });
 
   it('a seed after the first append is refused: that append already took an eid the old log may hold', () => {

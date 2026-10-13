@@ -69,7 +69,7 @@ afterEach(() => {
 });
 
 /** A fake claude that ignores SIGTERM and starts a grandchild that does too. */
-function writeHangingFake(): string {
+function writeHangingFake(startupDelayMs: number): string {
   const fake = join(fixtures, 'claude-hangs.mjs');
   writeFileSync(
     fake,
@@ -77,9 +77,14 @@ function writeHangingFake(): string {
       '#!/usr/bin/env node',
       "import { spawn } from 'child_process';",
       "import { writeFileSync } from 'fs';",
-      `const g = spawn(process.execPath, ['-e', ${JSON.stringify(IGNORES_TERM)}], { stdio: 'ignore' });`,
-      `writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid, g.pid]));`,
+      `await new Promise((resolve) => setTimeout(resolve, ${startupDelayMs}));`,
       IGNORES_TERM,
+      `const child = ${JSON.stringify(IGNORES_TERM + " process.send('ready');")};`,
+      "const g = spawn(process.execPath, ['-e', child], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+      "g.once('message', () => {",
+      // Both handlers exist before the parent advertises readiness.
+      `  writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify([process.pid, g.pid]));`,
+      '});',
     ].join('\n'),
     { mode: 0o755 }
   );
@@ -168,40 +173,42 @@ async function whenReported(): Promise<number[]> {
 }
 
 describe('ClaudeRunner: a run with its own ceiling, stopped as a group', () => {
-  it('a cancelled run that ignores SIGTERM settles at the group SIGKILL, once it has exited, as a non-transient failure', async () => {
-    hoisted.binary = writeHangingFake();
-    const controller = new AbortController();
-    let abortedAt = 0;
-    setTimeout(() => {
-      abortedAt = Date.now();
+  it.each([0, 700])(
+    'a cancelled run that ignores SIGTERM (%i ms startup) settles at the group SIGKILL, once it has exited, as a non-transient failure',
+    async (startupDelayMs) => {
+      hoisted.binary = writeHangingFake(startupDelayMs);
+      const controller = new AbortController();
+      const run = new ClaudeRunner().run('hello', {
+        config: {
+          workingDirectory: fixtures,
+          mcpConfigPath: join(fixtures, '.mcp.json'),
+          killProcessGroup: true,
+          signal: controller.signal,
+        },
+      });
+      const [fakeClaude, grandchild] = await whenReported();
+      const abortedAt = Date.now();
       controller.abort();
-    }, 500);
-    const result = await new ClaudeRunner().run('hello', {
-      config: {
-        workingDirectory: fixtures,
-        mcpConfigPath: join(fixtures, '.mcp.json'),
-        killProcessGroup: true,
-        signal: controller.signal,
-      },
-    });
-    const settledAfter = Date.now() - abortedAt;
-    const [fakeClaude, grandchild] = reported();
-    // Settled when the process was gone, not when it was signalled: until
-    // then it could still write to the session a next turn would resume.
-    expect(alive(fakeClaude)).toBe(false);
-    expect(settledAfter).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
-    expect(settledAfter).toBeLessThan(STOP_GRACE_MS + STOP_GIVE_UP_MS);
-    expect(result).toMatchObject({
-      success: false,
-      error: 'Claude Code turn cancelled, process stopped',
-    });
-    // Not the word the retry classifier reads as transient.
-    expect(String(result.error)).not.toMatch(/timeout/i);
+      const result = await run;
+      const settledAfter = Date.now() - abortedAt;
+      // Settled when the process was gone, not when it was signalled: until
+      // then it could still write to the session a next turn would resume.
+      expect(alive(fakeClaude)).toBe(false);
+      expect(settledAfter).toBeGreaterThanOrEqual(STOP_GRACE_MS - 100);
+      expect(settledAfter).toBeLessThan(STOP_GRACE_MS + STOP_GIVE_UP_MS);
+      expect(result).toMatchObject({
+        success: false,
+        error: 'Claude Code turn cancelled, process stopped',
+      });
+      // Not the word the retry classifier reads as transient.
+      expect(String(result.error)).not.toMatch(/timeout/i);
 
-    // The grandchild got the same SIGKILL; give the system a moment to reap it.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-    expect(alive(grandchild)).toBe(false);
-  }, 20_000);
+      // The grandchild got the same SIGKILL; give the system a moment to reap it.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(alive(grandchild)).toBe(false);
+    },
+    20_000
+  );
 
   it.each([
     ['as a group', true],

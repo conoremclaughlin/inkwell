@@ -504,4 +504,86 @@ describe('auditStudio', () => {
       }
     });
   });
+  // Syncs before 2026-09-29 copied .mcp.json's routing headers into the
+  // backend configs, so one session's id was sent for every session in the
+  // studio (PR #701). The check sends such a studio to its repair, and the
+  // repair's re-sync writes the config without them.
+  it('a backend config that bakes a routing header fails its MCP check until re-synced', async () => {
+    const root = await scratch();
+    try {
+      await completeStudio(root, { studioId: STUDIO_ID });
+      await writeFile(
+        path.join(root, '.mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            inkwell: {
+              type: 'http',
+              url: 'http://localhost:3001/mcp',
+              headers: { 'X-Ink-Session-Id': 'stale-configured-session' },
+            },
+          },
+        })
+      );
+      await writeFile(
+        path.join(root, '.codex', 'config.toml'),
+        codexToml().replace(
+          'required = true',
+          'required = true\nhttp_headers = { "X-Ink-Session-Id" = "stale-configured-session" }'
+        )
+      );
+      await writeFile(
+        path.join(root, '.gemini', 'settings.json'),
+        JSON.stringify({
+          mcpServers: {
+            inkwell: {
+              url: 'http://localhost:3001/mcp',
+              headers: { 'x-ink-studio-id': 'stale-configured-studio' },
+            },
+          },
+          hooks: geminiHooks(),
+        })
+      );
+      const baked = auditStudio(root, { linked: true });
+      expect(baked.missing).toEqual(['codex-mcp', 'gemini-mcp']);
+      expect(baked.checks.find((c) => c.id === 'codex-mcp')?.detail).toMatch(/routing header/);
+
+      syncMcpConfig(root);
+
+      const repaired = auditStudio(root, { linked: true });
+      expect(repaired.missing).toEqual([]);
+      expect(repaired.complete).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // The reader never reports clean what it could not read (Myra, #701
+  // 4d55a16d); a routing name only in a value or env_http_headers is not baked.
+  it('fails the Codex check on an http_headers form it cannot read, and passes a near-miss', async () => {
+    const root = await scratch();
+    try {
+      await completeStudio(root, { studioId: STUDIO_ID });
+      const codexPath = path.join(root, '.codex', 'config.toml');
+      await writeFile(
+        codexPath,
+        codexToml().replace(
+          'required = true',
+          'required = true\nhttp_headers = {\n  "X-A" = "v"\n}'
+        )
+      );
+      expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+
+      await writeFile(
+        codexPath,
+        codexToml().replace(
+          'required = true',
+          'required = true\nhttp_headers = { "X-Custom" = "x-ink-session-id" }\n' +
+            'env_http_headers = { "x-ink-context" = "INK_CONTEXT" }'
+        )
+      );
+      expect(auditStudio(root, { linked: true }).missing).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

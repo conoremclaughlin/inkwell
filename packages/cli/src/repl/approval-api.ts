@@ -14,9 +14,6 @@
 import { getValidAccessToken } from '../auth/tokens.js';
 import { resolveSlug, readIdentityJson } from '../backends/identity.js';
 
-const DEFAULT_TIMEOUT_SECONDS = 300;
-const POLL_INTERVAL_MS = 3000;
-
 function getServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
@@ -41,160 +38,22 @@ function getContextHeaders(): Record<string, string> {
   return headers;
 }
 
-export interface ApprovalRequestResult {
-  requestId: string;
-  status: 'granted' | 'denied' | 'expired' | 'timeout' | 'error' | 'aborted';
-  action?: string;
-  grantedTools?: string[];
-  error?: string;
-}
-
-/** Resolve after `ms`, or as soon as `signal` fires. */
-function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
-  if (!signal) return new Promise((r) => setTimeout(r, ms));
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-/**
- * Create an approval request on the Inkwell server and poll until resolved.
- *
- * The server handles notification routing:
- * - Looks up user's connected platforms (Telegram, WhatsApp) from trusted_users
- * - Sends formatted approval notification with reply-to threading
- * - The approval interceptor catches user responses before agent routing
- *
- * Fails closed: any error during creation or polling results in denial.
- */
-export async function requestToolApproval(options: {
-  tool: string;
-  args?: string;
-  reason: string;
-  sessionId?: string;
-  studioId?: string;
-  timeoutSeconds?: number;
-  onCreated?: (requestId: string) => void;
-  onPoll?: (elapsed: number) => void;
-  /**
-   * Give up early. Without it, cancelling a turn cannot reach a 2FA request
-   * already in flight — the poll loop below runs for the full timeout (5
-   * minutes), so Ctrl+C would not actually stop a shadow clone waiting here.
-   */
-  signal?: AbortSignal;
-  /**
-   * Which shadow clone raised this, when one did.
-   *
-   * An away-mode user is approving a tool call they cannot see the context for;
-   * "which of my three clones asked" is the difference between an informed yes
-   * and a blind one. It also has to reach the audit trail, not just the local
-   * console line.
-   */
-  origin?: { origin: 'parent' | 'clone'; cloneId?: string; cloneLabel?: string };
-}): Promise<ApprovalRequestResult> {
-  if (options.signal?.aborted) {
-    return { requestId: '', status: 'aborted' };
-  }
+export { type ApprovalRequestResult } from '@inklabs/shared/node-host';
+import { requestHostedToolApproval } from '@inklabs/shared/node-host';
+export async function requestToolApproval(
+  options: Parameters<typeof requestHostedToolApproval>[1]
+) {
+  if (options.signal?.aborted) return { requestId: '', status: 'aborted' as const };
   const serverUrl = getServerUrl();
   const token = await getValidAccessToken(serverUrl);
-  const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...getContextHeaders(),
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  // 1. Create the approval request — server sends platform notifications
-  let requestId: string;
-  try {
-    const resp = await fetch(`${serverUrl}/api/admin/approval-requests`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        tool: options.tool,
-        args: options.args,
-        reason: options.reason,
-        sessionId: options.sessionId,
-        studioId: options.studioId,
-        timeoutSeconds,
-        ...(options.origin?.origin === 'clone' ? { origin: options.origin } : {}),
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!resp.ok) {
-      return {
-        requestId: '',
-        status: 'error',
-        error: `Server returned ${resp.status}`,
-      };
-    }
-
-    const body = (await resp.json()) as { requestId: string };
-    requestId = body.requestId;
-    options.onCreated?.(requestId);
-  } catch (err) {
-    return {
-      requestId: '',
-      status: 'error',
-      error: `Could not reach approval server: ${String(err)}`,
-    };
-  }
-
-  // 2. Poll for resolution
-  const maxPollTime = timeoutSeconds * 1000;
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < maxPollTime) {
-    await sleepOrAbort(POLL_INTERVAL_MS, options.signal);
-    if (options.signal?.aborted) {
-      return { requestId, status: 'aborted' };
-    }
-    options.onPoll?.(Date.now() - startTime);
-
-    try {
-      const statusResp = await fetch(
-        `${serverUrl}/api/admin/approval-requests/${requestId}/status`,
-        { headers, signal: AbortSignal.timeout(5000) }
-      );
-
-      if (!statusResp.ok) continue;
-
-      const status = (await statusResp.json()) as {
-        status: string;
-        action?: string;
-        grantedTools?: string[];
-      };
-
-      if (status.status === 'pending') continue;
-
-      if (status.status === 'granted') {
-        return {
-          requestId,
-          status: 'granted',
-          action: status.action,
-          grantedTools: status.grantedTools,
-        };
-      }
-
-      return {
-        requestId,
-        status: status.status as 'denied' | 'expired',
-      };
-    } catch {
-      // Transient error, keep polling
-    }
-  }
-
-  return { requestId, status: 'timeout' };
+  return requestHostedToolApproval(
+    {
+      serverUrl,
+      headers: {
+        ...getContextHeaders(),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    },
+    options
+  );
 }

@@ -45,6 +45,7 @@ vi.mock('../services/graph-executor.service', () => ({
 }));
 
 import { ClaudeAdapter } from '../../../cli/src/backends/claude.js';
+import { createCliBackendHost } from '../../../cli/src/backends/cli-host.js';
 import { PARENT_OWNED_TURN_ENV, promptAttachmentWrite } from '../../../cli/src/lib/turn-owner.js';
 import { createTurnSignal } from '../../../cli/src/repl/turn-signal.js';
 import { decodeContextToken } from '@inklabs/shared';
@@ -224,15 +225,20 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
     if (write !== null) await post({ cliAttached: write });
   }
 
-  function childEnv(cliAttached: boolean, owner: Record<string, string>) {
-    const prepared = new ClaudeAdapter().prepare({
-      sbSlug: 'lumen',
-      inkSessionId: SESSION_ID,
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      cliAttached,
-    });
+  async function childEnv(cliAttached: boolean, owner: Record<string, string>) {
+    // Prepared as the chat's own host would: this process's directory and home.
+    const prepared = await new ClaudeAdapter().prepare(
+      {
+        sbSlug: 'lumen',
+        inkSessionId: SESSION_ID,
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        cwd: process.cwd(),
+        cliAttached,
+      },
+      createCliBackendHost()
+    );
     return { env: { ...prepared.env, ...owner }, cleanup: prepared.cleanup };
   }
 
@@ -247,7 +253,7 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
   it('a headless chat child leaves the parent turn marker open', async () => {
     // No server run is registered for a locally started chat.
     await ownerOpens(false);
-    const child = childEnv(false, PARENT_OWNED_TURN_ENV);
+    const child = await childEnv(false, PARENT_OWNED_TURN_ENV);
     try {
       await childPrompt(child.env);
       expect(updateSession.mock.calls.some(([, u]) => u.cliTurnAt === null)).toBe(false);
@@ -269,7 +275,7 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
     expect(row.cli_turn_at).not.toBeNull();
     expect(delivery()).toBe('spawn');
 
-    const child = childEnv(false, PARENT_OWNED_TURN_ENV);
+    const child = await childEnv(false, PARENT_OWNED_TURN_ENV);
     try {
       await childPrompt(child.env);
       expect(row.cli_turn_at).not.toBeNull();
@@ -283,7 +289,7 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
   it('control: an interactive owner on the same row stays an inline consumer', async () => {
     seedRow(true);
     await ownerOpens(true);
-    const child = childEnv(true, PARENT_OWNED_TURN_ENV);
+    const child = await childEnv(true, PARENT_OWNED_TURN_ENV);
     try {
       await childPrompt(child.env);
       expect(row.cli_attached).toBe(true);
@@ -296,7 +302,7 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
 
   it('control: a server spawn still detaches, and the detach clears the marker', async () => {
     await post({ lifecycle: 'running', event: 'prompt' });
-    const child = childEnv(false, {});
+    const child = await childEnv(false, {});
     try {
       await childPrompt(child.env);
       expect(row).toMatchObject({ cli_attached: false, cli_turn_at: null });
@@ -307,7 +313,7 @@ describe('hook-lifecycle: an ink chat turn, its provider child, and delivery', (
 
   it('an attached REPL child re-asserts attachment and keeps the marker', async () => {
     await ownerOpens(true);
-    const child = childEnv(true, PARENT_OWNED_TURN_ENV);
+    const child = await childEnv(true, PARENT_OWNED_TURN_ENV);
     try {
       await childPrompt(child.env);
       expect(updateSession.mock.calls.some(([, u]) => u.cliTurnAt === null)).toBe(false);
