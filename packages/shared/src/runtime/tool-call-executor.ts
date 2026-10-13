@@ -159,9 +159,13 @@ export async function executeToolCalls(
  * `onResult`, the transcript and the ledger see exactly the sequence a serial
  * batch would have produced, so the continuation is the same bytes.
  *
- * Approval prompts stay one at a time. A cancelled turn starts nothing new;
- * a read already in flight gets the signal through `callTool`, as a serial
- * call would.
+ * A pending approval is a barrier for everything after it
+ * (ink://specs/best-effort-tool-calls §3.1): a read that asks for approval
+ * holds every later call until it has been decided and has settled, so
+ * nothing runs around a pending decision and prompts are never shown two at
+ * a time. Reads started before it keep running. A cancelled turn starts
+ * nothing new; a read already in flight gets the signal through `callTool`,
+ * as a serial call would.
  */
 async function executeWithConcurrentReads(
   calls: LocalToolCall[],
@@ -172,13 +176,10 @@ async function executeWithConcurrentReads(
     results.push(result);
     deps.onResult?.(result);
   };
-  const callDeps: ToolCallExecutorPorts = {
-    ...deps,
-    promptForApproval: oneAtATime(deps.promptForApproval, deps.signal),
-  };
   // A throw from a port is the batch failing, as it is serially. Calls that
   // had already started still settle, so their intents are closed, and the
-  // first failure in emission order is what the batch rethrows.
+  // batch rethrows the first failure to arrive. Two overlapping reads that
+  // both throw can arrive out of emission order.
   let failure: { error: unknown } | undefined;
   let settled: Promise<void> = Promise.resolve();
 
@@ -191,6 +192,14 @@ async function executeWithConcurrentReads(
       settled = settled.then(() => settle(cancelled));
       continue;
     }
+    let awaitingApproval = false;
+    const callDeps: ToolCallExecutorPorts = {
+      ...deps,
+      promptForApproval: (tool, reason, args) => {
+        awaitingApproval = true;
+        return deps.promptForApproval(tool, reason, args);
+      },
+    };
     const outcome = executeOneToolCall(call, callDeps).then(
       (result) => ({ result }),
       (error: unknown) => {
@@ -202,28 +211,20 @@ async function executeWithConcurrentReads(
       const done = await outcome;
       if ('result' in done) settle(done.result);
     });
-    if (!concurrent) await settled;
+    if (!concurrent) {
+      await settled;
+      continue;
+    }
     // One tick, so a port that threw while this call was starting (a policy
-    // read, say) is seen before the next call starts.
-    else await Promise.resolve();
+    // read, say) is seen before the next call starts. Policy is synchronous,
+    // so by then a call that needs approval has already asked for it.
+    await Promise.resolve();
+    if (awaitingApproval) await settled;
   }
 
   await settled;
   if (failure) throw failure.error;
   return results;
-}
-
-/** Queue prompts behind each other; one whose turn comes after cancellation is never shown. */
-function oneAtATime(
-  prompt: ToolCallExecutorPorts['promptForApproval'],
-  signal: AbortSignal | undefined
-): ToolCallExecutorPorts['promptForApproval'] {
-  let tail: Promise<unknown> = Promise.resolve();
-  return (tool, reason, args) => {
-    const turn = tail.then(() => (signal?.aborted ? false : prompt(tool, reason, args)));
-    tail = turn.catch(() => undefined);
-    return turn;
-  };
 }
 
 async function executeOneToolCall(

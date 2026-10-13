@@ -234,9 +234,9 @@ describe('concurrent reads', () => {
     await run;
   });
 
-  it('decides policy in emission order and asks one approval at a time', async () => {
+  it('a pending approval holds every call after it, and reads before it keep running', async () => {
     const decided: string[] = [];
-    const granted = new Set(['grep']);
+    const granted = new Set(['grep', 'find']);
     const policy = vi.fn((tool: string) => {
       decided.push(tool);
       return granted.has(tool)
@@ -245,7 +245,7 @@ describe('concurrent reads', () => {
     });
     const asks: Array<{ tool: string; approve: () => void }> = [];
     const gate = gatedDispatcher();
-    const run = executeToolCalls([named('read'), named('grep'), named('recall')], {
+    const run = executeToolCalls([named('grep'), named('read'), named('find'), named('recall')], {
       ...ports({ concurrentReads: true, callTool: gate.callTool }),
       policy: { canCallInkTool: policy },
       promptForApproval: (tool) =>
@@ -259,21 +259,33 @@ describe('concurrent reads', () => {
           });
         }),
     });
-    await vi.waitFor(() => expect(decided.slice(0, 3)).toEqual(['read', 'grep', 'recall']));
     await vi.waitFor(() => expect(asks.map((a) => a.tool)).toEqual(['read']));
     await vi.waitFor(() => expect(gate.entered).toEqual(['grep']));
     await drain();
-    expect(asks).toHaveLength(1);
+    // Nothing after the pending decision is decided or started.
+    expect(decided).toEqual(['grep', 'read']);
     asks[0].approve();
-    await vi.waitFor(() => expect(asks.map((a) => a.tool)).toEqual(['read', 'recall']));
-    asks[1].approve();
-    await gate.answer('grep');
+    await vi.waitFor(() => expect(gate.entered).toEqual(['grep', 'read']));
     await gate.answer('read');
+    await drain();
+    // Approved is not enough: the barrier holds until the call has settled,
+    // and it has not, because grep before it is still open.
+    expect(decided).toEqual(['grep', 'read', 'read']);
+    await gate.answer('grep');
+    await vi.waitFor(() => expect(asks.map((a) => a.tool)).toEqual(['read', 'recall']));
+    expect(gate.entered).toEqual(['grep', 'read', 'find']);
+    asks[1].approve();
+    await gate.answer('find');
     await gate.answer('recall');
-    expect((await run).map((r) => r.status)).toEqual(['approved', 'executed', 'approved']);
+    expect((await run).map((r) => r.status)).toEqual([
+      'executed',
+      'approved',
+      'executed',
+      'approved',
+    ]);
   });
 
-  it('a cancelled turn starts nothing new, signals reads in flight and never shows a queued prompt', async () => {
+  it('a cancelled turn starts nothing new, signals reads in flight and shows no later prompt', async () => {
     const stop = new AbortController();
     const gate = gatedDispatcher();
     const prompted: string[] = [];
@@ -308,7 +320,7 @@ describe('concurrent reads', () => {
     expect(results.map((r) => [r.tool, r.status, r.reason])).toEqual([
       ['grep', 'executed', undefined],
       ['read', 'denied', 'Cancelled while waiting for approval'],
-      ['recall', 'denied', 'Cancelled while waiting for approval'],
+      ['recall', 'denied', 'Cancelled before this call ran'],
       ['send_response', 'denied', 'Cancelled before this call ran'],
     ]);
   });
