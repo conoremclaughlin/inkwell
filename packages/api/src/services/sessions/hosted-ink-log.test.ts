@@ -224,6 +224,7 @@ describe('hosted JSONL continuity', () => {
       expect(warn).toHaveBeenCalledWith('[HostedInkLog] Session journal history is split', {
         sessionId: 'session',
         selected: adopted,
+        parents: [parent],
         adoptedClones: [adopted],
       });
     });
@@ -241,7 +242,7 @@ describe('hosted JSONL continuity', () => {
       expect(resolveParentJournalSync(dir, 'session').path).toBe(log.path);
       expect(warn).toHaveBeenCalledWith(
         '[HostedInkLog] Session journal history is split',
-        expect.objectContaining({ selected: parent, adoptedClones: [adopted] })
+        expect.objectContaining({ selected: parent, parents: [parent], adoptedClones: [adopted] })
       );
     });
 

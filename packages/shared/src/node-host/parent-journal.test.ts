@@ -75,13 +75,13 @@ describe('resolveParentJournal', () => {
     const parent = journal(dir, `${SID}-100.jsonl`, start + parentTurn, 1000);
     journal(dir, `${SID}-100.clone-1.jsonl`, cloneStart + cloneTurn, 2000);
     const result = await resolveBoth(dir);
-    expect(result).toEqual({ path: parent, adoptedClones: [] });
+    expect(result).toEqual({ path: parent, parents: [parent], adoptedClones: [] });
     expect(describeJournalSplit(result)).toBeUndefined();
   });
 
-  it('a clone carrying later parent attaches is the adopted journal while it is newest, and is reported', async () => {
+  it('a clone carrying later parent attaches is the adopted journal while it is newest, and the warning names the parent', async () => {
     const dir = repl();
-    journal(dir, `${SID}-100.jsonl`, start + parentTurn, 1000);
+    const parent = journal(dir, `${SID}-100.jsonl`, start + parentTurn, 1000);
     const adopted = journal(
       dir,
       `${SID}-100.clone-4.jsonl`,
@@ -89,13 +89,16 @@ describe('resolveParentJournal', () => {
       2000
     );
     const result = await resolveBoth(dir);
-    expect(result).toEqual({ path: adopted, adoptedClones: [adopted] });
-    expect(describeJournalSplit(result)).toContain(`Replay uses ${adopted}`);
+    expect(result).toEqual({ path: adopted, parents: [parent], adoptedClones: [adopted] });
+    const warning = describeJournalSplit(result);
+    expect(warning).toContain(`Replay uses ${adopted}`);
+    // The parent holds the history before the adoption (Lumen, #851 review).
+    expect(warning).toContain(`also in ${parent}`);
   });
 
   it('a nested clone of an adopted clone stays a clone until it is adopted itself', async () => {
     const dir = repl();
-    journal(dir, `${SID}-100.jsonl`, start + parentTurn, 1000);
+    const parent = journal(dir, `${SID}-100.jsonl`, start + parentTurn, 1000);
     const adopted = journal(
       dir,
       `${SID}-100.clone-4.jsonl`,
@@ -104,13 +107,17 @@ describe('resolveParentJournal', () => {
     );
     const nestedPath = `${SID}-100.clone-4.clone-1.jsonl`;
     journal(dir, nestedPath, cloneStart + cloneTurn, 3000);
-    expect(await resolveBoth(dir)).toEqual({ path: adopted, adoptedClones: [adopted] });
+    expect(await resolveBoth(dir)).toEqual({
+      path: adopted,
+      parents: [parent],
+      adoptedClones: [adopted],
+    });
 
     // The next attach adopted the nested clone (Myra's Oct 8 transition).
     const nested = journal(dir, nestedPath, cloneStart + cloneTurn + attach + parentTurn, 4000);
     const result = await resolveBoth(dir);
-    expect(result).toEqual({ path: nested, adoptedClones: [nested, adopted] });
-    expect(describeJournalSplit(result)).toContain(`also in ${adopted}`);
+    expect(result).toEqual({ path: nested, parents: [parent], adoptedClones: [nested, adopted] });
+    expect(describeJournalSplit(result)).toContain(`also in ${parent}, ${adopted}`);
   });
 
   it('after the parent resumes, an adopted clone that is no longer newest is still surfaced', async () => {
@@ -131,7 +138,7 @@ describe('resolveParentJournal', () => {
     );
     const parent = journal(dir, `${SID}-100.jsonl`, start + parentTurn + parentTurn, 5000);
     const result = await resolveBoth(dir);
-    expect(result).toEqual({ path: parent, adoptedClones: [nested, adopted] });
+    expect(result).toEqual({ path: parent, parents: [parent], adoptedClones: [nested, adopted] });
     const warning = describeJournalSplit(result);
     expect(warning).toContain(`Replay uses ${parent}`);
     expect(warning).toContain(nested);
@@ -146,20 +153,34 @@ describe('resolveParentJournal', () => {
     journal(dir, `${OTHER}-200.clone-1.jsonl`, attach, 9000);
     symlinkSync(join(dir, `${OTHER}-200.jsonl`), join(dir, `${SID}-300.jsonl`));
     mkdirSync(join(dir, `${SID}-400.jsonl`));
-    expect(await resolveBoth(dir)).toEqual({ path: parent, adoptedClones: [] });
+    expect(await resolveBoth(dir)).toEqual({ path: parent, parents: [parent], adoptedClones: [] });
   });
 
-  it('several parent files still compete by mtime, as before', async () => {
+  it('several parent files still compete by mtime, as before, and are no split alone', async () => {
     const dir = repl();
-    journal(dir, `${SID}-100.jsonl`, start, 1000);
+    const older = journal(dir, `${SID}-100.jsonl`, start, 1000);
     const newer = journal(dir, `${SID}-200.jsonl`, start, 2000);
-    expect((await resolveBoth(dir)).path).toBe(newer);
+    const result = await resolveBoth(dir);
+    expect(result).toEqual({ path: newer, parents: [newer, older], adoptedClones: [] });
+    expect(describeJournalSplit(result)).toBeUndefined();
+  });
+
+  it('a split warning names every parent file and every adopted clone but the replayed one', async () => {
+    const dir = repl();
+    const oldest = journal(dir, `${SID}-100.jsonl`, start, 1000);
+    const older = journal(dir, `${SID}-200.jsonl`, start, 2000);
+    const adopted = journal(dir, `${SID}-200.clone-1.jsonl`, cloneStart + attach, 3000);
+    const result = await resolveBoth(dir);
+    expect(result).toEqual({ path: adopted, parents: [older, oldest], adoptedClones: [adopted] });
+    expect(describeJournalSplit(result)).toContain(
+      `Replay uses ${adopted}; this session's turns are also in ${older}, ${oldest}.`
+    );
   });
 
   it('an empty or missing directory has no journal', async () => {
     const dir = repl();
-    expect(await resolveBoth(dir)).toEqual({ adoptedClones: [] });
-    expect(await resolveBoth(join(dir, 'missing'))).toEqual({ adoptedClones: [] });
+    expect(await resolveBoth(dir)).toEqual({ parents: [], adoptedClones: [] });
+    expect(await resolveBoth(join(dir, 'missing'))).toEqual({ parents: [], adoptedClones: [] });
   });
 
   it.skipIf(process.getuid?.() === 0)(
@@ -242,7 +263,8 @@ describe('chooseParentJournal', () => {
   it('on an mtime tie the parent wins, whatever the input order', () => {
     const parent = { path: 'p', mtimeMs: 1, clone: false, carriesParentRecords: false };
     const adopted = { path: 'c', mtimeMs: 1, clone: true, carriesParentRecords: true };
-    expect(chooseParentJournal([parent, adopted])).toEqual({ path: 'p', adoptedClones: ['c'] });
-    expect(chooseParentJournal([adopted, parent])).toEqual({ path: 'p', adoptedClones: ['c'] });
+    const expected = { path: 'p', parents: ['p'], adoptedClones: ['c'] };
+    expect(chooseParentJournal([parent, adopted])).toEqual(expected);
+    expect(chooseParentJournal([adopted, parent])).toEqual(expected);
   });
 });

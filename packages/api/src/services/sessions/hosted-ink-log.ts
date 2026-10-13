@@ -33,6 +33,7 @@ export async function openHostedInkLog(input: {
     logger.warn('[HostedInkLog] Session journal history is split', {
       sessionId: input.sessionId,
       selected: journal.path ?? null,
+      parents: journal.parents,
       adoptedClones: journal.adoptedClones,
     });
   }

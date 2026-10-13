@@ -38,6 +38,8 @@ export interface JournalCandidate {
 export interface ParentJournalResolution {
   /** The session's journal, or undefined when it has none yet. */
   path?: string;
+  /** The session's parent journals (no clone), newest first, the selected one included. */
+  parents: string[];
   /** Clone journals that also carry this session's own turns, newest first. Non-empty means the history is split. */
   adoptedClones: string[];
 }
@@ -61,6 +63,7 @@ export function chooseParentJournal(
   const eligible = byNewest.filter((c) => !c.clone || c.carriesParentRecords);
   return {
     path: eligible[0]?.path,
+    parents: byNewest.filter((c) => !c.clone).map((c) => c.path),
     adoptedClones: byNewest.filter((c) => c.clone && c.carriesParentRecords).map((c) => c.path),
   };
 }
@@ -68,7 +71,11 @@ export function chooseParentJournal(
 /** One sentence naming every file that holds the session's turns, for a warning. Undefined when not split. */
 export function describeJournalSplit(resolution: ParentJournalResolution): string | undefined {
   if (resolution.adoptedClones.length === 0) return undefined;
-  const others = resolution.adoptedClones.filter((p) => p !== resolution.path);
+  // Every file holding the session's turns, parents included: when an adopted
+  // clone is the one replayed, the parent holds the history before it.
+  const others = [...resolution.parents, ...resolution.adoptedClones].filter(
+    (p) => p !== resolution.path
+  );
   const where = resolution.path ? `Replay uses ${resolution.path}` : 'No journal was selected';
   const also = others.length ? `; this session's turns are also in ${others.join(', ')}` : '';
   return (
@@ -156,7 +163,7 @@ export function resolveParentJournalSync(dir: string, sessionId: string): Parent
   try {
     names = readdirSync(dir);
   } catch (error) {
-    if (isMissing(error)) return { adoptedClones: [] };
+    if (isMissing(error)) return { parents: [], adoptedClones: [] };
     throw error;
   }
   const candidates: JournalCandidate[] = [];
@@ -188,7 +195,7 @@ export async function resolveParentJournal(
   try {
     names = await readdir(dir);
   } catch (error) {
-    if (isMissing(error)) return { adoptedClones: [] };
+    if (isMissing(error)) return { parents: [], adoptedClones: [] };
     throw error;
   }
   const candidates = await Promise.all(
