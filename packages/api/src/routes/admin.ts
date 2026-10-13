@@ -19,6 +19,7 @@ import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oa
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
+import { resolveParentJournal } from '@inklabs/shared/node-host';
 import { logger } from '../utils/logger';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
@@ -799,12 +800,16 @@ async function findInkTranscriptFile(sessionId: string): Promise<string | null> 
   }
   roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
+  // Each root's own journal for the session, never a clone's (task 65f3be41);
+  // then the newest across roots, as before.
   const matches: string[] = [];
   for (const root of roots) {
-    const rootMatches = await collectMatchingFiles(root, 0, (name) => {
-      return name.startsWith(`${sessionId}-`) && name.endsWith('.jsonl');
-    });
-    matches.push(...rootMatches);
+    try {
+      const journal = await resolveParentJournal(root, sessionId);
+      if (journal.path) matches.push(journal.path);
+    } catch {
+      // Ignore unreadable repl directories.
+    }
   }
 
   return pickNewestPath(matches);

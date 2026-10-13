@@ -96,6 +96,14 @@ vi.mock('fs', () => ({
   },
 }));
 
+// The ink journal is located by the shared resolver, which reads the disk
+// itself; its own tests cover that against real files (parent-journal.test.ts).
+const mockResolveParentJournal = vi.fn();
+vi.mock('@inklabs/shared/node-host', async (original) => ({
+  ...(await original<typeof import('@inklabs/shared/node-host')>()),
+  resolveParentJournal: (...args: unknown[]) => mockResolveParentJournal(...args),
+}));
+
 import router from './admin';
 
 const TEST_USER_ID = 'user-test-123';
@@ -244,6 +252,12 @@ describe('POST /sessions/:id/sync-transcript', () => {
       }
       throw new Error(`ENOENT: ${dir}`);
     });
+
+    mockResolveParentJournal.mockImplementation(async (dir: string) =>
+      dir === path.dirname(transcriptFile)
+        ? { path: transcriptFile, adoptedClones: [] }
+        : { adoptedClones: [] }
+    );
 
     mockFsStat.mockImplementation(async (filePath: string) => {
       if (filePath === transcriptFile) {
