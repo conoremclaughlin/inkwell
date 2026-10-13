@@ -47,8 +47,10 @@ export interface AutoEvictSelection {
  * the recipient's durable read pointer and `download_*` write files under
  * ~/.ink/files, and both looked like reads by prefix (Lumen, PR #584 round
  * 3). Anything not listed here — a new tool, a `*_status` — is treated as a
- * write, the only safe default. The classification decides WORDING only; it
- * never decides what is cleared.
+ * write, the only safe default. Here the classification decides WORDING only;
+ * it never decides what is cleared. The tool executor also reads it, behind
+ * its `concurrentReads` port, to decide which calls may overlap: adding a
+ * tool to this set lets it run alongside other reads.
  */
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   // ink-local

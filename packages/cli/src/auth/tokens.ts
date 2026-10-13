@@ -292,7 +292,22 @@ export async function getValidAccessToken(
     return auth.access_token;
   }
 
-  // Attempt refresh
+  // One refresh per refresh token. Calls that overlap in this process (a batch
+  // of concurrent reads) would otherwise each spend the same refresh token,
+  // and a refresh that fails clears auth.json for everyone.
+  const key = `${serverUrl}\n${auth.refresh_token}`;
+  const inFlight = refreshesInFlight.get(key);
+  if (inFlight) return inFlight;
+  const refresh = refreshStoredAuth(serverUrl, auth).finally(() => {
+    refreshesInFlight.delete(key);
+  });
+  refreshesInFlight.set(key, refresh);
+  return refresh;
+}
+
+const refreshesInFlight = new Map<string, Promise<string | null>>();
+
+async function refreshStoredAuth(serverUrl: string, auth: StoredAuth): Promise<string | null> {
   try {
     const refreshed = await refreshAccessToken(serverUrl, auth);
     saveAuth(refreshed);
