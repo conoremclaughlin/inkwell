@@ -167,7 +167,7 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), { tool: 'mcp__supabase__apply_migration' })).toBe('deny');
   });
 
-  it('denies installs, bare yarn included, and keeps the destructive defaults', () => {
+  it('denies installs, bare yarn included, and keeps the force-push defaults', () => {
     for (const command of [
       'yarn',
       'yarn install',
@@ -177,12 +177,24 @@ describe('the builder profile — composition', () => {
       'npm ci',
       'pnpm add x',
       'pnpm install',
-      'rm -rf build',
-      'git reset --hard HEAD~1',
+      'git push --force origin x',
     ]) {
       expect(decide(builder(), bash(command)), command).toBe('deny');
     }
     expect(decide(builder(), bash('yarn workspace @inklabs/shared build'))).toBe('allow');
+  });
+
+  it('the destructive local commands are no longer denied: the PreToolUse hook decides them', () => {
+    // A deny cannot be approved by anyone (spec automated-turn-permissions §3.4).
+    for (const rules of [builder(), reviewer()]) {
+      for (const retired of defaults.RETIRED_DENY_RULES) {
+        expect(rules.deny).not.toContain(retired);
+      }
+    }
+    expect(defaults.DEFAULT_CLAUDE_DENY_RULES).toEqual([
+      'Bash(git push --force *)',
+      'Bash(git push -f *)',
+    ]);
   });
 
   it('denies the pushes that rewrite or delete refs wholesale: --mirror, --all, --prune, --delete, -d', () => {

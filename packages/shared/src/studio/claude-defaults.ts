@@ -19,13 +19,30 @@
  */
 
 /**
- * Deny rules: destructive commands that always require confirmation, even
- * in a fully auto-approved studio. Backstops (see the module comment).
+ * Deny rules: force pushes, refused even in a fully auto-approved studio.
+ * Backstops (see the module comment).
+ *
+ * The destructive local commands (`rm -rf`, `git reset --hard`, `git
+ * clean`, `git checkout -- .`) were denied here until 2026-10-13. A deny
+ * cannot be approved by anyone, so they are now decided by the PreToolUse
+ * hook (`destructive-commands.ts`), which allows a delete inside the
+ * session's own studio and asks for anything else. See
+ * RETIRED_DENY_RULES.
  */
 export const DEFAULT_CLAUDE_DENY_RULES: readonly string[] = [
-  'Bash(rm -rf *)',
   'Bash(git push --force *)',
   'Bash(git push -f *)',
+];
+
+/**
+ * Denies that earlier profiles carried and the hook now decides (spec
+ * automated-turn-permissions §3.4). A deny wins over every hook answer, so
+ * while one of these stays in a studio's settings that studio still has no
+ * way to approve the command. `ink permissions sync --apply` removes them,
+ * exactly as spelled here and nothing else.
+ */
+export const RETIRED_DENY_RULES: readonly string[] = [
+  'Bash(rm -rf *)',
   'Bash(git reset --hard *)',
   'Bash(git clean -fd *)',
   'Bash(git clean -f *)',

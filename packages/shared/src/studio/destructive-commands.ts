@@ -1,0 +1,188 @@
+/**
+ * Destructive local commands, decided in the PreToolUse hook rather than by
+ * a deny rule (spec automated-turn-permissions §3.4).
+ *
+ * A deny rule cannot be approved by anyone: deny is evaluated first, and a
+ * hook's answer does not override it (Claude Code docs, permissions,
+ * "Extend permissions with hooks"). `Bash(rm -rf *)` therefore left no way
+ * to approve deleting a build cache, even with Conor at the terminal
+ * (2026-10-13). These commands now reach the hook, which decides:
+ *
+ *   - `allowed`: a delete the session may make without asking;
+ *   - `needs-approval`: destructive, and not that. The hook asks the person
+ *     attached, or requests Conor's approval for an unattended turn;
+ *   - `not-destructive`: nothing for this module to decide.
+ *
+ * THE ALLOWANCE IS DELIBERATELY TINY (Lumen's review, 63ae5a80). This is
+ * not a shell parser, and it does not claim to contain arbitrary Bash. A
+ * command is allowed only when it is a single simple `rm` with recursive or
+ * force flags and plain path operands, each strictly inside an allowed root
+ * and never the root itself. Every construct the check does not model
+ * (operators, redirections, substitutions, quotes, escapes, globs, `--`,
+ * wrappers, any other flag) needs approval. `git` is never allowed here:
+ * `git reset --hard` and `git clean` always ask.
+ *
+ * DETECTION IS BROAD; ALLOWANCE IS NARROW. Over-detecting only costs a
+ * question. Detection is at least as wide as the deny rules it replaces,
+ * which matched these commands at the start of each subcommand.
+ *
+ * LIMITS. The check is made against the filesystem when the hook runs. A
+ * symlink swapped in between the check and the delete, a hard link, or a
+ * mount point inside a root is not caught. Path classification is not
+ * filesystem isolation; that is the sandbox, which is separate work.
+ */
+
+import { isAbsolute, join, posix } from 'path';
+
+export type DestructiveVerdict =
+  | { kind: 'not-destructive' }
+  | { kind: 'allowed'; targets: string[] }
+  | { kind: 'needs-approval'; reason: string };
+
+/** The filesystem reads the classifier needs, injected for tests. */
+export interface DestructiveFs {
+  /** The real path of an existing path, or null when it does not exist. */
+  realpath(path: string): string | null;
+  /** Whether the path itself (not its target) is a symbolic link. */
+  isSymlink(path: string): boolean;
+}
+
+export interface DestructiveContext {
+  /** The directory the command runs in: the hook input's `cwd`. */
+  cwd: string;
+  /** The home directory, for a leading `~/` in an operand. */
+  home: string;
+  /** Directories inside which a delete is allowed, already chosen by the caller. */
+  roots: readonly string[];
+}
+
+/** Characters whose presence means the command is not a single simple command. */
+const UNMODELLED = /[;&|<>()$`'"\\*?[\]{}!#\n\r\t]/;
+
+/**
+ * The command's words for detection: split on whitespace, shell operators
+ * and quote characters, so a quoted or wrapped command (`bash -c "rm -rf
+ * x"`, `timeout 5 rm -r x`) is still seen. A rough cut, used only to decide
+ * whether to ask, never to allow.
+ */
+function detectionWords(command: string): string[] {
+  return command.split(/[\s;&|()`'"$<>]+/).filter(Boolean);
+}
+
+const RM_FLAG = /^(?:-[rRf]+|--recursive|--force)$/;
+
+function isRecursiveRmFlag(token: string): boolean {
+  if (token === '--recursive') return true;
+  return /^-[A-Za-z]*[rR][A-Za-z]*$/.test(token);
+}
+
+/** Strip a leading path from a program name: `/bin/rm` is `rm`. */
+function program(word: string): string {
+  return posix.basename(word);
+}
+
+/** `git [-C dir] [-c k=v] <sub> ...` → the subcommand and its arguments. */
+function gitArgs(words: string[]): string[] | null {
+  let i = 1;
+  while (i < words.length && words[i].startsWith('-')) {
+    i += words[i] === '-C' || words[i] === '-c' || words[i] === '--git-dir' ? 2 : 1;
+  }
+  return i < words.length ? words.slice(i) : null;
+}
+
+/**
+ * What destructive thing the words starting here do, if any. `rm` counts
+ * when a recursive flag follows it anywhere later in the command: broad on
+ * purpose, since over-detecting only costs a question.
+ */
+function destructiveKindAt(words: string[]): string | null {
+  const name = program(words[0]);
+  if (name === 'rm' && words.slice(1).some(isRecursiveRmFlag)) return 'a recursive rm';
+  if (name === 'git') {
+    const args = gitArgs(words);
+    if (!args) return null;
+    if (args[0] === 'reset' && args.includes('--hard')) return 'git reset --hard';
+    if (args[0] === 'clean' && args.slice(1).some((a) => /^-[A-Za-z]*f/.test(a) || a === '--force'))
+      return 'git clean -f';
+    if (args[0] === 'checkout' && args.includes('--') && args[args.indexOf('--') + 1] === '.')
+      return 'git checkout -- .';
+  }
+  return null;
+}
+
+/** Whether `child` lies strictly inside `root` (both real, absolute paths). */
+function strictlyInside(child: string, root: string): boolean {
+  const base = root.endsWith('/') ? root : `${root}/`;
+  return child !== root && child.startsWith(base);
+}
+
+/**
+ * The real path a target names, without following the target itself: the
+ * real path of its deepest existing ancestor, joined to the rest. Null when
+ * no ancestor resolves.
+ */
+function realTarget(absolute: string, fs: DestructiveFs): string | null {
+  const parts = absolute.split('/').filter(Boolean);
+  for (let keep = parts.length - 1; keep >= 0; keep--) {
+    const ancestor = '/' + parts.slice(0, keep).join('/');
+    const real = fs.realpath(ancestor);
+    if (real !== null) return posix.join(real, ...parts.slice(keep));
+  }
+  return null;
+}
+
+export function classifyDestructiveCommand(
+  command: string,
+  context: DestructiveContext,
+  fs: DestructiveFs
+): DestructiveVerdict {
+  const words = detectionWords(command);
+  const kinds = words
+    .map((_, i) => destructiveKindAt(words.slice(i)))
+    .filter((kind): kind is string => kind !== null);
+  if (kinds.length === 0) return { kind: 'not-destructive' };
+  const what = kinds[0];
+  const needs = (why: string): DestructiveVerdict => ({
+    kind: 'needs-approval',
+    reason: `${what}: ${why}`,
+  });
+
+  const text = command.trim();
+  if (UNMODELLED.test(text)) return needs('the command is not one simple command the check models');
+  const argv = text.split(/ +/);
+  if (argv[0] !== 'rm') return needs('only a plain rm is ever allowed without asking');
+
+  let i = 1;
+  while (i < argv.length && argv[i].startsWith('-')) {
+    if (!RM_FLAG.test(argv[i])) return needs(`the flag ${argv[i]} is not one the check allows`);
+    i++;
+  }
+  const operands = argv.slice(i);
+  if (operands.length === 0) return needs('there is no path to check');
+
+  const realRoots = context.roots
+    .map((root) => (isAbsolute(root) ? fs.realpath(root) : null))
+    .filter((root): root is string => root !== null);
+  if (realRoots.length === 0) return needs('this session has no directory it may delete inside');
+
+  const targets: string[] = [];
+  for (const operand of operands) {
+    if (operand.startsWith('-')) return needs(`${operand} reads as a flag after the paths`);
+    if (operand.endsWith('/')) return needs(`${operand} ends in a slash, which follows a link`);
+    if (operand.includes('~') && !operand.startsWith('~/')) {
+      return needs(`${operand} uses ~ in a form the check does not expand`);
+    }
+    const expanded = operand.startsWith('~/') ? join(context.home, operand.slice(2)) : operand;
+    const absolute = posix.normalize(
+      isAbsolute(expanded) ? expanded : posix.join(context.cwd, expanded)
+    );
+    if (fs.isSymlink(absolute)) return needs(`${operand} is a symbolic link`);
+    const real = realTarget(absolute, fs);
+    if (real === null) return needs(`${operand} cannot be resolved`);
+    if (!realRoots.some((root) => strictlyInside(real, root))) {
+      return needs(`${operand} is not inside a directory this session may delete in`);
+    }
+    targets.push(real);
+  }
+  return { kind: 'allowed', targets };
+}
