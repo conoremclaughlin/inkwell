@@ -274,7 +274,13 @@ export async function checkApprovalResponse(
   // bulk reply that happens to match one row is still a bulk reply (Lumen,
   // #853). A bulk denial still applies; denying only restricts (spec
   // automated-turn-permissions §3.5).
-  if (action !== 'deny' && (numberedSelections || isAllOrScoped)) {
+  //
+  // Keyed on the parsed action, not on the reply's spelling: only a plain
+  // single "grant" (approve, yes, y, or a reply to its message) may approve
+  // one. "approve for session" parses to grant-session but did not match
+  // isAllOrScoped's spelling (Lumen, #853).
+  const plainSingleGrant = action === 'grant' && !numberedSelections && !isAllOrScoped;
+  if (action !== 'deny' && !plainSingleGrant) {
     targetRequests = targetRequests.filter((r) => !r.scope_key);
   }
 
