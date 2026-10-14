@@ -126,6 +126,7 @@ import {
   executionTierPrompt,
   type TierSubject,
 } from '../../config/execution-tier.js';
+import { automatedTurnMode } from '../../config/automated-turns.js';
 import { INKLING_CLIENT } from '../inklings/inkling-client.js';
 import { isUuid } from '../inklings/inkling-service.js';
 import { isOwnersHeartbeat } from '../inklings/inkling-heartbeat.js';
@@ -2891,14 +2892,42 @@ export class SessionService implements ISessionService {
     // A service with no database (an embedded or test configuration) has no
     // studio rows at all, so there is no profile to deliver; that is logged,
     // not refused.
+    //
+    // Under INK_AUTOMATED_TURNS=yolo every Claude turn gets the automated
+    // rules at launch, the root studio and a spawn with no studio included
+    // (spec automated-turn-permissions §3.3). A studio row is still read, for
+    // its profile (a reviewer keeps its denies) and the working-directory
+    // check, and a row that cannot be read still fails the launch.
     let launchPermissions: ClaudeRunnerConfig['launchPermissions'];
-    if (resolvedBackend === 'claude-code' && session.studioId && session.studioId !== 'main') {
-      if (this.getStudiosRepo()) {
-        launchPermissions = await this.resolveLaunchPermissions(session.studioId);
-      } else {
+    if (resolvedBackend === 'claude-code') {
+      const turnMode = automatedTurnMode();
+      if (turnMode.problem) {
+        logger.warn('Automated-turn mode unreadable; running standard', {
+          problem: turnMode.problem,
+        });
+      }
+      const hasStudio = !!session.studioId && session.studioId !== 'main';
+      if (hasStudio && this.getStudiosRepo()) {
+        launchPermissions = await this.resolveLaunchPermissions(session.studioId as string);
+      } else if (hasStudio) {
         logger.warn('No studios repository: launch profile not delivered', {
           studioId: session.studioId,
         });
+      }
+      if (
+        turnMode.mode === 'yolo' &&
+        resolvedWorkingDirectory &&
+        (!hasStudio || this.getStudiosRepo())
+      ) {
+        launchPermissions = launchPermissions
+          ? { ...launchPermissions, mode: 'automated' }
+          : {
+              mode: 'automated',
+              profile: undefined,
+              owner: undefined,
+              mainRoot: null,
+              worktreePath: resolvedWorkingDirectory,
+            };
       }
     }
 

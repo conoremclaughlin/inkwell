@@ -985,6 +985,13 @@ export interface ClaudeRunnerConfig {
    * session; a profile that cannot be validated fails the launch.
    */
   launchPermissions?: {
+    /**
+     * `profile` (default): the studio's own profile. `automated`: the yolo
+     * rules for automated turns (INK_AUTOMATED_TURNS=yolo), for a studio, the
+     * root studio, or a spawn with no studio; `profile` is then the studio's
+     * profile when it has one, and undefined otherwise.
+     */
+    mode?: 'profile' | 'automated';
     profile: unknown;
     owner: unknown;
     /** The main checkout, for the record of sources; null when not a worktree. */

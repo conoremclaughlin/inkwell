@@ -40,6 +40,18 @@
  * should be given a directory of its own. Files a crash leaves behind are
  * never swept; they are 0600 and hold rules only.
  *
+ * AUTOMATED MODE (spec automated-turn-permissions, §3.2–3.3). When the
+ * server runs yolo, every automated launch gets `automatedLaunchRules`: the
+ * root studio and a spawn with no studio too, which get no file otherwise.
+ * The worktree's authored policy does not suppress it, because yolo is the
+ * operator's standing choice for automated turns, and the authored denies
+ * still apply from disk. A reviewer keeps its denies on top.
+ *
+ * VALIDATED BEFORE IT IS WRITTEN. In `-p` mode Claude Code silently ignores
+ * a settings file that fails validation (`claude --help`, `--print`), which
+ * would drop every deny in it without a word. Each rule is checked against
+ * the grammar Claude Code accepts, and one that fails refuses the launch.
+ *
  * FAILS CLOSED. An unknown profile, an owner that cannot name a scratch
  * path, a root that is not absolute, or a worktree settings file that cannot
  * be read throws, and the runner fails the launch. Never a builder default.
@@ -50,15 +62,26 @@ import type { Stats } from 'fs';
 import { access, lstat, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { isAbsolute, join, normalize, resolve } from 'path';
-import { studioPermissionRules, type StudioPermissionProfile } from '@inklabs/shared';
+import {
+  automatedLaunchRules,
+  studioPermissionRules,
+  type StudioPermissionProfile,
+} from '@inklabs/shared';
 
 export class LaunchSettingsError extends Error {
   override name = 'LaunchSettingsError';
 }
 
+/** `profile`: the studio's own profile; `automated`: yolo for automated turns. */
+export type LaunchPermissionMode = 'profile' | 'automated';
+
 export interface LaunchSettingsRequest {
   /** Unique per launch; default a fresh UUID. */
   launchId?: string;
+  /** Default `profile`. */
+  mode?: LaunchPermissionMode;
+  /** Automated mode: the MCP servers this launch connects, each named in an allow. */
+  mcpServers?: readonly string[];
   /**
    * The studio row's worktree. The launch is refused unless `worktreePath`
    * (where it actually runs) is this directory: a working directory that
@@ -70,9 +93,9 @@ export interface LaunchSettingsRequest {
   worktreePath: string;
   /** The main checkout when the studio is a linked worktree of it, for the source record. */
   mainRoot: string | null;
-  /** From the studio row; validated here. */
+  /** From the studio row; validated here. Automated mode: optional (none for the root). */
   profile: unknown;
-  /** Whose scratch paths the profile names: the row's SB; validated here. */
+  /** Whose scratch paths the profile names: the row's SB; validated here. Unused in automated mode. */
   owner: unknown;
   /** Host directory the file is written into. */
   outputDir: string;
@@ -95,10 +118,15 @@ export interface LaunchSettings {
   hostPath: string;
   /** What `--settings` is given. */
   processPath: string;
-  profile: StudioPermissionProfile;
-  /** `profile`: the rules are in the file; `authored-on-disk`: the worktree's own policy stands. */
-  delivered: 'profile' | 'authored-on-disk';
-  settings: { permissions?: { allow: string[]; deny: string[] } };
+  mode: LaunchPermissionMode;
+  /** Null only in automated mode, for a launch with no studio profile (the root, or no studio). */
+  profile: StudioPermissionProfile | null;
+  /**
+   * `profile`: the studio profile is in the file; `authored-on-disk`: the
+   * worktree's own policy stands; `automated`: the yolo rules are in the file.
+   */
+  delivered: 'profile' | 'authored-on-disk' | 'automated';
+  settings: { permissions?: { allow: string[]; deny: string[]; ask?: string[] } };
   sources: LaunchSource[];
   precedence: string;
   cleanup: () => Promise<void>;
@@ -152,15 +180,74 @@ async function exists(path: string): Promise<boolean> {
   );
 }
 
+/**
+ * Whether Claude Code's settings validation accepts a permission rule: a
+ * tool name (`WebSearch`, `mcp__server__tool`, `mcp__server__*`) alone, or
+ * `Tool(content)` with non-empty content, no line break, and balanced
+ * parentheses. A rule it rejects would make the whole file be ignored in
+ * `-p` mode, its denies with it.
+ */
+export function isValidPermissionRule(rule: unknown): boolean {
+  if (typeof rule !== 'string' || rule.length === 0 || /[\r\n]/.test(rule)) return false;
+  if (/^mcp__[A-Za-z0-9_-]+(__([A-Za-z0-9_.-]+|\*))?$/.test(rule)) return true;
+  if (/^[A-Z][A-Za-z]*$/.test(rule)) return true;
+  const scoped = rule.match(/^[A-Z][A-Za-z]*\((.+)\)$/s);
+  if (!scoped) return false;
+  let depth = 0;
+  for (const ch of scoped[1]) {
+    if (ch === '(') depth++;
+    if (ch === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+function assertValidRules(rules: readonly string[]): void {
+  const bad = rules.filter((rule) => !isValidPermissionRule(rule));
+  if (bad.length > 0) {
+    throw new LaunchSettingsError(
+      `the launch file would carry a rule Claude Code rejects, and -p would ignore the whole file: ${JSON.stringify(bad)}`
+    );
+  }
+}
+
+/**
+ * The server names in an MCP config file (`mcpServers`'s keys), for the
+ * automated allow list. A file that cannot be read or parsed refuses the
+ * launch: an automated turn without its MCP allows would be denied every
+ * MCP call, silently.
+ */
+export async function readMcpServerNames(mcpConfigPath: string): Promise<string[]> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(mcpConfigPath, 'utf-8'));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code ?? 'unparseable';
+    throw new LaunchSettingsError(`${mcpConfigPath} cannot be read for its MCP servers (${code})`);
+  }
+  if (!isPlainObject(parsed)) {
+    throw new LaunchSettingsError(`${mcpConfigPath} is not a JSON object`);
+  }
+  if (parsed.mcpServers === undefined) return [];
+  if (!isPlainObject(parsed.mcpServers)) {
+    throw new LaunchSettingsError(`${mcpConfigPath}: mcpServers is not an object`);
+  }
+  return Object.keys(parsed.mcpServers);
+}
+
 export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise<LaunchSettings> {
+  const mode: LaunchPermissionMode = req.mode ?? 'profile';
+  if (mode !== 'profile' && mode !== 'automated') {
+    throw new LaunchSettingsError(`unknown launch permission mode: ${JSON.stringify(req.mode)}`);
+  }
+  const automated = mode === 'automated';
   if (
-    typeof req.profile !== 'string' ||
-    !PROFILES.includes(req.profile as StudioPermissionProfile)
+    !(automated && req.profile === undefined) &&
+    (typeof req.profile !== 'string' || !PROFILES.includes(req.profile as StudioPermissionProfile))
   ) {
     throw new LaunchSettingsError(`unknown permission profile: ${JSON.stringify(req.profile)}`);
   }
-  const profile = req.profile as StudioPermissionProfile;
-  if (typeof req.owner !== 'string') {
+  const profile = (req.profile as StudioPermissionProfile | undefined) ?? null;
+  if (!automated && typeof req.owner !== 'string') {
     throw new LaunchSettingsError(`no owner to name scratch paths: ${JSON.stringify(req.owner)}`);
   }
   if (
@@ -185,7 +272,13 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
 
   let generated: ReturnType<typeof studioPermissionRules>;
   try {
-    generated = studioPermissionRules(profile, req.owner);
+    generated = automated
+      ? automatedLaunchRules({
+          ...(profile ? { profile } : {}),
+          ...(typeof req.owner === 'string' ? { owner: req.owner } : {}),
+          mcpServers: req.mcpServers ?? [],
+        })
+      : studioPermissionRules(profile as StudioPermissionProfile, req.owner as string);
   } catch (error) {
     throw new LaunchSettingsError(error instanceof Error ? error.message : String(error));
   }
@@ -205,7 +298,9 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
     throw new LaunchSettingsError(`${localPath} is not a regular file (a link is refused)`);
   }
   let authored = false;
-  if (fileStat) {
+  // Automated mode never defers to the worktree's own policy, so it is not
+  // read: its denies apply from disk regardless.
+  if (fileStat && !automated) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(await readFile(localPath, 'utf-8'));
@@ -229,14 +324,13 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
     }
   }
 
-  const settings: LaunchSettings['settings'] = authored
-    ? {}
-    : {
-        permissions: {
-          allow: generated.allow.map((rule) => renderAbsoluteRule(rule, root)),
-          deny: generated.deny.map((rule) => renderAbsoluteRule(rule, root)),
-        },
-      };
+  let settings: LaunchSettings['settings'] = {};
+  if (!authored) {
+    const allow = generated.allow.map((rule) => renderAbsoluteRule(rule, root));
+    const deny = generated.deny.map((rule) => renderAbsoluteRule(rule, root));
+    assertValidRules([...allow, ...deny]);
+    settings = { permissions: { allow, deny } };
+  }
 
   const launchId = req.launchId ?? randomUUID();
   if (!/^[A-Za-z0-9_-]+$/.test(launchId)) {
@@ -273,8 +367,9 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
     launchId,
     hostPath,
     processPath,
+    mode,
     profile,
-    delivered: authored ? 'authored-on-disk' : 'profile',
+    delivered: automated ? 'automated' : authored ? 'authored-on-disk' : 'profile',
     settings,
     sources,
     precedence: LAUNCH_PRECEDENCE_NOTE,

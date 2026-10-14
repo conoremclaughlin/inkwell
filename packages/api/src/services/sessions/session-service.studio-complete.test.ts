@@ -372,3 +372,92 @@ describe('a Claude launch in a studio is given its profile from the row (design 
     expect(claude.run).not.toHaveBeenCalled();
   });
 });
+
+describe('INK_AUTOMATED_TURNS=yolo: every Claude launch gets the automated rules (spec automated-turn-permissions §3.3)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetActiveRuns();
+    resetPendingFinalizations();
+    order.events.length = 0;
+    completion.calls.length = 0;
+    worktree = realpathSync(mkdtempSync(join(tmpdir(), 'studio-1-')));
+    vi.stubEnv('INK_AUTOMATED_TURNS', 'yolo');
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetActiveRuns();
+    resetPendingFinalizations();
+    rmSync(worktree, { recursive: true, force: true });
+  });
+
+  const launchConfig = (runner: { run: ReturnType<typeof vi.fn> }) =>
+    (runner.run.mock.calls[0]?.[1] as { config: Record<string, unknown> } | undefined)?.config;
+
+  it("a studio keeps its row's profile, owner and checks, in automated mode", async () => {
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'detached:origin/pr/7',
+      repo_root: '/repo',
+    });
+    await send();
+    expect(launchConfig(claude as never)?.launchPermissions).toEqual({
+      mode: 'automated',
+      profile: 'reviewer',
+      owner: 'lumen',
+      mainRoot: '/repo',
+      worktreePath: worktree,
+    });
+  });
+
+  it('the root (home) studio gets a launch file too, with no studio profile', async () => {
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'main',
+      repo_root: worktree,
+    });
+    await send();
+    expect(launchConfig(claude as never)?.launchPermissions).toEqual({
+      mode: 'automated',
+      profile: undefined,
+      owner: undefined,
+      mainRoot: null,
+      worktreePath: worktree,
+    });
+  });
+
+  it('a spawn with no studio gets one against its working directory', async () => {
+    const { send, claude } = makeService(
+      makeSession({ backend: 'claude-code', studioId: null }),
+      'lumen'
+    );
+    await send();
+    expect(launchConfig(claude as never)?.launchPermissions).toMatchObject({
+      mode: 'automated',
+      worktreePath: '/test',
+    });
+  });
+
+  it('a row that is gone still fails the launch: yolo is not a way past an unreadable row', async () => {
+    const { send, claude } = makeService(
+      makeSession({ backend: 'claude-code', studioId: 'studio-gone' }),
+      'lumen'
+    );
+    const result = await send();
+    expect(result.success).toBe(false);
+    expect(claude.run).not.toHaveBeenCalled();
+  });
+
+  it('a Codex launch is still not given one', async () => {
+    const { send, codex } = makeService(makeSession(), 'lumen', { branch: 'lumen/feat/x' });
+    await send();
+    expect(launchConfig(codex as never)).not.toHaveProperty('launchPermissions');
+  });
+
+  it('a value that does not parse runs standard: the root gets nothing', async () => {
+    vi.stubEnv('INK_AUTOMATED_TURNS', 'on');
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'main',
+      repo_root: worktree,
+    });
+    await send();
+    expect(launchConfig(claude as never)).not.toHaveProperty('launchPermissions');
+  });
+});

@@ -103,8 +103,8 @@ describe('planProfileSync', () => {
   });
 
   it('matches a deny only against an allow for the same tool', () => {
-    const plan = planProfileSync({ allow: ['Edit(git reset --hard x)'], deny: [] }, builder);
-    expect(plan.addDeny).toContain('Bash(git reset --hard *)');
+    const plan = planProfileSync({ allow: ['Edit(git push --force x)'], deny: [] }, builder);
+    expect(plan.addDeny).toContain('Bash(git push --force *)');
     expect(plan.kept).toEqual([]);
   });
 
@@ -352,5 +352,34 @@ describe('named Bash allows, in every spelling', () => {
   it('only a sole trailing wildcard names the bare command', () => {
     expect(denyRefusesNamedAllow('Bash(git -C * push)', 'Bash(git -C * push *)')).toBe(false);
     expect(denyRefusesNamedAllow('Bash(git push)', 'Bash(git push *)')).toBe(true);
+  });
+});
+
+describe('retired denies (spec automated-turn-permissions §3.4)', () => {
+  const builderRules = studioPermissionRules('builder', 'wren');
+
+  it('removes exactly the retired denies, keeping every other deny in place', () => {
+    const plan = planProfileSync(
+      {
+        allow: ['Bash(*)'],
+        deny: ['Bash(rm -rf *)', 'Bash(sudo *)', 'Bash(git reset --hard *)', 'Bash(rm -rf /tmp/x)'],
+      },
+      builderRules
+    );
+    expect(plan.removeDeny).toEqual(['Bash(rm -rf *)', 'Bash(git reset --hard *)']);
+    const deny = (plan.permissions as { deny: string[] }).deny;
+    expect(deny).not.toContain('Bash(rm -rf *)');
+    expect(deny.slice(0, 2)).toEqual(['Bash(sudo *)', 'Bash(rm -rf /tmp/x)']);
+  });
+
+  it('a file carrying only retired denies and the rest of the profile is not left as it is', () => {
+    const old = {
+      allow: [...builderRules.allow],
+      deny: ['Bash(rm -rf *)', ...builderRules.deny],
+    };
+    const plan = planProfileSync(old, builderRules);
+    expect(plan.state).toBe('authored');
+    expect(plan.removeDeny).toEqual(['Bash(rm -rf *)']);
+    expect(plan.permissions).toEqual(builderRules);
   });
 });

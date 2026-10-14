@@ -12,9 +12,11 @@
  * none of the Playwright or simulator tools.
  *
  * What it does. It adds each rule the profile has and the file lacks,
- * appended after the file's own rules in profile order. It never removes
- * or reorders a rule and keeps every other setting. Two exceptions keep an
- * author's explicit choice:
+ * appended after the file's own rules in profile order. It removes only the
+ * retired denies (RETIRED_DENY_RULES, spelled exactly), which earlier
+ * profiles carried and which would otherwise keep a studio from ever
+ * approving a delete; it never reorders a rule and keeps every other
+ * setting. Two exceptions keep an author's explicit choice:
  *   - a profile deny is not added when it would refuse something the file
  *     allows by name (`Bash(yarn install*)` against an authored
  *     `Bash(yarn install)`, `mcp__github__create_pull_request` against the
@@ -39,6 +41,7 @@
 import { existsSync, lstatSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import {
+  RETIRED_DENY_RULES,
   studioPermissionRules,
   type ClaudePermissionRules,
   type StudioPermissionProfile,
@@ -56,6 +59,8 @@ export interface ProfileSyncPlan {
   state: 'generated' | 'authored' | 'no-rules';
   addAllow: string[];
   addDeny: string[];
+  /** Retired denies the file carries, removed by the sync. */
+  removeDeny: string[];
   kept: KeptRule[];
   /** The permissions object with the additions, keys in their original order. */
   permissions: Record<string, unknown>;
@@ -156,7 +161,7 @@ export function planProfileSync(
   const allow = ruleList(permissions, 'allow');
   const deny = ruleList(permissions, 'deny');
   const ask = ruleList(permissions, 'ask');
-  const none = { addAllow: [], addDeny: [], kept: [], permissions };
+  const none = { addAllow: [], addDeny: [], removeDeny: [], kept: [], permissions };
   if (JSON.stringify(permissions) === JSON.stringify(rules)) {
     return { state: 'generated', ...none };
   }
@@ -189,10 +194,14 @@ export function planProfileSync(
     addDeny.push(rule);
   }
 
+  const removeDeny = deny.filter((rule) => RETIRED_DENY_RULES.includes(rule));
+
   const next: Record<string, unknown> = { ...permissions };
   if (addAllow.length > 0) next.allow = [...allow, ...addAllow];
-  if (addDeny.length > 0) next.deny = [...deny, ...addDeny];
-  return { state: 'authored', addAllow, addDeny, kept, permissions: next };
+  if (addDeny.length > 0 || removeDeny.length > 0) {
+    next.deny = [...deny.filter((rule) => !removeDeny.includes(rule)), ...addDeny];
+  }
+  return { state: 'authored', addAllow, addDeny, removeDeny, kept, permissions: next };
 }
 
 export interface StudioPermissionSync {
@@ -293,13 +302,18 @@ export function syncStudioPermissions(
   }
   const authored = `authored policy (${describeRules(settings.permissions)})`;
   const count = plan.addAllow.length + plan.addDeny.length;
-  if (count === 0) {
+  const removed = plan.removeDeny.length;
+  const changes = [
+    ...(count > 0 ? [`${count} rules to add`] : []),
+    ...(removed > 0 ? [`${removed} retired denies to remove`] : []),
+  ].join(', ');
+  if (count === 0 && removed === 0) {
     return result('nothing-to-add', `${authored}: has every rule it can take`, plan);
   }
   if (!options.apply) {
-    return result('would-add', `${authored}: ${count} rules to add`, plan);
+    return result('would-add', `${authored}: ${changes}`, plan);
   }
   const next = { ...settings, permissions: plan.permissions };
   writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n');
-  return result('added', `${authored}: added ${count} rules`, plan);
+  return result('added', `${authored}: applied ${changes}`, plan);
 }

@@ -73,18 +73,35 @@ function createSupabaseMock(state: SupabaseMockState) {
         }),
         update: vi.fn().mockImplementation((updates: Record<string, unknown>) => {
           state.updateCalledWith = updates;
-          return {
+          let targeted: unknown;
+          // The write filters, then reads back the rows it changed. A result
+          // with no data means the write won (one row); `data: []` means it
+          // changed nothing (a lost race, or expired first).
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const chain: any = {
             eq: vi.fn().mockImplementation((col: string, val: unknown) => {
               state.updateEqChain.push({ column: col, value: val });
-              if (col === 'id') state.updates.push({ id: val, updates });
-              return {
-                eq: vi.fn().mockImplementation((col2: string, val2: unknown) => {
-                  state.updateEqChain.push({ column: col2, value: val2 });
-                  return Promise.resolve(state.updateResult);
-                }),
-              };
+              if (col === 'id') {
+                targeted = val;
+                state.updates.push({ id: val, updates });
+              }
+              return chain;
             }),
+            gt: vi.fn().mockImplementation((col: string) => {
+              state.updateEqChain.push({ column: `${col} >`, value: 'now' });
+              return chain;
+            }),
+            select: vi
+              .fn()
+              .mockImplementation(() =>
+                Promise.resolve(
+                  state.updateResult.error
+                    ? state.updateResult
+                    : { data: state.updateResult.data ?? [{ id: targeted }], error: null }
+                )
+              ),
           };
+          return chain;
         }),
       };
     }
@@ -463,13 +480,23 @@ describe('checkApprovalResponse: resolution', () => {
     expect(ts).toBeLessThanOrEqual(Date.now());
   });
 
-  it('applies optimistic lock: .eq(id, …).eq(status, pending)', async () => {
+  it('applies the optimistic lock: still pending, this user, not expired', async () => {
     await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve');
-    // Two .eq() calls in the update chain: id then status
     expect(currentState.updateEqChain).toEqual([
       { column: 'id', value: 'req-42' },
       { column: 'status', value: 'pending' },
+      { column: 'user_id', value: USER_ID },
+      { column: 'expires_at >', value: 'now' },
     ]);
+  });
+
+  it('a write that changed no row is not reported as resolved: the race was lost (Lumen, #853)', async () => {
+    currentState = makeState({
+      pendingSelectResult: { data: [pending], error: null },
+      updateResult: { data: [], error: null },
+    });
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve');
+    expect(result.intercepted).toBe(false);
   });
 
   it('returns intercepted=false when the update fails (race/lock lost)', async () => {
@@ -815,5 +842,30 @@ describe('approval notifications — batch clone mapping', () => {
     const first = msg.split('\n').find((l) => l.startsWith('1.'));
     // No per-row attribution to read past when there is nothing to distinguish.
     expect(first).toBe('1. `save_link`');
+  });
+});
+
+describe('one-use approval notifications (spec automated-turn-permissions §3.5)', () => {
+  const oneUse = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'Bash',
+    args: 'rm -rf build/cache',
+    reason: 'Destructive command outside the session directories.',
+    requestingSlug: 'wren',
+    studioId: 'studio-1',
+    sessionId: 'session-1',
+    expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+    oneUse: { cwd: '/w/repo--alpha/packages/mobile' },
+  };
+
+  it('shows the full command, the directory and the signed scope, and says bulk replies do not cover it', () => {
+    const msg = formatSingleNotification(oneUse);
+    expect(msg).toContain('rm -rf build/cache');
+    expect(msg).toContain('/w/repo--alpha/packages/mobile');
+    expect(msg).toContain('session-1');
+    expect(msg).toContain('studio-1');
+    expect(msg).toContain('"approve all"');
+    expect(msg).not.toContain('approve session*');
   });
 });

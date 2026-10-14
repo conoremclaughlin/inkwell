@@ -167,7 +167,7 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), { tool: 'mcp__supabase__apply_migration' })).toBe('deny');
   });
 
-  it('denies installs, bare yarn included, and keeps the destructive defaults', () => {
+  it('denies installs, bare yarn included, and keeps the force-push defaults', () => {
     for (const command of [
       'yarn',
       'yarn install',
@@ -177,12 +177,24 @@ describe('the builder profile — composition', () => {
       'npm ci',
       'pnpm add x',
       'pnpm install',
-      'rm -rf build',
-      'git reset --hard HEAD~1',
+      'git push --force origin x',
     ]) {
       expect(decide(builder(), bash(command)), command).toBe('deny');
     }
     expect(decide(builder(), bash('yarn workspace @inklabs/shared build'))).toBe('allow');
+  });
+
+  it('the destructive local commands are no longer denied: the PreToolUse hook decides them', () => {
+    // A deny cannot be approved by anyone (spec automated-turn-permissions §3.4).
+    for (const rules of [builder(), reviewer()]) {
+      for (const retired of defaults.RETIRED_DENY_RULES) {
+        expect(rules.deny).not.toContain(retired);
+      }
+    }
+    expect(defaults.DEFAULT_CLAUDE_DENY_RULES).toEqual([
+      'Bash(git push --force *)',
+      'Bash(git push -f *)',
+    ]);
   });
 
   it('denies the pushes that rewrite or delete refs wholesale: --mirror, --all, --prune, --delete, -d', () => {
@@ -420,5 +432,101 @@ describe('describePermissions', () => {
     expect(defaults.describePermissions({ deny: ['Bash(x)'], ask: ['Bash(y)', 'Bash(z)'] })).toBe(
       '1 deny, 2 ask'
     );
+  });
+});
+
+describe('the automated rules — yolo with ironclad denies (spec automated-turn-permissions §3.2)', () => {
+  const yolo = (profile?: 'builder' | 'reviewer') =>
+    defaults.automatedLaunchRules({
+      ...(profile ? { profile, owner: 'wren' } : {}),
+      mcpServers: ['inkwell', 'playwright', 'github', 'supabase'],
+    });
+
+  it('a reviewer edits only its scratch under yolo too: no Edit(//**) (Lumen, #853)', () => {
+    expect(yolo('reviewer').allow).not.toContain('Edit(//**)');
+    expect(yolo('reviewer').allow).toContain('Edit(~/.ink/files/wren-scratch/**)');
+    expect(yolo('builder').allow).toContain('Edit(//**)');
+    expect(() => defaults.automatedLaunchRules({ profile: 'reviewer', mcpServers: [] })).toThrow(
+      /scratch/
+    );
+  });
+
+  it('everyday work runs without a prompt: shell, browser, Inkwell, GitHub reads, a feature push', () => {
+    for (const call of [
+      bash('yarn test'),
+      bash('git commit -F msg'),
+      bash('git push -u origin wren/feat/x'),
+      bash('yarn install'),
+      { tool: 'mcp__playwright__browser_navigate' },
+      { tool: 'mcp__inkwell__send_to_inbox' },
+      { tool: 'mcp__github__pull_request_read' },
+      { tool: 'mcp__github__create_pull_request' },
+    ]) {
+      expect(decide(yolo(), call)).toBe('allow');
+    }
+  });
+
+  it('the ironclad rules hold: no push to main, no force-push, no --no-verify, no merge', () => {
+    for (const command of [
+      'git push origin main',
+      'git push origin HEAD:main',
+      'git push --force origin wren/feat/x',
+      'git push -f origin wren/feat/x',
+      'git push origin +wren/feat/x',
+      'git push --no-verify origin wren/feat/x',
+      'git -C /w push origin main',
+      'git commit --no-verify -F msg',
+      'git commit -n -F msg',
+      'git -C /w commit -F msg -n',
+      'gh pr merge 851 --merge',
+      'gh -R owner/repo pr merge 851',
+    ]) {
+      expect(decide(yolo(), bash(command)), command).toBe('deny');
+    }
+    for (const tool of [
+      'mcp__github__merge_pull_request',
+      'mcp__github__push_files',
+      'mcp__github__create_or_update_file',
+      'mcp__github__delete_file',
+      'mcp__supabase__apply_migration',
+      'mcp__supabase__execute_sql',
+    ]) {
+      expect(decide(yolo(), { tool }), tool).toBe('deny');
+    }
+  });
+
+  it('the ironclad list is the builder push policy plus the commit, merge and write denies', () => {
+    for (const rule of defaults.STUDIO_PUSH_RULES.deny) {
+      expect(defaults.IRONCLAD_DENY_RULES).toContain(rule);
+    }
+    expect(new Set(defaults.IRONCLAD_DENY_RULES).size).toBe(defaults.IRONCLAD_DENY_RULES.length);
+  });
+
+  it('a reviewer keeps every reviewer deny: the code under review cannot commit or push through yolo', () => {
+    for (const rule of defaults.STUDIO_REVIEWER_RULES.deny) {
+      expect(yolo('reviewer').deny).toContain(rule);
+    }
+    expect(decide(yolo('reviewer'), bash('git commit -F msg'))).toBe('deny');
+    expect(decide(yolo('reviewer'), bash('git push -u origin x'))).toBe('deny');
+    expect(decide(yolo('builder'), bash('git commit -F msg'))).toBe('allow');
+  });
+
+  it('each MCP server is named: there is no cross-server wildcard, and an unnamed server asks', () => {
+    expect(yolo().allow).not.toContain('mcp__*');
+    expect(
+      decide(defaults.automatedLaunchRules({ mcpServers: ['inkwell'] }), {
+        tool: 'mcp__playwright__x',
+      })
+    ).toBe('ask');
+    expect(() => defaults.automatedLaunchRules({ mcpServers: ['a*'] })).toThrow();
+    expect(() => defaults.automatedLaunchRules({ mcpServers: ['a__b c'] })).toThrow();
+  });
+
+  it('no rule is both allowed and denied, and no rule is listed twice', () => {
+    for (const profile of [undefined, 'builder', 'reviewer'] as const) {
+      const rules = yolo(profile);
+      expect(rules.allow.filter((r) => rules.deny.includes(r))).toEqual([]);
+      expect(new Set(rules.deny).size).toBe(rules.deny.length);
+    }
   });
 });

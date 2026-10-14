@@ -50,6 +50,10 @@ interface PendingRequest {
   requesting_agent_id: string;
   studio_id: string | null;
   session_id: string | null;
+  /** Set only on a one-use request (spec automated-turn-permissions §3.5). */
+  scope_key?: string | null;
+  /** A one-use request's directory, as approved. */
+  cwd?: string | null;
 }
 
 export interface ApprovalInterceptResult {
@@ -87,6 +91,8 @@ export interface BufferedRequest {
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
+  /** A one-use request: the directory the approved command runs in. */
+  oneUse?: { cwd: string };
 }
 
 const notificationBuffer = new Map<
@@ -146,7 +152,9 @@ export async function checkApprovalResponse(
   // Fetch all pending requests for this user (up to 20)
   const { data: pendingRequests, error } = await supabase
     .from('approval_requests')
-    .select('id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id')
+    .select(
+      'id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id, scope_key, cwd'
+    )
     .eq('user_id', userId)
     .eq('status', 'pending')
     .gt('expires_at', new Date().toISOString())
@@ -259,6 +267,23 @@ export async function checkApprovalResponse(
     targetRequests = [pendingRequests[pendingRequests.length - 1]];
   }
 
+  // A one-use request is a destructive command outside a session's own
+  // directories, so it is approved only by a plain, single "approve" (or a
+  // reply to its own message): never by "approve all", a scope or a numbered
+  // batch, however many requests are pending. Cardinality is not intent: a
+  // bulk reply that happens to match one row is still a bulk reply (Lumen,
+  // #853). A bulk denial still applies; denying only restricts (spec
+  // automated-turn-permissions §3.5).
+  //
+  // Keyed on the parsed action, not on the reply's spelling: only a plain
+  // single "grant" (approve, yes, y, or a reply to its message) may approve
+  // one. "approve for session" parses to grant-session but did not match
+  // isAllOrScoped's spelling (Lumen, #853).
+  const plainSingleGrant = action === 'grant' && !numberedSelections && !isAllOrScoped;
+  if (action !== 'deny' && !plainSingleGrant) {
+    targetRequests = targetRequests.filter((r) => !r.scope_key);
+  }
+
   if (targetRequests.length === 0) {
     return { intercepted: false };
   }
@@ -267,20 +292,33 @@ export async function checkApprovalResponse(
   const status = action === 'deny' ? 'denied' : 'granted';
   const resolvedRequests: Array<{ id: string; tool: string; action: string; sbSlug?: string }> = [];
 
+  const oneUseGranted: PendingRequest[] = [];
   for (const req of targetRequests) {
     const grantedTools = action !== 'deny' ? [req.tool + (req.args ? `(${req.args})` : '')] : null;
+    // A one-use grant is spent once whatever the reply said: never a
+    // session, agent or studio grant.
+    const resolvedAction = req.scope_key && action !== 'deny' ? 'grant' : action;
 
-    const { error: updateError } = await supabase
+    // Optimistic lock: still pending, still this user's, not yet expired. Only
+    // a write that changed the row counts: the loser of a race, or a request
+    // that expired between the read and the write, is neither reported nor
+    // woken (Lumen, #853). PostgREST reports success for zero rows, so the
+    // changed rows are read back.
+    const nowIso = new Date().toISOString();
+    const { data: changed, error: updateError } = await supabase
       .from('approval_requests')
       .update({
         status,
-        action,
+        action: resolvedAction,
         granted_tools: grantedTools,
         granted_by: grantedBy,
-        resolved_at: new Date().toISOString(),
+        resolved_at: nowIso,
       })
       .eq('id', req.id)
-      .eq('status', 'pending'); // Optimistic lock
+      .eq('status', 'pending')
+      .eq('user_id', userId)
+      .gt('expires_at', nowIso)
+      .select('id');
 
     if (updateError) {
       logger.error('Failed to resolve approval request', {
@@ -289,12 +327,29 @@ export async function checkApprovalResponse(
       });
       continue;
     }
+    if (!Array.isArray(changed) || changed.length !== 1) {
+      logger.info('Approval request was resolved elsewhere or expired first; not resolved here', {
+        requestId: req.id,
+      });
+      continue;
+    }
 
     resolvedRequests.push({
       id: req.id,
       tool: req.tool,
-      action,
+      action: resolvedAction,
       sbSlug: req.requesting_agent_id,
+    });
+    if (req.scope_key && status === 'granted' && req.session_id) oneUseGranted.push(req);
+  }
+
+  for (const req of oneUseGranted) {
+    await resumeApprovedSession(userId, req).catch((err) => {
+      logger.error('Approved, but the session could not be woken', {
+        requestId: req.id,
+        sessionId: req.session_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -315,6 +370,37 @@ export async function checkApprovalResponse(
     requestId: resolvedRequests[0].id,
     resolvedRequests,
   };
+}
+
+/**
+ * Wake the session a one-use grant was asked from, so its next turn runs the
+ * command again and spends the grant. Sent to that session by id, as a
+ * session_resume; it queues behind a running turn like any message.
+ */
+async function resumeApprovedSession(userId: string, req: PendingRequest): Promise<void> {
+  const [{ handleSendToInbox }, { getDataComposer }] = await Promise.all([
+    import('../mcp/tools/inbox-handlers.js'),
+    import('../data/composer.js'),
+  ]);
+  await handleSendToInbox(
+    {
+      userId,
+      recipientSlug: req.requesting_agent_id,
+      recipientSessionId: req.session_id,
+      senderSlug: 'system',
+      messageType: 'session_resume',
+      priority: 'high',
+      content:
+        `Conor approved: \`${req.args ?? req.tool}\` in \`${req.cwd ?? 'the same directory'}\`. ` +
+        'Run it again, exactly as it was and from that directory: the approval is good ' +
+        `once, for that command there, until ${req.expires_at}.`,
+      trigger: true,
+      triggerType: 'message',
+      triggerSummary: 'Approval granted: run the command again',
+      metadata: { source: 'approval_interceptor', approvalRequestId: req.id },
+    },
+    await getDataComposer()
+  );
 }
 
 /**
@@ -369,8 +455,11 @@ export async function notifyPlatformOfApprovalRequest(request: {
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
+  oneUse?: { cwd: string };
 }): Promise<void> {
-  const bufferKey = request.userId;
+  // A one-use request is never folded into a numbered batch: it is approved
+  // only by a plain reply to its own message (spec §3.5).
+  const bufferKey = request.oneUse ? `${request.userId}:one-use:${request.id}` : request.userId;
   const existing = notificationBuffer.get(bufferKey);
 
   const buffered: BufferedRequest = {
@@ -384,6 +473,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
     studioId: request.studioId,
     sessionId: request.sessionId,
     expiresAt: request.expiresAt,
+    ...(request.oneUse ? { oneUse: request.oneUse } : {}),
   };
 
   if (existing) {
@@ -442,6 +532,19 @@ export function formatSingleNotification(req: BufferedRequest): string {
     1,
     Math.round((new Date(req.expiresAt).getTime() - Date.now()) / 60000)
   );
+
+  if (req.oneUse) {
+    return (
+      `\u{1F510} *Destructive command* from ${formatRequester(req)}:\n\n` +
+      `\`${req.args ?? req.tool}\`\n\n` +
+      `Directory: \`${req.oneUse.cwd}\`\n` +
+      (req.sessionId ? `Session: ${req.sessionId}\n` : '') +
+      (req.studioId ? `Studio: ${req.studioId}\n` : '') +
+      (req.reason ? `Reason: ${req.reason}\n` : '') +
+      `Expires in: ${expiresIn} min\n\n` +
+      `Reply *approve* or *deny* to this message. An approval is good once, for exactly this command in this directory; "approve all" and scoped approvals do not cover it.`
+    );
+  }
 
   return (
     `\u{1F510} *Permission request* from ${formatRequester(req)}:\n\n` +
