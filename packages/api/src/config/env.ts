@@ -256,6 +256,12 @@ const envSchema = z.object({
   // The in-process ink runtime, for these agents only (comma-separated
   // agent identity UUIDs). Unset by default: every ink turn spawns ink chat.
   INK_RUNTIME_IN_PROCESS_SB_IDS: optionalString,
+  // Read-only automated Claude permission warnings. Activation is separate
+  // from deploying the implementation; never changes a permission profile.
+  INK_SPAWN_PERMISSION_WARNINGS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 // Parse and validate environment variables

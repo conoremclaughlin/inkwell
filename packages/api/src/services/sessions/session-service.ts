@@ -130,11 +130,14 @@ import { automatedTurnMode } from '../../config/automated-turns.js';
 import { INKLING_CLIENT } from '../inklings/inkling-client.js';
 import { isUuid } from '../inklings/inkling-service.js';
 import { isOwnersHeartbeat } from '../inklings/inkling-heartbeat.js';
+import type { SpawnPermissionNotifier } from './spawn-permission-notifier.js';
 
 /**
  * Configuration for SessionService.
  */
 export interface SessionServiceConfig {
+  /** Operator-enabled advisory; no settings mutation or authorization. */
+  onPermissionWarning?: SpawnPermissionNotifier;
   /** Default working directory for Claude Code */
   defaultWorkingDirectory: string;
   /** Where inklings' own folders are made; ~/.ink/inklings unless given (tests). */
@@ -2948,6 +2951,12 @@ export class SessionService implements ISessionService {
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
+      ...(this.config.onPermissionWarning
+        ? {
+            onPermissionWarning: (warning, signal) =>
+              this.config.onPermissionWarning!(session, warning, signal),
+          }
+        : {}),
       // An inkling turn's stop takes the tools it started with it. It has a
       // ceiling only when INKLING_TURN_TIMEOUT_MS sets one.
       ...(inklingTurn ? inklingRunBounds(inklingTurnTimeoutMs()) : {}),
@@ -6251,6 +6260,12 @@ This session will continue with a fresh context after compaction. Your identity,
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
+        ...(this.config.onPermissionWarning
+          ? {
+              onPermissionWarning: (warning, signal) =>
+                this.config.onPermissionWarning!(session, warning, signal),
+            }
+          : {}),
         mcpConfigPath: this.config.mcpConfigPath,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
