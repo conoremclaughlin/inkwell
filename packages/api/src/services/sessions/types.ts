@@ -832,6 +832,9 @@ export interface IContextBuilder {
 // ─── Runner Interface ───
 
 export interface ClaudeRunnerConfig {
+  /** Advisory only, invoked after launch policy preparation and before final
+   * admission. Absent means no inspection or notification (default). */
+  onPermissionWarning?: import('./spawn-permission-warning.js').SpawnPermissionWarningHandler;
   workingDirectory: string;
   mcpConfigPath: string;
   /**
