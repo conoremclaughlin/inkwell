@@ -37,6 +37,7 @@ import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
 import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
 import { uploadMediaForRunner } from '../uploads/runner-media.js';
 import { uploadsRoot } from '../uploads/runtime.js';
+import { warnBeforeClaudeSpawn } from './spawn-permission-warning.js';
 
 /** Where the sandbox orchestrator mounts the studio checkout in a container. */
 const CONTAINER_STUDIO_ROOT = '/studio';
@@ -555,6 +556,19 @@ export class ClaudeRunner implements IRunner {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    if (config.onPermissionWarning) {
+      await warnBeforeClaudeSpawn(
+        {
+          workingDirectory: config.workingDirectory,
+          mainRoot: config.launchPermissions?.mainRoot ?? config.repoRoot,
+          launchSettings,
+          container: !!config.container,
+          configDir: config.launchEnv?.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR,
+        },
+        config.onPermissionWarning
+      );
     }
 
     // The caller's admission, asked again past the last await above. Nothing
