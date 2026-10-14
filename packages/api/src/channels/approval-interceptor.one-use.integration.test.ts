@@ -113,10 +113,25 @@ describe('one-use approval requests through the interceptor', () => {
     expect(sends.calls).toEqual([]);
   });
 
-  it('answered alone, it is granted as a one-shot grant, whatever scope the reply named', async () => {
+  it('a bulk or scoped approval never grants it, even as the only pending request', async () => {
     const oneUse = await insertPending(true);
-    await checkApprovalResponse(userId, 'telegram:100200300', 'approve session');
+    for (const reply of ['approve all', 'approve session', 'approve agent', 'approve 1']) {
+      await checkApprovalResponse(userId, 'telegram:100200300', reply);
+      expect((await statusOf(oneUse)).status, reply).toBe('pending');
+    }
+    expect(sends.calls).toEqual([]);
+  });
+
+  it('a plain approve grants it as a one-shot grant', async () => {
+    const oneUse = await insertPending(true);
+    await checkApprovalResponse(userId, 'telegram:100200300', 'approve');
     expect(await statusOf(oneUse)).toEqual({ status: 'granted', action: 'grant' });
+  });
+
+  it('a bulk denial does apply to it: denying only restricts', async () => {
+    const oneUse = await insertPending(true);
+    await checkApprovalResponse(userId, 'telegram:100200300', 'deny all');
+    expect((await statusOf(oneUse)).status).toBe('denied');
   });
 
   it('a grant wakes the session it was asked from, by id', async () => {

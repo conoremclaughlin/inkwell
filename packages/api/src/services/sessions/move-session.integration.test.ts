@@ -206,6 +206,29 @@ describe('moveSessionToStudio', () => {
     expect(await move(session, review.id)).toMatchObject({ ok: true, toStudioId: review.id });
   });
 
+  it('two concurrent moves from one studio: exactly one lands, and it is the one the row shows (Lumen, #853)', async () => {
+    for (let round = 0; round < 5; round++) {
+      const from = await insertStudio({ sbId: alphaId, slug: `cas-from-${round}` });
+      const builder = await insertStudio({ sbId: alphaId, slug: `cas-b-${round}` });
+      const review = await insertStudio({
+        sbId: alphaId,
+        slug: `cas-r-${round}`,
+        roleTemplate: 'reviewer',
+      });
+      const session = await insertSession({ sbId: alphaId, studioId: from.id, cliAttached: false });
+
+      const [toBuilder, toReview] = await Promise.all([
+        move(session, builder.id),
+        move(session, review.id),
+      ]);
+
+      const landed = [toBuilder, toReview].filter((r) => r.ok);
+      expect(landed, `round ${round}`).toHaveLength(1);
+      const winner = landed[0] as { toStudioId: string };
+      expect((await rowOf(session)).studio_id).toBe(winner.toStudioId);
+    }
+  });
+
   it("a token signed for another SB's session moves nothing", async () => {
     const from = await insertStudio({ sbId: betaId, slug: 'beta-from' });
     const to = await insertStudio({ sbId: alphaId, slug: 'alpha-to' });

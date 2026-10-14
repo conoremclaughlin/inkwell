@@ -53,7 +53,11 @@ describe.skipIf(!enabled)('claude doctor accepts every generated launch rule', (
     ],
     [
       'automated reviewer',
-      shared.automatedLaunchRules({ profile: 'reviewer', mcpServers: ['inkwell', 'github'] }),
+      shared.automatedLaunchRules({
+        profile: 'reviewer',
+        owner: 'wren',
+        mcpServers: ['inkwell', 'github'],
+      }),
     ],
     ['builder', shared.studioPermissionRules('builder', 'wren')],
     ['reviewer', shared.studioPermissionRules('reviewer', 'wren')],

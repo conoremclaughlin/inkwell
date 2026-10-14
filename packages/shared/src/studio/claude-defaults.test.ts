@@ -438,9 +438,18 @@ describe('describePermissions', () => {
 describe('the automated rules — yolo with ironclad denies (spec automated-turn-permissions §3.2)', () => {
   const yolo = (profile?: 'builder' | 'reviewer') =>
     defaults.automatedLaunchRules({
-      ...(profile ? { profile } : {}),
+      ...(profile ? { profile, owner: 'wren' } : {}),
       mcpServers: ['inkwell', 'playwright', 'github', 'supabase'],
     });
+
+  it('a reviewer edits only its scratch under yolo too: no Edit(//**) (Lumen, #853)', () => {
+    expect(yolo('reviewer').allow).not.toContain('Edit(//**)');
+    expect(yolo('reviewer').allow).toContain('Edit(~/.ink/files/wren-scratch/**)');
+    expect(yolo('builder').allow).toContain('Edit(//**)');
+    expect(() => defaults.automatedLaunchRules({ profile: 'reviewer', mcpServers: [] })).toThrow(
+      /scratch/
+    );
+  });
 
   it('everyday work runs without a prompt: shell, browser, Inkwell, GitHub reads, a feature push', () => {
     for (const call of [

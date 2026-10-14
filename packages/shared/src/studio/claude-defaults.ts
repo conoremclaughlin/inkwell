@@ -458,30 +458,38 @@ export const MCP_SERVER_NAME_FOR_RULES = /^[A-Za-z0-9_-]{1,64}$/;
  * these (deny wins across sources; documented, not measured).
  *
  * `Read(//**)` and `Edit(//**)` are absolute already, so the launch file
- * keeps them as written. Throws on an MCP server name that would not form a
- * server-scoped rule.
+ * keeps them as written. A reviewer gets no `Edit(//**)`: it edits only its
+ * SB's scratch directories, as its profile does. Throws on an MCP server
+ * name that would not form a server-scoped rule, and on a reviewer with no
+ * owner.
  */
 export function automatedLaunchRules(options: {
   profile?: StudioPermissionProfile;
+  /** Whose scratch paths a reviewer may edit; required for a reviewer. */
+  owner?: string;
   mcpServers: readonly string[];
 }): ClaudePermissionRules {
+  const reviewer = options.profile === 'reviewer';
+  if (reviewer && options.owner === undefined) {
+    throw new Error('a reviewer launch needs the SB whose scratch paths it may edit');
+  }
   for (const server of options.mcpServers) {
     if (!MCP_SERVER_NAME_FOR_RULES.test(server)) {
       throw new Error(`not an MCP server name that can form a rule: ${JSON.stringify(server)}`);
     }
   }
+  // A reviewer edits only its SB's scratch, as its profile does: yolo removes
+  // prompts, not the reviewer's read-only stance on the code under review
+  // (Lumen, #853).
   const allow = [
     'Bash(*)',
     'Read(//**)',
-    'Edit(//**)',
+    ...(reviewer ? scratchPathRules(options.owner as string) : ['Edit(//**)']),
     'WebFetch(*)',
     'WebSearch',
     ...options.mcpServers.map((server) => `mcp__${server}__*`),
   ];
-  const deny = [
-    ...IRONCLAD_DENY_RULES,
-    ...(options.profile === 'reviewer' ? STUDIO_REVIEWER_RULES.deny : []),
-  ];
+  const deny = [...IRONCLAD_DENY_RULES, ...(reviewer ? STUDIO_REVIEWER_RULES.deny : [])];
   return { allow: [...new Set(allow)], deny: [...new Set(deny)] };
 }
 

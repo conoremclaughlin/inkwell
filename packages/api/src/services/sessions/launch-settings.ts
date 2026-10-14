@@ -275,6 +275,7 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
     generated = automated
       ? automatedLaunchRules({
           ...(profile ? { profile } : {}),
+          ...(typeof req.owner === 'string' ? { owner: req.owner } : {}),
           mcpServers: req.mcpServers ?? [],
         })
       : studioPermissionRules(profile as StudioPermissionProfile, req.owner as string);

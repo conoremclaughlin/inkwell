@@ -169,6 +169,11 @@ export function classifyDestructiveCommand(
   for (const operand of operands) {
     if (operand.startsWith('-')) return needs(`${operand} reads as a flag after the paths`);
     if (operand.endsWith('/')) return needs(`${operand} ends in a slash, which follows a link`);
+    // `link/..` is erased by lexical normalisation, but the kernel resolves
+    // the link first, so `rm -rf link/../x` reaches outside (Lumen, #853).
+    if (operand.split('/').includes('..')) {
+      return needs(`${operand} has a .. segment, which a symlink before it can redirect`);
+    }
     if (operand.includes('~') && !operand.startsWith('~/')) {
       return needs(`${operand} uses ~ in a form the check does not expand`);
     }

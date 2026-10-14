@@ -98,16 +98,27 @@ export async function moveSessionToStudio(
     }
   }
 
+  // The write holds only while the session is still in the studio the checks
+  // above read: a concurrent move (into a reviewer studio, say) must not be
+  // overwritten by this stale one (Lumen, #853).
   const supabase = composer.getClient();
-  const { data: moved, error } = await supabase
+  const update = supabase
     .from('sessions')
     .update({ studio_id: target.id, working_dir: target.worktreePath })
     .eq('id', session.id)
-    .eq('user_id', input.userId)
-    .select('id, cli_attached');
+    .eq('user_id', input.userId);
+  const { data: moved, error } = await (
+    fromStudioId ? update.eq('studio_id', fromStudioId) : update.is('studio_id', null)
+  ).select('id, cli_attached');
   if (error) return { ok: false, error: `the session could not be moved: ${error.message}` };
   const row = (moved as Array<{ id: string; cli_attached: boolean | null }> | null)?.[0];
-  if (!row) return { ok: false, error: 'the session could not be moved: its row is gone' };
+  if (!row) {
+    return {
+      ok: false,
+      error:
+        'the session could not be moved: it changed studio while this move was checked; read it and try again',
+    };
+  }
 
   await composer.repositories.memory
     .addSessionLog({

@@ -264,10 +264,13 @@ export async function checkApprovalResponse(
   }
 
   // A one-use request is a destructive command outside a session's own
-  // directories, so it is resolved only when it is the one request answered:
-  // never swept up by "approve all", a scope or a numbered batch (spec
+  // directories, so it is approved only by a plain, single "approve" (or a
+  // reply to its own message): never by "approve all", a scope or a numbered
+  // batch, however many requests are pending. Cardinality is not intent: a
+  // bulk reply that happens to match one row is still a bulk reply (Lumen,
+  // #853). A bulk denial still applies; denying only restricts (spec
   // automated-turn-permissions §3.5).
-  if (targetRequests.length > 1) {
+  if (action !== 'deny' && (numberedSelections || isAllOrScoped)) {
     targetRequests = targetRequests.filter((r) => !r.scope_key);
   }
 

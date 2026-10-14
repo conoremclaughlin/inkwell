@@ -355,9 +355,11 @@ describe('automated mode: yolo for automated turns (spec automated-turn-permissi
     expect(fileOf(result.hostPath).permissions.deny).toContain('mcp__github__merge_pull_request');
   });
 
-  it('a reviewer keeps its own denies on top', async () => {
+  it('a reviewer keeps its own denies on top, and edits only its scratch', async () => {
     const result = await launch.prepareLaunchSettings(automated({ profile: 'reviewer' }));
-    const { deny } = fileOf(result.hostPath).permissions;
+    const { allow, deny } = fileOf(result.hostPath).permissions;
+    expect(allow).not.toContain('Edit(//**)');
+    expect(allow).toContain('Edit(~/.ink/files/wren-scratch/**)');
     expect(deny).toEqual(expect.arrayContaining(['Bash(git commit *)', 'Bash(git push *)']));
     expect(result.profile).toBe('reviewer');
   });
@@ -430,8 +432,16 @@ describe('every rule written is one Claude Code accepts: -p ignores a file that 
       ...shared.studioPermissionRules('builder', 'wren').deny,
       ...shared.studioPermissionRules('reviewer', 'wren').allow,
       ...shared.studioPermissionRules('reviewer', 'wren').deny,
-      ...shared.automatedLaunchRules({ profile: 'reviewer', mcpServers: ['inkwell'] }).allow,
-      ...shared.automatedLaunchRules({ profile: 'reviewer', mcpServers: ['inkwell'] }).deny,
+      ...shared.automatedLaunchRules({
+        profile: 'reviewer',
+        owner: 'wren',
+        mcpServers: ['inkwell'],
+      }).allow,
+      ...shared.automatedLaunchRules({
+        profile: 'reviewer',
+        owner: 'wren',
+        mcpServers: ['inkwell'],
+      }).deny,
     ];
     expect(all.filter((rule) => !launch.isValidPermissionRule(rule))).toEqual([]);
   });

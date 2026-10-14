@@ -93,9 +93,13 @@ describe('allowed: a single simple rm strictly inside an allowed root', () => {
 
 describe('needs approval: destructive, and not the tiny allowance', () => {
   it.each([
-    ['rm -rf ..', 'not inside'],
-    ['rm -rf ../repo', 'not inside'],
-    ['rm -rf dist/../..', 'not inside'],
+    ['rm -rf ..', '.. segment'],
+    ['rm -rf ../repo', '.. segment'],
+    ['rm -rf dist/../..', '.. segment'],
+    // Lexically inside, but the kernel resolves the link before the ..
+    // (Lumen, #853): out → /etc, so out/../x is /x.
+    ['rm -rf out/../victim', '.. segment'],
+    ['rm -rf dist/../node_modules', '.. segment'],
     ['rm -rf .', 'not inside'],
     [`rm -rf ${STUDIO}`, 'not inside'],
     [`rm -rf ${SCRATCH}`, 'not inside'],
