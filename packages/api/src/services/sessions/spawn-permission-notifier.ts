@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { DataComposer } from '../../data/composer.js';
 import { SYSTEM_PRINCIPAL, resolveSbInWorkspace } from '../principals.js';
-import type { SpawnPermissionWarning } from './spawn-permission-warning.js';
+import {
+  SpawnPermissionWarningError,
+  type SpawnPermissionWarning,
+} from './spawn-permission-warning.js';
 
 export interface SpawnWarningSession {
   userId: string;
@@ -17,27 +20,46 @@ export type SpawnPermissionNotifier = (
 
 /** One process-local notice per unchanged condition per hour. Only confirmed
  * storage suppresses another notice. Restart permits a duplicate, not silence.
- * Tenant + workspace + checkout + finding form the key, never a slug alone. */
+ * Tenant + workspace + checkout + finding form the key, never a slug alone.
+ * No owned Myra in that workspace means a recipient failure, not a fallback
+ * to another workspace or a guessed human channel. Distinct checkouts wake
+ * separately, including unverified-only findings, to keep notices timely. */
 export function createSpawnPermissionNotifier(composer: DataComposer): SpawnPermissionNotifier {
   const delivered = new Map<string, number>();
   const inFlight = new Map<string, symbol>();
   return async (session, warning, signal) => {
     if (signal.aborted) return;
-    if (!session.sbId) throw new Error('No identity for permission warning scope');
+    if (!session.sbId)
+      throw new SpawnPermissionWarningError('scope', 'No identity for permission warning scope');
     const client = composer.getClient();
     const { data: identity, error } = await client
       .from('agent_identities')
       .select('workspace_id')
       .eq('id', session.sbId)
       .eq('user_id', session.userId)
-      .maybeSingle();
+      .maybeSingle()
+      .then(
+        (result) => result,
+        () => {
+          throw new SpawnPermissionWarningError('scope');
+        }
+      );
     if (signal.aborted) return;
-    if (error || !identity?.workspace_id) throw new Error('Permission warning scope unavailable');
+    if (error || !identity?.workspace_id)
+      throw new SpawnPermissionWarningError('scope', 'Permission warning scope unavailable');
     const workspaceId = identity.workspace_id;
-    const recipient = await resolveSbInWorkspace(client, workspaceId, 'myra');
+    const recipient = await resolveSbInWorkspace(client, workspaceId, 'myra').catch(() => {
+      throw new SpawnPermissionWarningError(
+        'recipient',
+        'No triage identity in permission warning workspace'
+      );
+    });
     if (signal.aborted) return;
     if (recipient.userId !== session.userId || recipient.workspaceId !== workspaceId) {
-      throw new Error('No owned triage identity in permission warning workspace');
+      throw new SpawnPermissionWarningError(
+        'recipient',
+        'No owned triage identity in permission warning workspace'
+      );
     }
     const fingerprint = createHash('sha256')
       .update(
@@ -52,7 +74,8 @@ export function createSpawnPermissionNotifier(composer: DataComposer): SpawnPerm
       .digest('hex');
     const key = `${session.userId}:${workspaceId}:${fingerprint}`;
     if (inFlight.has(key) || (delivered.get(key) ?? 0) > Date.now()) return;
-    if (inFlight.size >= 1024) throw new Error('Permission warning pipeline is full');
+    if (inFlight.size >= 1024)
+      throw new SpawnPermissionWarningError('delivery', 'Permission warning pipeline is full');
     const attempt = Symbol('warning');
     inFlight.set(key, attempt);
     const abandon = () => {
@@ -94,7 +117,10 @@ export function createSpawnPermissionNotifier(composer: DataComposer): SpawnPerm
       // Only a confirmed structured success may suppress a later notice.
       const text = result.content.find((item) => item.type === 'text');
       if (!text || !('text' in text) || JSON.parse(text.text).success !== true) {
-        throw new Error('Permission warning delivery unconfirmed');
+        throw new SpawnPermissionWarningError(
+          'delivery',
+          'Permission warning delivery unconfirmed'
+        );
       }
       if (delivered.size >= 1024) delivered.delete(delivered.keys().next().value!);
       delivered.set(key, Date.now() + 60 * 60 * 1000);

@@ -57,14 +57,33 @@ describe('spawn permission warning delivery', () => {
   });
   it('fails closed on recipient scope, never guessing another workspace', async () => {
     const { notify } = setup(null);
-    await expect(notify(session, warning, new AbortController().signal)).rejects.toThrow('scope');
+    await expect(notify(session, warning, new AbortController().signal)).rejects.toMatchObject({
+      category: 'scope',
+    });
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('categorizes missing session identity without querying or sending', async () => {
+    const { notify, query } = setup();
+    await expect(
+      notify({ ...session, sbId: null }, warning, new AbortController().signal)
+    ).rejects.toMatchObject({ category: 'scope' });
+    expect(query.select).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('categorizes a rejected identity lookup without retaining its error text', async () => {
+    const { notify, query } = setup();
+    query.maybeSingle.mockRejectedValueOnce(new Error('fixture-private-value'));
+    await expect(notify(session, warning, new AbortController().signal)).rejects.toMatchObject({
+      category: 'scope',
+      message: 'Permission warning failed',
+    });
     expect(mocks.send).not.toHaveBeenCalled();
   });
   it('does not send without a triage identity', async () => {
     mocks.resolve.mockRejectedValue(new Error('No triage identity'));
-    await expect(setup().notify(session, warning, new AbortController().signal)).rejects.toThrow(
-      'triage'
-    );
+    await expect(
+      setup().notify(session, warning, new AbortController().signal)
+    ).rejects.toMatchObject({ category: 'recipient' });
     expect(mocks.send).not.toHaveBeenCalled();
   });
   it.each([

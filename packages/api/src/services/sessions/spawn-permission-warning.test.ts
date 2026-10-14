@@ -1,18 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { LaunchSettings } from './launch-settings.js';
 vi.mock('../../utils/logger.js', () => ({ logger: { warn: vi.fn() } }));
+import { logger } from '../../utils/logger.js';
 import {
   collectSpawnPermissions,
   inspectSpawnPermissions,
   readPermissionSource,
   SPAWN_STANDARD_ALLOW_RULES,
+  SpawnPermissionWarningError,
   warnBeforeClaudeSpawn,
 } from './spawn-permission-warning.js';
 
 const roots: string[] = [];
+beforeEach(() => vi.clearAllMocks());
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(roots.splice(0).map((p) => rm(p, { recursive: true, force: true })));
@@ -89,6 +92,7 @@ describe('read-only spawn permission inspection', () => {
     const warning = await inspectSpawnPermissions({ ...input, launchSettings });
     expect(warning?.missingRules).toEqual([]);
     expect(warning?.restrictedRules).toEqual(['ask: mcp__inkwell__* (full)']);
+    expect(warning?.fix).toContain('do not add a local permissions object');
     expect(JSON.stringify(warning)).not.toContain('rm -rf');
     expect(await readFile(local, 'utf8')).toBe(before);
   });
@@ -177,13 +181,40 @@ describe('read-only spawn permission inspection', () => {
     await warnBeforeClaudeSpawn(input, notify, 100);
     expect(notify).toHaveBeenCalledOnce();
     expect(signal?.aborted).toBe(true);
+    expect(logger.warn).toHaveBeenCalledWith(expect.any(String), {
+      workingDirectory: input.workingDirectory,
+      reason: 'deadline',
+    });
   });
   it('contains a rejected notification', async () => {
     const input = await fixture();
     await expect(
       warnBeforeClaudeSpawn(input, async () => {
-        throw new Error('fixture');
+        throw new Error('fixture-private-value');
       })
     ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.any(String), {
+      workingDirectory: input.workingDirectory,
+      reason: 'delivery',
+    });
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(
+      'fixture-private-value'
+    );
   });
+  it.each(['scope', 'recipient', 'delivery'] as const)(
+    'logs a fixed %s category, not error text',
+    async (category) => {
+      const input = await fixture();
+      await warnBeforeClaudeSpawn(input, async () => {
+        throw new SpawnPermissionWarningError(category, 'fixture-private-value');
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.any(String), {
+        workingDirectory: input.workingDirectory,
+        reason: category,
+      });
+      expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(
+        'fixture-private-value'
+      );
+    }
+  );
 });

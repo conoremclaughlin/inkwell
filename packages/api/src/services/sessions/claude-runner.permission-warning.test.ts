@@ -46,6 +46,7 @@ beforeEach(() => {
   mocks.warn.mockImplementation(async (_input, notify) => {
     mocks.order.push('warning');
     await notify({ missingRules: ['mcp__playwright__*'] }, new AbortController().signal);
+    mocks.order.push('warning-done');
   });
 });
 const spawnPrepared = (config: ClaudeRunnerConfig) =>
@@ -62,7 +63,11 @@ const spawnPrepared = (config: ClaudeRunnerConfig) =>
 describe('Claude permission warning at the final launch seam', () => {
   it('observes final launch/overlay state, then rechecks admission without spawning', async () => {
     let held = false;
-    const result = await spawnPrepared({
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const attempt = spawnPrepared({
       workingDirectory: '/synthetic/studio',
       mcpConfigPath: '',
       launchPermissions: {
@@ -73,14 +78,26 @@ describe('Claude permission warning at the final launch seam', () => {
       },
       permissionOverlay: { allow: ['mcp__playwright__*'] },
       onPermissionWarning: async () => {
+        await pending;
         held = true;
       },
       admitSpawn: () => {
         mocks.order.push('admission');
-        return held ? 'fixture hold' : undefined;
+        // Always refuse, including when the ordering guard is mutated. The
+        // assertion, not a real subprocess, diagnoses premature admission.
+        return held ? 'fixture hold' : 'premature fixture hold';
       },
     });
-    expect(mocks.order).toEqual(['settings', 'overlay', 'warning', 'admission']);
+    try {
+      await vi.waitFor(() => expect(mocks.warn).toHaveBeenCalledOnce());
+      expect(mocks.order).toEqual(['settings', 'overlay', 'warning']);
+      expect(mocks.spawn).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await attempt;
+    }
+    const result = await attempt;
+    expect(mocks.order).toEqual(['settings', 'overlay', 'warning', 'warning-done', 'admission']);
     expect(mocks.warn).toHaveBeenCalledWith(
       expect.objectContaining({
         workingDirectory: '/synthetic/studio',

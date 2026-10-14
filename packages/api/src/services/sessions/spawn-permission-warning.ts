@@ -37,6 +37,22 @@ export interface SpawnPermissionWarning {
   fix: string;
 }
 
+/** Fixed operational categories; error text and settings contents stay private. */
+export type SpawnPermissionWarningFailure =
+  | 'deadline'
+  | 'scope'
+  | 'recipient'
+  | 'delivery'
+  | 'inspection';
+export class SpawnPermissionWarningError extends Error {
+  constructor(
+    readonly category: SpawnPermissionWarningFailure,
+    message = 'Permission warning failed'
+  ) {
+    super(message);
+  }
+}
+
 const MAX_BYTES = 256 * 1024;
 const MAX_RULES = 2048;
 const MAX_RULE_LENGTH = 512;
@@ -181,7 +197,9 @@ export async function inspectSpawnPermissions(
     limitations,
     fix: input.container
       ? "Inspect the container's /permissions settings before changing policy; host files cannot repair it."
-      : 'Operator: review .claude/settings.local.json in this checkout; add only approved missing rules to permissions.allow, preserving all ask/deny rules. Review restrictions separately; do not remove them automatically.',
+      : input.launchSettings?.settings.permissions
+        ? 'Operator: review the delivered launch policy/profile and the source of any restrictions; do not add a local permissions object to replace a delivered studio profile, or remove its denies.'
+        : 'Operator: review .claude/settings.local.json in this checkout; add only approved missing rules to permissions.allow, preserving all ask/deny rules. Review restrictions separately; do not remove them automatically.',
   };
 }
 
@@ -199,23 +217,26 @@ export async function warnBeforeClaudeSpawn(
 ): Promise<void> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let stage: SpawnPermissionWarningFailure = 'inspection';
   try {
     await Promise.race([
       (async () => {
         const warning = await inspectSpawnPermissions(input);
         if (controller.signal.aborted || !warning) return;
+        stage = 'delivery';
         await notify(warning, controller.signal);
       })(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort();
-          reject(new Error('deadline'));
+          reject(new SpawnPermissionWarningError('deadline'));
         }, budgetMs);
       }),
     ]);
-  } catch {
+  } catch (error) {
     logger.warn('Spawn permission warning could not be confirmed (non-fatal)', {
       workingDirectory: input.workingDirectory,
+      reason: error instanceof SpawnPermissionWarningError ? error.category : stage,
     });
   } finally {
     if (timer) clearTimeout(timer);
