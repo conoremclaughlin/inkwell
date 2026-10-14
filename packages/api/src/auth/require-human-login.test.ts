@@ -94,6 +94,12 @@ describe('requireHumanLogin — credential preflight, not approval authority', (
     refused(`Bearer ${token({ nbf: Math.floor(Date.now() / 1000) + 60 })}`);
   });
 
+  it('accepts an otherwise valid login whose not-before time has arrived', () => {
+    expect(
+      invoke(`Bearer ${token({ nbf: Math.floor(Date.now() / 1000) - 60 })}`).next
+    ).toHaveBeenCalledOnce();
+  });
+
   it.each(['mcp_access', 'browser_client', 'unknown'])('refuses token type %s', (type) => {
     refused(`Bearer ${token({ type })}`);
   });
@@ -106,7 +112,8 @@ describe('requireHumanLogin — credential preflight, not approval authority', (
     refused(`Bearer ${token({ sub })}`);
   });
 
-  // Independent list: removing a guard key must leave its negative controls.
+  // Known and hypothetical claims: a new binding must fail closed without
+  // requiring its author to update this guard's vocabulary.
   const keys = [
     'sbId',
     'identityId',
@@ -116,6 +123,9 @@ describe('requireHumanLogin — credential preflight, not approval authority', (
     'contactId',
     'installationId',
     'grantId',
+    'clientId',
+    'workspaceId',
+    'futureBinding',
   ];
   for (const key of keys) {
     it.each(['bound', '', null, false, 0, [], {}])(

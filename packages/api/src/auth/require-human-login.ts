@@ -1,17 +1,11 @@
 import type { RequestHandler } from 'express';
 import { verifyInkAccessToken } from './ink-tokens';
 
-/** Claim presence matters: an empty or malformed binding is not a human. */
-const NON_HUMAN_BINDINGS = [
-  'sbId',
-  'identityId',
-  'sbSlug',
-  'agentId',
-  'sessionId',
-  'contactId',
-  'installationId',
-  'grantId',
-] as const;
+/**
+ * A closed vocabulary keeps future binding claims from silently becoming human
+ * credentials. Any other key is refused even if its value is empty or malformed.
+ */
+const HUMAN_LOGIN_CLAIMS = new Set(['type', 'sub', 'email', 'scope', 'iat', 'exp', 'nbf']);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -49,7 +43,7 @@ export const requireHumanLogin: RequestHandler = (req, res, next) => {
     res.status(401).json({ error: 'Human login required', code: 'human_login_required' });
     return;
   }
-  if (NON_HUMAN_BINDINGS.some((key) => Object.prototype.hasOwnProperty.call(payload, key))) {
+  if (Object.keys(payload).some((key) => !HUMAN_LOGIN_CLAIMS.has(key))) {
     res.status(403).json({ error: 'A human must confirm this action', code: 'human_login_bound' });
     return;
   }
