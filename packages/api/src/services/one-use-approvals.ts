@@ -49,7 +49,12 @@ export interface SignedSession {
   sessionId: string;
   studioId: string | null;
   sbId: string | null;
-  /** The session's SB slug, from its row: who asked, as the approver reads it. */
+  /**
+   * The session's SB slug, read from its canonical identity (sb_id →
+   * agent_identities), never from the session's own slug column or a header:
+   * who asked, as the approver reads it. Null when the session names no
+   * identity of this user; a one-use request is then refused (Lumen, #853).
+   */
   sbSlug: string | null;
 }
 
@@ -66,20 +71,27 @@ export async function readSignedSession(
   if (!tokenSessionId) return null;
   const { data, error } = await supabase
     .from('sessions')
-    .select('id, studio_id, sb_id, agent_id')
+    .select('id, studio_id, sb_id')
     .eq('id', tokenSessionId)
     .eq('user_id', userId)
     .maybeSingle();
   if (error) throw new Error(`session ${tokenSessionId} could not be read: ${error.message}`);
-  const row = data as {
-    id: string;
-    studio_id: string | null;
-    sb_id: string | null;
-    agent_id: string | null;
-  } | null;
-  return row
-    ? { sessionId: row.id, studioId: row.studio_id, sbId: row.sb_id, sbSlug: row.agent_id }
-    : null;
+  const row = data as { id: string; studio_id: string | null; sb_id: string | null } | null;
+  if (!row) return null;
+  let sbSlug: string | null = null;
+  if (row.sb_id) {
+    const { data: identity, error: identityError } = await supabase
+      .from('agent_identities')
+      .select('agent_id')
+      .eq('id', row.sb_id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (identityError) {
+      throw new Error(`identity ${row.sb_id} could not be read: ${identityError.message}`);
+    }
+    sbSlug = (identity as { agent_id: string | null } | null)?.agent_id ?? null;
+  }
+  return { sessionId: row.id, studioId: row.studio_id, sbId: row.sb_id, sbSlug };
 }
 
 /**

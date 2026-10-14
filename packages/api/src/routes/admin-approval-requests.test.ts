@@ -693,14 +693,19 @@ describe('one-use approval requests are scoped to the signed session', () => {
     return c;
   }
 
-  function install(sessionRow: Record<string, unknown> | null) {
+  function install(
+    sessionRow: Record<string, unknown> | null,
+    identityRow: Record<string, unknown> | null = { id: SB, agent_id: 'echo', workspace_id: null }
+  ) {
     const inserted: Array<Record<string, unknown>> = [];
     mockSupabaseFrom.mockImplementation((table: string) => {
       if (table === 'sessions') {
         return chain({ maybeSingle: vi.fn().mockResolvedValue({ data: sessionRow, error: null }) });
       }
       if (table === 'agent_identities') {
-        return chain({ maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }) });
+        return chain({
+          maybeSingle: vi.fn().mockResolvedValue({ data: identityRow, error: null }),
+        });
       }
       if (table === 'approval_requests') {
         return {
@@ -741,7 +746,7 @@ describe('one-use approval requests are scoped to the signed session', () => {
   });
 
   it("with one, the row's session and studio are the token's, never the body's, and the scope is keyed", async () => {
-    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB, agent_id: 'echo' });
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
     mockNotifyPlatform.mockClear();
     const res = createMockRes();
     await create(
@@ -777,6 +782,31 @@ describe('one-use approval requests are scoped to the signed session', () => {
         cwd: '/tmp',
       })
     );
+  });
+
+  it('a session with no canonical SB is refused, never labelled from the header (Lumen, #853)', async () => {
+    for (const [session, identity] of [
+      [{ id: SESSION, studio_id: STUDIO, sb_id: null }, null],
+      [{ id: SESSION, studio_id: STUDIO, sb_id: SB }, null],
+    ] as const) {
+      const inserted = install(session, identity);
+      const res = createMockRes();
+      await create(
+        createAuthenticatedReq({
+          body,
+          inkTokenSessionId: SESSION,
+          headers: {
+            authorization: 'Bearer test-token',
+            'x-ink-context': Buffer.from(JSON.stringify({ sbSlug: 'forged-peer' })).toString(
+              'base64url'
+            ),
+          },
+        }),
+        res as unknown as Response
+      );
+      expect(res._status).toBe(403);
+      expect(inserted).toEqual([]);
+    }
   });
 
   it("a token naming another user's session, or none that exists, is refused", async () => {

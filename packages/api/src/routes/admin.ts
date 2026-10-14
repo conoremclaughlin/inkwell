@@ -11314,6 +11314,12 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         res.status(403).json({ error: 'a one-use request needs a runner token for a session' });
         return;
       }
+      // Who asked comes from the session's canonical identity only. With none,
+      // the request is refused, never labelled from the unsigned header.
+      if (!session.sbSlug) {
+        res.status(403).json({ error: 'a one-use request needs a session with a canonical SB' });
+        return;
+      }
       oneUse = {
         session,
         scopeKey: approvalScopeKey({
@@ -11392,7 +11398,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         ...(oneUse ? { scope_key: oneUse.scopeKey } : {}),
         sb_id: requester.sbId,
         workspace_id: requester.workspaceId,
-        requesting_agent_id: oneUse?.session.sbSlug ?? requestingSlug,
+        requesting_agent_id: oneUse ? (oneUse.session.sbSlug as string) : requestingSlug,
         ...(oneUse ? { cwd: req.body.cwd } : {}),
         tool,
         args: args || null,
@@ -11442,7 +11448,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       tool,
       args,
       reason: req.body.reason,
-      requestingSlug: oneUse?.session.sbSlug ?? requestingSlug,
+      requestingSlug: oneUse ? (oneUse.session.sbSlug as string) : requestingSlug,
       origin: cloneOrigin,
       studioId: oneUse ? oneUse.session.studioId : studioId,
       sessionId: oneUse ? oneUse.session.sessionId : sessionId,
