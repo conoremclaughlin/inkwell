@@ -115,7 +115,15 @@ describe('one-use approval requests through the interceptor', () => {
 
   it('a bulk or scoped approval never grants it, even as the only pending request', async () => {
     const oneUse = await insertPending(true);
-    for (const reply of ['approve all', 'approve session', 'approve agent', 'approve 1']) {
+    for (const reply of [
+      'approve all',
+      'approve session',
+      'approve for session',
+      'approve agent',
+      'approve studio',
+      'approve always',
+      'approve 1',
+    ]) {
       await checkApprovalResponse(userId, 'telegram:100200300', reply);
       expect((await statusOf(oneUse)).status, reply).toBe('pending');
     }
