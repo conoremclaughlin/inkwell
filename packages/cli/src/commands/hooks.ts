@@ -2788,6 +2788,32 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
   const studioId = process.env.INK_STUDIO_ID?.trim() || undefined;
 
+  // A headless destructive command first tries to spend a grant Conor gave
+  // for exactly this command, here, in this session (spec §3.5). The server
+  // takes the session from the signed runner token, not from this request.
+  if (destructiveReason !== null) {
+    try {
+      const resp = await fetch(`${serverUrl}/api/admin/approval-requests/consume`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ tool: toolName, args: toolInput, cwd: hookCwd }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (resp.ok) {
+        const body = (await resp.json()) as { granted?: unknown; requestId?: unknown };
+        if (body.granted === true) {
+          hookLog('on_tool_approval_grant_spent', { requestId: String(body.requestId) });
+          process.exit(0);
+        }
+      } else {
+        hookLog('on_tool_approval_consume_failed', { status: resp.status });
+      }
+    } catch (err) {
+      // No grant could be spent; ask for one below, which fails closed too.
+      hookLog('on_tool_approval_consume_error', { error: String(err) });
+    }
+  }
+
   let requestId: string;
   try {
     const resp = await fetch(`${serverUrl}/api/admin/approval-requests`, {
@@ -2802,6 +2828,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
             : 'Tool requires explicit per-call confirmation by policy.',
         studioId,
         sessionId,
+        ...(destructiveReason !== null ? { oneUse: true, cwd: hookCwd } : {}),
         timeoutSeconds: destructiveReason !== null ? 1800 : 300,
       }),
       signal: AbortSignal.timeout(10000),

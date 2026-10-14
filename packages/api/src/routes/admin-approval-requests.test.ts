@@ -669,3 +669,131 @@ describe('GET /approval-requests/:requestId/status', () => {
     expect(updateSpy).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// One-use requests (spec automated-turn-permissions §3.5)
+// ---------------------------------------------------------------------------
+
+describe('one-use approval requests are scoped to the signed session', () => {
+  const SESSION = '11111111-1111-4111-8111-111111111111';
+  const STUDIO = '22222222-2222-4222-8222-222222222222';
+  const SB = '33333333-3333-4333-8333-333333333333';
+
+  /** A chain whose filters return itself, ending in the given terminal results. */
+  function chain(terminal: Record<string, unknown>) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const c: any = {};
+    for (const m of ['select', 'eq', 'is', 'gt', 'order', 'limit', 'in']) c[m] = vi.fn(() => c);
+    Object.assign(c, terminal);
+    return c;
+  }
+
+  function install(sessionRow: Record<string, unknown> | null) {
+    const inserted: Array<Record<string, unknown>> = [];
+    mockSupabaseFrom.mockImplementation((table: string) => {
+      if (table === 'sessions') {
+        return chain({ maybeSingle: vi.fn().mockResolvedValue({ data: sessionRow, error: null }) });
+      }
+      if (table === 'agent_identities') {
+        return chain({ maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }) });
+      }
+      if (table === 'approval_requests') {
+        return {
+          insert: vi.fn((row: Record<string, unknown>) => {
+            inserted.push(row);
+            return chain({
+              single: vi.fn().mockResolvedValue({
+                data: { id: 'req-1', status: 'pending', expires_at: futureIso(30) },
+                error: null,
+              }),
+            });
+          }),
+        };
+      }
+      throw new Error(`unexpected table ${table}`);
+    });
+    return inserted;
+  }
+
+  const create = findRouteHandler('post', '/approval-requests')!;
+  const consume = findRouteHandler('post', '/approval-requests/consume')!;
+  const body = {
+    tool: 'Bash',
+    args: 'rm -rf /tmp/x',
+    cwd: '/tmp',
+    oneUse: true,
+    // Supplied by the caller, and ignored for a one-use request.
+    sessionId: '99999999-9999-4999-8999-999999999999',
+    studioId: '88888888-8888-4888-8888-888888888888',
+  };
+
+  it('without a runner token for a session it is refused, and nothing is stored', async () => {
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const res = createMockRes();
+    await create(createAuthenticatedReq({ body }), res as unknown as Response);
+    expect(res._status).toBe(403);
+    expect(inserted).toEqual([]);
+  });
+
+  it("with one, the row's session and studio are the token's, never the body's, and the scope is keyed", async () => {
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body, inkTokenSessionId: SESSION }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(201);
+    expect(inserted[0]).toMatchObject({ session_id: SESSION, studio_id: STUDIO });
+    const { approvalScopeKey } = await import('../services/one-use-approvals');
+    expect(inserted[0].scope_key).toBe(
+      approvalScopeKey({
+        userId: USER_ID,
+        sessionId: SESSION,
+        studioId: STUDIO,
+        sbId: SB,
+        tool: 'Bash',
+        args: 'rm -rf /tmp/x',
+        cwd: '/tmp',
+      })
+    );
+  });
+
+  it("a token naming another user's session, or none that exists, is refused", async () => {
+    const inserted = install(null);
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body, inkTokenSessionId: SESSION }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(403);
+    expect(inserted).toEqual([]);
+  });
+
+  it('an ordinary request is unchanged: the body ids, and no scope key', async () => {
+    const inserted = install(null);
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body: { ...body, oneUse: undefined } }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(201);
+    expect(inserted[0]).toMatchObject({ session_id: body.sessionId, studio_id: body.studioId });
+    expect(inserted[0]).not.toHaveProperty('scope_key');
+  });
+
+  it('consume needs the signed session and every scope field', async () => {
+    install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const noSession = createMockRes();
+    await consume(
+      createAuthenticatedReq({ body: { tool: 'Bash', args: 'x', cwd: '/tmp' } }),
+      noSession as unknown as Response
+    );
+    expect(noSession._status).toBe(403);
+    const noCwd = createMockRes();
+    await consume(
+      createAuthenticatedReq({ body: { tool: 'Bash', args: 'x' }, inkTokenSessionId: SESSION }),
+      noCwd as unknown as Response
+    );
+    expect(noCwd._status).toBe(400);
+  });
+});

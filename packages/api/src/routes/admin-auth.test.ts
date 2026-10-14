@@ -506,6 +506,25 @@ describe('adminAuthMiddleware', () => {
       expect((req as any).inkTokenSbId).toBe(sbId);
     });
 
+    it("keeps a runner token's signed session for consuming a one-use grant", async () => {
+      const sessionId = '55555555-5555-4555-8555-555555555555';
+      mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+        type: 'mcp_access',
+        sub: 'user-mcp',
+        email: 'mcp@example.com',
+        scope: 'mcp:tools',
+        sbId: '77777777-7777-4777-8777-777777777777',
+        sessionId,
+      });
+
+      const req = createMockReq({ method: 'POST', path: '/approval-requests/consume' });
+      const next = vi.fn();
+      await middleware(req, createMockRes(), next);
+
+      expect(next).toHaveBeenCalled();
+      expect((req as any).inkTokenSessionId).toBe(sessionId);
+    });
+
     it("reads an older runner token's identityId the same way", async () => {
       const identityId = '66666666-6666-4666-8666-666666666666';
       mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
@@ -532,9 +551,11 @@ describe('adminAuthMiddleware', () => {
 
       const req = createMockReq({ method: 'POST', path: '/approval-requests' });
       (req as any).inkTokenSbId = 'left-over-from-a-reused-request';
+      (req as any).inkTokenSessionId = 'left-over-from-a-reused-request';
       await middleware(req, createMockRes(), vi.fn());
 
       expect((req as any).inkTokenSbId).toBeUndefined();
+      expect((req as any).inkTokenSessionId).toBeUndefined();
     });
 
     it('should accept mcp_access tokens for transcript list/export routes', async () => {

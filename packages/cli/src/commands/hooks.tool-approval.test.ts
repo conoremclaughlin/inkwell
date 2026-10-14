@@ -51,12 +51,27 @@ afterEach(async () => {
 });
 
 /** A server that answers approval-request creation, recording each body. */
-async function approvalServer(): Promise<{ url: string; bodies: Array<Record<string, unknown>> }> {
+async function approvalServer(options: { grant?: boolean } = {}): Promise<{
+  url: string;
+  bodies: Array<Record<string, unknown>>;
+  consumes: Array<Record<string, unknown>>;
+}> {
   const bodies: Array<Record<string, unknown>> = [];
+  const consumes: Array<Record<string, unknown>> = [];
   const server = createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => (raw += chunk));
     req.on('end', () => {
+      if (req.method === 'POST' && req.url === '/api/admin/approval-requests/consume') {
+        consumes.push(JSON.parse(raw) as Record<string, unknown>);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify(
+            options.grant ? { granted: true, requestId: 'req-granted' } : { granted: false }
+          )
+        );
+        return;
+      }
       if (req.method === 'POST' && req.url === '/api/admin/approval-requests') {
         bodies.push(JSON.parse(raw) as Record<string, unknown>);
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -69,7 +84,7 @@ async function approvalServer(): Promise<{ url: string; bodies: Array<Record<str
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address() as { port: number };
-  return { url: `http://127.0.0.1:${address.port}`, bodies };
+  return { url: `http://127.0.0.1:${address.port}`, bodies, consumes };
 }
 
 const headless = Buffer.from(
@@ -170,7 +185,27 @@ describe('on-tool-approval: destructive commands', () => {
     expect(run.decision?.permissionDecision).toBe('deny');
     expect(run.decision?.permissionDecisionReason).toContain('req-fixture-1');
     expect(server.bodies).toHaveLength(1);
-    expect(server.bodies[0]).toMatchObject({ tool: 'Bash', timeoutSeconds: 1800 });
+    expect(server.bodies[0]).toMatchObject({
+      tool: 'Bash',
+      timeoutSeconds: 1800,
+      oneUse: true,
+      cwd: worktree,
+    });
+    // It tried to spend a grant first, for this exact command and directory.
+    expect(server.consumes).toEqual([
+      { tool: 'Bash', args: `rm -rf ${join(mainCheckout, 'dist')}`, cwd: worktree },
+    ]);
+  });
+
+  it('headless, a grant Conor gave for this command is spent and the command runs', async () => {
+    const server = await approvalServer({ grant: true });
+    const run = await runHook(`rm -rf ${join(mainCheckout, 'dist')}`, {
+      serverUrl: server.url,
+      context: headless,
+    });
+    expect(run.code).toBe(0);
+    expect(run.decision).toBeUndefined();
+    expect(server.bodies).toHaveLength(0);
   });
 
   it('headless, with the approval server unreachable, it is denied: fail closed, not open', async () => {

@@ -50,6 +50,8 @@ interface PendingRequest {
   requesting_agent_id: string;
   studio_id: string | null;
   session_id: string | null;
+  /** Set only on a one-use request (spec automated-turn-permissions §3.5). */
+  scope_key?: string | null;
 }
 
 export interface ApprovalInterceptResult {
@@ -146,7 +148,9 @@ export async function checkApprovalResponse(
   // Fetch all pending requests for this user (up to 20)
   const { data: pendingRequests, error } = await supabase
     .from('approval_requests')
-    .select('id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id')
+    .select(
+      'id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id, scope_key'
+    )
     .eq('user_id', userId)
     .eq('status', 'pending')
     .gt('expires_at', new Date().toISOString())
@@ -259,6 +263,14 @@ export async function checkApprovalResponse(
     targetRequests = [pendingRequests[pendingRequests.length - 1]];
   }
 
+  // A one-use request is a destructive command outside a session's own
+  // directories, so it is resolved only when it is the one request answered:
+  // never swept up by "approve all", a scope or a numbered batch (spec
+  // automated-turn-permissions §3.5).
+  if (targetRequests.length > 1) {
+    targetRequests = targetRequests.filter((r) => !r.scope_key);
+  }
+
   if (targetRequests.length === 0) {
     return { intercepted: false };
   }
@@ -267,14 +279,18 @@ export async function checkApprovalResponse(
   const status = action === 'deny' ? 'denied' : 'granted';
   const resolvedRequests: Array<{ id: string; tool: string; action: string; sbSlug?: string }> = [];
 
+  const oneUseGranted: PendingRequest[] = [];
   for (const req of targetRequests) {
     const grantedTools = action !== 'deny' ? [req.tool + (req.args ? `(${req.args})` : '')] : null;
+    // A one-use grant is spent once whatever the reply said: never a
+    // session, agent or studio grant.
+    const resolvedAction = req.scope_key && action !== 'deny' ? 'grant' : action;
 
     const { error: updateError } = await supabase
       .from('approval_requests')
       .update({
         status,
-        action,
+        action: resolvedAction,
         granted_tools: grantedTools,
         granted_by: grantedBy,
         resolved_at: new Date().toISOString(),
@@ -293,8 +309,19 @@ export async function checkApprovalResponse(
     resolvedRequests.push({
       id: req.id,
       tool: req.tool,
-      action,
+      action: resolvedAction,
       sbSlug: req.requesting_agent_id,
+    });
+    if (req.scope_key && status === 'granted' && req.session_id) oneUseGranted.push(req);
+  }
+
+  for (const req of oneUseGranted) {
+    await resumeApprovedSession(userId, req).catch((err) => {
+      logger.error('Approved, but the session could not be woken', {
+        requestId: req.id,
+        sessionId: req.session_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
 
@@ -315,6 +342,37 @@ export async function checkApprovalResponse(
     requestId: resolvedRequests[0].id,
     resolvedRequests,
   };
+}
+
+/**
+ * Wake the session a one-use grant was asked from, so its next turn runs the
+ * command again and spends the grant. Sent to that session by id, as a
+ * session_resume; it queues behind a running turn like any message.
+ */
+async function resumeApprovedSession(userId: string, req: PendingRequest): Promise<void> {
+  const [{ handleSendToInbox }, { getDataComposer }] = await Promise.all([
+    import('../mcp/tools/inbox-handlers.js'),
+    import('../data/composer.js'),
+  ]);
+  await handleSendToInbox(
+    {
+      userId,
+      recipientSlug: req.requesting_agent_id,
+      recipientSessionId: req.session_id,
+      senderSlug: 'system',
+      messageType: 'session_resume',
+      priority: 'high',
+      content:
+        `Conor approved: \`${req.args ?? req.tool}\`. Run it again, exactly as it was and ` +
+        'from the same directory: the approval is good once, for that command there, ' +
+        `until ${req.expires_at}.`,
+      trigger: true,
+      triggerType: 'message',
+      triggerSummary: 'Approval granted: run the command again',
+      metadata: { source: 'approval_interceptor', approvalRequestId: req.id },
+    },
+    await getDataComposer()
+  );
 }
 
 /**
