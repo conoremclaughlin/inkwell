@@ -49,6 +49,8 @@ export interface SignedSession {
   sessionId: string;
   studioId: string | null;
   sbId: string | null;
+  /** The session's SB slug, from its row: who asked, as the approver reads it. */
+  sbSlug: string | null;
 }
 
 /**
@@ -64,13 +66,20 @@ export async function readSignedSession(
   if (!tokenSessionId) return null;
   const { data, error } = await supabase
     .from('sessions')
-    .select('id, studio_id, sb_id')
+    .select('id, studio_id, sb_id, agent_id')
     .eq('id', tokenSessionId)
     .eq('user_id', userId)
     .maybeSingle();
   if (error) throw new Error(`session ${tokenSessionId} could not be read: ${error.message}`);
-  const row = data as { id: string; studio_id: string | null; sb_id: string | null } | null;
-  return row ? { sessionId: row.id, studioId: row.studio_id, sbId: row.sb_id } : null;
+  const row = data as {
+    id: string;
+    studio_id: string | null;
+    sb_id: string | null;
+    agent_id: string | null;
+  } | null;
+  return row
+    ? { sessionId: row.id, studioId: row.studio_id, sbId: row.sb_id, sbSlug: row.agent_id }
+    : null;
 }
 
 /**

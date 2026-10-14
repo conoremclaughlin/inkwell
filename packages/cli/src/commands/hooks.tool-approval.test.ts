@@ -222,6 +222,23 @@ describe('on-tool-approval: destructive commands', () => {
 });
 
 describe('on-tool-approval: the 2FA refusals fail closed', () => {
+  it.each([
+    ['headless', headless],
+    ['attached', undefined],
+  ])(
+    '%s, an allowed in-studio delete still honours an approvalRequired rule for it (Lumen, #853)',
+    async (_name, context) => {
+      mkdirSync(join(worktree, '.claude'), { recursive: true });
+      writeFileSync(
+        join(worktree, '.claude', 'settings.local.json'),
+        JSON.stringify({ permissions: { approvalRequired: ['Bash(rm -rf *)'] } })
+      );
+      const run = await runHook('rm -rf dist', context ? { context } : {});
+      expect(run.code).toBe(0);
+      expect(run.decision?.permissionDecision).toBe('deny');
+    }
+  );
+
   it('an approvalRequired match with the server unreachable is a JSON deny, not exit 1', async () => {
     mkdirSync(join(worktree, '.claude'), { recursive: true });
     writeFileSync(

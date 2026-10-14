@@ -736,14 +736,30 @@ describe('one-use approval requests are scoped to the signed session', () => {
   });
 
   it("with one, the row's session and studio are the token's, never the body's, and the scope is keyed", async () => {
-    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB, agent_id: 'echo' });
+    mockNotifyPlatform.mockClear();
     const res = createMockRes();
     await create(
       createAuthenticatedReq({ body, inkTokenSessionId: SESSION }),
       res as unknown as Response
     );
     expect(res._status).toBe(201);
-    expect(inserted[0]).toMatchObject({ session_id: SESSION, studio_id: STUDIO });
+    expect(inserted[0]).toMatchObject({
+      session_id: SESSION,
+      studio_id: STUDIO,
+      cwd: '/tmp',
+      requesting_agent_id: 'echo',
+    });
+    // The notice names the signed scope and the directory, never the body's ids
+    // (Lumen, #853 R6).
+    expect(mockNotifyPlatform).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: SESSION,
+        studioId: STUDIO,
+        requestingSlug: 'echo',
+        oneUse: { cwd: '/tmp' },
+      })
+    );
     const { approvalScopeKey } = await import('../services/one-use-approvals');
     expect(inserted[0].scope_key).toBe(
       approvalScopeKey({

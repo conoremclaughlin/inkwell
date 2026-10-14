@@ -60,7 +60,7 @@ describe('one-use approval requests through the interceptor', () => {
         requesting_agent_id: 'echo',
         tool: 'Bash',
         args: oneUse ? 'rm -rf /tmp/fixture-out' : 'docker push registry/app',
-        ...(oneUse ? { scope_key: randomUUID() } : {}),
+        ...(oneUse ? { scope_key: randomUUID(), cwd: '/tmp/fixture-cwd' } : {}),
         expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
         timeout_seconds: 1800,
       } as never)
@@ -145,6 +145,7 @@ describe('one-use approval requests through the interceptor', () => {
       metadata: { approvalRequestId: oneUse },
     });
     expect(String(sends.calls[0].content)).toContain('rm -rf /tmp/fixture-out');
+    expect(String(sends.calls[0].content)).toContain('/tmp/fixture-cwd');
   });
 
   it('a denial wakes no one', async () => {

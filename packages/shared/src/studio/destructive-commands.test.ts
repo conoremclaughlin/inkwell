@@ -100,6 +100,8 @@ describe('needs approval: destructive, and not the tiny allowance', () => {
     // (Lumen, #853): out → /etc, so out/../x is /x.
     ['rm -rf out/../victim', '.. segment'],
     ['rm -rf dist/../node_modules', '.. segment'],
+    [`rm -rf ${STUDIO}/out/../victim`, '.. segment'],
+    ['rm -rf ~/.ink/files/wren-scratch/../x', '.. segment'],
     ['rm -rf .', 'not inside'],
     [`rm -rf ${STUDIO}`, 'not inside'],
     [`rm -rf ${SCRATCH}`, 'not inside'],

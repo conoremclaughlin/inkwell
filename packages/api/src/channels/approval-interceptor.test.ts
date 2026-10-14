@@ -817,3 +817,28 @@ describe('approval notifications — batch clone mapping', () => {
     expect(first).toBe('1. `save_link`');
   });
 });
+
+describe('one-use approval notifications (spec automated-turn-permissions §3.5)', () => {
+  const oneUse = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'Bash',
+    args: 'rm -rf build/cache',
+    reason: 'Destructive command outside the session directories.',
+    requestingSlug: 'wren',
+    studioId: 'studio-1',
+    sessionId: 'session-1',
+    expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+    oneUse: { cwd: '/w/repo--alpha/packages/mobile' },
+  };
+
+  it('shows the full command, the directory and the signed scope, and says bulk replies do not cover it', () => {
+    const msg = formatSingleNotification(oneUse);
+    expect(msg).toContain('rm -rf build/cache');
+    expect(msg).toContain('/w/repo--alpha/packages/mobile');
+    expect(msg).toContain('session-1');
+    expect(msg).toContain('studio-1');
+    expect(msg).toContain('"approve all"');
+    expect(msg).not.toContain('approve session*');
+  });
+});

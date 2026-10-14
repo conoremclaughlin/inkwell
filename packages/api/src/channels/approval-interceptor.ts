@@ -52,6 +52,8 @@ interface PendingRequest {
   session_id: string | null;
   /** Set only on a one-use request (spec automated-turn-permissions §3.5). */
   scope_key?: string | null;
+  /** A one-use request's directory, as approved. */
+  cwd?: string | null;
 }
 
 export interface ApprovalInterceptResult {
@@ -89,6 +91,8 @@ export interface BufferedRequest {
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
+  /** A one-use request: the directory the approved command runs in. */
+  oneUse?: { cwd: string };
 }
 
 const notificationBuffer = new Map<
@@ -149,7 +153,7 @@ export async function checkApprovalResponse(
   const { data: pendingRequests, error } = await supabase
     .from('approval_requests')
     .select(
-      'id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id, scope_key'
+      'id, tool, args, expires_at, metadata, requesting_agent_id, studio_id, session_id, scope_key, cwd'
     )
     .eq('user_id', userId)
     .eq('status', 'pending')
@@ -366,9 +370,9 @@ async function resumeApprovedSession(userId: string, req: PendingRequest): Promi
       messageType: 'session_resume',
       priority: 'high',
       content:
-        `Conor approved: \`${req.args ?? req.tool}\`. Run it again, exactly as it was and ` +
-        'from the same directory: the approval is good once, for that command there, ' +
-        `until ${req.expires_at}.`,
+        `Conor approved: \`${req.args ?? req.tool}\` in \`${req.cwd ?? 'the same directory'}\`. ` +
+        'Run it again, exactly as it was and from that directory: the approval is good ' +
+        `once, for that command there, until ${req.expires_at}.`,
       trigger: true,
       triggerType: 'message',
       triggerSummary: 'Approval granted: run the command again',
@@ -430,8 +434,11 @@ export async function notifyPlatformOfApprovalRequest(request: {
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
+  oneUse?: { cwd: string };
 }): Promise<void> {
-  const bufferKey = request.userId;
+  // A one-use request is never folded into a numbered batch: it is approved
+  // only by a plain reply to its own message (spec §3.5).
+  const bufferKey = request.oneUse ? `${request.userId}:one-use:${request.id}` : request.userId;
   const existing = notificationBuffer.get(bufferKey);
 
   const buffered: BufferedRequest = {
@@ -445,6 +452,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
     studioId: request.studioId,
     sessionId: request.sessionId,
     expiresAt: request.expiresAt,
+    ...(request.oneUse ? { oneUse: request.oneUse } : {}),
   };
 
   if (existing) {
@@ -503,6 +511,19 @@ export function formatSingleNotification(req: BufferedRequest): string {
     1,
     Math.round((new Date(req.expiresAt).getTime() - Date.now()) / 60000)
   );
+
+  if (req.oneUse) {
+    return (
+      `\u{1F510} *Destructive command* from ${formatRequester(req)}:\n\n` +
+      `\`${req.args ?? req.tool}\`\n\n` +
+      `Directory: \`${req.oneUse.cwd}\`\n` +
+      (req.sessionId ? `Session: ${req.sessionId}\n` : '') +
+      (req.studioId ? `Studio: ${req.studioId}\n` : '') +
+      (req.reason ? `Reason: ${req.reason}\n` : '') +
+      `Expires in: ${expiresIn} min\n\n` +
+      `Reply *approve* or *deny* to this message. An approval is good once, for exactly this command in this directory; "approve all" and scoped approvals do not cover it.`
+    );
+  }
 
   return (
     `\u{1F510} *Permission request* from ${formatRequester(req)}:\n\n` +

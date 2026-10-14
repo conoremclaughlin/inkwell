@@ -11,14 +11,17 @@
 --   the signed runner token's session (and that session's studio and SB)
 --   plus the tool, the full command and the directory it runs in. Present
 --   only on a one-use request, so it is also what marks one.
+-- cwd: the directory the command runs in, stored and shown to the approver,
+--   who approves exactly that command there; it is part of the scope too.
 -- consumed_at: when the grant was spent. A consume is one conditional
 --   update on `consumed_at IS NULL`, so two racing turns cannot both spend
 --   it.
 --
--- Both nullable; every existing row and every other request leaves them null.
+-- All nullable; every existing row and every other request leaves them null.
 
 ALTER TABLE public.approval_requests
   ADD COLUMN IF NOT EXISTS scope_key text,
+  ADD COLUMN IF NOT EXISTS cwd text,
   ADD COLUMN IF NOT EXISTS consumed_at timestamptz;
 
 CREATE INDEX IF NOT EXISTS approval_requests_unspent_grant_idx

@@ -11392,7 +11392,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         ...(oneUse ? { scope_key: oneUse.scopeKey } : {}),
         sb_id: requester.sbId,
         workspace_id: requester.workspaceId,
-        requesting_agent_id: requestingSlug,
+        requesting_agent_id: oneUse?.session.sbSlug ?? requestingSlug,
+        ...(oneUse ? { cwd: req.body.cwd } : {}),
         tool,
         args: args || null,
         reason: reason || null,
@@ -11433,16 +11434,19 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
 
     // Send notification to connected platforms (non-blocking)
+    // A one-use request's notice names its signed scope, never the body's ids
+    // or the header slug, and shows the directory being approved (Lumen, #853).
     notifyPlatformOfApprovalRequest({
       id: data.id,
       userId: authReq.inkUserId,
       tool,
       args,
       reason: req.body.reason,
-      requestingSlug,
+      requestingSlug: oneUse?.session.sbSlug ?? requestingSlug,
       origin: cloneOrigin,
-      studioId,
-      sessionId,
+      studioId: oneUse ? oneUse.session.studioId : studioId,
+      sessionId: oneUse ? oneUse.session.sessionId : sessionId,
+      ...(oneUse ? { oneUse: { cwd: req.body.cwd } } : {}),
       expiresAt,
     }).catch((err) => {
       logger.error('Failed to send platform notification for approval request', {

@@ -2744,7 +2744,6 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
       hostFs
     );
     hookLog('on_tool_approval_destructive', { kind: verdict.kind });
-    if (verdict.kind === 'allowed') process.exit(0);
     if (verdict.kind === 'needs-approval') {
       if (!isHeadlessSession()) {
         emitDecision('ask', `Confirm this destructive command. ${verdict.reason}.`);
@@ -2753,7 +2752,9 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
-  // Check against approval set
+  // The checkout's own approval policy applies whatever the destructive
+  // check said: an allowed delete means "no further destructive restriction",
+  // never "skip an approval the checkout requires" (Lumen, #853).
   if (destructiveReason === null) {
     const approvalSet = loadApprovalSet(cwd);
     if (approvalSet.length === 0 || !matchesApprovalSet(toolName, toolInput, approvalSet)) {
