@@ -56,18 +56,32 @@ export async function resolveApprovalRequests(
     userId: string;
     grantedBy: string;
     action: ApprovalResolutionAction;
+    /** Human intent, not the number of matching rows. */
+    selection: 'targeted' | 'bulk';
     requests: readonly ApprovalResolutionRequest[];
   }
 ): Promise<ResolvedApprovalRequest[]> {
-  const { userId, grantedBy, action, requests } = decision;
+  const { userId, grantedBy, action, selection, requests } = decision;
   // Internal callers still get an explicit closed vocabulary; an unknown action
   // must never become a grant merely because it is not spelled "deny".
   if (!RESOLUTION_ACTIONS.includes(action)) throw new Error('Unsupported approval decision');
+  if (selection !== 'targeted' && selection !== 'bulk') {
+    throw new Error('Unsupported approval selection');
+  }
+  if (selection === 'targeted' && requests.length !== 1) {
+    throw new Error('A targeted approval must name exactly one request');
+  }
   const status = action === 'deny' ? 'denied' : 'granted';
   const resolvedRequests: ResolvedApprovalRequest[] = [];
 
   const oneUseGranted: ApprovalResolutionRequest[] = [];
   for (const req of requests) {
+    // One-use consent is a plain grant to one exact request. A batch that
+    // happened to find only one row is still a batch; a scope cannot be
+    // smuggled in by labelling it targeted. Bulk denial remains restrictive.
+    if (req.scope_key && action !== 'deny' && (selection !== 'targeted' || action !== 'grant')) {
+      continue;
+    }
     const grantedTools = action !== 'deny' ? [req.tool + (req.args ? `(${req.args})` : '')] : null;
     // A one-use grant is spent once whatever the reply said: never a
     // session, agent or studio grant.

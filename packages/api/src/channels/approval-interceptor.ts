@@ -286,6 +286,10 @@ export async function checkApprovalResponse(
     userId,
     grantedBy,
     action,
+    selection:
+      numberedSelections || isAllOrScoped || (action !== 'grant' && action !== 'deny')
+        ? 'bulk'
+        : 'targeted',
     requests: targetRequests,
   });
 

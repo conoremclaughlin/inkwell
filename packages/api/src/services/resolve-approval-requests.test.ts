@@ -100,12 +100,14 @@ function pending(overrides: Partial<Row> = {}): Row {
 function resolve(
   db: ReturnType<typeof database>,
   action: ApprovalResolutionAction = 'grant',
-  requests = [request()]
+  requests = [request()],
+  selection: 'targeted' | 'bulk' = 'targeted'
 ) {
   return resolveApprovalRequests(db.client, {
     userId: 'owner-a',
     grantedBy: 'platform:fixture',
     action,
+    selection,
     requests,
   });
 }
@@ -201,10 +203,11 @@ describe('resolveApprovalRequests', () => {
     expect(wake).not.toHaveBeenCalled();
   });
 
-  it('repeated ids do not duplicate the successful decision or wake', async () => {
+  it('a targeted decision cannot disguise multiple ids or duplicate one id', async () => {
     const db = database([pending()]);
-    expect(await resolve(db, 'grant', [request(), request()])).toHaveLength(1);
-    expect(wake).toHaveBeenCalledTimes(1);
+    await expect(resolve(db, 'grant', [request(), request()])).rejects.toThrow('exactly one');
+    expect(db.writes).toEqual([]);
+    expect(wake).not.toHaveBeenCalled();
   });
 
   it.each([null, undefined, [], [{ id: 'request-a' }, { id: 'extra' }], { id: 'request-a' }])(
@@ -236,15 +239,6 @@ describe('resolveApprovalRequests', () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
-  it('one failed wake does not suppress a second winning requester', async () => {
-    const db = database([pending(), pending({ id: 'request-b' })]);
-    wake.mockRejectedValueOnce(new Error('fixture wake failed'));
-    expect(
-      await resolve(db, 'grant', [request(), request({ id: 'request-b', session_id: 'session-b' })])
-    ).toHaveLength(2);
-    expect(wake).toHaveBeenCalledTimes(2);
-  });
-
   it.each(['grant', 'grant-session', 'grant-agent', 'grant-studio', 'allow', 'deny'] as const)(
     'preserves ordinary request action %s without a one-use wake',
     async (action) => {
@@ -256,12 +250,47 @@ describe('resolveApprovalRequests', () => {
     }
   );
 
-  it('retains one-use grant normalization independently of the transport filter', async () => {
+  it.each(['grant-session', 'grant-agent', 'grant-studio', 'allow'] as const)(
+    'a scoped action %s cannot grant one-use consent even when labelled targeted',
+    async (action) => {
+      const db = database([pending()]);
+      expect(await resolve(db, action)).toEqual([]);
+      expect(db.writes).toEqual([]);
+      expect(wake).not.toHaveBeenCalled();
+    }
+  );
+
+  it('a bulk approval cannot grant a lone one-use request', async () => {
     const db = database([pending()]);
-    expect(await resolve(db, 'grant-session')).toEqual([
-      { id: 'request-a', tool: 'Bash', action: 'grant', sbSlug: 'fixture-sb' },
-    ]);
-    expect(db.writes[0].payload.action).toBe('grant');
+    expect(await resolve(db, 'grant', [request()], 'bulk')).toEqual([]);
+    expect(db.writes).toEqual([]);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it('bulk approval keeps ordinary rows but drops one-use rows', async () => {
+    const db = database([pending(), pending({ id: 'ordinary' })]);
+    expect(
+      await resolve(db, 'grant', [request(), request({ id: 'ordinary', scope_key: null })], 'bulk')
+    ).toEqual([{ id: 'ordinary', tool: 'Bash', action: 'grant', sbSlug: 'fixture-sb' }]);
+    expect(db.rows[0].status).toBe('pending');
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it('bulk denial still restricts one-use and ordinary requests without waking', async () => {
+    const db = database([pending(), pending({ id: 'ordinary' })]);
+    expect(
+      await resolve(db, 'deny', [request(), request({ id: 'ordinary', scope_key: null })], 'bulk')
+    ).toHaveLength(2);
+    expect(db.rows.map(({ status }) => status)).toEqual(['denied', 'denied']);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it('missing or unknown selection cannot turn into targeted consent', async () => {
+    const db = database([pending()]);
+    await expect(resolve(db, 'grant', [request()], 'unknown' as 'targeted')).rejects.toThrow(
+      'Unsupported approval selection'
+    );
+    expect(db.writes).toEqual([]);
   });
 
   it('a granted request without a session does not guess a wake destination', async () => {

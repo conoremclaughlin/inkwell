@@ -869,3 +869,15 @@ describe('one-use approval notifications (spec automated-turn-permissions §3.5)
     expect(msg).not.toContain('approve session*');
   });
 });
+
+it('a scoped approval alias cannot grant a lone one-use request', async () => {
+  const oneUse = {
+    ...mockRow({ id: 'one-use', tool: 'Bash', session_id: null }),
+    scope_key: 'fixture',
+  };
+  currentState = makeState({ pendingSelectResult: { data: [oneUse], error: null } });
+  expect(await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve for session')).toEqual({
+    intercepted: false,
+  });
+  expect(currentState.updateCalledWith).toBeNull();
+});
