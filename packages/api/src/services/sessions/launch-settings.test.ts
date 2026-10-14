@@ -325,3 +325,149 @@ describe('the effective sources are recorded, precedence labelled documented, no
     expect(result.sources.map((s) => s.scope)).not.toContain('local (main checkout)');
   });
 });
+
+describe('automated mode: yolo for automated turns (spec automated-turn-permissions §3.2–3.3)', () => {
+  const automated = (extra: Record<string, unknown> = {}) =>
+    request({ mode: 'automated', mcpServers: ['inkwell', 'playwright'], ...extra });
+
+  it('carries the automated rules, every configured MCP server and the ironclad denies', async () => {
+    const result = await launch.prepareLaunchSettings(automated());
+    const { allow, deny } = fileOf(result.hostPath).permissions;
+    expect(result.delivered).toBe('automated');
+    expect(result.mode).toBe('automated');
+    expect(allow).toEqual(
+      expect.arrayContaining([
+        'Bash(*)',
+        'Read(//**)',
+        'Edit(//**)',
+        'mcp__inkwell__*',
+        'mcp__playwright__*',
+      ])
+    );
+    expect(deny).toEqual([...shared.IRONCLAD_DENY_RULES]);
+  });
+
+  it('the root studio, or a spawn with no studio, needs no profile and no owner', async () => {
+    const result = await launch.prepareLaunchSettings(
+      automated({ profile: undefined, owner: undefined, mainRoot: null })
+    );
+    expect(result.profile).toBeNull();
+    expect(fileOf(result.hostPath).permissions.deny).toContain('mcp__github__merge_pull_request');
+  });
+
+  it('a reviewer keeps its own denies on top', async () => {
+    const result = await launch.prepareLaunchSettings(automated({ profile: 'reviewer' }));
+    const { deny } = fileOf(result.hostPath).permissions;
+    expect(deny).toEqual(expect.arrayContaining(['Bash(git commit *)', 'Bash(git push *)']));
+    expect(result.profile).toBe('reviewer');
+  });
+
+  it('an authored builder policy does not suppress it, and is left untouched on disk', async () => {
+    const authored = JSON.stringify({ permissions: { allow: [], deny: ['Bash(git commit *)'] } });
+    writeFileSync(join(worktree, '.claude', 'settings.local.json'), authored);
+    const result = await launch.prepareLaunchSettings(automated());
+    expect(result.delivered).toBe('automated');
+    expect(fileOf(result.hostPath).permissions.allow).toContain('Bash(*)');
+    expect(readFileSync(join(worktree, '.claude', 'settings.local.json'), 'utf-8')).toBe(authored);
+  });
+
+  it('a profile string that is not a profile is still refused', async () => {
+    await expect(launch.prepareLaunchSettings(automated({ profile: 'admin' }))).rejects.toThrow(
+      launch.LaunchSettingsError
+    );
+    expect(existsSync(out) ? readdirSync(out) : []).toEqual([]);
+  });
+
+  it('an MCP server name that would not form a rule refuses the launch', async () => {
+    await expect(
+      launch.prepareLaunchSettings(automated({ mcpServers: ['inkwell', 'evil*'] }))
+    ).rejects.toThrow(launch.LaunchSettingsError);
+  });
+
+  it('the working-directory check still applies: a fallback directory is refused', async () => {
+    await expect(
+      launch.prepareLaunchSettings(automated({ studioWorktreePath: mainRoot }))
+    ).rejects.toThrow(/not the studio's worktree/);
+  });
+
+  it('an unknown mode is refused, never read as profile', async () => {
+    await expect(launch.prepareLaunchSettings(request({ mode: 'yolo' }))).rejects.toThrow(
+      launch.LaunchSettingsError
+    );
+  });
+
+  it('standard mode is unchanged: the builder profile, delivered as profile', async () => {
+    const result = await launch.prepareLaunchSettings(request());
+    expect(result.delivered).toBe('profile');
+    expect(result.mode).toBe('profile');
+    expect(fileOf(result.hostPath).permissions.allow).not.toContain('Edit(//**)');
+  });
+});
+
+describe('every rule written is one Claude Code accepts: -p ignores a file that fails validation', () => {
+  it.each([
+    'Bash(*)',
+    'Read(//**)',
+    'WebSearch',
+    'mcp__inkwell__*',
+    'mcp__github__merge_pull_request',
+    'Bash(git push * +*)',
+    'Bash(echo (a) b)',
+  ])('accepts %s', (rule) => {
+    expect(launch.isValidPermissionRule(rule)).toBe(true);
+  });
+
+  it.each(['', 'Bash()', 'Bash(x', 'Bash(x))', 'bash(x)', 'Bash(a\nb)', 'mcp__', 'mcp__a b__*', 7])(
+    'rejects %j',
+    (rule) => {
+      expect(launch.isValidPermissionRule(rule)).toBe(false);
+    }
+  );
+
+  it('every rule of every profile and both modes passes', () => {
+    const all = [
+      ...shared.studioPermissionRules('builder', 'wren').allow,
+      ...shared.studioPermissionRules('builder', 'wren').deny,
+      ...shared.studioPermissionRules('reviewer', 'wren').allow,
+      ...shared.studioPermissionRules('reviewer', 'wren').deny,
+      ...shared.automatedLaunchRules({ profile: 'reviewer', mcpServers: ['inkwell'] }).allow,
+      ...shared.automatedLaunchRules({ profile: 'reviewer', mcpServers: ['inkwell'] }).deny,
+    ];
+    expect(all.filter((rule) => !launch.isValidPermissionRule(rule))).toEqual([]);
+  });
+});
+
+describe('readMcpServerNames', () => {
+  it('lists the configured servers, and none when there is no mcpServers key', async () => {
+    const path = join(root, 'mcp.json');
+    writeFileSync(path, JSON.stringify({ mcpServers: { inkwell: {}, playwright: {} } }));
+    expect(await launch.readMcpServerNames(path)).toEqual(['inkwell', 'playwright']);
+    writeFileSync(path, JSON.stringify({}));
+    expect(await launch.readMcpServerNames(path)).toEqual([]);
+  });
+
+  it('a missing or unparseable file refuses rather than reading as no servers', async () => {
+    await expect(launch.readMcpServerNames(join(root, 'absent.json'))).rejects.toThrow(
+      launch.LaunchSettingsError
+    );
+    const path = join(root, 'bad.json');
+    writeFileSync(path, '{');
+    await expect(launch.readMcpServerNames(path)).rejects.toThrow(launch.LaunchSettingsError);
+  });
+});
+
+describe('the grammar guard is reached on the launch path, not only as a helper', () => {
+  it('a rule set carrying a malformed rule refuses the launch and writes no file', async () => {
+    const spy = vi
+      .spyOn(shared, 'automatedLaunchRules')
+      .mockReturnValue({ allow: ['Bash(*)'], deny: ['Bash(git push --force'] });
+    try {
+      await expect(
+        launch.prepareLaunchSettings(request({ mode: 'automated', mcpServers: [] }))
+      ).rejects.toThrow(/Claude Code rejects/);
+      expect(existsSync(out) ? readdirSync(out) : []).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

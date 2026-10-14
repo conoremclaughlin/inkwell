@@ -375,6 +375,99 @@ export function studioPermissionRules(
   };
 }
 
+// ============================================================================
+// Automated turns: yolo with ironclad denies (spec automated-turn-permissions)
+// ============================================================================
+
+/**
+ * Skipping the hooks on a commit: `--no-verify`, or its short form `-n`.
+ * Backstops: a combined short flag (`-an`) or a script still gets through.
+ */
+export const NO_VERIFY_COMMIT_DENY_RULES: readonly string[] = [
+  'git commit',
+  'git -C * commit',
+].flatMap((commit) => [
+  `Bash(${commit} *--no-verify*)`,
+  `Bash(${commit} -n *)`,
+  `Bash(${commit} * -n *)`,
+  `Bash(${commit} * -n)`,
+]);
+
+/**
+ * The rules no automated turn is pre-approved to break, yolo included.
+ * Conor, 2026-10-06: "yolo should keep these ironclad rules about no push to
+ * main, no force-push, and no merging PRs without review still apply."
+ * AGENTS.md adds `--no-verify`, and migrations go through `yarn db:migrate`.
+ *
+ *   - the builder's push denies: force, a `+` refspec, main as the
+ *     destination, `--no-verify`, and the wholesale ref rewrites;
+ *   - `--no-verify` on a commit;
+ *   - merging a pull request, by the GitHub tool or `gh pr merge`;
+ *   - writing a branch or a repository without a push or a PR: the GitHub
+ *     tools that write files directly, or delete a repository;
+ *   - applying a migration through the Supabase tool.
+ *
+ * Backstops, like every Bash deny here (see the module comment).
+ */
+export const IRONCLAD_DENY_RULES: readonly string[] = [
+  ...new Set([
+    ...STUDIO_PUSH_RULES.deny,
+    ...NO_VERIFY_COMMIT_DENY_RULES,
+    'mcp__github__merge_pull_request',
+    'Bash(gh pr merge*)',
+    'Bash(gh * pr merge*)',
+    'mcp__github__push_files',
+    'mcp__github__create_or_update_file',
+    'mcp__github__delete_file',
+    'mcp__github__delete_repository',
+    'mcp__supabase__apply_migration',
+    'mcp__supabase__execute_sql',
+  ]),
+];
+
+/**
+ * An MCP server name that can be put in an `mcp__<server>__*` rule. Claude
+ * Code has no cross-server wildcard, so each configured server is named.
+ */
+export const MCP_SERVER_NAME_FOR_RULES = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * The rules an automated turn gets when the server runs yolo
+ * (`INK_AUTOMATED_TURNS=yolo`): no prompt for the everyday tools, the shell,
+ * reads and edits anywhere, the web, every MCP server the launch connects,
+ * and the ironclad denies. A reviewer launch keeps the reviewer's own denies
+ * as well, because the code under review must not be able to commit or push
+ * through it. Stored denies in the checkout's settings still apply beside
+ * these (deny wins across sources; documented, not measured).
+ *
+ * `Read(//**)` and `Edit(//**)` are absolute already, so the launch file
+ * keeps them as written. Throws on an MCP server name that would not form a
+ * server-scoped rule.
+ */
+export function automatedLaunchRules(options: {
+  profile?: StudioPermissionProfile;
+  mcpServers: readonly string[];
+}): ClaudePermissionRules {
+  for (const server of options.mcpServers) {
+    if (!MCP_SERVER_NAME_FOR_RULES.test(server)) {
+      throw new Error(`not an MCP server name that can form a rule: ${JSON.stringify(server)}`);
+    }
+  }
+  const allow = [
+    'Bash(*)',
+    'Read(//**)',
+    'Edit(//**)',
+    'WebFetch(*)',
+    'WebSearch',
+    ...options.mcpServers.map((server) => `mcp__${server}__*`),
+  ];
+  const deny = [
+    ...IRONCLAD_DENY_RULES,
+    ...(options.profile === 'reviewer' ? STUDIO_REVIEWER_RULES.deny : []),
+  ];
+  return { allow: [...new Set(allow)], deny: [...new Set(deny)] };
+}
+
 /** The studio record fields the profile is read from. */
 export interface StudioProfileRecord {
   branch?: string | null;

@@ -34,7 +34,11 @@ import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
 import { isGroupId, stopProcessAndWait } from './stop-process.js';
 import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
-import { prepareLaunchSettings, type LaunchSettings } from './launch-settings.js';
+import {
+  prepareLaunchSettings,
+  readMcpServerNames,
+  type LaunchSettings,
+} from './launch-settings.js';
 import { uploadMediaForRunner } from '../uploads/runner-media.js';
 import { uploadsRoot } from '../uploads/runtime.js';
 
@@ -504,7 +508,16 @@ export class ClaudeRunner implements IRunner {
     let launchSettings: LaunchSettings | null = null;
     if (config.launchPermissions && config.workingDirectory) {
       try {
+        const mode = config.launchPermissions.mode ?? 'profile';
         launchSettings = await prepareLaunchSettings({
+          mode,
+          ...(mode === 'automated'
+            ? {
+                mcpServers: config.mcpConfigPath
+                  ? await readMcpServerNames(config.mcpConfigPath)
+                  : [],
+              }
+            : {}),
           worktreePath: config.workingDirectory,
           studioWorktreePath: config.launchPermissions.worktreePath,
           mainRoot: config.launchPermissions.mainRoot,
@@ -533,6 +546,7 @@ export class ClaudeRunner implements IRunner {
       logger.info('Launch settings delivered', {
         launchId: launchSettings.launchId,
         studioId: config.studioId,
+        mode: launchSettings.mode,
         profile: launchSettings.profile,
         delivered: launchSettings.delivered,
         sources: launchSettings.sources,
