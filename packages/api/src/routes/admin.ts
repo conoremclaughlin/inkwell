@@ -11538,10 +11538,35 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
 
     // Auto-expire if past deadline and still pending
     if (data.status === 'pending' && new Date(data.expires_at) < new Date()) {
-      await supabase
+      // Expire only a row still pending: a grant that raced this poll must
+      // not be overwritten by it (Lumen, #853).
+      const { data: expired } = await supabase
         .from('approval_requests')
         .update({ status: 'expired', resolved_at: new Date().toISOString() })
-        .eq('id', requestId);
+        .eq('id', requestId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('status', 'pending')
+        .select('id');
+      if (!Array.isArray(expired) || expired.length !== 1) {
+        const { data: current } = await supabase
+          .from('approval_requests')
+          .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at')
+          .eq('id', requestId)
+          .eq('user_id', authReq.inkUserId)
+          .single();
+        if (current) {
+          res.json({
+            requestId: current.id,
+            status: current.status,
+            action: current.action,
+            grantedTools: current.granted_tools,
+            grantedBy: current.granted_by,
+            expiresAt: current.expires_at,
+            resolvedAt: current.resolved_at,
+          });
+          return;
+        }
+      }
 
       res.json({
         requestId: data.id,

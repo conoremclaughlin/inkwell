@@ -210,9 +210,14 @@ function installSelectMock(result: SelectResult, updateSpy?: ReturnType<typeof v
       }),
       update: vi.fn().mockImplementation((updates: Record<string, unknown>) => {
         updateSpy?.(updates);
-        return {
-          eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+        // eq(id).eq(user_id).eq(status, pending).select(id): the expiry write
+        // changes the row, so it reads back one.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const chain: any = {
+          eq: vi.fn(() => chain),
+          select: vi.fn().mockResolvedValue({ data: [{ id: result.data?.id }], error: null }),
         };
+        return chain;
       }),
     };
   });
@@ -811,5 +816,61 @@ describe('one-use approval requests are scoped to the signed session', () => {
       noCwd as unknown as Response
     );
     expect(noCwd._status).toBe(400);
+  });
+});
+
+describe('status polling never overwrites a grant that raced it (Lumen, #853)', () => {
+  it('when the expiry write changes nothing, the current row is returned, not "expired"', async () => {
+    const statusHandler = findRouteHandler('get', '/approval-requests/:requestId/status')!;
+    let reads = 0;
+    mockSupabaseFrom.mockImplementation(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const readChain: any = {
+        eq: vi.fn(() => readChain),
+        single: vi.fn(async () => {
+          reads += 1;
+          // First read: still pending and past its deadline. Second read,
+          // after the lost expiry write: granted by the race winner.
+          return reads === 1
+            ? {
+                data: {
+                  id: 'req-raced',
+                  status: 'pending',
+                  action: null,
+                  granted_tools: null,
+                  granted_by: null,
+                  expires_at: pastIso(1),
+                  resolved_at: null,
+                  created_at: new Date().toISOString(),
+                },
+                error: null,
+              }
+            : {
+                data: {
+                  id: 'req-raced',
+                  status: 'granted',
+                  action: 'grant',
+                  granted_tools: ['Bash(x)'],
+                  granted_by: 'platform:telegram:100200300',
+                  expires_at: pastIso(1),
+                  resolved_at: new Date().toISOString(),
+                },
+                error: null,
+              };
+        }),
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const writeChain: any = {
+        eq: vi.fn(() => writeChain),
+        select: vi.fn().mockResolvedValue({ data: [], error: null }),
+      };
+      return { select: vi.fn(() => readChain), update: vi.fn(() => writeChain) };
+    });
+    const res = createMockRes();
+    await statusHandler(
+      createAuthenticatedReq({ params: { requestId: 'req-raced' } }) as Request,
+      res as unknown as Response
+    );
+    expect(res._json).toMatchObject({ status: 'granted', action: 'grant' });
   });
 });

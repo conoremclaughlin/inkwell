@@ -293,22 +293,37 @@ export async function checkApprovalResponse(
     // session, agent or studio grant.
     const resolvedAction = req.scope_key && action !== 'deny' ? 'grant' : action;
 
-    const { error: updateError } = await supabase
+    // Optimistic lock: still pending, still this user's, not yet expired. Only
+    // a write that changed the row counts: the loser of a race, or a request
+    // that expired between the read and the write, is neither reported nor
+    // woken (Lumen, #853). PostgREST reports success for zero rows, so the
+    // changed rows are read back.
+    const nowIso = new Date().toISOString();
+    const { data: changed, error: updateError } = await supabase
       .from('approval_requests')
       .update({
         status,
         action: resolvedAction,
         granted_tools: grantedTools,
         granted_by: grantedBy,
-        resolved_at: new Date().toISOString(),
+        resolved_at: nowIso,
       })
       .eq('id', req.id)
-      .eq('status', 'pending'); // Optimistic lock
+      .eq('status', 'pending')
+      .eq('user_id', userId)
+      .gt('expires_at', nowIso)
+      .select('id');
 
     if (updateError) {
       logger.error('Failed to resolve approval request', {
         requestId: req.id,
         error: updateError,
+      });
+      continue;
+    }
+    if (!Array.isArray(changed) || changed.length !== 1) {
+      logger.info('Approval request was resolved elsewhere or expired first; not resolved here', {
+        requestId: req.id,
       });
       continue;
     }
