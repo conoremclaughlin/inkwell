@@ -408,6 +408,56 @@ describe('spawnBackend (mocked process boundary)', () => {
     await result;
   });
 
+  // claude puts its per-uid temp directory under CLAUDE_CODE_TMPDIR, else
+  // under /tmp. An operator who confines a turn to its own directory can only
+  // do that if the setting reaches the provider child, by its exact name and
+  // value. Synthetic values only; spawn is the mock above.
+  describe('CLAUDE_CODE_TMPDIR reaches the child by exact name', () => {
+    const tmpdir = '/synthetic/run-1/tmp/claude';
+    const spawnedEnv = async (parentEnv: Record<string, string>) => {
+      const { result } = spawnBackend({ binary: 'claude', args: ['--print'], parentEnv });
+      const env = spawnMock.mock.calls.at(-1)![2].env as Record<string, string | undefined>;
+      child.emit('close', 0);
+      await result;
+      return env;
+    };
+
+    it('crosses unchanged', async () => {
+      const env = await spawnedEnv({ CLAUDE_CODE_TMPDIR: tmpdir });
+      expect(env.CLAUDE_CODE_TMPDIR).toBe(tmpdir);
+    });
+
+    it('near-miss names and unrelated secret-shaped names do not cross beside it', async () => {
+      const env = await spawnedEnv({
+        CLAUDE_CODE_TMPDIR: tmpdir,
+        CLAUDE_CODE_TMPDIR_EXTRA: '/synthetic/extra',
+        CLAUDE_CODE_TMPDIRS: '/synthetic/plural',
+        claude_code_tmpdir: '/synthetic/lowercase',
+        CLAUDE_TMPDIR: '/synthetic/legacy-alias',
+        JWT_SECRET: 'synthetic-signing-key',
+        SUPABASE_SECRET_KEY: 'synthetic-service-key',
+        TELEGRAM_BOT_TOKEN: 'synthetic-bot-token',
+      });
+      expect(env.CLAUDE_CODE_TMPDIR).toBe(tmpdir);
+      for (const name of [
+        'CLAUDE_CODE_TMPDIR_EXTRA',
+        'CLAUDE_CODE_TMPDIRS',
+        'claude_code_tmpdir',
+        'CLAUDE_TMPDIR',
+        'JWT_SECRET',
+        'SUPABASE_SECRET_KEY',
+        'TELEGRAM_BOT_TOKEN',
+      ]) {
+        expect(Object.keys(env), name).not.toContain(name);
+      }
+    });
+
+    it('is not manufactured when the parent has none', async () => {
+      const env = await spawnedEnv({ PATH: '/usr/bin' });
+      expect(Object.keys(env)).not.toContain('CLAUDE_CODE_TMPDIR');
+    });
+  });
+
   // The result settles when the child has stopped, never merely because a
   // signal was sent: a host that releases a run on this promise must not free
   // it while the process still runs, and the turn's temp files must outlive
