@@ -5,6 +5,33 @@ export const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 export const MAX_TEXT = 12_000;
 export const MAX_FIELDS = 40;
 export const BRIDGE_PATH = '/browser-companion';
+export const PAIRING_PATH = `${BRIDGE_PATH}/pair`;
+
+/** Public commitment only. Neither an installation secret nor a code belongs in a URL. */
+export function pairingApprovalPath(
+  installationId: string,
+  installationCommitment: string
+): string {
+  return `${PAIRING_PATH}#${new URLSearchParams({ installationId, installationCommitment })}`;
+}
+
+export function parsePairingOffer(fragment: string): {
+  installationId: string;
+  installationCommitment: string;
+} | null {
+  const params = new URLSearchParams(fragment.replace(/^#/, ''));
+  const installationId = params.get('installationId') ?? '';
+  const installationCommitment = params.get('installationCommitment') ?? '';
+  if (
+    [...params.keys()].length !== 2 ||
+    params.getAll('installationId').length !== 1 ||
+    params.getAll('installationCommitment').length !== 1 ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(installationId) ||
+    !/^[0-9a-f]{64}$/.test(installationCommitment)
+  )
+    return null;
+  return { installationId, installationCommitment };
+}
 
 /** Recovery is read-only and explicitly scoped, never the dashboard's current selection. */
 export function browserRecoveryPath(key: string, workspaceId: string | null): string {

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import background from './entrypoints/background';
 import type { CompanionState } from './state';
 import type { BrowserSnapshot, FillProposal } from './protocol';
+import { webcrypto } from 'node:crypto';
+import type { PairingRecord, PairingView } from './pairing';
 
 type Handler = (
   message: Record<string, unknown>,
@@ -14,6 +16,7 @@ let handler: Handler;
 let removed: (id: number) => void;
 let updated: (id: number, change: chrome.tabs.OnUpdatedInfo) => void;
 let stored: CompanionState;
+let pairingStored: PairingRecord | undefined;
 let fake: ReturnType<typeof makeChrome>;
 const snapshot = (): BrowserSnapshot => ({
   version: 1,
@@ -52,10 +55,22 @@ function makeChrome() {
     },
     storage: {
       session: {
-        get: vi.fn(async () => ({ companion: stored })),
-        set: vi.fn(async ({ companion }: { companion: CompanionState }) => {
-          stored = companion;
-        }),
+        setAccessLevel: vi.fn(async () => undefined),
+        get: vi.fn(async (key: string) =>
+          key === 'pairing' ? { pairing: pairingStored } : { companion: stored }
+        ),
+        set: vi.fn(
+          async ({
+            companion,
+            pairing,
+          }: {
+            companion?: CompanionState;
+            pairing?: PairingRecord;
+          }) => {
+            if (companion) stored = companion;
+            if (pairing) pairingStored = structuredClone(pairing);
+          }
+        ),
       },
     },
     action: { onClicked: { addListener: vi.fn() } },
@@ -91,6 +106,14 @@ async function request(
   return new Promise((resolve) => handler(message, sender, resolve as (value: unknown) => void));
 }
 beforeEach(() => {
+  pairingStored = undefined;
+  vi.stubGlobal('crypto', webcrypto);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('Unmocked fetch is forbidden in this suite.');
+    })
+  );
   stored = {
     sourceTabId: 1,
     documentId: 'source-doc',
@@ -250,5 +273,77 @@ describe('privileged companion message boundaries (all browser IO mocked)', () =
     background.main();
     const result = await request({ type: 'state' });
     expect(result.value).toEqual(before);
+  });
+});
+
+describe('installed pairing message wiring (all Chrome and fetch IO mocked)', () => {
+  it('refuses website and bridge pairing messages before session storage is touched', async () => {
+    for (const sender of [bridge(), { id: extensionId, url: 'https://fixture.test' }]) {
+      for (const type of ['pair:prepare', 'pair:claim', 'pair:disconnect', 'pair:status'])
+        expect((await request({ type, origin: 'http://localhost:3002' }, sender)).ok).toBe(false);
+    }
+    expect(fake.storage.session.setAccessLevel).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('fails closed rather than putting credentials in an unprotected storage area', async () => {
+    fake.storage.session.setAccessLevel.mockRejectedValue(new Error('synthetic storage refusal'));
+    expect((await request({ type: 'pair:prepare', origin: 'http://localhost:3002' })).ok).toBe(
+      false
+    );
+    expect(fake.tabs.create).not.toHaveBeenCalled();
+    expect(fake.storage.session.set).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('opens only the fixed approval path and keeps credentials out of generic state', async () => {
+    const ready = await request({ type: 'pair:prepare', origin: 'http://localhost:49322' });
+    expect(ready.ok).toBe(true);
+    expect(fake.storage.session.setAccessLevel).toHaveBeenCalledWith({
+      accessLevel: 'TRUSTED_CONTEXTS',
+    });
+    const url = new URL((ready.value as PairingView).approvalUrl!);
+    expect(url.origin).toBe('http://localhost:49322');
+    expect(url.pathname).toBe('/browser-companion/pair');
+    expect(url.search).toBe('');
+    expect(fake.tabs.create).toHaveBeenCalledWith({ url: url.href });
+    expect(JSON.stringify(ready)).not.toContain(pairingStored!.installationSecret);
+    const state = await request({ type: 'state' });
+    expect(state.value).toEqual(stored);
+    expect(JSON.stringify(state)).not.toContain(pairingStored!.installationSecret);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('lets Disconnect reach the fence while the real claim adapter waits', async () => {
+    await request({ type: 'pair:prepare', origin: 'http://localhost:3002' });
+    let finish!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({ revoked: true, grantId: '00000000-0000-4000-8000-000000000001' })
+      )
+    );
+    const claim = request({ type: 'pair:claim', code: 'ABCDEFGHJKLM' });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    expect((await request({ type: 'pair:disconnect' })).value).toMatchObject({
+      phase: 'disconnected',
+      revocation: 'pending',
+    });
+    finish(
+      new Response(
+        JSON.stringify({
+          grantId: '00000000-0000-4000-8000-000000000001',
+          pairingSecret: 'ink-bc-' + 'a'.repeat(64),
+          expiresAt: '2099-01-01T00:00:00Z',
+          storage: 'session',
+        })
+      )
+    );
+    expect((await claim).value).toMatchObject({ phase: 'disconnected' });
+    await vi.waitFor(() => expect(pairingStored?.revocation).toBe('confirmed'));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify((await request({ type: 'state' })).value)).not.toContain('ink-bc-');
   });
 });

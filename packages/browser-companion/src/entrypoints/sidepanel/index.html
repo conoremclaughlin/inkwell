@@ -13,6 +13,35 @@
     </header>
     <main>
       <section>
+        <h2>Connect to Inkwell</h2>
+        <label for="origin">Inkwell dashboard (web port)</label>
+        <input id="origin" value="http://localhost:3002" spellcheck="false" />
+        <button id="pair-open" data-pairing>Open pairing approval ↗</button>
+        <p class="small">
+          Approve this installation in your signed-in dashboard, then enter its code below. Pairing
+          grants no page access.
+        </p>
+        <label for="pair-code">Pairing code</label>
+        <input
+          id="pair-code"
+          autocomplete="off"
+          spellcheck="false"
+          maxlength="20"
+          placeholder="ABCD-EFGH-JKLM"
+        />
+        <div class="row">
+          <button id="pair-claim" data-pairing>Pair this browser</button>
+          <button id="pair-disconnect" data-pairing class="secondary">Disconnect</button>
+        </div>
+        <p id="pair-origin" class="small"></p>
+        <p id="pair-status" role="status" aria-live="polite"></p>
+        <button id="pair-retry" data-pairing class="secondary">Retry remote revocation</button>
+        <p class="small">
+          Pairing credentials stay in extension session storage, never local or sync storage.
+          Closing the panel does not end the browser session.
+        </p>
+      </section>
+      <section>
         <h2>01 · Capture deliberately</h2>
         <p>
           Click the extension icon on your source page first. Selected text is the default; nothing
@@ -39,14 +68,11 @@
         </p>
         <p id="privacy" class="warning"></p>
         <pre id="preview"></pre>
-        <label for="origin">Inkwell dashboard (web port)</label
-        ><input id="origin" value="http://localhost:3002" spellcheck="false" /><button id="share">
-          Review in Inkwell ↗
-        </button>
+        <button id="share">Review in Inkwell ↗</button>
         <p class="small">
           Access is granted only to this dashboard host. Chrome host grants cover all ports; the
-          companion uses the exact origin above. No account token is stored in the extension.
-          Sending shares context with the SB and its model provider; copies may remain in
+          companion uses the exact origin above. No general dashboard token is stored in the
+          extension. Sending shares context with the SB and its model provider; copies may remain in
           transcripts, logs or later summaries. Do not share credentials.
         </p>
       </section>

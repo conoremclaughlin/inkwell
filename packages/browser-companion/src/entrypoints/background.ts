@@ -9,10 +9,11 @@ import {
 } from '../protocol';
 import { connectDashboard } from '../dashboard-bridge';
 import type { CompanionState, Reply } from '../state';
+import { createPairingClient, parsePairingRecord } from '../pairing';
 
 export default defineBackground(() => {
-  // MV3 suspension is normal. Persist only transient state, never tokens,
-  // captures in sync/local storage, or assumed liveness from a keepalive port.
+  // MV3 suspension is normal. Captures and pairing material use session
+  // storage only. General dashboard credentials are never accepted here.
   const read = async (): Promise<CompanionState> =>
     (await chrome.storage.session.get('companion')).companion || {};
   const write = (state: CompanionState) => chrome.storage.session.set({ companion: state });
@@ -27,6 +28,36 @@ export default defineBackground(() => {
       sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('sidepanel.html')
     );
   };
+  let pairing: Promise<ReturnType<typeof createPairingClient>> | undefined;
+  function getPairing() {
+    return (pairing ??= (async () => {
+      // Fail closed if trusted-only session storage is unavailable. Do not
+      // fall back to local/sync, or expose these values in the generic state.
+      await chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+      return createPairingClient({
+        read: async () => parsePairingRecord((await chrome.storage.session.get('pairing')).pairing),
+        write: async (value) => {
+          await chrome.storage.session.set({ pairing: value });
+        },
+      });
+    })());
+  }
+  async function pairingAction(message: Record<string, unknown>) {
+    const client = await getPairing();
+    if (message.type === 'pair:status') return client.status();
+    if (message.type === 'pair:disconnect') return client.disconnect();
+    if (message.type === 'pair:retry-revocation') return client.retryRevocation();
+    if (message.type === 'pair:claim') return client.claim(String(message.code ?? ''));
+    if (message.type === 'pair:prepare') {
+      const origin = dashboardOrigin(String(message.origin ?? ''));
+      const state = await client.prepare(origin, () =>
+        chrome.permissions.contains({ origins: [dashboardPermission(origin)] })
+      );
+      if (state.approvalUrl) await chrome.tabs.create({ url: state.approvalUrl });
+      return state;
+    }
+    throw new Error('Unsupported pairing action.');
+  }
   const requireSnapshot = (state: CompanionState, id: unknown) => {
     if (
       !state.snapshot ||
@@ -101,6 +132,22 @@ export default defineBackground(() => {
   });
 
   chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, respond) => {
+    if (typeof message?.type === 'string' && message.type.startsWith('pair:')) {
+      // This lane never queues behind captures, page fills, or an auth fetch.
+      // In particular, Disconnect reaches its local fence while claim waits.
+      const action = isPanel(sender)
+        ? pairingAction(message)
+        : Promise.reject(new Error('Only the extension panel can request pairing.'));
+      void action.then(
+        (value) => respond({ ok: true, value }),
+        (error) =>
+          respond({
+            ok: false,
+            error: error instanceof Error ? error.message : 'Pairing unavailable.',
+          })
+      );
+      return true;
+    }
     void serialized(async () => {
       const state = await read();
       if (message?.type === 'bridge:proposal') {

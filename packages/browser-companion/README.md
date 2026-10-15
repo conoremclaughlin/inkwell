@@ -4,7 +4,8 @@ An opt-in Chrome MV3 extension for deliberately sharing page context and reviewi
 suggested field changes. Built with WXT, following Inkah's build pattern rather
 than copying its all-sites content script. No browsing recorder or background agent.
 
-The current UI is a snapshot/share/confirmed-fill prototype. It does **not** yet
+The current UI is a snapshot/share/confirmed-fill prototype with an installation
+pairing checkpoint. It does **not** yet
 provide a live conversation in the sidebar or automatic follow-up page inspection.
 The required page-aware read/chat/interact experience is being built separately.
 
@@ -33,6 +34,38 @@ Other localhost/127.0.0.1 ports work; remote dashboards require HTTPS. Existing
 dashboard authentication and API authorization are unchanged.
 
 ## First conversation
+
+### Installation pairing checkpoint
+
+Use **Open pairing approval** to open the authenticated dashboard. The extension
+creates a random installation secret and passes only its SHA-256 commitment and
+installation ID in the approval URL's fragment. The dashboard requires a human
+confirmation before minting a code, bound to the selected workspace. Paste that
+code back in the extension. If sign-in loses the request, reopen approval from
+the panel. Neither loading the link nor receiving a code starts a model turn.
+
+The worker claims the code over the fixed companion namespace with explicit
+`credentials: 'omit'`, no redirects, and the exact chosen dashboard origin.
+Pairing credentials use `storage.session`, explicitly restricted to trusted
+extension contexts; other trusted extension pages are part of this trust boundary,
+not isolated from one another. Credentials are never returned in panel messages,
+rendered, put in URLs, or stored in local/sync storage. This checkpoint does not
+mint a bearer token or admit a page; hosted chat remains unwired.
+
+**Disconnect** fences a pending claim without waiting for its network response.
+The worker attempts to revoke a late successful claim, never reattaches it. A failed revocation retains
+only the credential needed for an explicit idempotent retry. An unacknowledged
+claim is **unknown**, including after worker suspension: it is never retried.
+Without its one-time receipt the client cannot confirm remote revocation. A new
+browser session clears local pairing state, but does not revoke a server grant;
+the grant's twelve-hour expiry remains the backstop. A pending revocation blocks
+replacement within the same browser session rather than silently abandoning it.
+
+Pairing tests use synthetic Chrome APIs, storage, fetch, and dashboard responses.
+They do not demonstrate deployed migrations/proxy behavior, real-account pairing,
+native panel acceptance, or Firefox installation support.
+
+### Snapshot handoff (independent of pairing)
 
 1. On the source page, select the text you want help with and click the extension
    icon. In its panel, click **Selected text**. Larger page capture is a separate,
@@ -69,7 +102,7 @@ clicks, navigation or submission commands are accepted. Replies remain untrusted
 
 - Permissions: `activeTab`, `scripting`, `storage`, `sidePanel`, plus the dashboard
   host you explicitly approve. No always-granted sites, ambient content scripts,
-  cookies/history/debugger access or account token in the extension.
+  cookies/history/debugger access or general dashboard token in the extension.
 - Capture excludes form values, hidden/editable text, query strings and fragments.
   Titles, URL paths and visible text may still contain sensitive information.
 - Sending shares context with Inkwell, the recipient and its model provider. Copies

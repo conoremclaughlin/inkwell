@@ -105,7 +105,9 @@ footer {
 .change {
   margin-top: 12px;
 }
-#status {
+#status,
+#pair-status,
+#pair-origin {
   font-weight: 600;
   overflow-wrap: anywhere;
 }
