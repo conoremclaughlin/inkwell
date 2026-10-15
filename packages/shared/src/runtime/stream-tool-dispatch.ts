@@ -16,7 +16,8 @@ export interface StreamDispatchResult {
   extracted: ReturnType<typeof extractToolBlocks>;
   admitted: LocalToolCall[];
   notRun: Array<{ call: LocalToolCall; reason: string }>;
-  results: ToolCallResult[];
+  /** Source position orders this attempt's relay; it is not invocation identity. */
+  results: Array<ToolCallResult & Pick<LocalToolCall, 'sourceStart'>>;
   /** Partial outcomes remain available on failure; this is not a successful batch. */
   failure?: { kind: 'parser' | 'executor'; message: string };
 }
@@ -136,9 +137,9 @@ class StreamToolDispatch {
       this.wake?.();
     }
     await this.execution;
-    const results: ToolCallResult[] = [];
+    const results: StreamDispatchResult['results'] = [];
     for (const state of this.progress.values()) {
-      if (state.result) results.push(state.result);
+      if (state.result) results.push({ ...state.result, sourceStart: state.call.sourceStart });
       else if (!state.dispatched) {
         this.refuse(state.call, 'Executor failed before dispatch; not run.');
       } else {
@@ -146,6 +147,7 @@ class StreamToolDispatch {
           tool: state.call.tool,
           args: state.call.args,
           invocationId: state.invocationId,
+          sourceStart: state.call.sourceStart,
           status: 'error',
           dispatchState: 'unknown',
           error: 'Executor failed without a confirmed outcome; do not retry automatically.',

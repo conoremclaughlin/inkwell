@@ -165,9 +165,9 @@ function streamHarness(results: BackendRunResult[] = []) {
   const reportFailure = vi.fn(async () => {});
   h.ports.streamTools = { journal, ports: batch, turnId: 'synthetic-user-turn', reportFailure };
   let userTurns = 0;
-  const run = (signal?: AbortSignal) => {
+  const run = (signal?: AbortSignal, continueOnFailure = true) => {
     userTurns++;
-    return h.run(signal);
+    return h.run(signal, continueOnFailure);
   };
   const events = () => lines.map((line) => JSON.parse(line));
   return {
@@ -542,18 +542,108 @@ describe('opt-in provider-attempt stream composition', () => {
     expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
   });
 
-  it('never retries an unknown tool effect, even when ordinary failure continuation is enabled', async () => {
-    const h = streamHarness([result(tool('send_response') + '\n')]);
+  it.each([
+    ['bash', '1 failed, 3 passed. Command exited with code 1'],
+    ['read', 'Synthetic fixture file does not exist'],
+    ['send_response', 'Synthetic lost receipt'],
+  ])(
+    'relays an unknown %s outcome without automatically retrying the call',
+    async (name, error) => {
+      const h = streamHarness([result(tool(name) + '\n'), result('I will inspect the failure.')]);
+      vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error(error));
+      const done = await h.run();
+      expect(done.loop.success).toBe(true);
+      expect(done.loop.toolResults[0]).toMatchObject({ tool: name, dispatchState: 'unknown' });
+      const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+      expect(prompt).toContain(error);
+      expect(prompt).toContain('dispatchState: unknown');
+      expect(prompt).toContain('not retried automatically');
+      expect(prompt).not.toContain('none of those calls ran');
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.reportFailure).not.toHaveBeenCalled();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    }
+  );
+
+  it('relays unknown outcomes in the final-only response when failure continuation is off', async () => {
+    const h = streamHarness([result(tool('send_response') + '\n'), result(tool('send_response'))]);
+    vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic lost receipt'));
+    await h.run(undefined, false);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+    expect(prompt).toContain('FINAL');
+    expect(prompt).toContain('dispatchState: unknown');
+    expect(prompt).toContain('not retried automatically');
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.events().filter((event) => event.type === 'tool_attempt')).toHaveLength(1);
+    expect(h.reportFailure).not.toHaveBeenCalled();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+  });
+
+  it('requires a new model emission to resend a call after an unknown outcome', async () => {
+    const text = tool('read', { path: '/synthetic/fixture.txt' }) + '\n';
+    const h = streamHarness([result(text), result(text), result('Read the fixture.')]);
+    vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic read failure'));
+    const done = await h.run();
+    expect(done.loop.success).toBe(true);
+    expect(done.loop.toolResults).toMatchObject([
+      { invocationId: 'synthetic-invocation-1', dispatchState: 'unknown' },
+      { invocationId: 'synthetic-invocation-2', dispatchState: 'returned' },
+    ]);
+    expect(h.batch.callTool).toHaveBeenCalledTimes(2);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 3 });
+  });
+
+  it('does not reseed a missing provider session after an unknown effect', async () => {
+    const h = streamHarness([
+      result(tool('send_response') + '\n', { success: false, resumeFailedNoSession: true }),
+    ]);
+    h.provider.state.id = 'synthetic-missing-session';
     vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic lost receipt'));
     const done = await h.run();
     expect(done.loop.success).toBe(false);
-    expect(done.loop.toolResults[0]).toMatchObject({
-      tool: 'send_response',
-      dispatchState: 'unknown',
-    });
-    expect(h.reportFailure).toHaveBeenCalledWith(expect.stringContaining('unknown outcome'));
+    expect(done.loop.toolResults[0]).toMatchObject({ dispatchState: 'unknown' });
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
     expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
   });
+
+  it.each([false, true])(
+    'reports capped calls once, in emission order (terminal: %s)',
+    async (terminal) => {
+      const names = [
+        'remember',
+        'recall',
+        'read',
+        'list_tasks',
+        terminal ? 'signal_status' : 'bash',
+        'send_response',
+        'create_task',
+      ];
+      const h = streamHarness([
+        result(names.map((name) => tool(name)).join('\n') + '\n'),
+        result('Acknowledged.'),
+      ]);
+      vi.mocked(h.batch.callTool).mockImplementation(async (name) =>
+        name === 'signal_status'
+          ? {
+              content: [
+                { type: 'text', text: JSON.stringify({ signal: { status: 'completed' } }) },
+              ],
+            }
+          : { success: true }
+      );
+      const done = await h.run();
+      expect(done.loop.toolResults.map((entry) => entry.tool)).toEqual(names);
+      const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+      expect([...prompt.matchAll(/Tool (\w+) \(/g)].map((match) => match[1])).toEqual(names);
+      expect(prompt.match(/Per-response tool cap reached/g)).toHaveLength(2);
+      expect(prompt).not.toContain('never reached it at all');
+      expect(prompt).not.toContain('NOT EXECUTED —');
+      expect(prompt.includes('FINAL')).toBe(terminal);
+      expect(h.batch.callTool).toHaveBeenCalledTimes(5);
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    }
+  );
 
   it.each(['changed-final', 'changed-frame', 'second-message'] as const)(
     'fails closed on %s while retaining the effect already admitted',

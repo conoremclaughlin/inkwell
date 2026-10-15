@@ -35,7 +35,7 @@ const chatSource = cliSource + '\n' + providerSource + '\n' + compactionSource +
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
   const out: Array<{ at: number; literal: string }> = [];
   const re =
-    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn)\(\{|: BackendRunRequest => \(\{/g;
+    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn|runAttempt)\(\{|: BackendRunRequest => \(\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     const open = m.index + m[0].length - 1;

@@ -160,8 +160,10 @@ export async function runToolStreamingAttempt(options: {
     }
     const toolStream = await close(result.success && !controller.signal.aborted)!;
     failure ??= toolStream.failure?.message;
-    if (toolStream.results.some((entry) => entry.dispatchState === 'unknown'))
-      failure ??= 'A tool effect has an unknown outcome; this turn will not retry or reseed.';
+    // Dispatcher errors (including ordinary non-zero command exits) belong in
+    // the model's result relay, not in provider failure. Their effects remain
+    // unknown; the journal and admitted-prefix reseed guard still prevent an
+    // automatic redispatch. Only a new model emission can request another call.
     if (failure) {
       // Reporting must not discard the known effects if the alert port fails.
       try {

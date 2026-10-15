@@ -48,6 +48,8 @@ export interface ToolResultRecord {
   args?: unknown;
   invocationId?: string;
   dispatchState?: ToolCallResult['dispatchState'];
+  /** Position within the owning attempt, for reporting order only. */
+  sourceStart?: number;
   /**
    * This record says how a call was READ, not what happened to it.
    *
@@ -371,6 +373,7 @@ function streamResults(stream: StreamDispatchResult): ToolResultRecord[] {
     status: result.status,
     invocationId: result.invocationId,
     dispatchState: result.dispatchState,
+    sourceStart: result.sourceStart,
     result: result.status === 'error' ? result.error : (result.reason ?? result.result),
   }));
 }
@@ -382,7 +385,25 @@ function streamRefusals(stream: StreamDispatchResult): ToolResultRecord[] {
     status: 'not-run',
     result: reason,
     dispatchState: 'not-dispatched',
+    sourceStart: call.sourceStart,
   }));
+}
+
+/** Diagnostics without a source position keep their existing leading order. */
+function inEmissionOrder(results: ToolResultRecord[]): ToolResultRecord[] {
+  return results.sort((a, b) => (a.sourceStart ?? -1) - (b.sourceStart ?? -1));
+}
+
+/** A stream reports each refused call itself; don't repeat the batch drop note. */
+function dropsAlreadyReported(
+  dropped: ReadonlyArray<LocalToolCall>,
+  results: ReadonlyArray<ToolResultRecord>
+): boolean {
+  return dropped.every(
+    (call) =>
+      call.sourceStart !== undefined &&
+      results.some((r) => r.status === 'not-run' && r.sourceStart === call.sourceStart)
+  );
 }
 
 /**
@@ -519,11 +540,16 @@ function renderToolResults(
 function renderToolResult(r: ToolResultRecord, maxBytes: number): string {
   const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
   const tool = shortName(r.tool);
-  if (resultStr === undefined) return `Tool ${tool} (${r.status}): undefined`;
+  const uncertainty =
+    r.dispatchState === 'unknown'
+      ? '[dispatchState: unknown; outcome unknown; not retried automatically. Check effects before deciding whether to resend.]\n'
+      : '';
+  const head = `Tool ${tool} (${r.status}): ${uncertainty}`;
+  if (resultStr === undefined) return `${head}undefined`;
   const size = utf8Bytes(resultStr);
-  if (size <= maxBytes) return `Tool ${tool} (${r.status}): ${resultStr}`;
+  if (size <= maxBytes) return `${head}${resultStr}`;
   return (
-    `Tool ${tool} (${r.status}): ${cutUtf8(resultStr, maxBytes)}\n` +
+    `${head}${cutUtf8(resultStr, maxBytes)}\n` +
     `…[ink: result truncated — ${size.toLocaleString()} bytes total, ` +
     `${maxBytes.toLocaleString()} shown; the full payload is in this session's transcript. ` +
     'Ask for less next time (page, filter, or narrow the query).]'
@@ -625,7 +651,9 @@ export function buildContinuationBody(
   // cannot disagree about what an iteration contained, which is the failure
   // that produced this fix in the first place.
   const outcomes = outcomesOnly(results);
-  const nothingRan = outcomes.length > 0 && !outcomes.some((r) => RAN_STATUSES.has(r.status));
+  const nothingRan =
+    outcomes.length > 0 &&
+    !outcomes.some((r) => RAN_STATUSES.has(r.status) || r.dispatchState === 'unknown');
   const refusalNote = !nothingRan
     ? ''
     : hasUnseenFailure(results)
@@ -664,7 +692,7 @@ export function buildContinuationBody(
         `Up to ${dropped.length} of your calls did not run at all, or ran in altered form. ` +
         `Do not guess and do not re-emit blindly: read back the current state and act on what you ` +
         `find. Re-running a write that already succeeded is not safe.`
-      : dropped.length === 0
+      : dropped.length === 0 || dropsAlreadyReported(dropped, results)
         ? ''
         : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
           `outcomes are above, and some of those may themselves have been refused or failed. ` +
@@ -737,7 +765,7 @@ export function buildFinalRelayBody(
         `emitted, so the runtime cannot tell you which of yours reached it. Up to ` +
         `${dropped.length} of your calls did not run at all, or ran in altered form. The loop has ` +
         `ended. Say that plainly rather than reporting the work as done.`
-      : dropped.length === 0
+      : dropped.length === 0 || dropsAlreadyReported(dropped, results)
         ? ''
         : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${listDropped(dropped)}. They had no effect. Say so rather than reporting them as done.`;
 
@@ -897,7 +925,7 @@ export async function runAgentLoop(
   const retainFailedStream = (failed: BackendTurnOutcome): void => {
     const stream = failed.toolStream;
     if (!stream) return;
-    const records: ToolResultRecord[] = [
+    const records = inEmissionOrder([
       ...streamResults(stream),
       ...streamRefusals(stream),
       ...stream.extracted.malformed.map((block) => ({
@@ -905,10 +933,9 @@ export async function runAgentLoop(
         status: 'malformed',
         result: describeMalformedBlock(block),
       })),
-      ...(stream.failure
-        ? [{ tool: 'runtime', status: 'error', result: stream.failure.message }]
-        : []),
-    ];
+    ]);
+    if (stream.failure)
+      records.push({ tool: 'runtime', status: 'error', result: stream.failure.message });
     allToolResults.push(...records);
     for (const record of records) ports.observe?.recordToolCall(record);
     if (records.length || stream.admitted.length) iteration++;
@@ -1015,10 +1042,13 @@ export async function runAgentLoop(
           `the runtime cannot close is discarded.`,
       })),
     ];
+    // With an admitted stream prefix, record results and refusals together
+    // below. A no-admission response still needs its diagnostics before break.
+    const deferStreamRecords = (outcome.toolStream?.admitted.length ?? 0) > 0;
     if (unrunnable.length > 0) {
-      allToolResults.push(...unrunnable);
+      if (!deferStreamRecords) allToolResults.push(...unrunnable);
       for (const record of unrunnable) {
-        ports.observe?.recordToolCall(record);
+        if (!deferStreamRecords) ports.observe?.recordToolCall(record);
         ports.ui.printEvent(`  ⋯ ${record.status}: ${record.tool} — ${String(record.result)}`);
       }
     }
@@ -1108,7 +1138,10 @@ export async function runAgentLoop(
       ports.ui.printEvent(
         `  ⋯ ${selection.unmatched} of ${selection.reached} calls that reached the runner match nothing emitted — which of the model's calls reached it is not determinable`
       );
-    } else if (selection.dropped.length > 0) {
+    } else if (
+      selection.dropped.length > 0 &&
+      !dropsAlreadyReported(selection.dropped, unrunnable)
+    ) {
       ports.ui.printEvent(
         `  ⋯ ${selection.dropped.length} of ${selection.emitted} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration): ${selection.dropped.map((c) => c.tool).join(', ')}`
       );
@@ -1231,13 +1264,16 @@ export async function runAgentLoop(
     const executed = outcome.toolStream
       ? streamResults(outcome.toolStream)
       : await ports.tools.execute(calls, { iteration, signal: input.signal });
-    allToolResults.push(...executed);
-    for (const r of executed) ports.observe?.recordToolCall(r);
     // What the model is shown for this iteration: the blocks that could not be
-    // run, then the calls that were. `executed` alone still drives the stop
+    // run and the calls that were, in stream emission order where known.
+    // `executed` alone still drives the stop
     // reason below — a malformed block is a reporting obligation, not a
     // refusal, and must not turn a healthy turn into `all-refused`.
-    const results = unrunnable.length > 0 ? [...unrunnable, ...executed] : executed;
+    const results = [...unrunnable, ...executed];
+    if (outcome.toolStream) inEmissionOrder(results);
+    const newlyRecorded = deferStreamRecords ? results : executed;
+    allToolResults.push(...newlyRecorded);
+    for (const r of newlyRecorded) ports.observe?.recordToolCall(r);
     // Results and drops together, from the same iteration, at the one moment
     // both are known. Every exit below inherits exactly this.
     stranded = { results, selection };
