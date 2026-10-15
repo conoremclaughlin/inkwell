@@ -29,6 +29,42 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 describe('pairing panel with actual markup', () => {
+  it.each(['pending', 'confirmed'] as const)(
+    'keeps storage failure distinct from %s revocation and fences new pairing',
+    async (revocation) => {
+      view = { phase: 'disconnected', revocation, storageUnavailable: true };
+      mountPairingPanel();
+      await vi.waitFor(() =>
+        expect(document.getElementById('pair-status')?.textContent).toContain(
+          'Session storage is unavailable'
+        )
+      );
+      expect(button('pair-open').disabled).toBe(true);
+      expect(button('pair-claim').disabled).toBe(true);
+      expect(button('pair-disconnect').disabled).toBe(false);
+      expect(button('pair-retry').disabled).toBe(revocation === 'confirmed');
+      const text = document.getElementById('pair-status')?.textContent;
+      expect(text).not.toContain('You can start a new pairing');
+      expect(text).toContain(
+        revocation === 'pending' ? 'Remote revocation is not confirmed' : 'No revocation is pending'
+      );
+    }
+  );
+  it('does not suggest that closing the panel revokes an unconfirmed grant', async () => {
+    view = { phase: 'paired' };
+    request.mockImplementation(async (message) => {
+      if (message.type === 'pair:disconnect') throw new Error('synthetic worker unavailable');
+      return view;
+    });
+    mountPairingPanel();
+    await vi.waitFor(() => expect(button('pair-disconnect').disabled).toBe(false));
+    button('pair-disconnect').click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('pair-status')?.textContent).toContain(
+        'Closing this panel does not revoke a server grant'
+      )
+    );
+  });
   it('requires a human click and host permission before preparing approval', async () => {
     mountPairingPanel();
     await vi.waitFor(() => expect(request).toHaveBeenCalledWith({ type: 'pair:status' }));

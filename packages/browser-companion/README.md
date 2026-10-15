@@ -61,6 +61,12 @@ browser session clears local pairing state, but does not revoke a server grant;
 the grant's twelve-hour expiry remains the backstop. A pending revocation blocks
 replacement within the same browser session rather than silently abandoning it.
 
+A session-storage write failure stops new pairing, but does not block cleanup.
+The worker keeps a known grant in memory solely to revoke it, including a late
+receipt. Remote confirmation and unsaved local state are reported separately.
+If revocation also fails, retry while that worker still holds the receipt; a
+worker restart can lose unsaved state. Closing the panel is not revocation.
+
 Pairing tests use synthetic Chrome APIs, storage, fetch, and dashboard responses.
 They do not demonstrate deployed migrations/proxy behavior, real-account pairing,
 native panel acceptance, or Firefox installation support.

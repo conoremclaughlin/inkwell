@@ -24,6 +24,7 @@ export interface PairingView {
   approvalUrl?: string;
   expiresAt?: string;
   revocation?: PairingRecord['revocation'];
+  storageUnavailable?: true;
 }
 export interface PairingStore {
   read(): Promise<PairingRecord | undefined>;
@@ -152,6 +153,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
             : {}),
           expiresAt: record.grant?.expiresAt,
           revocation: record.revocation,
+          ...(failed ? { storageUnavailable: true as const } : {}),
         }
       : { phase: 'unpaired' };
   async function save(next: PairingRecord) {
@@ -160,17 +162,36 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
       await store.write(next);
     } catch {
       failed = true;
+      // Keep a known grant for cleanup, never for use. A failed local write
+      // cannot undo a server receipt or prevent revoking one that arrives late.
+      record = {
+        ...next,
+        phase: 'disconnected',
+        installationSecret: undefined,
+        revocation:
+          next.revocation === 'confirmed' || next.phase === 'ready' ? 'confirmed' : 'pending',
+      };
       throw new Error('Session storage unavailable. Pairing actions are stopped.');
     }
   }
-  function transition<T>(fn: () => Promise<T> | T): Promise<T> {
+  async function saveCleanup(next: PairingRecord) {
+    // The memory fence and warning survive a rejected write. Cleanup does not
+    // need persistence permission; opening or claiming a pairing still does.
+    await save(next).catch(() => undefined);
+  }
+  function transition<T>(fn: () => Promise<T> | T, cleanup = false): Promise<T> {
     const work = tail.then(async () => {
-      if (failed) throw new Error('Session storage unavailable. Pairing actions are stopped.');
+      if (failed && !cleanup)
+        throw new Error('Session storage unavailable. Pairing actions are stopped.');
       if (!loaded) {
         record = await store.read();
-        // A worker restart cannot recover the one-time secret from a lost receipt.
-        if (record?.phase === 'claiming') await save({ ...record, phase: 'unknown' });
         loaded = true;
+        // A worker restart cannot recover the one-time secret from a lost receipt.
+        if (record?.phase === 'claiming') {
+          const next = { ...record, phase: 'unknown' as const };
+          if (cleanup) await saveCleanup(next);
+          else await save(next);
+        }
       }
       return fn();
     });
@@ -178,10 +199,12 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
     return work;
   }
   async function revoke() {
-    const pending = await transition(() =>
-      record?.phase === 'disconnected' && record.grant && record.revocation === 'pending'
-        ? record
-        : undefined
+    const pending = await transition(
+      () =>
+        record?.phase === 'disconnected' && record.grant && record.revocation === 'pending'
+          ? record
+          : undefined,
+      true
     );
     if (!pending) return;
     if (revoking) return revoking;
@@ -190,8 +213,8 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
         await transport.revoke(pending);
         await transition(async () => {
           if (record?.installationId === pending.installationId && record.phase === 'disconnected')
-            await save({ ...record, grant: undefined, revocation: 'confirmed' });
-        });
+            await saveCleanup({ ...record, grant: undefined, revocation: 'confirmed' });
+        }, true);
       } catch {
         // Retain the secret solely for an explicit idempotent revocation retry.
         // An outage, invalid credential, or malformed response is not a receipt.
@@ -202,7 +225,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
     return revoking;
   }
   return {
-    status: () => transition(view),
+    status: () => transition(view, true),
     async prepare(input: string, permitted: () => Promise<boolean> = async () => true) {
       const origin = dashboardOrigin(input);
       const generation = stopped;
@@ -250,56 +273,58 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
         }
         return { intent, response: transport.claim(intent, code) };
       });
-      if (!pending) return transition(view);
+      if (!pending) return transition(view, true);
       try {
         const grant = await pending.response;
         await transition(async () => {
           if (record?.installationId !== pending.intent.installationId)
             throw new Error('Pairing changed.');
-          await save({
+          const disconnected = failed || generation !== stopped;
+          await saveCleanup({
             ...record,
             grant,
-            phase: generation === stopped ? 'paired' : 'disconnected',
-            revocation: generation === stopped ? 'none' : 'pending',
+            phase: disconnected ? 'disconnected' : 'paired',
+            revocation: disconnected ? 'pending' : 'none',
           });
-        });
-        if (generation !== stopped) void revoke().catch(() => undefined);
+        }, true);
       } catch (error) {
         await transition(async () => {
           if (record?.installationId !== pending.intent.installationId) return;
           if (record.phase === 'disconnected') {
-            if (error instanceof RefusedCode) await save({ ...record, revocation: 'confirmed' });
+            if (error instanceof RefusedCode)
+              await saveCleanup({ ...record, revocation: 'confirmed' });
           } else if (error instanceof RefusedCode) {
-            await save(pending.intent);
+            await saveCleanup(pending.intent);
           } else {
-            await save({ ...record, phase: 'unknown' });
+            await saveCleanup({ ...record, phase: 'unknown' });
           }
-        });
+        }, true);
         if (error instanceof RefusedCode)
           throw new Error(
             'Code refused or expired. Check the code; nothing will retry automatically.'
           );
       }
-      return transition(view);
+      void revoke().catch(() => undefined);
+      return transition(view, true);
     },
     async disconnect() {
       ++stopped; // Fence in-flight work immediately, before storage or any network wait.
       await transition(async () => {
         if (!record || record.phase === 'disconnected') return;
         const noDispatch = record.phase === 'ready';
-        await save({
+        await saveCleanup({
           ...record,
           phase: 'disconnected',
           installationSecret: undefined,
           revocation: noDispatch ? 'confirmed' : 'pending',
         });
-      });
+      }, true);
       void revoke().catch(() => undefined);
-      return transition(view);
+      return transition(view, true);
     },
     async retryRevocation() {
       await revoke();
-      return transition(view);
+      return transition(view, true);
     },
   };
 }

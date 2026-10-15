@@ -187,6 +187,116 @@ describe('pairing state (synthetic storage and network only)', () => {
     expect(f.transport.claim).not.toHaveBeenCalled();
     await expect(f.client.claim('ABCDEFGHJKLM')).rejects.toThrow('storage unavailable');
   });
+  it.each(['disconnect', 'receipt', 'late receipt'])(
+    'revokes a known grant despite failed storage at %s',
+    async (point) => {
+      const f = fixture();
+      await f.client.prepare(origin);
+      const response = deferred<typeof grant>();
+      f.transport.claim.mockReturnValue(response.promise);
+      // Catch old implementation errors so the regression checks revocation, not an exit path.
+      const claiming = f.client.claim('ABCDEFGHJKLM').catch(() => undefined);
+      await vi.waitFor(() => expect(f.transport.claim).toHaveBeenCalledOnce());
+      if (point === 'disconnect') {
+        response.resolve(grant);
+        await claiming;
+      }
+      f.store.write.mockRejectedValue(new Error('synthetic storage failure'));
+      if (point === 'receipt') {
+        response.resolve(grant);
+        await claiming;
+      }
+      await f.client.disconnect().catch(() => undefined);
+      if (point === 'late receipt') {
+        response.resolve(grant);
+        await claiming;
+      }
+      await vi.waitFor(() => expect(f.transport.revoke).toHaveBeenCalledOnce());
+      expect(f.transport.revoke.mock.calls[0]?.[0]).toMatchObject({
+        phase: 'disconnected',
+        grant,
+        installationId: f.stored.installationId,
+      });
+      await vi.waitFor(async () =>
+        expect(await f.client.status()).toMatchObject({
+          phase: 'disconnected',
+          revocation: 'confirmed',
+          storageUnavailable: true,
+        })
+      );
+      expect(JSON.stringify(await f.client.status())).not.toContain(grant.secret);
+      // Local persistence remains failed even after the actual server receipt.
+      await expect(f.client.prepare(origin)).rejects.toThrow('storage unavailable');
+      await expect(f.client.claim('ABCDEFGHJKLM')).rejects.toThrow('storage unavailable');
+      expect(f.transport.claim).toHaveBeenCalledOnce();
+    }
+  );
+  it('automatically revokes an unsaved claim receipt, retaining an explicit retry on remote failure', async () => {
+    const f = fixture();
+    await f.client.prepare(origin);
+    f.transport.claim.mockImplementation(async () => {
+      f.store.write.mockRejectedValue(new Error('synthetic storage failure'));
+      return grant;
+    });
+    f.transport.revoke.mockRejectedValue(new Error('synthetic remote outage'));
+    expect(await f.client.claim('ABCDEFGHJKLM')).toMatchObject({
+      phase: 'disconnected',
+      revocation: 'pending',
+      storageUnavailable: true,
+    });
+    await vi.waitFor(() => expect(f.transport.revoke).toHaveBeenCalledOnce());
+    expect(await f.client.status()).toMatchObject({ revocation: 'pending' });
+    const retry = deferred<void>();
+    f.transport.revoke.mockReturnValue(retry.promise);
+    const first = f.client.retryRevocation();
+    const second = f.client.retryRevocation();
+    await vi.waitFor(() => expect(f.transport.revoke).toHaveBeenCalledTimes(2));
+    expect(f.transport.revoke.mock.calls[1]?.[0].grant).toEqual(grant);
+    retry.resolve();
+    for (const result of await Promise.all([first, second])) {
+      expect(result).toMatchObject({ revocation: 'confirmed', storageUnavailable: true });
+    }
+    expect(f.transport.revoke).toHaveBeenCalledTimes(2);
+    expect((await f.client.status()).expiresAt).toBeUndefined();
+    await expect(f.client.prepare(origin)).rejects.toThrow('storage unavailable');
+  });
+  it('reports an actual revocation receipt even when only its confirmation write fails', async () => {
+    const f = fixture();
+    await f.client.prepare(origin);
+    await f.client.claim('ABCDEFGHJKLM');
+    f.transport.revoke.mockImplementation(async () => {
+      f.store.write.mockRejectedValue(new Error('synthetic confirmation failure'));
+    });
+    await f.client.disconnect();
+    await vi.waitFor(async () =>
+      expect(await f.client.status()).toMatchObject({
+        phase: 'disconnected',
+        revocation: 'confirmed',
+        storageUnavailable: true,
+      })
+    );
+    expect(f.stored.revocation).toBe('pending'); // Do not pretend the durable record changed.
+    expect(f.transport.revoke).toHaveBeenCalledOnce();
+    await f.client.retryRevocation();
+    expect(f.transport.revoke).toHaveBeenCalledOnce();
+  });
+  it('keeps recovered claiming state readable after a failed normalization write without dispatch', async () => {
+    const f = fixture();
+    await f.client.prepare(origin);
+    const restored = fixture({ ...f.stored, phase: 'claiming', installationSecret: undefined });
+    restored.store.write.mockRejectedValue(new Error('synthetic normalization failure'));
+    expect(await restored.client.status()).toMatchObject({
+      phase: 'disconnected',
+      revocation: 'pending',
+      storageUnavailable: true,
+    });
+    await restored.client.disconnect();
+    await restored.client.retryRevocation();
+    expect(restored.store.read).toHaveBeenCalledOnce();
+    expect(restored.transport.claim).not.toHaveBeenCalled();
+    expect(restored.transport.revoke).not.toHaveBeenCalled();
+    await expect(restored.client.prepare(origin)).rejects.toThrow('storage unavailable');
+  });
 });
 
 describe('fixed-path fetch transport (mocked, not native browser acceptance)', () => {

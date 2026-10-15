@@ -13,10 +13,13 @@ export function mountPairingPanel() {
   function render() {
     el<HTMLButtonElement>('pair-open').disabled =
       busy ||
+      !!current.storageUnavailable ||
       !['unpaired', 'ready', 'disconnected'].includes(current.phase) ||
       (current.phase === 'disconnected' && current.revocation !== 'confirmed');
-    el<HTMLButtonElement>('pair-claim').disabled = busy || current.phase !== 'ready';
-    el<HTMLInputElement>('pair-code').disabled = busy || current.phase !== 'ready';
+    el<HTMLButtonElement>('pair-claim').disabled =
+      busy || !!current.storageUnavailable || current.phase !== 'ready';
+    el<HTMLInputElement>('pair-code').disabled =
+      busy || !!current.storageUnavailable || current.phase !== 'ready';
     el<HTMLButtonElement>('pair-disconnect').disabled = !busy && current.phase === 'unpaired';
     el<HTMLButtonElement>('pair-retry').disabled =
       busy || current.phase !== 'disconnected' || current.revocation !== 'pending';
@@ -31,10 +34,16 @@ export function mountPairingPanel() {
         'Pairing receipt received. Hosted chat is not enabled in this checkpoint; no page authority was granted.',
       disconnected:
         current.revocation === 'confirmed'
-          ? 'Disconnected. You can start a new pairing.'
+          ? current.storageUnavailable
+            ? 'Disconnected. No revocation is pending.'
+            : 'Disconnected. You can start a new pairing.'
           : 'Disconnected locally. Remote revocation is not confirmed. Retry is safe if the receipt was received; otherwise the server grant must expire.',
     };
-    el('pair-status').textContent = messages[current.phase];
+    el('pair-status').textContent =
+      messages[current.phase] +
+      (current.storageUnavailable
+        ? ' Session storage is unavailable. New pairing is disabled. Local state may be stale after an extension restart.'
+        : '');
     el('pair-origin').textContent = current.origin ? `Pairing destination: ${current.origin}` : '';
   }
   async function refresh() {
@@ -102,7 +111,7 @@ export function mountPairingPanel() {
     // Deliberately not run(): it must bypass a pending permission/claim wait.
     void panelRequest({ type: 'pair:disconnect' }).then(refresh, () => {
       el('pair-status').textContent =
-        'Disconnect was not confirmed. Close the extension to prevent further use.';
+        'Disconnect was not confirmed. Try Disconnect again. Closing this panel does not revoke a server grant.';
     });
   };
   el('pair-retry').onclick = () => void run(() => panelRequest({ type: 'pair:retry-revocation' }));
