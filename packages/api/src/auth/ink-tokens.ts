@@ -13,6 +13,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { Database } from '../data/supabase/types';
 import { tokenIdentityState } from './token-identity';
+import { SPACE_TURN_SCOPE } from './token-scope';
 
 // ============================================================================
 // Types
@@ -51,6 +52,14 @@ export interface InkTokenPayload {
    */
   sessionId?: string;
   contactId?: string;
+  /**
+   * The conversation a space-turn token (`scope: 'mcp:space-turn'`) was minted
+   * for. Signed, so the tool allowlist can bind the turn to its own thread.
+   * Absent on every other token.
+   */
+  workspaceId?: string;
+  threadId?: string;
+  threadKey?: string;
   /**
    * Absolute expiry, seconds since the epoch. Present on every verified
    * token. On a payload passed to signInkAccessToken it is a ceiling.
@@ -119,6 +128,45 @@ export function signRunnerAccessToken(
       ...(claims.sbId ? { sbId: claims.sbId } : {}),
       ...(claims.sessionId ? { sessionId: claims.sessionId } : {}),
       ...(claims.contactId ? { contactId: claims.contactId } : {}),
+    },
+    expiresInSeconds
+  );
+}
+
+/**
+ * Sign the access token for one turn in a shared conversation.
+ *
+ * The token names the conversation it serves, and the server lets it reach
+ * only the space-turn tools for that thread (mcp/tools/space-turn-policy.ts).
+ * The verifier refuses one missing any of the four binding claims. Nothing
+ * mints these yet: SessionService still signs every runner with
+ * signRunnerAccessToken.
+ */
+export function signSpaceTurnAccessToken(
+  claims: {
+    userId: string;
+    email: string;
+    sbId: string;
+    sbSlug: string;
+    sessionId: string;
+    workspaceId: string;
+    threadId: string;
+    threadKey: string;
+  },
+  expiresInSeconds = 60 * 60
+): string {
+  return signInkAccessToken(
+    {
+      type: 'mcp_access',
+      sub: claims.userId,
+      email: claims.email,
+      scope: SPACE_TURN_SCOPE,
+      sbSlug: claims.sbSlug,
+      sbId: claims.sbId,
+      sessionId: claims.sessionId,
+      workspaceId: claims.workspaceId,
+      threadId: claims.threadId,
+      threadKey: claims.threadKey,
     },
     expiresInSeconds
   );
