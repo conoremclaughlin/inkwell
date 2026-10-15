@@ -10,6 +10,7 @@ import type { ContextImage } from './context-image.js';
 import { SessionLog } from './session-log.js';
 import { SessionContextState } from './session-context-state.js';
 import { parseJsonRpcToolPayload } from './mcp-result.js';
+import { ToolSettlementSupervisor } from './tool-settlement-supervisor.js';
 
 const block = (tool: string, args: Record<string, unknown> = {}) =>
   '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```\n';
@@ -48,12 +49,193 @@ function harness() {
     log: ports.log,
     mintInvocationId: () => `synthetic-call-${++sequence}`,
   });
+  const supervisor = new ToolSettlementSupervisor({
+    sessionId: journal.sessionId,
+    maxActiveAttempts: 4,
+  });
   const start = (attemptId = 'attempt-1', turnId = 'turn-1', enabled = true) =>
-    createSessionToolStream({ enabled, ports, journal, owner: { turnId, attemptId } });
-  return { ports, events, release, journal, start };
+    createSessionToolStream({ enabled, ports, journal, supervisor, owner: { turnId, attemptId } });
+  return { ports, events, release, journal, supervisor, start };
 }
 
 describe('session-owned stream settlement and identity', () => {
+  it('keeps abort-ignoring work and mutation ownership visible after a bounded Stop', async () => {
+    const h = harness();
+    const effect = gate<Record<string, unknown>>();
+    vi.mocked(h.ports.callTool).mockReturnValueOnce(effect.promise);
+    const stream = (await h.start())!;
+    stream.append(block('remember'));
+    await vi.waitFor(() => expect(h.ports.callTool).toHaveBeenCalledOnce());
+    stream.markGenerationEnded();
+    const pending = await h.supervisor.stopAndWait(0);
+    expect(pending).toMatchObject([
+      {
+        resources: 'live',
+        waitExpired: true,
+        generationEnded: true,
+        admission: 'closed',
+        stopRequested: true,
+      },
+    ]);
+    expect(vi.mocked(h.ports.callTool).mock.calls[0][2].signal?.aborted).toBe(true);
+    expect(h.release).not.toHaveBeenCalled();
+    expect(h.events.filter((event) => event.type === 'local_tool_call')).toEqual([]);
+    effect.resolve({ success: true });
+    expect((await stream.finish({ endOfResponse: false })).results).toMatchObject([
+      { dispatchState: 'returned' },
+    ]);
+    expect(h.release).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
+  it('releases settled dispatcher exceptions without treating unknown effects as live work', async () => {
+    const h = harness();
+    vi.mocked(h.ports.callTool).mockRejectedValueOnce(new Error('synthetic unknown effect'));
+    const stream = (await h.start())!;
+    stream.append(block('send_response'));
+    const done = await stream.finish({ endOfResponse: true });
+    expect(done.results).toMatchObject([{ dispatchState: 'unknown', status: 'error' }]);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(
+      readToolInvocationJournal(h.events, h.journal.sessionId)[0].invocations[0].result
+    ).toMatchObject({ dispatchState: 'unknown' });
+    expect(h.ports.callTool).toHaveBeenCalledOnce();
+  });
+
+  it('retains opening writes after Stop and never admits work when the opening write resumes', async () => {
+    const h = harness();
+    const opening = gate<void>();
+    vi.mocked(h.ports.log.flush).mockReturnValueOnce(opening.promise);
+    const starting = h.start();
+    expect(h.supervisor.observe()).toHaveLength(1);
+    expect(await h.supervisor.stopAndWait(0)).toMatchObject([
+      { resources: 'live', waitExpired: true },
+    ]);
+    opening.resolve();
+    const stream = (await starting)!;
+    await stream.finish({ endOfResponse: false });
+    expect(() => stream.append(block('remember'))).toThrow('ended');
+    expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
+  it('owns an intent flush past Stop and does not dispatch when it eventually finishes', async () => {
+    const h = harness();
+    const stream = (await h.start())!;
+    const intent = gate<void>();
+    vi.mocked(h.ports.log.flush).mockReturnValueOnce(intent.promise);
+    stream.append(block('remember'));
+    await vi.waitFor(() =>
+      expect(h.events.some((event) => event.type === 'tool_intent')).toBe(true)
+    );
+    expect(await h.supervisor.stopAndWait(0)).toMatchObject([{ resources: 'live' }]);
+    expect(h.release).not.toHaveBeenCalled();
+    intent.resolve();
+    const done = await stream.finish({ endOfResponse: false });
+    expect(done.results).toMatchObject([{ dispatchState: 'not-dispatched', status: 'denied' }]);
+    expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
+  it('keeps a pending approval owned past Stop without acting on a late approval', async () => {
+    const h = harness();
+    const approval = gate<boolean>();
+    vi.mocked(h.ports.policy.canCallInkTool).mockReturnValue({
+      allowed: false,
+      promptable: true,
+      reason: 'synthetic approval',
+    });
+    vi.mocked(h.ports.promptForApproval).mockReturnValue(approval.promise);
+    const stream = (await h.start())!;
+    stream.append(block('remember') + block('send_response'));
+    await vi.waitFor(() => expect(h.ports.promptForApproval).toHaveBeenCalledOnce());
+    expect(await h.supervisor.stopAndWait(0)).toMatchObject([
+      { resources: 'live', waitExpired: true },
+    ]);
+    expect(h.release).not.toHaveBeenCalled();
+    approval.resolve(true);
+    const done = await stream.finish({ endOfResponse: false });
+    expect(done.results.map((result) => result.status)).toEqual(['denied', 'denied']);
+    expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.ports.promptForApproval).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
+  it('holds ownership through the outcome flush, not only the dispatcher result', async () => {
+    const h = harness();
+    const outcome = gate<void>();
+    const stream = (await h.start())!;
+    vi.mocked(h.ports.log.flush).mockImplementation(() =>
+      h.events.at(-1)?.type === 'local_tool_call' ? outcome.promise : Promise.resolve()
+    );
+    stream.append(block('remember'));
+    const finishing = stream.finish({ endOfResponse: true });
+    await vi.waitFor(() => expect(h.ports.onResult).toHaveBeenCalledOnce());
+    expect(await stream.ownership.wait(0)).toMatchObject({ resources: 'live', waitExpired: true });
+    expect(h.release).not.toHaveBeenCalled();
+    outcome.resolve();
+    await finishing;
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.release).toHaveBeenCalledOnce();
+  });
+
+  it('retains a failed mutation release for explicit reconciliation', async () => {
+    const h = harness();
+    h.release.mockImplementation(() => {
+      throw new Error('synthetic release failure');
+    });
+    const stream = (await h.start())!;
+    stream.append(block('remember'));
+    expect((await stream.finish({ endOfResponse: true })).failure?.message).toContain(
+      'settlement failed'
+    );
+    expect(h.supervisor.observe()).toMatchObject([{ resources: 'reconciliation-required' }]);
+    expect(await stream.ownership.reconcile(async () => false)).toBe(false);
+    expect(h.supervisor.observe()).toHaveLength(1);
+    expect(await stream.ownership.reconcile(async () => true)).toBe(true);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.ports.callTool).toHaveBeenCalledOnce();
+  });
+
+  it('keeps late records bound to their original owner while a newer turn is present', async () => {
+    const h = harness();
+    const oldEffect = gate<Record<string, unknown>>();
+    vi.mocked(h.ports.callTool).mockReturnValueOnce(oldEffect.promise);
+    const old = (await h.start('attempt-old', 'turn-old'))!;
+    old.append(block('recall'));
+    await vi.waitFor(() => expect(h.ports.callTool).toHaveBeenCalledOnce());
+    const oldFinished = old.finish({ endOfResponse: true });
+    await old.ownership.wait(0);
+    const newer = (await h.start('attempt-new', 'turn-new'))!;
+    expect(h.supervisor.observe().map((entry) => entry.owner.turnId)).toEqual([
+      'turn-old',
+      'turn-new',
+    ]);
+    oldEffect.resolve({ value: 'synthetic old result' });
+    await oldFinished;
+    expect(h.events.find((event) => event.type === 'local_tool_call')?.toolOwner).toMatchObject({
+      turnId: 'turn-old',
+      attemptId: 'attempt-old',
+    });
+    expect(h.supervisor.observe()).toMatchObject([
+      { owner: { turnId: 'turn-new' }, resources: 'live', waitExpired: false },
+    ]);
+    await newer.finish({ endOfResponse: true });
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
+  it('refuses duplicate ownership before attempting another journal write', async () => {
+    const h = harness();
+    const stream = (await h.start())!;
+    const eventCount = h.events.length;
+    await expect(h.start()).rejects.toThrow('already live');
+    expect(h.events).toHaveLength(eventCount);
+    await stream.finish({ endOfResponse: true });
+    expect(h.supervisor.observe()).toEqual([]);
+    await expect(h.start()).rejects.toThrow('never redispatch');
+    expect(h.supervisor.observe()).toEqual([]);
+  });
+
   it('is inert when disabled and refuses mismatched session/log ownership before writing', async () => {
     const h = harness();
     expect(await h.start('attempt-1', 'turn-1', false)).toBeUndefined();
@@ -63,6 +245,7 @@ describe('session-owned stream settlement and identity', () => {
         enabled: true,
         ports: { ...h.ports, sessionId: 'wrong-session' },
         journal: h.journal,
+        supervisor: h.supervisor,
         owner: { turnId: 't', attemptId: 'a' },
       })
     ).rejects.toThrow('owning session');
@@ -71,6 +254,7 @@ describe('session-owned stream settlement and identity', () => {
         enabled: true,
         ports: { ...h.ports, log: { ...h.ports.log } },
         journal: h.journal,
+        supervisor: h.supervisor,
         owner: { turnId: 't', attemptId: 'a' },
       })
     ).rejects.toThrow('owning session');
@@ -302,6 +486,7 @@ describe('session-owned stream settlement and identity', () => {
       const stream = (await createSessionToolStream({
         enabled: true,
         journal,
+        supervisor: h.supervisor,
         owner: { turnId: 'turn-1', attemptId: 'attempt-1' },
         ports: { ...h.ports, log, beginContextMutation: (calls) => context.beginMutation(calls) },
       }))!;
@@ -379,6 +564,7 @@ describe('session-owned stream settlement and identity', () => {
         enabled: true,
         ports: { ...h.ports, log },
         journal,
+        supervisor: h.supervisor,
         owner: { turnId: 'synthetic-turn', attemptId: 'synthetic-attempt' },
       }))!;
       stream.append(block('recall'));

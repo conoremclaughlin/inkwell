@@ -13,12 +13,14 @@ import { createSessionToolStream } from '../runtime/session-tool-stream.js';
 import type { SessionToolBatchPorts } from '../runtime/session-tool-batch.js';
 import type { createToolInvocationJournal } from '../runtime/tool-invocation-journal.js';
 import type { ProviderToolStreamPorts } from './tool-stream-attempt.js';
+import type { ToolSettlementSupervisor } from '../runtime/tool-settlement-supervisor.js';
 
 export interface SessionAgentTurnPorts extends Omit<AgentLoopPorts, 'backend'> {
   provider: Omit<SessionProviderPorts, 'toolStream'>;
   /** Default-off. A host must own/recover this journal for the whole session. */
   streamTools?: {
     journal: ReturnType<typeof createToolInvocationJournal>;
+    supervisor: ToolSettlementSupervisor;
     turnId: string;
     ports: SessionToolBatchPorts;
     reportFailure: ProviderToolStreamPorts['reportFailure'];
@@ -79,6 +81,7 @@ export async function runSessionAgentTurn(
                     enabled: true,
                     ports: { ...streaming.ports, signal },
                     journal: streaming.journal,
+                    supervisor: streaming.supervisor,
                     owner: { turnId: streaming.turnId, attemptId: ports.provider.mintId() },
                   }))!,
                 reportFailure: streaming.reportFailure,

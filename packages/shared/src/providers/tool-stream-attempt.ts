@@ -4,7 +4,10 @@ import type { createSessionToolStream } from '../runtime/session-tool-stream.js'
 import type { StreamDispatchResult } from '../runtime/stream-tool-dispatch.js';
 import { ToolStreamSource } from './tool-stream-source.js';
 
-type SessionToolStream = NonNullable<Awaited<ReturnType<typeof createSessionToolStream>>>;
+type SessionToolStream = Pick<
+  NonNullable<Awaited<ReturnType<typeof createSessionToolStream>>>,
+  'append' | 'finish' | 'signal' | 'markGenerationEnded'
+>;
 export interface ProviderToolStreamPorts {
   /** Reserve a fresh durable attempt before the provider can emit anything. */
   open(signal: AbortSignal): Promise<SessionToolStream>;
@@ -93,7 +96,8 @@ export async function runToolStreamingAttempt(options: {
     }
     // An abort while the attempt's opening write was flushing still owns the
     // newly created source. Close it without ever launching a provider.
-    if (options.signal?.aborted) abort();
+    stream.signal.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted || stream.signal.aborted) abort();
     try {
       controller.signal.throwIfAborted();
       launchEntered = true;
@@ -124,6 +128,7 @@ export async function runToolStreamingAttempt(options: {
         childExited: !launchEntered,
       };
     }
+    if (result.childExited) stream.markGenerationEnded();
     if (!result.childExited) refuse('Provider exit is unconfirmed; this turn cannot continue.');
     if (result.success && !controller.signal.aborted) {
       // Only a successful, named confirmation can complete an EOF fence.
@@ -167,6 +172,7 @@ export async function runToolStreamingAttempt(options: {
       await close(false);
     } finally {
       options.signal?.removeEventListener('abort', abort);
+      stream?.signal.removeEventListener('abort', abort);
     }
   }
 }

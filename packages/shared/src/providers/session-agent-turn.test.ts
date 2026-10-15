@@ -13,6 +13,7 @@ import { runSessionAgentTurn, type SessionAgentTurnPorts } from './session-agent
 import type { SessionProviderPorts } from './session-provider.js';
 import { SessionLog } from '../runtime/session-log.js';
 import { createToolInvocationJournal } from '../runtime/tool-invocation-journal.js';
+import { ToolSettlementSupervisor } from '../runtime/tool-settlement-supervisor.js';
 import type { SessionToolBatchPorts } from '../runtime/session-tool-batch.js';
 import type { BackendMessageSource, BackendTextSource } from './stream.js';
 
@@ -176,7 +177,17 @@ function streamHarness(results: BackendRunResult[] = []) {
     onResult: vi.fn(),
   };
   const reportFailure = vi.fn(async () => {});
-  h.ports.streamTools = { journal, ports: batch, turnId: 'synthetic-user-turn', reportFailure };
+  const supervisor = new ToolSettlementSupervisor({
+    sessionId: journal.sessionId,
+    maxActiveAttempts: 4,
+  });
+  h.ports.streamTools = {
+    journal,
+    supervisor,
+    ports: batch,
+    turnId: 'synthetic-user-turn',
+    reportFailure,
+  };
   let userTurns = 0;
   const run = (signal?: AbortSignal, continueOnFailure = true) => {
     userTurns++;
@@ -187,6 +198,7 @@ function streamHarness(results: BackendRunResult[] = []) {
     ...h,
     run,
     batch,
+    supervisor,
     log,
     journal,
     dispatched,
@@ -372,6 +384,47 @@ describe('opt-in provider-attempt stream composition', () => {
     expect(done.loop.success).toBe(false);
     expect(h.batch.callTool).not.toHaveBeenCalled();
     expect(h.ports.tools.execute).not.toHaveBeenCalled();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it('keeps generation completion separate from a late unknown tool outcome', async () => {
+    const h = streamHarness([result(tool('remember') + '\n'), result('Observed the tool error.')]);
+    const effect = gate<Record<string, unknown>>();
+    vi.mocked(h.batch.callTool).mockReturnValueOnce(effect.promise);
+    const running = h.run();
+    await vi.waitFor(() => expect(h.batch.callTool).toHaveBeenCalledOnce());
+    expect(h.supervisor.observe()).toMatchObject([
+      { generationEnded: true, resources: 'live', admission: 'closed' },
+    ]);
+    // Deadline observation must not cause a continuation or release resources.
+    const pending = await h.supervisor.stopAndWait(0);
+    expect(pending).toMatchObject([{ waitExpired: true, resources: 'live' }]);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    expect(h.release).not.toHaveBeenCalled();
+    effect.reject(new Error('synthetic late unknown outcome'));
+    const done = await running;
+    expect(done.loop.toolResults).toMatchObject([{ tool: 'remember', status: 'error' }]);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.release).toHaveBeenCalledOnce();
+    // Explicit Stop forbids a model continuation, even when the effect settles late.
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it('routes supervisor Stop to the actual provider handle', async () => {
+    const h = streamHarness();
+    const providerEnd = gate<BackendRunResult>();
+    const text = tool('remember') + '\n';
+    const abort = vi.fn(() => providerEnd.resolve(result(text, { success: false, exitCode: 143 })));
+    vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+      request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
+      return { result: providerEnd.promise, abort };
+    });
+    const running = h.run();
+    await h.dispatched.promise;
+    await h.supervisor.stopAndWait(50);
+    await running;
+    expect(abort).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toEqual([]);
     expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
   });
 

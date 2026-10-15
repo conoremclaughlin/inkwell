@@ -80,6 +80,8 @@ async function harness() {
           },
         })!;
         return {
+          signal,
+          markGenerationEnded: () => {},
           append: (text) => stream.append(text),
           finish: async (options) => ({ ...(await stream.finish(options)), records: [] }),
         };
