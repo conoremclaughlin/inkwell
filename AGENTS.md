@@ -796,7 +796,7 @@ Docker is the scarcest resource on the development machine, and the DB integrati
 
 ### Harnesses that spawn tools
 
-Before you build, review or run a test harness, smoke test, integration-stack run, launcher or wrapper that spawns external tools (Supabase CLI, docker, yarn, node, python), load the `harness-child-environment` skill. A child process inherits the session's environment, tokens included, unless it's given an explicit one, and some tools look up stored credentials on their own. The skill covers allowlisted child environments, pinned tools, contained credential stores, and reporting evidence without overclaiming. It's installed for Claude Code and Codex on the development machine; if it isn't available to you, say so before running anything.
+Before you build, review or run a test harness, smoke test, integration-stack run, launcher or wrapper that spawns external tools (Supabase CLI, docker, yarn, node, python), load the `harness-child-environment` skill. A child process inherits the session's environment, tokens included, unless it's given an explicit one, and some tools look up stored credentials on their own. The skill covers allowlisted child environments, pinned tools, contained credential stores, and reporting evidence without overclaiming. It's committed at `.agents/skills/harness-child-environment/SKILL.md`, where Codex finds repo skills, and `.claude/skills/` links it for Claude Code, so a fresh clone carries it. Which skills a session loads depends on the task in front of it; another runtime can read that file directly. If you can't load or read it, say so before running anything.
 
 ### Private data and public contributor attribution (IRONCLAD)
 
