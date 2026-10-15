@@ -27,6 +27,7 @@ import { join } from 'path';
 import { readCodexStaticHeaderNames } from './codex-http-headers.js';
 import { readCodexConfig } from './mcp-config-sync.js';
 import { describePermissions } from './claude-defaults.js';
+import { canonicalInkLauncher } from './ink-launcher.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -129,9 +130,34 @@ function hookCommands(hooks: unknown): string[] {
   return out;
 }
 
-/** Which of the wanted ink hooks have no command line naming them. */
-function missingHooks(commands: string[], wanted: readonly string[]): string[] {
-  return wanted.filter((name) => !commands.some((c) => c.includes(` hooks ${name}`)));
+/**
+ * Which of the wanted ink hooks have no command line naming them. When a
+ * canonical launcher exists, a hook counts only if it starts with it: one
+ * spelled another way runs twice beside the main checkout's copy, so it needs
+ * the same repair as a missing one (see ink-launcher.ts).
+ */
+function missingHooks(
+  commands: string[],
+  wanted: readonly string[],
+  launcher: string | null
+): string[] {
+  return wanted.filter(
+    (name) =>
+      !commands.some((c) =>
+        launcher === null
+          ? c.includes(` hooks ${name}`)
+          : c.trimStart().startsWith(`${launcher} hooks ${name}`)
+      )
+  );
+}
+
+/** The detail for a hooks check: missing ones, or ones spelled another way. */
+function hooksDetail(commands: string[], missing: string[], launcher: string | null): string {
+  const elsewhere = missing.filter((name) => commands.some((c) => c.includes(` hooks ${name}`)));
+  if (launcher !== null && elsewhere.length === missing.length) {
+    return `${missing.join(', ')} not spelled with ${launcher}`;
+  }
+  return `missing ${missing.join(', ')}`;
 }
 
 function hasInkwellServer(config: Record<string, unknown> | null): boolean {
@@ -183,8 +209,16 @@ function geminiBakesRouting(config: Record<string, unknown> | null): boolean {
   });
 }
 
-export function auditStudio(worktreePath: string, options: { linked: boolean }): StudioAudit {
+export function auditStudio(
+  worktreePath: string,
+  options: {
+    linked: boolean;
+    /** The launcher managed hooks must start with; defaults to `canonicalInkLauncher()`. */
+    inkLauncher?: string | null;
+  }
+): StudioAudit {
   const { linked } = options;
+  const launcher = options.inkLauncher === undefined ? canonicalInkLauncher() : options.inkLauncher;
   const checks: StudioCheck[] = [];
   const add = (
     id: StudioCheckId,
@@ -299,7 +333,8 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
             : 'missing'
         : 'main worktree: not defaulted'
   );
-  const claudeMissing = missingHooks(hookCommands(settings?.hooks), CLAUDE_HOOK_NAMES);
+  const claudeCommands = hookCommands(settings?.hooks);
+  const claudeMissing = missingHooks(claudeCommands, CLAUDE_HOOK_NAMES, launcher);
   add(
     'claude-hooks',
     '.claude/settings.local.json ink hooks',
@@ -308,7 +343,7 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
     claudeMissing.length === 0
       ? `all ${CLAUDE_HOOK_NAMES.length} hooks`
       : settings
-        ? `missing ${claudeMissing.join(', ')}`
+        ? hooksDetail(claudeCommands, claudeMissing, launcher)
         : existsSync(settingsPath)
           ? 'unparseable'
           : 'missing'
@@ -352,7 +387,7 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
         .map((line) => line.match(/^\s*[a-z_]+\s*=\s*"(.*)"\s*$/)?.[1])
         .filter((v): v is string => typeof v === 'string')
     : [];
-  const codexMissing = missingHooks(codexCommands, CODEX_HOOK_NAMES);
+  const codexMissing = missingHooks(codexCommands, CODEX_HOOK_NAMES, launcher);
   add(
     'codex-hooks',
     '.codex/config.toml ink hooks',
@@ -361,7 +396,7 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
     codexMissing.length === 0
       ? `all ${CODEX_HOOK_NAMES.length} hooks`
       : codex
-        ? `missing ${codexMissing.join(', ')}`
+        ? hooksDetail(codexCommands, codexMissing, launcher)
         : 'missing'
   );
 
@@ -384,7 +419,8 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
           ? 'unparseable'
           : 'missing'
   );
-  const geminiMissing = missingHooks(hookCommands(gemini?.hooks), GEMINI_HOOK_NAMES);
+  const geminiCommands = hookCommands(gemini?.hooks);
+  const geminiMissing = missingHooks(geminiCommands, GEMINI_HOOK_NAMES, launcher);
   add(
     'gemini-hooks',
     '.gemini/settings.json ink hooks',
@@ -393,7 +429,7 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
     geminiMissing.length === 0
       ? `all ${GEMINI_HOOK_NAMES.length} hooks`
       : gemini
-        ? `missing ${geminiMissing.join(', ')}`
+        ? hooksDetail(geminiCommands, geminiMissing, launcher)
         : existsSync(geminiPath)
           ? 'unparseable'
           : 'missing'

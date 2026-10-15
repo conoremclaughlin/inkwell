@@ -35,7 +35,12 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir, tmpdir } from 'os';
 import { createHash } from 'crypto';
-import { classifyDestructiveCommand, SB_SLUG_FOR_RULES, type DestructiveFs } from '@inklabs/shared';
+import {
+  canonicalInkLauncher,
+  classifyDestructiveCommand,
+  SB_SLUG_FOR_RULES,
+  type DestructiveFs,
+} from '@inklabs/shared';
 import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
 import {
@@ -1382,6 +1387,11 @@ function buildSbCommandPrefix(path: string): string {
  * environments where ~/.local/bin may not be in PATH.
  */
 function resolveSbBinaryPath(cwd: string): string {
+  // One spelling everywhere: the link, when it exists (see ink-launcher.ts in
+  // @inklabs/shared). Matching text lets Claude Code merge the main checkout's
+  // copy of a hook with a studio's, so it runs once.
+  const launcher = canonicalInkLauncher();
+  if (launcher) return launcher;
   const invokedPath = process.argv[1];
   if (invokedPath && existsSync(invokedPath) && looksLikeSbEntrypoint(invokedPath)) {
     return buildSbCommandPrefix(invokedPath);

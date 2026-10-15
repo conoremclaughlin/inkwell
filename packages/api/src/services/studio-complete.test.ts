@@ -14,6 +14,7 @@ vi.mock('../utils/logger', () => ({
 }));
 
 import { completeStudioViaCli, ensureStudioComplete, isLinkedWorktree } from './studio-complete';
+import { canonicalInkLauncher } from '@inklabs/shared';
 
 let root: string;
 let worktree: string;
@@ -318,7 +319,8 @@ describe('the permission profile reaches ink init (design v3, items 3 and 5)', (
 });
 
 function seedComplete(dir: string) {
-  const INK = 'node /repo/packages/cli/dist/cli.js';
+  // What ink init writes on this machine: the link when it exists.
+  const INK = canonicalInkLauncher() ?? 'node /repo/packages/cli/dist/cli.js';
   const cmd = (name: string, backend: string) => ({
     hooks: [{ type: 'command', command: `${INK} hooks ${name} --backend ${backend}` }],
   });
