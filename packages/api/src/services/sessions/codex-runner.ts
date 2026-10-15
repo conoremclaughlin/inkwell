@@ -331,6 +331,7 @@ export class CodexRunner implements IRunner {
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,

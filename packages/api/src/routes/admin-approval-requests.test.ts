@@ -210,9 +210,14 @@ function installSelectMock(result: SelectResult, updateSpy?: ReturnType<typeof v
       }),
       update: vi.fn().mockImplementation((updates: Record<string, unknown>) => {
         updateSpy?.(updates);
-        return {
-          eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+        // eq(id).eq(user_id).eq(status, pending).select(id): the expiry write
+        // changes the row, so it reads back one.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const chain: any = {
+          eq: vi.fn(() => chain),
+          select: vi.fn().mockResolvedValue({ data: [{ id: result.data?.id }], error: null }),
         };
+        return chain;
       }),
     };
   });
@@ -667,5 +672,235 @@ describe('GET /approval-requests/:requestId/status', () => {
       grantedBy: 'platform:telegram:chat-1',
     });
     expect(updateSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One-use requests (spec automated-turn-permissions §3.5)
+// ---------------------------------------------------------------------------
+
+describe('one-use approval requests are scoped to the signed session', () => {
+  const SESSION = '11111111-1111-4111-8111-111111111111';
+  const STUDIO = '22222222-2222-4222-8222-222222222222';
+  const SB = '33333333-3333-4333-8333-333333333333';
+
+  /** A chain whose filters return itself, ending in the given terminal results. */
+  function chain(terminal: Record<string, unknown>) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const c: any = {};
+    for (const m of ['select', 'eq', 'is', 'gt', 'order', 'limit', 'in']) c[m] = vi.fn(() => c);
+    Object.assign(c, terminal);
+    return c;
+  }
+
+  function install(
+    sessionRow: Record<string, unknown> | null,
+    identityRow: Record<string, unknown> | null = { id: SB, agent_id: 'echo', workspace_id: null }
+  ) {
+    const inserted: Array<Record<string, unknown>> = [];
+    mockSupabaseFrom.mockImplementation((table: string) => {
+      if (table === 'sessions') {
+        return chain({ maybeSingle: vi.fn().mockResolvedValue({ data: sessionRow, error: null }) });
+      }
+      if (table === 'agent_identities') {
+        return chain({
+          maybeSingle: vi.fn().mockResolvedValue({ data: identityRow, error: null }),
+        });
+      }
+      if (table === 'approval_requests') {
+        return {
+          insert: vi.fn((row: Record<string, unknown>) => {
+            inserted.push(row);
+            return chain({
+              single: vi.fn().mockResolvedValue({
+                data: { id: 'req-1', status: 'pending', expires_at: futureIso(30) },
+                error: null,
+              }),
+            });
+          }),
+        };
+      }
+      throw new Error(`unexpected table ${table}`);
+    });
+    return inserted;
+  }
+
+  const create = findRouteHandler('post', '/approval-requests')!;
+  const consume = findRouteHandler('post', '/approval-requests/consume')!;
+  const body = {
+    tool: 'Bash',
+    args: 'rm -rf /tmp/x',
+    cwd: '/tmp',
+    oneUse: true,
+    // Supplied by the caller, and ignored for a one-use request.
+    sessionId: '99999999-9999-4999-8999-999999999999',
+    studioId: '88888888-8888-4888-8888-888888888888',
+  };
+
+  it('without a runner token for a session it is refused, and nothing is stored', async () => {
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const res = createMockRes();
+    await create(createAuthenticatedReq({ body }), res as unknown as Response);
+    expect(res._status).toBe(403);
+    expect(inserted).toEqual([]);
+  });
+
+  it("with one, the row's session and studio are the token's, never the body's, and the scope is keyed", async () => {
+    const inserted = install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    mockNotifyPlatform.mockClear();
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body, inkTokenSessionId: SESSION }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(201);
+    expect(inserted[0]).toMatchObject({
+      session_id: SESSION,
+      studio_id: STUDIO,
+      cwd: '/tmp',
+      requesting_agent_id: 'echo',
+    });
+    // The notice names the signed scope and the directory, never the body's ids
+    // (Lumen, #853 R6).
+    expect(mockNotifyPlatform).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: SESSION,
+        studioId: STUDIO,
+        requestingSlug: 'echo',
+        oneUse: { cwd: '/tmp' },
+      })
+    );
+    const { approvalScopeKey } = await import('../services/one-use-approvals');
+    expect(inserted[0].scope_key).toBe(
+      approvalScopeKey({
+        userId: USER_ID,
+        sessionId: SESSION,
+        studioId: STUDIO,
+        sbId: SB,
+        tool: 'Bash',
+        args: 'rm -rf /tmp/x',
+        cwd: '/tmp',
+      })
+    );
+  });
+
+  it('a session with no canonical SB is refused, never labelled from the header (Lumen, #853)', async () => {
+    for (const [session, identity] of [
+      [{ id: SESSION, studio_id: STUDIO, sb_id: null }, null],
+      [{ id: SESSION, studio_id: STUDIO, sb_id: SB }, null],
+    ] as const) {
+      const inserted = install(session, identity);
+      const res = createMockRes();
+      await create(
+        createAuthenticatedReq({
+          body,
+          inkTokenSessionId: SESSION,
+          headers: {
+            authorization: 'Bearer test-token',
+            'x-ink-context': Buffer.from(JSON.stringify({ sbSlug: 'forged-peer' })).toString(
+              'base64url'
+            ),
+          },
+        }),
+        res as unknown as Response
+      );
+      expect(res._status).toBe(403);
+      expect(inserted).toEqual([]);
+    }
+  });
+
+  it("a token naming another user's session, or none that exists, is refused", async () => {
+    const inserted = install(null);
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body, inkTokenSessionId: SESSION }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(403);
+    expect(inserted).toEqual([]);
+  });
+
+  it('an ordinary request is unchanged: the body ids, and no scope key', async () => {
+    const inserted = install(null);
+    const res = createMockRes();
+    await create(
+      createAuthenticatedReq({ body: { ...body, oneUse: undefined } }),
+      res as unknown as Response
+    );
+    expect(res._status).toBe(201);
+    expect(inserted[0]).toMatchObject({ session_id: body.sessionId, studio_id: body.studioId });
+    expect(inserted[0]).not.toHaveProperty('scope_key');
+  });
+
+  it('consume needs the signed session and every scope field', async () => {
+    install({ id: SESSION, studio_id: STUDIO, sb_id: SB });
+    const noSession = createMockRes();
+    await consume(
+      createAuthenticatedReq({ body: { tool: 'Bash', args: 'x', cwd: '/tmp' } }),
+      noSession as unknown as Response
+    );
+    expect(noSession._status).toBe(403);
+    const noCwd = createMockRes();
+    await consume(
+      createAuthenticatedReq({ body: { tool: 'Bash', args: 'x' }, inkTokenSessionId: SESSION }),
+      noCwd as unknown as Response
+    );
+    expect(noCwd._status).toBe(400);
+  });
+});
+
+describe('status polling never overwrites a grant that raced it (Lumen, #853)', () => {
+  it('when the expiry write changes nothing, the current row is returned, not "expired"', async () => {
+    const statusHandler = findRouteHandler('get', '/approval-requests/:requestId/status')!;
+    let reads = 0;
+    mockSupabaseFrom.mockImplementation(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const readChain: any = {
+        eq: vi.fn(() => readChain),
+        single: vi.fn(async () => {
+          reads += 1;
+          // First read: still pending and past its deadline. Second read,
+          // after the lost expiry write: granted by the race winner.
+          return reads === 1
+            ? {
+                data: {
+                  id: 'req-raced',
+                  status: 'pending',
+                  action: null,
+                  granted_tools: null,
+                  granted_by: null,
+                  expires_at: pastIso(1),
+                  resolved_at: null,
+                  created_at: new Date().toISOString(),
+                },
+                error: null,
+              }
+            : {
+                data: {
+                  id: 'req-raced',
+                  status: 'granted',
+                  action: 'grant',
+                  granted_tools: ['Bash(x)'],
+                  granted_by: 'platform:telegram:100200300',
+                  expires_at: pastIso(1),
+                  resolved_at: new Date().toISOString(),
+                },
+                error: null,
+              };
+        }),
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const writeChain: any = {
+        eq: vi.fn(() => writeChain),
+        select: vi.fn().mockResolvedValue({ data: [], error: null }),
+      };
+      return { select: vi.fn(() => readChain), update: vi.fn(() => writeChain) };
+    });
+    const res = createMockRes();
+    await statusHandler(
+      createAuthenticatedReq({ params: { requestId: 'req-raced' } }) as Request,
+      res as unknown as Response
+    );
+    expect(res._json).toMatchObject({ status: 'granted', action: 'grant' });
   });
 });

@@ -700,6 +700,52 @@ describe('production native steering selection', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it('preserves credential freshness refusal after preparation without a legacy fallback', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.mocked(ensureStudioComplete).mockImplementationOnce(async () => {
+      // The one-hour credential is still valid for native admission, but is
+      // inside the server's final-minute refusal window before spawn.
+      vi.setSystemTime(Date.now() + 3_541_000);
+      return { ok: true, complete: true, missing: [] };
+    });
+    const result = await run();
+    expect(result.success).toBe(false);
+    expect(native).not.toHaveBeenCalled();
+    expect(legacy).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('rechecks credential freshness at the native physical spawn boundary', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await realNativeTransport();
+    // If admission regresses, complete the inert fake rather than waiting for
+    // the runner's timeout. The no-spawn assertion must be what fails.
+    const write = f.proc.stdin.write.getMockImplementation()!;
+    f.proc.stdin.write.mockImplementation((line: string) => {
+      const result = write(line);
+      if (JSON.parse(line).method === 'turn/start')
+        queueMicrotask(() =>
+          f.receive({
+            method: 'turn/completed',
+            params: {
+              threadId: 'synthetic-thread',
+              turn: { id: 'synthetic-turn', status: 'completed' },
+            },
+          })
+        );
+      return result;
+    });
+    vi.mocked(resolveBinaryPath).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 3_541_000);
+      return '/synthetic/codex';
+    });
+    expect((await run()).success).toBe(false);
+    expect(native).toHaveBeenCalledOnce();
+    expect(legacy).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(listOwnedChildren()).toEqual([]);
+  });
+
   it('never falls back to exec after an app-server failure', async () => {
     native.mockRejectedValueOnce(new Error('Synthetic app-server failure'));
     expect((await run()).success).toBe(false);

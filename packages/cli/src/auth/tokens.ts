@@ -148,7 +148,7 @@ export function clearDelegatedAuth(sbSlug: string): void {
 }
 
 // ============================================================================
-// JWT Decode (no verification — server-issued, trusted locally)
+// Unverified JWT decode — selection only; the server authenticates the token
 // ============================================================================
 
 export function decodeJwtPayload(token: string): JwtPayload | null {
@@ -237,12 +237,47 @@ export interface SelectedCredential {
 
 /** A token naming a session must never widen into the machine login. */
 export function hasSessionTokenBinding(): boolean {
+  // Set explicitly by server launchers, independently of whether minting or
+  // delivery left a token. INK_SESSION_ID alone also describes interactive OAuth.
+  if (requiresRunnerCredential()) return true;
   const token = process.env.INK_ACCESS_TOKEN?.trim();
   const sessionId = token ? decodeJwtPayload(token)?.sessionId : undefined;
   // Interactive launchers also set INK_SESSION_ID beside a human OAuth token.
   // Only the credential's own claim limits authority to that session. Decoding
   // is not verification; the server still verifies the signature and scope.
   return typeof sessionId === 'string' && sessionId.trim().length > 0;
+}
+
+function requiresRunnerCredential(): boolean {
+  // A malformed policy value is a refusal, never an opt-out into machine auth.
+  return process.env.INK_RUNNER_AUTH_REQUIRED !== undefined;
+}
+
+function usableRunnerCredential(token: string): boolean {
+  const payload = decodeJwtPayload(token);
+  const sessionId = process.env.INK_SESSION_ID?.trim();
+  const sbSlug = process.env.SB_SLUG?.trim();
+  // These are selection checks, NOT signature verification. Only the server
+  // can authenticate the JWT; its refusal must not trigger another credential.
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  const nbf = (payload as JwtPayload & { nbf?: unknown }).nbf;
+  return (
+    process.env.INK_RUNNER_AUTH_REQUIRED === '1' &&
+    !!sessionId &&
+    payload.sessionId === sessionId &&
+    !!sbSlug &&
+    payload.sbSlug === sbSlug &&
+    payload.type === 'mcp_access' &&
+    typeof payload.sub === 'string' &&
+    !!payload.sub.trim() &&
+    typeof payload.scope === 'string' &&
+    payload.scope.split(/\s+/).includes('mcp:tools') &&
+    typeof payload.exp === 'number' &&
+    Number.isFinite(payload.exp) &&
+    payload.exp * 1000 > Date.now() + 60_000 &&
+    (nbf === undefined ||
+      (typeof nbf === 'number' && Number.isFinite(nbf) && nbf * 1000 <= Date.now()))
+  );
 }
 
 /**
@@ -262,6 +297,12 @@ export function hasSessionTokenBinding(): boolean {
  */
 export function selectCredential(options?: { allowEnvToken?: boolean }): SelectedCredential | null {
   const allowEnvToken = options?.allowEnvToken !== false;
+  if (requiresRunnerCredential()) {
+    const token = process.env.INK_ACCESS_TOKEN?.trim();
+    return allowEnvToken && token && usableRunnerCredential(token)
+      ? { source: 'env', token }
+      : null;
+  }
   if (allowEnvToken) {
     const envToken = process.env.INK_ACCESS_TOKEN?.trim();
     // Skip provably expired env tokens. Unscoped commands may use the
@@ -282,6 +323,9 @@ export async function getValidAccessToken(
   options?: { allowEnvToken?: boolean }
 ): Promise<string | null> {
   const selected = selectCredential(options);
+  if (!selected && requiresRunnerCredential()) {
+    throw new Error('Server runner credential unavailable; re-admit the session before retrying');
+  }
   if (!selected) return null;
   if (selected.source === 'env') return selected.token;
 
@@ -292,7 +336,22 @@ export async function getValidAccessToken(
     return auth.access_token;
   }
 
-  // Attempt refresh
+  // One refresh per refresh token. Calls that overlap in this process (a batch
+  // of concurrent reads) would otherwise each spend the same refresh token,
+  // and a refresh that fails clears auth.json for everyone.
+  const key = `${serverUrl}\n${auth.refresh_token}`;
+  const inFlight = refreshesInFlight.get(key);
+  if (inFlight) return inFlight;
+  const refresh = refreshStoredAuth(serverUrl, auth).finally(() => {
+    refreshesInFlight.delete(key);
+  });
+  refreshesInFlight.set(key, refresh);
+  return refresh;
+}
+
+const refreshesInFlight = new Map<string, Promise<string | null>>();
+
+async function refreshStoredAuth(serverUrl: string, auth: StoredAuth): Promise<string | null> {
   try {
     const refreshed = await refreshAccessToken(serverUrl, auth);
     saveAuth(refreshed);
@@ -308,6 +367,7 @@ export function getValidDelegatedAccessToken(
   sbSlug: string,
   options?: { bufferSeconds?: number }
 ): string | null {
+  if (hasSessionTokenBinding()) return null;
   const auth = loadDelegatedAuth(sbSlug);
   if (!auth) return null;
   if (isTokenExpired(auth, options?.bufferSeconds ?? 300)) return null;

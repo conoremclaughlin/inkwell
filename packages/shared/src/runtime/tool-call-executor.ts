@@ -9,7 +9,9 @@
  */
 
 import type { LocalToolCall } from './agent-loop.js';
+import { READ_ONLY_TOOLS } from './auto-evict.js';
 import { isClientLocalTool } from './context-tools.js';
+import { bareToolName } from './tool-dispatch.js';
 
 /** Tool responses stay opaque to the executor, exactly as in the host client. */
 export type RuntimeToolCallResponse = Record<string, unknown>;
@@ -85,10 +87,38 @@ export interface ToolCallExecutorPorts {
    * when only the caller checked, after the whole batch had returned.
    */
   signal?: AbortSignal;
+  /**
+   * Run the batch's audited reads (`READ_ONLY_TOOLS`) concurrently with each
+   * other. Every other call stays exclusive: it starts once everything before
+   * it has finished, and nothing after it starts until it has. Off unless the
+   * host turns it on; shared runtime never reads the environment itself.
+   */
+  concurrentReads?: boolean;
 }
 
 /**
- * Execute a list of local tool calls sequentially with policy checks.
+ * Whether a call may overlap other reads. Client-local tools stay exclusive
+ * even when listed as reads: `list_context` reads the ledger that each
+ * earlier result's `onResult` writes, so it must see those entries land.
+ */
+function runsConcurrently(call: LocalToolCall): boolean {
+  return !isClientLocalTool(call.tool) && READ_ONLY_TOOLS.has(bareToolName(call.tool));
+}
+
+function cancelledBeforeRun(call: LocalToolCall): ToolCallResult {
+  // Report the remainder rather than dropping it silently: the agent asked
+  // for these, and "cancelled" is a different answer from "never mentioned".
+  return {
+    tool: call.tool,
+    args: call.args,
+    status: 'denied',
+    reason: 'Cancelled before this call ran',
+  };
+}
+
+/**
+ * Execute a list of local tool calls with policy checks, sequentially unless
+ * `concurrentReads` is on.
  *
  * For each call:
  * 1. Check policy via canCallInkTool()
@@ -102,18 +132,12 @@ export async function executeToolCalls(
   calls: LocalToolCall[],
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult[]> {
+  if (deps.concurrentReads) return executeWithConcurrentReads(calls, deps);
   const results: ToolCallResult[] = [];
 
   for (const call of calls) {
     if (deps.signal?.aborted) {
-      // Report the remainder rather than dropping it silently: the agent asked
-      // for these, and "cancelled" is a different answer from "never mentioned".
-      const cancelled: ToolCallResult = {
-        tool: call.tool,
-        args: call.args,
-        status: 'denied',
-        reason: 'Cancelled before this call ran',
-      };
+      const cancelled = cancelledBeforeRun(call);
       results.push(cancelled);
       deps.onResult?.(cancelled);
       continue;
@@ -123,6 +147,90 @@ export async function executeToolCalls(
     deps.onResult?.(result);
   }
 
+  return results;
+}
+
+/**
+ * The same sequence, with adjacent reads overlapping.
+ *
+ * Calls START in emission order, and each runs synchronously up to its first
+ * await, so policy decisions and one-use grants are spent in the order the
+ * model wrote them. Results are SETTLED in emission order through one chain:
+ * `onResult`, the transcript and the ledger see exactly the sequence a serial
+ * batch would have produced, so the continuation is the same bytes.
+ *
+ * A pending approval is a barrier for everything after it
+ * (ink://specs/best-effort-tool-calls §3.1): a read that asks for approval
+ * holds every later call until it has been decided and has settled, so
+ * nothing runs around a pending decision and prompts are never shown two at
+ * a time. Reads started before it keep running. A cancelled turn starts
+ * nothing new; a read already in flight gets the signal through `callTool`,
+ * as a serial call would.
+ */
+async function executeWithConcurrentReads(
+  calls: LocalToolCall[],
+  deps: ToolCallExecutorPorts
+): Promise<ToolCallResult[]> {
+  const results: ToolCallResult[] = [];
+  // A throw from a port is the batch failing, as it is serially. Calls that
+  // had already started still settle, so their intents are closed, and the
+  // batch rethrows the first failure to arrive. Two overlapping reads that
+  // both throw can arrive out of emission order.
+  let failure: { error: unknown } | undefined;
+  // `onResult` is a port too. Its throw is kept, never thrown into the
+  // settlement chain: a rejected chain would skip every later settlement and
+  // let the batch return while admitted reads are still running.
+  const settle = (result: ToolCallResult) => {
+    results.push(result);
+    try {
+      deps.onResult?.(result);
+    } catch (error) {
+      failure ??= { error };
+    }
+  };
+  let settled: Promise<void> = Promise.resolve();
+
+  for (const call of calls) {
+    const concurrent = runsConcurrently(call);
+    if (!concurrent) await settled;
+    if (failure) break;
+    if (deps.signal?.aborted) {
+      const cancelled = cancelledBeforeRun(call);
+      settled = settled.then(() => settle(cancelled));
+      continue;
+    }
+    let awaitingApproval = false;
+    const callDeps: ToolCallExecutorPorts = {
+      ...deps,
+      promptForApproval: (tool, reason, args) => {
+        awaitingApproval = true;
+        return deps.promptForApproval(tool, reason, args);
+      },
+    };
+    const outcome = executeOneToolCall(call, callDeps).then(
+      (result) => ({ result }),
+      (error: unknown) => {
+        failure ??= { error };
+        return { error };
+      }
+    );
+    settled = settled.then(async () => {
+      const done = await outcome;
+      if ('result' in done) settle(done.result);
+    });
+    if (!concurrent) {
+      await settled;
+      continue;
+    }
+    // One tick, so a port that threw while this call was starting (a policy
+    // read, say) is seen before the next call starts. Policy is synchronous,
+    // so by then a call that needs approval has already asked for it.
+    await Promise.resolve();
+    if (awaitingApproval) await settled;
+  }
+
+  await settled;
+  if (failure) throw failure.error;
   return results;
 }
 

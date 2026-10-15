@@ -36,6 +36,9 @@ jobs:
 
       - run: yarn install --immutable
 
+      - name: Dependency security regressions (no shell execution or network)
+        run: node --test scripts/security-dependencies.test.cjs
+
       - run: yarn build
 
       # pi's grep/find tools shell out to ripgrep and fd, and pi downloads them

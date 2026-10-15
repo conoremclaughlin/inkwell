@@ -18,6 +18,8 @@ vi.mock('./stop-process.js', () => ({
   probeGroup: vi.fn(() => 'alive'),
 }));
 import { spawn } from 'child_process';
+import { buildSessionEnv } from '@inklabs/shared';
+import { buildSessionEnv as realBuildSessionEnv } from '../../../../shared/src/runner/mcp-config.js';
 import { resolveBinaryPath } from './resolve-binary.js';
 import { stopProcessAndWait } from './stop-process.js';
 import { buildCodexAppServerArgs, runOwnedCodexAppServer } from './codex-app-server.js';
@@ -352,6 +354,20 @@ describe('owned Codex app-server runner', () => {
     expect(f.proc.stdin.end).toHaveBeenCalledOnce();
     expect(spawn).toHaveBeenCalledOnce();
     expect(f.config.onSpawned).toHaveBeenCalledWith({ pid: 222222 });
+  });
+
+  it('pins the native child to its supplied runner credential without interactive fallback', async () => {
+    const f = fixture();
+    vi.mocked(buildSessionEnv).mockImplementationOnce(realBuildSessionEnv);
+    const running = f.run({ inkAccessToken: 'synthetic-native-runner-token' });
+    await tick();
+    f.complete();
+    expect((await running).success).toBe(true);
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(vi.mocked(spawn).mock.calls[0][2]?.env).toMatchObject({
+      INK_RUNNER_AUTH_REQUIRED: '1',
+      INK_ACCESS_TOKEN: 'synthetic-native-runner-token',
+    });
   });
 
   it('settles unobserved input as unknown and never sends a second turn', async () => {

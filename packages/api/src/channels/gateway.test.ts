@@ -544,6 +544,84 @@ describe('ChannelGateway', () => {
       expect((gateway as any).pendingVoiceReplyConversations.has(key)).toBe(false);
     });
   });
+
+  // The send result is the delivery record: the caller learns the platform's
+  // message id from the send itself, with no lookup afterwards.
+  describe('Delivery record', () => {
+    it('returns the message id Telegram assigned to a text send', async () => {
+      const sendMessage = vi.fn().mockResolvedValue('4242');
+      (gateway as any).telegramListener = { sendMessage };
+
+      const result = await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '123456789',
+        content: 'hello',
+      });
+
+      expect(result).toEqual({ platformMessageIds: ['4242'] });
+    });
+
+    it('returns nothing when the listener reports no id and no media was sent', async () => {
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = { sendMessage };
+
+      const result = await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '123456789',
+        content: 'hello',
+      });
+
+      expect(result).toBeUndefined();
+    });
+
+    it('returns the media counters and the text id together', async () => {
+      const sendMessage = vi.fn().mockResolvedValue('77');
+      (gateway as any).telegramListener = { sendMessage };
+      vi.spyOn(gateway as any, 'sendMediaAttachments').mockResolvedValue({
+        sent: 1,
+        failed: 0,
+        errors: [],
+      });
+
+      const result = await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '123456789',
+        content: 'caption text',
+        media: [{ type: 'image', path: '/tmp/a.png' }],
+      });
+
+      expect(result).toEqual({
+        mediaSent: 1,
+        mediaFailed: 0,
+        mediaErrors: undefined,
+        platformMessageIds: ['77'],
+      });
+    });
+
+    it('returns the id of the text sent after a voice reply', async () => {
+      mockTtsIsEnabled.mockReturnValue(true);
+      mockTtsSynthesize.mockResolvedValue({
+        filePath: '/tmp/reply.ogg',
+        contentType: 'audio/ogg',
+        filename: 'reply.ogg',
+        cleanup: vi.fn().mockResolvedValue(undefined),
+      });
+      const sendMessage = vi.fn().mockResolvedValue('901');
+      (gateway as any).telegramListener = {
+        sendVoice: vi.fn().mockResolvedValue(undefined),
+        sendMessage,
+      };
+
+      const result = await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '123456789',
+        content: 'spoken and written',
+        metadata: { voiceReply: true },
+      });
+
+      expect(result).toEqual({ platformMessageIds: ['901'] });
+    });
+  });
 });
 
 describe('Gateway Status', () => {

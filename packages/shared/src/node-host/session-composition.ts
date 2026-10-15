@@ -245,6 +245,13 @@ export async function composeInkSession(ports: SessionCompositionPorts, signal?:
     sbSlug,
     cliAttached: ports.cliAttached,
     contextBudgetAuto: () => ports.contextBudgetAuto,
+    passthroughArgs: () =>
+      buildBackendToolPassthrough(
+        runtime.backend,
+        runtime.toolRouting,
+        policy.getBackendToolGate(),
+        runtime.strictTools
+      ).passthroughArgs,
     append: (event) => log.append(event),
     flush: () => log.flush(),
     spawnContext: ports.spawnContext,

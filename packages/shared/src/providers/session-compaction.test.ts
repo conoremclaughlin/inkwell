@@ -55,6 +55,7 @@ function fixture(n = 20) {
     sbSlug: 'echo',
     cliAttached: false,
     contextBudgetAuto: () => true,
+    passthroughArgs: () => ['--skip-git-repo-check', '--sandbox', 'read-only'],
     append,
     flush: vi.fn(async () => {}),
     spawnContext: () => ({
@@ -201,6 +202,8 @@ describe('createSessionCompaction', () => {
         sbSlug: 'echo',
         model: 'test-model',
         effort: 'high',
+        toolRouting: 'local',
+        passthroughArgs: ['--skip-git-repo-check', '--sandbox', 'read-only'],
         systemPromptOverride: 'synthetic identity',
         timeoutMs: 300000,
         idleTimeoutMs: 2000,
@@ -213,6 +216,20 @@ describe('createSessionCompaction', () => {
       })
     );
     expect(f.ports.recordUsage).toHaveBeenCalledWith(f.ok.usage);
+  });
+  it('resolves current routing and passthrough policy at summarizer launch', async () => {
+    const f = fixture();
+    f.runtime.backend = 'codex';
+    f.runtime.toolRouting = 'backend';
+    f.ports.passthroughArgs = () => ['--sandbox', 'read-only'];
+    await f.compaction.compactContextNow({ actor: 'system', reason: 'test' });
+    expect(f.startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        backend: 'codex',
+        toolRouting: 'backend',
+        passthroughArgs: ['--sandbox', 'read-only'],
+      })
+    );
   });
   it.each(['during-launch', 'after-launch'] as const)(
     'aborts %s and records failed usage without compacting',

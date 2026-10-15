@@ -303,6 +303,7 @@ export class GeminiRunner implements IRunner {
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...(extraEnv || {}),
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           studioId: config.studioId,
           accessToken: config.inkAccessToken,

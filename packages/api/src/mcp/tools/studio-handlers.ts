@@ -24,6 +24,7 @@ import { resolveCaller, resolveImplicitSession } from './memory-handlers';
 import {
   isSessionAuthorized,
   loadAuthorizedAmbientSession,
+  resolveCallerIdentity,
   type CallerIdentity,
 } from './caller-identity';
 import { resolveCallerSb } from './caller-principal';
@@ -71,6 +72,12 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 // ============== Schemas ==============
 
 const createStudioSchema = userIdentifierBaseSchema.extend({
+  moveSession: z
+    .boolean()
+    .optional()
+    .describe(
+      'Move the session you are running in to this studio once it is ready: your next turn runs there, with its permissions (spec automated-turn-permissions §3.6). A headless session is woken there; an attached one is given the relaunch command.'
+    ),
   sbSlug: z
     .string()
     .refine(isSafeStudioComponent, 'Invalid SB path component')
@@ -204,6 +211,12 @@ const closeStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const adoptStudioSchema = userIdentifierBaseSchema.extend({
+  moveSession: z
+    .boolean()
+    .optional()
+    .describe(
+      'Move the session you are running in to this studio once it is ready: your next turn runs there, with its permissions (spec automated-turn-permissions §3.6). A headless session is woken there; an attached one is given the relaunch command.'
+    ),
   sbSlug: z.string().describe('SB slug adopting the studio'),
   sessionId: z.string().guid().describe('Session ID to link to the studio'),
   studioId: z.string().guid().optional().describe('Studio UUID to adopt'),
@@ -689,6 +702,28 @@ function provenanceWarnings(
 
 // ============== Handlers ==============
 
+/**
+ * `moveSession: true` on create or adopt: move the calling session into the
+ * studio (services/sessions/move-session.ts). The studio stands either way;
+ * a move that is refused is reported beside it, not as a failed create.
+ */
+async function moveIfAsked(
+  dataComposer: DataComposer,
+  asked: boolean | undefined,
+  userId: string,
+  sbSlug: string,
+  studioId: string
+): Promise<{ move?: unknown }> {
+  if (!asked) return {};
+  const { moveSessionToStudio } = await import('../../services/sessions/move-session.js');
+  const move = await moveSessionToStudio(dataComposer, {
+    userId,
+    caller: resolveCallerIdentity(sbSlug),
+    targetStudioId: studioId,
+  });
+  return { move };
+}
+
 export async function handleCreateStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = createStudioSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -831,6 +866,13 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
           : `Studio already registered at ${worktreePath}`,
         reused: true,
         revived,
+        ...(await moveIfAsked(
+          dataComposer,
+          parsed.moveSession,
+          resolved.user.id,
+          actor.sbSlug,
+          studio.id
+        )),
         studio: {
           id: studio.id,
           studioId: studio.id,
@@ -963,6 +1005,13 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
 
   return successResponse({
     message: `Studio created at ${worktreePath}`,
+    ...(await moveIfAsked(
+      dataComposer,
+      parsed.moveSession,
+      resolved.user.id,
+      actor.sbSlug,
+      studio.id
+    )),
     provenance: {
       sessionId: creatorSessionId ?? null,
       sessionReason: creatorSessionReason ?? null,
@@ -1511,6 +1560,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 
   return successResponse({
     message: `Studio adopted by ${actor.sbSlug} and linked to session ${sessionId}`,
+    ...(await moveIfAsked(dataComposer, parsed.moveSession, user.id, actor.sbSlug, updated.id)),
     provenance: { sessionId, logged: provenance.logged },
     lease: provenance.lease,
     routing: provenance.routing,

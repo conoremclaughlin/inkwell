@@ -187,6 +187,9 @@ function printSyncReport(report: PermissionsSyncReport, apply: boolean): void {
   if (!plan) return;
   for (const rule of plan.addAllow) console.log(chalk.green(`    + allow ${rule}`));
   for (const rule of plan.addDeny) console.log(chalk.red(`    + deny  ${rule}`));
+  for (const rule of plan.removeDeny) {
+    console.log(chalk.cyan(`    - deny  ${rule} (retired: the delete hook decides it now)`));
+  }
   for (const kept of plan.kept) {
     console.log(chalk.yellow(`    · not added (${kept.list}) ${kept.rule}: ${kept.reason}`));
   }

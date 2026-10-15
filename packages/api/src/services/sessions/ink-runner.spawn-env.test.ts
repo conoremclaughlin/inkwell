@@ -12,6 +12,7 @@ import { EventEmitter } from 'events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const spawnMock = vi.fn();
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
 const resolveInkCliMock = vi.fn();
 
 vi.mock('child_process', () => ({ spawn: (...args: unknown[]) => spawnMock(...args) }));
@@ -106,6 +107,7 @@ describe('InkRunner child environment (Phase 0)', () => {
     expect('TELEGRAM_BOT_TOKEN' in env).toBe(false);
     // The child's own credentials, from the config, never the parent's env.
     expect(env.INK_ACCESS_TOKEN).toBe('child-session-token');
+    expect(env.INK_RUNNER_AUTH_REQUIRED).toBe('1');
     expect(env.INK_DELEGATION_SECRET).toBe('synthetic-derived-secret');
     expect(env.INK_SESSION_ID).toBe('sess-env-1');
     expect(env.SB_SLUG).toBe('myra');
@@ -125,6 +127,7 @@ describe('InkRunner child environment (Phase 0)', () => {
       inkSessionId: 'sess-env-2',
     });
     expect('INK_DELEGATION_SECRET' in env).toBe(false);
+    expect(env.INK_RUNNER_AUTH_REQUIRED).toBe('1');
     expect('JWT_SECRET' in env).toBe(false);
   });
 

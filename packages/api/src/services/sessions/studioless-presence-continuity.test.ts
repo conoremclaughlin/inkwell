@@ -22,10 +22,12 @@
 
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { fakeProcessEnv } from '../../test/fake-env';
 import * as sessionServiceModule from './session-service';
 import { SessionService, RoutingRefusedError } from './session-service';
 import { assignThreadParticipant } from './thread-assignment';
+import { BackendFailureError } from '../../channels/trigger-retry';
 import { decideDelivery } from './trigger-delivery.js';
 import { resetActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
@@ -33,6 +35,11 @@ import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import type { IContextBuilder, IRunner, Session } from './types';
 import type { IActivityStream } from './session-service';
 import { inTurnNote } from '../inklings/inkling-reply-chain';
+
+// Admission needs explicit synthetic signing authority; never the checkout environment.
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
+beforeEach(() => vi.stubEnv('JWT_SECRET', fakeProcessEnv.JWT_SECRET));
+afterEach(() => vi.unstubAllEnvs());
 
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -97,7 +104,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
+       RoutingRefusedError, BackendFailureError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
        inTurnNote
      } = deps;
      ${compiledHandler}
@@ -288,7 +295,13 @@ function typeRow(type: string, writeIntent: string, studioPolicy: string): Row {
 const contextBuilder = {
   buildContext: vi.fn(async () => ({
     agent: { sbSlug: SLUG, name: 'Lumen', role: 'assistant', values: [], capabilities: [] },
-    user: { id: USER, timezone: 'UTC', contacts: {}, preferences: {} },
+    user: {
+      id: USER,
+      email: 'runner-owner@example.test',
+      timezone: 'UTC',
+      contacts: {},
+      preferences: {},
+    },
     temporal: {
       currentTime: '02:30',
       currentDate: '2026-10-02',
@@ -492,6 +505,7 @@ function makeWorld(opts: WorldOptions = {}) {
     storedTriggerMedia: vi.fn(async () => []),
     decideDelivery,
     RoutingRefusedError,
+    BackendFailureError,
     routeResponses: vi.fn(async () => undefined),
     triggerRetryScheduler: { cancelFor: vi.fn() },
     // The no-progress breaker's completion hook (T1): inert here.
@@ -556,6 +570,18 @@ describe('a pinned presence thread with no studio in the project repo keeps one 
   beforeEach(() => {
     resetActiveRuns();
     resetPendingFinalizations();
+  });
+
+  it('carries a credential refusal through the extracted handler without starting a runner', async () => {
+    vi.stubEnv('JWT_SECRET', '');
+    const w = makeWorld();
+    const result = await w.send();
+    expect(result.routeOnly).toBeNull();
+    expect(result.wake).toBeInstanceOf(BackendFailureError);
+    expect(result.wake).toMatchObject({
+      classification: { category: 'auth', retryable: false },
+    });
+    expect(w.runner.run).not.toHaveBeenCalled();
   });
 
   it('first message makes one row; the second resumes it: same id, stamp and transcript, no new rows', async () => {

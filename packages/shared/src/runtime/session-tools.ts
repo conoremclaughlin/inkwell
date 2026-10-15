@@ -48,6 +48,8 @@ export interface SessionToolsPorts {
   collectAgents(args: Record<string, unknown>): Promise<InkToolCallResult>;
   compact(args: Record<string, unknown>, ctx: { signal?: AbortSignal }): Promise<InkToolCallResult>;
   measurement(): ProviderContextMeasurement | undefined;
+  /** Host-owned switch; see `ToolCallExecutorPorts.concurrentReads`. */
+  concurrentReads?: boolean;
   recordEviction(
     actor: 'sb',
     reason: string,
@@ -68,6 +70,7 @@ export function createSessionTools(ports: SessionToolsPorts) {
       log: ports.log,
       policy: ports.policy,
       sessionId: ports.sessionId(),
+      concurrentReads: ports.concurrentReads,
       mintInvocationId: ports.mintInvocationId,
       impossibleCallRefusal,
       beginContextMutation: ports.beginContextMutation,

@@ -7,7 +7,8 @@
  * merges, what stays apart, and who owns the merged turn's replies.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { fakeProcessEnv } from '../../test/fake-env';
 import { SessionService } from './session-service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import type {
@@ -21,6 +22,16 @@ import type {
   SessionResult,
 } from './types.js';
 import type { IActivityStream } from './session-service.js';
+
+// The fixture runner never needs studio repair or an ink-init subprocess.
+vi.mock('../studio-complete.js', () => ({
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
+
+// Admission needs explicit synthetic signing authority; never the checkout environment.
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
+beforeEach(() => vi.stubEnv('JWT_SECRET', fakeProcessEnv.JWT_SECRET));
+afterEach(() => vi.unstubAllEnvs());
 
 vi.mock('../principals.js', () => ({
   workspaceOfSb: vi.fn(async () => 'ws-1'),
@@ -80,7 +91,13 @@ const context = (): InjectedContext => ({
     capabilities: [],
     relationships: {},
   },
-  user: { id: 'user-456', timezone: 'UTC', contacts: {}, preferences: {} },
+  user: {
+    id: 'user-456',
+    email: 'runner-owner@example.test',
+    timezone: 'UTC',
+    contacts: {},
+    preferences: {},
+  },
   temporal: {
     currentTime: '10:00 AM',
     currentDate: '2026-10-06',

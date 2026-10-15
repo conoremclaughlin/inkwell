@@ -301,6 +301,9 @@ describe('bearer-verification census', () => {
     // the exact admitted owner/session/SB and full tier. Signed browser-token
     // refusal and an admitted MCP-token control are exercised below.
     'services/sessions/native-steering-binding.ts',
+    // Server launches require their minted mcp_access token with exact session,
+    // owner, agent and contact bindings. No browser or human-token downgrade.
+    'services/sessions/session-service.ts',
     // The companion router itself.
     'routes/browser-companion.ts',
   ].sort();

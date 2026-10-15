@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { mkdtempSync, existsSync, readdirSync, readFileSync, rmSync } from 'fs';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
@@ -39,6 +40,11 @@ vi.mock('fs/promises', () => ({
 vi.mock('./resolve-binary.js', () => ({
   resolveBinaryPath: vi.fn().mockResolvedValue('codex'),
   buildSpawnPath: vi.fn().mockReturnValue(process.env.PATH || ''),
+}));
+
+vi.mock('@inklabs/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@inklabs/shared')>()),
+  writeRuntimeSessionHint: vi.fn(),
 }));
 
 vi.mock('../../utils/logger.js', () => ({
@@ -192,6 +198,7 @@ describe('CodexRunner', () => {
       { env?: Record<string, string> },
     ];
     expect(options.env?.INK_ACCESS_TOKEN).toBe('test-ink-token');
+    expect(options.env?.INK_RUNNER_AUTH_REQUIRED).toBe('1');
   });
 
   // spec:sender-token-binding v3 §4 Phase 0 (task 7f4ceda4). The host path

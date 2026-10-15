@@ -156,6 +156,8 @@ export class InkClient {
   }
 
   private loadConfig(): InkAuthConfig {
+    // A server runner has no reason to read the legacy machine credential.
+    if (hasSessionTokenBinding()) return {};
     if (!existsSync(this.configPath)) {
       return {};
     }

@@ -1,6 +1,11 @@
 import { backendTurnActivity } from '@inklabs/shared/node-host';
 import { sanitizeArgsForApproval } from '@inklabs/shared/runtime';
 import { createSessionClones } from '@inklabs/shared/node-host';
+import {
+  describeJournalSplit,
+  resolveParentJournalSync,
+  type ParentJournalResolution,
+} from '@inklabs/shared/node-host';
 import { createSessionToolHost } from '@inklabs/shared/node-host';
 import { homedir, tmpdir } from 'os';
 import {
@@ -73,15 +78,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  statSync,
-  unwatchFile,
-  watchFile,
-} from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unwatchFile, watchFile } from 'fs';
 import { isAbsolute, join } from 'path';
 import { randomUUID } from 'crypto';
 import {
@@ -524,28 +521,23 @@ function ensureRuntimeTranscriptPath(sessionId?: string): string {
   return join(dir, `${safeSession}-${Date.now()}.jsonl`);
 }
 
+/**
+ * The session's own journal, never a clone's (task 65f3be41). Clones live
+ * beside it under the same prefix, so newest-by-mtime alone adopted a clone
+ * whenever one wrote last. A clone that an earlier attach already adopted
+ * still counts, and is reported as a split.
+ */
+function resolveSessionJournal(sessionId: string): ParentJournalResolution {
+  return resolveParentJournalSync(join(process.cwd(), '.ink', 'runtime', 'repl'), sessionId);
+}
+
+/** For listings and previews: an unreadable journal shows as none rather than failing the list. */
 function findLatestTranscriptForSession(sessionId: string): string | undefined {
-  const dir = join(process.cwd(), '.ink', 'runtime', 'repl');
-  if (!existsSync(dir)) return undefined;
-  const sessionPrefix = `${sessionId}-`;
-  const candidates = readdirSync(dir)
-    .filter((entry) => entry.startsWith(sessionPrefix) && entry.endsWith('.jsonl'))
-    .map((entry) => join(dir, entry))
-    .filter((fullPath) => {
-      try {
-        return statSync(fullPath).isFile();
-      } catch {
-        return false;
-      }
-    })
-    .sort((a, b) => {
-      try {
-        return statSync(b).mtimeMs - statSync(a).mtimeMs;
-      } catch {
-        return 0;
-      }
-    });
-  return candidates[0];
+  try {
+    return resolveSessionJournal(sessionId).path;
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveTranscriptTarget(target: string): string {
@@ -2983,10 +2975,15 @@ async function runChatSession(
     }
   }
 
-  const existingTranscript =
+  // Attach reads the journal it will append to, so a read error stops here
+  // instead of starting a fresh file beside the session's history.
+  const journal =
     runtime.sessionId && attachedToExistingSession
-      ? findLatestTranscriptForSession(runtime.sessionId)
+      ? resolveSessionJournal(runtime.sessionId)
       : undefined;
+  const existingTranscript = journal?.path;
+  const journalSplit = journal ? describeJournalSplit(journal) : undefined;
+  if (journalSplit) console.error(chalk.yellow(`[ink] ${journalSplit}`));
   // The live obs mirror: EVERY projection-type ledger append (user, system
   // turns, inkClient/local tools, assistant results, backend events, session
   // markers) is emitted as an `obs` line from inside SessionLog.append — one
@@ -3525,6 +3522,13 @@ async function runChatSession(
     sbSlug,
     cliAttached,
     contextBudgetAuto: () => contextBudgetAuto,
+    passthroughArgs: () =>
+      buildBackendToolPassthrough(
+        runtime.backend,
+        runtime.toolRouting,
+        toolPolicy.getBackendToolGate(),
+        runtime.strictTools
+      ).passthroughArgs,
     append: (entry) => runtime.log.append(entry),
     flush: () => runtime.log.flush(),
     spawnContext: providerSpawnContext,
@@ -4258,6 +4262,8 @@ async function runChatSession(
     collectAgents: runCollectAgents,
     compact: runSbCompaction,
     measurement: providerContextMeasurement,
+    // Opt-in while it is new: a batch's audited reads overlap each other.
+    concurrentReads: process.env.INK_CONCURRENT_READS === 'true',
     recordEviction,
   });
   const runIterationTools = async (

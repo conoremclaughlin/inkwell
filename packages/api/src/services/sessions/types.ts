@@ -653,7 +653,8 @@ export interface ISessionService {
    * Sends compaction prompt, waits for agent to persist context,
    * then rotates to fresh Claude session.
    */
-  triggerCompaction(sessionId: string): Promise<void>;
+  // Credential admission can refuse with the same classification as a turn.
+  triggerCompaction(sessionId: string): Promise<void | SessionResult>;
 
   /**
    * End a session (for task agents or explicit termination).
@@ -833,6 +834,9 @@ export interface IContextBuilder {
 // ─── Runner Interface ───
 
 export interface ClaudeRunnerConfig {
+  /** Advisory only, invoked after launch policy preparation and before final
+   * admission. Absent means no inspection or notification (default). */
+  onPermissionWarning?: import('./spawn-permission-warning.js').SpawnPermissionWarningHandler;
   workingDirectory: string;
   mcpConfigPath: string;
   /** Host-created capability for one admitted owner generation; never request metadata. */
@@ -985,6 +989,13 @@ export interface ClaudeRunnerConfig {
    * session; a profile that cannot be validated fails the launch.
    */
   launchPermissions?: {
+    /**
+     * `profile` (default): the studio's own profile. `automated`: the yolo
+     * rules for automated turns (INK_AUTOMATED_TURNS=yolo), for a studio, the
+     * root studio, or a spawn with no studio; `profile` is then the studio's
+     * profile when it has one, and undefined otherwise.
+     */
+    mode?: 'profile' | 'automated';
     profile: unknown;
     owner: unknown;
     /** The main checkout, for the record of sources; null when not a worktree. */

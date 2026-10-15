@@ -21,6 +21,7 @@
 import path from 'path';
 import { homedir, tmpdir } from 'os';
 import { createLocalHostedInkRunner } from './services/sessions/hosted-ink-local-host';
+import { createSpawnPermissionNotifier } from './services/sessions/spawn-permission-notifier';
 import { getDataComposer, DataComposer } from './data/composer';
 import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
@@ -233,6 +234,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       sbIds: [...hostedInkSbIds],
     });
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
+    ...(env.INK_SPAWN_PERMISSION_WARNINGS
+      ? { onPermissionWarning: createSpawnPermissionNotifier(dataComposer) }
+      : {}),
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,

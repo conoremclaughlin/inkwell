@@ -39,9 +39,8 @@ describe('sb permissions', () => {
 
     expect(perms.allow).toContain('Bash(*)');
     expect(perms.allow).toContain('Edit(*)');
-    expect(perms.deny).toContain('Bash(rm -rf *)');
     expect(perms.deny).toContain('Bash(git push --force *)');
-    expect(perms.deny).toContain('Bash(git reset --hard *)');
+    expect(perms.deny).not.toContain('Bash(rm -rf *)');
   });
 
   it('auto writes the one shared list, not a copy of it (design v3, item 6)', () => {
@@ -80,7 +79,7 @@ describe('sb permissions', () => {
     runSb(['permissions', 'auto'], tmpDir);
     const output = runSb(['permissions', 'show'], tmpDir);
     expect(output).toContain('Bash(*)');
-    expect(output).toContain('rm -rf');
+    expect(output).toContain('git push --force');
   });
 
   it('reset removes permission rules', () => {

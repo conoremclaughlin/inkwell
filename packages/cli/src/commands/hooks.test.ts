@@ -463,6 +463,7 @@ describe('installHooks: detection priority', () => {
 // ============================================================================
 
 vi.mock('../auth/tokens.js', () => ({
+  hasSessionTokenBinding: vi.fn(() => false),
   getValidAccessToken: vi.fn(),
   getValidDelegatedAccessToken: vi.fn(),
   loadAuth: vi.fn(),

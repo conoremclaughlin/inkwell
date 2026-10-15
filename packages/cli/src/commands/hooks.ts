@@ -18,14 +18,29 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs';
-import { join, dirname } from 'path';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  appendFileSync,
+  rmSync,
+  statSync,
+  realpathSync,
+  lstatSync,
+} from 'fs';
+import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
+import { classifyDestructiveCommand, SB_SLUG_FOR_RULES, type DestructiveFs } from '@inklabs/shared';
 import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
-import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
+import {
+  getValidAccessToken,
+  getValidDelegatedAccessToken,
+  hasSessionTokenBinding,
+} from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
@@ -265,6 +280,7 @@ export async function callInkTool(
   const serverUrl = getInkServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.INK_ACCESS_TOKEN?.trim());
+  const sessionBound = hasSessionTokenBinding();
   const delegatedSlug =
     typeof args.sbSlug === 'string' && args.sbSlug.trim().length > 0
       ? args.sbSlug.trim().toLowerCase()
@@ -287,6 +303,9 @@ export async function callInkTool(
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
+    if (!token && sessionBound) {
+      throw new Error('Session-scoped hook authority unavailable; re-admit the session');
+    }
     const headers = { ...baseHeaders };
     if (token) {
       headers.Authorization = `Bearer ${token}`;
@@ -311,7 +330,7 @@ export async function callInkTool(
     allowEnvToken?: boolean;
     skipDelegated?: boolean;
   }): Promise<{ token: string | null; source: 'delegated' | 'base' }> => {
-    if (delegatedSlug && !options?.skipDelegated) {
+    if (!sessionBound && delegatedSlug && !options?.skipDelegated) {
       const delegatedToken = getValidDelegatedAccessToken(delegatedSlug);
       if (delegatedToken) {
         return { token: delegatedToken, source: 'delegated' };
@@ -326,7 +345,11 @@ export async function callInkTool(
 
   // Retry once if a runtime token was injected OR if we attempted a delegated token.
   // This allows fallback to local auth token when the first credential is rejected.
-  if (response.status === 401 && (hasInjectedEnvToken || usedDelegatedTokenOnFirstAttempt)) {
+  if (
+    !sessionBound &&
+    response.status === 401 &&
+    (hasInjectedEnvToken || usedDelegatedTokenOnFirstAttempt)
+  ) {
     // Drain first response body before retrying so the underlying HTTP client
     // can cleanly release the stream (avoids occasional undici body warnings).
     try {
@@ -2632,8 +2655,72 @@ export function matchesApprovalSet(
   return false;
 }
 
+/**
+ * A PreToolUse decision, as Claude Code reads it: JSON on stdout and exit 0.
+ * Never `exit 1` with plain text: Claude Code treats that as a NON-BLOCKING
+ * error and runs the tool (docs: hooks, "Exit code output"), which is how
+ * every refusal below failed open until 2026-10-13.
+ */
+export function preToolUseDecision(
+  decision: 'deny' | 'ask',
+  reason: string
+): { hookSpecificOutput: Record<string, string> } {
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: decision,
+      permissionDecisionReason: reason,
+    },
+  };
+}
+
+function emitDecision(decision: 'deny' | 'ask', reason: string): never {
+  process.stdout.write(JSON.stringify(preToolUseDecision(decision, reason)) + '\n');
+  process.exit(0);
+}
+
+/**
+ * The directories a delete is allowed inside without asking (spec
+ * automated-turn-permissions §3.4): the launch checkout when it is a linked
+ * worktree (its `.git` is a file), never a main checkout, and the SB's own
+ * scratch and screenshot directories.
+ */
+export function destructiveRoots(projectDir: string | undefined, sbSlug: string | null): string[] {
+  const roots: string[] = [];
+  if (projectDir && isAbsolute(projectDir)) {
+    try {
+      if (statSync(join(projectDir, '.git')).isFile()) roots.push(projectDir);
+    } catch {
+      // No .git: not a checkout the session may clean.
+    }
+  }
+  if (sbSlug && SB_SLUG_FOR_RULES.test(sbSlug)) {
+    const files = join(homedir(), '.ink', 'files');
+    roots.push(join(files, `${sbSlug}-scratch`), join(files, `${sbSlug}-screenshots`));
+  }
+  return roots;
+}
+
+const hostFs: DestructiveFs = {
+  realpath(path) {
+    try {
+      return realpathSync(path);
+    } catch {
+      return null;
+    }
+  },
+  isSymlink(path) {
+    try {
+      return lstatSync(path).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  },
+};
+
 async function onToolApprovalHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
+  const hookCwd = typeof stdin.cwd === 'string' && stdin.cwd ? stdin.cwd : process.cwd();
   const cwd = process.cwd();
 
   // Claude Code PreToolUse passes: { tool_name, tool_input }
@@ -2654,11 +2741,38 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
 
   hookLog('on_tool_approval', { toolName, toolInputPreview: toolInput.substring(0, 100) });
 
-  // Check against approval set
-  const approvalSet = loadApprovalSet(cwd);
-  if (approvalSet.length === 0 || !matchesApprovalSet(toolName, toolInput, approvalSet)) {
-    // Not in the approval set — allow through
-    process.exit(0);
+  // Destructive local commands (rm -r, git reset --hard, git clean -f, git
+  // checkout -- .) are decided here rather than by a deny rule, which no one
+  // could approve (spec automated-turn-permissions §3.4).
+  let destructiveReason: string | null = null;
+  if (toolName === 'Bash') {
+    const verdict = classifyDestructiveCommand(
+      toolInput,
+      {
+        cwd: hookCwd,
+        home: homedir(),
+        roots: destructiveRoots(process.env.CLAUDE_PROJECT_DIR, resolveSlug()),
+      },
+      hostFs
+    );
+    hookLog('on_tool_approval_destructive', { kind: verdict.kind });
+    if (verdict.kind === 'needs-approval') {
+      if (!isHeadlessSession()) {
+        emitDecision('ask', `Confirm this destructive command. ${verdict.reason}.`);
+      }
+      destructiveReason = verdict.reason;
+    }
+  }
+
+  // The checkout's own approval policy applies whatever the destructive
+  // check said: an allowed delete means "no further destructive restriction",
+  // never "skip an approval the checkout requires" (Lumen, #853).
+  if (destructiveReason === null) {
+    const approvalSet = loadApprovalSet(cwd);
+    if (approvalSet.length === 0 || !matchesApprovalSet(toolName, toolInput, approvalSet)) {
+      // Not in the approval set — allow through
+      process.exit(0);
+    }
   }
 
   hookLog('on_tool_approval_match', { toolName, toolInput: toolInput.substring(0, 200) });
@@ -2687,6 +2801,32 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
   const studioId = process.env.INK_STUDIO_ID?.trim() || undefined;
 
+  // A headless destructive command first tries to spend a grant Conor gave
+  // for exactly this command, here, in this session (spec §3.5). The server
+  // takes the session from the signed runner token, not from this request.
+  if (destructiveReason !== null) {
+    try {
+      const resp = await fetch(`${serverUrl}/api/admin/approval-requests/consume`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ tool: toolName, args: toolInput, cwd: hookCwd }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (resp.ok) {
+        const body = (await resp.json()) as { granted?: unknown; requestId?: unknown };
+        if (body.granted === true) {
+          hookLog('on_tool_approval_grant_spent', { requestId: String(body.requestId) });
+          process.exit(0);
+        }
+      } else {
+        hookLog('on_tool_approval_consume_failed', { status: resp.status });
+      }
+    } catch (err) {
+      // No grant could be spent; ask for one below, which fails closed too.
+      hookLog('on_tool_approval_consume_error', { error: String(err) });
+    }
+  }
+
   let requestId: string;
   try {
     const resp = await fetch(`${serverUrl}/api/admin/approval-requests`, {
@@ -2695,10 +2835,14 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
       body: JSON.stringify({
         tool: toolName,
         args: toolInput,
-        reason: 'Tool requires explicit per-call confirmation by policy.',
+        reason:
+          destructiveReason !== null
+            ? `Destructive command outside the session's own directories (${destructiveReason}).`
+            : 'Tool requires explicit per-call confirmation by policy.',
         studioId,
         sessionId,
-        timeoutSeconds: 300,
+        ...(destructiveReason !== null ? { oneUse: true, cwd: hookCwd } : {}),
+        timeoutSeconds: destructiveReason !== null ? 1800 : 300,
       }),
       signal: AbortSignal.timeout(10000),
     });
@@ -2706,10 +2850,10 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
     if (!resp.ok) {
       hookLog('on_tool_approval_create_failed', { status: resp.status });
       // Fail closed — this is a security gate, don't allow through on errors
-      process.stdout.write(
-        `\n⚠️ Permission blocked: could not create approval request (server returned ${resp.status}).\n`
+      emitDecision(
+        'deny',
+        `Permission blocked: could not create approval request (server returned ${resp.status}).`
       );
-      process.exit(1);
     }
 
     const body = (await resp.json()) as { requestId: string };
@@ -2718,10 +2862,17 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   } catch (err) {
     hookLog('on_tool_approval_create_error', { error: String(err) });
     // Fail closed — security gate must not silently bypass on errors
-    process.stdout.write(
-      `\n⚠️ Permission blocked: could not reach approval server (${String(err)}).\n`
+    emitDecision('deny', `Permission blocked: could not reach approval server (${String(err)}).`);
+  }
+
+  // A headless destructive command never waits: the runner's silence
+  // timeout is also 5 minutes, so a poll would race the kill (spec §3.5).
+  if (destructiveReason !== null) {
+    emitDecision(
+      'deny',
+      `Approval requested from Conor (request ${requestId}): ${destructiveReason}. ` +
+        'Do not retry or work around it. Stop here; this session is resumed if it is approved.'
     );
-    process.exit(1);
   }
 
   // Poll for resolution (up to 5 min, check every 3s)
@@ -2756,12 +2907,10 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
 
       // denied, expired, or cancelled
       hookLog('on_tool_approval_denied', { requestId, status: status.status });
-      // Output a message explaining the denial
-      process.stdout.write(
-        `\n⚠️ Permission denied: ${toolName} requires approval. ` +
-          `Request ${requestId} was ${status.status}.\n`
+      emitDecision(
+        'deny',
+        `Permission denied: ${toolName} requires approval. Request ${requestId} was ${status.status}.`
       );
-      process.exit(1); // Block the tool
     } catch {
       // Transient error, keep polling
     }
@@ -2769,10 +2918,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
 
   // Timeout — deny
   hookLog('on_tool_approval_timeout', { requestId });
-  process.stdout.write(
-    `\n⚠️ Permission timeout: ${toolName} approval request expired after 5 minutes.\n`
-  );
-  process.exit(1);
+  emitDecision('deny', `Permission timeout: ${toolName} approval request expired after 5 minutes.`);
 }
 
 async function onPromptHandler(options?: {

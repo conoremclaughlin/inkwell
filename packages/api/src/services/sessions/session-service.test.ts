@@ -6,6 +6,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { fakeEnv } from '../../test/fake-env';
+vi.mock('../../config/env', async () => ({
+  env: (await import('../../test/fake-env')).fakeEnv,
+  isDevelopment: () => false,
+  isProduction: () => false,
+  isTest: () => true,
+}));
 import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
@@ -148,6 +155,7 @@ describe('SessionService', () => {
     },
     user: {
       id: 'user-456',
+      email: 'fixture@example.invalid',
       timezone: 'America/Los_Angeles',
       contacts: {},
       preferences: {},
@@ -176,6 +184,13 @@ describe('SessionService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv('JWT_SECRET', fakeEnv.JWT_SECRET);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => {
+        throw new Error('No network allowed in this service fixture');
+      })
+    );
 
     // Create fresh mocks for each test
     mockRepository = {
@@ -250,6 +265,134 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  describe('required runner credential admission', () => {
+    it.each(['turn', 'compaction'])(
+      'rechecks credential expiry at the %s physical-spawn seam',
+      async (kind) => {
+        const session = createMockSession();
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        if (kind === 'compaction') await sessionService.triggerCompaction(session.id);
+        else
+          await (
+            sessionService as unknown as {
+              processMessage: (
+                request: ReturnType<typeof createMockRequest>,
+                session: Session
+              ) => Promise<unknown>;
+            }
+          ).processMessage(createMockRequest(), session);
+        const config = vi.mocked(mockClaudeRunner.run).mock.calls[0][1]?.config;
+        expect(config?.admitSpawn?.()).toBeUndefined();
+        vi.useFakeTimers();
+        vi.setSystemTime(Date.now() + 2 * 3600_000);
+        const refusal = config?.admitSpawn?.();
+        expect(refusal).toBeDefined();
+        expect(refusal).toMatch(/runner credential unavailable/i);
+      }
+    );
+    it.each(['email', 'signing-key'])(
+      'refuses a turn without %s before any runner call',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        const start = vi.fn(async () => {});
+        const end = vi.fn(async (_result: unknown) => {});
+        const result = await sessionService.handleMessage(
+          createMockRequest({ turnHooks: { start, end } })
+        );
+        expect(result).toMatchObject({
+          success: false,
+          sessionId: session.id,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(start).toHaveBeenCalledOnce();
+        expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['email', 'signing-key'])(
+      'refuses compaction without %s and releases the lock',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+        await expect(sessionService.triggerCompaction('session-123')).resolves.toMatchObject({
+          success: false,
+          sessionId: 'session-123',
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it.each(['turn', 'compaction'])(
+      'classifies a %s mint exception without exposing its details',
+      async (kind) => {
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.spyOn(
+          sessionService as unknown as { createRunnerAccessToken: () => string },
+          'createRunnerAccessToken'
+        ).mockImplementation(() => {
+          throw new Error('synthetic private mint detail');
+        });
+        const end = vi.fn(async (_result: unknown) => {});
+        const result =
+          kind === 'turn'
+            ? await sessionService.handleMessage(
+                createMockRequest({ turnHooks: { start: async () => {}, end } })
+              )
+            : await sessionService.triggerCompaction(session.id);
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(JSON.stringify(result)).not.toContain('synthetic private mint detail');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        if (kind === 'turn')
+          expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
+        else expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it('compaction delivers the same explicit binding as ordinary turns', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+      await sessionService.triggerCompaction('session-123');
+      expect(mockClaudeRunner.run).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          config: expect.objectContaining({
+            inkSessionId: 'session-123',
+            sbSlug: 'myra',
+            inkAccessToken: expect.any(String),
+          }),
+        })
+      );
+    });
   });
 
   describe('turn hooks: each turn, in turn order (Lumen, #769)', () => {
@@ -3994,40 +4137,57 @@ describe('SessionService', () => {
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
-    it('records the compaction run’s launch, so a restart can stop it too', async () => {
-      const store = {
-        reserve: vi.fn(async () => 'row-compaction'),
-        attach: vi.fn(async () => undefined),
-        markExited: vi.fn(async () => undefined),
-        listOpen: vi.fn(async () => []),
-      };
-      configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
-      try {
-        const session = createMockSession({ backendSessionId: 'claude-abc' });
-        vi.mocked(mockRepository.findById).mockResolvedValue(session);
-        vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
-        vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
-          _message: string,
-          options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
-        ) => {
-          options.config.onSpawned?.({ pid: 4343 });
-          return createMockClaudeResult({ success: true });
-        }) as never);
-        await sessionService.triggerCompaction('session-123');
-        await vi.waitFor(() => expect(store.markExited).toHaveBeenCalledWith(['row-compaction']));
-        expect(store.reserve).toHaveBeenCalledWith(
-          expect.objectContaining({ sessionId: 'session-123' })
-        );
-        await vi.waitFor(() =>
-          expect(store.attach).toHaveBeenCalledWith(
-            'row-compaction',
-            expect.objectContaining({ pid: 4343 })
-          )
-        );
-      } finally {
-        configureLaunchRecording(undefined);
+    it.each(['alive', 'gone'] as const)(
+      'records the compaction run’s launch, so a restart can stop it too (pid %s)',
+      async (pidState) => {
+        const store = {
+          reserve: vi.fn(async () => 'row-compaction'),
+          attach: vi.fn(async () => undefined),
+          markExited: vi.fn(async () => undefined),
+          listOpen: vi.fn(async () => []),
+        };
+        // 4343 is a fixture, not an unused OS pid. Stub liveness so neither
+        // outcome depends on the host's process table, and never send a signal.
+        const processProbe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+          if (pid !== 4343 || signal !== 0) throw new Error('unexpected process probe');
+          if (pidState === 'alive') return true;
+          throw Object.assign(new Error('synthetic exit'), { code: 'ESRCH' });
+        });
+        try {
+          configureLaunchRecording({ store, serverInstance: 'host:3001', bootId: 'boot' });
+          const session = createMockSession({ backendSessionId: 'claude-abc' });
+          vi.mocked(mockRepository.findById).mockResolvedValue(session);
+          vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+          vi.mocked(mockClaudeRunner.run).mockImplementationOnce((async (
+            _message: string,
+            options: { config: { onSpawned?: (spawned: { pid: number }) => void } }
+          ) => {
+            options.config.onSpawned?.({ pid: 4343 });
+            return createMockClaudeResult({ success: true });
+          }) as never);
+          await sessionService.triggerCompaction('session-123');
+          // Assert outside the probe: pidAlive catches thrown errors.
+          expect(processProbe.mock.calls).toEqual([[4343, 0]]);
+          if (pidState === 'gone') {
+            expect(store.markExited).toHaveBeenCalledExactlyOnceWith(['row-compaction']);
+          } else {
+            expect(store.markExited).not.toHaveBeenCalled();
+          }
+          expect(store.reserve).toHaveBeenCalledWith(
+            expect.objectContaining({ sessionId: 'session-123' })
+          );
+          await vi.waitFor(() =>
+            expect(store.attach).toHaveBeenCalledWith(
+              'row-compaction',
+              expect.objectContaining({ pid: 4343 })
+            )
+          );
+        } finally {
+          processProbe.mockRestore();
+          configureLaunchRecording(undefined);
+        }
       }
-    });
+    );
 
     it('does not compact when a hold lands while the compaction lock is taken', async () => {
       try {

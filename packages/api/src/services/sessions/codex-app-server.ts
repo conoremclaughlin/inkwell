@@ -93,6 +93,7 @@ export async function runOwnedCodexAppServer(input: {
         ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           runtimeLinkId,
           studioId: config.studioId,
