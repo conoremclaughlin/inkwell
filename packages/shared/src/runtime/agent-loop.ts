@@ -1581,7 +1581,10 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
  * legacy to-first-``` treatment; a scanned JSON with a missing closing fence
  * is still accepted (executing beats leaking).
  */
-export function findInkToolBlocks(text: string): InkToolBlock[] {
+export function findInkToolBlocks(
+  text: string,
+  options: { unquotedOnly?: boolean } = {}
+): InkToolBlock[] {
   const blocks: InkToolBlock[] = [];
   // Derived from INK_TOOL_OPENER so the finder and the sibling-boundary rule
   // cannot disagree about what an opener is. The trailing run is about where
@@ -1647,7 +1650,26 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     // than past it.
     openRe.lastIndex = boundary.payloadEnd;
   }
-  return blocks;
+  if (!options.unquotedOnly) return blocks;
+
+  // The streaming protocol accepts requests, not examples nested in another
+  // code fence. Keep the JSON-aware finder above as the single block grammar;
+  // walk only the prose BETWEEN its blocks with the shared fence grammar.
+  let lineStart = 0;
+  let open: OpenFence | null = null;
+  return blocks.filter((block) => {
+    while (lineStart < block.start) {
+      const nl = text.indexOf('\n', lineStart);
+      const end = nl === -1 ? text.length : nl;
+      open = fenceAfterLine(open, text.slice(lineStart, end));
+      lineStart = end + 1;
+    }
+    if (open !== null) return false;
+    // Do not interpret a request's own closer as the next example opener.
+    // An unclosed block may end exactly ON a sibling's opening line.
+    lineStart = text[block.end - 1] === '\n' ? block.end : nextLineStart(text, block.end);
+    return true;
+  });
 }
 
 /**
@@ -1864,7 +1886,15 @@ export function repairTruncatedJson(payload: string): string | null {
  * that genuinely want just the calls. The LOOP must use this one — dropping the
  * second half is the bug (see MalformedToolBlock).
  */
-export function extractToolBlocks(responseText: string): {
+export function extractToolBlocks(
+  responseText: string,
+  options: {
+    /** Opt-in stream protocol: closed canonical JSON only; no repair or XML fallback. */
+    canonicalOnly?: boolean;
+    /** More text may arrive: a closing line is not final until its newline arrives. */
+    partial?: boolean;
+  } = {}
+): {
   calls: LocalToolCall[];
   malformed: MalformedToolBlock[];
   /** Blocks that parsed only after their open containers were closed for them. */
@@ -1874,8 +1904,30 @@ export function extractToolBlocks(responseText: string): {
   const malformed: MalformedToolBlock[] = [];
   const repaired: MalformedToolBlock[] = [];
 
-  for (const block of findInkToolBlocks(responseText)) {
+  if (options.canonicalOnly) {
+    // The live and final readers cut at exactly the same imitation boundary.
+    const imitation = findImitatedToolResults(responseText);
+    if (imitation) responseText = responseText.slice(0, imitation.index);
+  }
+
+  for (const block of findInkToolBlocks(responseText, {
+    unquotedOnly: options.canonicalOnly,
+  })) {
     if (!block.payload) continue;
+    if (options.canonicalOnly) {
+      if (options.partial && (!block.fenceClosed || responseText.indexOf('\n', block.end) < 0)) {
+        continue;
+      }
+      if (!block.fenceClosed) {
+        malformed.push({
+          tool: readToolName(block.payload),
+          error: 'canonical tool calls require a closing fence',
+          payloadLength: block.payload.length,
+          fenceClosed: false,
+        });
+        continue;
+      }
+    }
     let payload = block.payload;
     let wasRepaired = false;
     try {
@@ -1886,7 +1938,8 @@ export function extractToolBlocks(responseText: string): {
       // provably open — but only for a block the model finished writing, and
       // never in silence. The repair is reported to the model alongside the
       // result, so a persistent miscounter is corrected rather than propped up.
-      const fixed = block.fenceClosed ? repairTruncatedJson(payload) : null;
+      const fixed =
+        block.fenceClosed && !options.canonicalOnly ? repairTruncatedJson(payload) : null;
       if (fixed === null) {
         // Report a REQUEST, not every fence-shaped string — see
         // `looksLikeToolRequest`.
@@ -1952,6 +2005,19 @@ export function extractToolBlocks(responseText: string): {
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
           : {};
+      if (
+        options.canonicalOnly &&
+        parsed.args !== undefined &&
+        (parsed.args === null || typeof parsed.args !== 'object' || Array.isArray(parsed.args))
+      ) {
+        malformed.push({
+          tool,
+          error: 'canonical tool args must be a JSON object',
+          payloadLength: payload.length,
+          fenceClosed: true,
+        });
+        continue;
+      }
       indexed.push({
         index: block.start,
         call: { tool, args, raw: responseText.slice(block.start, block.end) },
@@ -1966,6 +2032,9 @@ export function extractToolBlocks(responseText: string): {
       }
     }
   }
+
+  if (options.canonicalOnly)
+    return { calls: indexed.map((entry) => entry.call), malformed, repaired };
 
   // Variant tolerance: a long-lived session whose history predates
   // wholly-in-ink can drift into emitting tool calls as
