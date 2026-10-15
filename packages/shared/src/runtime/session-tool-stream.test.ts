@@ -9,6 +9,7 @@ import {
 import type { ContextImage } from './context-image.js';
 import { SessionLog } from './session-log.js';
 import { SessionContextState } from './session-context-state.js';
+import { parseJsonRpcToolPayload } from './mcp-result.js';
 
 const block = (tool: string, args: Record<string, unknown> = {}) =>
   '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```\n';
@@ -350,4 +351,54 @@ describe('session-owned stream settlement and identity', () => {
     await stream.finish({ endOfResponse: true });
     expect(secondRelease).toHaveBeenCalledOnce();
   });
+
+  it.each([null, [1, 2], 'done', 42, true].map((payload) => [payload]))(
+    'recovers the opaque JSON payload %j accepted by the tool parser',
+    async (payload) => {
+      const h = harness();
+      const lines: string[] = [];
+      const log = new SessionLog({
+        path: '/synthetic/result-shapes.jsonl',
+        sink: {
+          write: (line) => {
+            lines.push(line);
+          },
+        },
+      });
+      const journal = createToolInvocationJournal({
+        sessionId: h.ports.sessionId!,
+        log,
+        mintInvocationId: () => 'synthetic-shape-call',
+      });
+      vi.mocked(h.ports.callTool).mockResolvedValue(
+        parseJsonRpcToolPayload({
+          result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+        })
+      );
+      const stream = (await createSessionToolStream({
+        enabled: true,
+        ports: { ...h.ports, log },
+        journal,
+        owner: { turnId: 'synthetic-turn', attemptId: 'synthetic-attempt' },
+      }))!;
+      stream.append(block('recall'));
+      const done = await stream.finish({ endOfResponse: true });
+      expect(done.failure).toBeUndefined();
+      expect(done.results[0]).toMatchObject({ status: 'executed', result: payload });
+      const restored = createToolInvocationJournal({
+        sessionId: h.ports.sessionId!,
+        log,
+        mintInvocationId: () => 'unused',
+        recoveredEvents: lines.map((line) => JSON.parse(line)),
+      });
+      expect(restored.recovered[0].invocations[0]).toMatchObject({
+        state: 'settled',
+        result: { status: 'executed', dispatchState: 'returned', result: payload },
+      });
+      await expect(
+        restored.begin({ turnId: 'synthetic-turn', attemptId: 'synthetic-attempt' })
+      ).rejects.toThrow('never redispatch');
+      expect(h.ports.callTool).toHaveBeenCalledOnce();
+    }
+  );
 });

@@ -18,7 +18,8 @@ export interface RecoveredToolInvocation {
   args: Record<string, unknown>;
   /** A persisted intent without an outcome is uncertain, never runnable work. */
   state: 'not-dispatched' | 'unknown' | 'settled';
-  result?: ToolCallResult;
+  /** The tool payload is opaque JSON, including null, arrays and primitives. */
+  result?: Omit<ToolCallResult, 'result'> & { result?: unknown };
 }
 export interface RecoveredToolAttempt {
   owner: ToolAttemptOwner;
@@ -86,7 +87,6 @@ export function readToolInvocationJournal(
       !attempt ||
       !Number.isSafeInteger(stamp.ordinal) ||
       (stamp.ordinal as number) < 0 ||
-      (stamp.ordinal as number) >= MAX_TOOL_CALLS_PER_ITERATION ||
       !validId(event.invocationId) ||
       typeof event.tool !== 'string' ||
       !event.tool ||
@@ -140,7 +140,6 @@ export function readToolInvocationJournal(
       !statuses.includes(event.status as ToolCallResult['status']) ||
       (event.dispatchState !== undefined &&
         !['not-dispatched', 'returned', 'unknown'].includes(String(event.dispatchState))) ||
-      (event.result !== undefined && !record(event.result)) ||
       (event.reason !== undefined && typeof event.reason !== 'string') ||
       (event.error !== undefined && typeof event.error !== 'string') ||
       ((event.dispatchState === 'returned' || event.dispatchState === 'unknown') &&
@@ -157,9 +156,7 @@ export function readToolInvocationJournal(
       ...(event.dispatchState === undefined
         ? {}
         : { dispatchState: event.dispatchState as ToolCallResult['dispatchState'] }),
-      ...(event.result === undefined
-        ? {}
-        : { result: structuredClone(event.result) as ToolCallResult['result'] }),
+      ...(event.result === undefined ? {} : { result: structuredClone(event.result) }),
       ...(event.reason === undefined ? {} : { reason: event.reason as string }),
       ...(event.error === undefined ? {} : { error: event.error as string }),
     };

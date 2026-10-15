@@ -4,6 +4,7 @@ import {
   readToolInvocationJournal,
 } from './tool-invocation-journal.js';
 import type { LocalToolCall } from './agent-loop.js';
+import { MAX_TOOL_CALLS_PER_ITERATION } from './agent-loop.js';
 
 const owner = {
   version: 1,
@@ -116,6 +117,21 @@ describe('tool invocation journal recovery fences', () => {
     for (let index = 0; index < 5; index++) attempt.admit(call());
     expect(() => attempt.admit(call())).toThrow('admission refused');
     expect(readToolInvocationJournal(h.events, owner.sessionId)[0].invocations).toHaveLength(5);
+  });
+
+  it('recovers historical sequential ordinals independently of the current admission cap', () => {
+    const count = MAX_TOOL_CALLS_PER_ITERATION + 1;
+    const events = [
+      { type: 'tool_attempt', toolOwner: owner },
+      ...Array.from({ length: count }, (_, ordinal) => ({
+        type: 'tool_admission',
+        toolOwner: { ...owner, ordinal },
+        invocationId: `synthetic-historical-${ordinal}`,
+        tool: 'recall',
+        args: {},
+      })),
+    ];
+    expect(readToolInvocationJournal(events, owner.sessionId)[0].invocations).toHaveLength(count);
   });
 
   it('poisons further admission and attempts after an uncertain admission append', async () => {
