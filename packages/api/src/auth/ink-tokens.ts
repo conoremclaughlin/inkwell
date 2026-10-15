@@ -61,6 +61,12 @@ export interface InkTokenPayload {
   threadId?: string;
   threadKey?: string;
   /**
+   * The admitted turn a space-turn token belongs to: its session's
+   * turn_epoch when the token was minted. Every request it makes is checked
+   * against the session row, so the token stops working when the turn does.
+   */
+  turnEpoch?: string;
+  /**
    * Absolute expiry, seconds since the epoch. Present on every verified
    * token. On a payload passed to signInkAccessToken it is a ceiling.
    */
@@ -136,9 +142,11 @@ export function signRunnerAccessToken(
 /**
  * Sign the access token for one turn in a shared conversation.
  *
- * The token names the conversation it serves, and the server lets it reach
- * only the space-turn tools for that thread (mcp/tools/space-turn-policy.ts).
- * The verifier refuses one missing any of the four binding claims. Nothing
+ * The token names the conversation and the turn it serves, and the server
+ * lets it reach only the space-turn tools for that thread
+ * (mcp/tools/space-turn-policy.ts), and only while that turn is current. The
+ * verifier refuses one missing any of its seven binding claims: sbSlug,
+ * sbId, sessionId, workspaceId, threadId, threadKey and turnEpoch. Nothing
  * mints these yet: SessionService still signs every runner with
  * signRunnerAccessToken.
  */
@@ -152,6 +160,7 @@ export function signSpaceTurnAccessToken(
     workspaceId: string;
     threadId: string;
     threadKey: string;
+    turnEpoch: string;
   },
   expiresInSeconds = 60 * 60
 ): string {
@@ -167,6 +176,7 @@ export function signSpaceTurnAccessToken(
       workspaceId: claims.workspaceId,
       threadId: claims.threadId,
       threadKey: claims.threadKey,
+      turnEpoch: claims.turnEpoch,
     },
     expiresInSeconds
   );

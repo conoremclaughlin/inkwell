@@ -902,28 +902,99 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       vi.mocked(runWithRequestContext).mockClear();
     });
 
+    const EPOCH = 'epoch-synthetic-current';
+    const spaceTurnToken = {
+      userId: 'user-123',
+      email: 'user@example.com',
+      sbSlug: 'synthetic-inkling',
+      sbId: 'identity-inkling',
+      sessionId: 'session-synthetic',
+      scope: 'mcp:space-turn',
+      workspaceId: 'workspace-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: KEY,
+      turnEpoch: EPOCH,
+    };
+    const liveTurnSession = (overrides: Record<string, unknown> = {}) => ({
+      id: 'session-synthetic',
+      userId: 'user-123',
+      sbSlug: 'synthetic-inkling',
+      turnScope: 'space-turn',
+      turnEpoch: EPOCH,
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+      ...overrides,
+    });
+
     it("carries a space-turn token's scope and thread into the request context", async () => {
-      mockVerifyAccessToken.mockResolvedValue({
-        userId: 'user-123',
-        email: 'user@example.com',
-        sbSlug: 'synthetic-inkling',
-        sbId: 'identity-inkling',
-        sessionId: 'session-synthetic',
-        scope: 'mcp:space-turn',
-        workspaceId: 'workspace-synthetic',
-        threadId: 'thread-synthetic',
-        threadKey: KEY,
-      });
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession());
 
       const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
 
       expect(res.status).toBe(200);
+      expect(mockGetSession).toHaveBeenCalledWith('session-synthetic');
       expect(lastContext()).toMatchObject({
         tokenScope: 'mcp:space-turn',
         tokenWorkspaceId: 'workspace-synthetic',
         tokenThreadId: 'thread-synthetic',
         tokenThreadKey: KEY,
       });
+    });
+
+    // Phase 2 gate 7: the token lives only as long as its admitted turn.
+    it.each([
+      ['an ended session', { endedAt: new Date() }],
+      ['a newer turn', { turnEpoch: 'epoch-synthetic-next' }],
+      ['an unmarked session', { turnScope: undefined }],
+      ['a session with no turn', { turnEpoch: undefined }],
+    ])('refuses a space-turn token whose session shows %s (401)', async (_label, change) => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession(change));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('refuses a space-turn token whose session is gone (401)', async () => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(null);
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('answers 503 when the space-turn session cannot be read', async () => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockRejectedValue(new Error('synthetic read failure'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(503);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('reads no session for an ordinary runner token (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({
+        userId: 'user-123',
+        email: 'user@example.com',
+        sbSlug: 'synthetic-alpha',
+        sbId: 'identity-alpha',
+        sessionId: 'session-synthetic',
+        scope: 'mcp:tools',
+      });
+      mockGetSession.mockClear();
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).not.toHaveBeenCalled();
     });
 
     it('gives an unsigned header claiming a scope or thread no effect', async () => {

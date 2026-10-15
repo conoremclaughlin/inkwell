@@ -156,6 +156,8 @@ export interface Session {
    * request by its context alone.
    */
   turnScope?: string;
+  /** The current admitted turn (`sessions.turn_epoch`), rotated by claim_turn_epoch. */
+  turnEpoch?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
   /** @deprecated Use lifecycle. Kept for backward compat. */
@@ -286,6 +288,7 @@ export interface SessionRow {
   alias?: string | null;
   /** 'space-turn' or null; absent on a database that predates the column. */
   turn_scope?: string | null;
+  turn_epoch?: string | null;
   active_thread_key?: string | null;
   lifecycle?: string | null;
   status?: string | null;

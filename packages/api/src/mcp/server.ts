@@ -225,6 +225,38 @@ export class MCPServer {
   }
 
   /**
+   * Whether a space-turn token's turn is still the session's current one.
+   * The token's signed sessionId is not a turn fence on its own: without
+   * this it would work until `exp`, after its turn had ended.
+   */
+  private async spaceTurnStillCurrent(
+    token: VerifiedAccessToken
+  ): Promise<'current' | 'ended' | 'unreadable'> {
+    let session;
+    try {
+      session = token.sessionId
+        ? await this.dataComposer.repositories.memory.getSession(token.sessionId)
+        : null;
+    } catch {
+      logger.warn('Space-turn session could not be read', {
+        code: 'space_turn_session_unreadable',
+      });
+      return 'unreadable';
+    }
+    const current =
+      !!session &&
+      !session.endedAt &&
+      session.turnScope === 'space-turn' &&
+      !!token.turnEpoch &&
+      session.turnEpoch === token.turnEpoch;
+    if (!current) {
+      logger.warn('Refused a space-turn token outside its turn', { code: 'space_turn_turn_ended' });
+      return 'ended';
+    }
+    return 'current';
+  }
+
+  /**
    * Canonical workspace derivation: one identity UUID → its workspace.
    * Preferred over the slug variant whenever sbId is known — the slug can
    * match identities in multiple workspaces (ambiguous by schema).
@@ -481,6 +513,23 @@ export class MCPServer {
       }
       // A token whose SB no longer exists is refused like an invalid one.
       let userData: VerifiedAccessToken | null = verdict.ok ? verdict.token : null;
+
+      // A space-turn token works only while its turn does: its session must be
+      // live, marked space-turn, and still at the turn the token was minted
+      // for. Anything else is refused like an expired token; a failed read
+      // cannot be judged (ink://specs/inkling-multi-person-groups, gate 7).
+      if (userData && isSpaceTurnScope(userData.scope)) {
+        const turn = await this.spaceTurnStillCurrent(userData);
+        if (turn === 'unreadable') {
+          res.status(503).json({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: "The token's turn couldn't be checked; try again" },
+            id: null,
+          });
+          return;
+        }
+        if (turn === 'ended') userData = null;
+      }
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
