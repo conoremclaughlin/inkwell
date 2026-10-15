@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as agentLoop from './agent-loop.js';
 import { extractToolBlocks, type LocalToolCall } from './agent-loop.js';
 import { createStreamToolDispatch } from './stream-tool-dispatch.js';
 import type { ToolCallExecutorPorts, ToolCallResult } from './tool-call-executor.js';
@@ -76,6 +77,44 @@ describe('canonical stream extraction', () => {
     expect(extractToolBlocks(text, { canonicalOnly: true }).calls).toEqual([]);
     expect(extractToolBlocks(text).calls).toHaveLength(1);
   });
+
+  it('does not diagnose variant examples inside fences or valid canonical payloads', () => {
+    const xml = '<tool_call>{"name":"remember","arguments":{}}</tool_call>';
+    const text = '````markdown\n' + xml + '\n````\n' + block('remember', { content: xml });
+    const parsed = extractToolBlocks(text, { canonicalOnly: true });
+    expect(parsed.calls.map((c) => c.tool)).toEqual(['remember']);
+    expect(parsed.malformed).toEqual([]);
+  });
+
+  it('keeps malformed block boundaries fixed when later prose closes their missing braces', () => {
+    const broken = '```ink-tool\n{"tool":"x","args":{"c":"fixture"}\n```\n';
+    const text = broken + block('a') + 'Done }\n' + block('b') + block('c');
+    const final = extractToolBlocks(text, { canonicalOnly: true });
+    expect(final.calls.map((c) => c.tool)).toEqual(['a', 'b', 'c']);
+    expect(final.malformed).toMatchObject([{ tool: 'x', fenceClosed: true }]);
+    for (let i = 0; i <= text.length; i++) {
+      const partial = extractToolBlocks(text.slice(0, i), { canonicalOnly: true, partial: true });
+      expect(partial.calls).toEqual(final.calls.slice(0, partial.calls.length));
+    }
+  });
+
+  it('reports trailing non-JSON inside a fence without hiding the next real block', () => {
+    const text = '```ink-tool\n{"tool":"x","args":{}} // note\n```\nNext:\n' + block('remember');
+    const final = extractToolBlocks(text, { canonicalOnly: true });
+    expect(final.calls.map((c) => c.tool)).toEqual(['remember']);
+    expect(final.malformed).toMatchObject([{ tool: 'x', fenceClosed: true }]);
+  });
+
+  it.each([
+    '<tool_call>{"name":"remember","arguments":{}}</tool_call>\n',
+    '<invoke name="remember">\n<parameter name="content">fixture</parameter>\n</invoke>\n',
+  ])('reports unsupported variant calls without executing them: %s', (text) => {
+    const parsed = extractToolBlocks(text, { canonicalOnly: true });
+    expect(parsed.calls).toEqual([]);
+    expect(parsed.malformed).toMatchObject([
+      { tool: 'remember', error: expect.stringContaining('not executed') },
+    ]);
+  });
 });
 
 describe('opt-in incremental admission with a fake provider', () => {
@@ -132,19 +171,19 @@ describe('opt-in incremental admission with a fake provider', () => {
     commit.resolve();
     await vi.waitFor(() => expect(h.effects).toEqual(['send_response']));
     h.stream.append('The provider is still writing.\n');
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(result.results).toMatchObject([
       { dispatchState: 'returned', invocationId: 'synthetic-invocation-1' },
     ]);
-    expect(await h.stream.finish()).toEqual(result);
+    expect(await h.stream.finish({ endOfResponse: true })).toEqual(result);
     expect(h.effects).toEqual(['send_response']);
   });
 
   it('does not duplicate identical calls at chunk boundaries or final extraction', async () => {
     const h = harness();
     for (const char of block('send_response') + block('send_response')) h.stream.append(char);
-    expect((await h.stream.finish()).results).toHaveLength(2);
-    await h.stream.finish();
+    expect((await h.stream.finish({ endOfResponse: true })).results).toHaveLength(2);
+    await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual(['send_response', 'send_response']);
     expect(h.intents.map((i) => i.id)).toEqual([
       'synthetic-invocation-1',
@@ -157,7 +196,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     const h = harness();
     h.stream.append(block('send_response') + '[Tool res');
     h.stream.append('ults from previous turn]\n' + block('remember'));
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual(['send_response']);
     expect(result.extracted.calls.map((call) => call.tool)).toEqual(['send_response']);
   });
@@ -168,7 +207,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     await tick();
     expect(h.effects).toEqual([]);
     h.stream.append('json\n');
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual([]);
     expect(result.extracted.malformed).toHaveLength(1);
   });
@@ -184,9 +223,9 @@ describe('opt-in incremental admission with a fake provider', () => {
     h.stream.append(block('send_response'));
     await vi.waitFor(() => expect(effects).toBe(1));
     // Provider failure closes the same attempt, rather than discarding/replaying it.
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: false });
     expect(result.results).toMatchObject([{ status: 'error', dispatchState: 'unknown' }]);
-    await h.stream.finish();
+    await h.stream.finish({ endOfResponse: true });
     expect(effects).toBe(1);
   });
 
@@ -194,7 +233,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     const h = harness();
     for (let n = 0; n < 7; n++) h.stream.append(block('send_response', { n }));
     await vi.waitFor(() => expect(h.effects).toHaveLength(5));
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(result.notRun).toHaveLength(2);
     expect(result.notRun.every((r) => r.reason.includes('cap'))).toBe(true);
   });
@@ -205,7 +244,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     await tick();
     expect(h.effects).toEqual([]);
     h.stream.append(block('remember'));
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(result.results).toEqual([]);
     expect(result.notRun.map((r) => r.call.tool)).toEqual(['spawn_agent', 'remember']);
     expect(h.intents).toEqual([]);
@@ -216,7 +255,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     h.stream.append(block('spawn_agent'));
     await tick();
     expect(h.effects).toEqual([]);
-    await h.stream.finish();
+    await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual(['spawn_agent']);
   });
 
@@ -225,7 +264,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     h.stream.append(block('remember'));
     await vi.waitFor(() => expect(h.effects).toEqual(['remember']));
     h.stream.append(block('spawn_agent') + block('send_response'));
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual(['remember']);
     expect(result.notRun.map((r) => r.call.tool)).toEqual(['spawn_agent', 'send_response']);
     expect(result.notRun[0].reason).toContain('remember');
@@ -252,7 +291,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     expect(entered).toEqual(['read', 'grep']);
     expect(h.settled).toEqual([]);
     read.resolve({ success: true });
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(entered).toEqual(['read', 'grep', 'send_response']);
     expect(result.results.map((r) => r.tool)).toEqual(entered);
   });
@@ -282,7 +321,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     expect(h.effects).toEqual([]);
     expect(asks).toBe(1);
     approval.resolve(true);
-    await h.stream.finish();
+    await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual(['read', 'recall']);
   });
 
@@ -294,7 +333,7 @@ describe('opt-in incremental admission with a fake provider', () => {
       },
     });
     h.stream.append(block('remember') + block('send_response'));
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(result.results.map((r) => r.status)).toEqual(['blocked', 'error']);
     expect(result.results[1].dispatchState).toBe('not-dispatched');
     expect(h.effects).toEqual([]);
@@ -309,7 +348,7 @@ describe('opt-in incremental admission with a fake provider', () => {
     stop.abort();
     h.stream.append(block('remember'));
     commit.resolve();
-    const result = await h.stream.finish();
+    const result = await h.stream.finish({ endOfResponse: true });
     expect(h.effects).toEqual([]);
     expect(result.results).toMatchObject([{ dispatchState: 'not-dispatched', status: 'denied' }]);
     expect(result.notRun).toMatchObject([
@@ -338,7 +377,159 @@ describe('opt-in incremental admission with a fake provider', () => {
     h.stream.append(block('send_response'));
     await vi.waitFor(() => expect(running).toBe(true));
     stop.abort();
-    expect((await h.stream.finish()).results).toMatchObject([{ dispatchState: 'unknown' }]);
+    expect((await h.stream.finish({ endOfResponse: true })).results).toMatchObject([
+      { dispatchState: 'unknown' },
+    ]);
     expect(running).toBe(false);
+  });
+
+  it('preserves every admitted sibling after a malformed block and never skips a shifted ordinal', async () => {
+    const h = harness();
+    h.stream.append('```ink-tool\n{"tool":"x","args":{"c":"fixture"}\n```\n' + block('a'));
+    await vi.waitFor(() => expect(h.effects).toEqual(['a']));
+    h.stream.append('Done }\n' + block('b') + block('c'));
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(h.effects).toEqual(['a', 'b', 'c']);
+    expect(done.admitted.map((c) => c.tool)).toEqual(done.extracted.calls.map((c) => c.tool));
+    expect(done.notRun).toEqual([]);
+  });
+
+  it('never allows later balancing prose to hide an imitation boundary', async () => {
+    const h = harness();
+    h.stream.append(
+      '```ink-tool\n{"tool":"x","args":{"c":"fixture"}\n```\n[Tool results from previous turn]\n'
+    );
+    h.stream.append('}\n' + block('send_response'));
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(h.effects).toEqual([]);
+    expect(done.extracted.calls).toEqual([]);
+  });
+
+  it('does not reparse payloads on deltas with no newline', async () => {
+    const h = harness();
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      h.stream.append(block('remember'));
+      const parsed = parse.mock.calls.length;
+      for (const char of 'Independent work continues without another line.') h.stream.append(char);
+      expect(parse.mock.calls.length).toBe(parsed);
+    } finally {
+      parse.mockRestore();
+      await h.stream.finish({ endOfResponse: true });
+    }
+  });
+
+  it('reports each cancelled call once when a spawn follows it', async () => {
+    const stop = new AbortController();
+    const h = harness({ signal: stop.signal });
+    stop.abort();
+    h.stream.append(block('remember') + block('spawn_agent'));
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(done.notRun.map((r) => r.call.tool)).toEqual(['remember', 'spawn_agent']);
+    expect(h.effects).toEqual([]);
+  });
+
+  it('does not treat a crash as a completed response for an unterminated closer line', async () => {
+    const h = harness();
+    h.stream.append(block('remember') + block('send_response').trimEnd());
+    const done = await h.stream.finish({ endOfResponse: false });
+    expect(h.effects).toEqual(['remember']);
+    expect(done.extracted.calls.map((c) => c.tool)).toEqual(['remember']);
+    expect(done.extracted.malformed).toMatchObject([{ tool: 'send_response', fenceClosed: false }]);
+    expect(await h.stream.finish({ endOfResponse: true })).toEqual(done);
+    expect(h.effects).toEqual(['remember']);
+  });
+
+  it('does not run a held exclusive call on a crashed attempt, even with a complete closer', async () => {
+    const h = harness();
+    h.stream.append(block('spawn_agent'));
+    const done = await h.stream.finish({ endOfResponse: false });
+    expect(h.effects).toEqual([]);
+    expect(done.notRun).toMatchObject([
+      { call: { tool: 'spawn_agent' }, reason: expect.stringContaining('provider failed') },
+    ]);
+  });
+
+  it('retains known outcomes and names queued calls after an executor reporting failure', async () => {
+    const h = harness({
+      onResult: () => {
+        throw new Error('synthetic reporting failure');
+      },
+    });
+    h.stream.append(block('remember') + block('send_response'));
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(done.results).toMatchObject([{ tool: 'remember', dispatchState: 'returned' }]);
+    expect(done.notRun).toMatchObject([
+      { call: { tool: 'send_response' }, reason: expect.stringContaining('Executor failed') },
+    ]);
+    expect(h.effects).toEqual(['remember']);
+    expect(done.failure).toMatchObject({
+      kind: 'executor',
+      message: 'synthetic reporting failure',
+    });
+    expect(await h.stream.finish({ endOfResponse: true })).toEqual(done);
+  });
+
+  it('retains every overlapping read outcome when one reporting callback throws', async () => {
+    const first = deferred<Record<string, unknown>>();
+    const second = deferred<Record<string, unknown>>();
+    const invoked: string[] = [];
+    const h = harness({
+      concurrentReads: true,
+      callTool: (tool) => {
+        invoked.push(tool);
+        return tool === 'recall' ? first.promise : second.promise;
+      },
+      onResult: () => {
+        throw new Error('synthetic reporting failure');
+      },
+    });
+    h.stream.append(block('recall') + block('get_artifact') + block('remember'));
+    const finishing = h.stream.finish({ endOfResponse: true });
+    await vi.waitFor(() => expect(invoked).toEqual(['recall', 'get_artifact']));
+    second.resolve({ value: 'second' });
+    first.resolve({ value: 'first' });
+    const done = await finishing;
+    expect(done.results.map((r) => r.tool)).toEqual(['recall', 'get_artifact']);
+    expect(done.results.every((r) => r.dispatchState === 'returned')).toBe(true);
+    expect(done.notRun.map((r) => r.call.tool)).toEqual(['remember']);
+    expect(done.failure?.kind).toBe('executor');
+  });
+
+  it('reports a policy port failure as not dispatched rather than losing the admitted prefix', async () => {
+    const h = harness({
+      policy: {
+        canCallInkTool: () => {
+          throw new Error('synthetic policy failure');
+        },
+      },
+    });
+    h.stream.append(block('remember') + block('send_response'));
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(done.results).toEqual([]);
+    expect(done.notRun.map((r) => r.call.tool)).toEqual(['remember', 'send_response']);
+    expect(done.failure?.kind).toBe('executor');
+    expect(h.effects).toEqual([]);
+  });
+
+  it('fails closed if the parser changes an already observed block instead of trusting its ordinal', async () => {
+    const h = harness();
+    h.stream.append(block('remember'));
+    await vi.waitFor(() => expect(h.effects).toEqual(['remember']));
+    const parsed = extractToolBlocks(block('remember') + block('send_response'), {
+      canonicalOnly: true,
+    });
+    parsed.calls[0].raw = 'changed by a synthetic parser fault';
+    const reader = vi.spyOn(agentLoop, 'extractToolBlocks').mockReturnValueOnce(parsed);
+    try {
+      h.stream.append(block('send_response'));
+    } finally {
+      reader.mockRestore();
+    }
+    const done = await h.stream.finish({ endOfResponse: true });
+    expect(h.effects).toEqual(['remember']);
+    expect(done.results).toMatchObject([{ tool: 'remember', dispatchState: 'returned' }]);
+    expect(done.notRun.map((r) => r.call.tool)).toEqual(['send_response']);
+    expect(done.failure?.kind).toBe('parser');
   });
 });

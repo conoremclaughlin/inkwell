@@ -34,6 +34,8 @@ export interface LocalToolCall {
   raw: string;
   /** Parsed from the deprecated <tool_call> XML variant, not an ink-tool fence. */
   variantFormat?: boolean;
+  /** Canonical parser provenance within one attempt; NOT durable invocation identity. */
+  sourceStart?: number;
 }
 
 /** One executed (or refused) tool call, as the loop accumulates them. */
@@ -1537,8 +1539,11 @@ export { isPotentialImitationPrefix } from './imitation-grammar.js';
  * block may legitimately contain the header; the imitation that matters is
  * the one written as if it were the next message.
  */
-export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
-  const inkBlocks = findInkToolBlocks(responseText);
+export function findImitatedToolResults(
+  responseText: string,
+  options: { fenceBounded?: boolean } = {}
+): ImitatedToolResultsFrame | null {
+  const inkBlocks = findInkToolBlocks(responseText, options);
   // The open fence, if any. CommonMark closes a fence only with the same
   // character, at least as long, and nothing but whitespace after it — a ```
   // in a ```` block, a ~~~ under a ```, or ```not-a-close inside an open
@@ -1583,7 +1588,7 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
  */
 export function findInkToolBlocks(
   text: string,
-  options: { unquotedOnly?: boolean } = {}
+  options: { unquotedOnly?: boolean; fenceBounded?: boolean } = {}
 ): InkToolBlock[] {
   const blocks: InkToolBlock[] = [];
   // Derived from INK_TOOL_OPENER so the finder and the sibling-boundary rule
@@ -1604,7 +1609,11 @@ export function findInkToolBlocks(
   let m: RegExpExecArray | null;
   while ((m = openRe.exec(text))) {
     const payloadStart = m.index + m[0].length;
-    const scanned = scanJsonValueEnd(text, payloadStart);
+    // A stream's completed fence must never grow when later prose balances
+    // malformed JSON. Canonical mode bounds first, then parses that payload.
+    // A valid JSON string cannot contain a raw newline, so a closer LINE
+    // cannot be part of a valid string (mid-line backticks still are content).
+    const scanned = options.fenceBounded ? null : scanJsonValueEnd(text, payloadStart);
     if (scanned) {
       // The value parsed, so repair is not at stake here; what a closing fence
       // decides on this path is only how much text the block covers. Anything
@@ -1906,22 +1915,21 @@ export function extractToolBlocks(
 
   if (options.canonicalOnly) {
     // The live and final readers cut at exactly the same imitation boundary.
-    const imitation = findImitatedToolResults(responseText);
+    const imitation = findImitatedToolResults(responseText, { fenceBounded: true });
     if (imitation) responseText = responseText.slice(0, imitation.index);
   }
 
   for (const block of findInkToolBlocks(responseText, {
     unquotedOnly: options.canonicalOnly,
+    fenceBounded: options.canonicalOnly,
   })) {
     if (!block.payload) continue;
     if (options.canonicalOnly) {
-      if (options.partial && (!block.fenceClosed || responseText.indexOf('\n', block.end) < 0)) {
-        continue;
-      }
-      if (!block.fenceClosed) {
+      if (!block.fenceClosed || (options.partial && responseText.indexOf('\n', block.end) < 0)) {
         malformed.push({
           tool: readToolName(block.payload),
-          error: 'canonical tool calls require a closing fence',
+          error:
+            'canonical tool calls require a complete closing fence line; this block was not executed',
           payloadLength: block.payload.length,
           fenceClosed: false,
         });
@@ -2020,7 +2028,12 @@ export function extractToolBlocks(
       }
       indexed.push({
         index: block.start,
-        call: { tool, args, raw: responseText.slice(block.start, block.end) },
+        call: {
+          tool,
+          args,
+          raw: responseText.slice(block.start, block.end),
+          ...(options.canonicalOnly ? { sourceStart: block.start } : {}),
+        },
       });
       if (wasRepaired) {
         repaired.push({
@@ -2033,9 +2046,6 @@ export function extractToolBlocks(
     }
   }
 
-  if (options.canonicalOnly)
-    return { calls: indexed.map((entry) => entry.call), malformed, repaired };
-
   // Variant tolerance: a long-lived session whose history predates
   // wholly-in-ink can drift into emitting tool calls as
   // `<tool_call>{"name":"mcp__inkwell__X","arguments":{...}}</tool_call>`
@@ -2044,9 +2054,19 @@ export function extractToolBlocks(
   // via the fallback router, and text-form signal_status never halted the
   // continuation loop). Parse and execute the variant so the turn WORKS;
   // the continuation prompt separately steers the model back to the fence.
-  for (const block of findLegacyToolBlocks(responseText)) {
+  for (const block of findLegacyToolBlocks(responseText, { unquotedOnly: options.canonicalOnly })) {
     const payload = responseText.slice(block.payloadStart, block.payloadEnd).trim();
     if (!payload) continue;
+    if (options.canonicalOnly) {
+      malformed.push({
+        tool: readToolName(payload, 'name'),
+        error:
+          'Unsupported tool_call XML. Use a fenced ink-tool JSON object with tool and args; this XML was not executed.',
+        payloadLength: payload.length,
+        fenceClosed: true,
+      });
+      continue;
+    }
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
       const rawName = typeof parsed.name === 'string' ? parsed.name.trim() : '';

@@ -17,6 +17,15 @@ export interface StreamDispatchResult {
   admitted: LocalToolCall[];
   notRun: Array<{ call: LocalToolCall; reason: string }>;
   results: ToolCallResult[];
+  /** Partial outcomes remain available on failure; this is not a successful batch. */
+  failure?: { kind: 'parser' | 'executor'; message: string };
+}
+
+interface InvocationProgress {
+  call: LocalToolCall;
+  invocationId?: string;
+  dispatched: boolean;
+  result?: ToolCallResult;
 }
 
 /**
@@ -37,7 +46,9 @@ export function createStreamToolDispatch(options: {
 
 class StreamToolDispatch {
   private text = '';
-  private seen = 0;
+  // Offsets are parser provenance only. The executor still mints invocation
+  // identities; these keys must never be used as durable effect identities.
+  private seen = new Map<number, string>();
   private ended = false;
   private heldExclusive = false;
   private refusedSuffix = false;
@@ -46,12 +57,31 @@ class StreamToolDispatch {
   private queue: LocalToolCall[] = [];
   private wake: (() => void) | undefined;
   private failure: { error: unknown } | undefined;
+  private parserFailure: string | undefined;
+  private progress = new Map<Record<string, unknown>, InvocationProgress>();
+  private finishing: Promise<StreamDispatchResult> | undefined;
   private readonly execution: Promise<ToolCallResult[]>;
 
   constructor(private readonly executor: ToolCallExecutorPorts) {
     // Catch at creation, not at finish: a port can fail while generation is
     // still running. Observe it without letting a rejection go unhandled.
-    this.execution = executeToolCalls(this.source(), executor).catch((error: unknown) => {
+    this.execution = executeToolCalls(this.source(), {
+      ...executor,
+      commitIntent: (call, invocationId) => {
+        this.progress.get(call.args)!.invocationId = invocationId;
+        return executor.commitIntent(call, invocationId);
+      },
+      callTool: (tool, args, ctx) => {
+        this.progress.get(args)!.dispatched = true;
+        return executor.callTool(tool, args, ctx);
+      },
+      onResult: (result) => {
+        // Retain the outcome BEFORE a reporting port can throw. This does not
+        // replace the host's journal; persistence can still fail independently.
+        this.progress.get(result.args)!.result = result;
+        executor.onResult?.(result);
+      },
+    }).catch((error: unknown) => {
       this.failure = { error };
       return [];
     });
@@ -61,45 +91,98 @@ class StreamToolDispatch {
   append(delta: string): void {
     if (this.ended) throw new Error('Tool stream already ended');
     this.text += delta;
-    this.scan(true);
+    // A partial closer cannot complete without a newline. This exact gate
+    // avoids reparsing a large JSON payload on every tiny provider delta.
+    if (delta.includes('\n')) this.scan(true);
   }
 
   /**
    * Also called after a provider failure: already admitted calls still settle.
    * Repeated final extraction returns those outcomes, never dispatches again.
    */
-  async finish(): Promise<StreamDispatchResult> {
+  finish(options: { endOfResponse: boolean }): Promise<StreamDispatchResult> {
+    // The first close owns finality. Repeated final extraction cannot upgrade
+    // a failed attempt to a successful EOF or dispatch its tail later.
+    return (this.finishing ??= this.finalize(options.endOfResponse));
+  }
+
+  private async finalize(endOfResponse: boolean): Promise<StreamDispatchResult> {
+    const partial = !endOfResponse;
     if (!this.ended) {
-      this.scan(false);
+      this.scan(partial);
       if (this.heldExclusive) {
-        const extracted = extractToolBlocks(this.text, { canonicalOnly: true });
+        const extracted = extractToolBlocks(this.text, { canonicalOnly: true, partial });
         const screen = screenIteration(extracted.calls, MAX_TOOL_CALLS_PER_ITERATION);
-        if (screen.ok) {
+        if (!endOfResponse) {
+          for (const call of extracted.calls)
+            this.refuse(
+              call,
+              'Not run: the provider failed before the exclusive response was complete.'
+            );
+        } else if (screen.ok) {
           for (const call of screen.calls) this.admit(call);
         } else {
-          this.notRun.push(...extracted.calls.map((call) => ({ call, reason: screen.reason })));
+          for (const call of extracted.calls) this.refuse(call, screen.reason);
         }
       }
       this.ended = true;
       this.wake?.();
     }
-    const results = await this.execution;
-    if (this.failure) throw this.failure.error;
+    await this.execution;
+    const results: ToolCallResult[] = [];
+    for (const state of this.progress.values()) {
+      if (state.result) results.push(state.result);
+      else if (!state.dispatched) {
+        this.refuse(state.call, 'Executor failed before dispatch; not run.');
+      } else {
+        results.push({
+          tool: state.call.tool,
+          args: state.call.args,
+          invocationId: state.invocationId,
+          status: 'error',
+          dispatchState: 'unknown',
+          error: 'Executor failed without a confirmed outcome; do not retry automatically.',
+        });
+      }
+    }
     return {
-      extracted: extractToolBlocks(this.text, { canonicalOnly: true }),
+      extracted: extractToolBlocks(this.text, { canonicalOnly: true, partial }),
       admitted: snapshotCalls(this.admitted),
       notRun: this.notRun.map(({ call, reason }) => ({ call: snapshotCalls([call])[0]!, reason })),
       results,
+      ...(this.failure
+        ? {
+            failure: {
+              kind: 'executor' as const,
+              message:
+                this.failure.error instanceof Error
+                  ? this.failure.error.message
+                  : String(this.failure.error),
+            },
+          }
+        : this.parserFailure
+          ? { failure: { kind: 'parser' as const, message: this.parserFailure } }
+          : {}),
     };
   }
 
   private scan(partial: boolean): void {
     const { calls } = extractToolBlocks(this.text, { canonicalOnly: true, partial });
-    for (const call of calls.slice(this.seen)) {
-      this.seen++;
+    const current = new Map(calls.map((call) => [call.sourceStart!, call.raw]));
+    if ([...this.seen].some(([start, raw]) => current.get(start) !== raw)) {
+      this.parserFailure ??=
+        'Canonical extraction changed an already observed block; further admission stopped.';
+    }
+    for (const call of calls) {
+      if (this.seen.has(call.sourceStart!)) continue;
+      this.seen.set(call.sourceStart!, call.raw);
+      if (this.parserFailure) {
+        this.refuse(call, this.parserFailure);
+        continue;
+      }
       if (this.heldExclusive) continue;
       if (this.refusedSuffix) {
-        this.notRun.push({ call, reason: 'Not run: follows a refused exclusive call.' });
+        this.refuse(call, 'Not run: follows a refused exclusive call.');
         continue;
       }
       // Use the existing canonical exclusivity screen, including MCP spelling.
@@ -109,13 +192,12 @@ class StreamToolDispatch {
           this.heldExclusive = true;
         } else {
           this.refusedSuffix = true;
-          this.notRun.push({
+          this.refuse(
             call,
-            reason:
-              `Not run: ${call.tool} must be first and alone. ` +
+            `Not run: ${call.tool} must be first and alone. ` +
               `Earlier admitted calls (${this.admitted.map((c) => c.tool).join(', ')}) ` +
-              'retain their own outcomes; this call and every following call were not run.',
-          });
+              'retain their own outcomes; this call and every following call were not run.'
+          );
         }
         continue;
       }
@@ -125,16 +207,25 @@ class StreamToolDispatch {
 
   private admit(call: LocalToolCall): void {
     if (this.executor.signal?.aborted) {
-      this.notRun.push({ call, reason: 'Cancelled before admission; not run.' });
+      this.refuse(call, 'Cancelled before admission; not run.');
     } else if (this.failure) {
-      this.notRun.push({ call, reason: 'Executor failed before admission; not run.' });
+      this.refuse(call, 'Executor failed before admission; not run.');
+    } else if (this.parserFailure) {
+      this.refuse(call, this.parserFailure);
     } else if (this.admitted.length >= MAX_TOOL_CALLS_PER_ITERATION) {
-      this.notRun.push({ call, reason: 'Per-response tool cap reached; not run.' });
+      this.refuse(call, 'Per-response tool cap reached; not run.');
     } else {
       const copy = snapshotCalls([call])[0]!;
       this.admitted.push(copy);
+      this.progress.set(copy.args, { call: copy, dispatched: false });
       this.queue.push(copy);
       this.wake?.();
+    }
+  }
+
+  private refuse(call: LocalToolCall, reason: string): void {
+    if (!this.notRun.some((entry) => entry.call.sourceStart === call.sourceStart)) {
+      this.notRun.push({ call, reason });
     }
   }
 
