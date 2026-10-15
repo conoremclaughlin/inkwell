@@ -41,6 +41,7 @@ import type {
   SessionSteeringReceipt,
 } from '@inklabs/shared/runtime';
 import { logger } from '../../utils/logger.js';
+import type { DrainBlocker } from './deploy-drain.types.js';
 
 /**
  * How a settled runner ended, from the point of view of what shutdown may
@@ -278,6 +279,51 @@ export function activeRunCount(): number {
   return active.size;
 }
 
+/** Stable logical admission ID, including for a child agent's own turn. */
+export function turnDrainAdmissionId(sessionId: string, turnEpoch: string): string {
+  return JSON.stringify(['turn', sessionId, turnEpoch]);
+}
+
+/**
+ * Read-only deploy census over the EXISTING owner registries. Does not close
+ * intake, revoke a generation, probe/stop children, clear holds or launch work.
+ * A physical child is not evidence of a logical child-turn registration.
+ *
+ * Still incomplete: explicit coverage gaps prevent this projection alone from
+ * declaring server readiness, even when all three registries are empty. Remove
+ * a gap only when its real ingress/obligations are covered and tested. No
+ * production drain/control caller uses this function yet.
+ */
+export function readDeployDrainBlockers(): DrainBlocker[] {
+  const blockers: DrainBlocker[] = [];
+  for (const run of active.values()) {
+    if (!run.turnEpoch?.trim()) {
+      blockers.push({ kind: 'unknown', id: JSON.stringify(['unfenced-turn', run.sessionId]) });
+      continue;
+    }
+    const id = turnDrainAdmissionId(run.sessionId, run.turnEpoch);
+    blockers.push({
+      kind: run.runnerSettledAt === undefined ? 'executing-turn' : 'unfinalized-turn',
+      id,
+    });
+    if (run.turnEpochCandidates?.some((epoch) => epoch !== run.turnEpoch))
+      blockers.push({ kind: 'unknown', id });
+  }
+  for (const child of ownedChildren) blockers.push({ kind: 'owned-child', id: child.drainId });
+  // An aggregate hold remains until EVERY tracked lifecycle write settles.
+  if (inFlightWrites.size > 0)
+    blockers.push({ kind: 'state-write', id: 'active-runs:lifecycle-writes' });
+  for (const id of [
+    'deploy:admission-preparation-and-pending-queues',
+    'deploy:compaction',
+    'deploy:launch-reservations-and-survivors',
+    'deploy:effect-and-delivery-writes',
+    'deploy:durable-ingress',
+  ])
+    blockers.push({ kind: 'coverage-gap', id });
+  return blockers;
+}
+
 export function isIntakeOpen(): boolean {
   return intakeOpen;
 }
@@ -356,6 +402,8 @@ export interface ChildOwnership {
 }
 
 interface OwnedChildRecord {
+  /** Process-local census label only, never a generation or release capability. */
+  readonly drainId: string;
   readonly sessionId: string;
   readonly turnEpoch: string;
   readonly child: OwnedChild;
@@ -369,6 +417,7 @@ interface OwnedChildRecord {
  * running in this process until it is stopped.
  */
 const ownedChildren = new Set<OwnedChildRecord>();
+let nextChildDrainId = 0;
 
 /**
  * Whether `turnEpoch` is the generation admitted for `sessionId` right now,
@@ -429,7 +478,12 @@ export function attachRunChild(
   child: OwnedChild
 ): ChildOwnership | undefined {
   if (!mayGenerationProceed(sessionId, turnEpoch)) return undefined;
-  const record: OwnedChildRecord = { sessionId, turnEpoch, child };
+  const record: OwnedChildRecord = {
+    drainId: JSON.stringify(['owned-child', sessionId, turnEpoch, ++nextChildDrainId]),
+    sessionId,
+    turnEpoch,
+    child,
+  };
   ownedChildren.add(record);
   return {
     sessionId,
