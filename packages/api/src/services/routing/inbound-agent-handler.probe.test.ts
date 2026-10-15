@@ -20,7 +20,18 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
-import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { fakeProcessEnv } from '../../test/fake-env';
+
+// The fixture runner never needs studio repair or an ink-init subprocess.
+vi.mock('../studio-complete.js', () => ({
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
+
+// Admission needs explicit synthetic signing authority; never the checkout environment.
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
+beforeEach(() => vi.stubEnv('JWT_SECRET', fakeProcessEnv.JWT_SECRET));
+afterEach(() => vi.unstubAllEnvs());
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -485,7 +496,13 @@ describe('reply admission, through session routing', () => {
       getAgentBackend: vi.fn(async () => ({ backend: 'claude-code' })),
       buildContext: vi.fn(async () => ({
         agent: { sbSlug: 'wren', name: 'Wren', role: 'developer', values: [], capabilities: [] },
-        user: { id: 'user-1', timezone: 'America/Los_Angeles', contacts: {}, preferences: {} },
+        user: {
+          id: 'user-1',
+          email: 'runner-owner@example.test',
+          timezone: 'America/Los_Angeles',
+          contacts: {},
+          preferences: {},
+        },
         temporal: {
           currentTime: '10 AM',
           currentDate: '2026-09-25',

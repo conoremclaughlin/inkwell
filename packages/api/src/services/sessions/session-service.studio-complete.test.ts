@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { fakeProcessEnv } from '../../test/fake-env';
 import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -26,6 +27,11 @@ import { resetActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
 import type { Session, ISessionRepository, IContextBuilder, IRunner } from './types.js';
 import type { IActivityStream } from './session-service.js';
+
+// Admission needs explicit synthetic signing authority; never the checkout environment.
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
+beforeEach(() => vi.stubEnv('JWT_SECRET', fakeProcessEnv.JWT_SECRET));
+afterEach(() => vi.unstubAllEnvs());
 
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -124,7 +130,13 @@ const contextBuilder = (backend: string) =>
         capabilities: [],
         relationships: {},
       },
-      user: { id: 'user-456', timezone: 'UTC', contacts: {}, preferences: {} },
+      user: {
+        id: 'user-456',
+        email: 'runner-owner@example.test',
+        timezone: 'UTC',
+        contacts: {},
+        preferences: {},
+      },
       temporal: {
         currentTime: '00:51',
         currentDate: '2026-09-29',
