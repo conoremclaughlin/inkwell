@@ -56,10 +56,14 @@ mint a bearer token or admit a page; hosted chat remains unwired.
 The worker attempts to revoke a late successful claim, never reattaches it. A failed revocation retains
 only the credential needed for an explicit idempotent retry. An unacknowledged
 claim is **unknown**, including after worker suspension: it is never retried.
-Without its one-time receipt the client cannot confirm remote revocation. A new
-browser session clears local pairing state, but does not revoke a server grant;
-the grant's twelve-hour expiry remains the backstop. A pending revocation blocks
-replacement within the same browser session rather than silently abandoning it.
+Without its one-time receipt the client cannot confirm remote revocation. After
+Disconnect, a terminal missing-receipt outcome allows a fresh installation and
+approval in the same browser session. It never retries the old claim or calls the
+old grant revoked: the grant's twelve-hour expiry remains the backstop.
+Replacement is blocked while a claim can still return a receipt, or a known grant
+still needs revocation. The panel offers remote retry only when that credential
+is present. After a worker restart, the old request cannot deliver a receipt to
+the new worker; that does not revoke a server grant.
 
 A session-storage write failure stops new pairing, but does not block cleanup.
 The worker keeps a known grant in memory solely to revoke it, including a late

@@ -32,7 +32,12 @@ describe('pairing panel with actual markup', () => {
   it.each(['pending', 'confirmed'] as const)(
     'keeps storage failure distinct from %s revocation and fences new pairing',
     async (revocation) => {
-      view = { phase: 'disconnected', revocation, storageUnavailable: true };
+      view = {
+        phase: 'disconnected',
+        revocation,
+        storageUnavailable: true,
+        ...(revocation === 'pending' ? { cleanup: 'revocation' as const } : {}),
+      };
       mountPairingPanel();
       await vi.waitFor(() =>
         expect(document.getElementById('pair-status')?.textContent).toContain(
@@ -103,7 +108,7 @@ describe('pairing panel with actual markup', () => {
           fail = reject;
         });
       if (message.type === 'pair:disconnect')
-        view = { phase: 'disconnected', revocation: 'pending' };
+        view = { phase: 'disconnected', revocation: 'pending', cleanup: 'awaiting-receipt' };
       return view;
     });
     mountPairingPanel();
@@ -117,8 +122,46 @@ describe('pairing panel with actual markup', () => {
     await vi.waitFor(() =>
       expect(document.getElementById('pair-status')?.textContent).toContain('Disconnected locally')
     );
+    view = { phase: 'disconnected', revocation: 'pending', cleanup: 'missing-receipt' };
     fail(new Error('old failure must not replace Disconnect'));
-    await vi.waitFor(() => expect(button('pair-retry').disabled).toBe(false));
+    await vi.waitFor(() => expect(button('pair-open').disabled).toBe(false));
+    expect(button('pair-retry').hidden).toBe(true);
     expect(document.getElementById('pair-status')?.textContent).toContain('Disconnected locally');
+  });
+  it.each(['awaiting-receipt', 'missing-receipt', 'revocation'] as const)(
+    'offers only the action available for %s',
+    async (cleanup) => {
+      view = { phase: 'disconnected', revocation: 'pending', cleanup };
+      mountPairingPanel();
+      await vi.waitFor(() =>
+        expect(document.getElementById('pair-status')?.textContent).toContain(
+          'Disconnected locally'
+        )
+      );
+      expect(button('pair-open').disabled).toBe(cleanup !== 'missing-receipt');
+      expect(button('pair-retry').hidden).toBe(cleanup !== 'revocation');
+      expect(button('pair-retry').disabled).toBe(cleanup !== 'revocation');
+      if (cleanup === 'missing-receipt')
+        expect(document.getElementById('pair-status')?.textContent).toContain(
+          'starting again does not revoke it'
+        );
+    }
+  );
+  it('keeps new pairing fenced when the receipt is missing and storage has failed', async () => {
+    view = {
+      phase: 'disconnected',
+      revocation: 'pending',
+      cleanup: 'missing-receipt',
+      storageUnavailable: true,
+    };
+    mountPairingPanel();
+    await vi.waitFor(() =>
+      expect(document.getElementById('pair-status')?.textContent).toContain(
+        'Session storage is unavailable'
+      )
+    );
+    expect(button('pair-open').disabled).toBe(true);
+    expect(button('pair-retry').hidden).toBe(true);
+    expect(document.getElementById('pair-status')?.textContent).not.toContain('You can start');
   });
 });

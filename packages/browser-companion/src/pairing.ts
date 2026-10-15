@@ -25,6 +25,7 @@ export interface PairingView {
   expiresAt?: string;
   revocation?: PairingRecord['revocation'];
   storageUnavailable?: true;
+  cleanup?: 'awaiting-receipt' | 'missing-receipt' | 'revocation';
 }
 export interface PairingStore {
   read(): Promise<PairingRecord | undefined>;
@@ -137,8 +138,19 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
   let loaded = false;
   let stopped = 0;
   let failed = false;
+  // A suspended worker cannot receive its old request's result. In this worker,
+  // however, Disconnect must not let replacement discard a still-returning grant.
+  let claimInFlight = false;
   let tail: Promise<unknown> = Promise.resolve();
   let revoking: Promise<void> | undefined;
+  const cleanup = (): PairingView['cleanup'] =>
+    record?.phase === 'disconnected' && record.revocation === 'pending'
+      ? record.grant
+        ? 'revocation'
+        : claimInFlight
+          ? 'awaiting-receipt'
+          : 'missing-receipt'
+      : undefined;
   const view = (): PairingView =>
     record
       ? {
@@ -153,6 +165,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
             : {}),
           expiresAt: record.grant?.expiresAt,
           revocation: record.revocation,
+          ...(cleanup() ? { cleanup: cleanup() } : {}),
           ...(failed ? { storageUnavailable: true as const } : {}),
         }
       : { phase: 'unpaired' };
@@ -243,7 +256,13 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
       return transition(async () => {
         if (generation !== stopped) throw new Error('Pairing stopped.');
         if (record?.phase === 'ready' && record.origin === origin) return view();
-        if (record && !(record.phase === 'disconnected' && record.revocation === 'confirmed'))
+        if (
+          record &&
+          !(
+            record.phase === 'disconnected' &&
+            (record.revocation === 'confirmed' || cleanup() === 'missing-receipt')
+          )
+        )
           throw new Error('Finish or disconnect the existing pairing first.');
         await save({
           origin,
@@ -271,7 +290,9 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
           await save(intent); // No dispatch occurred; the queued disconnect can confirm that.
           return undefined;
         }
-        return { intent, response: transport.claim(intent, code) };
+        const response = transport.claim(intent, code);
+        claimInFlight = true;
+        return { intent, response };
       });
       if (!pending) return transition(view, true);
       try {
@@ -286,6 +307,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
             phase: disconnected ? 'disconnected' : 'paired',
             revocation: disconnected ? 'pending' : 'none',
           });
+          claimInFlight = false;
         }, true);
       } catch (error) {
         await transition(async () => {
@@ -298,6 +320,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
           } else {
             await saveCleanup({ ...record, phase: 'unknown' });
           }
+          claimInFlight = false;
         }, true);
         if (error instanceof RefusedCode)
           throw new Error(

@@ -15,21 +15,32 @@ export function mountPairingPanel() {
       busy ||
       !!current.storageUnavailable ||
       !['unpaired', 'ready', 'disconnected'].includes(current.phase) ||
-      (current.phase === 'disconnected' && current.revocation !== 'confirmed');
+      (current.phase === 'disconnected' &&
+        current.revocation !== 'confirmed' &&
+        current.cleanup !== 'missing-receipt');
     el<HTMLButtonElement>('pair-claim').disabled =
       busy || !!current.storageUnavailable || current.phase !== 'ready';
     el<HTMLInputElement>('pair-code').disabled =
       busy || !!current.storageUnavailable || current.phase !== 'ready';
     el<HTMLButtonElement>('pair-disconnect').disabled = !busy && current.phase === 'unpaired';
-    el<HTMLButtonElement>('pair-retry').disabled =
-      busy || current.phase !== 'disconnected' || current.revocation !== 'pending';
-    el('pair-retry').hidden = current.phase !== 'disconnected' || current.revocation !== 'pending';
+    el<HTMLButtonElement>('pair-retry').disabled = busy || current.cleanup !== 'revocation';
+    el('pair-retry').hidden = current.cleanup !== 'revocation';
+    const pending =
+      current.cleanup === 'awaiting-receipt'
+        ? 'Disconnected locally. Waiting for the claim to finish; a late receipt will trigger revocation. No new pairing can start while this request is pending.'
+        : current.cleanup === 'missing-receipt'
+          ? 'Disconnected locally. The pairing receipt is missing, so remote revocation cannot be confirmed.' +
+            (current.storageUnavailable ? '' : ' You can start a new pairing.') +
+            ' Any previous server grant must expire; starting again does not revoke it.'
+          : current.cleanup === 'revocation'
+            ? 'Disconnected locally. Remote revocation is not confirmed. Retry remote revocation to finish disconnecting.'
+            : 'Disconnected locally. Remote revocation is not confirmed. Check pairing status before starting again.';
     const messages: Record<PairingView['phase'], string> = {
       unpaired: 'Not paired. Start in Inkwell, then enter the code here.',
       ready: 'Waiting for your approval in Inkwell. No page access is granted.',
       claiming: 'Waiting for a pairing receipt. You can disconnect now.',
       unknown:
-        'Pairing outcome unknown. Do not try the code again. Disconnect stops local use, but cannot confirm remote revocation without the missing receipt. A fresh pairing requires a new browser session; ending this one does not revoke an unknown server grant.',
+        'Pairing outcome unknown. Do not try the code again. Disconnect before starting a new pairing. Without the missing receipt, any previous server grant cannot be revoked here and must expire.',
       paired:
         'Pairing receipt received. Hosted chat is not enabled in this checkpoint; no page authority was granted.',
       disconnected:
@@ -37,7 +48,7 @@ export function mountPairingPanel() {
           ? current.storageUnavailable
             ? 'Disconnected. No revocation is pending.'
             : 'Disconnected. You can start a new pairing.'
-          : 'Disconnected locally. Remote revocation is not confirmed. Retry is safe if the receipt was received; otherwise the server grant must expire.',
+          : pending,
     };
     el('pair-status').textContent =
       messages[current.phase] +

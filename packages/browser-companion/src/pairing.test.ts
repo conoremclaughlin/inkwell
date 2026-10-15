@@ -297,6 +297,94 @@ describe('pairing state (synthetic storage and network only)', () => {
     expect(restored.transport.revoke).not.toHaveBeenCalled();
     await expect(restored.client.prepare(origin)).rejects.toThrow('storage unavailable');
   });
+  it.each(['failed request', 'worker restart'])(
+    'allows a fresh installation after a terminal missing receipt from %s, not another claim',
+    async (scenario) => {
+      const first = fixture();
+      const ready = await first.client.prepare(origin);
+      const f =
+        scenario === 'worker restart'
+          ? fixture({ ...first.stored, phase: 'claiming', installationSecret: undefined })
+          : first;
+      if (scenario === 'failed request') {
+        f.transport.claim.mockRejectedValue(new Error('synthetic lost response'));
+        await f.client.claim('ABCDEFGHJKLM');
+      }
+      expect((await f.client.status()).phase).toBe('unknown');
+      await expect(f.client.claim('ABCDEFGHJKLM')).rejects.toThrow('cannot be claimed again');
+      await expect(f.client.prepare(origin)).rejects.toThrow('existing pairing');
+      const disconnected = await f.client.disconnect();
+      expect(disconnected.revocation).toBe('pending'); // Missing is not revoked.
+      expect((await f.client.retryRevocation()).revocation).toBe('pending');
+      const replacement = await f.client.prepare(origin);
+      expect(replacement.phase).toBe('ready');
+      expect(replacement.installationId).not.toBe(ready.installationId);
+      expect(replacement.approvalUrl).not.toBe(ready.approvalUrl);
+      expect(f.transport.claim).toHaveBeenCalledTimes(scenario === 'failed request' ? 1 : 0);
+      expect(f.transport.revoke).not.toHaveBeenCalled();
+    }
+  );
+  it('blocks replacement during a returning claim and until its late grant is revoked', async () => {
+    const f = fixture();
+    const first = await f.client.prepare(origin);
+    const response = deferred<typeof grant>();
+    const revocation = deferred<void>();
+    f.transport.claim.mockReturnValue(response.promise);
+    f.transport.revoke.mockReturnValue(revocation.promise);
+    const claiming = f.client.claim('ABCDEFGHJKLM');
+    await vi.waitFor(() => expect(f.transport.claim).toHaveBeenCalledOnce());
+    expect(await f.client.disconnect()).toMatchObject({
+      phase: 'disconnected',
+      revocation: 'pending',
+      cleanup: 'awaiting-receipt',
+    });
+    await expect(f.client.prepare(origin)).rejects.toThrow('existing pairing');
+    response.resolve(grant);
+    expect(await claiming).toMatchObject({ cleanup: 'revocation' });
+    await vi.waitFor(() => expect(f.transport.revoke).toHaveBeenCalledOnce());
+    await expect(f.client.prepare(origin)).rejects.toThrow('existing pairing');
+    expect(f.transport.revoke.mock.calls[0]?.[0]).toMatchObject({
+      installationId: first.installationId,
+      grant,
+    });
+    revocation.resolve();
+    await vi.waitFor(async () => expect((await f.client.status()).revocation).toBe('confirmed'));
+    expect((await f.client.prepare(origin)).installationId).not.toBe(first.installationId);
+  });
+  it('permits replacement after an already-disconnected claim terminates without a receipt', async () => {
+    const f = fixture();
+    const first = await f.client.prepare(origin);
+    const response = deferred<typeof grant>();
+    f.transport.claim.mockReturnValue(
+      response.promise.then(() => {
+        throw new Error('synthetic timeout');
+      })
+    );
+    const claiming = f.client.claim('ABCDEFGHJKLM');
+    await vi.waitFor(() => expect(f.transport.claim).toHaveBeenCalledOnce());
+    await f.client.disconnect();
+    await expect(f.client.prepare(origin)).rejects.toThrow('existing pairing');
+    response.resolve(grant);
+    expect(await claiming).toMatchObject({ revocation: 'pending', cleanup: 'missing-receipt' });
+    expect((await f.client.prepare(origin)).installationId).not.toBe(first.installationId);
+    expect(f.transport.revoke).not.toHaveBeenCalled();
+  });
+  it('permits replacement after restarting a disconnected worker with no receipt, not one with a grant', async () => {
+    const f = fixture();
+    await f.client.prepare(origin);
+    const stopped: PairingRecord = {
+      ...f.stored,
+      phase: 'disconnected',
+      installationSecret: undefined,
+      revocation: 'pending',
+    };
+    const missing = fixture(stopped);
+    expect(await missing.client.status()).toMatchObject({ cleanup: 'missing-receipt' });
+    expect((await missing.client.prepare(origin)).phase).toBe('ready');
+    const known = fixture({ ...stopped, grant });
+    expect(await known.client.status()).toMatchObject({ cleanup: 'revocation' });
+    await expect(known.client.prepare(origin)).rejects.toThrow('existing pairing');
+  });
 });
 
 describe('fixed-path fetch transport (mocked, not native browser acceptance)', () => {
