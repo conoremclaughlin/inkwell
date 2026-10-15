@@ -294,6 +294,7 @@ describe('browser companion router', () => {
           workspaceId: WORKSPACE_ID,
           threadId: '00000000-0000-4000-8000-0000000000e1',
           threadKey: 'inkling:thread:fixture-group',
+          turnEpoch: '00000000-0000-4000-8000-0000000000f1',
         },
         3600
       );

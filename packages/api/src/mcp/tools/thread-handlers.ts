@@ -599,23 +599,33 @@ export function creatorForDispatch(
 
 // ============== Handlers ==============
 
+/**
+ * The SB a get_thread_messages call reads as.
+ *
+ * Omitted, the caller reads as itself: the slug its token was minted for
+ * (or, over stdio, bootstrap's pin), else the one its own session context
+ * names. A wake tells an SB to read its thread, and a brand-new inkling that
+ * left the slug out failed its very first turn on the required field
+ * (debug:inkling-first-reply). The two branches stay apart: an explicit
+ * slug keeps the existing pinning rule, and getEffectiveSlug(undefined)
+ * would return the context's routing hint ahead of the token (Lumen, #763
+ * r1). The participant check in the handler still decides what it may read.
+ *
+ * Exported so the space-turn policy resolves the thread exactly as the
+ * handler will (space-turn-thread-resolver.ts).
+ */
+export function threadReaderSlug(explicit: string | undefined): string | undefined {
+  return explicit !== undefined
+    ? (getEffectiveSlug(explicit) ?? explicit)
+    : (resolveCallerIdentity().sbSlug ?? getRequestContext()?.sbSlug);
+}
+
 export async function handleGetThreadMessages(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getThreadMessagesSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  // Omitted, the caller reads as itself: the slug its token was minted for
-  // (or, over stdio, bootstrap's pin), else the one its own session context
-  // names. A wake tells an SB to read its thread, and a brand-new inkling that
-  // left the slug out failed its very first turn on the required field
-  // (debug:inkling-first-reply). The two branches stay apart: an explicit
-  // slug keeps the existing pinning rule, and getEffectiveSlug(undefined)
-  // would return the context's routing hint ahead of the token (Lumen, #763
-  // r1). The participant check below still decides what it may read.
-  const sbSlug =
-    parsed.sbSlug !== undefined
-      ? (getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug)
-      : (resolveCallerIdentity().sbSlug ?? getRequestContext()?.sbSlug);
+  const sbSlug = threadReaderSlug(parsed.sbSlug);
   if (!sbSlug) {
     return {
       content: [

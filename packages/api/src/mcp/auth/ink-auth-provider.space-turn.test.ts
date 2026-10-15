@@ -41,6 +41,7 @@ const SESSION = '00000000-0000-4000-8000-0000000000c1';
 const WORKSPACE = '00000000-0000-4000-8000-0000000000d1';
 const THREAD = '00000000-0000-4000-8000-0000000000e1';
 const THREAD_KEY = 'inkling:thread:fixture-group';
+const TURN_EPOCH = '00000000-0000-4000-8000-0000000000f1';
 
 function sign(claims: Record<string, unknown>): string {
   return jwt.sign(
@@ -58,6 +59,7 @@ const spaceTurnClaims = {
   workspaceId: WORKSPACE,
   threadId: THREAD,
   threadKey: THREAD_KEY,
+  turnEpoch: TURN_EPOCH,
 };
 
 describe('space-turn token verification', () => {
@@ -76,13 +78,18 @@ describe('space-turn token verification', () => {
     });
   });
 
-  it.each(['sbSlug', 'sbId', 'sessionId', 'workspaceId', 'threadId', 'threadKey'] as const)(
-    'refuses a space-turn token missing %s',
-    (claim) => {
-      const { [claim]: _dropped, ...rest } = spaceTurnClaims;
-      expect(provider.verifyAccessTokenSignature(`Bearer ${sign(rest)}`)).toBeNull();
-    }
-  );
+  it.each([
+    'sbSlug',
+    'sbId',
+    'sessionId',
+    'workspaceId',
+    'threadId',
+    'threadKey',
+    'turnEpoch',
+  ] as const)('refuses a space-turn token missing %s', (claim) => {
+    const { [claim]: _dropped, ...rest } = spaceTurnClaims;
+    expect(provider.verifyAccessTokenSignature(`Bearer ${sign(rest)}`)).toBeNull();
+  });
 
   it.each(['sbSlug', 'sbId', 'threadKey'] as const)(
     'refuses a space-turn token whose %s is blank',
@@ -235,9 +242,14 @@ describe('signSpaceTurnAccessToken', () => {
       workspaceId: WORKSPACE,
       threadId: THREAD,
       threadKey: THREAD_KEY,
+      turnEpoch: TURN_EPOCH,
     });
     const verified = new InkAuthProvider().verifyAccessTokenSignature(`Bearer ${token}`);
-    expect(verified).toMatchObject({ scope: 'mcp:space-turn', threadKey: THREAD_KEY });
+    expect(verified).toMatchObject({
+      scope: 'mcp:space-turn',
+      threadKey: THREAD_KEY,
+      turnEpoch: TURN_EPOCH,
+    });
     const exp = verified?.expiresAt ?? 0;
     // The default lifetime is the runner token's hour.
     expect(exp - Math.floor(Date.now() / 1000)).toBeGreaterThan(3500);

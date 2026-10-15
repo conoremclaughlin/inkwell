@@ -46,6 +46,8 @@ import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { getHeartbeatTickHealth } from '../services/heartbeat';
 import { InkAuthProvider, type VerifiedAccessToken } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
+import { RUNNER_TOOLS_SCOPE, isSpaceTurnScope } from '../auth/token-scope';
+import { spaceTurnIsLive } from './space-turn-liveness';
 import {
   ACCOUNT_BEING_DELETED,
   leaseAccountForRequest,
@@ -140,6 +142,18 @@ export class MCPServer {
       return null;
     }
 
+    // A space-turn session's runner knows its own sessionId and slug, so a
+    // context naming it proves nothing; resolved here, its owner would act
+    // broad with no token scope for the allowlist to read. Refused for both
+    // the bearer-less fallback and enrichment, which resolves through here
+    // (ink://specs/inkling-multi-person-groups, Phase 2 gate 1).
+    if (session.turnScope) {
+      logger.warn('Context-based auth refused for a space-turn session', {
+        code: 'space_turn_session_context',
+      });
+      return null;
+    }
+
     if (session.sbSlug !== sbSlug) {
       logger.warn('Context-based auth: sbSlug mismatch', {
         sessionId,
@@ -209,6 +223,32 @@ export class MCPServer {
       sbSlug,
       sbId: data.id,
     };
+  }
+
+  /**
+   * Whether a space-turn token's turn is still running (space-turn-liveness.ts).
+   * The token's signed sessionId is not a turn fence on its own: without
+   * this it would work until `exp`, after its turn had settled or ended.
+   */
+  private async spaceTurnStillCurrent(
+    token: VerifiedAccessToken
+  ): Promise<'current' | 'ended' | 'unreadable'> {
+    let session;
+    try {
+      session = token.sessionId
+        ? await this.dataComposer.repositories.memory.getSession(token.sessionId)
+        : null;
+    } catch {
+      logger.warn('Space-turn session could not be read', {
+        code: 'space_turn_session_unreadable',
+      });
+      return 'unreadable';
+    }
+    if (!spaceTurnIsLive(session, token)) {
+      logger.warn('Refused a space-turn token outside its turn', { code: 'space_turn_turn_ended' });
+      return 'ended';
+    }
+    return 'current';
   }
 
   /**
@@ -468,6 +508,23 @@ export class MCPServer {
       }
       // A token whose SB no longer exists is refused like an invalid one.
       let userData: VerifiedAccessToken | null = verdict.ok ? verdict.token : null;
+
+      // A space-turn token works only while its turn does: its session must be
+      // live, marked space-turn, and still at the turn the token was minted
+      // for. Anything else is refused like an expired token; a failed read
+      // cannot be judged (ink://specs/inkling-multi-person-groups, gate 7).
+      if (userData && isSpaceTurnScope(userData.scope)) {
+        const turn = await this.spaceTurnStillCurrent(userData);
+        if (turn === 'unreadable') {
+          res.status(503).json({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: "The token's turn couldn't be checked; try again" },
+            id: null,
+          });
+          return;
+        }
+        if (turn === 'ended') userData = null;
+      }
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
@@ -935,6 +992,21 @@ export class MCPServer {
         return;
       }
       const userData = verdict.token;
+      // The seam already refuses a space-turn presenter here. Refused again,
+      // before anything is minted, so that no later change to the seam can
+      // turn delegation into a way to widen one
+      // (ink://specs/inkling-multi-person-groups, Phase 2 gate 2).
+      if (isSpaceTurnScope(userData.scope)) {
+        logger.warn('Refused delegation of a space-turn token', {
+          code: 'space_turn_token_refused',
+        });
+        res.status(403).json({
+          error: 'forbidden',
+          error_description: 'A shared-conversation token cannot be delegated',
+          code: 'space_turn_token_refused',
+        });
+        return;
+      }
       if (!leaseAccountForRequest(res, userData.userId)) return;
 
       const requestedSlug =
@@ -1023,12 +1095,15 @@ export class MCPServer {
         return;
       }
 
+      // The delegated token carries the presenter's own scope, never a wider
+      // one written here. Every token today is mcp:tools.
+      const scope = userData.scope ?? RUNNER_TOOLS_SCOPE;
       const accessToken = signInkAccessToken(
         {
           type: 'mcp_access',
           sub: userData.userId,
           email: userData.email,
-          scope: 'mcp:tools',
+          scope,
           sbSlug: identity.agent_id,
           identityId: identity.id,
           ...(userData.sessionId ? { sessionId: userData.sessionId } : {}),
@@ -1042,7 +1117,7 @@ export class MCPServer {
         access_token: accessToken,
         token_type: 'Bearer',
         expires_in: notAfter - nowSeconds,
-        scope: 'mcp:tools',
+        scope,
         delegated_agent_id: identity.agent_id,
         sb_id: identity.id,
       });

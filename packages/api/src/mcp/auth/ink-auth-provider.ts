@@ -43,6 +43,8 @@ export interface VerifiedAccessToken {
   workspaceId?: string;
   threadId?: string;
   threadKey?: string;
+  /** A space-turn token's admitted turn (the session's turn_epoch), signed. */
+  turnEpoch?: string;
   /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
   expiresAt?: number;
 }
@@ -561,6 +563,9 @@ export class InkAuthProvider {
         payload.workspaceId,
         payload.threadId,
         payload.threadKey,
+        // The turn it was minted for; /mcp checks it against the session row
+        // on every request (Phase 2 gate 7).
+        payload.turnEpoch,
       ];
       if (!bound.every((claim) => typeof claim === 'string' && claim.trim() !== '')) return null;
     }
@@ -582,6 +587,7 @@ export class InkAuthProvider {
             workspaceId: payload.workspaceId,
             threadId: payload.threadId,
             threadKey: payload.threadKey,
+            turnEpoch: payload.turnEpoch,
           }
         : {}),
       ...(typeof exp === 'number' ? { expiresAt: exp } : {}),

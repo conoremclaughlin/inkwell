@@ -643,6 +643,221 @@ describe('the common send_response inkling channel', () => {
   });
 });
 
+// Phase 2 gate 3 (ink://specs/inkling-multi-person-groups): a space-turn
+// reply is checked against one thread, by id, and must be written to that
+// thread or nowhere. Through the real policy, resolver, handler-argument pin,
+// response handler, inkling send and inbox send (Lumen, PR #867 review).
+describe('a space-turn reply stays on the thread it was checked against', () => {
+  const REPLACEMENT_ID = '99999999-9999-4999-8999-999999999999';
+  const REPLY = 'A synthetic scoped reply.';
+
+  /**
+   * After the inkling send's membership check, before the inbox send runs:
+   * the checked thread is deleted, or deleted and recreated under the same
+   * key with the same members.
+   */
+  function changeThreadAfterTheCheck(change: 'replace' | 'delete', originalId: string) {
+    let changed = false;
+    const originalFrom = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = originalFrom(table);
+      if (table === 'inbox_thread_participants') {
+        const originalSingle = query.maybeSingle.bind(query);
+        query.maybeSingle = async () => {
+          const result = await originalSingle();
+          if (!changed && result.data) {
+            changed = true;
+            const oldThread = threadOf(KEY);
+            const members = db
+              .rows('inbox_thread_participants')
+              .filter((row) => row.thread_id === originalId);
+            db.tables.inbox_threads = db.rows('inbox_threads').filter((t) => t.id !== originalId);
+            db.tables.inbox_thread_participants = db
+              .rows('inbox_thread_participants')
+              .filter((row) => row.thread_id !== originalId);
+            if (change === 'replace') {
+              db.seed('inbox_threads', { ...oldThread, id: REPLACEMENT_ID });
+              for (const member of members) {
+                db.seed('inbox_thread_participants', { ...member, thread_id: REPLACEMENT_ID });
+              }
+            }
+          }
+          return result;
+        };
+      }
+      return query;
+    }) as typeof db.from;
+    return {
+      changed: () => changed,
+      restore: () => {
+        db.from = originalFrom;
+      },
+    };
+  }
+
+  async function spaceTurnReply(originalId: string) {
+    const { handleSendResponse } = await import('../../mcp/tools/response-handlers');
+    const { runWithRequestContext } = await import('../../utils/request-context');
+    const { decideSpaceTurnCall, spaceTurnHandlerArgs } =
+      await import('../../mcp/tools/space-turn-policy');
+    const { createSpaceTurnThreadResolver } =
+      await import('../../mcp/tools/space-turn-thread-resolver');
+    const context = {
+      userId: ME,
+      sbId: 'sb-pip',
+      sbSlug: 'pip',
+      workspaceId: WS,
+      tokenSlug: 'pip',
+      tokenSbId: 'sb-pip',
+      agentTokenBound: true,
+      tokenScope: 'mcp:space-turn',
+      tokenThreadKey: KEY,
+      tokenThreadId: originalId,
+      tokenWorkspaceId: WS,
+    };
+    const args = { channel: 'inkling', conversationId: KEY, content: REPLY };
+    return runWithRequestContext(context, async () => {
+      const decision = await decideSpaceTurnCall(
+        'send_response',
+        args,
+        context,
+        createSpaceTurnThreadResolver(dataComposer)
+      );
+      expect(decision).toMatchObject({ allowed: true, thread: { id: originalId } });
+      if (!decision.allowed || !decision.thread) throw new Error('The reply was not admitted');
+      const [pinned] = spaceTurnHandlerArgs('send_response', [args], decision.thread);
+      expect(pinned).toMatchObject({ conversationId: originalId });
+      return handleSendResponse(pinned, dataComposer);
+    });
+  }
+
+  const replies = () => messages().filter((row) => row.content === REPLY);
+
+  it('stores the reply on the checked thread when nothing changed (control)', async () => {
+    await ownerStarts();
+    const originalId = threadOf(KEY).id as string;
+    const result = await spaceTurnReply(originalId);
+    expect(result.isError).not.toBe(true);
+    expect(replies().map((row) => row.thread_id)).toEqual([originalId]);
+  });
+
+  it('refuses when the thread was replaced under the same key, writing nothing', async () => {
+    await ownerStarts();
+    const originalId = threadOf(KEY).id as string;
+    const change = changeThreadAfterTheCheck('replace', originalId);
+    try {
+      const result = await spaceTurnReply(originalId);
+      expect(change.changed()).toBe(true);
+      expect(result.isError).toBe(true);
+      expect(replies()).toEqual([]);
+    } finally {
+      change.restore();
+    }
+  });
+
+  it('refuses when the thread disappeared, creating nothing under its key', async () => {
+    await ownerStarts();
+    const originalId = threadOf(KEY).id as string;
+    const change = changeThreadAfterTheCheck('delete', originalId);
+    try {
+      const result = await spaceTurnReply(originalId);
+      expect(change.changed()).toBe(true);
+      expect(result.isError).toBe(true);
+      expect(replies()).toEqual([]);
+      expect(db.rows('inbox_threads').filter((t) => t.thread_key === KEY)).toEqual([]);
+    } finally {
+      change.restore();
+    }
+  });
+
+  describe('the inbox send bound to a thread id', () => {
+    const asPip = {
+      sender: {
+        principal: {
+          kind: 'sb' as const,
+          sbId: 'sb-pip',
+          sbSlug: 'pip',
+          userId: ME,
+          workspaceId: WS,
+        },
+        workspaceId: WS,
+      },
+    };
+
+    it('writes to that thread when the key still names it (control)', async () => {
+      await ownerStarts();
+      const id = threadOf(KEY).id as string;
+      await handleSendToInbox(
+        { userId: ME, threadKey: KEY, recipientSlug: 'pip', content: REPLY },
+        dataComposer,
+        { ...asPip, expectedThreadId: id }
+      );
+      expect(replies().map((row) => row.thread_id)).toEqual([id]);
+    });
+
+    it('refuses when the key names another thread, or none, and creates nothing', async () => {
+      await ownerStarts();
+      const threadsBefore = db.rows('inbox_threads').length;
+      for (const [threadKey, expectedThreadId] of [
+        [KEY, REPLACEMENT_ID],
+        ['chat:conversation-never-made', threadOf(KEY).id as string],
+      ]) {
+        await expect(
+          handleSendToInbox(
+            { userId: ME, threadKey, recipientSlug: 'pip', content: REPLY },
+            dataComposer,
+            { ...asPip, expectedThreadId }
+          )
+        ).rejects.toThrow(/gone or was replaced/);
+      }
+      expect(replies()).toEqual([]);
+      expect(db.rows('inbox_threads')).toHaveLength(threadsBefore);
+    });
+
+    // A key lookup after the check could find a thread that replaced the
+    // checked one; the bound send makes none, so every write uses the id.
+    it('looks the key up once, for its check, and writes to the checked id', async () => {
+      await ownerStarts();
+      const id = threadOf(KEY).id as string;
+      let keyLookups = 0;
+      const originalFrom = db.from.bind(db);
+      db.from = ((name: string) => {
+        const query = originalFrom(name);
+        if (name === 'inbox_threads') {
+          const originalEq = query.eq.bind(query);
+          query.eq = (column: string, value: unknown) => {
+            if (column === 'thread_key') keyLookups += 1;
+            return originalEq(column, value);
+          };
+        }
+        return query;
+      }) as typeof db.from;
+      try {
+        await handleSendToInbox(
+          { userId: ME, threadKey: KEY, recipientSlug: 'pip', content: REPLY },
+          dataComposer,
+          { ...asPip, expectedThreadId: id }
+        );
+      } finally {
+        db.from = originalFrom;
+      }
+      expect(keyLookups).toBe(1);
+      expect(replies().map((row) => row.thread_id)).toEqual([id]);
+    });
+
+    it('refuses a bound send that names no thread key', async () => {
+      await ownerStarts();
+      await expect(
+        handleSendToInbox({ userId: ME, recipientSlug: 'pip', content: REPLY }, dataComposer, {
+          ...asPip,
+          expectedThreadId: threadOf(KEY).id as string,
+        })
+      ).rejects.toThrow(/needs its thread key/);
+      expect(replies()).toEqual([]);
+    });
+  });
+});
+
 describe('consecutive owner messages through the real session queue and closing hooks', () => {
   it('stores the follow-ups while busy, then answers their verified batch once', async () => {
     const { SessionService } = await import('../sessions/session-service');

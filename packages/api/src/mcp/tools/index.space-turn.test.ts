@@ -7,6 +7,10 @@
  * runInToolCall, which wraps every handler: a refused call never gets there,
  * whatever the tool's body would have done. The stand-in never runs a body,
  * so no handler touches a store here.
+ *
+ * The thread lookup is stubbed here so this file judges the wrapper alone;
+ * the real lookup, through the handlers' own functions, is exercised in
+ * space-turn-thread-binding.test.ts.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { z } from 'zod';
@@ -18,6 +22,16 @@ vi.mock('../../utils/tool-call-context', () => ({
     return { content: [{ type: 'text', text: '{"success":true}' }] };
   },
   currentToolName: () => undefined,
+}));
+// The token's own thread, found where the handler would find it.
+const resolveThread = vi.hoisted(() =>
+  vi.fn(async () => ({
+    id: '00000000-0000-4000-8000-0000000000e1',
+    workspaceId: '00000000-0000-4000-8000-0000000000d1',
+  }))
+);
+vi.mock('./space-turn-thread-resolver', () => ({
+  createSpaceTurnThreadResolver: () => resolveThread,
 }));
 
 import { registerAllTools } from './index';

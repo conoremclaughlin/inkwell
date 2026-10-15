@@ -2,6 +2,7 @@
 import { isAbsolute } from 'path';
 import type { SessionSteeringRequest, SessionSteeringReceipt } from '@inklabs/shared/runtime';
 import { verifyInkAccessToken } from '../../auth/ink-tokens';
+import { isPlainToolsScope } from '../../auth/token-scope';
 import {
   getActiveRun,
   mayGenerationProceed,
@@ -83,8 +84,7 @@ export function createNativeSteeringBinding(
     (claims.identityId !== undefined && claims.identityId !== sbId) ||
     claims.sessionId !== sessionId ||
     claims.contactId !== undefined ||
-    typeof claims.scope !== 'string' ||
-    !claims.scope.split(/\s+/).includes('mcp:tools') ||
+    !isPlainToolsScope(claims.scope) ||
     typeof claims.exp !== 'number' ||
     !Number.isFinite(claims.exp) ||
     claims.exp * 1000 <= Date.now()

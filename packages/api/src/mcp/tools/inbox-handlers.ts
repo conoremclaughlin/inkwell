@@ -457,6 +457,14 @@ export interface InternalSendContext {
    * POST /api/admin/threads and /threads/reply set it.
    */
   inklingGroup?: { wake?: string[]; inTurn?: boolean; ticket?: number };
+  /**
+   * The thread this send was checked against, by id (an inkling reply's
+   * resolved conversation, inkling-response.ts). The send is written to
+   * exactly this thread or refused: the key must still name it when the send
+   * looks, and nothing is followed or created by key. A thread deleted, or
+   * replaced under the same key, after the check gets nothing.
+   */
+  expectedThreadId?: string;
 }
 
 export async function handleSendToInbox(
@@ -674,6 +682,10 @@ export async function handleSendToInbox(
   // Without threadKey, falls through to legacy agent_inbox path.
   let prefixWarning: string | undefined;
 
+  if (internal?.expectedThreadId !== undefined && !threadKey) {
+    throw new Error('A send bound to a checked conversation needs its thread key');
+  }
+
   if (threadKey) {
     const allRecipients = recipients || [recipientSlug!];
 
@@ -777,6 +789,14 @@ export async function handleSendToInbox(
 
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
+    // A send bound to a checked thread goes there or nowhere: refused before
+    // anything is written when the key no longer names that thread.
+    if (
+      internal?.expectedThreadId !== undefined &&
+      existingThread?.id !== internal.expectedThreadId
+    ) {
+      throw new Error('The conversation this send was checked against is gone or was replaced');
+    }
 
     // A conversation with an inkling is only between its owner and the
     // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
@@ -829,15 +849,20 @@ export async function handleSendToInbox(
       ...(internal?.createIntent ? { createIntent: internal.createIntent } : {}),
       ...(inklingVerdict.inklingConversation ? { [INKLING_CONVERSATION_MARK]: true } : {}),
     };
-    let thread = await findOrCreateThread(supabase, {
-      workspaceId,
-      threadKey,
-      creator: sender,
-      title: subject || null,
-      participants: participantSbs,
-      person: sender.kind === 'user' ? sender : null,
-      ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
-    });
+    // A send bound to a checked thread never looks the key up again, so every
+    // write below lands on that id; a thread deleted since fails the writes.
+    let thread =
+      internal?.expectedThreadId !== undefined
+        ? { id: internal.expectedThreadId, isNew: false }
+        : await findOrCreateThread(supabase, {
+            workspaceId,
+            threadKey,
+            creator: sender,
+            title: subject || null,
+            participants: participantSbs,
+            person: sender.kind === 'user' ? sender : null,
+            ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
+          });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
     // and the insert. Nothing has been written yet (findOrCreateThread writes
