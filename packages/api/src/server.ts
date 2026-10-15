@@ -2261,7 +2261,8 @@ function printStatus(): void {
 /**
  * Graceful shutdown with force-kill timeout.
  * If graceful teardown hangs (open connections, polling loops, etc.),
- * force-exit after 10 seconds so tsx --watch can restart cleanly.
+ * force-exit after 10 seconds so the dev watcher (scripts/dev-watch.mjs) can
+ * restart cleanly.
  *
  * `reason` is logged so a stop always says what caused it.
  */

@@ -39,6 +39,11 @@ jobs:
       - name: Dependency security regressions (no shell execution or network)
         run: node --test scripts/security-dependencies.test.cjs
 
+      # The dev API server's watcher restarts a run that crashed, stops on a
+      # signal even mid-backoff, and restarts on a change (task ff78e1dd).
+      - name: Dev server watcher
+        run: node --test scripts/dev-watch.test.mjs
+
       - run: yarn build
 
       # pi's grep/find tools shell out to ripgrep and fd, and pi downloads them
