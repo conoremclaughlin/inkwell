@@ -4,13 +4,20 @@
  * other route is closed by verifyAccessToken's default. This pin keeps it
  * that way: a second opt-in anywhere in the server source fails here, in
  * review, instead of opening a route to a shared conversation's token.
+ *
+ * It counts the option's name, not one spelling of it. A shorthand
+ * `{ allowSpaceTurn }` or a computed `allowSpaceTurn: isMcp` opens a seam as
+ * surely as the literal does, so any mention outside the provider that
+ * defines the option counts as an opt-in.
  */
 import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'fs';
 import { join, relative } from 'path';
 
 const SRC = join(__dirname, '..');
-const OPT_IN = /allowSpaceTurn\s*:\s*true/g;
+const DEFINED_IN = join('mcp', 'auth', 'ink-auth-provider.ts');
+const OPTION = /\ballowSpaceTurn\b/g;
+const LITERAL_OPT_IN = /allowSpaceTurn\s*:\s*true\b/g;
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -23,14 +30,21 @@ function sourceFiles(dir: string): string[] {
 }
 
 describe('the space-turn opt-in', () => {
-  it('appears exactly once in the server source, at the MCP endpoint', () => {
+  it('is named exactly once outside its definition, at the MCP endpoint', () => {
     const files = sourceFiles(SRC);
     // The scan is over the real tree, not an empty directory.
     expect(files.length).toBeGreaterThan(200);
     const hits = files.flatMap((file) => {
-      const count = readFileSync(file, 'utf8').match(OPT_IN)?.length ?? 0;
-      return count ? [{ file: relative(SRC, file), count }] : [];
+      const path = relative(SRC, file);
+      if (path === DEFINED_IN) return [];
+      const count = readFileSync(file, 'utf8').match(OPTION)?.length ?? 0;
+      return count ? [{ file: path, count }] : [];
     });
     expect(hits).toEqual([{ file: join('mcp', 'server.ts'), count: 1 }]);
+  });
+
+  it('is the literal opt-in there, not a value computed at the call', () => {
+    const server = readFileSync(join(SRC, 'mcp', 'server.ts'), 'utf8');
+    expect(server.match(LITERAL_OPT_IN)?.length ?? 0).toBe(1);
   });
 });
