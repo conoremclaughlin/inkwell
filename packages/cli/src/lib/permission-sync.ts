@@ -169,15 +169,24 @@ export function planProfileSync(
     return { state: 'no-rules', ...none };
   }
 
+  // A retired deny the studio's own profile still carries stays: the
+  // reviewer keeps denying the PR and SQL tools the builder no longer does.
+  const removeDeny = deny.filter(
+    (rule) => RETIRED_DENY_RULES.includes(rule) && !rules.deny.includes(rule)
+  );
+  // Allows are judged against the denies that survive this sync, so the
+  // allow a retired deny blocked is added in the same pass (Lumen, #868).
+  const keptDeny = deny.filter((rule) => !removeDeny.includes(rule));
+
   const kept: KeptRule[] = [];
   const addAllow: string[] = [];
   for (const rule of rules.allow) {
     if (allow.includes(rule)) continue;
-    if (deny.includes(rule) || ask.includes(rule)) {
+    if (keptDeny.includes(rule) || ask.includes(rule)) {
       kept.push({
         rule,
         list: 'allow',
-        reason: `this file ${deny.includes(rule) ? 'denies' : 'asks about'} ${rule} by name`,
+        reason: `this file ${keptDeny.includes(rule) ? 'denies' : 'asks about'} ${rule} by name`,
       });
       continue;
     }
@@ -194,17 +203,9 @@ export function planProfileSync(
     addDeny.push(rule);
   }
 
-  // A retired deny the studio's own profile still carries stays: the
-  // reviewer keeps denying the PR and SQL tools the builder no longer does.
-  const removeDeny = deny.filter(
-    (rule) => RETIRED_DENY_RULES.includes(rule) && !rules.deny.includes(rule)
-  );
-
   const next: Record<string, unknown> = { ...permissions };
   if (addAllow.length > 0) next.allow = [...allow, ...addAllow];
-  if (addDeny.length > 0 || removeDeny.length > 0) {
-    next.deny = [...deny.filter((rule) => !removeDeny.includes(rule)), ...addDeny];
-  }
+  if (addDeny.length > 0 || removeDeny.length > 0) next.deny = [...keptDeny, ...addDeny];
   return { state: 'authored', addAllow, addDeny, removeDeny, kept, permissions: next };
 }
 

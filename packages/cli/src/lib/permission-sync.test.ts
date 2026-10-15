@@ -406,6 +406,50 @@ describe('retired denies (spec automated-turn-permissions §3.4)', () => {
     );
   });
 
+  describe('one sync brings the old generated builder profile up to date', () => {
+    const lifted = [
+      'mcp__github__create_pull_request',
+      'mcp__github__update_pull_request',
+      'mcp__github__update_pull_request_branch',
+      'mcp__supabase__execute_sql',
+    ];
+    const installs = ['Bash(yarn)', 'Bash(yarn install*)', 'Bash(npm install*)'];
+    // What the builder profile generated before this branch: the PR and SQL
+    // tools denied rather than allowed, and installs denied.
+    const old = {
+      allow: builderRules.allow.filter((rule) => !lifted.includes(rule)),
+      deny: [...builderRules.deny, ...lifted, ...installs],
+    };
+
+    it('grants the PR and SQL tools in the pass that lifts their denies', () => {
+      const plan = planProfileSync(old, builderRules);
+      const permissions = plan.permissions as { allow: string[]; deny: string[] };
+      expect(plan.addAllow).toEqual(lifted);
+      expect(plan.removeDeny).toEqual([...lifted, ...installs]);
+      expect(plan.kept).toEqual([]);
+      expect([...permissions.allow].sort()).toEqual([...builderRules.allow].sort());
+      expect([...permissions.deny].sort()).toEqual([...builderRules.deny].sort());
+    });
+
+    it('leaves nothing for a second sync to do', () => {
+      const once = planProfileSync(old, builderRules);
+      const twice = planProfileSync(once.permissions, builderRules);
+      expect(twice.addAllow).toEqual([]);
+      expect(twice.addDeny).toEqual([]);
+      expect(twice.removeDeny).toEqual([]);
+    });
+
+    it('still keeps out an allow the file asks about', () => {
+      const plan = planProfileSync({ ...old, ask: ['mcp__supabase__execute_sql'] }, builderRules);
+      const permissions = plan.permissions as { allow: string[]; ask: string[] };
+      expect(permissions.allow).not.toContain('mcp__supabase__execute_sql');
+      expect(permissions.ask).toEqual(['mcp__supabase__execute_sql']);
+      expect(plan.kept).toContainEqual(
+        expect.objectContaining({ rule: 'mcp__supabase__execute_sql', list: 'allow' })
+      );
+    });
+  });
+
   it('lifts the old install denies from a builder and a reviewer alike', () => {
     const installs = ['Bash(yarn)', 'Bash(yarn install*)', 'Bash(npm ci*)', 'Bash(pnpm add *)'];
     const file = { allow: ['Bash(*)'], deny: ['Bash(sudo *)', ...installs] };
