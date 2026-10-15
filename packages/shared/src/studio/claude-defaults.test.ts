@@ -58,6 +58,17 @@ function decide(
 const bash = (command: string): Call => ({ tool: 'Bash', command });
 const builder = () => defaults.studioPermissionRules('builder', 'wren');
 const reviewer = () => defaults.studioPermissionRules('reviewer', 'wren');
+/** Every install spelling the retired denies named. */
+const INSTALLS = [
+  'yarn',
+  'yarn install',
+  'yarn install --immutable',
+  'yarn add left-pad',
+  'npm install',
+  'npm ci',
+  'pnpm add x',
+  'pnpm install',
+];
 
 describe('the evaluator models the documented matching (its own controls)', () => {
   it('a trailing " *" matches the bare command; "*" spans spaces; deny beats allow', () => {
@@ -171,21 +182,13 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), { tool: 'mcp__supabase__apply_migration' })).toBe('deny');
   });
 
-  it('denies installs, bare yarn included, and keeps the force-push defaults', () => {
-    for (const command of [
-      'yarn',
-      'yarn install',
-      'yarn install --immutable',
-      'yarn add left-pad',
-      'npm install',
-      'npm ci',
-      'pnpm add x',
-      'pnpm install',
-      'git push --force origin x',
-    ]) {
-      expect(decide(builder(), bash(command)), command).toBe('deny');
+  it('installs dependencies, bare yarn included, and keeps the force-push defaults', () => {
+    // Conor, 2026-10-15: a session installs in its own studio.
+    for (const command of INSTALLS) {
+      expect(decide(builder(), bash(command)), command).toBe('allow');
     }
     expect(decide(builder(), bash('yarn workspace @inklabs/shared build'))).toBe('allow');
+    expect(decide(builder(), bash('git push --force origin x'))).toBe('deny');
   });
 
   it('the destructive local commands are no longer denied: the PreToolUse hook decides them', () => {
@@ -259,9 +262,14 @@ describe('the reviewer profile — composition', () => {
       'git commit -m x',
       'git commit',
       'git -C . commit -m x',
-      'yarn install',
     ]) {
       expect(decide(reviewer(), bash(command)), command).toBe('deny');
+    }
+  });
+
+  it('installs the dependencies its tests need', () => {
+    for (const command of INSTALLS) {
+      expect(decide(reviewer(), bash(command)), command).toBe('allow');
     }
   });
 

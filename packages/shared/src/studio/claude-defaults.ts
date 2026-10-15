@@ -46,7 +46,10 @@ export const DEFAULT_CLAUDE_DENY_RULES: readonly string[] = [
  *     decides (spec automated-turn-permissions §3.4);
  *   - opening or updating a PR and running SQL, which the builder now
  *     allows (Conor, 2026-10-15). Spelled here rather than spread from
- *     GITHUB_PR_TOOLS and SUPABASE_SQL_TOOLS, which are declared below.
+ *     GITHUB_PR_TOOLS and SUPABASE_SQL_TOOLS, which are declared below;
+ *   - dependency installs, which both profiles now allow (Conor,
+ *     2026-10-15). A session already runs its checkout's code through its
+ *     tests, so an install's scripts are not a new kind of trust.
  */
 export const RETIRED_DENY_RULES: readonly string[] = [
   'Bash(rm -rf *)',
@@ -58,6 +61,13 @@ export const RETIRED_DENY_RULES: readonly string[] = [
   'mcp__github__update_pull_request',
   'mcp__github__update_pull_request_branch',
   'mcp__supabase__execute_sql',
+  'Bash(yarn)',
+  'Bash(yarn install*)',
+  'Bash(yarn add *)',
+  'Bash(npm install*)',
+  'Bash(npm ci*)',
+  'Bash(pnpm add *)',
+  'Bash(pnpm install*)',
 ];
 
 /**
@@ -212,20 +222,6 @@ export interface StudioRuleSet {
 }
 
 /**
- * Dependency installs. Backstops: a studio profile does not pre-approve an
- * install, which runs code the package manager chooses.
- */
-export const INSTALL_DENY_RULES: readonly string[] = [
-  'Bash(yarn)',
-  'Bash(yarn install*)',
-  'Bash(yarn add *)',
-  'Bash(npm install*)',
-  'Bash(npm ci*)',
-  'Bash(pnpm add *)',
-  'Bash(pnpm install*)',
-];
-
-/**
  * Every push, by the spellings a rule can name. The reviewer profile denies
  * them all. Backstops: `Bash(git push *)` also matches a bare `git push`,
  * but no rule matches every spelling (Claude Code's documentation names
@@ -348,9 +344,10 @@ export function scratchPathRules(sbSlug: string): string[] {
  * The builder profile: a development session in its own studio. Edits
  * anywhere in its checkout, commits locally and pushes its own branch
  * (STUDIO_PUSH_RULES), opens and updates its pull request, reads GitHub,
- * runs SQL, and is not pre-approved to force-push, push to main, skip the
- * pre-push hook, install, merge a pull request, write a branch through the
- * GitHub API, or apply a migration through the Supabase tool.
+ * runs SQL, installs dependencies, and is not pre-approved to force-push,
+ * push to main, skip the pre-push hook, merge a pull request, write a
+ * branch through the GitHub API, or apply a migration through the Supabase
+ * tool.
  *
  * `Edit(/**)`: a single leading slash anchors at the session's primary
  * working directory when the rule lives in `.claude/settings.local.json`,
@@ -374,7 +371,6 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
   ],
   deny: [
     ...DEFAULT_CLAUDE_DENY_RULES,
-    ...INSTALL_DENY_RULES,
     ...STUDIO_PUSH_RULES.deny,
     ...GITHUB_PUBLISH_TOOLS,
     ...SUPABASE_MIGRATION_TOOLS,
@@ -384,10 +380,10 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
 /**
  * The reviewer profile: a detached checkout of code under review. Reads
  * everything, writes only its SB's scratch directories, posts its review,
- * and is not pre-approved to stage, commit or push, install, or use any
- * other write tool. Its `Bash(*)` is kept for running tests, so every
- * Bash deny here is a backstop too: a subprocess can still write the
- * checkout.
+ * and is not pre-approved to stage, commit or push, or use any other write
+ * tool. Its `Bash(*)` is kept for running tests, and installing the
+ * dependencies they need, so every Bash deny here is a backstop too: a
+ * subprocess can still write the checkout.
  */
 export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
   allow: [
@@ -403,7 +399,6 @@ export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
   ],
   deny: [
     ...DEFAULT_CLAUDE_DENY_RULES,
-    ...INSTALL_DENY_RULES,
     ...COMMIT_DENY_RULES,
     ...PUSH_DENY_RULES,
     ...GITHUB_PUBLISH_TOOLS,

@@ -88,21 +88,17 @@ describe('planProfileSync', () => {
     // does, and denies every push, which the file allows in its legacy form.
     const plan = planProfileSync(ROOT_COPY, reviewer);
     expect(plan.addDeny).not.toContain('mcp__github__create_pull_request');
-    expect(plan.addDeny).not.toContain('Bash(yarn install*)');
     expect(plan.kept.map((k) => k.rule).sort()).toEqual(
-      ['Bash(git push *)', 'Bash(yarn install*)', 'mcp__github__create_pull_request'].sort()
+      ['Bash(git push *)', 'mcp__github__create_pull_request'].sort()
     );
     expect(plan.kept.every((k) => k.list === 'deny')).toBe(true);
-    expect(plan.kept.find((k) => k.rule === 'Bash(yarn install*)')!.reason).toContain(
-      'Bash(yarn install)'
+    expect(plan.kept.find((k) => k.rule === 'Bash(git push *)')!.reason).toContain(
+      'Bash(git push:*)'
     );
     // Every other deny is added: a broad allow does not block a backstop.
     expect(plan.addDeny).toEqual(
       reviewer.deny.filter(
-        (r) =>
-          r !== 'mcp__github__create_pull_request' &&
-          r !== 'Bash(yarn install*)' &&
-          r !== 'Bash(git push *)'
+        (r) => r !== 'mcp__github__create_pull_request' && r !== 'Bash(git push *)'
       )
     );
   });
@@ -307,8 +303,8 @@ describe('named Bash allows, in every spelling', () => {
     ['reviewer', 'Bash(git push *)', 'Bash(git push)'],
     ['reviewer', 'Bash(git push *)', 'Bash(git push:*)'],
     ['reviewer', 'Bash(git add *)', 'Bash(git add:*)'],
-    ['builder', 'Bash(pnpm add *)', 'Bash(pnpm add:*)'],
-    ['builder', 'Bash(pnpm add *)', 'Bash(pnpm add)'],
+    ['builder', 'Bash(git push --force *)', 'Bash(git push --force:*)'],
+    ['builder', 'Bash(git push --force *)', 'Bash(git push --force)'],
   ] as const)('%s: %s is kept out beside an authored %s', (profile, deny, allow) => {
     const plan = planProfileSync(
       { allow: [allow], deny: [] },
@@ -408,5 +404,15 @@ describe('retired denies (spec automated-turn-permissions §3.4)', () => {
     expect((reviewed.permissions as { deny: string[] }).deny).toEqual(
       expect.arrayContaining(lifted)
     );
+  });
+
+  it('lifts the old install denies from a builder and a reviewer alike', () => {
+    const installs = ['Bash(yarn)', 'Bash(yarn install*)', 'Bash(npm ci*)', 'Bash(pnpm add *)'];
+    const file = { allow: ['Bash(*)'], deny: ['Bash(sudo *)', ...installs] };
+    for (const profile of ['builder', 'reviewer'] as const) {
+      const plan = planProfileSync(file, studioPermissionRules(profile, 'wren'));
+      expect(plan.removeDeny, profile).toEqual(installs);
+      expect((plan.permissions as { deny: string[] }).deny, profile).toContain('Bash(sudo *)');
+    }
   });
 });
