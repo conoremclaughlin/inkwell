@@ -27,6 +27,8 @@ import {
 import { findInvokeToolBlocks, stripInvokeToolBlocks } from './invoke-tool-blocks.js';
 import { findLegacyToolBlocks, stripLegacyToolBlocks } from './legacy-tool-blocks.js';
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from './local-tool-placeholder.js';
+import type { StreamDispatchResult } from './stream-tool-dispatch.js';
+import type { ToolCallResult } from './tool-call-executor.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -44,6 +46,8 @@ export interface ToolResultRecord {
   result: unknown;
   status: string;
   args?: unknown;
+  invocationId?: string;
+  dispatchState?: ToolCallResult['dispatchState'];
   /**
    * This record says how a call was READ, not what happened to it.
    *
@@ -143,7 +147,7 @@ export function describeMalformedBlock(block: MalformedToolBlock): string {
     : 'it was NOT executed because the response ended before its closing ``` fence';
   return (
     `${subject} (${block.payloadLength} bytes) was discarded: ${cause} — ${block.error}. ` +
-    `Nothing ran and nothing was written. Re-emit it as one balanced JSON object, ` +
+    `This block ran no tool and wrote nothing. Re-emit it as one balanced JSON object, ` +
     `checking that every { and [ you opened is closed.`
   );
 }
@@ -296,6 +300,8 @@ export interface AgentLoopPorts {
         signal?: AbortSignal;
         /** Only an ordinary continuation after the completed tool round. */
         completedToolRound?: true;
+        /** Explicit authority: final relay/correction output is never executable. */
+        toolExecution?: 'allowed' | 'forbidden';
       }
     ): Promise<BackendTurnOutcome>;
   };
@@ -354,6 +360,29 @@ export interface BackendTurnOutcome {
   stdout: string;
   stderr: string;
   exitCode?: number;
+  /** Already settled by the attempt owner. Never re-execute final extraction. */
+  toolStream?: StreamDispatchResult;
+}
+
+function streamResults(stream: StreamDispatchResult): ToolResultRecord[] {
+  return stream.results.map((result) => ({
+    tool: result.tool,
+    args: result.args,
+    status: result.status,
+    invocationId: result.invocationId,
+    dispatchState: result.dispatchState,
+    result: result.status === 'error' ? result.error : (result.reason ?? result.result),
+  }));
+}
+
+function streamRefusals(stream: StreamDispatchResult): ToolResultRecord[] {
+  return stream.notRun.map(({ call, reason }) => ({
+    tool: call.tool,
+    args: call.args,
+    status: 'not-run',
+    result: reason,
+    dispatchState: 'not-dispatched',
+  }));
 }
 
 /**
@@ -730,6 +759,8 @@ export interface AgentLoopInput {
   prompt: string;
   /** Local tool routing off (`backend`) means the loop never extracts calls. */
   toolRouting: 'backend' | 'local';
+  /** Matches opt-in stream admission, including final display/correction checks. */
+  canonicalTools?: boolean;
   /**
    * Tool iterations allowed. Every cap check follows the first request, so a
    * value below one behaves as one: the model's first request always runs.
@@ -831,7 +862,7 @@ export async function runAgentLoop(
     phase: ProtocolViolation['phase']
   ): ImitatedToolResultsFrame | null => {
     if (input.toolRouting !== 'local') return null;
-    const imitation = findImitatedToolResults(text);
+    const imitation = findImitatedToolResults(text, { fenceBounded: input.canonicalTools });
     if (!imitation) return null;
     const violation: ProtocolViolation = {
       kind: 'imitated-tool-results',
@@ -863,7 +894,27 @@ export async function runAgentLoop(
   // answer, so nothing is cut here — but the violation is recorded, and
   // since no correction follows a failure it stays uncorrected: the host
   // fails closed and rolls the session.
+  const retainFailedStream = (failed: BackendTurnOutcome): void => {
+    const stream = failed.toolStream;
+    if (!stream) return;
+    const records: ToolResultRecord[] = [
+      ...streamResults(stream),
+      ...streamRefusals(stream),
+      ...stream.extracted.malformed.map((block) => ({
+        tool: block.tool ?? 'unknown',
+        status: 'malformed',
+        result: describeMalformedBlock(block),
+      })),
+      ...(stream.failure
+        ? [{ tool: 'runtime', status: 'error', result: stream.failure.message }]
+        : []),
+    ];
+    allToolResults.push(...records);
+    for (const record of records) ports.observe?.recordToolCall(record);
+    if (records.length || stream.admitted.length) iteration++;
+  };
   const noteImitationInFailedOutcome = (failed: BackendTurnOutcome): void => {
+    retainFailedStream(failed);
     if (failed.responseText) noteImitation(failed.responseText, 'turn');
   };
 
@@ -886,18 +937,20 @@ export async function runAgentLoop(
     iteration,
     isContinuation: false,
     signal: input.signal,
+    toolExecution: 'allowed',
   });
 
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
-  // A failed opening spawn is a failed turn, whatever text it left behind:
-  // nothing in it is screened, executed, or corrected — a tool it asked for
-  // must not run on the say-so of a process that died, and a correction it
-  // earned would only mark the session clean. Any imitation in that text is
+  // A failed opening spawn is a failed turn, whatever text it left behind.
+  // Never batch-execute or correct that failed text. Streaming effects may
+  // already exist: retain their owned outcomes without running them again.
+  // A correction here would only mark the session clean. Any imitation in that text is
   // recorded, uncorrected, so the host fails closed and rolls the session
   // (Lumen, PR #575 round 3). The text itself is still cut for display.
   if (!outcome.success) {
+    retainFailedStream(outcome);
     responseText = discardImitatedResults(responseText, 'turn').text;
     stopReason = 'backend-failure';
   }
@@ -915,7 +968,8 @@ export async function runAgentLoop(
 
     const blocks =
       input.toolRouting === 'local'
-        ? extractToolBlocks(responseText)
+        ? (outcome.toolStream?.extracted ??
+          extractToolBlocks(responseText, { canonicalOnly: input.canonicalTools }))
         : { calls: [] as LocalToolCall[], malformed: [], repaired: [] };
     const extracted = blocks.calls;
     // Taken before `screen` can touch these objects — see snapshotCalls.
@@ -937,6 +991,7 @@ export async function runAgentLoop(
     // authored a miscounted brace and nobody witnessed it, which is precisely
     // the emergent class that predicate is a denylist for.
     const unrunnable: ToolResultRecord[] = [
+      ...(outcome.toolStream ? streamRefusals(outcome.toolStream) : []),
       ...blocks.malformed.map((block) => ({
         tool: block.tool ?? 'unknown',
         status: 'malformed',
@@ -971,9 +1026,11 @@ export async function runAgentLoop(
     // Screening sees every call the model emitted, before the per-iteration cap
     // discards any — a rule about what may accompany what cannot be enforced on
     // a truncated list.
-    const screened = ports.tools.screen
-      ? ports.tools.screen(extracted)
-      : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
+    const screened = outcome.toolStream
+      ? { calls: outcome.toolStream.admitted }
+      : ports.tools.screen
+        ? ports.tools.screen(extracted)
+        : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
 
     if ('rejected' in screened) {
       // Refused whole. Tell the model why and let it try again; the iteration
@@ -1024,6 +1081,7 @@ export async function runAgentLoop(
             iteration,
             isContinuation: true,
             signal: input.signal,
+            toolExecution: 'allowed',
           }
         );
       } finally {
@@ -1123,6 +1181,7 @@ export async function runAgentLoop(
               iteration,
               isContinuation: true,
               signal: input.signal,
+              toolExecution: 'allowed',
             }
           );
         } finally {
@@ -1164,12 +1223,14 @@ export async function runAgentLoop(
     // A provider can resolve after cancellation (including a successful final
     // frame racing abort). Do not hand its calls to a new host's executor.
     // The executor must still fence each approval/commit/dispatch await.
-    if (input.signal?.aborted) {
+    if (input.signal?.aborted && !outcome.toolStream) {
       stopReason = 'aborted';
       break;
     }
 
-    const executed = await ports.tools.execute(calls, { iteration, signal: input.signal });
+    const executed = outcome.toolStream
+      ? streamResults(outcome.toolStream)
+      : await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...executed);
     for (const r of executed) ports.observe?.recordToolCall(r);
     // What the model is shown for this iteration: the blocks that could not be
@@ -1270,6 +1331,7 @@ export async function runAgentLoop(
           isContinuation: true,
           signal: input.signal,
           completedToolRound: true,
+          toolExecution: 'allowed',
         }
       );
     } finally {
@@ -1351,6 +1413,7 @@ export async function runAgentLoop(
         iteration,
         isContinuation: true,
         signal: input.signal,
+        toolExecution: 'forbidden',
       });
     } finally {
       stopRelayWaiting();
