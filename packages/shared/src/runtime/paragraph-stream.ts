@@ -150,7 +150,7 @@ export class StreamedTurnRenderer {
   /** The current assistant message, uncut, across its continued blocks. */
   private messageText = '';
   private muted = false;
-  private lastMessageText = '';
+  private lastMessageText: string | undefined = '';
 
   constructor(
     private readonly transform: (text: string) => string = (t) => t,
@@ -231,13 +231,30 @@ export class StreamedTurnRenderer {
   }
 
   /**
+   * A source-aware caller already fed only fresh positioned text via pushDelta.
+   * Confirm that message without replaying its snapshots or borrowing another
+   * interleaved block's delta buffer for final-response deduplication.
+   */
+  confirmMessage(fullText: string): void {
+    this.messageText = fullText;
+    this.lastMessageText = this.cutAtFrame(fullText);
+    this.blockText = '';
+    this.sawDeltaThisBlock = false;
+  }
+
+  /** Interleaved partial messages did not render as one contiguous message. */
+  clearMessageConfirmation(): void {
+    this.lastMessageText = undefined;
+  }
+
+  /**
    * True when the final response body is already on screen — the turn should
    * close with a compact meta line instead of reprinting it. `finalDisplayText`
    * is the display form (already transformed by the caller); the recorded raw
    * message text goes through the same transform for a like-for-like match.
    */
   shouldSkipFinal(finalDisplayText: string): boolean {
-    if (!this.streamedVisible) return false;
+    if (!this.streamedVisible || this.lastMessageText === undefined) return false;
     return finalDisplayText.trim() === this.transform(this.lastMessageText).trim();
   }
 
