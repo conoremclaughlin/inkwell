@@ -14,7 +14,7 @@
  * the main checkout and in the studio is then merged into one hook. Without
  * the link (a container, CI), the writer falls back to its previous choice.
  */
-import { lstatSync } from 'fs';
+import { accessSync, constants, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -26,12 +26,17 @@ export function quoteShellWord(value: string): string {
 
 /**
  * The launcher every managed hook should start with, already quoted for a
- * shell line, or null when `~/.local/bin/ink` doesn't exist here.
+ * shell line. It is null unless `~/.local/bin/ink` resolves to an executable
+ * regular file. A dangling link, a directory or a file without execute
+ * permission would make every hook fail to start, with no output: an approval
+ * hook that can't run decides nothing (Lumen, #861). Then the writer keeps the
+ * launcher that ran it.
  */
 export function canonicalInkLauncher(home: string = homedir()): string | null {
   const link = join(home, '.local', 'bin', 'ink');
   try {
-    lstatSync(link);
+    if (!statSync(link).isFile()) return null;
+    accessSync(link, constants.X_OK);
     return quoteShellWord(link);
   } catch {
     return null;

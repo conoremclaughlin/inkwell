@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, STUDIO_CHECK_IDS } from './checklist';
@@ -614,6 +614,29 @@ describe('auditStudio: one launcher spelling for every managed hook', () => {
       expect(audit.missing).toEqual(['claude-hooks', 'codex-hooks', 'gemini-hooks']);
       const claude = audit.checks.find((check) => check.id === 'claude-hooks');
       expect(claude?.detail).toContain('not spelled with /home/me/.local/bin/ink');
+    }));
+
+  it('a canonical copy beside a stale one still needs repair: the stale copy runs too (Lumen, #861)', () =>
+    withStudio(async (root) => {
+      const settingsPath = path.join(root, '.claude', 'settings.local.json');
+      const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+      const LINK = '/home/me/.local/bin/ink';
+      const stale = settings.hooks.PreToolUse[0].hooks[0].command as string;
+      settings.hooks.PreToolUse[0].hooks[0].command = stale.replace(INK, LINK);
+      settings.hooks.PreToolUse[0].hooks.push({ type: 'command', command: stale });
+      for (const [event, entries] of Object.entries(settings.hooks) as Array<
+        [string, Array<{ hooks: Array<{ command: string }> }>]
+      >) {
+        if (event === 'PreToolUse') continue;
+        for (const entry of entries)
+          for (const hook of entry.hooks) hook.command = hook.command.replace(INK, LINK);
+      }
+      await writeFile(settingsPath, JSON.stringify(settings));
+      const claude = auditStudio(root, { linked: true, inkLauncher: LINK }).checks.find(
+        (check) => check.id === 'claude-hooks'
+      );
+      expect(claude?.ok).toBe(false);
+      expect(claude?.detail).toContain('on-tool-approval');
     }));
 
   it('the hooks spelled with the launcher pass', () =>

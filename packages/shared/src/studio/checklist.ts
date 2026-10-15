@@ -131,24 +131,24 @@ function hookCommands(hooks: unknown): string[] {
 }
 
 /**
- * Which of the wanted ink hooks have no command line naming them. When a
- * canonical launcher exists, a hook counts only if it starts with it: one
- * spelled another way runs twice beside the main checkout's copy, so it needs
- * the same repair as a missing one (see ink-launcher.ts).
+ * Which of the wanted ink hooks need repair. With no canonical launcher, a
+ * hook is fine when some command names it. With one, every command naming the
+ * hook must start with it, and at least one must: a copy spelled another way,
+ * alone or beside a canonical one, runs twice beside the main checkout's copy
+ * (see ink-launcher.ts). The repair rewrites the whole hooks block, stale
+ * copies included.
  */
 function missingHooks(
   commands: string[],
   wanted: readonly string[],
   launcher: string | null
 ): string[] {
-  return wanted.filter(
-    (name) =>
-      !commands.some((c) =>
-        launcher === null
-          ? c.includes(` hooks ${name}`)
-          : c.trimStart().startsWith(`${launcher} hooks ${name}`)
-      )
-  );
+  return wanted.filter((name) => {
+    const naming = commands.filter((c) => c.includes(` hooks ${name}`));
+    if (naming.length === 0) return true;
+    if (launcher === null) return false;
+    return !naming.every((c) => c.trimStart().startsWith(`${launcher} hooks ${name}`));
+  });
 }
 
 /** The detail for a hooks check: missing ones, or ones spelled another way. */
