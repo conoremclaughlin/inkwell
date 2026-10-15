@@ -1045,6 +1045,98 @@ describe('review regressions: conversation receipts and keyed history', () => {
     }
   );
 
+  it.each(['navigation', 'grant', 'detach'] as const)(
+    'keeps an actionable uncertainty reference after %s without retaining the old page or draft',
+    async (change) => {
+      const inspectDelivery = vi.fn<NonNullable<ChatPanelCallbacks['inspectDelivery']>>();
+      const p = setup(view(), { inspectDelivery });
+      p.input('Question private to the original page');
+      p.submit();
+      const operationId = p.send.mock.calls[0]![0].operationId;
+      p.result.resolve({ status: 'unknown' });
+      await Promise.resolve();
+      const next = view();
+      if (change === 'navigation') next.page!.binding.navigationId = 'synthetic-navigation-2';
+      if (change === 'grant') next.page!.binding.grantId = 'synthetic-grant-2';
+      if (change === 'detach') next.page = null;
+      else next.page!.title = 'A different attachment';
+      p.panel.setState(next);
+      expect(p.rows()).toHaveLength(0);
+      expect(p.host.textContent).not.toContain('Question private to the original page');
+      expect(p.composer.value).toBe('');
+      expect(p.host.textContent).toContain(`Unconfirmed request: ${operationId}`);
+      const inspect = [...p.host.querySelectorAll('button')].find(
+        (button) => button.textContent === 'Check delivery in thread'
+      )!;
+      expect(inspect.hidden).toBe(false);
+      inspect.click();
+      expect(inspectDelivery).toHaveBeenCalledExactlyOnceWith({
+        conversation: next.conversation,
+        operationId,
+      });
+      expect(Object.isFrozen(inspectDelivery.mock.calls[0]![0].conversation)).toBe(true);
+      p.input('New draft');
+      expect(p.sendButton.disabled).toBe(true);
+      expect(p.send).toHaveBeenCalledTimes(1);
+      p.panel.setState({ ...next, messages: [message(operationId, 'stored')] });
+      expect(p.host.textContent).not.toContain('Unconfirmed request:');
+      expect(inspect.closest('div')?.hidden).toBe(true);
+      expect(p.sendButton.disabled).toBe(false);
+    }
+  );
+
+  it.each(['scopeId', 'threadKey', 'sbSlug'] as const)(
+    'hides a recovery reference from another %s and restores it only in the original conversation',
+    async (field) => {
+      const inspectDelivery = vi.fn();
+      const p = setup(view(), { inspectDelivery });
+      p.input('Original draft');
+      p.submit();
+      const operationId = p.send.mock.calls[0]![0].operationId;
+      p.result.resolve({ status: 'unknown' });
+      await Promise.resolve();
+      const other = view();
+      other.conversation![field] = 'synthetic-other';
+      p.panel.setState(other);
+      expect(p.host.textContent).not.toContain(operationId);
+      const inspect = [...p.host.querySelectorAll('button')].find(
+        (button) => button.textContent === 'Check delivery in thread'
+      )!;
+      expect(inspect.disabled).toBe(true);
+      inspect.click();
+      expect(inspectDelivery).not.toHaveBeenCalled();
+      p.panel.setState(view({ page: null }));
+      expect(p.host.textContent).toContain(`Unconfirmed request: ${operationId}`);
+      inspect.click();
+      expect(inspectDelivery.mock.calls[0]![0]).toEqual({
+        conversation: view().conversation,
+        operationId,
+      });
+    }
+  );
+
+  it('keeps the guard and reference if opening the receipt check fails', async () => {
+    const p = setup(view(), {
+      inspectDelivery: () => {
+        throw new Error('Synthetic unavailable');
+      },
+    });
+    p.input('Original draft');
+    p.submit();
+    const operationId = p.send.mock.calls[0]![0].operationId;
+    p.result.resolve({ status: 'unknown' });
+    await Promise.resolve();
+    p.panel.setState(view({ page: null }));
+    [...p.host.querySelectorAll('button')]
+      .find((button) => button.textContent === 'Check delivery in thread')!
+      .click();
+    expect(p.host.textContent).toContain('Could not open the delivery check. No retry was sent.');
+    expect(p.host.textContent).toContain(`Unconfirmed request: ${operationId}`);
+    p.input('Another draft');
+    expect(p.sendButton.disabled).toBe(true);
+    expect(p.send).toHaveBeenCalledTimes(1);
+  });
+
   it('navigation churn cannot create many ambiguous sends to one conversation', async () => {
     const p = setup();
     p.send.mockResolvedValue({ status: 'unknown' });

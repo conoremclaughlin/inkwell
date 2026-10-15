@@ -72,6 +72,13 @@ export interface ChatPanelCallbacks {
     operationId?: string;
     readSessionId?: string;
   }): void;
+  /** Open a scoped receipt check, never resend. No old page content or draft is supplied.
+   * The adapter owns the authenticated lookup and reports evidence via setState.
+   */
+  inspectDelivery?(request: {
+    conversation: Readonly<ChatConversation>;
+    operationId: string;
+  }): void;
   subscribe?(receive: (state: ChatPanelViewState) => void): () => void;
 }
 
@@ -262,7 +269,13 @@ export function createChatPanel(
   notice.setAttribute('role', 'status');
   const guard = element('p');
   guard.setAttribute('role', 'status');
-  form.append(label, count, send, stop, notice, guard);
+  const recovery = element('div');
+  const reference = element('p');
+  reference.style.overflowWrap = 'anywhere';
+  const inspect = element('button', 'Check delivery in thread');
+  inspect.type = 'button';
+  recovery.append(reference, inspect);
+  form.append(label, count, send, stop, notice, guard, recovery);
   root.append(heading, thread, page, sharing, connection, log, form);
   host.append(root);
 
@@ -314,6 +327,11 @@ export function createChatPanel(
           ? 'Too many unresolved deliveries. Reconcile earlier sends before sending again.'
           : ''
     );
+    const operationId = unresolved.get(conversationKey(state));
+    recovery.hidden = !operationId;
+    setText(reference, operationId ? `Unconfirmed request: ${operationId}` : '');
+    inspect.hidden = !callbacks.inspectDelivery;
+    inspect.disabled = !operationId || !state.conversation;
     const busy = String(!!pending);
     if (log.getAttribute('aria-busy') !== busy) log.setAttribute('aria-busy', busy);
   }
@@ -413,6 +431,22 @@ export function createChatPanel(
     revision++;
     // Typing must not replace transcript nodes, disturb selection or reannounce the log.
     renderControls();
+  }
+
+  function inspectUncertainDelivery() {
+    const operationId = unresolved.get(conversationKey(state));
+    if (destroyed || !state.conversation || !operationId || !callbacks.inspectDelivery) return;
+    // Resolve from the CURRENT conversation at click time. Page navigation can
+    // discard a local row, but must not discard its receipt reference or leak
+    // its old body/page into a new target. Inspection never clears the guard.
+    try {
+      callbacks.inspectDelivery({
+        conversation: Object.freeze({ ...state.conversation }),
+        operationId,
+      });
+    } catch {
+      setText(notice, 'Could not open the delivery check. No retry was sent.');
+    }
   }
 
   function submit(event: Event) {
@@ -542,7 +576,18 @@ export function createChatPanel(
     form.removeEventListener('submit', submit);
     composer.removeEventListener('input', input);
     stop.removeEventListener('click', stopLocal);
-    for (const node of [heading, thread, page, sharing, connection, messages, notice, guard])
+    inspect.removeEventListener('click', inspectUncertainDelivery);
+    for (const node of [
+      heading,
+      thread,
+      page,
+      sharing,
+      connection,
+      messages,
+      notice,
+      guard,
+      reference,
+    ])
       node.replaceChildren();
     root.replaceChildren();
     root.remove();
@@ -557,6 +602,7 @@ export function createChatPanel(
   form.addEventListener('submit', submit);
   composer.addEventListener('input', input);
   stop.addEventListener('click', stopLocal);
+  inspect.addEventListener('click', inspectUncertainDelivery);
   render();
   try {
     unsubscribe = callbacks.subscribe?.(setState);

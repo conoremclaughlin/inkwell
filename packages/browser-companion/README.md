@@ -200,6 +200,10 @@ callbacks; these are UI contracts, not server API schemas or authorization.
   Once reconciled, a later `unknown` row does not automatically re-lock this view;
   the adapter must distinguish admission evidence from execution uncertainty and
   own durable retry gating independently of the rendered history window.
+- Uncertain sends retain an operation reference after the old page and draft
+  are discarded. An optional `inspectDelivery` adapter callback opens a check
+  for that exact conversation and operation, never a retry. It receives no
+  page binding or message body, and inspection does not reconcile the guard.
 - Echoed local messages stay retired when the supplied history window slides;
   they do not reappear below newer replies. Echo tracking shares the bounded
   local-message buffer rather than accumulating an unbounded ID set.
