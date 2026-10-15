@@ -80,13 +80,16 @@ export async function sendInklingResponse(
 
   // Reuse the real send boundary: owner-test gate, fixed participants,
   // role checks, read pointers and quiet replies all remain authoritative.
+  // The send is bound to the thread checked above by id, so a thread
+  // replaced under the same key since then gets nothing (Phase 2 gate 3).
   const sent = await handleSendToInbox(
     {
       threadKey: thread.thread_key,
       recipientSlug: caller.sb.sbSlug,
       content: input.content,
     },
-    dataComposer
+    dataComposer,
+    { expectedThreadId: thread.id }
   );
   const body = JSON.parse(sent.content[0].text) as { success?: boolean; messageId?: string };
   if (body.success !== true || !body.messageId) throw new Error('The inkling reply was not stored');
