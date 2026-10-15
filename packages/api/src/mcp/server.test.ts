@@ -839,6 +839,50 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(typeof body.access_token).toBe('string');
       expect(signerClock.calls).toBe(1);
     });
+
+    // Phase 2 gate 2: the route refuses on its own, so a seam that admitted
+    // the token by mistake still cannot turn delegation into a widening. The
+    // double hands back a ready verdict, as a seam that admitted it would.
+    it.each(['mcp:space-turn', 'mcp:tools mcp:space-turn'])(
+      'refuses a %s presenter even when the seam admitted it, signing nothing',
+      async (scope) => {
+        mockVerifyAccessToken.mockResolvedValue({ ok: true, token: { ...SPACE_TURN, scope } });
+        delegatedIdentity = SB_ALPHA;
+        signerClock.calls = 0;
+
+        const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+        expect(status).toBe(403);
+        expect(body.code).toBe('space_turn_token_refused');
+        expect(body.access_token).toBeUndefined();
+        expect(signerClock.calls).toBe(0);
+      }
+    );
+
+    it('mints the presenter’s own scope, not a literal', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, scope: 'mcp:tools offline_access' });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.scope).toBe('mcp:tools offline_access');
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access');
+      expect(payload?.scope).toBe('mcp:tools offline_access');
+    });
+
+    it('mints mcp:tools for a presenter that names no scope (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.scope).toBe('mcp:tools');
+      expect(verifyInkAccessToken(body.access_token as string, 'mcp_access')?.scope).toBe(
+        'mcp:tools'
+      );
+    });
   });
 
   // =========================================================================

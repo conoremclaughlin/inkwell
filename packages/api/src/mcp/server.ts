@@ -46,6 +46,7 @@ import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { getHeartbeatTickHealth } from '../services/heartbeat';
 import { InkAuthProvider, type VerifiedAccessToken } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
+import { RUNNER_TOOLS_SCOPE, isSpaceTurnScope } from '../auth/token-scope';
 import {
   ACCOUNT_BEING_DELETED,
   leaseAccountForRequest,
@@ -947,6 +948,21 @@ export class MCPServer {
         return;
       }
       const userData = verdict.token;
+      // The seam already refuses a space-turn presenter here. Refused again,
+      // before anything is minted, so that no later change to the seam can
+      // turn delegation into a way to widen one
+      // (ink://specs/inkling-multi-person-groups, Phase 2 gate 2).
+      if (isSpaceTurnScope(userData.scope)) {
+        logger.warn('Refused delegation of a space-turn token', {
+          code: 'space_turn_token_refused',
+        });
+        res.status(403).json({
+          error: 'forbidden',
+          error_description: 'A shared-conversation token cannot be delegated',
+          code: 'space_turn_token_refused',
+        });
+        return;
+      }
       if (!leaseAccountForRequest(res, userData.userId)) return;
 
       const requestedSlug =
@@ -1035,12 +1051,15 @@ export class MCPServer {
         return;
       }
 
+      // The delegated token carries the presenter's own scope, never a wider
+      // one written here. Every token today is mcp:tools.
+      const scope = userData.scope ?? RUNNER_TOOLS_SCOPE;
       const accessToken = signInkAccessToken(
         {
           type: 'mcp_access',
           sub: userData.userId,
           email: userData.email,
-          scope: 'mcp:tools',
+          scope,
           sbSlug: identity.agent_id,
           identityId: identity.id,
           ...(userData.sessionId ? { sessionId: userData.sessionId } : {}),
@@ -1054,7 +1073,7 @@ export class MCPServer {
         access_token: accessToken,
         token_type: 'Bearer',
         expires_in: notAfter - nowSeconds,
-        scope: 'mcp:tools',
+        scope,
         delegated_agent_id: identity.agent_id,
         sb_id: identity.id,
       });

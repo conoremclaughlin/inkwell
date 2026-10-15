@@ -413,6 +413,21 @@ describe('ink-tokens', () => {
         })
       );
     });
+
+    // Phase 2 gate 4 (ink://specs/inkling-multi-person-groups): a space-turn
+    // token lives for one turn, so nothing may outlive it as a refresh record.
+    it.each([
+      [['mcp:space-turn']],
+      [['mcp:tools', 'mcp:space-turn']],
+      [['mcp:tools mcp:space-turn']],
+    ])('refuses to create a refresh token for %j, storing nothing', async (scopes) => {
+      mockInsert.mockReturnValue({ error: null });
+
+      await expect(
+        createRefreshToken(getMockSupabase(), 'user-123', 'test-client', scopes, 90)
+      ).rejects.toThrow('A space-turn scope cannot have a refresh token');
+      expect(mockInsert).not.toHaveBeenCalled();
+    });
   });
 
   // =========================================================================
@@ -580,6 +595,40 @@ describe('ink-tokens', () => {
       // Should have deleted the expired token
       expect(mockFrom).toHaveBeenCalledWith('mcp_tokens');
     });
+
+    // Phase 2 gate 4: such a record would mint the scope with no
+    // conversation bound to it. Refused and removed, minting nothing.
+    it.each([[['mcp:space-turn']], [['mcp:tools', 'mcp:space-turn']]])(
+      'refuses and deletes a stored record with scopes %j, minting nothing',
+      async (scopes) => {
+        const futureDate = new Date(Date.now() + 86400000).toISOString();
+        currentMcpTokensChain = mockChain({
+          id: 'token-space',
+          user_id: 'user-123',
+          client_id: 'test-client',
+          refresh_token: 'ink-rt-space',
+          scopes,
+          expires_at: futureDate,
+          users: { email: 'test@example.com' },
+        });
+        const deleteEq = vi.fn(() => ({ error: null }));
+        mockDelete.mockReturnValue({ eq: deleteEq });
+        mockUpdate.mockReturnValue({ eq: vi.fn(() => ({ error: null })) });
+
+        const result = await exchangeRefreshToken(
+          getMockSupabase(),
+          'ink-rt-space',
+          'test-client',
+          'mcp_access',
+          3600
+        );
+
+        expect(result).toBeNull();
+        expect(deleteEq).toHaveBeenCalledWith('id', 'token-space');
+        // Nothing was refreshed: last_used_at is written only after a mint.
+        expect(mockUpdate).not.toHaveBeenCalled();
+      }
+    );
 
     it('should update last_used_at on successful exchange', async () => {
       const futureDate = new Date(Date.now() + 86400000).toISOString();

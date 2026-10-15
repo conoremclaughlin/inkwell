@@ -13,7 +13,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { Database } from '../data/supabase/types';
 import { tokenIdentityState } from './token-identity';
-import { SPACE_TURN_SCOPE } from './token-scope';
+import { SPACE_TURN_SCOPE, isSpaceTurnScope } from './token-scope';
 
 // ============================================================================
 // Types
@@ -237,6 +237,12 @@ export async function createRefreshToken(
   sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
+  // A space-turn token lives for one turn and is bound to it; a refresh
+  // record would outlive the turn and mint the scope without its bindings
+  // (ink://specs/inkling-multi-person-groups, Phase 2 gate 4).
+  if (scopes.some((scope) => isSpaceTurnScope(scope))) {
+    throw new Error('A space-turn scope cannot have a refresh token');
+  }
   const refreshToken = `ink-rt-${crypto.randomBytes(32).toString('hex')}`;
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
 
@@ -299,6 +305,18 @@ export async function exchangeRefreshToken(
 
   if (new Date(tokenRecord.expires_at) < new Date()) {
     logger.warn('Refresh token expired', { userId: tokenRecord.user_id });
+    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
+    return null;
+  }
+
+  // No record may mint a space-turn token: the scope would come out with no
+  // conversation bound to it. Nothing creates such a record, so one that
+  // exists is removed rather than kept (ink://specs/inkling-multi-person-groups,
+  // Phase 2 gate 4).
+  if (isSpaceTurnScope((tokenRecord.scopes ?? []).join(' '))) {
+    logger.warn('Refused a refresh record with a space-turn scope', {
+      code: 'space_turn_refresh_refused',
+    });
     await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
     return null;
   }
