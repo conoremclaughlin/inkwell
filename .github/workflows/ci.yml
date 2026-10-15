@@ -85,6 +85,11 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # Backend config folders stay untracked at any depth; only the root's
+      # .claude/skills (the repo skills, for Claude Code) is tracked.
+      - name: Agent config ignore rules
+        run: sh scripts/gitignore-agent-dirs.test.sh
+
       # The migration wrapper (run a file, record it under the file's own
       # version; apply the pending set; refuse a window migration), the
       # startup status parser, and the startup preflight that applies before
