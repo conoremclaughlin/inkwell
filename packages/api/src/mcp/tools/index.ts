@@ -4,7 +4,9 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { runInToolCall } from '../../utils/tool-call-context';
+import { getRequestContext } from '../../utils/request-context';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import { spaceTurnRefusal, spaceTurnRefusalResult } from './space-turn-policy';
 import {
   describeToolSchema,
   handleDescribeTool,
@@ -383,6 +385,7 @@ import { handleDebugRequestContext } from './debug-handlers';
 export { setResponseCallback } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
 export { setMiniAppsRegistry } from './skill-handlers';
+export { SPACE_TURN_TOOLS } from './space-turn-policy';
 
 // Shared schema for flexible user identification
 // Usually unnecessary — userId and email are auto-resolved from OAuth token.
@@ -469,6 +472,17 @@ export function registerAllTools(
       const handler = (...handlerArgs: any[]) =>
         runInToolCall(name, () => registered(...handlerArgs));
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
+        // A space-turn token reaches only its allowlist, for its own thread.
+        // Decided here, before the handler, so no tool body runs for a call
+        // the token may not make (space-turn-policy.ts).
+        const refusal = spaceTurnRefusal(name, handlerArgs[0], getRequestContext());
+        if (refusal) {
+          logger.warn('Refused a tool call outside the space-turn allowlist', {
+            tool: name,
+            code: refusal.code,
+          });
+          return spaceTurnRefusalResult(refusal);
+        }
         const start = performance.now();
         try {
           const result = await handler(...handlerArgs);

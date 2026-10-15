@@ -23,6 +23,7 @@ import {
 import { resolveAccountForPrincipal } from '../../services/account-deletion/principal';
 import { accountGate } from '../../services/account-deletion/gate';
 import { tokenIdentityState } from '../../auth/token-identity';
+import { RUNNER_TOOLS_SCOPE, isSpaceTurnScope } from '../../auth/token-scope';
 
 /** A signed, unexpired `mcp_access` token's claims. */
 export interface VerifiedAccessToken {
@@ -33,6 +34,15 @@ export interface VerifiedAccessToken {
   /** Signed runner binding — authenticated, unlike the x-ink-context header. */
   sessionId?: string;
   contactId?: string;
+  /**
+   * The signed scope. A token minted before scopes were read carries none and
+   * reads as `mcp:tools`, which is what it was always allowed.
+   */
+  scope?: string;
+  /** A space-turn token's conversation, signed. Present only on that scope. */
+  workspaceId?: string;
+  threadId?: string;
+  threadKey?: string;
   /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
   expiresAt?: number;
 }
@@ -491,6 +501,18 @@ export class InkAuthProvider {
     const payload = verifyInkAccessToken(token, 'mcp_access');
     if (!payload) return null;
     const exp = (payload as { exp?: unknown }).exp;
+    const scope =
+      typeof payload.scope === 'string' && payload.scope.trim()
+        ? payload.scope
+        : RUNNER_TOOLS_SCOPE;
+
+    // A space-turn token is bound to one session's turn in one conversation.
+    // Missing any part of that binding, it is not a narrower token but an
+    // unbound one, and is refused like a bad signature.
+    if (isSpaceTurnScope(scope)) {
+      const bound = [payload.sessionId, payload.workspaceId, payload.threadId, payload.threadKey];
+      if (!bound.every((claim) => typeof claim === 'string' && claim.trim() !== '')) return null;
+    }
 
     return {
       userId: payload.sub,
@@ -503,6 +525,14 @@ export class InkAuthProvider {
           : {}),
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
       ...(payload.contactId ? { contactId: payload.contactId } : {}),
+      scope,
+      ...(isSpaceTurnScope(scope)
+        ? {
+            workspaceId: payload.workspaceId,
+            threadId: payload.threadId,
+            threadKey: payload.threadKey,
+          }
+        : {}),
       ...(typeof exp === 'number' ? { expiresAt: exp } : {}),
     };
   }

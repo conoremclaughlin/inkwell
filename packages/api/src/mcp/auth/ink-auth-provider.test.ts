@@ -714,6 +714,7 @@ describe('InkAuthProvider', () => {
       expect(result).toEqual({
         userId: 'user-123',
         email: 'test@example.com',
+        scope: 'mcp:tools',
         expiresAt: (jwt.decode(token) as { exp: number }).exp,
       });
     });
@@ -846,6 +847,7 @@ describe('InkAuthProvider', () => {
       expect(verified).toEqual({
         userId: 'user-123',
         email: 'test@example.com',
+        scope: 'mcp:tools',
         expiresAt: refreshedDecoded.exp,
       });
 

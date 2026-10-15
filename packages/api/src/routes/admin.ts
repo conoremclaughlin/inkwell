@@ -79,6 +79,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/ink-tokens';
 import { tokenIdentityState } from '../auth/token-identity';
+import { isSpaceTurnScope } from '../auth/token-scope';
 import type { Database } from '../data/supabase/types';
 import {
   BrowserCompanionGrantService,
@@ -1164,6 +1165,17 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyInkAccessToken(token, 'mcp_access');
+      // A space-turn token serves one shared conversation through MCP and
+      // reaches nothing here (ink://specs/inkling-multi-person-groups).
+      // Refused outright, before any other tier could admit the request.
+      if (mcpPayload && isSpaceTurnScope(mcpPayload.scope)) {
+        logger.warn('Refused a space-turn token on an admin route', { path: req.path });
+        res.status(403).json({
+          error: 'A shared-conversation token cannot use this route',
+          code: 'space_turn_token_refused',
+        });
+        return;
+      }
       // The SB it names must still exist, as on every mcp_access seam
       // (token-identity.ts). A token whose SB is gone authenticates nothing
       // here and falls through to the refusal below.

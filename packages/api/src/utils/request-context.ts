@@ -51,6 +51,17 @@ export interface RequestContextData {
   tokenSessionId?: string;
   tokenContactId?: string;
   /**
+   * The bearer token's signed scope, and for a space-turn token the
+   * conversation it was minted for. Set only from a verified token, never
+   * from a header or an argument; the tool allowlist reads these
+   * (mcp/tools/space-turn-policy.ts). Absent when the request carried no
+   * token.
+   */
+  tokenScope?: string;
+  tokenWorkspaceId?: string;
+  tokenThreadId?: string;
+  tokenThreadKey?: string;
+  /**
    * True when the bearer token itself was agent-bound. Distinct from
    * `callerProfile`, which defaults to 'agent' for every HTTP request and
    * therefore says nothing about how the caller authenticated.
@@ -97,8 +108,9 @@ let pinnedSessionSlug: string | null = null;
  * token alone.
  *
  * Extracted so the handoff is testable end to end. Everything downstream of
- * this — contact isolation in particular — depends on these four fields
- * surviving the trip from the runner's JWT into AsyncLocalStorage. A dropped
+ * this — contact isolation and the space-turn allowlist in particular —
+ * depends on these fields surviving the trip from the runner's JWT into
+ * AsyncLocalStorage. A dropped
  * claim does not fail loudly: a contact runner simply looks owner-scoped and
  * is refused its own session.
  */
@@ -109,12 +121,25 @@ export function tokenIdentityContext(
         sbId?: string;
         sessionId?: string;
         contactId?: string;
+        scope?: string;
+        workspaceId?: string;
+        threadId?: string;
+        threadKey?: string;
       }
     | null
     | undefined
 ): Partial<RequestContextData> {
-  if (!tokenIdentity?.sbSlug && !tokenIdentity?.sbId) return {};
+  // The scope travels whether or not the token names an SB: a narrow token
+  // with no SB binding must not read as an unscoped one.
+  const scoped: Partial<RequestContextData> = {
+    ...(tokenIdentity?.scope ? { tokenScope: tokenIdentity.scope } : {}),
+    ...(tokenIdentity?.workspaceId ? { tokenWorkspaceId: tokenIdentity.workspaceId } : {}),
+    ...(tokenIdentity?.threadId ? { tokenThreadId: tokenIdentity.threadId } : {}),
+    ...(tokenIdentity?.threadKey ? { tokenThreadKey: tokenIdentity.threadKey } : {}),
+  };
+  if (!tokenIdentity?.sbSlug && !tokenIdentity?.sbId) return scoped;
   return {
+    ...scoped,
     agentTokenBound: true,
     ...(tokenIdentity.sbSlug ? { tokenSlug: tokenIdentity.sbSlug } : {}),
     ...(tokenIdentity.sbId ? { tokenSbId: tokenIdentity.sbId } : {}),

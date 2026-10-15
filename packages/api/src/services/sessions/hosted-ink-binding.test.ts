@@ -134,6 +134,7 @@ describe('server binding, admitted identity and explicit resources', () => {
     'permissions',
     'browser-token',
     'admin-token',
+    'space-turn-token',
   ] as const)('refuses %s before effects or provider execution', async (kind) => {
     const h = await setup();
     if (kind === 'missing') h.config.inkAccessToken = undefined;
@@ -177,6 +178,26 @@ describe('server binding, admitted identity and explicit resources', () => {
           sbSlug: 'echo',
           scope: 'mcp:tools',
           grantId: 'fixture-grant',
+        },
+        env.JWT_SECRET,
+        { expiresIn: 120 }
+      );
+    // A shared conversation's turn token for this very session. The hosted
+    // binding re-mints the runner's credential for its MCP client, and must
+    // not turn a space-turn token into a broad one: it refuses it instead
+    // (ink://specs/inkling-multi-person-groups, Phase 1).
+    if (kind === 'space-turn-token')
+      h.config.inkAccessToken = jwt.sign(
+        {
+          type: 'mcp_access',
+          sub: 'fixture-user',
+          email: 'fixture@example.invalid',
+          scope: 'mcp:space-turn',
+          sbSlug: 'echo',
+          sessionId: h.sessionId,
+          workspaceId: 'fixture-workspace',
+          threadId: 'fixture-thread',
+          threadKey: 'inkling:thread:fixture-group',
         },
         env.JWT_SECRET,
         { expiresIn: 120 }

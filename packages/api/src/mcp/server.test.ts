@@ -150,6 +150,7 @@ vi.mock('@supabase/supabase-js', () => ({
 import { MCPServer } from './server';
 import { env } from '../config/env';
 import { registerAllTools } from './tools';
+import { runWithRequestContext } from '../utils/request-context';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -792,6 +793,92 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(payload).toMatchObject({ sbSlug: SB_BETA.agent_id, identityId: SB_BETA.id });
       expect(payload?.sessionId).toBeUndefined();
       expect(payload?.contactId).toBeUndefined();
+    });
+  });
+
+  // =========================================================================
+  // The token scope reaches the request context from the signed token alone
+  // (ink://specs/inkling-multi-person-groups, Phase 1)
+  // =========================================================================
+  describe('the request context takes its token scope from the verified token only', () => {
+    const KEY = 'inkling:thread:fixture-group';
+
+    function lastContext(): Record<string, unknown> {
+      const calls = vi.mocked(runWithRequestContext).mock.calls;
+      return calls[calls.length - 1]?.[0] as Record<string, unknown>;
+    }
+
+    beforeEach(() => {
+      expect(serverUnavailableError).toBeNull();
+      vi.mocked(runWithRequestContext).mockClear();
+    });
+
+    it("carries a space-turn token's scope and thread into the request context", async () => {
+      mockVerifyAccessToken.mockResolvedValue({
+        userId: 'user-123',
+        email: 'user@example.com',
+        sbSlug: 'synthetic-inkling',
+        sbId: 'identity-inkling',
+        sessionId: 'session-synthetic',
+        scope: 'mcp:space-turn',
+        workspaceId: 'workspace-synthetic',
+        threadId: 'thread-synthetic',
+        threadKey: KEY,
+      });
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(200);
+      expect(lastContext()).toMatchObject({
+        tokenScope: 'mcp:space-turn',
+        tokenWorkspaceId: 'workspace-synthetic',
+        tokenThreadId: 'thread-synthetic',
+        tokenThreadKey: KEY,
+      });
+    });
+
+    it('gives an unsigned header claiming a scope or thread no effect', async () => {
+      mockVerifyAccessToken.mockResolvedValue({
+        userId: 'user-123',
+        email: 'user@example.com',
+        sbSlug: 'synthetic-alpha',
+        sbId: 'identity-alpha',
+        scope: 'mcp:tools',
+      });
+      const forged = Buffer.from(
+        JSON.stringify({
+          sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+          studioId: 'main',
+          sbSlug: 'synthetic-alpha',
+          cliAttached: false,
+          runtime: 'claude',
+          scope: 'mcp:space-turn',
+          tokenScope: 'mcp:space-turn',
+          threadKey: KEY,
+          tokenThreadKey: KEY,
+        })
+      ).toString('base64url');
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': forged,
+        'x-ink-token-scope': 'mcp:space-turn',
+      });
+
+      expect(res.status).toBe(200);
+      const ctx = lastContext();
+      expect(ctx.tokenScope).toBe('mcp:tools');
+      expect(ctx.tokenThreadKey).toBeUndefined();
+      expect(ctx.tokenThreadId).toBeUndefined();
+    });
+
+    it('leaves the scope unset when the request carried no token', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST);
+
+      expect(res.status).toBe(200);
+      expect(lastContext().tokenScope).toBeUndefined();
     });
   });
 
