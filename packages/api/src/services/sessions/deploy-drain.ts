@@ -2,10 +2,12 @@ import type {
   DeployDrainMode,
   DeployDrainSnapshot,
   DrainAdmission,
+  DrainAdmissionObservation,
   DrainAttempt,
   DrainBlocker,
   DrainCommitResult,
   DrainReceipt,
+  DrainReconcileResult,
 } from './deploy-drain.types.js';
 
 const blockerKinds = new Set<DrainBlocker['kind']>([
@@ -42,7 +44,10 @@ export class DeployDrainGate {
   private mode: DeployDrainMode = 'open';
   private attempt = 0;
   private revision = 0;
-  private readonly reservations = new Map<DrainAdmission, 'pending' | 'committing' | 'unknown'>();
+  private readonly reservations = new Map<
+    DrainAdmission,
+    'pending' | 'committing' | 'unknown' | 'reconciling'
+  >();
 
   constructor(
     private readonly incarnation: string,
@@ -113,6 +118,66 @@ export class DeployDrainGate {
     return true;
   }
 
+  /**
+   * Resolve uncertainty from trusted, synchronous registry/preparation evidence.
+   * The observer must establish quiescence, not infer it from a registry miss.
+   * Registered work must be positively covered by the canonical census under
+   * the SAME admission ID; absent work must not contradict that census.
+   * No executor is launched or retried, and caller-supplied evidence is not auth.
+   */
+  reconcileAdmission(
+    reservation: DrainAdmission,
+    observe: () => DrainAdmissionObservation
+  ): DrainReconcileResult {
+    if (this.mode === 'sealed' || this.mode === 'shutdown')
+      return { status: 'held', reason: 'gate-closed' };
+    if (this.reservations.get(reservation) !== 'unknown')
+      return { status: 'held', reason: 'not-unknown' };
+    this.reservations.set(reservation, 'reconciling');
+    const revision = ++this.revision;
+    const hold = (reason: Extract<DrainReconcileResult, { status: 'held' }>['reason']) => {
+      this.reservations.set(reservation, 'unknown');
+      this.revision++;
+      return { status: 'held' as const, reason };
+    };
+    try {
+      // Copy each field once before the revision fence (including any getters).
+      const { admissionId, preparationSettled, outcome } = observe();
+      if (this.revision !== revision) return hold('gate-changed');
+      if (
+        admissionId !== reservation.id ||
+        preparationSettled !== true ||
+        (outcome !== 'registered' && outcome !== 'absent')
+      )
+        return hold('unconfirmed');
+      // Read only canonical entries, not this gate's local reconciliation hold.
+      const census = this.readCanonicalBlockers();
+      if (this.revision !== revision) return hold('gate-changed');
+      if (!census) return hold('evidence-unavailable');
+      const matching = census.filter((entry) => entry.id === reservation.id);
+      const registered = matching.some((entry) =>
+        reservation.kind === 'compaction'
+          ? entry.kind === 'compaction'
+          : entry.kind === 'executing-turn' || entry.kind === 'unfinalized-turn'
+      );
+      const uncertain = (entry: DrainBlocker) =>
+        ['unknown', 'coverage-gap', 'launch-hold', 'reservation'].includes(entry.kind);
+      if (
+        (outcome === 'registered' && (!registered || matching.some(uncertain))) ||
+        // A partial census cannot establish absence, even with no matching ID.
+        (outcome === 'absent' &&
+          (matching.length !== 0 ||
+            census.some((entry) => entry.kind === 'coverage-gap' || entry.kind === 'unknown')))
+      )
+        return hold('unconfirmed');
+      this.reservations.delete(reservation);
+      this.revision++;
+      return { status: 'reconciled', outcome };
+    } catch {
+      return hold('evidence-unavailable');
+    }
+  }
+
   /** Repeated start on the same attempt is idempotent; shutdown is irreversible. */
   beginDrain(): DrainAttempt | undefined {
     if (this.mode === 'shutdown') return undefined;
@@ -158,6 +223,15 @@ export class DeployDrainGate {
     return this.receipt();
   }
 
+  /** Explicit operator abandonment, not cancellation by an old drain request. */
+  abandonSeal(expected: DrainReceipt): boolean {
+    if (this.mode !== 'sealed' || !this.matchesReceipt(expected)) return false;
+    this.mode = 'open';
+    this.attempt++;
+    this.revision++;
+    return true;
+  }
+
   isRestartReady(expected: DrainReceipt): boolean {
     return (
       this.mode === 'sealed' &&
@@ -189,23 +263,32 @@ export class DeployDrainGate {
 
   private collectBlockers(): DrainBlocker[] {
     const blockers: DrainBlocker[] = [...this.reservations].map(([entry, state]) => ({
-      kind: state === 'unknown' ? 'unknown' : 'reservation',
+      kind: state === 'unknown' || state === 'reconciling' ? 'unknown' : 'reservation',
       id: entry.id,
     }));
     const revision = this.revision;
-    try {
-      const external = this.readBlockers();
-      if (
-        !Array.isArray(external) ||
-        external.some((entry) => !entry || !blockerKinds.has(entry.kind) || !nonblank(entry.id))
-      )
-        throw new TypeError('Invalid drain census');
-      blockers.push(...external.map(({ kind, id }) => ({ kind, id })));
-    } catch {
-      // Do not echo error text; the census may have failed with private data.
-      blockers.push({ kind: 'unknown', id: 'census-unavailable' });
-    }
+    const external = this.readCanonicalBlockers();
+    if (external) blockers.push(...external);
+    else blockers.push({ kind: 'unknown', id: 'census-unavailable' });
     if (revision !== this.revision) blockers.push({ kind: 'unknown', id: 'census-mutated-gate' });
     return blockers;
+  }
+
+  private readCanonicalBlockers(): DrainBlocker[] | undefined {
+    try {
+      const external = this.readBlockers();
+      if (!Array.isArray(external)) return undefined;
+      const copied: DrainBlocker[] = [];
+      for (const entry of external) {
+        if (!entry) return undefined;
+        const { kind, id } = entry;
+        if (!blockerKinds.has(kind) || !nonblank(id)) return undefined;
+        copied.push({ kind, id });
+      }
+      return copied;
+    } catch {
+      // Do not echo error text; the census may have failed with private data.
+      return undefined;
+    }
   }
 }

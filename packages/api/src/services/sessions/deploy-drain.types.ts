@@ -16,6 +16,30 @@ export interface DrainAdmission {
   readonly kind: 'turn' | 'compaction' | 'child-turn';
 }
 
+/** Trusted wiring observation, never evidence supplied by an HTTP caller. */
+export interface DrainAdmissionObservation {
+  readonly admissionId: string;
+  readonly outcome: 'registered' | 'absent' | 'unknown';
+  /**
+   * Positive evidence that preparation and its registration callback cannot
+   * register later, and any preparation-owned resources have been transferred
+   * or cleaned up. A registry miss alone does not establish this.
+   */
+  readonly preparationSettled: boolean;
+}
+
+export type DrainReconcileResult =
+  | { status: 'reconciled'; outcome: 'registered' | 'absent' }
+  | {
+      status: 'held';
+      reason:
+        | 'not-unknown'
+        | 'gate-closed'
+        | 'evidence-unavailable'
+        | 'gate-changed'
+        | 'unconfirmed';
+    };
+
 export interface DrainBlocker {
   readonly kind:
     | 'reservation'
