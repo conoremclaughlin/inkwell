@@ -105,14 +105,18 @@ else
   echo "ok   isolation: the planted GIT_DIR decoy was never written"
 fi
 
-# Control for that check: a git call that does inherit the planted
-# variables writes the decoy, so an empty decoy above is evidence.
-(cd "$work" && HOME="$work/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+# Control for that check: a git call that is handed the planted variables
+# writes the decoy, so an empty decoy above is evidence. It gets those four
+# and nothing else from this shell (Lumen, #870).
+(cd "$work" && env -i HOME="$work/home" PATH=/usr/bin:/bin LANG=C \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_DIR="$GIT_DIR" GIT_WORK_TREE="$GIT_WORK_TREE" \
+  GIT_INDEX_FILE="$GIT_INDEX_FILE" GIT_CONFIG_PARAMETERS="$GIT_CONFIG_PARAMETERS" \
   "$git_bin" init -q 2>/dev/null) || true
 if [ -e "$decoy/.git/HEAD" ]; then
-  echo "ok   control: an inheriting git call writes the decoy"
+  echo "ok   control: a git call handed the planted variables writes the decoy"
 else
-  fail "control: an inheriting git call left the decoy empty, so the isolation check proves nothing"
+  fail "control: a git call handed the planted variables left the decoy empty, so the isolation check proves nothing"
 fi
 
 if [ "$failures" -ne 0 ]; then
