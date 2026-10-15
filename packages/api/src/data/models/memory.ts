@@ -151,9 +151,11 @@ export interface Session {
   alias?: string;
   /**
    * `'space-turn'` for a session that runs turns in a shared conversation
-   * (ink://specs/inkling-multi-person-groups). Set only at insert, and the
-   * database refuses any later change. Such a session never authenticates a
-   * request by its context alone.
+   * (ink://specs/inkling-multi-person-groups). Set only at insert: server code
+   * never writes it after that (pinned by session-turn-scope-writes.test.ts).
+   * The database checks only its value, so a service-role or raw SQL write
+   * could still change it. Such a session never authenticates a request by
+   * its context alone.
    */
   turnScope?: string;
   /** The current admitted turn (`sessions.turn_epoch`), rotated by claim_turn_epoch. */
