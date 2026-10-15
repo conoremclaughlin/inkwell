@@ -794,6 +794,10 @@ Docker is the scarcest resource on the development machine, and the DB integrati
 2. **When it does, run the focused files while iterating, and the full suite once**, on the head you hand over. Name that head in the review request; a reviewer does not repeat the full run on the same head. Do not fan out subagents that each run the suite.
 3. **Use the shared stack.** One stack is the design: each extra one holds most of a GiB of Docker memory and replays every migration on a cold start. A busy stack is waited on, not refused, so a new `ink-integration-<suffix>` is never the way past it. On 2026-10-02 four stacks came up in eleven minutes that way and maxed out Docker. A private stack takes `--private-stack`, is capped at one per machine, and is stopped after its run; it is for a run the shared stack cannot serve, such as withheld migrations. Mechanics are in [CONTRIBUTING.md](./CONTRIBUTING.md#integration-tests).
 
+### Harnesses that spawn tools
+
+Before you build, review or run a test harness, smoke test, integration-stack run, launcher or wrapper that spawns external tools (Supabase CLI, docker, yarn, node, python), load the `harness-child-environment` skill. A child process inherits the session's environment, tokens included, unless it's given an explicit one, and some tools look up stored credentials on their own. The skill covers allowlisted child environments, pinned tools, contained credential stores, and reporting evidence without overclaiming. It's installed for Claude Code and Codex on the development machine; if it isn't available to you, say so before running anything.
+
 ### Private data and public contributor attribution (IRONCLAD)
 
 **Public contributor identity is allowed; private contact and life data is not.** A contributor's public name, normal authorship credit, and established public contributor attribution in git history are not privacy incidents merely because they identify a person. Repository-work examples may name contributors. This does not make their private contact details, or other people's personal information, public.
