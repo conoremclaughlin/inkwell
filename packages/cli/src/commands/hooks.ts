@@ -2691,6 +2691,7 @@ const TOOL_USE_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
  */
 export async function claimToolCallDecision(
   toolUseId: unknown,
+  scope: { sessionId: unknown; cwd: string; command: string },
   dir = join(homedir(), '.ink', 'runtime', 'hook-decisions'),
   waitMs = 20_000
 ): Promise<
@@ -2712,7 +2713,12 @@ export async function claimToolCallDecision(
   } catch {
     return noop;
   }
-  const path = join(dir, `${toolUseId}.json`);
+  // Keyed by the whole call, not the id alone: a reused id for another
+  // session, directory or command never shares a decision (Lumen, #861).
+  const key = createHash('sha256')
+    .update(JSON.stringify([toolUseId, String(scope.sessionId ?? ''), scope.cwd, scope.command]))
+    .digest('hex');
+  const path = join(dir, `${key}.json`);
   try {
     writeFileSync(path, '', { flag: 'wx', mode: 0o600 });
     return {
@@ -2937,7 +2943,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   // Every copy of this hook running for the same headless destructive call
   // returns one decision (see claimToolCallDecision).
   if (destructiveReason !== null) {
-    const claim = await claimToolCallDecision(stdin.tool_use_id);
+    const claim = await claimToolCallDecision(stdin.tool_use_id, {
+      sessionId: stdin.session_id,
+      cwd: hookCwd,
+      command: toolInput,
+    });
     if (claim.role === 'follow') {
       hookLog('on_tool_approval_followed', { decision: claim.decision?.decision ?? 'none' });
       if (claim.decision?.decision === 'allow') process.exit(0);

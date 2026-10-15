@@ -213,10 +213,10 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
   it.each([
     `bash -c 'set -e; V=${SCRATCH}/vt; rm -rf "$V/work"; mkdir -p "$V/work"'`,
     'yarn build && rm -rf dist',
+    `cd ${STUDIO} && rm -rf dist`,
     'sudo rm -rf /',
     'timeout 5 rm --recursive x',
     'FOO=1 rm -rf x',
-    'rm -rf "$HOME/x"',
   ])('%j: needs approval, as a plain rm', (command) => {
     expect(asPlain(command)).toBe(true);
   });
@@ -232,6 +232,11 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
     ['a quoted operand', "rm -rf '/outside/build cache'"],
     ['an escaped operand', 'rm -rf /outside/build\\ cache'],
     ['a double-quoted scratch operand', `rm -rf "${SCRATCH}/x"`],
+    // Literal names that look like syntax (Lumen, #861 round 2).
+    ['a quoted name with parentheses', "rm -rf '/outside/build (old)'"],
+    ['a quoted name with a dollar sign', "rm -rf '/outside/$cache'"],
+    ['a compound that starts with rm', 'rm -rf /outside/a && rm -rf /outside/b'],
+    ['a variable in a single rm', 'rm -rf "$HOME/x"'],
   ])('%s: needs approval as written, never sent back', (_name, command) => {
     expect(asPlain(command)).toBe(false);
   });
@@ -241,31 +246,14 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
   });
 });
 
-describe('heredoc bodies are data unless a shell reads them', () => {
+describe('a heredoc is never read as data: everything in it stays in view (Lumen, #861 round 2)', () => {
   it.each([
-    [
-      'a commit message written with a quoted heredoc',
-      'M=/tmp/msg; cat > "$M" <<\'EOF\'\nfix: stop asking about rm -rf in scratch\n\nThe old check denied rm -rf dist.\nEOF\ngit commit -F "$M"',
-    ],
-    ['a heredoc git reads', 'git commit -F - <<EOF\nmention rm -rf x and git reset --hard\nEOF'],
-    ['a dash heredoc with a tab-indented end', 'cat > f <<-EOF\n\trm -rf x\n\tEOF'],
-    ['a python heredoc printing the words', "python3 - <<'PY'\nprint('rm -rf x')\nPY"],
-  ])('%s is not destructive', (_name, command) => {
-    expect(classify(command).kind).toBe('not-destructive');
-  });
-
-  it.each([
-    ['bash reads it', "bash <<'EOF'\nrm -rf x\nEOF"],
-    ['it is piped to sh', 'cat <<EOF | sh\nrm -rf x\nEOF'],
-    ['sudo wraps the reader', 'sudo tee /etc/x <<EOF\nrm -rf x\nEOF'],
-    ['ssh reads it', 'ssh host <<EOF\nrm -rf x\nEOF'],
-    ['a real rm after the heredoc', "cat > f <<'EOF'\nhello\nEOF\nrm -rf /h/ws/repo/dist"],
-    ['an rm on the heredoc line itself', "rm -rf x; cat > f <<'EOF'\nhi\nEOF"],
-  ])('%s: still destructive', (_name, command) => {
+    ['substitution in a heredoc cat reads', 'cat <<EOF\n$(rm -rf /outside/x)\nEOF'],
+    ['backticks in a heredoc cat reads', 'cat <<EOF\n`rm -rf /outside/x`\nEOF'],
+    ['a quoted <<EOF then a real rm', "echo '<<EOF'\nrm -rf /outside/x"],
+    ['a here-string then a real rm', 'cat <<<EOF\nrm -rf /outside/x'],
+    ['a shell mid-pipeline', "cat <<'EOF' | sh | cat\nrm -rf /outside/x\nEOF"],
+  ])('%s is destructive', (_name, command) => {
     expect(classify(command).kind).not.toBe('not-destructive');
-  });
-
-  it('a heredoc never makes a delete allowed: the command is not one the allowance models', () => {
-    expect(classify(`rm -rf ${SCRATCH}/x <<EOF\nEOF`).kind).toBe('needs-approval');
   });
 });
