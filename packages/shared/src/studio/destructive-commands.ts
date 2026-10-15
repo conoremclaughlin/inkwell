@@ -9,8 +9,9 @@
  * (2026-10-13). These commands now reach the hook, which decides:
  *
  *   - `allowed`: a delete the session may make without asking;
- *   - `needs-approval`: destructive, and not that. The hook asks the person
- *     attached, or requests Conor's approval for an unattended turn;
+ *   - `needs-approval`: destructive, and not that. For an unattended turn
+ *     the hook requests Conor's approval, except a recursive rm it could not
+ *     read (`asPlainRm`), which it first sends back to be run as a plain rm;
  *   - `not-destructive`: nothing for this module to decide.
  *
  * THE ALLOWANCE IS DELIBERATELY TINY (Lumen's review, 63ae5a80). This is
@@ -37,7 +38,17 @@ import { isAbsolute, join, posix } from 'path';
 export type DestructiveVerdict =
   | { kind: 'not-destructive' }
   | { kind: 'allowed'; targets: string[] }
-  | { kind: 'needs-approval'; reason: string };
+  | {
+      kind: 'needs-approval';
+      reason: string;
+      /**
+       * A recursive rm the check could not read because of what surrounds it
+       * (a script, a wrapper, an operator, a variable). Run as its own plain
+       * `rm`, it is fully checked: allowed inside a root, asked for outside.
+       * So an unattended turn is told to do that before anyone is asked.
+       */
+      asPlainRm?: true;
+    };
 
 /** The filesystem reads the classifier needs, injected for tests. */
 export interface DestructiveFs {
@@ -142,15 +153,27 @@ export function classifyDestructiveCommand(
     .filter((kind): kind is string => kind !== null);
   if (kinds.length === 0) return { kind: 'not-destructive' };
   const what = kinds[0];
-  const needs = (why: string): DestructiveVerdict => ({
+  const needs = (why: string, asPlainRm = false): DestructiveVerdict => ({
     kind: 'needs-approval',
     reason: `${what}: ${why}`,
+    ...(asPlainRm ? { asPlainRm: true as const } : {}),
   });
-
   const text = command.trim();
-  if (UNMODELLED.test(text)) return needs('the command is not one simple command the check models');
+  // Sent back to be run plain only when it plainly can be: every destructive
+  // thing found is an rm (a git reset or clean is asked about as is), and
+  // the command starts with some other program or assignment, a script, a
+  // wrapper, a cd. A command that starts with rm is asked about as written,
+  // whatever follows: quoting can make a literal name look like syntax, and
+  // telling which is which is a shell parser's job, not this check's
+  // (Lumen, #861).
+  const onlyRm = kinds.every((kind) => kind === 'a recursive rm');
+  const asPlain = onlyRm && text.split(/\s+/)[0] !== 'rm';
+
+  if (UNMODELLED.test(text)) {
+    return needs('the command is not one simple command the check models', asPlain);
+  }
   const argv = text.split(/ +/);
-  if (argv[0] !== 'rm') return needs('only a plain rm is ever allowed without asking');
+  if (argv[0] !== 'rm') return needs('only a plain rm is ever allowed without asking', asPlain);
 
   let i = 1;
   while (i < argv.length && argv[i].startsWith('-')) {

@@ -8,6 +8,7 @@ import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 import type { GroupState } from './stop-process';
 import type { InkProvider } from './ink-provider';
+import type { NativeSteeringBinding } from './native-steering-binding';
 
 // ─── Channel Types ───
 
@@ -838,6 +839,8 @@ export interface ClaudeRunnerConfig {
   onPermissionWarning?: import('./spawn-permission-warning.js').SpawnPermissionWarningHandler;
   workingDirectory: string;
   mcpConfigPath: string;
+  /** Host-created capability for one admitted owner generation; never request metadata. */
+  nativeSteering?: NativeSteeringBinding;
   /**
    * This run's hard ceiling, when it must be lower than the runner's own
    * (an inkling turn's). The Claude runner honours it.

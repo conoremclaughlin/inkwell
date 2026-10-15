@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { auditStudio } from '@inklabs/shared';
+import { auditStudio, canonicalInkLauncher } from '@inklabs/shared';
 import type { CompleteStudioReport } from './studio-complete.js';
 import {
   completeStudioForLaunch,
@@ -78,7 +78,8 @@ function deps(overrides: Partial<LaunchStudioDeps> = {}) {
 
 /** Every checklist item, so the audit reads complete. */
 function seedComplete(dir: string) {
-  const INK = 'node /repo/packages/cli/dist/cli.js';
+  // What ink init writes on this machine: the link when it exists.
+  const INK = canonicalInkLauncher() ?? 'node /repo/packages/cli/dist/cli.js';
   const cmd = (name: string, backend: string) => ({
     hooks: [{ type: 'command', command: `${INK} hooks ${name} --backend ${backend}` }],
   });

@@ -555,7 +555,13 @@ node ./packages/cli/dist/cli.js <subcommand>
 
 The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
 
-**The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
+**The server never runs the global link itself.** For `ink init` and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override.
+
+**Hooks are the exception: every managed hook is spelled with the link.** When `~/.local/bin/ink` exists, every writer spells every managed hook with it, whoever runs the install: a person, `ink init` run by the server, or the pre-spawn repair (`canonicalInkLauncher` in `packages/shared/src/studio/ink-launcher.ts`). Without the link, as in a container or CI, the writer keeps the launcher that ran it.
+
+- **Why:** a studio worktree reads the main checkout's settings as well as its own, and Claude Code merges hooks only when their command text is identical. So two spellings meant every hook ran twice, in parallel. On 2026-10-14 that made one-use approvals loop.
+- **The trade-off:** the hook code that runs is whatever the link points at. That's the OB's choice, today the root checkout, which is also the server's.
+- **Repair:** a hook spelled another way counts as missing in the studio checklist, so the next `ink init` or pre-spawn repair rewrites it. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
 
 ## Studios: One Checklist, One Routine
 

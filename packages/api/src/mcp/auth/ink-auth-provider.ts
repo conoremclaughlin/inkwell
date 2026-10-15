@@ -23,6 +23,7 @@ import {
 import { resolveAccountForPrincipal } from '../../services/account-deletion/principal';
 import { accountGate } from '../../services/account-deletion/gate';
 import { tokenIdentityState } from '../../auth/token-identity';
+import { RUNNER_TOOLS_SCOPE, isSpaceTurnScope } from '../../auth/token-scope';
 
 /** A signed, unexpired `mcp_access` token's claims. */
 export interface VerifiedAccessToken {
@@ -33,6 +34,15 @@ export interface VerifiedAccessToken {
   /** Signed runner binding — authenticated, unlike the x-ink-context header. */
   sessionId?: string;
   contactId?: string;
+  /**
+   * The signed scope. A token minted before scopes were read carries none and
+   * reads as `mcp:tools`, which is what it was always allowed.
+   */
+  scope?: string;
+  /** A space-turn token's conversation, signed. Present only on that scope. */
+  workspaceId?: string;
+  threadId?: string;
+  threadKey?: string;
   /** The token's `exp`, seconds since the epoch. Nothing minted from it may outlive it. */
   expiresAt?: number;
 }
@@ -41,11 +51,43 @@ export interface VerifiedAccessToken {
  * A request's bearer token, judged:
  * - `ok`: signed, unexpired, and any SB it names still exists;
  * - 401: missing, invalid or expired, or naming an SB with no identity row;
+ * - 403: a space-turn token on a seam that does not admit one;
  * - 503: the SB it names couldn't be read, so the request can't be judged.
  */
 export type AccessTokenVerdict =
   | { ok: true; token: VerifiedAccessToken }
-  | { ok: false; status: 401 | 503 };
+  | { ok: false; status: 401 | 503 }
+  | SpaceTurnSeamRefusal;
+
+export type SpaceTurnSeamRefusal = {
+  ok: false;
+  status: 403;
+  reason: 'space_turn_token_refused';
+};
+
+export interface VerifyAccessTokenOptions {
+  /**
+   * Admit a space-turn token. Only the MCP endpoint does, where the tool
+   * allowlist confines it to its own conversation; every other seam refuses
+   * one by leaving this unset.
+   */
+  allowSpaceTurn?: boolean;
+}
+
+/**
+ * The seam rule for a signed token's scope: a space-turn token is refused
+ * unless the caller opted in (ink://specs/inkling-multi-person-groups).
+ * Exported so a test double of the provider applies this same rule.
+ */
+export function spaceTurnSeamRefusal(
+  token: Pick<VerifiedAccessToken, 'scope'>,
+  options?: VerifyAccessTokenOptions
+): SpaceTurnSeamRefusal | null {
+  if (options?.allowSpaceTurn === true) return null;
+  return isSpaceTurnScope(token.scope)
+    ? { ok: false, status: 403, reason: 'space_turn_token_refused' }
+    : null;
+}
 
 /**
  * Carry an SB binding across the rename on a pending-auth JWT.
@@ -466,10 +508,19 @@ export class InkAuthProvider {
    * signature and expiry, and then that the SB it names still exists. A
    * deleted space takes its SBs' identity rows with it, and its tokens are
    * refused from their next request (token-identity.ts, task 3f7f6a8f).
+   *
+   * A space-turn token is refused here, before the identity read, unless the
+   * caller opted in: one guard for every route that takes these tokens, so a
+   * route added later is closed to it without knowing it exists.
    */
-  async verifyAccessToken(authHeader: string | undefined): Promise<AccessTokenVerdict> {
+  async verifyAccessToken(
+    authHeader: string | undefined,
+    options?: VerifyAccessTokenOptions
+  ): Promise<AccessTokenVerdict> {
     const token = this.verifyAccessTokenSignature(authHeader);
     if (!token) return { ok: false, status: 401 };
+    const refusal = spaceTurnSeamRefusal(token, options);
+    if (refusal) return refusal;
     const state = await tokenIdentityState(this.supabase, {
       userId: token.userId,
       sbId: token.sbId,
@@ -491,6 +542,28 @@ export class InkAuthProvider {
     const payload = verifyInkAccessToken(token, 'mcp_access');
     if (!payload) return null;
     const exp = (payload as { exp?: unknown }).exp;
+    const scope =
+      typeof payload.scope === 'string' && payload.scope.trim()
+        ? payload.scope
+        : RUNNER_TOOLS_SCOPE;
+
+    // A space-turn token is bound to one inkling's turn in one conversation.
+    // Missing any part of that binding, it is not a narrower token but an
+    // unbound one, and is refused like a bad signature. The SB claims are
+    // part of it: a token that names no SB is enriched from the unsigned
+    // context header and resolves the caller's slug from its arguments, so
+    // it could act as another of the owner's inklings on the bound thread.
+    if (isSpaceTurnScope(scope)) {
+      const bound = [
+        payload.sbSlug,
+        payload.sbId,
+        payload.sessionId,
+        payload.workspaceId,
+        payload.threadId,
+        payload.threadKey,
+      ];
+      if (!bound.every((claim) => typeof claim === 'string' && claim.trim() !== '')) return null;
+    }
 
     return {
       userId: payload.sub,
@@ -503,6 +576,14 @@ export class InkAuthProvider {
           : {}),
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
       ...(payload.contactId ? { contactId: payload.contactId } : {}),
+      scope,
+      ...(isSpaceTurnScope(scope)
+        ? {
+            workspaceId: payload.workspaceId,
+            threadId: payload.threadId,
+            threadKey: payload.threadKey,
+          }
+        : {}),
       ...(typeof exp === 'number' ? { expiresAt: exp } : {}),
     };
   }

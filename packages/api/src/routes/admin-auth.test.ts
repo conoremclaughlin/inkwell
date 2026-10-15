@@ -525,6 +525,64 @@ describe('adminAuthMiddleware', () => {
       expect((req as any).inkTokenSessionId).toBe(sessionId);
     });
 
+    it('refuses a space-turn token on every route that admits runner tokens', async () => {
+      // A shared conversation's turn token serves MCP only
+      // (ink://specs/inkling-multi-person-groups). Signed and valid, it still
+      // authenticates nothing here, and no later tier gets to admit it.
+      const routes: Array<[string, string]> = [
+        ['POST', '/sessions/session-123/sync-transcript'],
+        ['GET', '/sessions/synced'],
+        ['GET', '/sessions/session-123/transcript'],
+        ['POST', '/approval-requests'],
+        ['POST', '/approval-requests/consume'],
+        ['GET', '/approval-requests/request-1/status'],
+      ];
+      for (const scope of ['mcp:space-turn', 'mcp:tools mcp:space-turn']) {
+        mockVerifyInkAccessToken.mockImplementation((_token: string, type: string) =>
+          type === 'mcp_access'
+            ? {
+                type: 'mcp_access',
+                sub: 'user-mcp',
+                email: 'mcp@example.com',
+                scope,
+                sbSlug: 'fixture-inkling',
+                sbId: '77777777-7777-4777-8777-777777777777',
+                sessionId: '55555555-5555-4555-8555-555555555555',
+                workspaceId: '44444444-4444-4444-8444-444444444444',
+                threadId: '33333333-3333-4333-8333-333333333333',
+                threadKey: 'inkling:thread:fixture-group',
+              }
+            : null
+        );
+        for (const [method, path] of routes) {
+          const req = createMockReq({ method, path });
+          const res = createMockRes();
+          const next = vi.fn();
+          await middleware(req, res, next);
+          expect(res._status, `${scope} ${method} ${path}`).toBe(403);
+          expect(res._json).toMatchObject({ code: 'space_turn_token_refused' });
+          expect(next).not.toHaveBeenCalled();
+          expect((req as any).inkUserId).toBeUndefined();
+        }
+      }
+      expect(mockGetUser).not.toHaveBeenCalled();
+
+      // The control: an mcp:tools runner token still passes on the same routes.
+      mockVerifyInkAccessToken.mockImplementation((_token: string, type: string) =>
+        type === 'mcp_access'
+          ? { type: 'mcp_access', sub: 'user-mcp', email: 'mcp@example.com', scope: 'mcp:tools' }
+          : null
+      );
+      for (const [method, path] of routes) {
+        const req = createMockReq({ method, path });
+        const next = vi.fn();
+        await middleware(req, createMockRes(), next);
+        expect(next, `mcp:tools ${method} ${path}`).toHaveBeenCalled();
+        expect((req as any).inkUserId).toBe('user-mcp');
+      }
+      mockVerifyInkAccessToken.mockReset();
+    });
+
     it("reads an older runner token's identityId the same way", async () => {
       const identityId = '66666666-6666-4666-8666-666666666666';
       mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({

@@ -278,6 +278,30 @@ describe('browser companion router', () => {
       expect(await res.json()).toEqual({ error: 'browser_credential_invalid' });
     });
 
+    it('refuses a space-turn mcp_access token', async () => {
+      // Pins the existing refusal for the shared-conversation scope
+      // (ink://specs/inkling-multi-person-groups): this router takes browser
+      // credentials only, so the narrow scope needs no rule of its own here.
+      const spaceTurn = signInkAccessToken(
+        {
+          type: 'mcp_access',
+          sub: USER_ID,
+          email: 'mcp@example.com',
+          scope: 'mcp:space-turn',
+          sbSlug: 'fixture-inkling',
+          sbId: '00000000-0000-4000-8000-0000000000b1',
+          sessionId: '00000000-0000-4000-8000-0000000000c1',
+          workspaceId: WORKSPACE_ID,
+          threadId: '00000000-0000-4000-8000-0000000000e1',
+          threadKey: 'inkling:thread:fixture-group',
+        },
+        3600
+      );
+      const res = await get('/session', spaceTurn);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'browser_credential_invalid' });
+    });
+
     it('refuses an expired browser token', async () => {
       const res = await get(
         '/session',

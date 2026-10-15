@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, STUDIO_CHECK_IDS } from './checklist';
@@ -144,7 +144,7 @@ describe('auditStudio', () => {
     const root = await scratch();
     try {
       await completeStudio(root, { studioId: STUDIO_ID });
-      const audit = auditStudio(root, { linked: true });
+      const audit = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(audit.complete).toBe(true);
       expect(audit.missing).toEqual([]);
       expect(audit.checks.map((c) => c.id)).toEqual([...STUDIO_CHECK_IDS]);
@@ -158,7 +158,7 @@ describe('auditStudio', () => {
   it('an empty worktree fails every required check and names the repair for each', async () => {
     const root = await scratch();
     try {
-      const audit = auditStudio(root, { linked: true });
+      const audit = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(audit.complete).toBe(false);
       const required = audit.checks.filter((c) => c.required);
       expect(required.length).toBeGreaterThan(0);
@@ -260,7 +260,7 @@ describe('auditStudio', () => {
       try {
         await completeStudio(root, { studioId: STUDIO_ID });
         await c.break(root);
-        const audit = auditStudio(root, { linked: true });
+        const audit = auditStudio(root, { linked: true, inkLauncher: INK });
         const failed = audit.checks.filter((x) => !x.ok).map((x) => x.id);
         expect(failed, c.id).toEqual([c.id]);
       } finally {
@@ -285,7 +285,7 @@ describe('auditStudio', () => {
           path.join(root, '.claude', 'settings.local.json'),
           JSON.stringify({ permissions, hooks: claudeHooks() })
         );
-        const audit = auditStudio(root, { linked: true });
+        const audit = auditStudio(root, { linked: true, inkLauncher: INK });
         const check = audit.checks.find((c) => c.id === 'claude-permissions');
         expect(check?.ok, JSON.stringify(permissions)).toBe(true);
         expect(audit.complete, JSON.stringify(permissions)).toBe(true);
@@ -309,7 +309,7 @@ describe('auditStudio', () => {
       try {
         await completeStudio(root, { studioId: STUDIO_ID });
         await writeFile(path.join(root, '.claude', 'settings.local.json'), c.content);
-        const check = auditStudio(root, { linked: true }).checks.find(
+        const check = auditStudio(root, { linked: true, inkLauncher: INK }).checks.find(
           (x) => x.id === 'claude-permissions'
         );
         expect(check?.ok, c.detail).toBe(false);
@@ -330,13 +330,13 @@ describe('auditStudio', () => {
         JSON.stringify({ hooks: claudeHooks() })
       );
       await rm(path.join(root, '.ink', 'identity.json'));
-      const main = auditStudio(root, { linked: false });
+      const main = auditStudio(root, { linked: false, inkLauncher: INK });
       expect(main.complete).toBe(true);
       expect(main.checks.find((c) => c.id === 'identity')?.required).toBe(false);
       expect(main.checks.find((c) => c.id === 'studio-id')?.required).toBe(false);
       expect(main.checks.find((c) => c.id === 'claude-permissions')?.required).toBe(false);
       // ...and the same files in a linked worktree are not.
-      const linked = auditStudio(root, { linked: true });
+      const linked = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(linked.complete).toBe(false);
       expect(linked.missing).toEqual(['identity', 'studio-id', 'claude-permissions']);
     } finally {
@@ -349,7 +349,7 @@ describe('auditStudio', () => {
     try {
       await completeStudio(root, { studioId: STUDIO_ID });
       await rm(path.join(root, '.env.local'));
-      const audit = auditStudio(root, { linked: true });
+      const audit = auditStudio(root, { linked: true, inkLauncher: INK });
       const env = audit.checks.find((c) => c.id === 'env-local');
       expect(env?.ok).toBe(false);
       expect(env?.required).toBe(false);
@@ -368,7 +368,7 @@ describe('auditStudio', () => {
         path.join(root, '.ink', 'identity.json'),
         JSON.stringify({ agentId: 'wren', studioId: STUDIO_ID })
       );
-      const audit = auditStudio(root, { linked: true });
+      const audit = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(audit.checks.find((c) => c.id === 'identity')?.ok).toBe(true);
       expect(audit.complete).toBe(true);
     } finally {
@@ -382,7 +382,7 @@ describe('auditStudio', () => {
       await completeStudio(root, { studioId: STUDIO_ID });
       await writeFile(path.join(root, '.mcp.json'), '{not json');
       await writeFile(path.join(root, '.claude', 'settings.local.json'), '{not json');
-      const audit = auditStudio(root, { linked: true });
+      const audit = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(audit.missing).toEqual(['mcp-json', 'claude-permissions', 'claude-hooks']);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -395,7 +395,8 @@ describe('auditStudio', () => {
   // (Myra, #701 d0f4698e).
   describe('codex-mcp reads the config by what its keys resolve to', () => {
     const codexDetail = (root: string) =>
-      auditStudio(root, { linked: true }).checks.find((c) => c.id === 'codex-mcp')?.detail;
+      auditStudio(root, { linked: true, inkLauncher: INK }).checks.find((c) => c.id === 'codex-mcp')
+        ?.detail;
     const figmaStudio = async (root: string) => {
       await completeStudio(root, { studioId: STUDIO_ID });
       await writeFile(
@@ -408,7 +409,7 @@ describe('auditStudio', () => {
         })
       );
       syncMcpConfig(root);
-      expect(auditStudio(root, { linked: true }).complete).toBe(true);
+      expect(auditStudio(root, { linked: true, inkLauncher: INK }).complete).toBe(true);
       return readFileSync(path.join(root, '.codex', 'config.toml'), 'utf-8');
     };
 
@@ -437,14 +438,16 @@ describe('auditStudio', () => {
         try {
           const synced = await figmaStudio(root);
           await writeFile(path.join(root, '.codex', 'config.toml'), outside(synced));
-          expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+          expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual([
+            'codex-mcp',
+          ]);
           expect(codexDetail(root)).toBe(
             'defines [mcp_servers.figma] more than once, which Codex cannot parse; run `ink mcp sync`'
           );
 
           syncMcpConfig(root);
 
-          expect(auditStudio(root, { linked: true }).complete).toBe(true);
+          expect(auditStudio(root, { linked: true, inkLauncher: INK }).complete).toBe(true);
         } finally {
           await rm(root, { recursive: true, force: true });
         }
@@ -464,7 +467,9 @@ describe('auditStudio', () => {
         const synced = syncMcpConfig(root);
 
         expect(synced.codexHandEdit).toHaveLength(1);
-        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual([
+          'codex-mcp',
+        ]);
         expect(codexDetail(root)).toBe(
           "defines [mcp_servers.inkwell] outside ink's managed block, where `ink mcp sync` cannot update it; remove that definition, then run `ink mcp sync`"
         );
@@ -481,7 +486,7 @@ describe('auditStudio', () => {
           path.join(root, '.codex', 'config.toml'),
           codexToml().replace('[mcp_servers.inkwell]', '[ "mcp_servers" . inkwell ]')
         );
-        expect(auditStudio(root, { linked: true }).complete).toBe(true);
+        expect(auditStudio(root, { linked: true, inkLauncher: INK }).complete).toBe(true);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -492,12 +497,16 @@ describe('auditStudio', () => {
       try {
         await completeStudio(root, { studioId: STUDIO_ID });
         await writeFile(path.join(root, '.codex', 'config.toml'), `model = "open\n${codexToml()}`);
-        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual([
+          'codex-mcp',
+        ]);
         expect(codexDetail(root)).toBe('could not be read at line 1');
         // After the inkwell server, where everything read so far looks fine:
         // the part not read may still define it twice.
         await writeFile(path.join(root, '.codex', 'config.toml'), `${codexToml()}model = "open\n`);
-        expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+        expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual([
+          'codex-mcp',
+        ]);
         expect(codexDetail(root)).toBe('could not be read at line 13');
       } finally {
         await rm(root, { recursive: true, force: true });
@@ -543,13 +552,13 @@ describe('auditStudio', () => {
           hooks: geminiHooks(),
         })
       );
-      const baked = auditStudio(root, { linked: true });
+      const baked = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(baked.missing).toEqual(['codex-mcp', 'gemini-mcp']);
       expect(baked.checks.find((c) => c.id === 'codex-mcp')?.detail).toMatch(/routing header/);
 
       syncMcpConfig(root);
 
-      const repaired = auditStudio(root, { linked: true });
+      const repaired = auditStudio(root, { linked: true, inkLauncher: INK });
       expect(repaired.missing).toEqual([]);
       expect(repaired.complete).toBe(true);
     } finally {
@@ -571,7 +580,7 @@ describe('auditStudio', () => {
           'required = true\nhttp_headers = {\n  "X-A" = "v"\n}'
         )
       );
-      expect(auditStudio(root, { linked: true }).missing).toEqual(['codex-mcp']);
+      expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual(['codex-mcp']);
 
       await writeFile(
         codexPath,
@@ -581,9 +590,62 @@ describe('auditStudio', () => {
             'env_http_headers = { "x-ink-context" = "INK_CONTEXT" }'
         )
       );
-      expect(auditStudio(root, { linked: true }).missing).toEqual([]);
+      expect(auditStudio(root, { linked: true, inkLauncher: INK }).missing).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+});
+
+describe('auditStudio: one launcher spelling for every managed hook', () => {
+  async function withStudio(fn: (root: string) => void | Promise<void>) {
+    const root = await mkdtemp(path.join(tmpdir(), 'studio-launcher-'));
+    try {
+      await completeStudio(root, { studioId: STUDIO_ID });
+      await fn(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it('a hook spelled with another launcher needs repair, and the detail says why', () =>
+    withStudio((root) => {
+      const audit = auditStudio(root, { linked: true, inkLauncher: '/home/me/.local/bin/ink' });
+      expect(audit.missing).toEqual(['claude-hooks', 'codex-hooks', 'gemini-hooks']);
+      const claude = audit.checks.find((check) => check.id === 'claude-hooks');
+      expect(claude?.detail).toContain('not spelled with /home/me/.local/bin/ink');
+    }));
+
+  it('a canonical copy beside a stale one still needs repair: the stale copy runs too (Lumen, #861)', () =>
+    withStudio(async (root) => {
+      const settingsPath = path.join(root, '.claude', 'settings.local.json');
+      const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+      const LINK = '/home/me/.local/bin/ink';
+      const stale = settings.hooks.PreToolUse[0].hooks[0].command as string;
+      settings.hooks.PreToolUse[0].hooks[0].command = stale.replace(INK, LINK);
+      settings.hooks.PreToolUse[0].hooks.push({ type: 'command', command: stale });
+      for (const [event, entries] of Object.entries(settings.hooks) as Array<
+        [string, Array<{ hooks: Array<{ command: string }> }>]
+      >) {
+        if (event === 'PreToolUse') continue;
+        for (const entry of entries)
+          for (const hook of entry.hooks) hook.command = hook.command.replace(INK, LINK);
+      }
+      await writeFile(settingsPath, JSON.stringify(settings));
+      const claude = auditStudio(root, { linked: true, inkLauncher: LINK }).checks.find(
+        (check) => check.id === 'claude-hooks'
+      );
+      expect(claude?.ok).toBe(false);
+      expect(claude?.detail).toContain('on-tool-approval');
+    }));
+
+  it('the hooks spelled with the launcher pass', () =>
+    withStudio((root) => {
+      expect(auditStudio(root, { linked: true, inkLauncher: INK }).complete).toBe(true);
+    }));
+
+  it('with no launcher link on the machine, any spelling counts', () =>
+    withStudio((root) => {
+      expect(auditStudio(root, { linked: true, inkLauncher: null }).complete).toBe(true);
+    }));
 });

@@ -531,16 +531,20 @@ export class HostedInkSessionRunner implements IRunner {
       );
       lifetime.whenClosed(() => launches.abortOpen());
 
+      const body =
+        options.injectedContext && !options.backendSessionId
+          ? `${formatInjectedContext(options.injectedContext, { childCallsBootstrap: true })}\n\n---\n\n${message}`
+          : message;
+      // Match the child InkRunner: current reply/tier instructions belong on
+      // every turn, including resumes. Do not copy the private identity prompt.
+      const instructions = config.turnInstructions?.trim();
       const input: HostedInkSessionInput = Object.freeze({
         sessionId,
         turnEpoch,
         ...(config.sbSlug ? { sbSlug: config.sbSlug } : {}),
         ...(config.studioId ? { studioId: config.studioId } : {}),
         workingDirectory: config.workingDirectory,
-        message:
-          options.injectedContext && !options.backendSessionId
-            ? `${formatInjectedContext(options.injectedContext, { childCallsBootstrap: true })}\n\n---\n\n${message}`
-            : message,
+        message: instructions ? `${instructions}\n\n---\n\n${body}` : body,
         attachments: Object.freeze(
           (options.mediaAttachments ?? [])
             .filter((attachment) => typeof attachment.path === 'string')

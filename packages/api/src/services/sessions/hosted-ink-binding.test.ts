@@ -134,6 +134,7 @@ describe('server binding, admitted identity and explicit resources', () => {
     'permissions',
     'browser-token',
     'admin-token',
+    'space-turn-token',
   ] as const)('refuses %s before effects or provider execution', async (kind) => {
     const h = await setup();
     if (kind === 'missing') h.config.inkAccessToken = undefined;
@@ -177,6 +178,26 @@ describe('server binding, admitted identity and explicit resources', () => {
           sbSlug: 'echo',
           scope: 'mcp:tools',
           grantId: 'fixture-grant',
+        },
+        env.JWT_SECRET,
+        { expiresIn: 120 }
+      );
+    // A shared conversation's turn token for this very session. The hosted
+    // binding re-mints the runner's credential for its MCP client, and must
+    // not turn a space-turn token into a broad one: it refuses it instead
+    // (ink://specs/inkling-multi-person-groups, Phase 1).
+    if (kind === 'space-turn-token')
+      h.config.inkAccessToken = jwt.sign(
+        {
+          type: 'mcp_access',
+          sub: 'fixture-user',
+          email: 'fixture@example.invalid',
+          scope: 'mcp:space-turn',
+          sbSlug: 'echo',
+          sessionId: h.sessionId,
+          workspaceId: 'fixture-workspace',
+          threadId: 'fixture-thread',
+          threadKey: 'inkling:thread:fixture-group',
         },
         env.JWT_SECRET,
         { expiresIn: 120 }
@@ -246,4 +267,47 @@ it('withholds steering from the admitted tools tier regardless of later caller c
   expect(h.prepare).toHaveBeenCalledOnce();
   expect(fetch).not.toHaveBeenCalled();
   expect(h.host.resolveBinary).not.toHaveBeenCalled();
+});
+
+it('never widens a mixed-scope space-turn token: what it re-mints verifies as nothing', async () => {
+  // "mcp:tools mcp:space-turn" passes the binding's mcp:tools check, and the
+  // binding copies the scope as it is. Its re-minted claims omit the
+  // conversation, so the provider must read the minted token as invalid,
+  // never as a broad one (ink://specs/inkling-multi-person-groups, Phase 1).
+  // Pins today's behaviour; the binding itself is unchanged.
+  const h = await setup();
+  h.config.inkAccessToken = jwt.sign(
+    {
+      type: 'mcp_access',
+      sub: 'fixture-user',
+      email: 'fixture@example.invalid',
+      scope: 'mcp:tools mcp:space-turn',
+      sbSlug: 'echo',
+      sessionId: h.sessionId,
+      workspaceId: 'fixture-workspace',
+      threadId: 'fixture-thread',
+      threadKey: 'inkling:thread:fixture-group',
+    },
+    env.JWT_SECRET,
+    { expiresIn: 120 }
+  );
+  const minted: string[] = [];
+  h.prepare.mockImplementation(async (_input, ports) => {
+    const childEnv = await ports.provider.context!.host.sessionEnv({ hardTimeoutMs: 30_000 });
+    minted.push(childEnv.INK_ACCESS_TOKEN!);
+    throw new Error('fixture preparation stops here');
+  });
+
+  const outcome = await createBoundHostedInkRunner(h.host).run('hello', { config: h.config });
+
+  expect(outcome.success).toBe(false);
+  expect(h.prepare).toHaveBeenCalledOnce();
+  expect(h.host.resolveBinary).not.toHaveBeenCalled();
+  expect(minted).toHaveLength(1);
+  const raw = verifyInkAccessToken(minted[0], 'mcp_access')!;
+  // The scope travelled unchanged, and the conversation did not.
+  expect(raw.scope).toBe('mcp:tools mcp:space-turn');
+  expect(raw.threadKey).toBeUndefined();
+  const { InkAuthProvider } = await import('../../mcp/auth/ink-auth-provider');
+  expect(new InkAuthProvider().verifyAccessTokenSignature(`Bearer ${minted[0]}`)).toBeNull();
 });

@@ -34,7 +34,7 @@ import rateLimit from 'express-rate-limit';
 async function resolveAlertUser(
   req: Request,
   authProvider: InkAuthProvider
-): Promise<{ userId: string; via: 'token' | 'bearer' } | { status: 401 | 503 }> {
+): Promise<{ userId: string; via: 'token' | 'bearer' } | { status: 401 | 403 | 503 }> {
   const provided = req.header('x-ink-alert-token');
   if (provided && secretsMatch(provided, env.ALERT_INGEST_TOKEN)) {
     if (!env.ALERT_INGEST_USER_ID) {
@@ -48,8 +48,19 @@ async function resolveAlertUser(
   return verdict.ok ? { userId: verdict.token.userId, via: 'bearer' } : { status: verdict.status };
 }
 
-/** The 401, or the 503 when the token's SB couldn't be read. */
-function refuseAlertCaller(res: Response, status: 401 | 503): void {
+/**
+ * The 401; the 403 for a shared conversation's turn token, which reaches no
+ * alert; or the 503 when the token's SB couldn't be read.
+ */
+function refuseAlertCaller(res: Response, status: 401 | 403 | 503): void {
+  if (status === 403) {
+    res.status(403).json({
+      success: false,
+      error: 'A shared-conversation token cannot use this route',
+      code: 'space_turn_token_refused',
+    });
+    return;
+  }
   res.status(status).json({
     success: false,
     error: status === 503 ? 'Could not check the token; try again' : 'Authentication required',
