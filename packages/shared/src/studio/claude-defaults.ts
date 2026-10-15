@@ -35,11 +35,18 @@ export const DEFAULT_CLAUDE_DENY_RULES: readonly string[] = [
 ];
 
 /**
- * Denies that earlier profiles carried and the hook now decides (spec
- * automated-turn-permissions §3.4). A deny wins over every hook answer, so
- * while one of these stays in a studio's settings that studio still has no
- * way to approve the command. `ink permissions sync --apply` removes them,
- * exactly as spelled here and nothing else.
+ * Denies that earlier profiles carried and the current ones lift. A deny
+ * wins over every allow and every hook answer, so while one of these stays
+ * in a studio's settings the studio cannot do what its profile now allows.
+ * `ink permissions sync --apply` removes them, exactly as spelled here and
+ * nothing else, and only where the studio's own profile no longer denies
+ * them (a reviewer keeps its PR and SQL denies).
+ *
+ *   - the destructive local commands, which the PreToolUse hook now
+ *     decides (spec automated-turn-permissions §3.4);
+ *   - opening or updating a PR and running SQL, which the builder now
+ *     allows (Conor, 2026-10-15). Spelled here rather than spread from
+ *     GITHUB_PR_TOOLS and SUPABASE_SQL_TOOLS, which are declared below.
  */
 export const RETIRED_DENY_RULES: readonly string[] = [
   'Bash(rm -rf *)',
@@ -47,6 +54,10 @@ export const RETIRED_DENY_RULES: readonly string[] = [
   'Bash(git clean -fd *)',
   'Bash(git clean -f *)',
   'Bash(git checkout -- .)',
+  'mcp__github__create_pull_request',
+  'mcp__github__update_pull_request',
+  'mcp__github__update_pull_request_branch',
+  'mcp__supabase__execute_sql',
 ];
 
 /**
@@ -105,21 +116,30 @@ export const GITHUB_READ_TOOLS: readonly string[] = [
 ];
 
 /**
- * GitHub MCP tools that publish code or change a repository, a branch or a
- * pull request's state: opening, merging, closing or retargeting a PR,
- * writing files or branches directly, creating, forking or deleting a
- * repository. Denied in both studio profiles.
+ * GitHub MCP tools that publish code or change a repository or a branch
+ * outside a push: merging a PR, writing files or branches directly (these
+ * can name main), creating, forking or deleting a repository. Denied in
+ * both studio profiles.
  */
 export const GITHUB_PUBLISH_TOOLS: readonly string[] = [
   'mcp__github__create_branch',
   'mcp__github__create_or_update_file',
-  'mcp__github__create_pull_request',
   'mcp__github__create_repository',
   'mcp__github__delete_file',
   'mcp__github__delete_repository',
   'mcp__github__fork_repository',
   'mcp__github__merge_pull_request',
   'mcp__github__push_files',
+];
+
+/**
+ * GitHub MCP tools that open or update a pull request. A builder works on
+ * its own branch, so its PR is its own work, and Conor allowed it on
+ * 2026-10-15. The builder allows them and the reviewer denies them. Merging
+ * stays in GITHUB_PUBLISH_TOOLS.
+ */
+export const GITHUB_PR_TOOLS: readonly string[] = [
+  'mcp__github__create_pull_request',
   'mcp__github__update_pull_request',
   'mcp__github__update_pull_request_branch',
 ];
@@ -162,10 +182,23 @@ export const SUPABASE_READ_TOOLS: readonly string[] = [
   'mcp__supabase__search_docs',
 ];
 
+/**
+ * Applying a migration through the Supabase tool. Denied everywhere: the
+ * tool records the apply time as the version and the ledger drifts, so
+ * migrations go through `yarn db:migrate` (AGENTS.md).
+ */
+export const SUPABASE_MIGRATION_TOOLS: readonly string[] = ['mcp__supabase__apply_migration'];
+
+/**
+ * Arbitrary SQL, writes included. The builder allows it, as Conor did on
+ * 2026-10-15; the reviewer denies it.
+ */
+export const SUPABASE_SQL_TOOLS: readonly string[] = ['mcp__supabase__execute_sql'];
+
 /** Supabase MCP tools that can write: a migration, or arbitrary SQL. */
 export const SUPABASE_WRITE_TOOLS: readonly string[] = [
-  'mcp__supabase__apply_migration',
-  'mcp__supabase__execute_sql',
+  ...SUPABASE_MIGRATION_TOOLS,
+  ...SUPABASE_SQL_TOOLS,
 ];
 
 // ============================================================================
@@ -314,9 +347,10 @@ export function scratchPathRules(sbSlug: string): string[] {
 /**
  * The builder profile: a development session in its own studio. Edits
  * anywhere in its checkout, commits locally and pushes its own branch
- * (STUDIO_PUSH_RULES), reads GitHub and Supabase, and is not pre-approved
- * to force-push, push to main, skip the pre-push hook, install, open or
- * merge a pull request, or write the database.
+ * (STUDIO_PUSH_RULES), opens and updates its pull request, reads GitHub,
+ * runs SQL, and is not pre-approved to force-push, push to main, skip the
+ * pre-push hook, install, merge a pull request, write a branch through the
+ * GitHub API, or apply a migration through the Supabase tool.
  *
  * `Edit(/**)`: a single leading slash anchors at the session's primary
  * working directory when the rule lives in `.claude/settings.local.json`,
@@ -333,7 +367,9 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
     'mcp__inkwell__*',
     'mcp__playwright__*',
     ...GITHUB_READ_TOOLS,
+    ...GITHUB_PR_TOOLS,
     ...SUPABASE_READ_TOOLS,
+    ...SUPABASE_SQL_TOOLS,
     ...STUDIO_PUSH_RULES.allow,
   ],
   deny: [
@@ -341,7 +377,7 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
     ...INSTALL_DENY_RULES,
     ...STUDIO_PUSH_RULES.deny,
     ...GITHUB_PUBLISH_TOOLS,
-    ...SUPABASE_WRITE_TOOLS,
+    ...SUPABASE_MIGRATION_TOOLS,
   ],
 };
 
@@ -371,6 +407,7 @@ export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
     ...COMMIT_DENY_RULES,
     ...PUSH_DENY_RULES,
     ...GITHUB_PUBLISH_TOOLS,
+    ...GITHUB_PR_TOOLS,
     ...GITHUB_OTHER_WRITE_TOOLS,
     ...SUPABASE_WRITE_TOOLS,
   ],
@@ -422,7 +459,8 @@ export const NO_VERIFY_COMMIT_DENY_RULES: readonly string[] = [
  *   - merging a pull request, by the GitHub tool or `gh pr merge`;
  *   - writing a branch or a repository without a push or a PR: the GitHub
  *     tools that write files directly, or delete a repository;
- *   - applying a migration through the Supabase tool.
+ *   - applying a migration through the Supabase tool. SQL itself is not
+ *     denied (Conor, 2026-10-15).
  *
  * Backstops, like every Bash deny here (see the module comment).
  */
@@ -437,8 +475,7 @@ export const IRONCLAD_DENY_RULES: readonly string[] = [
     'mcp__github__create_or_update_file',
     'mcp__github__delete_file',
     'mcp__github__delete_repository',
-    'mcp__supabase__apply_migration',
-    'mcp__supabase__execute_sql',
+    ...SUPABASE_MIGRATION_TOOLS,
   ]),
 ];
 

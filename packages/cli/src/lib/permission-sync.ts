@@ -14,9 +14,9 @@
  * What it does. It adds each rule the profile has and the file lacks,
  * appended after the file's own rules in profile order. It removes only the
  * retired denies (RETIRED_DENY_RULES, spelled exactly), which earlier
- * profiles carried and which would otherwise keep a studio from ever
- * approving a delete; it never reorders a rule and keeps every other
- * setting. Two exceptions keep an author's explicit choice:
+ * profiles carried and which would otherwise keep a studio from doing what
+ * its profile now allows, and never one its own profile still denies; it
+ * never reorders a rule and keeps every other setting. Two exceptions keep an author's explicit choice:
  *   - a profile deny is not added when it would refuse something the file
  *     allows by name (`Bash(yarn install*)` against an authored
  *     `Bash(yarn install)`, `mcp__github__create_pull_request` against the
@@ -194,7 +194,11 @@ export function planProfileSync(
     addDeny.push(rule);
   }
 
-  const removeDeny = deny.filter((rule) => RETIRED_DENY_RULES.includes(rule));
+  // A retired deny the studio's own profile still carries stays: the
+  // reviewer keeps denying the PR and SQL tools the builder no longer does.
+  const removeDeny = deny.filter(
+    (rule) => RETIRED_DENY_RULES.includes(rule) && !rules.deny.includes(rule)
+  );
 
   const next: Record<string, unknown> = { ...permissions };
   if (addAllow.length > 0) next.allow = [...allow, ...addAllow];

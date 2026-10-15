@@ -430,17 +430,6 @@ export class ClaudeRunner implements IRunner {
       args.push('--append-system-prompt', config.appendSystemPrompt);
     }
 
-    // sandbox_bypass (studio override > SB default, resolved by the session
-    // service): no permission prompts, the way an attached `ink --yolo`
-    // session runs. A headless turn has nobody to answer a prompt, so without
-    // it every tool off the allow lists is refused, WebSearch included
-    // (Conor, 2026-10-15). Deny rules still apply in this mode, and so does
-    // the PreToolUse hook's destructive-command check (Claude Code docs:
-    // permission modes; hooks guide).
-    if (config.sandboxBypass) {
-      args.push('--dangerously-skip-permissions');
-    }
-
     // Allow access to ~/.ink/files (Telegram/Discord/Slack media downloads, Gmail attachments)
     const inkFilesDir = join(homedir(), '.ink', 'files');
     args.push('--add-dir', inkFilesDir);

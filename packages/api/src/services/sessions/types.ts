@@ -917,11 +917,7 @@ export interface ClaudeRunnerConfig {
   channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
-  /**
-   * When true, the turn runs without permission prompts: Codex gets
-   * --dangerously-bypass-approvals-and-sandbox, Claude gets
-   * --dangerously-skip-permissions. Opt-in per SB, overridable per studio.
-   */
+  /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
   /**
    * Set by a runner when it has already prefixed this turn's message with the

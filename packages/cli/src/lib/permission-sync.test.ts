@@ -84,11 +84,13 @@ describe('planProfileSync', () => {
   });
 
   it('does not add a deny that would refuse what the file allows by name, and says so', () => {
-    const plan = planProfileSync(ROOT_COPY, builder);
+    // The reviewer still denies opening a PR, which the builder no longer
+    // does, and denies every push, which the file allows in its legacy form.
+    const plan = planProfileSync(ROOT_COPY, reviewer);
     expect(plan.addDeny).not.toContain('mcp__github__create_pull_request');
     expect(plan.addDeny).not.toContain('Bash(yarn install*)');
     expect(plan.kept.map((k) => k.rule).sort()).toEqual(
-      ['Bash(yarn install*)', 'mcp__github__create_pull_request'].sort()
+      ['Bash(git push *)', 'Bash(yarn install*)', 'mcp__github__create_pull_request'].sort()
     );
     expect(plan.kept.every((k) => k.list === 'deny')).toBe(true);
     expect(plan.kept.find((k) => k.rule === 'Bash(yarn install*)')!.reason).toContain(
@@ -96,8 +98,11 @@ describe('planProfileSync', () => {
     );
     // Every other deny is added: a broad allow does not block a backstop.
     expect(plan.addDeny).toEqual(
-      builder.deny.filter(
-        (r) => r !== 'mcp__github__create_pull_request' && r !== 'Bash(yarn install*)'
+      reviewer.deny.filter(
+        (r) =>
+          r !== 'mcp__github__create_pull_request' &&
+          r !== 'Bash(yarn install*)' &&
+          r !== 'Bash(git push *)'
       )
     );
   });
@@ -381,5 +386,27 @@ describe('retired denies (spec automated-turn-permissions §3.4)', () => {
     expect(plan.state).toBe('authored');
     expect(plan.removeDeny).toEqual(['Bash(rm -rf *)']);
     expect(plan.permissions).toEqual(builderRules);
+  });
+
+  it("lifts a builder's old PR and SQL denies, and keeps a reviewer's", () => {
+    const lifted = [
+      'mcp__github__create_pull_request',
+      'mcp__github__update_pull_request',
+      'mcp__github__update_pull_request_branch',
+      'mcp__supabase__execute_sql',
+    ];
+    const file = { allow: ['Bash(*)'], deny: ['Bash(sudo *)', ...lifted] };
+
+    const built = planProfileSync(file, builderRules);
+    expect(built.removeDeny).toEqual(lifted);
+    expect((built.permissions as { deny: string[] }).deny).not.toEqual(
+      expect.arrayContaining(['mcp__supabase__execute_sql'])
+    );
+
+    const reviewed = planProfileSync(file, studioPermissionRules('reviewer', 'wren'));
+    expect(reviewed.removeDeny).toEqual([]);
+    expect((reviewed.permissions as { deny: string[] }).deny).toEqual(
+      expect.arrayContaining(lifted)
+    );
   });
 });

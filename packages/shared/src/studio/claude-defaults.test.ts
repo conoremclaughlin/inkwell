@@ -139,12 +139,16 @@ describe('the builder profile — composition', () => {
     }
   });
 
-  it('denies the GitHub tools that open, merge, close or retarget a PR or write a branch or file', () => {
+  it('opens and updates its PR, and is denied merging or writing a branch or file through the API', () => {
     for (const tool of [
       'mcp__github__create_pull_request',
-      'mcp__github__merge_pull_request',
       'mcp__github__update_pull_request',
       'mcp__github__update_pull_request_branch',
+    ]) {
+      expect(decide(builder(), { tool }), tool).toBe('allow');
+    }
+    for (const tool of [
+      'mcp__github__merge_pull_request',
       'mcp__github__push_files',
       'mcp__github__create_or_update_file',
       'mcp__github__delete_file',
@@ -160,10 +164,10 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), { tool: 'mcp__github__add_issue_comment' })).toBe('ask');
   });
 
-  it('reads GitHub and Supabase, and is denied the database writes', () => {
+  it('reads GitHub and Supabase and runs SQL, and is denied applying a migration through the tool', () => {
     expect(decide(builder(), { tool: 'mcp__github__pull_request_read' })).toBe('allow');
     expect(decide(builder(), { tool: 'mcp__supabase__list_tables' })).toBe('allow');
-    expect(decide(builder(), { tool: 'mcp__supabase__execute_sql' })).toBe('deny');
+    expect(decide(builder(), { tool: 'mcp__supabase__execute_sql' })).toBe('allow');
     expect(decide(builder(), { tool: 'mcp__supabase__apply_migration' })).toBe('deny');
   });
 
@@ -186,10 +190,15 @@ describe('the builder profile — composition', () => {
 
   it('the destructive local commands are no longer denied: the PreToolUse hook decides them', () => {
     // A deny cannot be approved by anyone (spec automated-turn-permissions §3.4).
-    for (const rules of [builder(), reviewer()]) {
-      for (const retired of defaults.RETIRED_DENY_RULES) {
-        expect(rules.deny).not.toContain(retired);
-      }
+    for (const retired of defaults.RETIRED_DENY_RULES) {
+      expect(builder().deny).not.toContain(retired);
+      if (retired.startsWith('Bash(')) expect(reviewer().deny).not.toContain(retired);
+    }
+    // The PR and SQL tools the builder no longer denies stay denied for a
+    // reviewer, so sync must not strip them from a reviewer studio.
+    for (const tool of [...defaults.GITHUB_PR_TOOLS, ...defaults.SUPABASE_SQL_TOOLS]) {
+      expect(defaults.RETIRED_DENY_RULES).toContain(tool);
+      expect(reviewer().deny).toContain(tool);
     }
     expect(defaults.DEFAULT_CLAUDE_DENY_RULES).toEqual([
       'Bash(git push --force *)',
@@ -262,6 +271,7 @@ describe('the reviewer profile — composition', () => {
     }
     for (const tool of [
       ...defaults.GITHUB_PUBLISH_TOOLS,
+      ...defaults.GITHUB_PR_TOOLS,
       ...defaults.GITHUB_OTHER_WRITE_TOOLS,
       ...defaults.SUPABASE_WRITE_TOOLS,
     ]) {
@@ -489,9 +499,12 @@ describe('the automated rules — yolo with ironclad denies (spec automated-turn
       'mcp__github__create_or_update_file',
       'mcp__github__delete_file',
       'mcp__supabase__apply_migration',
-      'mcp__supabase__execute_sql',
     ]) {
       expect(decide(yolo(), { tool }), tool).toBe('deny');
+    }
+    // SQL and the PR's own tools are not ironclad (Conor, 2026-10-15).
+    for (const tool of ['mcp__supabase__execute_sql', 'mcp__github__create_pull_request']) {
+      expect(decide(yolo(), { tool }), tool).toBe('allow');
     }
   });
 
