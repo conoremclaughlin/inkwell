@@ -6,9 +6,10 @@
  * Two things are pinned. Every refusal is a JSON `deny` with exit 0, never
  * plain text with exit 1, which Claude Code treats as a non-blocking error
  * and runs the tool anyway (docs: hooks, "Exit code output"). And the
- * destructive-command decision: allowed inside the session's own linked
- * worktree, asked of a person attached, and requested from Conor without
- * waiting for a headless turn.
+ * destructive-command decision, made only for a turn the server spawned:
+ * allowed inside the session's own linked worktree, and otherwise requested
+ * from Conor without waiting. A person attached gets no decision from it and
+ * runs as Claude Code normally would.
  *
  * Needs the CLI built (`yarn workspace @inklabs/cli build`), as the other
  * entry-point tests do.
@@ -16,7 +17,7 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -51,7 +52,7 @@ afterEach(async () => {
 });
 
 /** A server that answers approval-request creation, recording each body. */
-async function approvalServer(options: { grant?: boolean } = {}): Promise<{
+async function approvalServer(options: { grant?: boolean; grantOnce?: boolean } = {}): Promise<{
   url: string;
   bodies: Array<Record<string, unknown>>;
   consumes: Array<Record<string, unknown>>;
@@ -64,18 +65,18 @@ async function approvalServer(options: { grant?: boolean } = {}): Promise<{
     req.on('end', () => {
       if (req.method === 'POST' && req.url === '/api/admin/approval-requests/consume') {
         consumes.push(JSON.parse(raw) as Record<string, unknown>);
+        // grantOnce is a real one-use grant: only the first consume spends it.
+        const granted = options.grant || (options.grantOnce && consumes.length === 1);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
-          JSON.stringify(
-            options.grant ? { granted: true, requestId: 'req-granted' } : { granted: false }
-          )
+          JSON.stringify(granted ? { granted: true, requestId: 'req-granted' } : { granted: false })
         );
         return;
       }
       if (req.method === 'POST' && req.url === '/api/admin/approval-requests') {
         bodies.push(JSON.parse(raw) as Record<string, unknown>);
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ requestId: 'req-fixture-1' }));
+        res.end(JSON.stringify({ requestId: `req-fixture-${bodies.length}` }));
         return;
       }
       res.writeHead(404).end();
@@ -99,7 +100,15 @@ interface HookRun {
 
 function runHook(
   command: string,
-  options: { cwd?: string; projectDir?: string; serverUrl?: string; context?: string } = {}
+  options: {
+    cwd?: string;
+    projectDir?: string;
+    serverUrl?: string;
+    context?: string;
+    claudeSessionId?: string;
+    claudeTmpdir?: string;
+    toolUseId?: string;
+  } = {}
 ): Promise<HookRun> {
   const cwd = options.cwd ?? worktree;
   const env: NodeJS.ProcessEnv = {
@@ -109,6 +118,7 @@ function runHook(
     INK_SERVER_URL: options.serverUrl ?? 'http://127.0.0.1:9',
     CLAUDE_PROJECT_DIR: options.projectDir ?? worktree,
     ...(options.context ? { INK_CONTEXT: options.context } : {}),
+    ...(options.claudeTmpdir ? { CLAUDE_CODE_TMPDIR: options.claudeTmpdir } : {}),
   };
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -140,39 +150,65 @@ function runHook(
         tool_name: 'Bash',
         tool_input: { command, description: 'fixture' },
         cwd,
+        ...(options.claudeSessionId ? { session_id: options.claudeSessionId } : {}),
+        ...(options.toolUseId ? { tool_use_id: options.toolUseId } : {}),
       })
     );
   });
 }
 
 describe('on-tool-approval: destructive commands', () => {
-  it('a delete inside the linked-worktree launch checkout runs: no decision, exit 0', async () => {
-    const run = await runHook('rm -rf dist');
+  it('headless, a delete inside the linked-worktree launch checkout runs: no decision, exit 0', async () => {
+    const server = await approvalServer();
+    const run = await runHook('rm -rf dist', { serverUrl: server.url, context: headless });
     expect(run.code).toBe(0);
     expect(run.decision).toBeUndefined();
   });
 
-  it('a delete inside the SB scratch directory runs', async () => {
-    const run = await runHook(`rm -rf ${join(home, '.ink', 'files', 'wren-scratch', 'x')}`);
+  it('headless, a delete inside the SB scratch directory runs', async () => {
+    const server = await approvalServer();
+    const run = await runHook(`rm -rf ${join(home, '.ink', 'files', 'wren-scratch', 'x')}`, {
+      serverUrl: server.url,
+      context: headless,
+    });
     expect(run.code).toBe(0);
     expect(run.decision).toBeUndefined();
+    expect(server.bodies).toHaveLength(0);
   });
 
-  it('attached, a delete outside asks the person: Claude Code shows its own prompt', async () => {
-    const run = await runHook(`rm -rf ${join(mainCheckout, 'dist')}`);
-    expect(run.code).toBe(0);
-    expect(run.decision?.permissionDecision).toBe('ask');
-    expect(run.decision?.permissionDecisionReason).toContain('not inside');
+  it.each([
+    ['a delete outside the studio', (): string => `rm -rf ${join(mainCheckout, 'dist')}`],
+    ['git reset --hard', (): string => 'git reset --hard'],
+    ['a quoted rm in another program', (): string => `python3 -c "print('rm -rf x')"`],
+  ])(
+    'attached, %s gets no decision and no request: it runs as Claude Code normally would',
+    async (_name, command) => {
+      const server = await approvalServer();
+      const run = await runHook(command(), { serverUrl: server.url });
+      expect(run.code).toBe(0);
+      expect(run.decision).toBeUndefined();
+      expect(server.bodies).toHaveLength(0);
+      expect(server.consumes).toHaveLength(0);
+    }
+  );
+
+  it('headless, a main checkout is never a root: deleting inside it is requested and denied', async () => {
+    const server = await approvalServer();
+    const run = await runHook('rm -rf dist', {
+      cwd: mainCheckout,
+      projectDir: mainCheckout,
+      serverUrl: server.url,
+      context: headless,
+    });
+    expect(run.decision?.permissionDecision).toBe('deny');
+    expect(server.bodies).toHaveLength(1);
   });
 
-  it('a main checkout is never a root: deleting inside it asks', async () => {
-    const run = await runHook('rm -rf dist', { cwd: mainCheckout, projectDir: mainCheckout });
-    expect(run.decision?.permissionDecision).toBe('ask');
-  });
-
-  it('git reset --hard always asks, even in the studio', async () => {
-    const run = await runHook('git reset --hard');
-    expect(run.decision?.permissionDecision).toBe('ask');
+  it('headless, git reset --hard is requested and denied, even in the studio', async () => {
+    const server = await approvalServer();
+    const run = await runHook('git reset --hard', { serverUrl: server.url, context: headless });
+    expect(run.decision?.permissionDecision).toBe('deny');
+    expect(server.bodies).toHaveLength(1);
   });
 
   it('headless, a delete outside requests approval and is denied at once, naming the request', async () => {
@@ -212,6 +248,187 @@ describe('on-tool-approval: destructive commands', () => {
     const run = await runHook(`rm -rf ${join(mainCheckout, 'dist')}`, { context: headless });
     expect(run.code).toBe(0);
     expect(run.decision?.permissionDecision).toBe('deny');
+  });
+
+  it('headless, a script hiding a scratch delete is sent back as a plain rm: Conor is not asked', async () => {
+    const server = await approvalServer();
+    const script = `bash -c 'set -e; V=${join(home, '.ink', 'files', 'wren-scratch')}/vt; rm -rf "$V/work"'`;
+    const run = await runHook(script, { serverUrl: server.url, context: headless });
+    expect(run.code).toBe(0);
+    expect(run.decision?.permissionDecision).toBe('deny');
+    expect(run.decision?.permissionDecisionReason).toContain('no approval was requested');
+    expect(run.decision?.permissionDecisionReason).toContain('plain `rm -rf <path>`');
+    expect(server.bodies).toHaveLength(0);
+    // A grant Conor already gave for this exact script would still be spent.
+    expect(server.consumes).toHaveLength(1);
+  });
+
+  it('headless, a single rm whose literal name needs quotes is requested as written (Lumen, #861)', async () => {
+    const server = await approvalServer();
+    const run = await runHook(`rm -rf '${join(mainCheckout, 'build cache')}'`, {
+      serverUrl: server.url,
+      context: headless,
+    });
+    expect(run.decision?.permissionDecision).toBe('deny');
+    expect(run.decision?.permissionDecisionReason).toContain('req-fixture-1');
+    expect(server.bodies).toHaveLength(1);
+  });
+
+  it('headless, a grant for such a script is spent and it runs', async () => {
+    const server = await approvalServer({ grant: true });
+    const run = await runHook(`bash -c 'rm -rf ${join(mainCheckout, 'dist')}'`, {
+      serverUrl: server.url,
+      context: headless,
+    });
+    expect(run.decision).toBeUndefined();
+    expect(server.bodies).toHaveLength(0);
+  });
+
+  describe("this Claude session's own scratchpad", () => {
+    const own = '6e9ea775-c73a-4936-8c70-51c8b50dff72';
+    const other = '0b0b0b0b-1111-4222-8333-444444444444';
+    const scratchpad = (session: string) =>
+      join(base, 'tmp', `claude-${process.getuid!()}`, '-proj', session, 'scratchpad');
+    const linked = '1c1c1c1c-2222-4333-8444-555555555555';
+    /** Make one component of the linked session's scratchpad path a link outside. */
+    const scratchpadLink = (outside: string, at: 'leaf' | 'session' | 'project'): string => {
+      const uidDir = join(base, 'tmp', `claude-${process.getuid!()}`);
+      if (at === 'leaf') {
+        mkdirSync(join(uidDir, '-proj', linked), { recursive: true });
+        symlinkSync(join(outside, 'scratchpad'), join(uidDir, '-proj', linked, 'scratchpad'));
+        return join(uidDir, '-proj', linked, 'scratchpad');
+      }
+      if (at === 'session') {
+        symlinkSync(join(outside, linked), join(uidDir, '-proj', linked));
+        return join(uidDir, '-proj', linked, 'scratchpad');
+      }
+      symlinkSync(join(outside, '-proj2'), join(uidDir, '-proj2'));
+      return join(uidDir, '-proj2', linked, 'scratchpad');
+    };
+
+    beforeEach(() => {
+      mkdirSync(join(scratchpad(own), 'out'), { recursive: true });
+      mkdirSync(join(scratchpad(other), 'out'), { recursive: true });
+    });
+
+    it('headless, a delete inside its own scratchpad runs', async () => {
+      const server = await approvalServer();
+      const run = await runHook(`rm -rf ${join(scratchpad(own), 'out')}`, {
+        serverUrl: server.url,
+        context: headless,
+        claudeSessionId: own,
+        claudeTmpdir: join(base, 'tmp'),
+      });
+      expect(run.decision).toBeUndefined();
+      expect(server.bodies).toHaveLength(0);
+    });
+
+    it("headless, another session's scratchpad is not this session's: it is requested", async () => {
+      const server = await approvalServer();
+      const run = await runHook(`rm -rf ${join(scratchpad(other), 'out')}`, {
+        serverUrl: server.url,
+        context: headless,
+        claudeSessionId: own,
+        claudeTmpdir: join(base, 'tmp'),
+      });
+      expect(run.decision?.permissionDecision).toBe('deny');
+      expect(server.bodies).toHaveLength(1);
+    });
+
+    it('headless, the shared claude-<uid> parent is never a root', async () => {
+      const server = await approvalServer();
+      const run = await runHook(
+        `rm -rf ${join(base, 'tmp', `claude-${process.getuid!()}`, '-proj')}`,
+        {
+          serverUrl: server.url,
+          context: headless,
+          claudeSessionId: own,
+          claudeTmpdir: join(base, 'tmp'),
+        }
+      );
+      expect(run.decision?.permissionDecision).toBe('deny');
+      expect(server.bodies).toHaveLength(1);
+    });
+
+    // Lumen, #861: a linked component would carry the root to wherever it
+    // points. Each of the three is a link to an outside directory here.
+    it.each([
+      ['the scratchpad itself', (outside: string) => scratchpadLink(outside, 'leaf')],
+      ['the session folder', (outside: string) => scratchpadLink(outside, 'session')],
+      ['the project folder', (outside: string) => scratchpadLink(outside, 'project')],
+    ])(
+      'headless, a link at %s is not a root: an outside delete through it is requested',
+      async (_name, link) => {
+        const outside = join(base, 'outside');
+        mkdirSync(join(outside, 'scratchpad', 'out'), { recursive: true });
+        mkdirSync(join(outside, '-proj2', linked, 'scratchpad', 'out'), { recursive: true });
+        mkdirSync(join(outside, linked, 'scratchpad', 'out'), { recursive: true });
+        const target = link(outside);
+        const server = await approvalServer();
+        const run = await runHook(`rm -rf ${join(target, 'out')}`, {
+          serverUrl: server.url,
+          context: headless,
+          claudeSessionId: linked,
+          claudeTmpdir: join(base, 'tmp'),
+        });
+        expect(run.decision?.permissionDecision).toBe('deny');
+        expect(server.bodies).toHaveLength(1);
+      }
+    );
+
+    it('a session id that is not a UUID names no scratchpad', async () => {
+      const server = await approvalServer();
+      const run = await runHook(`rm -rf ${join(scratchpad(own), 'out')}`, {
+        serverUrl: server.url,
+        context: headless,
+        claudeSessionId: '../../x',
+        claudeTmpdir: join(base, 'tmp'),
+      });
+      expect(run.decision?.permissionDecision).toBe('deny');
+    });
+  });
+
+  // A worktree reads the main checkout's settings too, so the hook can be
+  // registered twice under different spellings and run twice, in parallel,
+  // for one call. One copy spent the grant and the other asked again and
+  // denied, so an approval never took effect (2026-10-14).
+  describe('two copies of the hook for one tool call share one decision', () => {
+    it('a one-use grant is spent once and both copies allow', async () => {
+      const server = await approvalServer({ grantOnce: true });
+      const command = `rm -rf ${join(mainCheckout, 'dist')}`;
+      const options = { serverUrl: server.url, context: headless, toolUseId: 'toolu_double_1' };
+      const [first, second] = await Promise.all([
+        runHook(command, options),
+        runHook(command, options),
+      ]);
+      expect(first.decision).toBeUndefined();
+      expect(second.decision).toBeUndefined();
+      expect(server.consumes).toHaveLength(1);
+      expect(server.bodies).toHaveLength(0);
+    });
+
+    it('with no grant, one request is made and both copies deny naming it', async () => {
+      const server = await approvalServer();
+      const command = `rm -rf ${join(mainCheckout, 'dist')}`;
+      const options = { serverUrl: server.url, context: headless, toolUseId: 'toolu_double_2' };
+      const [first, second] = await Promise.all([
+        runHook(command, options),
+        runHook(command, options),
+      ]);
+      expect(server.bodies).toHaveLength(1);
+      expect(first.decision?.permissionDecision).toBe('deny');
+      expect(second.decision?.permissionDecision).toBe('deny');
+      expect(first.decision?.permissionDecisionReason).toContain('req-fixture-1');
+      expect(second.decision?.permissionDecisionReason).toContain('req-fixture-1');
+    });
+
+    it('different tool calls are decided separately', async () => {
+      const server = await approvalServer();
+      const command = `rm -rf ${join(mainCheckout, 'dist')}`;
+      await runHook(command, { serverUrl: server.url, context: headless, toolUseId: 'toolu_a' });
+      await runHook(command, { serverUrl: server.url, context: headless, toolUseId: 'toolu_b' });
+      expect(server.bodies).toHaveLength(2);
+    });
   });
 
   it('a command that is not destructive gets no decision', async () => {

@@ -203,3 +203,57 @@ describe('detection looks through operators and wrappers, as broadly as the deni
     expect(classify(command).kind).not.toBe('not-destructive');
   });
 });
+
+describe('asPlainRm: an rm the check could not read is sent back to be run plain', () => {
+  const asPlain = (command: string) => {
+    const verdict = classify(command);
+    return verdict.kind === 'needs-approval' ? verdict.asPlainRm === true : null;
+  };
+
+  it.each([
+    `bash -c 'set -e; V=${SCRATCH}/vt; rm -rf "$V/work"; mkdir -p "$V/work"'`,
+    'yarn build && rm -rf dist',
+    `cd ${STUDIO} && rm -rf dist`,
+    'sudo rm -rf /',
+    'timeout 5 rm --recursive x',
+    'FOO=1 rm -rf x',
+  ])('%j: needs approval, as a plain rm', (command) => {
+    expect(asPlain(command)).toBe(true);
+  });
+
+  it.each([
+    // A plain rm is already fully checked: outside a root it is asked as is.
+    ['/h/ws/repo/dist', 'rm -rf /h/ws/repo/dist'],
+    ['a .. segment', `rm -rf ${STUDIO}/a/../b`],
+    // Any git kind in the command keeps it asked about as written.
+    ['git reset with an rm', 'git reset --hard && rm -rf dist'],
+    ['git clean alone', 'git clean -fdx'],
+    // Already as plain as it gets: a literal name that needs quoting (Lumen, #861).
+    ['a quoted operand', "rm -rf '/outside/build cache'"],
+    ['an escaped operand', 'rm -rf /outside/build\\ cache'],
+    ['a double-quoted scratch operand', `rm -rf "${SCRATCH}/x"`],
+    // Literal names that look like syntax (Lumen, #861 round 2).
+    ['a quoted name with parentheses', "rm -rf '/outside/build (old)'"],
+    ['a quoted name with a dollar sign', "rm -rf '/outside/$cache'"],
+    ['a compound that starts with rm', 'rm -rf /outside/a && rm -rf /outside/b'],
+    ['a variable in a single rm', 'rm -rf "$HOME/x"'],
+  ])('%s: needs approval as written, never sent back', (_name, command) => {
+    expect(asPlain(command)).toBe(false);
+  });
+
+  it('the plain form of an in-scope delete is then allowed', () => {
+    expect(classify(`rm -rf ${SCRATCH}/vt/work`).kind).toBe('allowed');
+  });
+});
+
+describe('a heredoc is never read as data: everything in it stays in view (Lumen, #861 round 2)', () => {
+  it.each([
+    ['substitution in a heredoc cat reads', 'cat <<EOF\n$(rm -rf /outside/x)\nEOF'],
+    ['backticks in a heredoc cat reads', 'cat <<EOF\n`rm -rf /outside/x`\nEOF'],
+    ['a quoted <<EOF then a real rm', "echo '<<EOF'\nrm -rf /outside/x"],
+    ['a here-string then a real rm', 'cat <<<EOF\nrm -rf /outside/x'],
+    ['a shell mid-pipeline', "cat <<'EOF' | sh | cat\nrm -rf /outside/x\nEOF"],
+  ])('%s is destructive', (_name, command) => {
+    expect(classify(command).kind).not.toBe('not-destructive');
+  });
+});
