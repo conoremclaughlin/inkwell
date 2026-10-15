@@ -3,10 +3,8 @@
  * (ink://specs/inkling-multi-person-groups, Phase 2 gate 1).
  *
  * The MCP server refuses to authenticate by a marked session's context, so a
- * marked row must stay marked and an unmarked one stay unmarked. The
- * migration adds only the CHECK constraint: DB-level immutability needs a
- * trigger, and the Oct 4 rule keeps triggers for Conor to decide. So the
- * guarantee lives in the server's own code, and this file pins it:
+ * marked row must stay marked and an unmarked one stay unmarked. Server code
+ * never writes the column after insert, and this file pins that:
  *
  * - every update or upsert chained onto from('sessions') in api source
  *   builds its payload from keys named in that source, and no key is
@@ -14,10 +12,13 @@
  *   caller's object, the payload handed to a function) fails the census;
  * - the builders that take a caller's object drop a turnScope or turn_scope
  *   smuggled into it;
- * - no migration but the marker's own names the column.
+ * - no migration names the column but the marker's own and the trigger's.
  *
- * Outside this bound: a service-role or raw SQL write, and a query builder
+ * Outside this census: a service-role or raw SQL write, and a query builder
  * stored in a variable before .update is called on it (none exists today).
+ * The database trigger session_turn_scope_immutable is the floor under it:
+ * any update that changes the column is refused, whoever writes it
+ * (approved by Conor, Oct 15, 2026, as defense in depth).
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -39,6 +40,7 @@ import { SessionRepository } from '../../services/sessions/session-repository';
 const API_SRC = fileURLToPath(new URL('../../', import.meta.url));
 const MIGRATIONS = fileURLToPath(new URL('../../../../../supabase/migrations/', import.meta.url));
 const MARKER_MIGRATION = '20261015070518_sessions_turn_scope_marker.sql';
+const TRIGGER_MIGRATION = '20261015203541_sessions_turn_scope_immutable.sql';
 const FORBIDDEN = 'turn_scope';
 
 interface SessionWrite {
@@ -413,12 +415,12 @@ describe('the builders that take a caller’s object drop a smuggled turn_scope'
   });
 });
 
-describe('no migration but the marker names turn_scope', () => {
-  it('finds the column only where it is added', () => {
+describe('no migration but the marker and its trigger names turn_scope', () => {
+  it('finds the column only where it is added and where it is held fixed', () => {
     const naming = readdirSync(MIGRATIONS).filter(
       (name) =>
         name.endsWith('.sql') && readFileSync(join(MIGRATIONS, name), 'utf8').includes(FORBIDDEN)
     );
-    expect(naming).toEqual([MARKER_MIGRATION]);
+    expect(naming.sort()).toEqual([MARKER_MIGRATION, TRIGGER_MIGRATION]);
   });
 });
