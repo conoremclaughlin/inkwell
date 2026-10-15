@@ -14,7 +14,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { AxiosAdapter } from 'axios';
-import { apiClient, apiGet } from './client';
+import { apiClient, apiGet, apiPost } from './client';
 import { useWorkspaceApiQuery } from './hooks';
 import {
   getSelectedWorkspaceId,
@@ -53,6 +53,26 @@ afterEach(() => {
 });
 
 describe('workspace-bound requests', () => {
+  it('binds a send before an asynchronous interceptor can see a later selection', async () => {
+    setSelectedWorkspaceId('fixture-workspace-a');
+    const pending = apiPost(
+      '/api/admin/threads',
+      { key: 'fixture:thread:send' },
+      {
+        workspaceId: 'fixture-workspace-a',
+      }
+    );
+    setSelectedWorkspaceId('fixture-workspace-b');
+    await pending;
+    expect(sent).toEqual(['fixture-workspace-a']);
+  });
+
+  it('keeps a send explicitly bound to the default workspace', async () => {
+    setSelectedWorkspaceId('fixture-workspace-b');
+    await apiPost('/api/admin/threads', {}, { workspaceId: null });
+    expect(sent).toEqual([null]);
+  });
+
   it('ask their own workspace, whatever is selected', async () => {
     setSelectedWorkspaceId('fixture-workspace-b');
     await apiGet('/api/admin/threads/messages?key=a', { workspaceId: 'fixture-workspace-a' });

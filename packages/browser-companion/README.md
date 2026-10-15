@@ -85,6 +85,13 @@ clicks, navigation or submission commands are accepted. Replies remain untrusted
 - A storage receipt does not mean the recipient was woken or read the request.
   Structured trigger failures are shown explicitly. Ambiguous send/fill responses
   are never automatically retried; inspect the thread/page before trying again.
+- The dashboard's **Check original thread** link carries the send's workspace and
+  thread key. Its read-only recovery page keeps both bound on requests and in its
+  cache, even if the dashboard changes workspace. It never changes that selection,
+  retries a send, or offers reply/reaction controls. Finding a thread is not a
+  receipt for a particular operation. The extension's future delivery-check
+  adapter can build this same target with `browserRecoveryPath`; a durable
+  operation lookup is still separate work.
 - A fill is at-most-once, not transactional. A site can change later fields during
   an input event; partial application is reported without pretending to roll back.
 

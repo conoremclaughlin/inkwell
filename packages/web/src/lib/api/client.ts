@@ -123,8 +123,16 @@ export async function apiGet<T>(path: string, binding?: WorkspaceBinding): Promi
 /**
  * POST request
  */
-export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  const response = await apiClient.post<T>(path, body);
+export async function apiPost<T>(
+  path: string,
+  body?: unknown,
+  binding?: WorkspaceBinding
+): Promise<T> {
+  const response = await apiClient.post<T>(
+    path,
+    body,
+    binding ? { inkWorkspace: binding } : undefined
+  );
   return response.data;
 }
 

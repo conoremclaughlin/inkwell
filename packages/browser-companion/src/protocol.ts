@@ -6,6 +6,30 @@ export const MAX_TEXT = 12_000;
 export const MAX_FIELDS = 40;
 export const BRIDGE_PATH = '/browser-companion';
 
+/** Recovery is read-only and explicitly scoped, never the dashboard's current selection. */
+export function browserRecoveryPath(key: string, workspaceId: string | null): string {
+  return `${BRIDGE_PATH}/recovery?${new URLSearchParams({ key, workspace: workspaceId ?? 'default' })}`;
+}
+
+export function parseBrowserRecoveryTarget(params: URLSearchParams): {
+  key: string;
+  workspaceId: string | null;
+} | null {
+  const key = params.get('key');
+  const workspace = params.get('workspace');
+  if (
+    params.getAll('key').length !== 1 ||
+    params.getAll('workspace').length !== 1 ||
+    !key?.trim() ||
+    key.length > 500 ||
+    !workspace ||
+    (workspace !== 'default' &&
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(workspace))
+  )
+    return null;
+  return { key, workspaceId: workspace === 'default' ? null : workspace };
+}
+
 export interface BrowserField {
   id: string;
   label: string;

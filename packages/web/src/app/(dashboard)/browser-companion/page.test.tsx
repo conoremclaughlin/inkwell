@@ -4,6 +4,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { formatBrowserRequest, type BrowserSnapshot } from '@inklabs/browser-companion/protocol';
 import * as protocol from '@inklabs/browser-companion/protocol';
 import BrowserCompanionPage from './page';
+import { setSelectedWorkspaceId } from '@/lib/workspace-selection';
+
+const WORKSPACE_A = '00000000-0000-4000-8000-00000000000a';
+const WORKSPACE_B = '00000000-0000-4000-8000-00000000000b';
+const query = vi.hoisted(() => vi.fn());
 
 const post = vi.hoisted(() => vi.fn());
 const replyState = vi.hoisted(() => ({
@@ -15,6 +20,12 @@ const replyState = vi.hoisted(() => ({
   }>,
 }));
 vi.mock('@/lib/api', () => ({
+  useWorkspaceApiQuery: (key: string[], path: string, workspaceId: string | null) => {
+    query(key, path, workspaceId);
+    return key[0] === 'companion-recipients'
+      ? { data: { individuals: [{ sbSlug: 'fixture-sb', name: 'Fixture SB' }] } }
+      : { data: replyState };
+  },
   apiPost: post,
   useApiQuery: (key: string[]) =>
     key[0] === 'companion-recipients'
@@ -50,6 +61,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   replyState.messages = [];
+  setSelectedWorkspaceId(null);
 });
 describe('browser dashboard human-send boundary', () => {
   it('scans attention cues per capture rather than on every instruction edit', () => {
@@ -83,12 +95,16 @@ describe('browser dashboard human-send boundary', () => {
     post.mockResolvedValue({ messageId: 'synthetic-message' });
     fireEvent.click(send);
     await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
-    expect(post).toHaveBeenCalledWith('/api/admin/threads', {
-      key: `thread:browser-${snapshot.id}`,
-      recipients: ['fixture-sb'],
-      title: 'Browser assistance',
-      content: formatBrowserRequest(snapshot, 'Investigate this page'),
-    });
+    expect(post).toHaveBeenCalledWith(
+      '/api/admin/threads',
+      {
+        key: `thread:browser-${snapshot.id}`,
+        recipients: ['fixture-sb'],
+        title: 'Browser assistance',
+        content: formatBrowserRequest(snapshot, 'Investigate this page'),
+      },
+      { workspaceId: null }
+    );
     await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Stored'));
     expect(send.disabled).toBe(true);
   });
@@ -111,8 +127,8 @@ describe('browser dashboard human-send boundary', () => {
       expect(screen.getByRole('status').textContent).toContain('may have been stored')
     );
     expect(post).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('link', { name: 'Open thread' }).getAttribute('href')).toBe(
-      `/threads?key=${encodeURIComponent(`thread:browser-${snapshot.id}`)}`
+    expect(screen.getByRole('link', { name: 'Check original thread' }).getAttribute('href')).toBe(
+      `/browser-companion/recovery?key=${encodeURIComponent(`thread:browser-${snapshot.id}`)}&workspace=default`
     );
     expect((screen.getByText('Send reviewed context') as HTMLButtonElement).disabled).toBe(true);
   });
@@ -133,7 +149,7 @@ describe('browser dashboard human-send boundary', () => {
     expect(screen.getByRole('status').textContent).toContain('New capture');
     expect(post).not.toHaveBeenCalled();
   });
-  it('surfaces structured trigger failures without claiming the recipient is dead', () => {
+  it('surfaces structured trigger failures without claiming the recipient is dead', async () => {
     replyState.messages = [
       {
         id: 'synthetic-failure',
@@ -144,6 +160,11 @@ describe('browser dashboard human-send boundary', () => {
     ];
     render(<BrowserCompanionPage />);
     act(() => offer());
+    fireEvent.change(screen.getByLabelText('Instruction'), { target: { value: 'Investigate' } });
+    fireEvent.change(screen.getByLabelText('Recipient'), { target: { value: 'fixture-sb' } });
+    post.mockResolvedValue({ messageId: 'synthetic-message' });
+    fireEvent.click(screen.getByText('Send reviewed context'));
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Stored'));
     expect(screen.getByRole('alert').textContent).toContain('wake-up attempt failed');
     expect(screen.getByRole('alert').textContent).toContain('not confirmed');
   });
@@ -159,5 +180,42 @@ describe('browser dashboard human-send boundary', () => {
     expect((screen.getByText('Send reviewed context') as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText('Review new capture — keep my instruction')).toBeNull();
     expect(post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('browser recovery workspace binding', () => {
+  it('keeps the original workspace on POST, reply reads, and recovery after a switch', async () => {
+    setSelectedWorkspaceId(WORKSPACE_A);
+    render(<BrowserCompanionPage />);
+    act(() => offer());
+    fireEvent.change(screen.getByLabelText('Instruction'), { target: { value: 'Investigate' } });
+    fireEvent.change(screen.getByLabelText('Recipient'), { target: { value: 'fixture-sb' } });
+    post.mockRejectedValue(new Error('Synthetic lost receipt'));
+    fireEvent.click(screen.getByText('Send reviewed context'));
+    await waitFor(() =>
+      expect(screen.getByRole('status').textContent).toContain('may have been stored')
+    );
+    act(() => setSelectedWorkspaceId(WORKSPACE_B));
+    expect(post.mock.calls[0][2]).toEqual({ workspaceId: WORKSPACE_A });
+    expect(
+      screen.getByRole('link', { name: 'Check original thread' }).getAttribute('href')
+    ).toContain('workspace=' + WORKSPACE_A);
+    expect(query.mock.calls.filter(([key]) => key[0] === 'companion-replies').at(-1)?.[2]).toBe(
+      WORKSPACE_A
+    );
+    expect(post).toHaveBeenCalledTimes(1);
+    expect((screen.getByText('Send reviewed context') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('requires a recipient choice in the new workspace before an unsent capture can be sent', () => {
+    setSelectedWorkspaceId(WORKSPACE_A);
+    render(<BrowserCompanionPage />);
+    act(() => offer());
+    fireEvent.change(screen.getByLabelText('Instruction'), { target: { value: 'Investigate' } });
+    fireEvent.change(screen.getByLabelText('Recipient'), { target: { value: 'fixture-sb' } });
+    act(() => setSelectedWorkspaceId(WORKSPACE_B));
+    expect((screen.getByLabelText('Recipient') as HTMLSelectElement).value).toBe('');
+    fireEvent.click(screen.getByText('Send reviewed context'));
+    expect(post).not.toHaveBeenCalled();
   });
 });

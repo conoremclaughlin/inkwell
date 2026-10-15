@@ -1,15 +1,17 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   assertFresh,
+  browserRecoveryPath,
   formatBrowserRequest,
   parseSnapshot,
   privacySignals,
   proposalFromMessage,
   type BrowserSnapshot,
 } from '@inklabs/browser-companion/protocol';
-import { apiPost, useApiQuery } from '@/lib/api';
+import { apiPost, useWorkspaceApiQuery } from '@/lib/api';
+import { getSelectedWorkspaceId, subscribeSelectedWorkspace } from '@/lib/workspace-selection';
 
 interface Message {
   id: string;
@@ -26,11 +28,17 @@ interface SendResult {
  * and propose changes, never invoke authenticated API calls on its own.
  */
 export default function BrowserCompanionPage() {
+  const workspaceId = useSyncExternalStore(
+    subscribeSelectedWorkspace,
+    getSelectedWorkspaceId,
+    () => null
+  );
   const [offer, setOffer] = useState<{ bridgeId: string; snapshot: BrowserSnapshot } | null>(null);
   const offerRef = useRef(offer);
   const [nextOffer, setNextOffer] = useState<typeof offer>(null);
   const [instruction, setInstruction] = useState('');
-  const [recipient, setRecipient] = useState('');
+  const [choice, setChoice] = useState<{ slug: string; workspaceId: string | null } | null>(null);
+  const recipient = choice?.workspaceId === workspaceId ? choice.slug : '';
   const [status, setStatus] = useState(
     'Waiting for a capture. Open the extension on a page, capture, then choose “Review in Inkwell”.'
   );
@@ -38,20 +46,23 @@ export default function BrowserCompanionPage() {
   const attemptedRef = useRef(false);
   // Keep the attempted key even if the storage receipt is lost. Recovery
   // reads this exact thread, rather than risking a duplicate send.
-  const [sentKey, setSentKey] = useState('');
+  const [sent, setSent] = useState<{ key: string; workspaceId: string | null } | null>(null);
+  const sentKey = sent?.key ?? '';
   const capture = offer?.snapshot;
   const privacyHints = useMemo(() => (capture ? privacySignals(capture) : ''), [capture]);
-  const { data: people, error: peopleError } = useApiQuery<{
+  const { data: people, error: peopleError } = useWorkspaceApiQuery<{
     individuals: Array<{ sbSlug: string; name: string }>;
-  }>(['companion-recipients'], '/api/admin/individuals');
-  const { data: replies, error: repliesError } = useApiQuery<{
+  }>(['companion-recipients'], '/api/admin/individuals', workspaceId);
+  const { data: replyData, error: repliesError } = useWorkspaceApiQuery<{
     messages: Message[];
     meta?: { truncated?: boolean };
   }>(
     ['companion-replies', sentKey],
     `/api/admin/threads/messages?key=${encodeURIComponent(sentKey)}`,
+    sent?.workspaceId ?? null,
     { enabled: !!sentKey, refetchInterval: sentKey ? 5000 : false }
   );
+  const replies = sent ? replyData : undefined;
 
   useEffect(() => {
     const receive = (event: MessageEvent) => {
@@ -113,6 +124,9 @@ export default function BrowserCompanionPage() {
   }
   async function send() {
     if (!offer || !payload || !recipient || attemptedRef.current) return;
+    // A switch may happen before React has rerendered. Never carry a selected
+    // recipient into another workspace, even in that gap.
+    if (getSelectedWorkspaceId() !== workspaceId) return;
     try {
       assertFresh(offer.snapshot);
     } catch {
@@ -123,13 +137,17 @@ export default function BrowserCompanionPage() {
       attemptedRef.current = true;
       setAttempted(true);
       const key = `thread:browser-${offer.snapshot.id}`;
-      setSentKey(key);
-      const result = await apiPost<SendResult>('/api/admin/threads', {
-        key,
-        recipients: [recipient],
-        content: payload,
-        title: 'Browser assistance',
-      });
+      setSent({ key, workspaceId });
+      const result = await apiPost<SendResult>(
+        '/api/admin/threads',
+        {
+          key,
+          recipients: [recipient],
+          content: payload,
+          title: 'Browser assistance',
+        },
+        { workspaceId }
+      );
       if (offerRef.current?.snapshot.id !== offer.snapshot.id) return;
       if (!result.messageId) throw new Error('No storage receipt');
       setStatus(
@@ -178,7 +196,7 @@ export default function BrowserCompanionPage() {
             setNextOffer(null);
             attemptedRef.current = false;
             setAttempted(false);
-            setSentKey('');
+            setSent(null);
             setStatus(
               'New capture selected. Your instruction is preserved; review the changed payload before sending again.'
             );
@@ -213,7 +231,7 @@ export default function BrowserCompanionPage() {
                 className="ml-2 rounded border bg-background p-2"
                 value={recipient}
                 disabled={attempted}
-                onChange={(e) => setRecipient(e.target.value)}
+                onChange={(e) => setChoice({ slug: e.target.value, workspaceId })}
               >
                 <option value="">Choose an SB</option>
                 {people?.individuals.map((p) => (
@@ -251,10 +269,14 @@ export default function BrowserCompanionPage() {
           </section>
           <section className="space-y-3">
             <h2 className="font-semibold">Conversation</h2>
-            {sentKey && (
-              <a className="underline" href={`/threads?key=${encodeURIComponent(sentKey)}`}>
-                Open thread
-              </a>
+            {sent && (
+              <p className="text-sm">
+                <a className="underline" href={browserRecoveryPath(sent.key, sent.workspaceId)}>
+                  Check original thread
+                </a>{' '}
+                — read-only, in the workspace used for this send. Switching the dashboard does not
+                move this request.
+              </p>
             )}
             {replies?.meta?.truncated && <p>Only the latest 100 messages are shown.</p>}
             {replies?.messages.some(
