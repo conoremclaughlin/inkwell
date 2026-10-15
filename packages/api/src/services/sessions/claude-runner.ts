@@ -631,6 +631,7 @@ export class ClaudeRunner implements IRunner {
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         // Session env vars
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,

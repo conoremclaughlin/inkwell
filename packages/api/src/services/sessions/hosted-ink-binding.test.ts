@@ -9,6 +9,12 @@ import { registerActiveRun, resetActiveRuns, submitRunSteering } from './active-
 import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
 import type { ClaudeRunnerConfig } from './types';
 import type { HostedInkSessionPorts } from './hosted-ink-session';
+vi.mock('../../config/env', async () => ({
+  env: (await import('../../test/fake-env')).fakeEnv,
+}));
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 const roots: string[] = [];
 beforeEach(() => resetActiveRuns());
 afterEach(async () => {
@@ -90,6 +96,7 @@ describe('server binding, admitted identity and explicit resources', () => {
         INK_MCP_URL: 'http://127.0.0.1:49271/mcp',
       });
       const env = await host.sessionEnv({ hardTimeoutMs: 30_000 });
+      expect(env.INK_RUNNER_AUTH_REQUIRED).toBe('1');
       const minted = verifyInkAccessToken(env.INK_ACCESS_TOKEN!, 'mcp_access')!;
       expect(minted.sessionId).toBe(h.sessionId);
       expect(minted.sub).toBe('fixture-user');
@@ -118,6 +125,8 @@ describe('server binding, admitted identity and explicit resources', () => {
     expect(verifyInkAccessToken(headers.Authorization.slice(7))?.sessionId).toBe(h.sessionId);
   });
   it.each([
+    'missing',
+    'malformed',
     'other-session',
     'other-owner',
     'expired',
@@ -127,6 +136,8 @@ describe('server binding, admitted identity and explicit resources', () => {
     'admin-token',
   ] as const)('refuses %s before effects or provider execution', async (kind) => {
     const h = await setup();
+    if (kind === 'missing') h.config.inkAccessToken = undefined;
+    if (kind === 'malformed') h.config.inkAccessToken = 'not-a-credential';
     if (kind === 'other-session')
       h.config.inkAccessToken = signRunnerAccessToken(
         {

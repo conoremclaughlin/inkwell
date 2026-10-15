@@ -239,6 +239,7 @@ describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
 describe('sessionEnvHandoff: a session process hands its own session state to its child', () => {
   const childEnv: Record<string, string> = {
     INK_ACCESS_TOKEN: 'child-session-token',
+    INK_RUNNER_AUTH_REQUIRED: '1',
     INK_DELEGATION_SECRET: 'synthetic-derived-secret',
     INK_SESSION_ID: 'sess-1',
     INK_STUDIO_ID: 'studio-1',
@@ -258,6 +259,7 @@ describe('sessionEnvHandoff: a session process hands its own session state to it
     const handoff = sessionEnvHandoff(childEnv);
     expect(handoff).toEqual({
       INK_ACCESS_TOKEN: 'child-session-token',
+      INK_RUNNER_AUTH_REQUIRED: '1',
       INK_DELEGATION_SECRET: 'synthetic-derived-secret',
       INK_SESSION_ID: 'sess-1',
       INK_STUDIO_ID: 'studio-1',
@@ -281,6 +283,12 @@ describe('sessionEnvHandoff: a session process hands its own session state to it
     expect(final.INK_ACCESS_TOKEN).toBe('child-session-token');
     expect(final.INK_SESSION_ID).toBe('from-prepare');
     expect('JWT_SECRET' in final).toBe(false);
+  });
+
+  it('hands on the required-credential policy even when the token is absent', () => {
+    expect(sessionEnvHandoff({ INK_RUNNER_AUTH_REQUIRED: '1' })).toEqual({
+      INK_RUNNER_AUTH_REQUIRED: '1',
+    });
   });
 });
 

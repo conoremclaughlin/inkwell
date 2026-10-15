@@ -193,12 +193,16 @@ export function buildSessionEnv(options: {
    * (spec:sender-token-binding v3 §4 Phase 0).
    */
   delegationSecret?: string;
+  /** Server admission requires its injected credential, never the machine login. */
+  requireAccessToken?: boolean;
   sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
   repoRoot?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {};
+  // Independent of token presence: a lost token must not remove the policy.
+  if (options.requireAccessToken) env.INK_RUNNER_AUTH_REQUIRED = '1';
 
   // Legacy individual env vars (Phase 1 backward compat)
   if (options.inkSessionId) {

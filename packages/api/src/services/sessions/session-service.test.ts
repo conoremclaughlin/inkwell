@@ -6,6 +6,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { fakeEnv } from '../../test/fake-env';
+vi.mock('../../config/env', async () => ({
+  env: (await import('../../test/fake-env')).fakeEnv,
+  isDevelopment: () => false,
+  isProduction: () => false,
+  isTest: () => true,
+}));
 import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
@@ -148,6 +155,7 @@ describe('SessionService', () => {
     },
     user: {
       id: 'user-456',
+      email: 'fixture@example.invalid',
       timezone: 'America/Los_Angeles',
       contacts: {},
       preferences: {},
@@ -176,6 +184,13 @@ describe('SessionService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv('JWT_SECRET', fakeEnv.JWT_SECRET);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => {
+        throw new Error('No network allowed in this service fixture');
+      })
+    );
 
     // Create fresh mocks for each test
     mockRepository = {
@@ -250,6 +265,91 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  describe('required runner credential admission', () => {
+    it.each(['turn', 'compaction'])(
+      'rechecks credential expiry at the %s physical-spawn seam',
+      async (kind) => {
+        const session = createMockSession();
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        if (kind === 'compaction') await sessionService.triggerCompaction(session.id);
+        else
+          await (
+            sessionService as unknown as {
+              processMessage: (
+                request: ReturnType<typeof createMockRequest>,
+                session: Session
+              ) => Promise<unknown>;
+            }
+          ).processMessage(createMockRequest(), session);
+        const config = vi.mocked(mockClaudeRunner.run).mock.calls[0][1]?.config;
+        expect(config?.admitSpawn?.()).toBeUndefined();
+        vi.useFakeTimers();
+        vi.setSystemTime(Date.now() + 2 * 3600_000);
+        const refusal = config?.admitSpawn?.();
+        expect(refusal).toBeDefined();
+        expect(refusal).toMatch(/runner credential unavailable/i);
+      }
+    );
+    it.each(['email', 'signing-key'])(
+      'refuses a turn without %s before any runner call',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        const service = sessionService as unknown as {
+          processMessage: (
+            request: ReturnType<typeof createMockRequest>,
+            session: Session
+          ) => Promise<unknown>;
+        };
+        await expect(
+          service.processMessage(createMockRequest(), createMockSession())
+        ).rejects.toThrow(/runner.*credential/i);
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['email', 'signing-key'])(
+      'refuses compaction without %s and releases the lock',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+        await expect(sessionService.triggerCompaction('session-123')).rejects.toThrow(
+          /runner.*credential/i
+        );
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it('compaction delivers the same explicit binding as ordinary turns', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+      await sessionService.triggerCompaction('session-123');
+      expect(mockClaudeRunner.run).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          config: expect.objectContaining({
+            inkSessionId: 'session-123',
+            sbSlug: 'myra',
+            inkAccessToken: expect.any(String),
+          }),
+        })
+      );
+    });
   });
 
   describe('turn hooks: each turn, in turn order (Lumen, #769)', () => {
