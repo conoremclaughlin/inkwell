@@ -408,3 +408,20 @@ describe('ClaudeRunner.buildArgs — effort (task 7ea6cdf7)', () => {
     expect(without).not.toContain('--effort');
   });
 });
+
+describe('ClaudeRunner.buildArgs — sandbox_bypass', () => {
+  it('skips permission prompts when the session resolves sandbox_bypass, and never otherwise', () => {
+    const runner = new ClaudeRunner();
+    const base = { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json' };
+
+    expect((runner as any).buildArgs('s-on', false, { ...base, sandboxBypass: true })).toContain(
+      '--dangerously-skip-permissions'
+    );
+    expect(
+      (runner as any).buildArgs('s-off', false, { ...base, sandboxBypass: false })
+    ).not.toContain('--dangerously-skip-permissions');
+    expect((runner as any).buildArgs('s-unset', true, base)).not.toContain(
+      '--dangerously-skip-permissions'
+    );
+  });
+});

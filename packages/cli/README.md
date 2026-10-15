@@ -423,7 +423,7 @@ sb permissions reset         # Remove all rules (Claude will prompt for everythi
 - **Allow**: `Bash(*)`, `Edit(*)`, `Write(*)`, `Read(*)`, `WebFetch(*)`, MCP tools — no prompts for normal dev work
 - **Deny**: `rm -rf`, `git push --force`, `git reset --hard`, `git clean -f` — always blocked
 
-> ⚠️ **`--yolo` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+> ⚠️ **`--yolo` skips every permission prompt.** It maps to each backend's native full-autonomy flag, so allow rules stop mattering. On Claude Code, deny rules still block in this mode, and so does the ink PreToolUse hook (Claude Code docs: permission modes; hooks guide). Codex's and Gemini's flags have no per-command deny rules to keep. A server-started session gets the same mode when its SB's or studio's `sandbox_bypass` is on.
 >
 > It was called `--dangerous` until 2026-09-22. That spelling still works and always will — it is in shell history and in hook commands already written to disk — but it is hidden from `--help`, and using it prints a one-line note. The banner the flag prints still says DANGEROUS: the shorter name does not make the behaviour milder. Codex and Gemini both call their equivalent `--yolo`, so this also stops `ink` being the odd one out.
 
