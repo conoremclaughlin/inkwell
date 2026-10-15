@@ -796,6 +796,36 @@ describe('a space-turn token across real turn finalization', () => {
     row.turn_scope = 'space-turn';
   });
 
+  // The runner settles before the terminal write; with that write failing,
+  // the row stays running at the same epoch and the generation stays
+  // registered for finalization. The token still dies with the runner
+  // (Lumen, PR #867 round 2).
+  it.each([true, false])(
+    'refuses a finished runner while its finalization write fails; runner succeeded = %s',
+    async (succeeded) => {
+      if (!succeeded)
+        native.mockImplementationOnce(async () => {
+          throw new Error('Synthetic runner failure');
+        });
+      vi.spyOn(repository, 'updateIfTurnEpoch').mockRejectedValue(
+        new Error('Synthetic finalization write failure')
+      );
+      expect((await run()).success).toBe(succeeded);
+      expect(row).toMatchObject({
+        lifecycle: 'running',
+        turn_epoch: 'synthetic-epoch',
+        turn_scope: 'space-turn',
+      });
+      expect(row.ended_at ?? null).toBeNull();
+      expect(getActiveRun(sessionId)).toMatchObject({
+        turnEpoch: 'synthetic-epoch',
+        runnerSettledAt: expect.any(Number),
+        settledOutcome: succeeded ? 'succeeded' : 'failed',
+      });
+      expect(live()).toBe(false);
+    }
+  );
+
   it('is live while the turn runs, and refused once it settles idle', async () => {
     const turn = native.getMockImplementation()!;
     let during: boolean | undefined;

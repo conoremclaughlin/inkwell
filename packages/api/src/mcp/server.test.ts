@@ -157,7 +157,11 @@ import { MCPServer } from './server';
 import { env } from '../config/env';
 import { registerAllTools } from './tools';
 import { runWithRequestContext } from '../utils/request-context';
-import { registerActiveRun, resetActiveRuns } from '../services/sessions/active-runs';
+import {
+  registerActiveRun,
+  resetActiveRuns,
+  markRunnerSettled,
+} from '../services/sessions/active-runs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -983,9 +987,19 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
     });
 
-    // The row says running at the token's epoch in each of these; only the
-    // admission in this process is missing or names another generation.
+    // The row says running at the token's epoch in each of these; only this
+    // process's registry refuses: its runner has settled while finalization is
+    // still pending (admission outlives the runner; Lumen, #867 round 2), no
+    // turn is admitted here, or another generation is.
     it.each([
+      [
+        'a successful runner awaiting finalization',
+        () => markRunnerSettled('session-synthetic', 'succeeded'),
+      ],
+      [
+        'a failed runner awaiting finalization',
+        () => markRunnerSettled('session-synthetic', 'failed'),
+      ],
       ['no admitted turn in this process', () => resetActiveRuns()],
       ['another generation admitted', () => admitTurn('epoch-synthetic-other')],
     ])('refuses a running space-turn token with %s (401)', async (_label, arrange) => {

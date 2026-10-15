@@ -13,16 +13,20 @@
  *   unended session the token names. Every write path rotates `turn_epoch`
  *   when it enters `running`, and `compacting` is not a turn in progress
  *   for this purpose: no tool runs mid-compaction under this token;
- * - this process admitted exactly that generation, with intake open
- *   (active-runs.ts). A row left `running` by a process that died owns no
- *   turn anywhere, and a draining process starts no work.
+ * - this process admitted exactly that generation, with intake open, and
+ *   its runner has not settled (isGenerationRunning, active-runs.ts). A row
+ *   left `running` by a process that died owns no turn anywhere, and a
+ *   draining process starts no work. Admission alone is not enough: it
+ *   outlives the runner so finalization can still claim the row, and while
+ *   that terminal write is pending or failing the row stays `running` at the
+ *   same epoch (Lumen, PR #867 round 2).
  *
  * So a space-turn token works only against the server process that admitted
  * its turn. Space turns are server-run and call back to that server; a
  * request that reaches any other process is refused.
  */
 
-import { isGenerationAdmitted } from '../services/sessions/active-runs';
+import { isGenerationRunning } from '../services/sessions/active-runs';
 
 /** The session fields the check reads, as the memory repository maps them. */
 export interface SpaceTurnSessionState {
@@ -42,6 +46,6 @@ export function spaceTurnIsLive(
     session.turnScope === 'space-turn' &&
     session.lifecycle === 'running' &&
     session.turnEpoch === token.turnEpoch &&
-    isGenerationAdmitted(token.sessionId, token.turnEpoch)
+    isGenerationRunning(token.sessionId, token.turnEpoch)
   );
 }
