@@ -26,12 +26,13 @@ vi.mock('../config/env', async () => ({
 
 // The real signer, with one switch: move the clock on by N seconds at the
 // moment of signing, the boundary Lumen's 9372b0c7 probe found.
-const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0 }));
+const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0, calls: 0 }));
 vi.mock('../auth/ink-tokens', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../auth/ink-tokens')>();
   return {
     ...actual,
     signInkAccessToken: (...args: Parameters<typeof actual.signInkAccessToken>) => {
+      signerClock.calls += 1;
       if (!signerClock.advanceSecondsAtSigning) return actual.signInkAccessToken(...args);
       const later = Date.now() + signerClock.advanceSecondsAtSigning * 1000;
       const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
@@ -85,15 +86,20 @@ vi.mock('../mini-apps', () => ({
   getMiniAppsInfo: vi.fn(() => []),
 }));
 
-vi.mock('./auth/ink-auth-provider', () => {
+vi.mock('./auth/ink-auth-provider', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./auth/ink-auth-provider')>();
   class MockInkAuthProvider {
     // The mock answers with the token's claims or null, as the provider's
     // signature check does; this wraps it in the verdict the routes read.
-    // A test can also hand back a verdict itself, e.g. a 503.
-    verifyAccessToken = async (header?: string) => {
+    // A test can also hand back a verdict itself, e.g. a 503. The space-turn
+    // seam rule is the real one, so a route's opt-in, or its absence, is
+    // tested as the route actually passes it. Without the rule (a provider
+    // that predates it) every signed token is admitted, as it then was.
+    verifyAccessToken = async (header?: string, options?: { allowSpaceTurn?: boolean }) => {
       const token = await mockVerifyAccessToken(header);
       if (token && typeof token === 'object' && 'ok' in token) return token;
-      return token ? { ok: true, token } : { ok: false, status: 401 };
+      if (!token) return { ok: false, status: 401 };
+      return actual.spaceTurnSeamRefusal?.(token, options) ?? { ok: true, token };
     };
     createPendingAuth = vi.fn(() => 'pending-id');
     handleAuthCallback = vi.fn(async () => ({ error: 'invalid_request' }));
@@ -793,6 +799,45 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(payload).toMatchObject({ sbSlug: SB_BETA.agent_id, identityId: SB_BETA.id });
       expect(payload?.sessionId).toBeUndefined();
       expect(payload?.contactId).toBeUndefined();
+    });
+
+    // A shared conversation's turn token for this same SB would otherwise come
+    // back as a broad mcp:tools token for the same session
+    // (ink://specs/inkling-multi-person-groups, Phase 1).
+    const SPACE_TURN = {
+      ...BOUND,
+      contactId: undefined,
+      scope: 'mcp:space-turn',
+      workspaceId: 'workspace-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: 'inkling:thread:fixture-group',
+    };
+
+    it.each(['mcp:space-turn', 'mcp:tools mcp:space-turn'])(
+      'refuses a %s token for its own SB, signing nothing',
+      async (scope) => {
+        mockVerifyAccessToken.mockResolvedValue({ ...SPACE_TURN, scope });
+        delegatedIdentity = SB_ALPHA;
+        signerClock.calls = 0;
+
+        const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+        expect(status).toBe(403);
+        expect(body.access_token).toBeUndefined();
+        expect(signerClock.calls).toBe(0);
+      }
+    );
+
+    it('still delegates for an mcp:tools token bound to the same SB (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, scope: 'mcp:tools' });
+      delegatedIdentity = SB_ALPHA;
+      signerClock.calls = 0;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(typeof body.access_token).toBe('string');
+      expect(signerClock.calls).toBe(1);
     });
   });
 

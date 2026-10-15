@@ -453,7 +453,11 @@ export class MCPServer {
 
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
-      const verdict = await this.authProvider.verifyAccessToken(authHeader);
+      // The one seam that admits a space-turn token: its calls reach only the
+      // tool allowlist for its own conversation (tools/space-turn-policy.ts).
+      const verdict = await this.authProvider.verifyAccessToken(authHeader, {
+        allowSpaceTurn: true,
+      });
       if (!verdict.ok && verdict.status === 503) {
         res.status(503).json({
           jsonrpc: '2.0',

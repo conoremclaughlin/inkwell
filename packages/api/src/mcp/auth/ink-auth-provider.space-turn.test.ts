@@ -10,8 +10,20 @@ import { describe, it, expect, vi } from 'vitest';
 import jwt from 'jsonwebtoken';
 import { fakeEnv } from '../../test/fake-env';
 
+// The provider's identity read. A chain that finds the SB, so an admitted
+// token reads as live; every from() is recorded.
+const identityReads = vi.hoisted(() => [] as string[]);
 vi.mock('@supabase/supabase-js', () => ({
-  createClient: vi.fn(() => ({ from: vi.fn() })),
+  createClient: vi.fn(() => ({
+    from: (table: string) => {
+      identityReads.push(table);
+      const chain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'limit']) chain[m] = () => chain;
+      chain.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: [{ id: '00000000-0000-4000-8000-0000000000b1' }], error: null });
+      return chain;
+    },
+  })),
 }));
 vi.mock('../../config/env', async () => ({
   env: { ...(await import('../../test/fake-env')).fakeEnv },
@@ -64,7 +76,7 @@ describe('space-turn token verification', () => {
     });
   });
 
-  it.each(['sessionId', 'workspaceId', 'threadId', 'threadKey'] as const)(
+  it.each(['sbSlug', 'sbId', 'sessionId', 'workspaceId', 'threadId', 'threadKey'] as const)(
     'refuses a space-turn token missing %s',
     (claim) => {
       const { [claim]: _dropped, ...rest } = spaceTurnClaims;
@@ -72,9 +84,19 @@ describe('space-turn token verification', () => {
     }
   );
 
-  it('refuses a space-turn token whose binding claim is blank', () => {
-    const token = sign({ ...spaceTurnClaims, threadKey: '  ' });
-    expect(provider.verifyAccessTokenSignature(`Bearer ${token}`)).toBeNull();
+  it.each(['sbSlug', 'sbId', 'threadKey'] as const)(
+    'refuses a space-turn token whose %s is blank',
+    (claim) => {
+      const token = sign({ ...spaceTurnClaims, [claim]: '  ' });
+      expect(provider.verifyAccessTokenSignature(`Bearer ${token}`)).toBeNull();
+    }
+  );
+
+  it('refuses a space-turn token that names no SB at all', () => {
+    // With no SB claim the request would be enriched from the unsigned
+    // context header and could act as another of the owner's inklings.
+    const { sbSlug: _s, sbId: _i, ...noSb } = spaceTurnClaims;
+    expect(provider.verifyAccessTokenSignature(`Bearer ${sign(noSb)}`)).toBeNull();
   });
 
   it('reads the narrow scope wherever it appears in a scope set', () => {
@@ -122,12 +144,21 @@ describe('space-turn claims reach the request context', () => {
     });
   });
 
-  it('keeps the scope on a token that names no SB', () => {
-    const { sbSlug: _s, sbId: _i, ...noSb } = spaceTurnClaims;
-    const verified = provider.verifyAccessTokenSignature(`Bearer ${sign(noSb)}`);
-    // An unbound narrow token must not read as an unscoped one downstream.
-    expect(tokenIdentityContext(verified)).toMatchObject({
+  it('keeps the scope on a verified token that names no SB (defense in depth)', () => {
+    // The verifier no longer passes such a token, but the handoff must not
+    // read a narrow token as an unscoped one if one ever reaches it.
+    expect(
+      tokenIdentityContext({
+        sessionId: SESSION,
+        scope: 'mcp:space-turn',
+        workspaceId: WORKSPACE,
+        threadId: THREAD,
+        threadKey: THREAD_KEY,
+      })
+    ).toEqual({
       tokenScope: 'mcp:space-turn',
+      tokenWorkspaceId: WORKSPACE,
+      tokenThreadId: THREAD,
       tokenThreadKey: THREAD_KEY,
     });
   });
@@ -139,6 +170,56 @@ describe('space-turn claims reach the request context', () => {
     const ctx = tokenIdentityContext(verified);
     expect(ctx.tokenScope).toBe('mcp:tools');
     expect(ctx.tokenThreadKey).toBeUndefined();
+  });
+});
+
+describe('the seam: verifyAccessToken refuses a space-turn token unless asked not to', () => {
+  const provider = new InkAuthProvider();
+
+  it.each(['mcp:space-turn', 'mcp:tools mcp:space-turn'])(
+    'refuses %s by default with a classified 403, before the identity read',
+    async (scope) => {
+      identityReads.length = 0;
+      const verdict = await provider.verifyAccessToken(
+        `Bearer ${sign({ ...spaceTurnClaims, scope })}`
+      );
+      expect(verdict).toEqual({ ok: false, status: 403, reason: 'space_turn_token_refused' });
+      expect(identityReads).toEqual([]);
+    }
+  );
+
+  it('admits a space-turn token when the caller opts in, after the identity read', async () => {
+    identityReads.length = 0;
+    const verdict = await provider.verifyAccessToken(`Bearer ${sign(spaceTurnClaims)}`, {
+      allowSpaceTurn: true,
+    });
+    expect(verdict).toMatchObject({
+      ok: true,
+      token: { scope: 'mcp:space-turn', threadKey: THREAD_KEY },
+    });
+    expect(identityReads).toEqual(['agent_identities']);
+  });
+
+  it('admits an ordinary runner token either way (control)', async () => {
+    const bearer = `Bearer ${sign({ scope: 'mcp:tools', sbId: SB, sessionId: SESSION })}`;
+    expect(await provider.verifyAccessToken(bearer)).toMatchObject({
+      ok: true,
+      token: { scope: 'mcp:tools' },
+    });
+    expect(await provider.verifyAccessToken(bearer, { allowSpaceTurn: true })).toMatchObject({
+      ok: true,
+      token: { scope: 'mcp:tools' },
+    });
+  });
+
+  it('still refuses an incomplete space-turn token as invalid (401), opted in or not', async () => {
+    const { threadKey: _k, ...unbound } = spaceTurnClaims;
+    const bearer = `Bearer ${sign(unbound)}`;
+    expect(await provider.verifyAccessToken(bearer)).toEqual({ ok: false, status: 401 });
+    expect(await provider.verifyAccessToken(bearer, { allowSpaceTurn: true })).toEqual({
+      ok: false,
+      status: 401,
+    });
   });
 });
 
