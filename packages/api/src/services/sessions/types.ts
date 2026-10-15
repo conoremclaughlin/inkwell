@@ -886,6 +886,13 @@ export interface ClaudeRunnerConfig {
   effort?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
+  /**
+   * What this turn must be told beyond the identity its runner loads: the
+   * conversation's reply contract and the execution tier, composed by the
+   * server. `ink chat` has no way to append to its system prompt, so the ink
+   * runner carries this in the turn's message, on every attempt.
+   */
+  turnInstructions?: string;
   inkAccessToken?: string;
   /**
    * The secret the ink chat child verifies and mints delegation tokens with,
