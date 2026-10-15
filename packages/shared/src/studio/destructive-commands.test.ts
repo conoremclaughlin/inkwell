@@ -203,3 +203,36 @@ describe('detection looks through operators and wrappers, as broadly as the deni
     expect(classify(command).kind).not.toBe('not-destructive');
   });
 });
+
+describe('asPlainRm: an rm the check could not read is sent back to be run plain (Conor, 2026-10-14)', () => {
+  const asPlain = (command: string) => {
+    const verdict = classify(command);
+    return verdict.kind === 'needs-approval' ? verdict.asPlainRm === true : null;
+  };
+
+  it.each([
+    `bash -c 'set -e; V=${SCRATCH}/vt; rm -rf "$V/work"; mkdir -p "$V/work"'`,
+    'yarn build && rm -rf dist',
+    'sudo rm -rf /',
+    'timeout 5 rm --recursive x',
+    'FOO=1 rm -rf x',
+    `rm -rf "${SCRATCH}/x"`,
+  ])('%j: needs approval, as a plain rm', (command) => {
+    expect(asPlain(command)).toBe(true);
+  });
+
+  it.each([
+    // A plain rm is already fully checked: outside a root it is asked as is.
+    ['/h/ws/repo/dist', 'rm -rf /h/ws/repo/dist'],
+    ['a .. segment', `rm -rf ${STUDIO}/a/../b`],
+    // Any git kind in the command keeps it asked about as written.
+    ['git reset with an rm', 'git reset --hard && rm -rf dist'],
+    ['git clean alone', 'git clean -fdx'],
+  ])('%s: needs approval as written, never sent back', (_name, command) => {
+    expect(asPlain(command)).toBe(false);
+  });
+
+  it('the plain form of an in-scope delete is then allowed', () => {
+    expect(classify(`rm -rf ${SCRATCH}/vt/work`).kind).toBe('allowed');
+  });
+});

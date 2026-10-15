@@ -28,11 +28,12 @@ import {
   statSync,
   realpathSync,
   lstatSync,
+  readdirSync,
 } from 'fs';
 import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { createHash } from 'crypto';
 import { classifyDestructiveCommand, SB_SLUG_FOR_RULES, type DestructiveFs } from '@inklabs/shared';
 import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
@@ -2667,13 +2668,54 @@ function emitDecision(decision: 'deny' | 'ask', reason: string): never {
   process.exit(0);
 }
 
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * This Claude session's own scratchpad, `<tmp>/claude-<uid>/<project>/<session>/scratchpad`,
+ * found by listing rather than by rebuilding the project segment. Only the
+ * directory named for this exact session id counts, never the shared
+ * `claude-<uid>` parent every session writes under (Conor, 2026-10-14: "It
+ * should also take into account his own scratchpad").
+ */
+export function sessionScratchpads(claudeSessionId: string | undefined): string[] {
+  if (!claudeSessionId || !UUID_SHAPE.test(claudeSessionId)) return [];
+  if (typeof process.getuid !== 'function') return [];
+  const bases = new Set(
+    [process.env.CLAUDE_CODE_TMPDIR, '/tmp', tmpdir()]
+      .filter((base): base is string => !!base && isAbsolute(base))
+      .map((base) => join(base, `claude-${process.getuid!()}`))
+  );
+  const found: string[] = [];
+  for (const base of bases) {
+    let projects: string[];
+    try {
+      projects = readdirSync(base);
+    } catch {
+      continue;
+    }
+    for (const project of projects) {
+      const scratchpad = join(base, project, claudeSessionId, 'scratchpad');
+      try {
+        if (statSync(scratchpad).isDirectory()) found.push(scratchpad);
+      } catch {
+        // Not this session's project folder.
+      }
+    }
+  }
+  return found;
+}
+
 /**
  * The directories a delete is allowed inside without asking (spec
  * automated-turn-permissions §3.4): the launch checkout when it is a linked
- * worktree (its `.git` is a file), never a main checkout, and the SB's own
- * scratch and screenshot directories.
+ * worktree (its `.git` is a file), never a main checkout, the SB's own
+ * scratch and screenshot directories, and this Claude session's own scratchpad.
  */
-export function destructiveRoots(projectDir: string | undefined, sbSlug: string | null): string[] {
+export function destructiveRoots(
+  projectDir: string | undefined,
+  sbSlug: string | null,
+  claudeSessionId?: string
+): string[] {
   const roots: string[] = [];
   if (projectDir && isAbsolute(projectDir)) {
     try {
@@ -2686,6 +2728,7 @@ export function destructiveRoots(projectDir: string | undefined, sbSlug: string 
     const files = join(homedir(), '.ink', 'files');
     roots.push(join(files, `${sbSlug}-scratch`), join(files, `${sbSlug}-screenshots`));
   }
+  roots.push(...sessionScratchpads(claudeSessionId));
   return roots;
 }
 
@@ -2731,24 +2774,30 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
 
   // Destructive local commands (rm -r, git reset --hard, git clean -f, git
   // checkout -- .) are decided here rather than by a deny rule, which no one
-  // could approve (spec automated-turn-permissions §3.4).
+  // could approve (spec automated-turn-permissions §3.4). Only for a turn the
+  // server spawned: a person at the terminal runs as Claude Code normally
+  // would, prompting or not by their own permission mode (Conor, 2026-10-14:
+  // "If I'm attached, I've got yolo on and it should operate per normal").
   let destructiveReason: string | null = null;
-  if (toolName === 'Bash') {
+  let destructiveAsPlainRm = false;
+  if (toolName === 'Bash' && isHeadlessSession()) {
     const verdict = classifyDestructiveCommand(
       toolInput,
       {
         cwd: hookCwd,
         home: homedir(),
-        roots: destructiveRoots(process.env.CLAUDE_PROJECT_DIR, resolveSlug()),
+        roots: destructiveRoots(
+          process.env.CLAUDE_PROJECT_DIR,
+          resolveSlug(),
+          typeof stdin.session_id === 'string' ? stdin.session_id : undefined
+        ),
       },
       hostFs
     );
     hookLog('on_tool_approval_destructive', { kind: verdict.kind });
     if (verdict.kind === 'needs-approval') {
-      if (!isHeadlessSession()) {
-        emitDecision('ask', `Confirm this destructive command. ${verdict.reason}.`);
-      }
       destructiveReason = verdict.reason;
+      destructiveAsPlainRm = verdict.asPlainRm === true;
     }
   }
 
@@ -2813,6 +2862,21 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
       // No grant could be spent; ask for one below, which fails closed too.
       hookLog('on_tool_approval_consume_error', { error: String(err) });
     }
+  }
+
+  // A recursive rm the check couldn't read is sent back to be run as a plain
+  // rm, which it can: allowed inside the session's directories, requested
+  // once outside them. Conor is asked only about deletes that really reach
+  // outside (2026-10-14: a scratch-folder cleanup in a script asked him).
+  if (destructiveReason !== null && destructiveAsPlainRm) {
+    hookLog('on_tool_approval_as_plain_rm', { reason: destructiveReason });
+    emitDecision(
+      'deny',
+      `Not run, and no approval was requested: ${destructiveReason}. Run each delete as its ` +
+        'own command, a plain `rm -rf <path>` with nothing else in it, and the rest separately. ' +
+        'Inside your studio or scratch folders it then runs without asking; anywhere else it ' +
+        'asks Conor once.'
+    );
   }
 
   let requestId: string;
