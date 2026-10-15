@@ -161,8 +161,10 @@ export class SessionStream {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'text-delta') {
+      this.noteUnpositionedText(evt.text);
       ports.render(this.renderer.pushDelta(evt.text));
     } else if (evt.kind === 'text' && evt.text.trim()) {
+      this.noteUnpositionedText(evt.text);
       this.recordText(evt.text);
       ports.render(
         this.renderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -172,6 +174,18 @@ export class SessionStream {
       this.currentModel = evt.model;
       ports.modelReported(evt.model);
     }
+  }
+
+  private noteUnpositionedText(text: string): void {
+    if (!text) return;
+    if (this.lastRenderedMessage !== undefined) {
+      // The append-only renderer cannot attribute this output to the preceding
+      // positioned message. Persist the ambiguity so a later exact snapshot or
+      // result cannot restore a false claim that its intact final was shown.
+      this.interleavedMessages.add(this.lastRenderedMessage);
+      this.renderer.clearMessageConfirmation();
+    }
+    this.lastRenderedMessage = undefined;
   }
 
   private positionedText(source: BackendTextSource, text: string, complete: boolean): void {
@@ -217,7 +231,7 @@ export class SessionStream {
   }
 
   private confirmMessage(key: string, text: string): void {
-    // The paragraph renderer is append-only. It cannot retract a child chunk
+    // The paragraph renderer is append-only. It cannot retract a foreign chunk
     // that arrived between two fragments of this message. Do not claim that
     // its intact final text is already on screen in that case.
     if (this.interleavedMessages.has(key)) this.renderer.clearMessageConfirmation();

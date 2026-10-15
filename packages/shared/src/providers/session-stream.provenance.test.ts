@@ -155,6 +155,73 @@ describe('source-aware display composition (pure parser and renderer)', () => {
     expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(true);
   });
 
+  it('does not suppress a positioned final split by an unpositioned delta', () => {
+    const f = fixture();
+    f.handle(
+      { kind: 'text-delta', text: 'Par', source: source() },
+      { kind: 'text-delta', text: 'Unidentified.\n\n' },
+      { kind: 'text-delta', text: 'ent.\n\n', source: { ...source(), offset: 3 } },
+      { kind: 'text', text: 'Parent.\n\n', source: source() },
+      { kind: 'result', text: 'Parent.\n\n', source: source() }
+    );
+    f.stream.endSpawn();
+    expect(f.lines.map((line) => line.text)).toEqual(['ParUnidentified.', 'ent.']);
+    expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(false);
+  });
+
+  it('keeps invalidation through a snapshot with no fresh suffix and final confirmation', () => {
+    const f = fixture();
+    f.handle(
+      { kind: 'text-delta', text: 'Parent.', source: source() },
+      { kind: 'text-delta', text: 'Unidentified.\n\n' },
+      { kind: 'text', text: 'Parent.', source: source() },
+      { kind: 'result', text: 'Parent.', source: source() }
+    );
+    f.stream.endSpawn();
+    expect(f.lines.map((line) => line.text)).toEqual(['Parent.Unidentified.']);
+    expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(false);
+  });
+
+  it('also accounts for a source-less completed block between positioned blocks', () => {
+    const f = fixture();
+    f.handle(
+      { kind: 'text', text: 'Par', source: source() },
+      { kind: 'text', text: 'Unidentified.\n\n' },
+      { kind: 'text', text: 'ent.\n\n', source: source('synthetic-message', 'synthetic-second') },
+      { kind: 'result', text: 'Parent.\n\n', source: source() }
+    );
+    f.stream.endSpawn();
+    expect(f.lines.map((line) => line.text)).toEqual(['ParUnidentified.', 'ent.']);
+    expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(false);
+  });
+
+  it('does not invalidate positioned output for an empty source-less delta', () => {
+    const f = fixture();
+    f.handle(
+      { kind: 'text-delta', text: 'Par', source: source() },
+      { kind: 'text-delta', text: '' },
+      { kind: 'text-delta', text: 'ent.\n\n', source: { ...source(), offset: 3 } },
+      { kind: 'text', text: 'Parent.\n\n', source: source() },
+      { kind: 'result', text: 'Parent.\n\n', source: source() }
+    );
+    f.stream.endSpawn();
+    expect(f.lines.map((line) => line.text)).toEqual(['Parent.']);
+    expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(true);
+  });
+
+  it('resets mixed-provenance invalidation for a fresh attempt', () => {
+    const f = fixture();
+    f.handle(
+      { kind: 'text-delta', text: 'Par', source: source() },
+      { kind: 'text-delta', text: 'Unidentified.\n\n' }
+    );
+    f.stream.endSpawn();
+    f.stream.beginSpawn();
+    f.handle({ kind: 'text', text: 'Parent.\n\n', source: source() });
+    f.stream.endSpawn();
+    expect(f.stream.renderer.shouldSkipFinal('Parent.')).toBe(true);
+  });
+
   it('starts correlation anew on every attempt even if the provider reuses its IDs', () => {
     const f = fixture();
     for (const text of ['First.', 'Second.']) {
