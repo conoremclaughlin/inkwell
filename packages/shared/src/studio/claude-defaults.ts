@@ -286,8 +286,9 @@ const PUSH_PREFIXES = ['git push', 'git -C * push'] as const;
  * that the push is clean. The session that pushes still checks that the
  * repository, the remote and the destination ref are the studio's
  * assigned ones, runs the preview, reads every message back and checks
- * authors. Opening and merging PRs stay behind review and Conor's OK; the
- * GitHub tools for them are denied in `GITHUB_PUBLISH_TOOLS`.
+ * authors. A builder opens its PR (GITHUB_PR_TOOLS) and merges it
+ * (GITHUB_MERGE_TOOLS) once a sibling has reviewed it and CI is green on
+ * that head; that order is the process rule, not a permission.
  */
 export const STUDIO_PUSH_RULES: StudioRuleSet = {
   allow: ['Bash(git push *)'],
