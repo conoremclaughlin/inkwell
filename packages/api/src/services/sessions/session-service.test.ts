@@ -10,6 +10,7 @@ import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { buildIdentityPrompt } from './claude-runner.js';
 import { deliverInklingHeartbeat } from '../inklings/inkling-heartbeat.js';
 import type { DueReminder, HeartbeatDeliveryOutcome } from '../heartbeat.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
@@ -1645,6 +1646,73 @@ describe('SessionService', () => {
             expect(POLICY().startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
             expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
             expect(promptPassed()).toContain('### Your environment');
+          });
+
+          it("hands an inkling's ink turn its reply contract and tier as turnInstructions, and nothing private (task 9160180d)", async () => {
+            // ink has no system-prompt-append path: appendSystemPrompt never
+            // reached the turn, so the inkling was never told how to reply.
+            const KEY = 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
+            const base = createMockInjectedContext();
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue({
+              ...base,
+              agent: { ...base.agent, soul: 'SOUL-CANARY', heartbeat: 'HEARTBEAT-CANARY' },
+            } as never);
+            // The file mocks the identity prompt to a constant, which would let
+            // the canaries never reach it. Here every call carries them, as the
+            // real one does, so their absence below is a real check (a mutant
+            // that builds the identity prompt a second time must fail too).
+            vi.mocked(buildIdentityPrompt).mockImplementation(
+              (_slug, _name, soul, _tz, heartbeat) => `IDENTITY-ONLY-SENTINEL ${soul} ${heartbeat}`
+            );
+            try {
+              await turn(
+                INKLING,
+                { ...fromOwner, metadata: { ...fromOwner.metadata, threadKey: KEY } },
+                OWNER
+              );
+            } finally {
+              vi.mocked(buildIdentityPrompt).mockImplementation(() => 'mocked-identity-prompt');
+            }
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const instructions = (configPassedToRunner() as { turnInstructions?: unknown })
+              .turnInstructions;
+            expect(typeof instructions).toBe('string');
+            expect(instructions).toContain('### Replying in this Inkling conversation');
+            expect(instructions).toContain(
+              `channel: "inkling", conversationId: ${JSON.stringify(KEY)}`
+            );
+            expect(instructions).toContain('### Your environment');
+            // The turn's own contract only: the identity prompt's private parts
+            // stay where they were.
+            expect(instructions).not.toContain('IDENTITY-ONLY-SENTINEL');
+            expect(instructions).not.toContain('SOUL-CANARY');
+            expect(instructions).not.toContain('HEARTBEAT-CANARY');
+            // The canaries did reach the identity prompt, so the absences above
+            // can fail; and Claude-style delivery is unchanged.
+            expect(promptPassed()).toContain('IDENTITY-ONLY-SENTINEL SOUL-CANARY HEARTBEAT-CANARY');
+            expect(promptPassed()).toContain('### Replying in this Inkling conversation');
+          });
+
+          it("gives an ordinary SB's ink turn its tier note in turnInstructions, and no inkling reply contract", async () => {
+            vi.stubEnv('INK_EXECUTION_TIER', 'tools');
+            await turn(
+              { runtimeConfig: { toolRouting: 'backend' } },
+              { sender: { id: 'system', name: 'heartbeat' } },
+              OWNER,
+              { session: { backend: 'ink' } }
+            );
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const instructions = String(
+              (configPassedToRunner() as { turnInstructions?: unknown }).turnInstructions
+            );
+            expect(instructions).toContain('### Your environment');
+            expect(instructions).not.toContain('### Replying in this Inkling conversation');
+          });
+
+          it('gives a full-tier turn with nothing to add no turnInstructions at all', async () => {
+            await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+            expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+            expect(configPassedToRunner(mockClaudeRunner)).not.toHaveProperty('turnInstructions');
           });
 
           it('runs an ordinary SB on the full tier by default, with no policy of its own and no note', async () => {

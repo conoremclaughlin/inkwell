@@ -194,7 +194,16 @@ export class InkRunner implements IRunner {
     let usedContextFallback = false;
     let resetAfterFailedResume = false;
 
+    // The turn's own instructions (reply contract, execution tier) come first
+    // on every attempt: fresh, resumed and the supplied-context recovery. This
+    // child has no system-prompt-append path, so the message is their only
+    // way in, and a resumed prompt would otherwise carry nothing.
+    const instructions = config.turnInstructions?.trim();
     const composeMessage = (): string => {
+      const body = composeBody();
+      return instructions ? `${instructions}\n\n---\n\n${body}` : body;
+    };
+    const composeBody = (): string => {
       if (!injectedContext) return message;
 
       // The child normally loads all of this itself. We only carry it when its
