@@ -234,16 +234,21 @@ export function classifyDestructiveCommand(
     reason: `${what}: ${why}`,
     ...(asPlainRm ? { asPlainRm: true as const } : {}),
   });
-  // Only when every destructive thing found is an rm: a git reset or clean
-  // in the same command is never made plain, so it is asked about as is.
-  const onlyRm = kinds.every((kind) => kind === 'a recursive rm');
-
   const text = command.trim();
+  // Sent back to be run plain only when it can be: every destructive thing
+  // found is an rm (a git reset or clean is asked about as is), and the rm
+  // is wrapped in something, a script, an operator or another program. A
+  // single rm whose operands need quotes or escapes is already as plain as
+  // it gets, so it is asked about as written (Lumen, #861).
+  const onlyRm = kinds.every((kind) => kind === 'a recursive rm');
+  const wrapped = /[;&|<>()$`\n\r]/.test(text) || text.split(/\s+/)[0] !== 'rm';
+  const asPlain = onlyRm && wrapped;
+
   if (UNMODELLED.test(text)) {
-    return needs('the command is not one simple command the check models', onlyRm);
+    return needs('the command is not one simple command the check models', asPlain);
   }
   const argv = text.split(/ +/);
-  if (argv[0] !== 'rm') return needs('only a plain rm is ever allowed without asking', onlyRm);
+  if (argv[0] !== 'rm') return needs('only a plain rm is ever allowed without asking', asPlain);
 
   let i = 1;
   while (i < argv.length && argv[i].startsWith('-')) {

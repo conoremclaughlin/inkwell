@@ -2663,9 +2663,91 @@ export function preToolUseDecision(
   };
 }
 
+/** Set while this copy of the hook is the one deciding for its tool call. */
+let recordSharedDecision: ((decision: SharedDecision) => void) | null = null;
+
 function emitDecision(decision: 'deny' | 'ask', reason: string): never {
+  recordSharedDecision?.({ decision, reason });
   process.stdout.write(JSON.stringify(preToolUseDecision(decision, reason)) + '\n');
   process.exit(0);
+}
+
+type SharedDecision = { decision: 'allow' } | { decision: 'deny' | 'ask'; reason: string };
+
+const TOOL_USE_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * One decision per tool call, however many copies of this hook run for it.
+ *
+ * A studio worktree reads the main checkout's settings as well as its own,
+ * and when the two register this hook under different spellings (`node
+ * .../cli.js hooks ...` and `ink hooks ...`), Claude Code runs both, in
+ * parallel. For a headless destructive command, one copy spent Conor's
+ * one-use grant and the other, finding nothing left to spend, asked again
+ * and denied, so an approval never took effect (2026-10-14, four approvals
+ * of one cleanup). The first copy to claim the call's `tool_use_id`
+ * decides; any other waits for that decision and returns it. A copy that
+ * cannot read a decision in time denies: fail closed.
+ */
+export async function claimToolCallDecision(
+  toolUseId: unknown,
+  dir = join(homedir(), '.ink', 'runtime', 'hook-decisions'),
+  waitMs = 20_000
+): Promise<
+  | { role: 'decide'; record: (decision: SharedDecision) => void }
+  | { role: 'follow'; decision: SharedDecision | null }
+> {
+  const noop = { role: 'decide' as const, record: () => {} };
+  if (typeof toolUseId !== 'string' || !TOOL_USE_ID_SHAPE.test(toolUseId)) return noop;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // Decisions older than an hour are no one's: clear them as we go.
+    for (const name of readdirSync(dir)) {
+      try {
+        if (Date.now() - statSync(join(dir, name)).mtimeMs > 3_600_000) rmSync(join(dir, name));
+      } catch {
+        // Another copy removed it first.
+      }
+    }
+  } catch {
+    return noop;
+  }
+  const path = join(dir, `${toolUseId}.json`);
+  try {
+    writeFileSync(path, '', { flag: 'wx', mode: 0o600 });
+    return {
+      role: 'decide',
+      record: (decision) => {
+        try {
+          writeFileSync(path, JSON.stringify(decision), { mode: 0o600 });
+        } catch {
+          // The other copy times out and denies: fail closed.
+        }
+      },
+    };
+  } catch {
+    // Another copy claimed this call first: wait for what it decides.
+  }
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    try {
+      const raw = readFileSync(path, 'utf8');
+      if (raw) {
+        const parsed = JSON.parse(raw) as SharedDecision;
+        if (
+          parsed.decision === 'allow' ||
+          parsed.decision === 'deny' ||
+          parsed.decision === 'ask'
+        ) {
+          return { role: 'follow', decision: parsed };
+        }
+      }
+    } catch {
+      // Not written yet, or mid-write.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { role: 'follow', decision: null };
 }
 
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2684,8 +2766,21 @@ export function sessionScratchpads(claudeSessionId: string | undefined): string[
       .filter((base): base is string => !!base && isAbsolute(base))
       .map((base) => join(base, `claude-${process.getuid!()}`))
   );
+  // Every component from claude-<uid> down must be a real directory, not a
+  // link: a linked scratchpad, session or project folder would carry the
+  // root to wherever it points (Lumen, #861). The tmp base itself may be an
+  // alias (/tmp is /private/tmp on macOS); only what lies below it is checked.
+  const realDir = (path: string): boolean => {
+    try {
+      const stat = lstatSync(path);
+      return stat.isDirectory() && !stat.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
   const found: string[] = [];
   for (const base of bases) {
+    if (!realDir(base)) continue;
     let projects: string[];
     try {
       projects = readdirSync(base);
@@ -2693,11 +2788,14 @@ export function sessionScratchpads(claudeSessionId: string | undefined): string[
       continue;
     }
     for (const project of projects) {
-      const scratchpad = join(base, project, claudeSessionId, 'scratchpad');
+      const session = join(base, project, claudeSessionId);
+      const scratchpad = join(session, 'scratchpad');
+      if (!realDir(join(base, project)) || !realDir(session) || !realDir(scratchpad)) continue;
       try {
-        if (statSync(scratchpad).isDirectory()) found.push(scratchpad);
+        const expected = join(realpathSync(base), project, claudeSessionId, 'scratchpad');
+        if (realpathSync(scratchpad) === expected) found.push(scratchpad);
       } catch {
-        // Not this session's project folder.
+        // Gone between the checks: not a root.
       }
     }
   }
@@ -2836,6 +2934,22 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
   const studioId = process.env.INK_STUDIO_ID?.trim() || undefined;
 
+  // Every copy of this hook running for the same headless destructive call
+  // returns one decision (see claimToolCallDecision).
+  if (destructiveReason !== null) {
+    const claim = await claimToolCallDecision(stdin.tool_use_id);
+    if (claim.role === 'follow') {
+      hookLog('on_tool_approval_followed', { decision: claim.decision?.decision ?? 'none' });
+      if (claim.decision?.decision === 'allow') process.exit(0);
+      if (claim.decision) emitDecision(claim.decision.decision, claim.decision.reason);
+      emitDecision(
+        'deny',
+        'Permission blocked: another copy of this hook was deciding this call and its decision could not be read.'
+      );
+    }
+    recordSharedDecision = claim.record;
+  }
+
   // A headless destructive command first tries to spend a grant Conor gave
   // for exactly this command, here, in this session (spec §3.5). The server
   // takes the session from the signed runner token, not from this request.
@@ -2851,6 +2965,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
         const body = (await resp.json()) as { granted?: unknown; requestId?: unknown };
         if (body.granted === true) {
           hookLog('on_tool_approval_grant_spent', { requestId: String(body.requestId) });
+          recordSharedDecision?.({ decision: 'allow' });
           process.exit(0);
         }
       } else {

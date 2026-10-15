@@ -216,7 +216,7 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
     'sudo rm -rf /',
     'timeout 5 rm --recursive x',
     'FOO=1 rm -rf x',
-    `rm -rf "${SCRATCH}/x"`,
+    'rm -rf "$HOME/x"',
   ])('%j: needs approval, as a plain rm', (command) => {
     expect(asPlain(command)).toBe(true);
   });
@@ -228,6 +228,10 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
     // Any git kind in the command keeps it asked about as written.
     ['git reset with an rm', 'git reset --hard && rm -rf dist'],
     ['git clean alone', 'git clean -fdx'],
+    // Already as plain as it gets: a literal name that needs quoting (Lumen, #861).
+    ['a quoted operand', "rm -rf '/outside/build cache'"],
+    ['an escaped operand', 'rm -rf /outside/build\\ cache'],
+    ['a double-quoted scratch operand', `rm -rf "${SCRATCH}/x"`],
   ])('%s: needs approval as written, never sent back', (_name, command) => {
     expect(asPlain(command)).toBe(false);
   });
