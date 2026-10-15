@@ -92,6 +92,60 @@ async function harness() {
 }
 
 describe('provider effect provenance', () => {
+  // Wren's source inspection of Claude Code 2.1.300 found snapshot-before-stop
+  // today. These synthetic alternate orders deliberately do not depend on that
+  // internal ordering; they are not recorded frames or a live provider probe.
+  it.each(['before-stop', 'after-stop', 'after-message-end'])(
+    'dispatches a streamed block only once when its snapshot arrives %s',
+    async (order) => {
+      const h = await harness();
+      const p = new ClaudeStreamParser();
+      const line = (frame: object) => JSON.stringify(frame) + '\n';
+      const partial = (event: object) =>
+        line({ type: 'stream_event', parent_tool_use_id: null, event });
+      const text = call();
+      const emit = (frames: string) => p.push(frames).forEach(h.emit);
+      emit(
+        partial({ type: 'message_start', message: { id: parent.messageId } }) +
+          partial({
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          }) +
+          partial({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
+      );
+      await vi.waitFor(() => expect(h.callTool).toHaveBeenCalledOnce());
+      const snap = line({
+        type: 'assistant',
+        uuid: 'synthetic-snapshot',
+        parent_tool_use_id: null,
+        message: { id: parent.messageId, content: [{ type: 'text', text }] },
+      });
+      const stop = partial({ type: 'content_block_stop', index: 0 });
+      const end =
+        partial({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }) +
+        partial({ type: 'message_stop' });
+      emit(
+        order === 'before-stop'
+          ? snap + stop + end
+          : order === 'after-stop'
+            ? stop + snap + end
+            : stop + end + snap
+      );
+      // Let the fake executor drain before final confirmation, so a refusal at
+      // final cannot conceal a second effect already caused by the snapshot.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const effectsBeforeFinal = h.callTool.mock.calls.length;
+      const parsedFinal = p.push(line({ type: 'result', subtype: 'success', result: '' })).at(-1);
+      if (parsedFinal?.kind !== 'result') throw new Error('Missing fixture final');
+      h.end(final(parsedFinal.text!, { responseSource: parsedFinal.source }));
+      const settled = await h.running;
+      expect(effectsBeforeFinal).toBe(1);
+      expect(settled.success, settled.stderr).toBe(true);
+      expect(h.callTool).toHaveBeenCalledOnce();
+    }
+  );
+
   it('dispatches a proven parent prefix before completion and does not replay positions or snapshots', async () => {
     const h = await harness();
     const text = call();

@@ -85,7 +85,7 @@ function sourceKey(source: BackendMessageSource): string {
 
 interface PartialMessage {
   source: BackendMessageSource;
-  blocks: Map<number, { type?: string; offset: number }>;
+  blocks: Map<number, { type?: string; offset: number; closed: boolean; snapshotted: boolean }>;
   stopReason?: string | null;
 }
 
@@ -222,6 +222,8 @@ export class ClaudeStreamParser implements BackendStreamParser {
   private lastAssistantMessageId: string | undefined;
   private lastAssistantSource: BackendMessageSource | undefined;
   private partialMessages = new Map<string, PartialMessage>();
+  /** Correlation survives block/message closure until this attempt ends. */
+  private messageBlocks = new Map<string, PartialMessage>();
   private snapshotSources = new Map<string, BackendTextSource>();
   private completedTextBlocks = new Set<string>();
   /**
@@ -237,7 +239,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
     return JSON.stringify([typeof ev.parent_tool_use_id, ev.parent_tool_use_id]);
   }
 
-  /** SDK assistant snapshots precede their SSE content_block_stop event. */
+  /** Match snapshots independently of whether their SSE block has closed. */
   private snapshotSource(ev: ClaudeStreamMessage): BackendTextSource | undefined {
     const source = messageSource(ev, ev.message?.id);
     if (!source) return undefined;
@@ -245,18 +247,21 @@ export class ClaudeStreamParser implements BackendStreamParser {
     const snapshotKey = uuid ? JSON.stringify([sourceKey(source), uuid]) : undefined;
     const previous = snapshotKey ? this.snapshotSources.get(snapshotKey) : undefined;
     if (previous) return previous;
-    const partial = this.partialMessages.get(this.originKey(ev));
-    const openTextBlocks =
-      partial && sourceKey(partial.source) === sourceKey(source)
-        ? [...partial.blocks].filter(([, block]) => block.type === 'text')
-        : [];
-    const blockId =
-      ev.message?.content?.length === 1 && openTextBlocks.length === 1
-        ? `index:${openTextBlocks[0]![0]}`
-        : uuid
-          ? `snapshot:${uuid}`
-          : undefined;
+    const partial = this.messageBlocks.get(sourceKey(source));
+    const content = ev.message?.content;
+    const streamedBlock =
+      content?.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string'
+        ? [...(partial?.blocks ?? [])]
+            .reverse()
+            .find(([, block]) => block.type === 'text' && !block.snapshotted)
+        : undefined;
+    const blockId = streamedBlock
+      ? `index:${streamedBlock[0]}`
+      : uuid
+        ? `snapshot:${uuid}`
+        : undefined;
     if (!blockId) return undefined;
+    if (streamedBlock) streamedBlock[1].snapshotted = true;
     const result = { ...source, blockId, offset: 0 };
     if (snapshotKey) this.snapshotSources.set(snapshotKey, result);
     return result;
@@ -271,7 +276,9 @@ export class ClaudeStreamParser implements BackendStreamParser {
       this.partialMessages.delete(key);
       const source = messageSource(ev, event.message?.id);
       if (source) {
-        this.partialMessages.set(key, { source, blocks: new Map() });
+        const partial: PartialMessage = { source, blocks: new Map() };
+        this.partialMessages.set(key, partial);
+        this.messageBlocks.set(sourceKey(source), partial);
         out.push({ kind: 'text-boundary', boundary: 'message-start', source });
       }
       return;
@@ -283,7 +290,12 @@ export class ClaudeStreamParser implements BackendStreamParser {
         event.content_block?.type === 'text' && typeof event.content_block.text === 'string'
           ? event.content_block.text
           : '';
-      partial.blocks.set(index, { type: event.content_block?.type, offset: initial.length });
+      partial.blocks.set(index, {
+        type: event.content_block?.type,
+        offset: initial.length,
+        closed: false,
+        snapshotted: false,
+      });
       out.push({
         kind: 'text-boundary',
         boundary: 'block-start',
@@ -295,11 +307,11 @@ export class ClaudeStreamParser implements BackendStreamParser {
       if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
         const block = index !== undefined ? partial?.blocks.get(index) : undefined;
         const source =
-          partial && block?.type === 'text'
+          partial && block?.type === 'text' && !block.closed
             ? { ...partial.source, blockId: `index:${index}`, offset: block.offset }
             : undefined;
         out.push({ kind: 'text-delta', text: delta.text, ...(source ? { source } : {}) });
-        if (block) block.offset += delta.text.length;
+        if (block && !block.closed) block.offset += delta.text.length;
       }
     } else if (event.type === 'content_block_stop' && partial && index !== undefined) {
       out.push({
@@ -307,7 +319,8 @@ export class ClaudeStreamParser implements BackendStreamParser {
         boundary: 'block-end',
         source: { ...partial.source, blockId: `index:${index}` },
       });
-      partial.blocks.delete(index);
+      const block = partial.blocks.get(index);
+      if (block) block.closed = true;
     } else if (event.type === 'message_delta' && partial) {
       partial.stopReason = event.delta?.stop_reason;
     } else if (event.type === 'message_stop' && partial) {
@@ -315,7 +328,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
       // proof that an EOF fence is complete or that the child has exited.
       const complete =
         ['end_turn', 'tool_use', 'stop_sequence'].includes(partial.stopReason ?? '') &&
-        partial.blocks.size === 0;
+        [...partial.blocks.values()].every((block) => block.closed);
       out.push({
         kind: 'text-boundary',
         boundary: 'message-end',

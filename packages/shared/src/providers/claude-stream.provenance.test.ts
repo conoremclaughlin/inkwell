@@ -18,6 +18,90 @@ const textEvents = (events: BackendTurnEvent[]) =>
   events.filter((e) => e.kind === 'text' || e.kind === 'text-delta');
 
 describe('Claude output provenance (synthetic SDK frames, no provider)', () => {
+  it.each(['before-stop', 'after-stop', 'after-message-end'])(
+    'retains indexed identity for a snapshot %s',
+    (order) => {
+      const p = new ClaudeStreamParser();
+      const snap = snapshot('synthetic-message', 'synthetic-snapshot', 'Hello.');
+      const stop = partial({ type: 'content_block_stop', index: 0 });
+      const end =
+        partial({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }) +
+        partial({ type: 'message_stop' });
+      const events = p.push(
+        partial({ type: 'message_start', message: { id: 'synthetic-message' } }) +
+          partial({
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          }) +
+          partial({
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: 'Hello.' },
+          }) +
+          (order === 'before-stop'
+            ? snap + stop + end
+            : order === 'after-stop'
+              ? stop + snap + end
+              : stop + end + snap) +
+          snap +
+          final()
+      );
+      expect(textEvents(events).map((event) => event.source?.blockId)).toEqual([
+        'index:0',
+        'index:0',
+        'index:0',
+      ]);
+      expect(events).toContainEqual(
+        expect.objectContaining({ boundary: 'message-end', complete: true })
+      );
+      expect(events.at(-1)).toMatchObject({ text: 'Hello.' });
+    }
+  );
+
+  it('does not reuse a closed block that already received its snapshot', () => {
+    const p = new ClaudeStreamParser();
+    const closedBlock = (index: number, type = 'text') =>
+      partial({ type: 'content_block_start', index, content_block: { type, text: '' } }) +
+      partial({ type: 'content_block_stop', index });
+    const events = p.push(
+      partial({ type: 'message_start', message: { id: 'synthetic-message' } }) +
+        closedBlock(0) +
+        snapshot('synthetic-message', 'synthetic-first-snapshot', 'First.') +
+        closedBlock(1, 'thinking') +
+        closedBlock(2) +
+        snapshot('synthetic-message', 'synthetic-second-snapshot', 'Second.') +
+        final()
+    );
+    expect(textEvents(events).map((event) => event.source?.blockId)).toEqual([
+      'index:0',
+      'index:2',
+    ]);
+    expect(events.at(-1)).toMatchObject({ text: 'First.Second.' });
+  });
+
+  it('does not assign closed-block provenance to late deltas', () => {
+    const p = new ClaudeStreamParser();
+    p.push(
+      partial({ type: 'message_start', message: { id: 'synthetic-message' } }) +
+        partial({
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' },
+        }) +
+        partial({ type: 'content_block_stop', index: 0 })
+    );
+    expect(
+      p.push(
+        partial({
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'late' },
+        })
+      )
+    ).toEqual([{ kind: 'text-delta', text: 'late' }]);
+  });
+
   it('preserves conflicting snapshots under one identity so an effect consumer can refuse them', () => {
     const p = new ClaudeStreamParser();
     const events = p.push(

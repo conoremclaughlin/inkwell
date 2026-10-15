@@ -46,6 +46,44 @@ function fixture() {
 }
 
 describe('source-aware display composition (pure parser and renderer)', () => {
+  it.each(['before-stop', 'after-stop', 'after-message-end'])(
+    'renders a streamed block once when its snapshot arrives %s',
+    (order) => {
+      const f = fixture();
+      const text = 'First paragraph.\n\nSecond paragraph.\n';
+      const stop = partial({ type: 'content_block_stop', index: 0 });
+      const end =
+        partial({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }) +
+        partial({ type: 'message_stop' });
+      const snap = snapshot(text);
+      f.handle(
+        ...new ClaudeStreamParser().push(
+          partial({ type: 'message_start', message: { id: 'synthetic-message' } }) +
+            partial({
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: '' },
+            }) +
+            partial({
+              type: 'content_block_delta',
+              index: 0,
+              delta: { type: 'text_delta', text },
+            }) +
+            (order === 'before-stop'
+              ? snap + stop + end
+              : order === 'after-stop'
+                ? stop + snap + end
+                : stop + end + snap) +
+            final
+        )
+      );
+      f.stream.endSpawn();
+      expect(f.lines.map((item) => item.text)).toEqual(['First paragraph.', 'Second paragraph.']);
+      expect(f.stream.dialogue).toEqual([{ role: 'assistant', text }]);
+      expect(f.stream.renderer.shouldSkipFinal(text)).toBe(true);
+    }
+  );
+
   it('renders repeated Claude snapshots once across paragraphs, dialogue, previews and final dedupe', () => {
     const f = fixture();
     const events = new ClaudeStreamParser().push(snapshot('Hello.\n\n').repeat(2) + final);
