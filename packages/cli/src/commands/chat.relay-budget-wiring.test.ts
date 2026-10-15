@@ -153,8 +153,12 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       join(here, '../../../shared/src/runtime/session-tool-batch.ts'),
       'utf8'
     );
-    expect(batch).toMatch(/const settleMutation = ports\.beginContextMutation\(calls\);\s*try \{/);
-    expect(batch).toMatch(/finally \{\s*settleMutation\(\);\s*\}/);
+    expect(batch).toMatch(
+      /const batch = createSessionToolBatch\(ports\);\s*batch\.admit\(calls\);\s*try \{\s*await executeToolCalls\(calls, batch\.executor\);/
+    );
+    expect(batch).toMatch(/finally \{\s*batch\.release\(\);\s*\}/);
+    expect(batch).toContain('mutations.push(ports.beginContextMutation(calls));');
+    expect(batch).toMatch(/for \(const settle of mutations\) \{\s*try \{\s*settle\(\);/);
     expect(provider).toMatch(
       /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
     );

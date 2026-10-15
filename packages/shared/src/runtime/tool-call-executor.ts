@@ -30,7 +30,7 @@ export interface ToolCallResult {
   result?: RuntimeToolCallResponse;
   reason?: string;
   error?: string;
-  /** Present only when this invocation reached the pre-dispatch barrier. */
+  /** Executor barrier ID; an owning journal may also identify an earlier refused admission. */
   invocationId?: string;
   /**
    * `returned` means the dispatcher answered, NOT that an external effect
@@ -44,7 +44,7 @@ export interface ToolCallExecutorPorts {
   /** Policy engine for permission decisions */
   policy: ToolCallPolicy;
   /** Per-host unique invocation identity, never ambient process state. */
-  mintInvocationId(): string;
+  mintInvocationId(call: LocalToolCall): string;
   /** Existing local-surface name diagnostics, supplied by the host catalog. */
   impossibleCallRefusal(tool: string): RuntimeToolCallResponse | null;
   /**
@@ -334,7 +334,7 @@ async function executeTool(
   call: LocalToolCall,
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult> {
-  const invocationId = deps.mintInvocationId();
+  const invocationId = deps.mintInvocationId(call);
   const identity = { tool: call.tool, args: call.args, invocationId };
   try {
     await deps.commitIntent(call, invocationId);

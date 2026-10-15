@@ -40,8 +40,12 @@ interface InvocationProgress {
 export function createStreamToolDispatch(options: {
   enabled?: boolean;
   executor: ToolCallExecutorPorts;
+  /** Session bookkeeping, before queueing. A throw refuses this and later admissions. */
+  onAdmission?(call: LocalToolCall): void;
 }): StreamToolDispatch | undefined {
-  return options.enabled === true ? new StreamToolDispatch(options.executor) : undefined;
+  return options.enabled === true
+    ? new StreamToolDispatch(options.executor, options.onAdmission)
+    : undefined;
 }
 
 class StreamToolDispatch {
@@ -62,7 +66,10 @@ class StreamToolDispatch {
   private finishing: Promise<StreamDispatchResult> | undefined;
   private readonly execution: Promise<ToolCallResult[]>;
 
-  constructor(private readonly executor: ToolCallExecutorPorts) {
+  constructor(
+    private readonly executor: ToolCallExecutorPorts,
+    private readonly onAdmission?: (call: LocalToolCall) => void
+  ) {
     // Catch at creation, not at finish: a port can fail while generation is
     // still running. Observe it without letting a rejection go unhandled.
     this.execution = executeToolCalls(this.source(), {
@@ -216,6 +223,13 @@ class StreamToolDispatch {
       this.refuse(call, 'Per-response tool cap reached; not run.');
     } else {
       const copy = snapshotCalls([call])[0]!;
+      try {
+        this.onAdmission?.(copy);
+      } catch (error) {
+        this.failure = { error };
+        this.refuse(call, 'Session admission failed; not run.');
+        return;
+      }
       this.admitted.push(copy);
       this.progress.set(copy.args, { call: copy, dispatched: false });
       this.queue.push(copy);
