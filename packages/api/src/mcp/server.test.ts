@@ -157,6 +157,7 @@ import { MCPServer } from './server';
 import { env } from '../config/env';
 import { registerAllTools } from './tools';
 import { runWithRequestContext } from '../utils/request-context';
+import { registerActiveRun, resetActiveRuns } from '../services/sessions/active-runs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -927,6 +928,20 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       metadata: {},
       ...overrides,
     });
+    /** This process admitted the token's turn (active-runs.ts), unless a case says otherwise. */
+    const admitTurn = (turnEpoch = EPOCH) => {
+      resetActiveRuns();
+      registerActiveRun({
+        sessionId: 'session-synthetic',
+        userId: 'user-123',
+        sbSlug: 'synthetic-inkling',
+        backend: 'ink',
+        startedAt: Date.now(),
+        turnEpoch,
+      });
+    };
+    beforeEach(() => admitTurn());
+    afterEach(() => resetActiveRuns());
 
     it("carries a space-turn token's scope and thread into the request context", async () => {
       mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
@@ -944,8 +959,16 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       });
     });
 
-    // Phase 2 gate 7: the token lives only as long as its admitted turn.
+    // Phase 2 gate 7: the token lives only as long as its admitted turn. The
+    // turn stays admitted in this process for every case here, so each row
+    // change is the only thing refusing it. A settled turn keeps its epoch
+    // and an unended session (SessionService finalization; Lumen, #867).
     it.each([
+      ['a settled idle turn', { lifecycle: 'idle' }],
+      ['a settled failed turn', { lifecycle: 'failed' }],
+      ['a completed turn, never ended', { lifecycle: 'completed' }],
+      ['a turn mid-compaction', { lifecycle: 'compacting' }],
+      ['no lifecycle', { lifecycle: undefined }],
       ['an ended session', { endedAt: new Date() }],
       ['a newer turn', { turnEpoch: 'epoch-synthetic-next' }],
       ['an unmarked session', { turnScope: undefined }],
@@ -953,6 +976,22 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     ])('refuses a space-turn token whose session shows %s (401)', async (_label, change) => {
       mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
       mockGetSession.mockResolvedValue(liveTurnSession(change));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    // The row says running at the token's epoch in each of these; only the
+    // admission in this process is missing or names another generation.
+    it.each([
+      ['no admitted turn in this process', () => resetActiveRuns()],
+      ['another generation admitted', () => admitTurn('epoch-synthetic-other')],
+    ])('refuses a running space-turn token with %s (401)', async (_label, arrange) => {
+      arrange();
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession());
 
       const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
 

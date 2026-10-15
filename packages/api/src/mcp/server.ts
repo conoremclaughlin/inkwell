@@ -47,6 +47,7 @@ import { getHeartbeatTickHealth } from '../services/heartbeat';
 import { InkAuthProvider, type VerifiedAccessToken } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
 import { RUNNER_TOOLS_SCOPE, isSpaceTurnScope } from '../auth/token-scope';
+import { spaceTurnIsLive } from './space-turn-liveness';
 import {
   ACCOUNT_BEING_DELETED,
   leaseAccountForRequest,
@@ -225,9 +226,9 @@ export class MCPServer {
   }
 
   /**
-   * Whether a space-turn token's turn is still the session's current one.
+   * Whether a space-turn token's turn is still running (space-turn-liveness.ts).
    * The token's signed sessionId is not a turn fence on its own: without
-   * this it would work until `exp`, after its turn had ended.
+   * this it would work until `exp`, after its turn had settled or ended.
    */
   private async spaceTurnStillCurrent(
     token: VerifiedAccessToken
@@ -243,13 +244,7 @@ export class MCPServer {
       });
       return 'unreadable';
     }
-    const current =
-      !!session &&
-      !session.endedAt &&
-      session.turnScope === 'space-turn' &&
-      !!token.turnEpoch &&
-      session.turnEpoch === token.turnEpoch;
-    if (!current) {
+    if (!spaceTurnIsLive(session, token)) {
       logger.warn('Refused a space-turn token outside its turn', { code: 'space_turn_turn_ended' });
       return 'ended';
     }
