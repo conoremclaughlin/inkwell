@@ -1314,6 +1314,27 @@ describe('MemoryRepository', () => {
         expect(result!.studioId).toBeUndefined();
         expect(result!.studioId).toBeUndefined();
       });
+
+      it('maps turn_scope to turnScope, and a null or absent one to undefined', async () => {
+        const base = {
+          id: 'session-scope',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+        mockSupabase._setReturnData({ ...base, turn_scope: 'space-turn' });
+        expect((await repo.getSession('session-scope'))!.turnScope).toBe('space-turn');
+
+        mockSupabase._setReturnData({ ...base, turn_scope: null });
+        expect((await repo.getSession('session-scope'))!.turnScope).toBeUndefined();
+
+        // A database without the column yet returns rows without the key.
+        mockSupabase._setReturnData(base);
+        expect((await repo.getSession('session-scope'))!.turnScope).toBeUndefined();
+      });
     });
   });
 

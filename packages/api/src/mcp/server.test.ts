@@ -1007,6 +1007,102 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(mockGetSession).toHaveBeenCalledWith('b2c3d4e5-f6a7-8901-bcde-f23456789012');
   });
 
+  // A space-turn session never authenticates by context: its runner knows its
+  // own sessionId and slug (ink://specs/inkling-multi-person-groups, gate 1).
+  describe('a context naming a space-turn session authenticates nothing', () => {
+    const SESSION_ID = 'c3d4e5f6-a7b8-4901-8cde-f34567890123';
+    const contextHeader = () =>
+      encodeContextHeader({
+        sessionId: SESSION_ID,
+        studioId: 'studio-1',
+        sbSlug: 'synthetic-inkling',
+        cliAttached: false,
+        runtime: 'ink',
+      });
+    const liveSession = (turnScope?: string) => ({
+      id: SESSION_ID,
+      userId: 'user-456',
+      sbSlug: 'synthetic-inkling',
+      ...(turnScope ? { turnScope } : {}),
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    function lastContext(): Record<string, unknown> {
+      const calls = vi.mocked(runWithRequestContext).mock.calls;
+      return calls[calls.length - 1]?.[0] as Record<string, unknown>;
+    }
+
+    beforeEach(() => {
+      expect(serverUnavailableError).toBeNull();
+      vi.mocked(runWithRequestContext).mockClear();
+      contextIdentity = {
+        id: 'sb-synthetic-inkling',
+        user_id: 'user-456',
+        users: { email: 'test@example.com' },
+      };
+    });
+
+    it('the bearer-less fallback refuses a marked session, admitting no principal', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+      mockGetSession.mockResolvedValue(liveSession('space-turn'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { 'x-ink-context': contextHeader() });
+
+      expect(mockGetSession).toHaveBeenCalledWith(SESSION_ID);
+      // With no principal the request runs as nobody, exactly as for any
+      // context that does not resolve (401 instead when OAuth is required).
+      expect(res.status).toBe(200);
+      expect(lastContext().userId).toBeUndefined();
+      expect(lastContext().sbSlug).toBeUndefined();
+      expect(lastContext().agentTokenBound).toBeUndefined();
+    });
+
+    it('the bearer-less fallback still admits an unmarked session (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+      mockGetSession.mockResolvedValue(liveSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { 'x-ink-context': contextHeader() });
+
+      expect(res.status).toBe(200);
+      expect(lastContext()).toMatchObject({ userId: 'user-456', sbSlug: 'synthetic-inkling' });
+    });
+
+    it('enrichment leaves a user token unenriched for a marked session', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+      mockGetSession.mockResolvedValue(liveSession('space-turn'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': contextHeader(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).toHaveBeenCalledWith(SESSION_ID);
+      expect(lastContext().userId).toBe('user-456');
+      expect(lastContext().sbSlug).toBeUndefined();
+      expect(lastContext().sbId).toBeUndefined();
+    });
+
+    it('enrichment still attaches an unmarked session’s SB (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+      mockGetSession.mockResolvedValue(liveSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': contextHeader(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(lastContext()).toMatchObject({
+        userId: 'user-456',
+        sbSlug: 'synthetic-inkling',
+        sbId: 'sb-synthetic-inkling',
+      });
+    });
+  });
+
   it('does not fail the request when the context session belongs to a different user', async () => {
     if (serverUnavailableError) return;
     // Cross-user session reference: enrichment is refused (identity stays

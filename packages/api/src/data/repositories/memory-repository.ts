@@ -2729,6 +2729,7 @@ export class MemoryRepository {
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,
       alias: row.alias || undefined,
+      turnScope: row.turn_scope || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,

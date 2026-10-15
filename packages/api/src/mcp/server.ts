@@ -140,6 +140,18 @@ export class MCPServer {
       return null;
     }
 
+    // A space-turn session's runner knows its own sessionId and slug, so a
+    // context naming it proves nothing; resolved here, its owner would act
+    // broad with no token scope for the allowlist to read. Refused for both
+    // the bearer-less fallback and enrichment, which resolves through here
+    // (ink://specs/inkling-multi-person-groups, Phase 2 gate 1).
+    if (session.turnScope) {
+      logger.warn('Context-based auth refused for a space-turn session', {
+        code: 'space_turn_session_context',
+      });
+      return null;
+    }
+
     if (session.sbSlug !== sbSlug) {
       logger.warn('Context-based auth: sbSlug mismatch', {
         sessionId,
