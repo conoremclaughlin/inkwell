@@ -49,7 +49,10 @@ export const DEFAULT_CLAUDE_DENY_RULES: readonly string[] = [
  *     GITHUB_PR_TOOLS and SUPABASE_SQL_TOOLS, which are declared below;
  *   - dependency installs, which both profiles now allow (Conor,
  *     2026-10-15). A session already runs its checkout's code through its
- *     tests, so an install's scripts are not a new kind of trust.
+ *     tests, so an install's scripts are not a new kind of trust;
+ *   - merging a pull request, which the builder now allows (Conor,
+ *     2026-10-15, 2:05 PM). Sibling review and green CI before a merge are
+ *     the process rule (AGENTS.md), not a permission.
  */
 export const RETIRED_DENY_RULES: readonly string[] = [
   'Bash(rm -rf *)',
@@ -68,6 +71,9 @@ export const RETIRED_DENY_RULES: readonly string[] = [
   'Bash(npm ci*)',
   'Bash(pnpm add *)',
   'Bash(pnpm install*)',
+  'mcp__github__merge_pull_request',
+  'Bash(gh pr merge*)',
+  'Bash(gh * pr merge*)',
 ];
 
 /**
@@ -126,10 +132,9 @@ export const GITHUB_READ_TOOLS: readonly string[] = [
 ];
 
 /**
- * GitHub MCP tools that publish code or change a repository or a branch
- * outside a push: merging a PR, writing files or branches directly (these
- * can name main), creating, forking or deleting a repository. Denied in
- * both studio profiles.
+ * GitHub MCP tools that change a repository or a branch outside a push and
+ * a PR: writing files or branches directly (these can name main), creating,
+ * forking or deleting a repository. Denied in both studio profiles.
  */
 export const GITHUB_PUBLISH_TOOLS: readonly string[] = [
   'mcp__github__create_branch',
@@ -138,20 +143,32 @@ export const GITHUB_PUBLISH_TOOLS: readonly string[] = [
   'mcp__github__delete_file',
   'mcp__github__delete_repository',
   'mcp__github__fork_repository',
-  'mcp__github__merge_pull_request',
   'mcp__github__push_files',
 ];
 
 /**
  * GitHub MCP tools that open or update a pull request. A builder works on
  * its own branch, so its PR is its own work, and Conor allowed it on
- * 2026-10-15. The builder allows them and the reviewer denies them. Merging
- * stays in GITHUB_PUBLISH_TOOLS.
+ * 2026-10-15. The builder allows them and the reviewer denies them.
  */
 export const GITHUB_PR_TOOLS: readonly string[] = [
   'mcp__github__create_pull_request',
   'mcp__github__update_pull_request',
   'mcp__github__update_pull_request_branch',
+];
+
+/**
+ * Merging a pull request, by the GitHub tool or `gh pr merge`. Conor,
+ * 2026-10-15: every builder session can merge its PR. Sibling review and
+ * green CI first are the process rule (AGENTS.md); no permission rule can
+ * tell whether they happened. The builder allows the tool, and its
+ * `Bash(*)` already covers `gh`; the reviewer denies both, because merging
+ * is the author's step.
+ */
+export const GITHUB_MERGE_TOOLS: readonly string[] = ['mcp__github__merge_pull_request'];
+export const GH_MERGE_DENY_RULES: readonly string[] = [
+  'Bash(gh pr merge*)',
+  'Bash(gh * pr merge*)',
 ];
 
 /**
@@ -344,10 +361,10 @@ export function scratchPathRules(sbSlug: string): string[] {
  * The builder profile: a development session in its own studio. Edits
  * anywhere in its checkout, commits locally and pushes its own branch
  * (STUDIO_PUSH_RULES), opens and updates its pull request, reads GitHub,
- * runs SQL, installs dependencies, and is not pre-approved to force-push,
- * push to main, skip the pre-push hook, merge a pull request, write a
- * branch through the GitHub API, or apply a migration through the Supabase
- * tool.
+ * runs SQL, installs dependencies, merges its pull request, and is not
+ * pre-approved to force-push, push to main, skip the pre-push hook, write
+ * a branch through the GitHub API, or apply a migration through the
+ * Supabase tool.
  *
  * `Edit(/**)`: a single leading slash anchors at the session's primary
  * working directory when the rule lives in `.claude/settings.local.json`,
@@ -365,6 +382,7 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
     'mcp__playwright__*',
     ...GITHUB_READ_TOOLS,
     ...GITHUB_PR_TOOLS,
+    ...GITHUB_MERGE_TOOLS,
     ...SUPABASE_READ_TOOLS,
     ...SUPABASE_SQL_TOOLS,
     ...STUDIO_PUSH_RULES.allow,
@@ -380,8 +398,8 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
 /**
  * The reviewer profile: a detached checkout of code under review. Reads
  * everything, writes only its SB's scratch directories, posts its review,
- * and is not pre-approved to stage, commit or push, or use any other write
- * tool. Its `Bash(*)` is kept for running tests, and installing the
+ * and is not pre-approved to stage, commit or push, merge, or use any
+ * other write tool. Its `Bash(*)` is kept for running tests, and installing the
  * dependencies they need, so every Bash deny here is a backstop too: a
  * subprocess can still write the checkout.
  */
@@ -403,6 +421,8 @@ export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
     ...PUSH_DENY_RULES,
     ...GITHUB_PUBLISH_TOOLS,
     ...GITHUB_PR_TOOLS,
+    ...GITHUB_MERGE_TOOLS,
+    ...GH_MERGE_DENY_RULES,
     ...GITHUB_OTHER_WRITE_TOOLS,
     ...SUPABASE_WRITE_TOOLS,
   ],
@@ -447,11 +467,14 @@ export const NO_VERIFY_COMMIT_DENY_RULES: readonly string[] = [
  * Conor, 2026-10-06: "yolo should keep these ironclad rules about no push to
  * main, no force-push, and no merging PRs without review still apply."
  * AGENTS.md adds `--no-verify`, and migrations go through `yarn db:migrate`.
+ * On 2026-10-15 he narrowed it: builders merge their PRs, and the intent of
+ * the rules is no deletes in random places and no push or force-push to
+ * main. A merge is no longer denied here; review first stays a process
+ * rule, and a reviewer launch still denies merging through its profile.
  *
  *   - the builder's push denies: force, a `+` refspec, main as the
  *     destination, `--no-verify`, and the wholesale ref rewrites;
  *   - `--no-verify` on a commit;
- *   - merging a pull request, by the GitHub tool or `gh pr merge`;
  *   - writing a branch or a repository without a push or a PR: the GitHub
  *     tools that write files directly, or delete a repository;
  *   - applying a migration through the Supabase tool. SQL itself is not
@@ -463,9 +486,6 @@ export const IRONCLAD_DENY_RULES: readonly string[] = [
   ...new Set([
     ...STUDIO_PUSH_RULES.deny,
     ...NO_VERIFY_COMMIT_DENY_RULES,
-    'mcp__github__merge_pull_request',
-    'Bash(gh pr merge*)',
-    'Bash(gh * pr merge*)',
     'mcp__github__push_files',
     'mcp__github__create_or_update_file',
     'mcp__github__delete_file',

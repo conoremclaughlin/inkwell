@@ -450,6 +450,19 @@ describe('retired denies (spec automated-turn-permissions §3.4)', () => {
     });
   });
 
+  it("lifts a builder's old merge denies, and keeps a reviewer's", () => {
+    const merge = ['mcp__github__merge_pull_request', 'Bash(gh pr merge*)', 'Bash(gh * pr merge*)'];
+    const file = { allow: ['Bash(*)'], deny: ['Bash(sudo *)', ...merge] };
+    const built = planProfileSync(file, builderRules);
+    expect(built.removeDeny).toEqual(merge);
+    expect(built.addAllow).toContain('mcp__github__merge_pull_request');
+    const reviewed = planProfileSync(file, studioPermissionRules('reviewer', 'wren'));
+    expect(reviewed.removeDeny).toEqual([]);
+    expect((reviewed.permissions as { deny: string[] }).deny).toEqual(
+      expect.arrayContaining(merge)
+    );
+  });
+
   it('lifts the old install denies from a builder and a reviewer alike', () => {
     const installs = ['Bash(yarn)', 'Bash(yarn install*)', 'Bash(npm ci*)', 'Bash(pnpm add *)'];
     const file = { allow: ['Bash(*)'], deny: ['Bash(sudo *)', ...installs] };
