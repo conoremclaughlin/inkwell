@@ -1537,13 +1537,20 @@ export { isPotentialImitationPrefix } from './imitation-grammar.js';
  * own frame (see ProtocolViolation). Line-anchored, and blind inside fenced
  * code (backtick or tilde, any length) — an ink-tool payload or a quoted code
  * block may legitimately contain the header; the imitation that matters is
- * the one written as if it were the next message.
+ * the one written as if it were the next message. Canonical (fence-bounded)
+ * payloads are different: a raw frame line cannot occur in valid JSON, so a
+ * malformed request must not hide it, regardless of where its closer lands.
  */
 export function findImitatedToolResults(
   responseText: string,
   options: { fenceBounded?: boolean } = {}
 ): ImitatedToolResultsFrame | null {
-  const inkBlocks = findInkToolBlocks(responseText, options);
+  const inkBlocks = findInkToolBlocks(responseText, {
+    ...options,
+    // Example fences belong to the Markdown walk, not to request extents.
+    // Otherwise an inner request can swallow its enclosing example's closer.
+    unquotedOnly: options.fenceBounded,
+  });
   // The open fence, if any. CommonMark closes a fence only with the same
   // character, at least as long, and nothing but whitespace after it — a ```
   // in a ```` block, a ~~~ under a ```, or ```not-a-close inside an open
@@ -1556,6 +1563,18 @@ export function findImitatedToolResults(
     const lineEnd = nl === -1 ? responseText.length : nl;
     const line = responseText.slice(lineStart, lineEnd);
     const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
+    // Complete JSON cannot contain a raw frame LINE inside a string. Scan the
+    // canonical payload whether its closer is present, missing, or arrives
+    // later: an invalid payload never grants permission to hide a frame.
+    // Do not interpret its fence-looking content as a new Markdown example.
+    if (
+      insideInkBlock &&
+      options.fenceBounded &&
+      openFence === null &&
+      (isImitationHeaderLine(line) || isImitationResultLine(line))
+    ) {
+      return { header: line.trim(), index: lineStart, discarded: responseText.slice(lineStart) };
+    }
     if (!insideInkBlock) {
       const next = fenceAfterLine(openFence, line);
       if (next !== openFence) {
