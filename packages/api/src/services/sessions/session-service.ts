@@ -2965,6 +2965,15 @@ export class SessionService implements ISessionService {
         }
       : undefined;
 
+    // The turn's own instructions: its execution tier and, for an inkling, the
+    // conversation's reply contract. Claude takes them appended to its system
+    // prompt; ink has no such path, so they ride in the turn's message
+    // instead (task 9160180d: an inkling's ink turn was never told how to
+    // reply).
+    const turnInstructions =
+      executionTierPrompt(executionTier) +
+      (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : '');
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       ...(this.config.onPermissionWarning
@@ -2990,9 +2999,8 @@ export class SessionService implements ISessionService {
             studioId: session.studioId || undefined,
             threadKey: session.threadKey || undefined,
           }
-        ) +
-        executionTierPrompt(executionTier) +
-        (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : ''),
+        ) + turnInstructions,
+      ...(resolvedBackend === 'ink' && turnInstructions.trim() ? { turnInstructions } : {}),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       inkAccessToken,
