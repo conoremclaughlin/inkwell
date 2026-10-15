@@ -189,6 +189,10 @@ export function createToolInvocationJournal(options: {
     log: options.log,
     sessionId: options.sessionId,
     recovered,
+    /** A failed write is distinct from a pre-write validation/replay refusal. */
+    get persistenceUncertain() {
+      return poisoned;
+    },
     async begin(
       owner: Pick<ToolAttemptOwner, 'turnId' | 'attemptId'>
     ): Promise<ToolAttemptJournal> {

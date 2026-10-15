@@ -16,10 +16,12 @@ const block = (tool: string, args: Record<string, unknown> = {}) =>
   '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```\n';
 function gate<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((r, fail) => {
     resolve = r;
+    reject = fail;
   });
-  return { resolve, promise };
+  return { resolve, reject, promise };
 }
 function harness() {
   const events: Record<string, unknown>[] = [];
@@ -193,6 +195,120 @@ describe('session-owned stream settlement and identity', () => {
     expect(await stream.ownership.reconcile(async () => false)).toBe(false);
     expect(h.supervisor.observe()).toHaveLength(1);
     expect(await stream.ownership.reconcile(async () => true)).toBe(true);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.ports.callTool).toHaveBeenCalledOnce();
+  });
+
+  it.each(['append', 'flush'] as const)(
+    'retains failed opening %s evidence without claiming a live effect',
+    async (operation) => {
+      const h = harness();
+      const failure = new Error('synthetic opening persistence failure');
+      if (operation === 'append')
+        vi.mocked(h.ports.log.append).mockImplementationOnce(() => {
+          throw failure;
+        });
+      else vi.mocked(h.ports.log.flush).mockRejectedValueOnce(failure);
+      await expect(h.start()).rejects.toBe(failure);
+      expect(h.supervisor.observe()).toMatchObject([
+        {
+          owner: { turnId: 'turn-1', attemptId: 'attempt-1' },
+          admission: 'closed',
+          resources: 'reconciliation-required',
+        },
+      ]);
+      expect(h.ports.callTool).not.toHaveBeenCalled();
+      expect(h.ports.beginContextMutation).not.toHaveBeenCalled();
+      expect(await h.supervisor.stopAndWait(0)).toMatchObject([
+        { resources: 'reconciliation-required', waitExpired: false },
+      ]);
+      const owner = h.supervisor.observe()[0].owner;
+      expect(await h.supervisor.reconcile(owner, async () => false)).toBe(false);
+      expect(h.supervisor.observe()).toHaveLength(1);
+      expect(await h.supervisor.reconcile(owner, async () => true)).toBe(true);
+      expect(h.supervisor.observe()).toEqual([]);
+    }
+  );
+
+  it('retains an outcome flush failure after the dispatcher and mutation release finish', async () => {
+    const h = harness();
+    const stream = (await h.start())!;
+    stream.append(block('remember'));
+    await vi.waitFor(() => expect(h.ports.onResult).toHaveBeenCalledOnce());
+    vi.mocked(h.ports.log.flush).mockRejectedValueOnce(new Error('synthetic outcome failure'));
+    const done = await stream.finish({ endOfResponse: true });
+    expect(done.results).toMatchObject([{ dispatchState: 'returned' }]);
+    expect(done.failure?.message).toContain('persistence failed');
+    expect(h.release).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toMatchObject([
+      { admission: 'closed', resources: 'reconciliation-required' },
+    ]);
+    expect(await stream.ownership.reconcile(async () => false)).toBe(false);
+    expect(h.supervisor.observe()).toHaveLength(1);
+    expect(await stream.ownership.reconcile(async () => true)).toBe(true);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.ports.callTool).toHaveBeenCalledOnce();
+  });
+
+  it('does not erase a failed intent write merely because the final flush succeeds', async () => {
+    const h = harness();
+    const stream = (await h.start())!;
+    vi.mocked(h.ports.log.flush).mockRejectedValueOnce(new Error('synthetic intent failure'));
+    stream.append(block('remember'));
+    const done = await stream.finish({ endOfResponse: true });
+    expect(done.results).toMatchObject([{ dispatchState: 'not-dispatched' }]);
+    expect(h.ports.log.flush).toHaveBeenCalledTimes(3);
+    expect(h.release).toHaveBeenCalledOnce();
+    expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.supervisor.observe()).toMatchObject([{ resources: 'reconciliation-required' }]);
+    expect(done.failure?.message).toContain('persistence failed');
+  });
+
+  it('retains opening failure after the Stop deadline as recovery, not still-running work', async () => {
+    const h = harness();
+    const opening = gate<void>();
+    vi.mocked(h.ports.log.flush).mockReturnValueOnce(opening.promise);
+    const starting = h.start();
+    const refused = expect(starting).rejects.toThrow('synthetic late opening failure');
+    expect(await h.supervisor.stopAndWait(0)).toMatchObject([
+      { resources: 'live', waitExpired: true, stopRequested: true },
+    ]);
+    opening.reject(new Error('synthetic late opening failure'));
+    await refused;
+    expect(h.supervisor.observe()).toMatchObject([
+      { resources: 'reconciliation-required', waitExpired: true, admission: 'closed' },
+    ]);
+    expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.ports.beginContextMutation).not.toHaveBeenCalled();
+  });
+
+  it('keeps a late flush failure bound to its old turn while a newer owner is live', async () => {
+    const h = harness();
+    const old = (await h.start('attempt-old', 'turn-old'))!;
+    old.append(block('remember'));
+    await vi.waitFor(() => expect(h.ports.onResult).toHaveBeenCalledOnce());
+    const outcome = gate<void>();
+    vi.mocked(h.ports.log.flush).mockReturnValueOnce(outcome.promise);
+    const oldFinished = old.finish({ endOfResponse: true });
+    await old.ownership.wait(0);
+    const newer = (await h.start('attempt-new', 'turn-new'))!;
+    outcome.reject(new Error('synthetic late outcome failure'));
+    await oldFinished;
+    expect(h.supervisor.observe()).toMatchObject([
+      { owner: { turnId: 'turn-old' }, resources: 'reconciliation-required', waitExpired: true },
+      { owner: { turnId: 'turn-new' }, resources: 'live', waitExpired: false },
+    ]);
+    const confirm = vi.fn(async () => true);
+    await expect(h.supervisor.reconcile(newer.ownership.observe().owner, confirm)).rejects.toThrow(
+      'do not require reconciliation'
+    );
+    await expect(
+      h.supervisor.reconcile({ ...old.ownership.observe().owner, sessionId: 'other' }, confirm)
+    ).rejects.toThrow('not registered');
+    expect(confirm).not.toHaveBeenCalled();
+    expect(await h.supervisor.reconcile(old.ownership.observe().owner, confirm)).toBe(true);
+    expect(h.supervisor.observe()).toEqual([newer.ownership.observe()]);
+    await newer.finish({ endOfResponse: true });
     expect(h.supervisor.observe()).toEqual([]);
     expect(h.ports.callTool).toHaveBeenCalledOnce();
   });
@@ -405,7 +521,7 @@ describe('session-owned stream settlement and identity', () => {
     ).toMatchObject({ turnId: 'turn-2', attemptId: 'attempt-2' });
   });
 
-  it('retains a returned effect and releases resources if outcome recording fails; recovery remains unknown', async () => {
+  it('retains a returned effect and a reconciliation obligation if outcome recording fails', async () => {
     const h = harness();
     const stream = (await h.start())!;
     vi.mocked(h.ports.log.append).mockImplementation((event) => {
@@ -421,6 +537,7 @@ describe('session-owned stream settlement and identity', () => {
     const recovered = readToolInvocationJournal(h.events, 'synthetic-session')[0].invocations;
     expect(recovered.map((i) => i.state)).toEqual(['unknown', 'not-dispatched']);
     expect(h.ports.callTool).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toMatchObject([{ resources: 'reconciliation-required' }]);
   });
 
   it('does not lose known effects when the final flush or context release fails', async () => {
@@ -450,6 +567,7 @@ describe('session-owned stream settlement and identity', () => {
     expect(done.notRun.map((r) => r.call.tool)).toEqual(['remember', 'send_response']);
     expect(done.failure?.kind).toBe('executor');
     expect(h.ports.callTool).not.toHaveBeenCalled();
+    expect(h.supervisor.observe()).toMatchObject([{ resources: 'reconciliation-required' }]);
   });
 
   it.each([false, true])(
@@ -514,6 +632,9 @@ describe('session-owned stream settlement and identity', () => {
       expect(done.results[0]).toMatchObject({ dispatchState: 'returned' });
       if (failOutcome) expect(done.failure?.kind).toBe('executor');
       else expect(done.failure).toBeUndefined();
+      expect(h.supervisor.observe()).toMatchObject(
+        failOutcome ? [{ resources: 'reconciliation-required' }] : []
+      );
     }
   );
 

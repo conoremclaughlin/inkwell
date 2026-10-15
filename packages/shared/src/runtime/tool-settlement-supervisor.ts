@@ -1,6 +1,6 @@
 import type { ToolAttemptOwner } from './tool-invocation-journal.js';
 
-/** Tool-resource lifetime, not effect certainty or provider-process lifetime. */
+/** Tool-resource/recovery obligations, not effect certainty or provider-process lifetime. */
 export interface ToolSettlementSnapshot {
   owner: ToolAttemptOwner;
   admission: 'open' | 'closed';
@@ -51,10 +51,17 @@ export class ToolSettlementSupervisor {
     return [...this.active.values()].map((lease) => lease.observe());
   }
 
+  /** Also reaches an opening failure whose stream never returned its lease. */
+  reconcile(owner: ToolAttemptOwner, confirmReconciled: () => Promise<boolean>): Promise<boolean> {
+    const lease = this.active.get(ownerKey(owner));
+    if (!lease) return Promise.reject(new Error('Tool settlement owner is not registered'));
+    return lease.reconcile(confirmReconciled);
+  }
+
   track(
     owner: ToolAttemptOwner,
     ports: {
-      /** Resolves only after effects, persistence and resource release settle. */
+      /** Resolves after work ends with persistence/release confirmed; rejects for reconciliation. */
       settled: Promise<void>;
       /** Synchronous signal/close request, not a second background operation. */
       requestStop(): undefined;
@@ -105,11 +112,12 @@ export class ToolSettlementLease {
       waitExpired: false,
       resources: 'live',
     };
-    // Observe rejection immediately. A broken cleanup promise is not proof of
-    // release; retain the owner for explicit host reconciliation instead.
+    // Observe rejection immediately. Failed persistence or cleanup is not
+    // proof of release; retain the owner for explicit host reconciliation.
     this.observed = ports.settled.then(
       () => this.settled(),
       () => {
+        this.closeAdmission();
         this.state.resources = 'reconciliation-required';
       }
     );
@@ -158,14 +166,14 @@ export class ToolSettlementLease {
     }
   }
 
-  /** Only a failed cleanup can be reconciled; a live effect cannot be waived. */
-  reconcile(confirmReleased: () => Promise<boolean>): Promise<boolean> {
+  /** Confirm recovery AND cleanup obligations; a live effect cannot be waived. */
+  reconcile(confirmReconciled: () => Promise<boolean>): Promise<boolean> {
     if (this.state.resources !== 'reconciliation-required')
       return Promise.reject(new Error('Tool resources do not require reconciliation'));
     return (this.reconciling ??= (async () => {
       await Promise.resolve(); // Install the shared promise before a port can throw.
       try {
-        if (!(await confirmReleased())) return false;
+        if (!(await confirmReconciled())) return false;
         this.settled();
         return true;
       } catch {

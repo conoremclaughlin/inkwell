@@ -27,11 +27,33 @@ export async function createSessionToolStream(options: {
   }
   const controller = new AbortController();
   let settleResources!: () => void;
-  let failedRelease!: (error: unknown) => void;
+  let failedSettlement!: (error: unknown) => void;
   const resources = new Promise<void>((resolve, reject) => {
     settleResources = resolve;
-    failedRelease = reject;
+    failedSettlement = reject;
   });
+  let persistenceFailure: { error: unknown } | undefined;
+  // Observe every attempt-owned intent/outcome write, not just the final
+  // flush. A later successful flush cannot prove an earlier failed append
+  // left a complete, recoverable journal. Never retry a write or an effect.
+  const log: typeof ports.log = {
+    append(event) {
+      try {
+        return ports.log.append(event);
+      } catch (error) {
+        persistenceFailure ??= { error };
+        throw error;
+      }
+    },
+    async flush() {
+      try {
+        await ports.log.flush();
+      } catch (error) {
+        persistenceFailure ??= { error };
+        throw error;
+      }
+    },
+  };
   let stream: NonNullable<ReturnType<typeof createStreamToolDispatch>> | undefined;
   let batch: ReturnType<typeof createSessionToolBatch>;
   let finishing:
@@ -62,16 +84,18 @@ export async function createSessionToolStream(options: {
   if (ports.signal?.aborted) externalStop();
   try {
     const invocations = await options.journal.begin(options.owner);
-    batch = createSessionToolBatch({ ...options.ports, signal: controller.signal, invocations });
+    batch = createSessionToolBatch({ ...ports, log, signal: controller.signal, invocations });
     stream = createStreamToolDispatch({
       enabled: true,
       executor: batch.executor,
       onAdmission: (call) => batch.admit([call]),
     })!;
   } catch (error) {
-    // No stream/effect was created, and the opening operation has now settled.
+    // No effect was created, but a failed opening write still needs recovery.
+    // Validation/replay refusals made before writing have no such obligation.
     ports.signal?.removeEventListener('abort', externalStop);
-    settleResources();
+    if (options.journal.persistenceUncertain) failedSettlement(error);
+    else settleResources();
     throw error;
   }
   if (controller.signal.aborted) stop();
@@ -81,18 +105,32 @@ export async function createSessionToolStream(options: {
     return (finishing ??= (async () => {
       let result: Awaited<ReturnType<NonNullable<typeof stream>['finish']>>;
       let releaseFailure: { error: unknown } | undefined;
+      let settlementFailure: { error: unknown } | undefined;
       // Known effects are retained even when persistence or bookkeeping
       // fails. The host must treat failure as a failed attempt, not retry it.
       try {
         result = await stream!.finish(options);
         try {
-          await ports.log.flush();
+          await log.flush();
         } catch (error) {
           result.failure ??= {
             kind: 'executor',
             message: `Tool outcome persistence failed: ${String(error)}`,
           };
         }
+        if (persistenceFailure)
+          result.failure ??= {
+            kind: 'executor',
+            message: `Tool journal persistence failed: ${String(persistenceFailure.error)}`,
+          };
+        // Executor infrastructure failures include incomplete admission and
+        // outcome bookkeeping. Ordinary dispatcher exceptions are returned
+        // tool outcomes, NOT stream failures, and do not retain this owner.
+        if (result.failure?.kind === 'executor')
+          settlementFailure = { error: result.failure.message };
+      } catch (error) {
+        settlementFailure = { error };
+        throw error;
       } finally {
         try {
           batch.release();
@@ -101,8 +139,10 @@ export async function createSessionToolStream(options: {
         }
         ports.signal?.removeEventListener('abort', externalStop);
         // Unknown external effect and live resources are different states.
-        // A release failure stays visible for explicit host reconciliation.
-        if (releaseFailure) failedRelease(releaseFailure.error);
+        // Persistence/bookkeeping obligations are not live effects either,
+        // but they remain visible until the host positively reconciles them.
+        const failure = releaseFailure ?? settlementFailure ?? persistenceFailure;
+        if (failure) failedSettlement(failure.error);
         else settleResources();
       }
       if (releaseFailure)
