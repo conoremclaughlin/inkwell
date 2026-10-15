@@ -2596,12 +2596,19 @@ export class SessionService implements ISessionService {
 
     // 3. Build runner config
     const inkDelegationSecret = this.createDelegationSecret();
-    const inkAccessToken = this.createRunnerAccessToken(
-      userId,
-      sbSlug,
-      injectedContext.user.email,
-      session
-    );
+    let inkAccessToken: string;
+    try {
+      inkAccessToken = this.createRunnerAccessToken(
+        userId,
+        sbSlug,
+        injectedContext.user.email,
+        session
+      );
+    } catch {
+      // Return through runTurn so the already-started turn's end hook runs.
+      // Mint/signing failures are not a retry into the machine's authority.
+      return this.runnerCredentialUnavailable(session);
+    }
 
     // 4. Select runtime backend and model. An inkling's session is stored as
     // ink, and its turn is refused below if it is not (inkling-runtime.ts).
@@ -3964,6 +3971,23 @@ export class SessionService implements ISessionService {
     const refusal = this.runnerCredentialRefusal(token, userId, sbSlug, session);
     if (refusal) throw new Error(refusal);
     return token;
+  }
+
+  /** Do not leak mint/signing error text or bypass the normal turn-end path. */
+  private runnerCredentialUnavailable(session: Session): SessionResult {
+    const summary = 'Runner credential unavailable: re-admit the session before retrying';
+    logger.warn(summary, { sessionId: session.id, sbSlug: session.sbSlug });
+    return {
+      success: false,
+      sessionId: session.id,
+      backendSessionId: session.backendSessionId ?? null,
+      responses: [],
+      sessionStatus: 'failed',
+      compactionTriggered: false,
+      error: summary,
+      errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+      classification: { category: 'auth', summary, retryable: false },
+    };
   }
 
   /** Rechecked after preparation and at every physical spawn, including recovery. */
@@ -6185,7 +6209,7 @@ export class SessionService implements ISessionService {
     return this.repository.findByUser(userId, options);
   }
 
-  async triggerCompaction(sessionId: string): Promise<void> {
+  async triggerCompaction(sessionId: string): Promise<void | SessionResult> {
     const session = await this.repository.findById(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -6271,12 +6295,18 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const compactionDelegationSecret = this.createDelegationSecret();
-      const compactionToken = this.createRunnerAccessToken(
-        session.userId,
-        session.sbSlug,
-        fullContext.user.email,
-        session
-      );
+      let compactionToken: string;
+      try {
+        compactionToken = this.createRunnerAccessToken(
+          session.userId,
+          session.sbSlug,
+          fullContext.user.email,
+          session
+        );
+      } catch {
+        // The same classified refusal as a turn; finally releases the lock.
+        return this.runnerCredentialUnavailable(session);
+      }
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       // Compaction deliberately uses the FLEET default model, not the SB's

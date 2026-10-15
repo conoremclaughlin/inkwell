@@ -305,15 +305,21 @@ describe('SessionService', () => {
         if (missing === 'email') context.user.email = undefined;
         else vi.stubEnv('JWT_SECRET', undefined);
         vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
-        const service = sessionService as unknown as {
-          processMessage: (
-            request: ReturnType<typeof createMockRequest>,
-            session: Session
-          ) => Promise<unknown>;
-        };
-        await expect(
-          service.processMessage(createMockRequest(), createMockSession())
-        ).rejects.toThrow(/runner.*credential/i);
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        const start = vi.fn(async () => {});
+        const end = vi.fn(async (_result: unknown) => {});
+        const result = await sessionService.handleMessage(
+          createMockRequest({ turnHooks: { start, end } })
+        );
+        expect(result).toMatchObject({
+          success: false,
+          sessionId: session.id,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(start).toHaveBeenCalledOnce();
+        expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
         expect(mockClaudeRunner.run).not.toHaveBeenCalled();
         expect(mockCodexRunner.run).not.toHaveBeenCalled();
         expect(mockInkRunner.run).not.toHaveBeenCalled();
@@ -328,11 +334,48 @@ describe('SessionService', () => {
         else vi.stubEnv('JWT_SECRET', undefined);
         vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
         vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
-        await expect(sessionService.triggerCompaction('session-123')).rejects.toThrow(
-          /runner.*credential/i
-        );
+        await expect(sessionService.triggerCompaction('session-123')).resolves.toMatchObject({
+          success: false,
+          sessionId: 'session-123',
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
         expect(mockClaudeRunner.run).not.toHaveBeenCalled();
         expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it.each(['turn', 'compaction'])(
+      'classifies a %s mint exception without exposing its details',
+      async (kind) => {
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.spyOn(
+          sessionService as unknown as { createRunnerAccessToken: () => string },
+          'createRunnerAccessToken'
+        ).mockImplementation(() => {
+          throw new Error('synthetic private mint detail');
+        });
+        const end = vi.fn(async (_result: unknown) => {});
+        const result =
+          kind === 'turn'
+            ? await sessionService.handleMessage(
+                createMockRequest({ turnHooks: { start: async () => {}, end } })
+              )
+            : await sessionService.triggerCompaction(session.id);
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(JSON.stringify(result)).not.toContain('synthetic private mint detail');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        if (kind === 'turn')
+          expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
+        else expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
       }
     );
 
