@@ -195,6 +195,7 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
       }
       return {
         INK_ACCESS_TOKEN: token,
+        INK_RUNNER_AUTH_REQUIRED: '1',
         ...(input.delegationSecret ? { INK_DELEGATION_SECRET: input.delegationSecret } : {}),
       };
     },

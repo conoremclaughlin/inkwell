@@ -652,7 +652,8 @@ export interface ISessionService {
    * Sends compaction prompt, waits for agent to persist context,
    * then rotates to fresh Claude session.
    */
-  triggerCompaction(sessionId: string): Promise<void>;
+  // Credential admission can refuse with the same classification as a turn.
+  triggerCompaction(sessionId: string): Promise<void | SessionResult>;
 
   /**
    * End a session (for task agents or explicit termination).

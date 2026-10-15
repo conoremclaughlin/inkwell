@@ -12,7 +12,7 @@ import { randomUUID } from 'crypto';
 import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { signRunnerAccessToken } from '../../auth/ink-tokens';
+import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
 import { deriveDelegationSecret } from '../../auth/delegation-secret';
 import type { Database } from '../../data/supabase/types.js';
 import type {
@@ -2596,12 +2596,19 @@ export class SessionService implements ISessionService {
 
     // 3. Build runner config
     const inkDelegationSecret = this.createDelegationSecret();
-    const inkAccessToken = this.createRunnerAccessToken(
-      userId,
-      sbSlug,
-      injectedContext.user.email,
-      session
-    );
+    let inkAccessToken: string;
+    try {
+      inkAccessToken = this.createRunnerAccessToken(
+        userId,
+        sbSlug,
+        injectedContext.user.email,
+        session
+      );
+    } catch {
+      // Return through runTurn so the already-started turn's end hook runs.
+      // Mint/signing failures are not a retry into the machine's authority.
+      return this.runnerCredentialUnavailable(session);
+    }
 
     // 4. Select runtime backend and model. An inkling's session is stored as
     // ink, and its turn is refused below if it is not (inkling-runtime.ts).
@@ -2979,7 +2986,7 @@ export class SessionService implements ISessionService {
         (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : ''),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
-      ...(inkAccessToken ? { inkAccessToken } : {}),
+      inkAccessToken,
       ...(inkDelegationSecret ? { inkDelegationSecret } : {}),
       inkSessionId: session.id,
       sbSlug,
@@ -3297,7 +3304,9 @@ export class SessionService implements ISessionService {
     const admitSpawn = (): string | undefined =>
       (fencedSbId && inklingFenceHolds(fencedSbId)
         ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
-        : undefined) ?? launchHoldFor(session.id);
+        : undefined) ??
+      launchHoldFor(session.id) ??
+      this.runnerCredentialRefusal(inkAccessToken, userId, sbSlug, session);
     // The launch is written before its process exists, so a restarted server
     // can find the process whatever happens next (launched-processes.ts). A
     // launch that cannot be written is refused, and starts nothing.
@@ -3934,24 +3943,24 @@ export class SessionService implements ISessionService {
     sbSlug: string,
     email: string | undefined,
     session: { id: string; sbId?: string; contactId?: string }
-  ): string | undefined {
-    if (!email) {
+  ): string {
+    if (!email?.trim()) {
       logger.warn('Cannot inject Inkwell access token for backend runner: missing user email', {
         userId,
         sbSlug,
       });
-      return undefined;
+      throw new Error('Runner credential unavailable: missing owner email');
     }
 
-    if (!process.env.JWT_SECRET) {
+    if (!process.env.JWT_SECRET?.trim()) {
       logger.warn('Cannot inject Inkwell access token for backend runner: JWT_SECRET missing', {
         userId,
         sbSlug,
       });
-      return undefined;
+      throw new Error('Runner credential unavailable: missing signing key');
     }
 
-    return signRunnerAccessToken({
+    const token = signRunnerAccessToken({
       userId,
       email,
       sbSlug,
@@ -3959,6 +3968,55 @@ export class SessionService implements ISessionService {
       sessionId: session.id,
       contactId: session.contactId,
     });
+    const refusal = this.runnerCredentialRefusal(token, userId, sbSlug, session);
+    if (refusal) throw new Error(refusal);
+    return token;
+  }
+
+  /** Do not leak mint/signing error text or bypass the normal turn-end path. */
+  private runnerCredentialUnavailable(session: Session): SessionResult {
+    const summary = 'Runner credential unavailable: re-admit the session before retrying';
+    logger.warn(summary, { sessionId: session.id, sbSlug: session.sbSlug });
+    return {
+      success: false,
+      sessionId: session.id,
+      backendSessionId: session.backendSessionId ?? null,
+      responses: [],
+      sessionStatus: 'failed',
+      compactionTriggered: false,
+      error: summary,
+      errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+      classification: { category: 'auth', summary, retryable: false },
+    };
+  }
+
+  /** Rechecked after preparation and at every physical spawn, including recovery. */
+  private runnerCredentialRefusal(
+    token: string,
+    userId: string,
+    sbSlug: string,
+    session: { id: string; sbId?: string; contactId?: string }
+  ): string | undefined {
+    const claims = verifyInkAccessToken(token, 'mcp_access');
+    if (
+      !claims ||
+      !userId?.trim() ||
+      !sbSlug?.trim() ||
+      !session.id?.trim() ||
+      claims.sub !== userId ||
+      claims.sbSlug !== sbSlug ||
+      claims.sessionId !== session.id ||
+      claims.sbId !== (session.sbId ?? undefined) ||
+      claims.contactId !== (session.contactId ?? undefined) ||
+      typeof claims.scope !== 'string' ||
+      !claims.scope.split(/\s+/).includes('mcp:tools') ||
+      typeof claims.exp !== 'number' ||
+      !Number.isFinite(claims.exp) ||
+      claims.exp * 1000 <= Date.now() + 60_000
+    ) {
+      return 'Runner credential unavailable: re-admit the session before spawning';
+    }
+    return undefined;
   }
 
   /**
@@ -6151,7 +6209,7 @@ export class SessionService implements ISessionService {
     return this.repository.findByUser(userId, options);
   }
 
-  async triggerCompaction(sessionId: string): Promise<void> {
+  async triggerCompaction(sessionId: string): Promise<void | SessionResult> {
     const session = await this.repository.findById(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -6237,12 +6295,18 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const compactionDelegationSecret = this.createDelegationSecret();
-      const compactionToken = this.createRunnerAccessToken(
-        session.userId,
-        session.sbSlug,
-        fullContext.user.email,
-        session
-      );
+      let compactionToken: string;
+      try {
+        compactionToken = this.createRunnerAccessToken(
+          session.userId,
+          session.sbSlug,
+          fullContext.user.email,
+          session
+        );
+      } catch {
+        // The same classified refusal as a turn; finally releases the lock.
+        return this.runnerCredentialUnavailable(session);
+      }
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       // Compaction deliberately uses the FLEET default model, not the SB's
@@ -6276,7 +6340,10 @@ This session will continue with a fresh context after compaction. Your identity,
           context.agent.heartbeat
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
-        ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
+        inkAccessToken: compactionToken,
+        inkSessionId: session.id,
+        sbSlug: session.sbSlug,
+        ...(session.studioId ? { studioId: session.studioId } : {}),
         ...(compactionDelegationSecret ? { inkDelegationSecret: compactionDelegationSecret } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
         // No turnEpoch: compaction takes no turn of its own (no pre-spawn
@@ -6304,7 +6371,9 @@ This session will continue with a fresh context after compaction. Your identity,
       // Asked again past the awaits since the first check, and by the runner
       // at its spawn seam, as a turn's admission is.
       // The launch is written first, as a turn's is.
-      const compactionHold = (): string | undefined => launchHoldFor(sessionId);
+      const compactionHold = (): string | undefined =>
+        launchHoldFor(sessionId) ??
+        this.runnerCredentialRefusal(compactionToken, session.userId, session.sbSlug, session);
       const launch =
         compactionHold() === undefined ? await reserveLaunch(sessionId, runtimeBackend) : undefined;
       const refusedAtRun = compactionHold() ?? launch?.refused;

@@ -484,6 +484,7 @@ export class InkRunner implements IRunner {
 
     const spawnPath = buildSpawnPath(inkBin);
     const sessionEnv = buildSessionEnv({
+      requireAccessToken: true,
       inkSessionId: config.inkSessionId,
       studioId: config.studioId,
       sbSlug: config.sbSlug,

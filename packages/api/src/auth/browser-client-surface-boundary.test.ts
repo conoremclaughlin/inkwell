@@ -294,6 +294,9 @@ describe('bearer-verification census', () => {
     // session, identity label and user. Browser grants are refused; regression in
     // hosted-ink-binding.test.ts. No human-auth fallback or token-type downgrade.
     'services/sessions/hosted-ink-binding.ts',
+    // Server launches require their minted mcp_access token with exact session,
+    // owner, agent and contact bindings. No browser or human-token downgrade.
+    'services/sessions/session-service.ts',
     // The companion router itself.
     'routes/browser-companion.ts',
   ].sort();

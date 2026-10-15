@@ -195,6 +195,14 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
+  it('keeps explicit runner policy even if its credential is missing', () => {
+    expect(buildSessionEnv({ requireAccessToken: true })).toEqual({
+      INK_RUNNER_AUTH_REQUIRED: '1',
+    });
+    expect(buildSessionEnv({ inkSessionId: 'interactive-session' })).not.toHaveProperty(
+      'INK_RUNNER_AUTH_REQUIRED'
+    );
+  });
   // Phase 0 of spec:sender-token-binding: the ink chat child used to verify and
   // mint delegation tokens with JWT_SECRET inherited from the server. The
   // server now hands it a DERIVED delegation secret explicitly, and never the key.

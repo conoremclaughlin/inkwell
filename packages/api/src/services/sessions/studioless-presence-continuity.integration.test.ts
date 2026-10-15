@@ -29,6 +29,7 @@ import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/in
 import { SessionService, RoutingRefusedError } from './session-service';
 import { SessionRepository } from './session-repository';
 import { assignThreadParticipant } from './thread-assignment';
+import { BackendFailureError } from '../../channels/trigger-retry';
 import { decideDelivery } from './trigger-delivery.js';
 import { resetActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
@@ -85,7 +86,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
+       RoutingRefusedError, BackendFailureError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
        inTurnNote
      } = deps;
      ${compiledHandler}
@@ -135,7 +136,13 @@ describe('a pinned presence thread keeps one session (integration, task bd4657a0
   const contextBuilder = {
     buildContext: vi.fn(async () => ({
       agent: { sbSlug: agent, name: agent, role: 'assistant', values: [], capabilities: [] },
-      user: { id: 'user', timezone: 'UTC', contacts: {}, preferences: {} },
+      user: {
+        id: userId,
+        email: 'continuity-owner@example.test',
+        timezone: 'UTC',
+        contacts: {},
+        preferences: {},
+      },
       temporal: {
         currentTime: '02:30',
         currentDate: '2026-10-02',
@@ -266,6 +273,7 @@ describe('a pinned presence thread keeps one session (integration, task bd4657a0
       storedTriggerMedia: vi.fn(async () => []),
       decideDelivery,
       RoutingRefusedError,
+      BackendFailureError,
       routeResponses: vi.fn(async () => undefined),
       triggerRetryScheduler: { cancelFor: vi.fn() },
       // The no-progress breaker's completion hook (T1): inert here.

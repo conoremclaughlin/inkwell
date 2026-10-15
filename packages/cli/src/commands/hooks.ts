@@ -36,7 +36,11 @@ import { homedir } from 'os';
 import { createHash } from 'crypto';
 import { classifyDestructiveCommand, SB_SLUG_FOR_RULES, type DestructiveFs } from '@inklabs/shared';
 import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
-import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
+import {
+  getValidAccessToken,
+  getValidDelegatedAccessToken,
+  hasSessionTokenBinding,
+} from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
@@ -276,6 +280,7 @@ export async function callInkTool(
   const serverUrl = getInkServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.INK_ACCESS_TOKEN?.trim());
+  const sessionBound = hasSessionTokenBinding();
   const delegatedSlug =
     typeof args.sbSlug === 'string' && args.sbSlug.trim().length > 0
       ? args.sbSlug.trim().toLowerCase()
@@ -298,6 +303,9 @@ export async function callInkTool(
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
+    if (!token && sessionBound) {
+      throw new Error('Session-scoped hook authority unavailable; re-admit the session');
+    }
     const headers = { ...baseHeaders };
     if (token) {
       headers.Authorization = `Bearer ${token}`;
@@ -322,7 +330,7 @@ export async function callInkTool(
     allowEnvToken?: boolean;
     skipDelegated?: boolean;
   }): Promise<{ token: string | null; source: 'delegated' | 'base' }> => {
-    if (delegatedSlug && !options?.skipDelegated) {
+    if (!sessionBound && delegatedSlug && !options?.skipDelegated) {
       const delegatedToken = getValidDelegatedAccessToken(delegatedSlug);
       if (delegatedToken) {
         return { token: delegatedToken, source: 'delegated' };
@@ -337,7 +345,11 @@ export async function callInkTool(
 
   // Retry once if a runtime token was injected OR if we attempted a delegated token.
   // This allows fallback to local auth token when the first credential is rejected.
-  if (response.status === 401 && (hasInjectedEnvToken || usedDelegatedTokenOnFirstAttempt)) {
+  if (
+    !sessionBound &&
+    response.status === 401 &&
+    (hasInjectedEnvToken || usedDelegatedTokenOnFirstAttempt)
+  ) {
     // Drain first response body before retrying so the underlying HTTP client
     // can cleanly release the stream (avoids occasional undici body warnings).
     try {

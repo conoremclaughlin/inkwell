@@ -562,6 +562,7 @@ export class AntigravityRunner implements IRunner {
         ...(bridgePath ? { INK_BRIDGE_PATH: bridgePath } : {}),
         // These are what the stdio bridge reads to build its HTTP headers.
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           studioId: config.studioId,
           accessToken: config.inkAccessToken,

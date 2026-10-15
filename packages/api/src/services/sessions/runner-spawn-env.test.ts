@@ -19,6 +19,7 @@ import { tmpdir } from 'os';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const spawnMock = vi.fn();
+vi.mock('../../config/env', async () => ({ env: (await import('../../test/fake-env')).fakeEnv }));
 
 vi.mock('child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('child_process')>()),
@@ -34,6 +35,7 @@ vi.mock('./resolve-binary.js', () => ({
 
 import { ClaudeRunner } from './claude-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { AntigravityRunner } from './antigravity-runner.js';
 
 type FakeChild = EventEmitter & {
   stdout: PassThrough;
@@ -100,6 +102,7 @@ afterEach(() => {
 });
 
 function assertAllowlisted(env: Record<string, string>, expected: Record<string, string>): void {
+  expect(env.INK_RUNNER_AUTH_REQUIRED).toBe('1');
   for (const name of Object.keys(SECRETS)) {
     if (name === 'INK_ACCESS_TOKEN') continue;
     expect(name in env, name).toBe(false);
@@ -170,5 +173,26 @@ describe('GeminiRunner child environment (Phase 0)', () => {
       PATH: '/fake/bin/gemini:dir:/usr/bin',
       GEMINI_SYNTHETIC_EXTRA: 'yes',
     });
+  });
+});
+
+describe('AntigravityRunner credential policy', () => {
+  it('hands its child the required-credential marker without global config staging', async () => {
+    const runner = new AntigravityRunner();
+    const env = await captureSpawnEnv(() =>
+      (
+        runner as unknown as {
+          spawnProcess: (args: string[], config: unknown) => Promise<unknown>;
+        }
+      ).spawnProcess([], {
+        workingDirectory,
+        mcpConfigPath: '',
+        inkMcpUrl: 'http://fixture.invalid/mcp',
+        sbSlug: 'fixture',
+        inkSessionId: 'fixture-session',
+        inkAccessToken: 'child-session-token',
+      })
+    );
+    assertAllowlisted(env, { INK_ACCESS_TOKEN: 'child-session-token' });
   });
 });

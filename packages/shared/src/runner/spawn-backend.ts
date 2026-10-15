@@ -307,6 +307,7 @@ export function buildCleanEnv(
  */
 export const SESSION_ENV_HANDOFF_NAMES: readonly string[] = [
   'INK_ACCESS_TOKEN',
+  'INK_RUNNER_AUTH_REQUIRED',
   'INK_DELEGATION_SECRET',
   'INK_SESSION_ID',
   'INK_STUDIO_ID',
