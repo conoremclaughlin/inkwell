@@ -143,6 +143,8 @@ function mapDbToSession(row: DbSession): Session {
     studioId: row.studio_id || undefined,
     workingDir: row.working_dir || undefined,
     contactId: row.contact_id || undefined,
+    // Unknown is not headless: native steering requires an explicit false.
+    cliAttached: typeof row.cli_attached === 'boolean' ? row.cli_attached : undefined,
     backendSessionId: row.backend_session_id || row.claude_session_id,
 
     type: (metadata.type as SessionType) || 'primary',

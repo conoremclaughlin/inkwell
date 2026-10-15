@@ -280,6 +280,21 @@ describe('SessionService', () => {
       async (kind) => {
         const session = createMockSession();
         vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        // Spawn admission belongs to the live runner invocation. After the
+        // turn finalizes, the generation fence correctly refuses admission
+        // before credential validation can run.
+        let checkedCredentialExpiry = false;
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (_message, { config }) => {
+          expect(config.admitSpawn).toBeTypeOf('function');
+          expect(config.admitSpawn?.()).toBeUndefined();
+          vi.useFakeTimers({ toFake: ['Date'] });
+          vi.setSystemTime(Date.now() + 2 * 3600_000);
+          const refusal = config.admitSpawn?.();
+          expect(refusal).toBeDefined();
+          expect(refusal).toMatch(/runner credential unavailable/i);
+          checkedCredentialExpiry = true;
+          return createMockClaudeResult();
+        });
         if (kind === 'compaction') await sessionService.triggerCompaction(session.id);
         else
           await (
@@ -290,13 +305,8 @@ describe('SessionService', () => {
               ) => Promise<unknown>;
             }
           ).processMessage(createMockRequest(), session);
-        const config = vi.mocked(mockClaudeRunner.run).mock.calls[0][1]?.config;
-        expect(config?.admitSpawn?.()).toBeUndefined();
-        vi.useFakeTimers();
-        vi.setSystemTime(Date.now() + 2 * 3600_000);
-        const refusal = config?.admitSpawn?.();
-        expect(refusal).toBeDefined();
-        expect(refusal).toMatch(/runner credential unavailable/i);
+        expect(mockClaudeRunner.run).toHaveBeenCalledOnce();
+        expect(checkedCredentialExpiry).toBe(true);
       }
     );
     it.each(['email', 'signing-key'])(

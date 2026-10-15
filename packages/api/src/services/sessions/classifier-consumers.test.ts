@@ -14,9 +14,9 @@
  * turns this red, and the fix is to decide, in review, whether the new site is
  * on the producer's path and must prefer a carried verdict.
  *
- * The producer itself lives in `@inklabs/shared` (`describeExitResult`) and is
- * out of this file's scope: it classifies the full readable output by
- * construction, which is the property the whole design rests on.
+ * The text-output producer lives in `@inklabs/shared` (`describeExitResult`)
+ * and is out of this file's scope. The native Codex protocol is another
+ * producer: its two scoped wire-error classifications are inventoried here.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -43,6 +43,13 @@ const API_SRC = resolve(__dirname, '../..');
  *                                 client (#618); the decision is unchanged
  *   heartbeat-escalation.ts   x1  the channel alert and the durable inbox copy
  *
+ * NATIVE PRODUCER — codex-app-server-protocol.ts x2 classifies the full scoped
+ * turn error (preferring structured provider status) and the direct reply to
+ * thread/resume for a pre-acceptance owner conflict. Neither reads an excerpt
+ * or overrides an upstream verdict. The runner carries these classifications
+ * to the existing consumers; codex-app-server.test.ts pins the failure and
+ * owner-conflict behavior, including errors after turn acceptance.
+ *
  * A fallback is not a loophole: a spawn failure, an internal throw, or a
  * runner with no classification seam carries no verdict, and classifying the
  * text is the only thing left to do — and correct, because that text was
@@ -50,6 +57,7 @@ const API_SRC = resolve(__dirname, '../..');
  */
 const EXPECTED_CALL_SITES: Record<string, number> = {
   'services/heartbeat-escalation.ts': 1,
+  'services/sessions/codex-app-server-protocol.ts': 2,
   'services/sessions/session-service.ts': 2,
   'services/trigger-failure-listener.ts': 1,
 };

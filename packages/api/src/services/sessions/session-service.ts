@@ -38,7 +38,12 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import {
+  createNativeSteeringBinding,
+  NativeSteeringAdmissionRefused,
+} from './native-steering-binding.js';
+import {
   registerActiveRun,
+  mayGenerationProceed,
   clearActiveRunIfOwner,
   widenActiveRunCandidates,
   getActiveRun,
@@ -2639,6 +2644,7 @@ export class SessionService implements ISessionService {
     let runtimeMaxTurns: number | undefined;
     // Set once an inkling's turn has passed the gate.
     let inklingTurn = false;
+    let nativeSteeringIdentityMetadata: unknown;
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
@@ -2656,6 +2662,9 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      // Snapshot the canonical, user-scoped identity at admission. Later
+      // metadata edits cannot add a port to a restricted generation.
+      nativeSteeringIdentityMetadata = identity?.metadata;
 
       // An inkling's turn starts only in the owner test, on its owner's
       // account, for its owner's own message (Lumen 97b1d66a). Refused
@@ -3313,6 +3322,9 @@ export class SessionService implements ISessionService {
       (fencedSbId && inklingFenceHolds(fencedSbId)
         ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
         : undefined) ??
+      (!mayGenerationProceed(session.id, turnEpoch)
+        ? 'Session generation cannot proceed while admission is closed or a previous child remains owned'
+        : undefined) ??
       launchHoldFor(session.id) ??
       this.runnerCredentialRefusal(inkAccessToken, userId, sbSlug, session);
     // The launch is written before its process exists, so a restarted server
@@ -3363,41 +3375,77 @@ export class SessionService implements ISessionService {
           )}\n\n${uploads.note}`;
 
     try {
-      result = await turnRunner
-        .run(runMessage, {
-          backendSessionId: session.backendSessionId || undefined,
-          // Always handed over, including on resume. Every runner already gates
-          // its own injection on `!isResume`, so this does not change what a
-          // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
-          // that re-bootstraps on every turn, and needs this copy on hand to
-          // recover when that bootstrap fails.
-          injectedContext,
-          // The epoch every terminal write for this turn is fenced on. A
-          // backend process that reports its own turns to the lifecycle route
-          // (ink chat) names this one instead of claiming its own, which fenced
-          // this run out of its own finalize on every ink-backed turn.
-          config: {
-            ...runnerConfig,
-            turnEpoch,
-            ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
-            admitSpawn,
-            ...(launch ? { launchEnv: launch.env } : {}),
-            onSpawned: (spawned) => launch?.spawned(spawned),
-          },
-          mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
-        })
-        .then((ran) => {
-          // A stop the runner could not confirm leaves its row open, for the
-          // next start's sweep to look at.
-          if (!ran.stopUnconfirmed) launch?.exited();
-          // Fenced before the turn is released below, so no admission can
-          // fall between the two.
-          if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
-            fenceInkling(inklingSbId, ran.stopUnconfirmed);
+      let nativeRefusal: string | undefined;
+      let nativeSteering: ReturnType<typeof createNativeSteeringBinding> = undefined;
+      try {
+        nativeSteering =
+          resolvedBackend === 'codex-cli'
+            ? createNativeSteeringBinding({
+                sessionId: session.id,
+                turnEpoch,
+                userId,
+                sbId: session.sbId,
+                sbSlug,
+                contactId: session.contactId ?? null,
+                cliAttached: session.cliAttached,
+                identityMetadata: nativeSteeringIdentityMetadata,
+                executionTier,
+                workingDirectory: resolvedWorkingDirectory,
+                inkAccessToken,
+                container: runnerConfig.container,
+                signal: inklingTracking?.signal,
+                admitSpawn,
+              })
+            : undefined;
+      } catch (error) {
+        if (!(error instanceof NativeSteeringAdmissionRefused)) throw error;
+        nativeRefusal = error.message;
+        launch?.exited(); // Nothing was spawned.
+      }
+      result = nativeRefusal
+        ? {
+            success: false,
+            backendSessionId: session.backendSessionId ?? null,
+            responses: [],
+            refusedBeforeSpawn: true,
+            error: nativeRefusal,
           }
-          return ran;
-        })
-        .finally(() => inklingTracking?.done());
+        : await turnRunner
+            .run(runMessage, {
+              backendSessionId: session.backendSessionId || undefined,
+              // Always handed over, including on resume. Every runner already gates
+              // its own injection on `!isResume`, so this does not change what a
+              // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+              // that re-bootstraps on every turn, and needs this copy on hand to
+              // recover when that bootstrap fails.
+              injectedContext,
+              // The epoch every terminal write for this turn is fenced on. A
+              // backend process that reports its own turns to the lifecycle route
+              // (ink chat) names this one instead of claiming its own, which fenced
+              // this run out of its own finalize on every ink-backed turn.
+              config: {
+                ...runnerConfig,
+                turnEpoch,
+                ...(nativeSteering ? { nativeSteering } : {}),
+                ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+                admitSpawn,
+                ...(launch ? { launchEnv: launch.env } : {}),
+                onSpawned: (spawned) => launch?.spawned(spawned),
+              },
+              mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
+            })
+            .then((ran) => {
+              // A stop the runner could not confirm leaves its row open, for the
+              // next start's sweep to look at.
+              if (!ran.stopUnconfirmed) launch?.exited();
+              // Fenced before the turn is released below, so no admission can
+              // fall between the two.
+              if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
+                fenceInkling(inklingSbId, ran.stopUnconfirmed);
+              }
+              return ran;
+            })
+            .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most

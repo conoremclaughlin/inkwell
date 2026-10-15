@@ -1,4 +1,4 @@
-/** Explicit owner text for the current hosted turn. No inbox wake or queue fallback. */
+/** Explicit owner text for the current admitted turn. No inbox wake or queue fallback. */
 import type { Router, Request, Response } from 'express';
 import { parseSessionSteering } from '@inklabs/shared/runtime';
 import type { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
@@ -90,7 +90,7 @@ export function addSessionSteeringRoute(
         run?.userId !== auth.userId ||
         run?.sbSlug !== identity.agent_id
       ) {
-        res.status(409).json({ error: 'No matching detached hosted owner' });
+        res.status(409).json({ error: 'No matching detached owner' });
         return;
       }
       // The mailbox rechecks its exact generation after its asynchronous durable
