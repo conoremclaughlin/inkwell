@@ -16,6 +16,8 @@ const fake = vi.hoisted(() => ({
   query: '',
   replace: vi.fn(),
   read: vi.fn(),
+  post: vi.fn(),
+  feed: vi.fn(),
 }));
 
 vi.mock('next/navigation', () => ({
@@ -27,6 +29,7 @@ vi.mock('next/navigation', () => ({
 vi.mock('@/lib/api/client', () => ({
   apiGet: async (path: string, options?: { workspaceId: string | null }) => {
     if (path === '/api/admin/threads') {
+      await fake.feed();
       return {
         spines: fake.spines,
         meta: {
@@ -41,7 +44,7 @@ vi.mock('@/lib/api/client', () => ({
     if (path.startsWith('/api/admin/threads/messages?')) return fake.read(path, options);
     throw new Error(`unexpected GET ${path}`);
   },
-  apiPost: async () => ({}),
+  apiPost: (...args: unknown[]) => fake.post(...args),
   apiPut: async () => ({}),
   apiPatch: async () => ({}),
   apiDelete: async () => ({}),
@@ -85,6 +88,8 @@ beforeEach(() => {
   fake.query = '';
   fake.replace.mockReset();
   fake.read.mockReset();
+  fake.post.mockReset().mockResolvedValue({});
+  fake.feed.mockReset().mockResolvedValue(undefined);
   window.localStorage.clear();
   window.matchMedia = ((query: string) => ({
     matches: false,
@@ -226,15 +231,104 @@ describe('Threads recovery deep links', () => {
     expect(screen.queryByRole('textbox', { name: /^Reply to / })).toBeNull();
   });
 
-  it('withholds a recovered composer when a later read fails, even with cached data', async () => {
+  it('keeps the mounted draft through a read outage and recovery, withholding sends only', async () => {
     const page = renderPage();
-    expect(await screen.findByRole('textbox', { name: `Reply to ${key}` })).toBeTruthy();
+    const composer = (await screen.findByRole('textbox', {
+      name: `Reply to ${key}`,
+    })) as HTMLTextAreaElement;
+    fireEvent.change(composer, { target: { value: 'Keep this unsent draft' } });
     fake.read.mockRejectedValue(new Error('Synthetic refresh unavailable'));
     await act(async () => {
       await page.client.invalidateQueries({ queryKey: ['thread-messages', key] });
     });
-    expect((await screen.findByRole('alert')).textContent).toContain('Could not read');
+    expect((await screen.findByRole('alert')).textContent).toContain('Could not refresh');
+    expect(screen.getByRole('textbox', { name: `Reply to ${key}` })).toBe(composer);
+    expect(composer.value).toBe('Keep this unsent draft');
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    expect(fake.post).not.toHaveBeenCalled();
+    fake.read.mockResolvedValue(receipt(key));
+    await act(async () => {
+      await page.client.invalidateQueries({ queryKey: ['thread-messages', key] });
+    });
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    expect(screen.getByRole('textbox', { name: `Reply to ${key}` })).toBe(composer);
+    expect(composer.value).toBe('Keep this unsent draft');
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(
+      false
+    );
+  });
+
+  it('does not erase a failed reply or its draft when the thread read fails and recovers', async () => {
+    fake.post.mockRejectedValue(new Error('Synthetic reply outcome unknown'));
+    const page = renderPage();
+    const composer = await screen.findByRole('textbox', { name: `Reply to ${key}` });
+    fireEvent.change(composer, { target: { value: 'A reply whose receipt is missing' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(await screen.findByText('Synthetic reply outcome unknown')).toBeTruthy();
+    fake.read.mockRejectedValue(new Error('Synthetic refresh unavailable'));
+    await act(async () => {
+      await page.client.invalidateQueries({ queryKey: ['thread-messages', key] });
+    });
+    await screen.findByRole('alert');
+    expect(screen.getByText('Synthetic reply outcome unknown')).toBeTruthy();
+    fake.read.mockResolvedValue(receipt(key));
+    await act(async () => {
+      await page.client.invalidateQueries({ queryKey: ['thread-messages', key] });
+    });
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    expect(screen.getByDisplayValue('A reply whose receipt is missing')).toBe(composer);
+    expect(screen.getByText('Synthetic reply outcome unknown')).toBeTruthy();
+    expect(fake.post).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['loading', 'error'] as const)(
+    'does not claim absence from a %s feed',
+    async (feedState) => {
+      let release!: () => void;
+      if (feedState === 'loading')
+        fake.feed.mockReturnValue(
+          new Promise<void>((resolve) => {
+            release = resolve;
+          })
+        );
+      else fake.feed.mockRejectedValue(new Error('Synthetic feed unavailable'));
+      const page = renderPage();
+      expect(await screen.findByText(`Receipt on ${key} in default`)).toBeTruthy();
+      expect(screen.queryByText(/outside the current activity feed/)).toBeNull();
+      if (feedState === 'loading') {
+        await act(async () => release());
+      } else {
+        fake.feed.mockResolvedValue(undefined);
+        await act(async () => {
+          await page.client.invalidateQueries({ queryKey: ['thread-spines'] });
+        });
+      }
+      expect(await screen.findByText(/outside the current activity feed/)).toBeTruthy();
+    }
+  );
+
+  it('keeps a first read pending rather than claiming the send is absent', async () => {
+    let release!: (value: unknown) => void;
+    fake.read.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      })
+    );
+    renderPage();
+    expect(await screen.findByText('Reading this thread…')).toBeTruthy();
+    expect(screen.queryByText(/No conversation was found/)).toBeNull();
     expect(screen.queryByRole('textbox', { name: /^Reply to / })).toBeNull();
+    await act(async () => release(receipt(key)));
+    expect(await screen.findByRole('textbox', { name: `Reply to ${key}` })).toBeTruthy();
+  });
+
+  it('does not use a mismatched thread row as confirmation', async () => {
+    fake.read.mockResolvedValue(receipt('thread:synthetic-other'));
+    renderPage();
+    expect((await screen.findByRole('alert')).textContent).toContain('thread unconfirmed');
+    expect(screen.queryByRole('textbox', { name: /^Reply to / })).toBeNull();
+    expect(screen.queryByText(/Receipt on thread:synthetic-other/)).toBeNull();
   });
 
   it('reads the same key in the selected workspace without reusing the old workspace content', async () => {

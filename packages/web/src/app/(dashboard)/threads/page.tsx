@@ -120,12 +120,14 @@ function ThreadsChat() {
       // Once found, ThreadConversation owns polling. Until then, a late
       // original request can still arrive without another send.
       refetchInterval: (query) =>
-        query.state.status === 'success' && query.state.data?.thread ? false : 5_000,
+        query.state.status === 'success' && query.state.data?.thread?.threadKey === selectedKey
+          ? false
+          : 5_000,
     }
   );
   const recoveredThread = recovered.data?.thread;
   const recoveredSelection: ThreadSpine | null =
-    recovering && !recovered.error && recoveredThread?.threadKey === selectedKey
+    recovering && recoveredThread?.threadKey === selectedKey
       ? {
           key: selectedKey,
           identity: null,
@@ -202,10 +204,16 @@ function ThreadsChat() {
             : 'hidden min-w-0 flex-1 flex-col md:flex'
         }
       >
-        {recoveredSelection && (
+        {recoveredSelection && !isLoading && !error && (
           <p className="border-b px-4 py-2 text-xs text-muted-foreground">
             This conversation is outside the current activity feed. Its messages are read directly;
             finding it is not a receipt for any particular send.
+          </p>
+        )}
+        {recoveredSelection && recovered.error && (
+          <p role="alert" className="border-b px-4 py-2 text-xs text-destructive">
+            Could not refresh this thread. Showing the last confirmed messages; your draft and reply
+            errors are kept. Sending is paused while we check again.
           </p>
         )}
         {selected ? (
@@ -218,16 +226,19 @@ function ThreadsChat() {
             onBack={() => select(null)}
             detailsOpen={detailsOpen}
             onToggleDetails={() => setDetailsOpen(!detailsOpen)}
+            readUnavailable={!!recoveredSelection && !!recovered.error}
           />
         ) : (
           <NoConversation
             state={
               recovering
-                ? recovered.error || (recoveredThread && recoveredThread.threadKey !== selectedKey)
+                ? recovered.error
                   ? 'unconfirmed'
-                  : recovered.isPending
-                    ? 'loading'
-                    : 'missing'
+                  : recoveredThread && recoveredThread.threadKey !== selectedKey
+                    ? 'mismatch'
+                    : recovered.isPending
+                      ? 'loading'
+                      : 'missing'
                 : threads.length === 0 && !isLoading
                   ? 'empty'
                   : 'idle'
@@ -263,7 +274,7 @@ function NoConversation({
   state,
   onBack,
 }: {
-  state: 'idle' | 'empty' | 'missing' | 'loading' | 'unconfirmed';
+  state: 'idle' | 'empty' | 'missing' | 'loading' | 'unconfirmed' | 'mismatch';
   onBack: () => void;
 }) {
   return (
@@ -272,24 +283,29 @@ function NoConversation({
         <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500/15 to-violet-500/15">
           <MessagesSquare className="h-6 w-6 text-sky-600 dark:text-sky-400" />
         </div>
-        {state === 'missing' || state === 'loading' || state === 'unconfirmed' ? (
+        {state === 'missing' ||
+        state === 'loading' ||
+        state === 'unconfirmed' ||
+        state === 'mismatch' ? (
           <>
             <p
               className="mt-4 text-sm font-medium"
-              role={state === 'unconfirmed' ? 'alert' : 'status'}
+              role={state === 'unconfirmed' || state === 'mismatch' ? 'alert' : 'status'}
             >
               {state === 'loading'
                 ? 'Reading this thread…'
                 : state === 'unconfirmed'
                   ? 'Could not read this thread — thread unconfirmed'
-                  : 'No conversation was found for this key yet'}
+                  : state === 'mismatch'
+                    ? 'The response did not match this key — thread unconfirmed'
+                    : 'No conversation was found for this key yet'}
             </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               {state === 'loading'
                 ? 'Checking the exact key, including conversations outside the activity feed.'
-                : state === 'unconfirmed'
-                  ? 'A read failure cannot confirm whether your send was stored. Check again before retrying the send.'
-                  : 'This is not a delivery receipt. An in-flight request may still arrive; check again before retrying the send.'}
+                : state === 'unconfirmed' || state === 'mismatch'
+                  ? 'This read cannot confirm whether your send was stored. We will keep checking; do not retry based on this result.'
+                  : 'This is not a delivery receipt. An in-flight request may still arrive; we will keep checking before you retry.'}
             </p>
             <button
               type="button"
