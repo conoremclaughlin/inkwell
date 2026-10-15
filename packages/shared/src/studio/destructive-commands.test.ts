@@ -204,7 +204,7 @@ describe('detection looks through operators and wrappers, as broadly as the deni
   });
 });
 
-describe('asPlainRm: an rm the check could not read is sent back to be run plain (Conor, 2026-10-14)', () => {
+describe('asPlainRm: an rm the check could not read is sent back to be run plain', () => {
   const asPlain = (command: string) => {
     const verdict = classify(command);
     return verdict.kind === 'needs-approval' ? verdict.asPlainRm === true : null;
@@ -234,5 +234,34 @@ describe('asPlainRm: an rm the check could not read is sent back to be run plain
 
   it('the plain form of an in-scope delete is then allowed', () => {
     expect(classify(`rm -rf ${SCRATCH}/vt/work`).kind).toBe('allowed');
+  });
+});
+
+describe('heredoc bodies are data unless a shell reads them', () => {
+  it.each([
+    [
+      'a commit message written with a quoted heredoc',
+      'M=/tmp/msg; cat > "$M" <<\'EOF\'\nfix: stop asking about rm -rf in scratch\n\nThe old check denied rm -rf dist.\nEOF\ngit commit -F "$M"',
+    ],
+    ['a heredoc git reads', 'git commit -F - <<EOF\nmention rm -rf x and git reset --hard\nEOF'],
+    ['a dash heredoc with a tab-indented end', 'cat > f <<-EOF\n\trm -rf x\n\tEOF'],
+    ['a python heredoc printing the words', "python3 - <<'PY'\nprint('rm -rf x')\nPY"],
+  ])('%s is not destructive', (_name, command) => {
+    expect(classify(command).kind).toBe('not-destructive');
+  });
+
+  it.each([
+    ['bash reads it', "bash <<'EOF'\nrm -rf x\nEOF"],
+    ['it is piped to sh', 'cat <<EOF | sh\nrm -rf x\nEOF'],
+    ['sudo wraps the reader', 'sudo tee /etc/x <<EOF\nrm -rf x\nEOF'],
+    ['ssh reads it', 'ssh host <<EOF\nrm -rf x\nEOF'],
+    ['a real rm after the heredoc', "cat > f <<'EOF'\nhello\nEOF\nrm -rf /h/ws/repo/dist"],
+    ['an rm on the heredoc line itself', "rm -rf x; cat > f <<'EOF'\nhi\nEOF"],
+  ])('%s: still destructive', (_name, command) => {
+    expect(classify(command).kind).not.toBe('not-destructive');
+  });
+
+  it('a heredoc never makes a delete allowed: the command is not one the allowance models', () => {
+    expect(classify(`rm -rf ${SCRATCH}/x <<EOF\nEOF`).kind).toBe('needs-approval');
   });
 });

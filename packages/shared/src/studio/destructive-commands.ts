@@ -71,6 +71,82 @@ export interface DestructiveContext {
 const UNMODELLED = /[;&|<>()$`'"\\*?[\]{}!#\n\r\t]/;
 
 /**
+ * Programs that run what they read as commands. A heredoc fed to one of
+ * these, directly or through a pipe, is code, and its body stays in view.
+ * Wrappers that run another program (sudo, env, timeout) count too: what
+ * they wrap is not known here.
+ */
+const HEREDOC_RUNNERS = new Set([
+  'bash',
+  'sh',
+  'zsh',
+  'dash',
+  'ksh',
+  'fish',
+  'eval',
+  'source',
+  '.',
+  'exec',
+  'ssh',
+  'xargs',
+  'sudo',
+  'su',
+  'env',
+  'nohup',
+  'timeout',
+  'nice',
+  'doas',
+]);
+
+const HEREDOC = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/g;
+
+/** The first program word of the last command segment in `text`. */
+function lastProgram(text: string): string | null {
+  const segment = text.split(/[;&|(]/).pop() ?? '';
+  const words = segment.trim().split(/\s+/).filter(Boolean);
+  const first = words.find((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+  return first ? posix.basename(first) : null;
+}
+
+/**
+ * The command with the bodies of data heredocs removed, for detection only:
+ * a commit message or a file written with `cat > f <<'EOF'` that mentions
+ * `rm -rf` deletes nothing. A heredoc stays when what
+ * reads it runs commands (`bash <<EOF`, `cat <<EOF | sh`). This narrows only
+ * what is asked about; nothing it removes could ever have been allowed,
+ * since any heredoc makes a command one the allowance does not model.
+ */
+export function withoutDataHeredocs(command: string): string {
+  const lines = command.split('\n');
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    kept.push(line);
+    const bodies: Array<{ delimiter: string; data: boolean; dash: boolean }> = [];
+    for (const match of line.matchAll(HEREDOC)) {
+      const before = line.slice(0, match.index);
+      const after = line.slice((match.index ?? 0) + match[0].length);
+      const reader = lastProgram(before);
+      const pipedTo = /\|/.test(after) ? lastProgram(after.slice(after.indexOf('|') + 1)) : null;
+      const runs =
+        reader === null ||
+        HEREDOC_RUNNERS.has(reader) ||
+        (pipedTo !== null && HEREDOC_RUNNERS.has(pipedTo));
+      bodies.push({ delimiter: match[2], data: !runs, dash: match[0].startsWith('<<-') });
+    }
+    for (const body of bodies) {
+      while (i + 1 < lines.length) {
+        const next = lines[++i];
+        const end = (body.dash ? next.replace(/^\t+/, '') : next) === body.delimiter;
+        if (end || !body.data) kept.push(next);
+        if (end) break;
+      }
+    }
+  }
+  return kept.join('\n');
+}
+
+/**
  * The command's words for detection: split on whitespace, shell operators
  * and quote characters, so a quoted or wrapped command (`bash -c "rm -rf
  * x"`, `timeout 5 rm -r x`) is still seen. A rough cut, used only to decide
@@ -147,7 +223,7 @@ export function classifyDestructiveCommand(
   context: DestructiveContext,
   fs: DestructiveFs
 ): DestructiveVerdict {
-  const words = detectionWords(command);
+  const words = detectionWords(withoutDataHeredocs(command));
   const kinds = words
     .map((_, i) => destructiveKindAt(words.slice(i)))
     .filter((kind): kind is string => kind !== null);

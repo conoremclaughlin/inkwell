@@ -9,7 +9,7 @@
  * destructive-command decision, made only for a turn the server spawned:
  * allowed inside the session's own linked worktree, and otherwise requested
  * from Conor without waiting. A person attached gets no decision from it and
- * runs as Claude Code normally would (Conor, 2026-10-14).
+ * runs as Claude Code normally would.
  *
  * Needs the CLI built (`yarn workspace @inklabs/cli build`), as the other
  * entry-point tests do.

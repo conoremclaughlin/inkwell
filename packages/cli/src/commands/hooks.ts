@@ -2674,8 +2674,7 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * This Claude session's own scratchpad, `<tmp>/claude-<uid>/<project>/<session>/scratchpad`,
  * found by listing rather than by rebuilding the project segment. Only the
  * directory named for this exact session id counts, never the shared
- * `claude-<uid>` parent every session writes under (Conor, 2026-10-14: "It
- * should also take into account his own scratchpad").
+ * `claude-<uid>` parent every session writes under.
  */
 export function sessionScratchpads(claudeSessionId: string | undefined): string[] {
   if (!claudeSessionId || !UUID_SHAPE.test(claudeSessionId)) return [];
@@ -2776,8 +2775,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   // checkout -- .) are decided here rather than by a deny rule, which no one
   // could approve (spec automated-turn-permissions §3.4). Only for a turn the
   // server spawned: a person at the terminal runs as Claude Code normally
-  // would, prompting or not by their own permission mode (Conor, 2026-10-14:
-  // "If I'm attached, I've got yolo on and it should operate per normal").
+  // would, prompting or not by their own permission mode.
   let destructiveReason: string | null = null;
   let destructiveAsPlainRm = false;
   if (toolName === 'Bash' && isHeadlessSession()) {
