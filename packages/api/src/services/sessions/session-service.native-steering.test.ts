@@ -57,6 +57,8 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 vi.mock('@inklabs/shared', async () => ({
   ...(await import('../../../../shared/src/errors/classify-error.js')),
+  // The runner-credential checks classify the token's scope with these.
+  ...(await import('../../../../shared/src/security/token-scope.js')),
   isPathWithinWorkspaceAsync: vi.fn(),
   studioPermissionProfile: vi.fn(),
   buildSessionEnv: vi.fn(() => ({})),

@@ -13,6 +13,7 @@ import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
+import { isPlainToolsScope } from '../../auth/token-scope';
 import { deriveDelegationSecret } from '../../auth/delegation-secret';
 import type { Database } from '../../data/supabase/types.js';
 import type {
@@ -4064,8 +4065,7 @@ export class SessionService implements ISessionService {
       claims.sessionId !== session.id ||
       claims.sbId !== (session.sbId ?? undefined) ||
       claims.contactId !== (session.contactId ?? undefined) ||
-      typeof claims.scope !== 'string' ||
-      !claims.scope.split(/\s+/).includes('mcp:tools') ||
+      !isPlainToolsScope(claims.scope) ||
       typeof claims.exp !== 'number' ||
       !Number.isFinite(claims.exp) ||
       claims.exp * 1000 <= Date.now() + 60_000

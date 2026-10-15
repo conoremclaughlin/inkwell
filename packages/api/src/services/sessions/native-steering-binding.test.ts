@@ -126,6 +126,9 @@ describe('native steering admission', () => {
     ['empty contact claim', { contactId: '' }],
     ['wrong scope', { scope: 'mcp:observe' }],
     ['malformed scope', { scope: null }],
+    // Phase 2 gate 6: includes mcp:tools, but is not a plain runner credential.
+    ['mixed space-turn scope', { scope: 'mcp:tools mcp:space-turn' }],
+    ['space-turn scope', { scope: 'mcp:space-turn' }],
     ['missing expiry', { exp: undefined }],
     ['malformed expiry', { exp: '9999999999' }],
     ['nonfinite expiry', { exp: Number.POSITIVE_INFINITY }],

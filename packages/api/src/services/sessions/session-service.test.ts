@@ -275,6 +275,42 @@ describe('SessionService', () => {
   });
 
   describe('required runner credential admission', () => {
+    // Phase 2 gate 6 (ink://specs/inkling-multi-person-groups): a scope that
+    // merely includes mcp:tools is not a plain runner credential; a mixed
+    // "mcp:tools mcp:space-turn" token must not be admitted as broad, nor
+    // mcp:tools beside any other scope.
+    it.each([
+      ['mcp:tools', true],
+      ['mcp:tools offline_access', false],
+      ['mcp:tools mcp:space-turn', false],
+      ['mcp:space-turn mcp:tools', false],
+      ['mcp:space-turn', false],
+    ] as const)('runner credential scoped "%s" is admitted: %s', async (scope, admitted) => {
+      const { signInkAccessToken } = await import('../../auth/ink-tokens');
+      const token = signInkAccessToken(
+        {
+          type: 'mcp_access',
+          sub: 'user-scope',
+          email: 'owner@example.invalid',
+          scope,
+          sbSlug: 'wren',
+          sessionId: 'session-scope',
+        },
+        3600
+      );
+      const refusal = (
+        sessionService as unknown as {
+          runnerCredentialRefusal: (
+            token: string,
+            userId: string,
+            sbSlug: string,
+            session: { id: string; sbId?: string; contactId?: string }
+          ) => string | undefined;
+        }
+      ).runnerCredentialRefusal(token, 'user-scope', 'wren', { id: 'session-scope' });
+      expect(refusal === undefined).toBe(admitted);
+    });
+
     it.each(['turn', 'compaction'])(
       'rechecks credential expiry at the %s physical-spawn seam',
       async (kind) => {
