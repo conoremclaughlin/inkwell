@@ -21,9 +21,15 @@
  *     lasted a minute. A crash loop retries slowly and never spins.
  *   - A change under a watched folder restarts it at once and resets the
  *     backoff. Bursts are coalesced (a shared rebuild writes dozens of files).
+ *   - A watched folder is checked for every second. One missing at start, or
+ *     deleted later, is watched as soon as it appears, and its appearance
+ *     restarts the server, as `tsx watch` did (Lumen, #872).
  *   - SIGINT, SIGTERM and SIGHUP are passed to the server, which shuts down on
- *     its own; after the stop timeout it is killed. A second signal kills it
- *     at once. Then this process exits 128 + the signal number.
+ *     its own; after the stop timeout it is killed. A second SIGINT (Ctrl-C
+ *     twice) kills it at once. Any other signal that arrives during the stop
+ *     is ignored: under `yarn dev`, one Ctrl-C is followed by concurrently's
+ *     SIGTERM, which must not cut the server's shutdown short (Lumen, #872).
+ *     Then this process exits 128 + the first signal's number.
  *
  * Usage:
  *   node scripts/dev-watch.mjs [--watch <dir>]... <entry> [args...]
@@ -36,7 +42,7 @@
  * the tests.
  */
 import { spawn } from 'node:child_process';
-import { watch } from 'node:fs';
+import { statSync, watch } from 'node:fs';
 import { constants } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +52,7 @@ const RESTART_DELAY_MS = positiveInt(process.env.DEV_WATCH_RESTART_DELAY_MS, 1_0
 const MAX_RESTART_DELAY_MS = 30_000;
 const HEALTHY_RUN_MS = 60_000;
 const CHANGE_DEBOUNCE_MS = 200;
+const ROOT_CHECK_MS = 1_000;
 
 function positiveInt(raw, fallback) {
   const value = Number(raw);
@@ -158,41 +165,80 @@ function main() {
 
   let changeTimer = null;
   let firstChange = null;
-  const watchers = [];
-  for (const dir of watchDirs) {
-    try {
-      const watcher = watch(path.resolve(dir), { recursive: true }, (_event, filename) => {
-        if (!filename) return;
-        const relative = filename.toString();
-        if (isIgnoredPath(relative)) return;
-        firstChange ??= path.join(dir, relative);
-        if (changeTimer !== null) clearTimeout(changeTimer);
-        changeTimer = setTimeout(() => {
-          const changed = firstChange;
-          changeTimer = null;
-          firstChange = null;
-          requestRestart(`change in ${changed}`);
-        }, CHANGE_DEBOUNCE_MS);
-      });
-      watcher.on('error', (error) => log(`stopped watching ${dir}: ${error.message}`));
-      watchers.push(watcher);
-    } catch (error) {
-      log(`not watching ${dir}: ${error.message}`);
-    }
+  function noteChange(changed) {
+    firstChange ??= changed;
+    if (changeTimer !== null) clearTimeout(changeTimer);
+    changeTimer = setTimeout(() => {
+      const first = firstChange;
+      changeTimer = null;
+      firstChange = null;
+      requestRestart(`change in ${first}`);
+    }, CHANGE_DEBOUNCE_MS);
   }
 
+  /** Each watched folder, and its watcher while the folder exists. */
+  const roots = watchDirs.map((dir) => ({ dir, absolute: path.resolve(dir), watcher: null }));
+  function watchRoot(root) {
+    try {
+      root.watcher = watch(root.absolute, { recursive: true }, (_event, filename) => {
+        if (!filename) return;
+        const relative = filename.toString();
+        if (!isIgnoredPath(relative)) noteChange(path.join(root.dir, relative));
+      });
+      root.watcher.on('error', (error) => {
+        log(`stopped watching ${root.dir}: ${error.message}`);
+        unwatchRoot(root);
+      });
+      return true;
+    } catch (error) {
+      log(`could not watch ${root.dir}: ${error.message}`);
+      root.watcher = null;
+      return false;
+    }
+  }
+  function unwatchRoot(root) {
+    root.watcher?.close();
+    root.watcher = null;
+  }
+  /** Watch the folders that exist, and let go of the ones that are gone. */
+  function checkRoots(atStart) {
+    for (const root of roots) {
+      const exists = statSync(root.absolute, { throwIfNoEntry: false })?.isDirectory() ?? false;
+      if (exists && root.watcher === null) {
+        if (watchRoot(root) && !atStart) {
+          log(`${root.dir} appeared; watching it`);
+          noteChange(root.dir);
+        }
+      } else if (!exists && root.watcher !== null) {
+        log(`${root.dir} is gone; watching for it to come back`);
+        unwatchRoot(root);
+      } else if (!exists && atStart) {
+        log(`${root.dir} does not exist yet; watching for it`);
+      }
+    }
+  }
+  checkRoots(true);
+  const rootTimer = setInterval(() => checkRoots(false), ROOT_CHECK_MS);
+
+  let firstSignal = null;
   async function shutdown(signal) {
-    const exitCode = 128 + constants.signals[signal];
     if (exiting) {
-      current?.proc.kill('SIGKILL');
-      process.exit(exitCode);
+      // Ctrl-C twice: stop waiting. Anything else (concurrently's SIGTERM after
+      // the Ctrl-C that reached the whole group) lets the shutdown finish.
+      if (signal === 'SIGINT' && firstSignal === 'SIGINT') {
+        current?.proc.kill('SIGKILL');
+        process.exit(128 + constants.signals[firstSignal]);
+      }
+      return;
     }
     exiting = true;
+    firstSignal = signal;
+    clearInterval(rootTimer);
     if (restartTimer !== null) clearTimeout(restartTimer);
     if (changeTimer !== null) clearTimeout(changeTimer);
-    for (const watcher of watchers) watcher.close();
+    for (const root of roots) unwatchRoot(root);
     await stopServer(signal);
-    process.exit(exitCode);
+    process.exit(128 + constants.signals[signal]);
   }
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => void shutdown(signal));

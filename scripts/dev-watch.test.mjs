@@ -14,7 +14,11 @@
  *   - a change in a watched folder restarts the run and the old run gets
  *     SIGTERM; a test file there does not;
  *   - a run that ignores SIGTERM is killed after the stop timeout;
- *   - SIGINT reaches the run, and the watcher exits 130.
+ *   - a watched folder missing at start, or deleted and recreated, is
+ *     watched once it is there (Lumen, #872);
+ *   - SIGINT reaches the run, and the watcher exits 130; a SIGTERM after it
+ *     (concurrently's, under `yarn dev`) lets the run finish shutting down,
+ *     and only a second SIGINT kills it at once (Lumen, #872).
  *
  * Each case runs the real watcher on a fixture entry in its own temporary
  * folder. The watcher is started as a process-group leader, so cleanup can
@@ -70,7 +74,11 @@ if (mine !== 'ignore-term') {
 } else {
   process.on('SIGTERM', () => appendFileSync(log, 'ignored-term ' + run + '\\n'));
 }
-process.on('SIGINT', () => { appendFileSync(log, 'int ' + run + '\\n'); process.exit(0); });
+process.on('SIGINT', () => {
+  appendFileSync(log, 'int ' + run + '\\n');
+  if (mine !== 'slow-int') process.exit(0);
+  setTimeout(() => { appendFileSync(log, 'cleaned ' + run + '\\n'); process.exit(0); }, 700);
+});
 if (mine === 'sigkill') process.kill(process.pid, 'SIGKILL');
 if (mine === 'exit1') process.exit(1);
 setInterval(() => {}, 1000);
@@ -79,10 +87,10 @@ setInterval(() => {}, 1000);
   return { dir, entry, log: path.join(dir, 'runs.log') };
 }
 
-function startWatcher(fx, env = {}) {
+function startWatcher(fx, env = {}, watchDirs = [path.join(fx.dir, 'src')]) {
   const watcher = spawn(
     process.execPath,
-    [WATCHER, '--watch', path.join(fx.dir, 'src'), fx.entry],
+    [WATCHER, ...watchDirs.flatMap((dir) => ['--watch', dir]), fx.entry],
     {
       cwd: fx.dir,
       detached: true,
@@ -201,7 +209,74 @@ describe('file changes', () => {
   });
 });
 
+describe('watched folders that come and go', () => {
+  it('a folder missing at start is watched once it appears, then on every change', async (t) => {
+    const fx = fixture({});
+    t.after(() => rmSync(fx.dir, { recursive: true, force: true }));
+    const late = path.join(fx.dir, 'late');
+    const watcher = startWatcher(fx, {}, [path.join(fx.dir, 'src'), late]);
+    await until(() => lines(fx).includes('start 1'), 'the first run');
+    assert.match(watcher.output, /late does not exist yet; watching for it/);
+    mkdirSync(late);
+    writeFileSync(path.join(late, 'index.js'), 'export {};\n');
+    await until(() => lines(fx).includes('start 2'), 'the restart when it appears');
+    assert.match(watcher.output, /late appeared; watching it/);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    writeFileSync(path.join(late, 'index.js'), 'export const later = 1;\n');
+    await until(() => lines(fx).includes('start 3'), 'the restart on an edit inside it');
+    watcher.kill('SIGTERM');
+    await exitsWithin(watcher, 4000);
+  });
+
+  it('a folder deleted and recreated is watched again', async (t) => {
+    const fx = fixture({});
+    t.after(() => rmSync(fx.dir, { recursive: true, force: true }));
+    const src = path.join(fx.dir, 'src');
+    const watcher = startWatcher(fx);
+    await until(() => lines(fx).includes('start 1'), 'the first run');
+    rmSync(src, { recursive: true });
+    await until(() => /src is gone; watching for it to come back/.test(watcher.output), 'the loss');
+    mkdirSync(src);
+    writeFileSync(path.join(src, 'module.ts'), 'export const x = 1;\n');
+    await until(() => /src appeared; watching it/.test(watcher.output), 'the return');
+    const before = lines(fx).filter((line) => line.startsWith('start')).length;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    writeFileSync(path.join(src, 'module.ts'), 'export const x = 2;\n');
+    await until(
+      () => lines(fx).filter((line) => line.startsWith('start')).length > before,
+      'a restart on an edit after it came back'
+    );
+    watcher.kill('SIGTERM');
+    await exitsWithin(watcher, 4000);
+  });
+});
+
 describe('stopping', () => {
+  it('a SIGTERM after the SIGINT lets the run finish shutting down', async (t) => {
+    const fx = fixture({ 1: 'slow-int' });
+    t.after(() => rmSync(fx.dir, { recursive: true, force: true }));
+    const watcher = startWatcher(fx);
+    await until(() => lines(fx).includes('start 1'), 'the first run');
+    watcher.kill('SIGINT');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watcher.kill('SIGTERM');
+    assert.deepEqual(await exitsWithin(watcher, 3000), { code: 130, signal: null });
+    assert.deepEqual(lines(fx), ['start 1', 'int 1', 'cleaned 1']);
+  });
+
+  it('a second SIGINT kills the run at once', async (t) => {
+    const fx = fixture({ 1: 'slow-int' });
+    t.after(() => rmSync(fx.dir, { recursive: true, force: true }));
+    const watcher = startWatcher(fx);
+    await until(() => lines(fx).includes('start 1'), 'the first run');
+    watcher.kill('SIGINT');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watcher.kill('SIGINT');
+    assert.deepEqual(await exitsWithin(watcher, 500), { code: 130, signal: null });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.deepEqual(lines(fx), ['start 1', 'int 1']);
+  });
+
   it('SIGINT reaches the run, and the watcher exits 130 without restarting it', async (t) => {
     const fx = fixture({});
     t.after(() => rmSync(fx.dir, { recursive: true, force: true }));
