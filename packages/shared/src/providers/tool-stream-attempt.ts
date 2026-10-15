@@ -2,6 +2,7 @@ import type { BackendRunRequest, BackendRunResult, BackendTurnHandle } from './b
 import type { BackendTurnEvent } from './stream.js';
 import type { createSessionToolStream } from '../runtime/session-tool-stream.js';
 import type { StreamDispatchResult } from '../runtime/stream-tool-dispatch.js';
+import { ToolStreamSource } from './tool-stream-source.js';
 
 type SessionToolStream = NonNullable<Awaited<ReturnType<typeof createSessionToolStream>>>;
 export interface ProviderToolStreamPorts {
@@ -14,8 +15,8 @@ export type ToolStreamingBackendResult = BackendRunResult & { toolStream?: Strea
 
 /**
  * One actual provider launch, not one logical loop iteration. The stream owns
- * dispatch; the final snapshot can only extend that same source, never replay
- * it. Still opt-in: production hosts must supply bounded execution/teardown
+ * dispatch; the final snapshot can only confirm that named source, never extend
+ * or replay it. Still opt-in: production hosts must supply bounded execution/teardown
  * before enabling this composition.
  */
 export async function runToolStreamingAttempt(options: {
@@ -32,10 +33,7 @@ export async function runToolStreamingAttempt(options: {
   let stream: SessionToolStream | undefined;
   let closing: ReturnType<SessionToolStream['finish']> | undefined;
   let failure: string | undefined;
-  let text = '';
-  let confirmed = '';
-  let completedBlock = false;
-  let bufferedDeltas = '';
+  const source = new ToolStreamSource();
   const close = (endOfResponse: boolean) => {
     if (!closing && stream) {
       closing = stream.finish({ endOfResponse });
@@ -63,42 +61,19 @@ export async function runToolStreamingAttempt(options: {
     failure ??= message;
     abort();
   };
-  const extend = (snapshot: string) => {
-    if (!snapshot.startsWith(text)) {
-      refuse('Provider text changed an already streamed prefix; no further tools admitted.');
-      return;
-    }
-    const suffix = snapshot.slice(text.length);
-    text = snapshot;
-    if (suffix) stream!.append(suffix);
-  };
   const onEvent = (event: BackendTurnEvent) => {
     // Do not let a reporting callback throw out of a child's stdout handler.
     // Close admission, retain the prefix, and reap via the existing abort port.
     try {
-      if (!controller.signal.aborted) {
-        if (event.kind === 'text-delta') {
-          if (!completedBlock) extend(text + event.text);
-          // The current normalized delta has no message identity. After a
-          // completed block, wait for continuesMessage confirmation rather
-          // than splicing a new message into the previous message's fence.
-          else bufferedDeltas += event.text;
-        } else if (event.kind === 'text') {
-          if (completedBlock && !event.continuesMessage) {
-            refuse('Multiple assistant messages in one local-tool attempt are not supported.');
-          } else {
-            const snapshot = (event.continuesMessage ? confirmed : '') + event.text;
-            if (bufferedDeltas && !event.text.startsWith(bufferedDeltas))
-              refuse('Provider text changed its pending content block.');
-            else {
-              extend(snapshot);
-              confirmed = snapshot;
-              completedBlock = true;
-              bufferedDeltas = '';
-            }
-          }
+      if (!controller.signal.aborted && !closing) {
+        try {
+          const suffix = source.consume(event);
+          if (suffix) stream!.append(suffix);
+        } catch (error) {
+          refuse(`Provider source refused; no further tools admitted: ${String(error)}`);
         }
       }
+      // Display/usage receives the original event, including conflicting text.
       options.request.onEvent?.(event);
     } catch (error) {
       refuse(`Provider stream callback failed: ${String(error)}`);
@@ -139,7 +114,7 @@ export async function runToolStreamingAttempt(options: {
       }
       result = reaped ?? {
         success: false,
-        responseText: text,
+        responseText: source.text,
         stdout: '',
         stderr: failure,
         exitCode: 1,
@@ -151,12 +126,13 @@ export async function runToolStreamingAttempt(options: {
     }
     if (!result.childExited) refuse('Provider exit is unconfirmed; this turn cannot continue.');
     if (result.success && !controller.signal.aborted) {
-      // Only the successful final snapshot can complete an EOF fence. Failed
-      // attempts retain the prefix already seen, not new work from stdout.
-      const finalText = result.responseText ?? result.stdout;
-      if (bufferedDeltas && !finalText.startsWith(text + bufferedDeltas))
-        refuse('Provider final text changed its pending content block.');
-      else extend(finalText);
+      // Only a successful, named confirmation can complete an EOF fence.
+      // Failed attempts retain the prefix, never new work from final/stdout.
+      try {
+        source.confirm(result);
+      } catch (error) {
+        refuse(`Provider final refused; no further tools admitted: ${String(error)}`);
+      }
     }
     const toolStream = await close(result.success && !controller.signal.aborted)!;
     failure ??= toolStream.failure?.message;

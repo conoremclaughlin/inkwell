@@ -14,6 +14,14 @@ import type { SessionProviderPorts } from './session-provider.js';
 import { SessionLog } from '../runtime/session-log.js';
 import { createToolInvocationJournal } from '../runtime/tool-invocation-journal.js';
 import type { SessionToolBatchPorts } from '../runtime/session-tool-batch.js';
+import type { BackendMessageSource, BackendTextSource } from './stream.js';
+
+const parentSource: BackendMessageSource = { messageId: 'synthetic-message', origin: 'parent' };
+const blockSource = (offset = 0, blockId = 'synthetic-block'): BackendTextSource => ({
+  ...parentSource,
+  blockId,
+  offset,
+});
 
 const tool = (name: string, args: Record<string, unknown> = {}) =>
   `\n\`\`\`ink-tool\n${JSON.stringify({ tool: name, args })}\n\`\`\``;
@@ -21,6 +29,7 @@ const result = (text: string, over: Partial<BackendRunResult> = {}): BackendRunR
   success: true,
   stdout: text,
   responseText: text,
+  responseSource: parentSource,
   stderr: '',
   exitCode: 0,
   durationMs: 3,
@@ -68,7 +77,11 @@ function harness(results: BackendRunResult[], session = 'one') {
       order.push('provider');
       const next = results.shift();
       if (!next) throw new Error('Unscripted provider launch');
-      request.onEvent?.({ kind: 'text-delta', text: next.responseText ?? '' });
+      request.onEvent?.({
+        kind: 'text-delta',
+        text: next.responseText ?? '',
+        source: blockSource(),
+      });
       return { result: Promise.resolve(next), abort: vi.fn() };
     }),
     onEvent: vi.fn(),
@@ -193,10 +206,10 @@ describe('opt-in provider-attempt stream composition', () => {
     const providerEnd = gate<BackendRunResult>();
     const text = tool('send_response', { content: 'Synthetic progress.' }) + '\n';
     vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
-      request.onEvent?.({ kind: 'text-delta', text: text.slice(0, 17) });
-      request.onEvent?.({ kind: 'text-delta', text: text.slice(17) });
-      request.onEvent?.({ kind: 'text', text });
-      request.onEvent?.({ kind: 'result', text });
+      request.onEvent?.({ kind: 'text-delta', text: text.slice(0, 17), source: blockSource() });
+      request.onEvent?.({ kind: 'text-delta', text: text.slice(17), source: blockSource(17) });
+      request.onEvent?.({ kind: 'text', text, source: blockSource() });
+      request.onEvent?.({ kind: 'result', text, source: parentSource });
       return { result: providerEnd.promise, abort: vi.fn() };
     });
     const running = h.run();
@@ -226,7 +239,7 @@ describe('opt-in provider-attempt stream composition', () => {
       const providerEnd = gate<BackendRunResult>();
       const text = tool('send_response') + '\n';
       vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
-        request.onEvent?.({ kind: 'text-delta', text });
+        request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
         return { result: providerEnd.promise, abort: vi.fn() };
       });
       const running = h.run();
@@ -347,7 +360,7 @@ describe('opt-in provider-attempt stream composition', () => {
   it('does not promote a failed provider EOF or unseen final text into a new call', async () => {
     const h = streamHarness();
     vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
-      request.onEvent?.({ kind: 'text-delta', text: tool('remember') });
+      request.onEvent?.({ kind: 'text-delta', text: tool('remember'), source: blockSource() });
       return {
         result: Promise.resolve(
           result(tool('remember') + '\n' + tool('send_response'), { success: false })
@@ -371,13 +384,17 @@ describe('opt-in provider-attempt stream composition', () => {
     const abort = vi.fn(() => providerEnd.resolve(result(text, { success: false, exitCode: 143 })));
     vi.mocked(h.provider.startTurn).mockImplementationOnce((value) => {
       request = value;
-      request.onEvent?.({ kind: 'text-delta', text });
+      request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
       return { result: providerEnd.promise, abort };
     });
     const running = h.run(controller.signal);
     await h.dispatched.promise;
     controller.abort();
-    request.onEvent?.({ kind: 'text-delta', text: tool('send_response') + '\n' });
+    request.onEvent?.({
+      kind: 'text-delta',
+      text: tool('send_response') + '\n',
+      source: blockSource(text.length),
+    });
     const done = await running;
     expect(done.loop).toMatchObject({
       stopReason: 'aborted',
@@ -503,7 +520,7 @@ describe('opt-in provider-attempt stream composition', () => {
         });
       }
       vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
-        request.onEvent?.({ kind: 'text-delta', text });
+        request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
         return {
           result: providerEnd.promise,
           abort: () => providerEnd.resolve(result(text, { success: false })),
@@ -654,15 +671,23 @@ describe('opt-in provider-attempt stream composition', () => {
       let request!: BackendRunRequest;
       vi.mocked(h.provider.startTurn).mockImplementationOnce((value) => {
         request = value;
-        request.onEvent?.({ kind: 'text-delta', text: prefix });
+        request.onEvent?.({ kind: 'text-delta', text: prefix, source: blockSource() });
         return { result: end.promise, abort: vi.fn(() => end.resolve(result(prefix))) };
       });
       const running = h.run();
       await h.dispatched.promise;
       if (mode === 'changed-final') end.resolve(result(tool('send_response')));
       else {
-        if (mode === 'second-message') request.onEvent?.({ kind: 'text', text: prefix });
-        request.onEvent?.({ kind: 'text', text: tool('send_response') + '\n' });
+        if (mode === 'second-message')
+          request.onEvent?.({ kind: 'text', text: prefix, source: blockSource() });
+        request.onEvent?.({
+          kind: 'text',
+          text: tool('send_response') + '\n',
+          source: {
+            ...blockSource(),
+            ...(mode === 'second-message' ? { messageId: 'synthetic-second-message' } : {}),
+          },
+        });
       }
       const done = await running;
       expect(done.loop.success).toBe(false);
@@ -673,18 +698,26 @@ describe('opt-in provider-attempt stream composition', () => {
     }
   );
 
-  it('dedupes continued content blocks and accepts a successful buffered provider snapshot', async () => {
+  it('dedupes continued content blocks with positioned deltas or completed block snapshots', async () => {
     for (const streamed of [true, false]) {
       const text = 'Checking.\n' + tool('recall') + '\n';
       const h = streamHarness([result('Done.')]);
       vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
-        if (streamed) {
-          request.onEvent?.({ kind: 'text', text: 'Checking.\n' });
-          request.onEvent?.({ kind: 'text-delta', text: tool('recall') + '\n' });
-          request.onEvent?.({ kind: 'text', text: tool('recall') + '\n', continuesMessage: true });
-        }
+        request.onEvent?.({ kind: 'text', text: 'Checking.\n', source: blockSource() });
+        if (streamed)
+          request.onEvent?.({
+            kind: 'text-delta',
+            text: tool('recall') + '\n',
+            source: blockSource(0, 'synthetic-second-block'),
+          });
+        request.onEvent?.({
+          kind: 'text',
+          text: tool('recall') + '\n',
+          continuesMessage: true,
+          source: blockSource(0, 'synthetic-second-block'),
+        });
         return {
-          result: Promise.resolve(result(text, streamed ? {} : { responseText: undefined })),
+          result: Promise.resolve(result(text)),
           abort: vi.fn(),
         };
       });
@@ -693,6 +726,39 @@ describe('opt-in provider-attempt stream composition', () => {
       expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
     }
   });
+
+  it.each(['missing', 'unknown', 'raw-stdout'])(
+    'does not batch-fallback or reseed when the stream has %s provenance',
+    async (mode) => {
+      const h = streamHarness();
+      const text = tool('remember') + '\n';
+      h.provider.state.id = 'synthetic-existing-session';
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+        if (mode === 'missing') request.onEvent?.({ kind: 'text-delta', text });
+        if (mode === 'unknown')
+          request.onEvent?.({
+            kind: 'text-delta',
+            text,
+            source: { ...blockSource(), origin: 'unknown' },
+          });
+        return {
+          result: Promise.resolve(
+            result(
+              text,
+              mode === 'raw-stdout' ? { responseText: undefined, responseSource: undefined } : {}
+            )
+          ),
+          abort: vi.fn(),
+        };
+      });
+      const done = await h.run();
+      expect(done.loop.success).toBe(false);
+      expect(h.batch.callTool).not.toHaveBeenCalled();
+      expect(h.ports.tools.execute).not.toHaveBeenCalled();
+      expect(h.reportFailure).toHaveBeenCalledOnce();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    }
+  );
 });
 
 describe('shared parent session turn', () => {

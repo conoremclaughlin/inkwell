@@ -55,7 +55,8 @@ export type BackendTurnEvent =
   /**
    * Correlation boundaries only. Block end is not message end; message end is
    * not child exit. A cut stream can emit message-end too; complete requires
-   * the backend's normal-completion evidence. Display consumers ignore it.
+   * the backend's normal-completion evidence. Consumers may reconcile display
+   * with these boundaries; none independently grants tool execution authority.
    */
   | {
       kind: 'text-boundary';
@@ -87,7 +88,8 @@ export type BackendTurnEvent =
     };
 
 /**
- * Stateful, single-turn parser. One fresh instance per turn — it owns a
+ * Stateful, single-request parser. One fresh instance per actual provider
+ * attempt, even when a persistent child serves multiple requests — it owns a
  * cross-chunk line buffer, so a JSON line split across two stdout chunks is
  * reassembled rather than dropped.
  */

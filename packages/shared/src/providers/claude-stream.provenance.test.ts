@@ -212,6 +212,24 @@ describe('Claude output provenance (synthetic SDK frames, no provider)', () => {
     });
   });
 
+  it.each(['synthetic-message', 'synthetic-child-message'])(
+    'resumes parent assembly after an interleaved child message (%s)',
+    (childId) => {
+      const p = new ClaudeStreamParser();
+      p.push(snapshot('synthetic-message', 'synthetic-first-block', 'Parent first.'));
+      p.push(
+        snapshot(childId, 'synthetic-child-block', 'Child text.', {
+          parent_tool_use_id: 'synthetic-parent-tool',
+        })
+      );
+      p.push(snapshot('synthetic-message', 'synthetic-second-block', ' Parent second.'));
+      expect(p.push(final()).at(-1)).toMatchObject({
+        text: 'Parent first. Parent second.',
+        source: { messageId: 'synthetic-message', origin: 'parent' },
+      });
+    }
+  );
+
   it('does not turn absent origin or missing message identity into parent provenance', () => {
     const p = new ClaudeStreamParser();
     expect(

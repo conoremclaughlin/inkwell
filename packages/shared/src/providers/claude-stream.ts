@@ -217,6 +217,8 @@ export class ClaudeStreamParser implements BackendStreamParser {
    * accumulate here; a new message id starts over.
    */
   private lastAssistantText = '';
+  /** A child may interleave without erasing earlier blocks of its parent. */
+  private messageTexts = new Map<string, string>();
   private lastAssistantMessageId: string | undefined;
   private lastAssistantSource: BackendMessageSource | undefined;
   private partialMessages = new Map<string, PartialMessage>();
@@ -413,7 +415,9 @@ export class ClaudeStreamParser implements BackendStreamParser {
             ...(source ? { source } : {}),
           });
           if (!repeated) {
-            this.lastAssistantText = continuesMessage ? this.lastAssistantText + text : text;
+            const key = message ? sourceKey(message) : undefined;
+            this.lastAssistantText = (key ? (this.messageTexts.get(key) ?? '') : '') + text;
+            if (key) this.messageTexts.set(key, this.lastAssistantText);
             this.lastAssistantMessageId = messageId;
             this.lastAssistantSource = message;
           }
