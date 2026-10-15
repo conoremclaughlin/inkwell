@@ -202,6 +202,95 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
     expect(f.fetcher).toHaveBeenCalledTimes(4);
     f.connection.close();
   });
+  it('keeps the last verified view through a proactive refresh while its bearer is live', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    vi.setSystemTime(start + 295_000);
+    const late = deferred<Response>();
+    f.fetcher.mockReturnValueOnce(late.promise);
+    const work = f.connection.refresh();
+    expect(f.connection.current()).toEqual(view());
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.connection.current()).toBeUndefined(); // Retention cannot extend the old bearer.
+    late.resolve(Response.json(tokenReceipt()));
+    expect(await work).toEqual(view());
+    f.connection.close();
+  });
+  it('remints once after a reused bearer gets 401 without granting new connection intent', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+    expect(await f.connection.refresh()).toEqual(view());
+    expect(f.fetcher.mock.calls.slice(2).map((c) => c[0])).toEqual([
+      `${origin}/api/browser-companion/session`,
+      `${origin}/api/browser-companion/auth/token`,
+      `${origin}/api/browser-companion/session`,
+    ]);
+    f.connection.close();
+  });
+  it('does not remint after a freshly issued bearer gets 401', async () => {
+    const f = fixture();
+    f.fetcher
+      .mockResolvedValueOnce(Response.json(tokenReceipt()))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }));
+    await expect(f.connection.refresh()).rejects.toMatchObject({ code: 'refused' });
+    expect(f.fetcher).toHaveBeenCalledTimes(2);
+    f.connection.close();
+  });
+  it.each(['mint', 'session'])('does not retry a second 401 from %s', async (step) => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+    if (step === 'session') f.fetcher.mockResolvedValueOnce(Response.json(tokenReceipt()));
+    f.fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+    await expect(f.connection.refresh()).rejects.toMatchObject({ code: 'refused' });
+    expect(f.fetcher).toHaveBeenCalledTimes(step === 'mint' ? 4 : 5);
+    expect(f.connection.current()).toBeUndefined();
+    f.connection.close();
+  });
+  it('drops a late recovery token after Disconnect', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    const late = deferred<Response>();
+    f.fetcher
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockReturnValueOnce(late.promise);
+    const rejected = expect(f.connection.refresh()).rejects.toMatchObject({ code: 'closed' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.fetcher).toHaveBeenCalledTimes(4);
+    expect(f.connection.current()).toBeUndefined(); // The reused bearer was refused.
+    f.intent.abort();
+    await rejected;
+    late.resolve(Response.json(tokenReceipt()));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.fetcher).toHaveBeenCalledTimes(4);
+    expect(f.connection.current()).toBeUndefined();
+  });
+  it('uses one total deadline across a reused-bearer refusal and remint', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(new Response(null, { status: 401 })), 8_000);
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(Response.json(tokenReceipt())), 8_000);
+          })
+      );
+    const rejected = expect(f.connection.refresh()).rejects.toMatchObject({ code: 'unavailable' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await rejected;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.fetcher).toHaveBeenCalledTimes(4);
+    expect(f.connection.current()).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    f.connection.close();
+  });
   it('never refreshes past grant expiry, even after a successful connection', async () => {
     const f = fixture();
     await f.connection.refresh();
@@ -322,6 +411,7 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
     f.fetcher.mockResolvedValueOnce(new Response(null, { status: 403 }));
     await expect(f.connection.refresh()).rejects.toMatchObject({ code: 'refused' });
     expect(f.connection.current()).toBeUndefined();
+    expect(f.fetcher).toHaveBeenCalledTimes(3); // A 403 cannot trigger a remint.
     f.connection.close();
   });
   it('sanitizes fetch exceptions and discards previous verification on an outage', async () => {

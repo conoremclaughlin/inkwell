@@ -18,6 +18,11 @@ export class ConnectionError extends Error {
     super(`Browser connection ${code}.`);
   }
 }
+class RejectedBearer extends ConnectionError {
+  constructor() {
+    super('refused');
+  }
+}
 
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -143,6 +148,10 @@ export function createBrowserConnection(
       });
       guard(signal);
       if (response.redirected || (response.url && response.url !== url)) throw invalid();
+      if (response.status === 401 && path === '/session') {
+        void response.body?.cancel().catch(() => undefined);
+        throw new RejectedBearer();
+      }
       if (response.status === 401 || response.status === 403) throw new ConnectionError('refused');
       if (response.status !== 200) throw new ConnectionError('unavailable');
       const result = await readJson(response, signal);
@@ -150,9 +159,7 @@ export function createBrowserConnection(
       return result;
     }
 
-    guard(signal);
-    let candidate = bearer;
-    if (!candidate || candidate.expiresAt <= now() + 30_000) {
+    async function mint() {
       const started = now();
       const token = await request('/auth/token');
       if (
@@ -167,14 +174,32 @@ export function createBrowserConnection(
         date(token.grantExpiresAt) !== grantExpiry
       )
         throw invalid();
-      candidate = {
+      return {
         value: token.accessToken,
         // Conservative: count from dispatch and account for JWT second rounding.
         expiresAt: Math.min(grantExpiry, started + token.expiresIn * 1000 - 1000),
       };
     }
-    if (now() >= candidate.expiresAt) throw new ConnectionError('expired');
-    const session = await request('/session', candidate.value);
+    async function readSession(candidate: { value: string; expiresAt: number }) {
+      if (now() >= candidate.expiresAt) throw new ConnectionError('expired');
+      return request('/session', candidate.value);
+    }
+    guard(signal);
+    const reusable = bearer && bearer.expiresAt > now() + 30_000 ? bearer : undefined;
+    let candidate = reusable ?? (await mint());
+    let session: Record<string, unknown>;
+    try {
+      session = await readSession(candidate);
+    } catch (error) {
+      // A locally fresh bearer may be expired server-side (for example after a
+      // clock adjustment). Only this reused-bearer 401 gets one bounded remint.
+      // Fresh-token failures and grant refusal (403) never enter this branch.
+      if (!(error instanceof RejectedBearer) || !reusable) throw error;
+      bearer = undefined;
+      checked = undefined;
+      candidate = await mint();
+      session = await readSession(candidate);
+    }
     if (
       session.grantId !== grant.id ||
       session.installationId !== installationId ||
@@ -209,7 +234,6 @@ export function createBrowserConnection(
     } catch (error) {
       return Promise.reject(error);
     }
-    checked = undefined;
     const operation = new AbortController();
     const abort = () => operation.abort(lifetime.signal.reason);
     lifetime.signal.addEventListener('abort', abort, { once: true });
