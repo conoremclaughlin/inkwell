@@ -3401,13 +3401,15 @@ describe('send_to_inbox links precondition', () => {
 
 // Reviewer regression: a bound SB must not become its person by omitting sbSlug.
 describe('PR 874 reviewer principal boundary', () => {
-  function privateInboxClient() {
+  function privateInboxClient(sbParticipant = false) {
     const privateThread = THREAD_ROW({
       id: 'private-review-thread',
       thread_key: 'chat:conversation-synthetic-review',
       metadata: { inklingConversation: true },
     });
-    const parts = [{ thread_id: privateThread.id, user_id: 'user-123', sb_id: null }];
+    const parts = sbParticipant
+      ? [{ thread_id: privateThread.id, user_id: null, sb_id: SB_IDS.lumen }]
+      : [{ thread_id: privateThread.id, user_id: 'user-123', sb_id: null }];
     const rows: Record<string, Array<Record<string, unknown>>> = {
       workspace_members: [{ workspace_id: WS, user_id: 'user-123', role: 'owner' }],
       inbox_threads: [privateThread],
@@ -3441,7 +3443,10 @@ describe('PR 874 reviewer principal boundary', () => {
             data = data.filter((r) =>
               parts.some((p) => p.thread_id === r.id && p.user_id === value)
             );
-          } else if (name === 'inbox_threads' && column === 'inbox_thread_participants.sb_id') {
+          } else if (
+            name === 'inbox_threads' &&
+            ['inbox_thread_participants.sb_id', 'viewer.sb_id'].includes(column)
+          ) {
             data = data.filter((r) => parts.some((p) => p.thread_id === r.id && p.sb_id === value));
           } else data = data.filter((r) => r[column] === value);
           return q;
@@ -3497,5 +3502,58 @@ describe('PR 874 reviewer principal boundary', () => {
   });
   it('excludes the same private conversation when that bound SB omits sbSlug', async () => {
     expect(await read('lumen', false)).toEqual([]);
+  });
+
+  async function readCanonical(sbParticipant: boolean, includeSlug: boolean) {
+    const ctx = await import('../../utils/request-context');
+    const actual = await vi.importActual<typeof ctx>('../../utils/request-context');
+    vi.mocked(ctx.getPinnedSlug).mockImplementation(actual.getPinnedSlug);
+    vi.mocked(ctx.getRequestContext).mockImplementation(actual.getRequestContext);
+    vi.mocked(ctx.getSessionContext).mockReturnValue(undefined as never);
+    const claims = {
+      userId: 'user-123',
+      email: 'owner@example.test',
+      sbId: SB_IDS.lumen,
+      ...(includeSlug ? { sbSlug: 'lumen' } : {}),
+    };
+    const client = privateInboxClient(sbParticipant);
+    const { signRunnerAccessToken } = await import('../../auth/ink-tokens');
+    const { InkAuthProvider } = await import('../auth/ink-auth-provider');
+    const provider = new InkAuthProvider();
+    // The database is synthetic; signing, verification, context and handler are real.
+    (provider as unknown as { supabase: unknown }).supabase = client;
+    const verdict = await provider.verifyAccessToken(`Bearer ${signRunnerAccessToken(claims)}`);
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) throw new Error('Synthetic token was unexpectedly refused');
+    const token = verdict.token;
+    expect(token.sbId).toBe(SB_IDS.lumen);
+    expect(token.sbSlug).toBe(includeSlug ? 'lumen' : undefined);
+    const response = await actual.runWithRequestContext(
+      { ...token, ...actual.tokenIdentityContext(token) },
+      () =>
+        handleGetInbox({ status: 'unread', markRead: false }, {
+          getClient: () => client,
+          repositories: {},
+        } as never)
+    );
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    return body.threadsWithUnread ?? [];
+  }
+
+  it('excludes a person-only conversation for a UUID-only bound SB', async () => {
+    expect(await readCanonical(false, false)).toEqual([]);
+  });
+
+  it('allows a UUID-only bound SB its own conversation without its owner (control)', async () => {
+    expect(JSON.stringify(await readCanonical(true, false))).toContain(
+      'synthetic private review canary'
+    );
+  });
+
+  it('allows a slug-and-UUID bound SB its own conversation without its owner (control)', async () => {
+    expect(JSON.stringify(await readCanonical(true, true))).toContain(
+      'synthetic private review canary'
+    );
   });
 });

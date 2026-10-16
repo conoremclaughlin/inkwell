@@ -450,13 +450,24 @@ describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
   });
 });
 
-describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1)', () => {
-  async function inbox(bound: { sbSlug: string; sbId: string }) {
+describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1 and r2)', () => {
+  /**
+   * The context a verified token gives: its identity spread in, plus what
+   * tokenIdentityContext adds. `slug: false` is a token bound by its
+   * canonical id alone.
+   */
+  async function bound(sbSlug: string, sbId: string, slug = true) {
+    const { tokenIdentityContext } = await import('../utils/request-context');
+    const identity = { sbId, ...(slug ? { sbSlug } : {}) };
+    return { ...identity, ...tokenIdentityContext(identity) };
+  }
+
+  async function inbox(context: Record<string, unknown>) {
     const { handleGetInbox } = await import('../mcp/tools/inbox-handlers');
     const { getDataComposer } = await import('../data/composer');
     const { runWithRequestContext } = await import('../utils/request-context');
     const dataComposer = await getDataComposer();
-    const res = await runWithRequestContext({ userId: owner.userId, ...bound }, () =>
+    const res = await runWithRequestContext({ userId: owner.userId, ...context }, () =>
       handleGetInbox(
         { userId: owner.userId, status: 'unread', limit: 5, markRead: false },
         dataComposer
@@ -467,27 +478,45 @@ describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1)', () 
     return { keys: new Set(threads.map((t) => t.threadKey)), text: JSON.stringify(body) };
   }
 
-  it("reads as the SB, not its person: the owner's own SB sees none of the owner's 1:1s", async () => {
-    const seen = await inbox({ sbSlug: `ivy-${run}`, sbId: ownersSbId });
-    expect(seen.keys.has(keys.ownerChat)).toBe(false);
-    expect(seen.text).not.toContain(canary.ownerChat);
-    expect(seen.keys.has(keys.open)).toBe(true);
-  });
+  it.each([
+    ['by slug and id', true],
+    ['by id alone', false],
+  ])(
+    "reads as the SB, not its person, bound %s: the owner's own SB sees none of the owner's 1:1s",
+    async (_label, slug) => {
+      const seen = await inbox(await bound(`ivy-${run}`, ownersSbId, slug));
+      expect(seen.keys.has(keys.ownerChat)).toBe(false);
+      expect(seen.text).not.toContain(canary.ownerChat);
+      expect(seen.keys.has(keys.open)).toBe(true);
+    }
+  );
 
-  it('shows a bound SB the conversations it is in (control)', async () => {
-    const seen = await inbox({ sbSlug: `moss-${run}`, sbId: inklingSbId });
+  it.each([
+    ['by slug and id', true],
+    ['by id alone', false],
+  ])('shows a bound SB the conversations it is in, bound %s (control)', async (_label, slug) => {
+    const seen = await inbox(await bound(`moss-${run}`, inklingSbId, slug));
     expect(seen.keys.has(keys.ownerChat)).toBe(true);
+    // The member's 1:1, which the inkling is in and the owner is not.
+    expect(seen.keys.has(keys.memberChat)).toBe(true);
   });
 });
 
 describe('graph evidence on a conversation key (Lumen, #874 r1)', () => {
   beforeAll(async () => {
+    // A graph group is born by conversion: inserted linear at version 0, then
+    // converted through convert_task_group_to_graph, as the database requires.
     const { rows } = await db.query<{ id: string }>(
-      `INSERT INTO task_groups (user_id, sb_id, title, thread_key, execution_model, status)
-       VALUES ($1, $2, $3, $4, 'graph', 'active') RETURNING id`,
+      `INSERT INTO task_groups (user_id, sb_id, title, thread_key, status)
+       VALUES ($1, $2, $3, $4, 'active') RETURNING id`,
       [owner.userId, inklingSbId, `graph-canary-${run}`, keys.ownerChat]
     );
     taskGroupIds.push(rows[0].id);
+    const { rows: converted } = await db.query<{ result: { success: boolean } }>(
+      'SELECT public.convert_task_group_to_graph($1, $2, 0, NULL, NULL, true) AS result',
+      [owner.userId, rows[0].id]
+    );
+    expect(converted[0].result).toMatchObject({ success: true });
   });
 
   const evidence = async (who: Person) => {

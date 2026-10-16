@@ -13,6 +13,7 @@ import { resolveSbId, resolveSbSlug } from '../../auth/resolve-identity';
 import {
   personalWorkspaceOf,
   principalColumns,
+  resolveSbById,
   resolveSbOwnedBy,
   resolveSbsByIds,
   resolveSbsInWorkspace,
@@ -2329,17 +2330,33 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           // The agent-less view: every thread in the account's workspaces,
           // except a participant-only conversation (D3), which appears only
           // to someone on it. An unbound person reads as the account, by
-          // their own participant row. A token bound to an SB reads as that
-          // SB even when it names none, by the SB's row (Lumen, #874 r1); a
-          // bound slug that resolves to none of the account's SBs sees none.
+          // their own participant row. A token bound to an SB, by slug or by
+          // its canonical id alone, reads as that SB even when it names none,
+          // by the SB's row (Lumen, #874 r1 and r2). A binding that resolves
+          // to no identity sees no participant-only conversation.
           // Two reads, so the others never take a place on the page.
-          const boundSlug = getPinnedSlug();
-          const privateReader = boundSlug
-            ? await resolveCallerSb(supabase, resolved.user.id, boundSlug).then(
-                (sb) => ({ column: 'viewer.sb_id', id: sb.sbId }),
-                () => null
-              )
-            : { column: 'viewer.user_id', id: resolved.user.id };
+          const privateReader = await (async (): Promise<{
+            column: 'viewer.user_id' | 'viewer.sb_id';
+            id: string;
+          } | null> => {
+            const boundCtx = getRequestContext() || getSessionContext();
+            const boundSlug = getPinnedSlug();
+            const boundSbId = boundCtx?.tokenSbId ?? boundCtx?.sbId;
+            if (!boundSlug && !boundSbId && boundCtx?.agentTokenBound !== true) {
+              return { column: 'viewer.user_id', id: resolved.user.id };
+            }
+            try {
+              // A slug is held to the token's id by resolveCallerSb.
+              const sb = boundSlug
+                ? await resolveCallerSb(supabase, resolved.user.id, boundSlug)
+                : boundSbId
+                  ? await resolveSbById(supabase, boundSbId)
+                  : null;
+              return sb ? { column: 'viewer.sb_id', id: sb.sbId } : null;
+            } catch {
+              return null;
+            }
+          })();
           const [open, ownPrivate] = await Promise.all([
             threadTable(supabase, 'inbox_threads')
               .select(THREAD_PAGE_COLUMNS)
