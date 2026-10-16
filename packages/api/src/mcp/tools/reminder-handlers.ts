@@ -5,6 +5,7 @@
  * Reminders are delivered via the heartbeat service at their scheduled times.
  */
 
+import { createServerSupabaseClient } from '../../data/supabase/client';
 import { z } from 'zod';
 import { quietHoursDeferralWarning } from '../../services/quiet-hours.js';
 import {
@@ -12,10 +13,8 @@ import {
   WATCHDOG_QUIET_HOURS_REFUSAL,
 } from '../../services/reminder-quiet-hours.js';
 import { isoDateTime } from './schema-primitives.js';
-import { createClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
-import { env } from '../../config/env';
 import type { Database } from '../../data/supabase/types';
 
 // Common user identifier schema
@@ -55,7 +54,7 @@ function mcpResponse(data: object, isError = false): McpResponse {
 
 // Get typed Supabase client
 function getSupabase() {
-  return createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+  return createServerSupabaseClient<Database>();
 }
 
 // ============================================================================

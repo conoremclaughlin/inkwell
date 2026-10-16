@@ -6,6 +6,27 @@ import type { Database } from './types';
 let supabaseClient: SupabaseClient<Database> | null = null;
 
 /**
+ * Fresh server client, with no persisted session or background refresh timer.
+ * On Node, default auth options start an interval even without a login; the
+ * interval retains the discarded client. persistSession:false alone does not
+ * disable it. Fresh instances also keep request-local auth state isolated.
+ * Use the publishable key only for dedicated user sign-in/sign-up clients.
+ */
+export function createServerSupabaseClient(keyType?: 'secret' | 'publishable'): SupabaseClient;
+export function createServerSupabaseClient<Schema>(
+  keyType?: 'secret' | 'publishable'
+): SupabaseClient<Schema>;
+export function createServerSupabaseClient(
+  keyType: 'secret' | 'publishable' = 'secret'
+): SupabaseClient {
+  return createClient(
+    env.SUPABASE_URL,
+    keyType === 'publishable' ? env.SUPABASE_PUBLISHABLE_KEY : env.SUPABASE_SECRET_KEY,
+    { auth: { autoRefreshToken: false, persistSession: false } }
+  );
+}
+
+/**
  * Singleton Supabase client for PostgREST data queries using the service role key.
  *
  * ⚠️  DO NOT call session-mutating auth methods on this client:
@@ -24,12 +45,7 @@ export function createSupabaseClient(): SupabaseClient<Database> {
   }
 
   try {
-    supabaseClient = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    });
+    supabaseClient = createServerSupabaseClient<Database>();
 
     logger.info('Supabase client created successfully', {
       url: env.SUPABASE_URL,
