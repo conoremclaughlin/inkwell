@@ -16,6 +16,12 @@
  * in. Its send wakes nobody (the verdict's `quiet`), so one inkling never
  * wakes another, and the turn gate wakes an inkling only for its owner's
  * message besides.
+ *
+ * One exception, in a team space only (inkling-shared-space.ts): a group
+ * created with other people of the space is shared with them. Its people
+ * are write-role members of the inklings' space, any of them may write, and
+ * a member inkling answers whoever is present. A starter space, and every
+ * conversation not created as such a group, keeps the owner-only rule.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -26,6 +32,7 @@ import {
 } from '../../config/inkling-flags';
 import type { Principal, SbPrincipal } from '../principals';
 import { INKLING_CLIENT, INKLINGS_DISABLED } from './inkling-service';
+import { areSpaceWriters, INKLING_SHARED_MARK, isSharedInklingSpace } from './inkling-shared-space';
 
 export const INKLING_THREAD_REFUSED = 'inkling_thread_refused';
 
@@ -48,6 +55,7 @@ export class InklingThreadRefusedError extends Error {
 interface IdentityRow {
   id: string;
   user_id: string;
+  workspace_id: string | null;
   metadata: Record<string, unknown> | null;
 }
 
@@ -57,6 +65,12 @@ export interface InklingThreadVerdict {
   quiet: boolean;
   /** True when the conversation holds an inkling, so its members are fixed at creation. */
   inklingConversation: boolean;
+  /**
+   * True when the conversation is shared with the space's people
+   * (inkling-shared-space.ts): created as a group in a team space, or one
+   * already marked so.
+   */
+  shared: boolean;
 }
 
 /**
@@ -72,6 +86,11 @@ export async function assertInklingThreadAllowed(
     /** Every SB this send puts on the thread: recipients, and an SB sender. */
     participantSbs: SbPrincipal[];
     existingThreadId: string | null;
+    /**
+     * People this send puts on a conversation it creates, beside its sender:
+     * a group in a team space (POST /threads `people`). Never on a reply.
+     */
+    addedPeople?: string[];
   },
   ownerTestUserIds: OwnerTestAllowlist = inklingOwnerTestUserIds()
 ): Promise<InklingThreadVerdict> {
@@ -85,6 +104,8 @@ export async function assertInklingThreadAllowed(
    * members' rows can be seen.
    */
   let marked = false;
+  /** Created as a group shared with the space's people. */
+  let sharedMark = false;
   if (input.existingThreadId) {
     const { data: threadRows, error: threadError } = await supabase
       .from('inbox_threads')
@@ -93,6 +114,7 @@ export async function assertInklingThreadAllowed(
     if (threadError) throw new Error(`Failed to read the conversation: ${threadError.message}`);
     const [threadRow] = (threadRows ?? []) as Array<{ metadata: Record<string, unknown> | null }>;
     marked = threadRow?.metadata?.[INKLING_CONVERSATION_MARK] === true;
+    sharedMark = threadRow?.metadata?.[INKLING_SHARED_MARK] === true;
     const { data, error } = await supabase
       .from('inbox_thread_participants')
       .select('sb_id, user_id')
@@ -112,8 +134,20 @@ export async function assertInklingThreadAllowed(
   // is not counted among the conversation's SBs: it joins nothing.
   const actorSbId =
     input.sender.kind === 'sb' && !sbIds.has(input.sender.sbId) ? input.sender.sbId : null;
+  const addedPeople = [...new Set((input.addedPeople ?? []).map((id) => id.toLowerCase()))];
+  if (addedPeople.length > 0 && input.existingThreadId !== null && !sharedMark) {
+    // People join a conversation only as it is made, never after. The one
+    // exception is a retry finishing its own interrupted create (POST
+    // /threads adoption), on the thread that create marked shared; the
+    // people it names are held to the same membership as at creation below
+    // (Lumen's review of 4f7896e6).
+    throw new InklingThreadRefusedError(
+      INKLING_THREAD_REFUSED,
+      'People are added to a conversation only when it is created'
+    );
+  }
   if (sbIds.size === 0 && !marked && !actorSbId) {
-    return { quiet: false, inklingConversation: false };
+    return { quiet: false, inklingConversation: false, shared: false };
   }
 
   const lookup = actorSbId ? [...sbIds, actorSbId] : [...sbIds];
@@ -121,7 +155,7 @@ export async function assertInklingThreadAllowed(
   if (lookup.length > 0) {
     const { data, error } = await supabase
       .from('agent_identities')
-      .select('id, user_id, metadata')
+      .select('id, user_id, workspace_id, metadata')
       .in('id', lookup);
     if (error) throw new Error(`Failed to read the conversation's SBs: ${error.message}`);
     identities = (data ?? []) as IdentityRow[];
@@ -137,7 +171,7 @@ export async function assertInklingThreadAllowed(
   }
   const inklings = identities.filter((r) => sbIds.has(r.id) && isInkling(r));
   if (inklings.length === 0) {
-    if (!marked) return { quiet: false, inklingConversation: false };
+    if (!marked) return { quiet: false, inklingConversation: false, shared: false };
     // An inkling conversation whose inklings this send cannot see yet: its
     // creator is still writing them. Nothing joins it on that view.
     throw new InklingThreadRefusedError(
@@ -153,19 +187,17 @@ export async function assertInklingThreadAllowed(
   const owner = inklings[0].user_id.toLowerCase();
   const sender = input.sender;
   const fromOwner = sender.kind === 'user' && sender.userId.toLowerCase() === owner;
-  // A member answering: in a conversation it is already in, with its owner
-  // in it too. Never a new conversation, and never one its owner has left.
-  // Every SB here is one of the owner's inklings (below), so a member
-  // sender is one too.
-  const replyFromInkling = sender.kind === 'sb' && members.has(sender.sbId) && people.has(owner);
+  // A member inkling answering, in a conversation it is already in. Never
+  // a new conversation. Every SB here is one of the owner's inklings
+  // (below), so a member sender is one too.
+  const fromMemberInkling = sender.kind === 'sb' && members.has(sender.sbId);
   // Members are fixed when a conversation is created: no send, the
   // owner's included, adds an SB to one that exists. Adding is what two
   // concurrent sends could each do against the same snapshot of members.
   const noNewMembers =
     input.existingThreadId === null || input.participantSbs.every((sb) => members.has(sb.sbId));
-  const allowed =
+  const inklingsHold =
     isInklingOwnerTestUser(owner, ownerTestUserIds) &&
-    (fromOwner || replyFromInkling) &&
     noNewMembers &&
     // Every SB in the conversation is an inkling: none is another SB, and
     // none is an id with no identity row.
@@ -173,13 +205,45 @@ export async function assertInklingThreadAllowed(
     sbIds.size <= MAX_CONVERSATION_INKLINGS &&
     inklings.every(
       (inkling) => inkling.user_id.toLowerCase() === owner && inkling.metadata?.ownerTest === true
-    ) &&
-    [...people].every((person) => person === owner);
-  if (!allowed) {
-    throw new InklingThreadRefusedError(
-      INKLING_THREAD_REFUSED,
-      "An inkling's conversation is only between its owner and the owner's own inklings"
     );
+  // The owner's own conversation: the owner writes, or a member inkling
+  // answers with its owner in it too (never one its owner has left), and
+  // nobody else is in it.
+  const ownersOwn =
+    inklingsHold &&
+    !sharedMark &&
+    addedPeople.length === 0 &&
+    (fromOwner || (fromMemberInkling && people.has(owner))) &&
+    [...people].every((person) => person === owner);
+  if (ownersOwn) return { quiet: sender.kind === 'sb', inklingConversation: true, shared: false };
+
+  // A group shared with the space's people: created with people, or marked
+  // so when it was. Its people are write-role members of a team space, the
+  // inklings' own, and a member inkling answers whoever of them is present.
+  const creatingShared = input.existingThreadId === null && addedPeople.length > 0;
+  const space = inklings[0].workspace_id;
+  const sharedShape =
+    inklingsHold &&
+    (sharedMark || creatingShared) &&
+    !!space &&
+    inklings.every((inkling) => inkling.workspace_id === space) &&
+    (sender.kind === 'user' || (fromMemberInkling && people.size > 0));
+  if (sharedShape && space) {
+    const writers = [...people, ...addedPeople];
+    if (sender.kind === 'user') writers.push(sender.userId.toLowerCase());
+    const [teamSpace, allWriters] = await Promise.all([
+      isSharedInklingSpace(supabase, space),
+      areSpaceWriters(supabase, space, writers),
+    ]);
+    if (teamSpace === 'unreadable' || allWriters === 'unreadable') {
+      throw new Error("Failed to read the conversation's space");
+    }
+    if (teamSpace === 'yes' && allWriters === 'yes') {
+      return { quiet: sender.kind === 'sb', inklingConversation: true, shared: true };
+    }
   }
-  return { quiet: sender.kind === 'sb', inklingConversation: true };
+  throw new InklingThreadRefusedError(
+    INKLING_THREAD_REFUSED,
+    "An inkling's conversation is only between its owner and the owner's own inklings"
+  );
 }

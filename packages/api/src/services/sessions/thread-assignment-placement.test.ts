@@ -71,7 +71,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
        RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
-       inTurnNote
+       inTurnNote, inklingConversationNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -185,7 +185,7 @@ function studioRow(id: string, repoRoot: string): Row {
  * free studio for this agent, and the participant stamp points at a live
  * session bound to a studio in ANOTHER repo.
  */
-function makeWorld() {
+function makeWorld(options: { conversationNote?: string } = {}) {
   const tables: Record<string, Row[]> = {
     agent_identities: [
       {
@@ -269,6 +269,7 @@ function makeWorld() {
   );
 
   const logInkmail = vi.fn(async () => undefined);
+  const inklingConversationNote = vi.fn(async () => options.conversationNote ?? null);
   const handler = makeTriggerHandler({
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     dataComposer: { getClient: () => supabase },
@@ -301,6 +302,9 @@ function makeWorld() {
     // What a member of an inkling group answering in turn is told
     // (inkling-reply-chain.ts): production, and silent for these wakes.
     inTurnNote,
+    // An inkling conversation's note (inkling-conversation-note.ts): none
+    // here unless a test gives one.
+    inklingConversationNote,
   });
 
   async function trigger(extra: Record<string, unknown> = {}) {
@@ -341,6 +345,7 @@ function makeWorld() {
     repository,
     assignment,
     handleMessage,
+    inklingConversationNote,
     logInkmail,
     trigger,
     stamp,
@@ -623,5 +628,32 @@ describe('repair is a CAS, and inline delivery needs the stamp (Lumen, #681 roun
       USER,
       expect.objectContaining({ sessionId: 'correct-cli' })
     );
+  });
+});
+
+describe('the trigger tells an inkling who reads its conversation (inkling-conversation-note.ts)', () => {
+  beforeEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+  });
+
+  it('asks for the note as the recipient, in the thread’s space, and appends it to the turn', async () => {
+    const w = makeWorld({ conversationNote: 'Synthetic note: only the people here read this.' });
+    expect(await w.trigger()).toBeNull();
+    expect(w.inklingConversationNote).toHaveBeenCalledWith(expect.anything(), {
+      workspaceId: 'ws-probe',
+      threadKey: THREAD_KEY,
+      recipientSbId: SB_ID,
+    });
+    expect(w.handleMessage).toHaveBeenCalledTimes(1);
+    const content = (w.handleMessage.mock.calls[0]?.[0] as unknown as { content: string }).content;
+    expect(content).toContain('\n\nSynthetic note: only the people here read this.');
+  });
+
+  it('control: no note, nothing appended', async () => {
+    const w = makeWorld();
+    expect(await w.trigger()).toBeNull();
+    const content = (w.handleMessage.mock.calls[0]?.[0] as unknown as { content: string }).content;
+    expect(content).not.toContain('Synthetic note');
   });
 });

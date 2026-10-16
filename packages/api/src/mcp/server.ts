@@ -304,6 +304,18 @@ export class MCPServer {
       });
       return userData;
     }
+    // A token bound by its canonical id alone keeps that binding: the session
+    // may name the slug of the same identity, never another one. Without this
+    // a same-owner sibling's live session replaced the effective identity
+    // while the signed one stayed behind in tokenSbId (Lumen, #874 r3).
+    if (userData.sbId && sessionIdentity.sbId !== userData.sbId) {
+      logger.warn('Context session enrichment rejected: session names another identity', {
+        sessionId: contextToken.sessionId,
+        sessionSbId: sessionIdentity.sbId,
+        tokenSbId: userData.sbId,
+      });
+      return userData;
+    }
 
     logger.debug('Context session enrichment: agent identity attached to user-token request', {
       sessionId: contextToken.sessionId,
@@ -1166,7 +1178,10 @@ export class MCPServer {
     // The only surface a `browser_client` credential can reach. Its own
     // middleware denies by default, so mounting it does not widen anything
     // that is not on its allowlist.
-    app.use('/api/browser-companion', createBrowserCompanionRouter(this.dataComposer.getClient()));
+    app.use(
+      '/api/browser-companion',
+      createBrowserCompanionRouter(this.dataComposer.getClient(), async () => this.dataComposer)
+    );
     logger.info('Browser companion routes registered at /api/browser-companion');
 
     if (this.config.getSessionService) {

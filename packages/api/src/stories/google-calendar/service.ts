@@ -22,6 +22,33 @@ const BARE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86_400_000;
 
 /**
+ * The longest span one free/busy query asks about. Google documents no limit
+ * on a query's range, and a year is asked for in 60-day pieces so an
+ * undocumented one can't cut the answer short.
+ */
+export const FREE_BUSY_CHUNK_MS = 60 * DAY_MS;
+
+/** Busy blocks in order, with any that touch or overlap joined into one. */
+export function joinBusy(
+  blocks: ReadonlyArray<{ start: string; end: string }>
+): Array<{ start: string; end: string }> {
+  const sorted = blocks
+    .map((block) => ({ start: Date.parse(block.start), end: Date.parse(block.end) }))
+    .filter((block) => !Number.isNaN(block.start) && !Number.isNaN(block.end))
+    .sort((a, b) => a.start - b.start);
+  const joined: Array<{ start: number; end: number }> = [];
+  for (const block of sorted) {
+    const last = joined[joined.length - 1];
+    if (last && block.start <= last.end) last.end = Math.max(last.end, block.end);
+    else joined.push({ ...block });
+  }
+  return joined.map((block) => ({
+    start: new Date(block.start).toISOString(),
+    end: new Date(block.end).toISOString(),
+  }));
+}
+
+/**
  * Reject a bare date that `Date` would silently rewrite into a different one.
  *
  * The YYYY-MM-DD shape above accepts impossible dates and the MCP schema is
@@ -291,10 +318,21 @@ export class GoogleCalendarService {
   private oauthService = getOAuthService();
 
   /**
-   * Get an authenticated Calendar API client for a user
+   * Get an authenticated Calendar API client for a user. `workspaceId` and
+   * `accountId` pick which of the user's connections to use; left out, the
+   * request's workspace and its most recent connection.
    */
-  private async getClient(userId: string): Promise<calendar_v3.Calendar> {
-    const accessToken = await this.oauthService.getValidAccessToken(userId, 'google');
+  private async getClient(
+    userId: string,
+    workspaceId?: string | null,
+    accountId?: string
+  ): Promise<calendar_v3.Calendar> {
+    const accessToken = await this.oauthService.getValidAccessToken(
+      userId,
+      'google',
+      workspaceId,
+      accountId ? { accountId } : {}
+    );
 
     const auth = new google.auth.OAuth2();
     auth.setCredentials({ access_token: accessToken });
@@ -556,6 +594,60 @@ export class GoogleCalendarService {
     });
 
     return this.mapEvent(response.data);
+  }
+
+  /**
+   * When the user's primary calendar is busy between two instants, from
+   * Google's free/busy query: a start and an end per block, and nothing else.
+   * No event is read, so no title, place or attendee can come back.
+   * `connection` is the user's Google connection to use: its workspace, and
+   * the stored account when one was chosen.
+   */
+  async primaryBusy(
+    userId: string,
+    window: { timeMin: string; timeMax: string },
+    connection: { workspaceId: string | null; accountId?: string }
+  ): Promise<Array<{ start: string; end: string }>> {
+    const calendar = await this.getClient(userId, connection.workspaceId, connection.accountId);
+    const min = Date.parse(window.timeMin);
+    const max = Date.parse(window.timeMax);
+    if (Number.isNaN(min) || Number.isNaN(max)) throw new Error('Unreadable free/busy window');
+    const blocks: Array<{ start: string; end: string }> = [];
+    // In pieces, in order; an event across a seam comes back in two and is joined.
+    for (let from = min; from < max; from += FREE_BUSY_CHUNK_MS) {
+      const to = Math.min(from + FREE_BUSY_CHUNK_MS, max);
+      blocks.push(
+        ...(await this.primaryBusyOnce(
+          calendar,
+          new Date(from).toISOString(),
+          new Date(to).toISOString()
+        ))
+      );
+    }
+    return joinBusy(blocks);
+  }
+
+  /** One free/busy query for the primary calendar. */
+  private async primaryBusyOnce(
+    calendar: calendar_v3.Calendar,
+    timeMin: string,
+    timeMax: string
+  ): Promise<Array<{ start: string; end: string }>> {
+    const response = await calendar.freebusy.query({
+      requestBody: { timeMin, timeMax, items: [{ id: 'primary' }] },
+    });
+    // Keyed by the id asked for; read the only entry if Google keyed it otherwise.
+    const calendars = response.data.calendars ?? {};
+    const entries = Object.values(calendars);
+    const primary = calendars.primary ?? (entries.length === 1 ? entries[0] : undefined);
+    if (!primary) throw new Error('Google returned no free/busy for the primary calendar');
+    if (primary.errors?.length) {
+      const reasons = primary.errors.map((error) => error.reason ?? 'unknown').join(', ');
+      throw new Error(`Google could not read free/busy: ${reasons}`);
+    }
+    return (primary.busy ?? []).flatMap((block) =>
+      block.start && block.end ? [{ start: block.start, end: block.end }] : []
+    );
   }
 
   /**

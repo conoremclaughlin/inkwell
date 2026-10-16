@@ -73,7 +73,7 @@ export async function linkReaderForPrincipal(
   workspaceId: string,
   principal: Principal
 ): Promise<LinkReader> {
-  if (principal.kind === 'system') return { kind: 'full' };
+  if (principal.kind === 'system') return { kind: 'full', principal: null };
   const role = await roleOfUserIn(
     supabase,
     workspaceId,

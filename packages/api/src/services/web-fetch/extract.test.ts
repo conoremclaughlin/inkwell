@@ -105,6 +105,13 @@ describe('htmlToReadable keeps structure', () => {
   it('strips invisible characters', () => {
     expect(md('<p>pay\u{200B}load\u{E0041}</p>')).toBe('payload');
   });
+  it('cleans the title and bidi isolates with the same Unicode policy as browser capture', () => {
+    const content = htmlToReadable('<title>Ti\u202etle</title><p>pa\u2066ge</p>', 'text');
+    expect(content).toEqual({ title: 'Title', text: 'page' });
+  });
+  it('preserves writing and emoji joiners rather than normalizing their scripts', () => {
+    expect(plain('<p>می\u200cروم 👩\u200d💻 ❤️</p>')).toBe('می\u200cروم 👩\u200d💻 ❤️');
+  });
 });
 
 describe('decodeEntities', () => {

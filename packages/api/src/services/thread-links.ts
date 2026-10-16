@@ -16,6 +16,7 @@
 import type { DataComposer } from '../data/composer';
 import { resolveSbsByIds } from './principals';
 import { classifyIdentityById } from './inklings/inkling-turn-gate';
+import { PARTICIPANT_ONLY_COLUMN } from './threads/thread-read-access';
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
 // thread_links is not in the generated types until they are regenerated
@@ -487,19 +488,30 @@ export interface ThreadLinkViews {
  * falls back to.
  *
  * - `full`: the team. The workspace owner in person, and the owner's own SBs
- *   that are not inklings.
+ *   that are not inklings. They see every thread's links except a
+ *   participant-only conversation's that they are not in (D3).
  * - `participant`: everyone else (members, viewers, inklings, an identity that
  *   cannot be classified). They see a link only when they take part in the
  *   thread at both ends, which is what they could already list, and an
  *   artifact end only when the artifact is their own user's.
  */
 export type LinkReader =
-  | { kind: 'full' }
+  | {
+      kind: 'full';
+      /**
+       * Who reads. A participant-only conversation (D3, thread-read-access)
+       * shows only to its participants, so even a full reader sees one only
+       * as a participant, and a reader with no principal (the system) never.
+       */
+      principal: LinkPrincipal | null;
+    }
   | {
       kind: 'participant';
-      principal: { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string };
+      principal: LinkPrincipal;
       userId: string;
     };
+
+type LinkPrincipal = { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string };
 
 /**
  * The reader scope of an SB caller. Full only for a non-inkling SB whose owner
@@ -515,7 +527,9 @@ export async function linkReaderForSb(
       supabase as unknown as Parameters<typeof classifyIdentityById>[0],
       caller.sbId
     );
-    if (identity.kind === 'other') return { kind: 'full' };
+    if (identity.kind === 'other') {
+      return { kind: 'full', principal: { kind: 'sb', sbId: caller.sbId } };
+    }
   }
   return {
     kind: 'participant',
@@ -527,7 +541,7 @@ export async function linkReaderForSb(
 /** The reader scope of a person acting as themselves. */
 export function linkReaderForUser(role: string, userId: string): LinkReader {
   return role === 'owner'
-    ? { kind: 'full' }
+    ? { kind: 'full', principal: { kind: 'user', userId } }
     : { kind: 'participant', principal: { kind: 'user', userId }, userId };
 }
 
@@ -567,8 +581,9 @@ async function participatingThreadIds(
  * - an artifact target: artifactVisibleTo, the same predicate that resolving
  *   a target uses, so a visible end is always one the caller can unlink.
  *
- * A full reader passes every thread check; artifacts are still held to the
- * workspace and the legacy-owner rule.
+ * A full reader passes every thread check except a participant-only
+ * conversation's, which it passes only as a participant; artifacts are still
+ * held to the workspace and the legacy-owner rule.
  */
 export async function describeThreadLinks(
   supabase: SupabaseClient,
@@ -602,18 +617,29 @@ export async function describeThreadLinks(
       : artifactsByUri(supabase, unique([...twinUriByKey.values()])),
   ]);
 
-  const visible =
+  // A full reader passes every thread check but one: a participant-only
+  // conversation (D3) shows only to its participants, whoever reads.
+  const knownThreads = [...threadsByKey.values(), ...sourcesById.values()];
+  const participantOnly = new Set(
+    knownThreads.filter((t) => t.participant_only === true).map((t) => t.id)
+  );
+  const askAbout =
     reader.kind === 'full'
-      ? null
-      : await participatingThreadIds(
-          supabase,
-          unique([...sourceIds, ...[...threadsByKey.values()].map((t) => t.id)]),
-          reader.principal
-        );
-  const canSeeThread = (threadId: string | undefined): boolean =>
-    visible === null || (threadId !== undefined && visible.has(threadId));
+      ? [...participantOnly]
+      : unique([...sourceIds, ...[...threadsByKey.values()].map((t) => t.id)]);
+  const participating = reader.principal
+    ? await participatingThreadIds(supabase, askAbout, reader.principal)
+    : new Set<string>();
+  const canSeeThread = (threadId: string | undefined): boolean => {
+    if (reader.kind === 'full') {
+      return (
+        threadId === undefined || !participantOnly.has(threadId) || participating.has(threadId)
+      );
+    }
+    return threadId !== undefined && participating.has(threadId);
+  };
   const canSeeThreadKey = (key: string): boolean => {
-    if (visible === null) return true;
+    if (reader.kind === 'full') return canSeeThread(threadsByKey.get(key)?.id);
     if (canSeeThread(threadsByKey.get(key)?.id)) return true;
     const twinUri = twinUriByKey.get(key);
     const twin = twinUri ? twinArtifacts.get(twinUri) : undefined;
@@ -650,7 +676,7 @@ export async function describeThreadLinks(
       // sees a `spec:` end through the spec alone gets the spec's title and
       // no status, the same whether the conversation exists or not, so the
       // view does not even say there is one.
-      if (visible !== null && !canSeeThread(t?.id)) {
+      if (reader.kind !== 'full' && !canSeeThread(t?.id)) {
         const twinUri = twinUriByKey.get(r.target_thread_key!);
         const twin = twinUri ? twinArtifacts.get(twinUri) : undefined;
         linksTo.push({
@@ -734,6 +760,8 @@ interface ThreadSummaryRow {
   thread_key: string;
   title: string | null;
   status: string;
+  /** JSON `true` when the conversation is its participants' alone (PARTICIPANT_ONLY_COLUMN). */
+  participant_only?: unknown;
 }
 
 async function threadsWhere(
@@ -746,7 +774,7 @@ async function threadsWhere(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data, error } = await (supabase as any)
     .from('inbox_threads')
-    .select('id, thread_key, title, status')
+    .select(`id, thread_key, title, status, ${PARTICIPANT_ONLY_COLUMN}`)
     .eq('workspace_id', workspaceId)
     .in(column, values);
   if (error) throw new Error(`Failed to read linked threads: ${error.message}`);

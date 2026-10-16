@@ -33,6 +33,11 @@ export interface SpineThreadRow {
   createdBySlug: string;
   updatedAt: string;
   closedAt: string | null;
+  /**
+   * A group chat created with other people of the space
+   * (inkling-shared-space.ts). Absent when the route does not say.
+   */
+  shared?: boolean;
   participants: string[];
   /** Newest deliverable message, when the route fetched one. */
   lastMessage?: ThreadLastMessage | null;
@@ -112,6 +117,8 @@ export interface ThreadSpine {
     participants: string[];
     people: SpinePerson[];
     closedAt: string | null;
+    /** A group chat created with other people; absent when the route does not say. */
+    shared?: boolean;
     /** Newest deliverable (non-system) message; null when there is none. */
     lastMessage: ThreadLastMessage | null;
     /**
@@ -408,6 +415,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       // agent to wake (Lumen, #620 — the merger used to drop this).
       people: t.people ?? [],
       closedAt: t.closedAt,
+      ...(t.shared !== undefined ? { shared: t.shared } : {}),
       lastMessage: t.lastMessage ?? null,
       // Only the viewer's own row carries a pin; no row, no field.
       ...(t.pinned !== undefined ? { pinned: t.pinned } : {}),

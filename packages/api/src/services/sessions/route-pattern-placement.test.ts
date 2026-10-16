@@ -153,7 +153,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
        RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion,
-       inTurnNote
+       inTurnNote, inklingConversationNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -458,6 +458,8 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = [], dFirst =
     // What a member of an inkling group answering in turn is told
     // (inkling-reply-chain.ts): production, and silent for these wakes.
     inTurnNote,
+    // An inkling conversation's note (inkling-conversation-note.ts): none here.
+    inklingConversationNote: vi.fn(async () => null),
   });
 
   /** One delivery, through the handler production registers on the gateway. */

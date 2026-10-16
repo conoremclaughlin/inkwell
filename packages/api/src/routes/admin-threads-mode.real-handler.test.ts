@@ -316,7 +316,7 @@ describe('an adopting retry completes the thread its original created', () => {
       title: null,
       conversation_mode: mode,
       metadata: {
-        createIntent: createIntentOf(ID, createRequestOf(['pip'], '', mode), 'hello', null),
+        createIntent: createIntentOf(ID, createRequestOf(['pip'], '', [], mode), 'hello', null),
         inklingConversation: true,
       },
     });

@@ -139,7 +139,9 @@ import { resolveWorkspaceContextForRequest } from '../../utils/workspace-scope';
 import {
   accountGateCaller,
   assertAccountTokenAllowed,
+  INKLING_CONSENTED_ACCOUNT_TOOLS,
   InklingAccountRefusedError,
+  SPACE_BUSY_TIMES_TOOL,
 } from './inkling-account-gate';
 import { INKLING_CLIENT } from './inkling-client';
 import { classifyIdentityById, inklingTurnRefusal } from './inkling-turn-gate';
@@ -242,6 +244,20 @@ describe('assertAccountTokenAllowed', () => {
     const allowlist = new Set(['list_email_labels']);
     await expect(gate(caller, 'list_email_labels', allowlist)).resolves.toBeUndefined();
     await expect(gate(caller, 'send_email', allowlist)).rejects.toThrow(InklingAccountRefusedError);
+  });
+
+  it('admits get_space_busy_times with nothing turned on, and no other tool (D6/D7)', async () => {
+    const caller = { ...tokenIdentityContext({ sbId: INKLING }), workspaceId: WORKSPACE };
+    expect([...INKLING_CONSENTED_ACCOUNT_TOOLS]).toEqual([SPACE_BUSY_TIMES_TOOL]);
+    expect(SPACE_BUSY_TIMES_TOOL).toBe('get_space_busy_times');
+    await expect(gate(caller, SPACE_BUSY_TIMES_TOOL)).resolves.toBeUndefined();
+    for (const tool of ['list_calendars', 'list_calendar_events', 'get_calendar_event']) {
+      await expect(gate(caller, tool)).rejects.toThrow(InklingAccountRefusedError);
+    }
+    // A name only like it is not it.
+    await expect(gate(caller, 'get_space_busy_times_all')).rejects.toThrow(
+      InklingAccountRefusedError
+    );
   });
 
   it('refuses an inkling outside any tool call, even with an allowlist', async () => {
@@ -442,6 +458,114 @@ describe('a Google tool from an inkling turn, end to end', () => {
     const result = await call(server, 'list_calendars', inklingTurn);
     expect(result.error).not.toContain("can't use its owner's google account");
     expect(accountReads()).toHaveLength(1);
+  });
+
+  describe("get_space_busy_times: each member's own switch, nothing turned on for inklings", () => {
+    const SAM = '00000000-0000-4000-8000-0000000000b1';
+    const KIT = '00000000-0000-4000-8000-0000000000b2';
+    const CALENDAR = 'https://www.googleapis.com/auth/calendar.readonly';
+
+    beforeEach(() => {
+      fake.tables.workspace_members = [
+        { workspace_id: WORKSPACE, user_id: OWNER, role: 'owner', calendar_share: 'busy' },
+        { workspace_id: WORKSPACE, user_id: SAM, role: 'member', calendar_share: 'busy' },
+        { workspace_id: WORKSPACE, user_id: KIT, role: 'member', calendar_share: 'none' },
+      ];
+      fake.tables.users = [
+        { id: OWNER, first_name: 'Ada', last_name: null, username: null },
+        { id: SAM, first_name: 'Sam', last_name: null, username: null },
+        { id: KIT, first_name: 'Kit', last_name: null, username: null },
+      ];
+      // Kit has connected Google; connecting shares nothing (D6).
+      fake.tables.connected_accounts = [SAM, KIT].map((userId) => ({
+        user_id: userId,
+        provider: 'google',
+        status: 'active',
+        workspace_id: WORKSPACE,
+        scopes: [CALENDAR],
+        access_token: `token-${userId}`,
+        refresh_token: null,
+        expires_at: null,
+      }));
+    });
+
+    const readsFor = (userId: string) =>
+      accountReads().filter((read) =>
+        read.filters.some(
+          ([op, column, value]) => op === 'eq' && column === 'user_id' && value === userId
+        )
+      );
+
+    it("reaches a sharer's own account with INK_INKLING_ACCOUNT_TOOLS unset, never a non-sharer's", async () => {
+      const result = (await call(registered(), 'get_space_busy_times', inklingTurn)) as unknown as {
+        success: boolean;
+        unavailable: Array<{ name: string; reason: string }>;
+        notSharing: string[];
+      };
+      expect(result.success).toBe(true);
+      // Sam's token was handed out (the gate admitted the tool) and Google was
+      // reached, which this file stubs out; Ada has no connection at all.
+      expect(fake.provider).toHaveBeenCalledTimes(1);
+      expect(result.unavailable).toEqual([
+        { name: 'Ada', reason: 'they have no Google calendar connected' },
+        { name: 'Sam', reason: 'their Google calendar could not be read just now' },
+      ]);
+      expect(result.notSharing).toEqual(['Kit']);
+      expect(readsFor(SAM).length).toBeGreaterThan(0);
+      expect(readsFor(KIT)).toEqual([]);
+    });
+
+    it("reads the calling SB's own space, whatever space the request names", async () => {
+      const ELSEWHERE = '00000000-0000-4000-8000-0000000000c1';
+      fake.tables.agent_identities.push({
+        id: ELSEWHERE,
+        agent_id: 'wick',
+        user_id: OWNER,
+        workspace_id: OTHER_WORKSPACE,
+        metadata: { ...INKLING_METADATA },
+      });
+      fake.tables.workspace_members.push({
+        workspace_id: OTHER_WORKSPACE,
+        user_id: OWNER,
+        role: 'owner',
+        calendar_share: 'none',
+      });
+      const result = (await call(registered(), 'get_space_busy_times', {
+        ...inklingTurn,
+        workspaceId: WORKSPACE,
+        sbId: ELSEWHERE,
+        sbSlug: 'wick',
+        ...tokenIdentityContext({ sbId: ELSEWHERE, sbSlug: 'wick' }),
+      })) as unknown as { sharing: unknown[]; notSharing: string[] };
+      expect(result.sharing).toEqual([]);
+      expect(result.notSharing).toEqual(['Ada']);
+      expect(accountReads()).toEqual([]);
+    });
+
+    it('refuses a caller that is no SB', async () => {
+      const result = await call(registered(), 'get_space_busy_times', {
+        userId: OWNER,
+        email: 'owner@example.test',
+        workspaceId: WORKSPACE,
+      });
+      expect(result).toMatchObject({
+        success: false,
+        error: "Only a space's SB can read its members' busy times",
+      });
+      expect(accountReads()).toEqual([]);
+    });
+
+    it('reads nothing of anyone once nobody has switched it on', async () => {
+      for (const member of fake.tables.workspace_members) member.calendar_share = 'none';
+      const result = (await call(registered(), 'get_space_busy_times', inklingTurn)) as unknown as {
+        sharing: unknown[];
+        notSharing: string[];
+      };
+      expect(result.sharing).toEqual([]);
+      expect(result.notSharing).toEqual(['Ada', 'Sam', 'Kit']);
+      expect(accountReads()).toEqual([]);
+      expect(fake.provider).not.toHaveBeenCalled();
+    });
   });
 
   describe("an inkling can't stop being one through its own identity tool (Lumen, PR #793)", () => {

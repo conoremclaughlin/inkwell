@@ -121,6 +121,7 @@ import { closeDeletionsInProgress } from './services/account-deletion/worker';
 import { configureDeletionWorker, nudgeDeletionWorker } from './services/account-deletion/runtime';
 import { cancelInklingTurns } from './services/inklings/inkling-turns';
 import { inklingsRoot } from './services/inklings/inkling-folder';
+import { inklingConversationNote } from './services/inklings/inkling-conversation-note';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -1318,6 +1319,15 @@ Type: ${payload.triggerType}`;
         for (const line of formatThreadDescriptorLines(descriptor)) {
           triggerMessage += `\n${line}`;
         }
+        // An inkling conversation: who can read it, and that the private
+        // stays private (inkling-conversation-note.ts). Told only to a
+        // participant, like the descriptor above.
+        const conversationNote = await inklingConversationNote(dataComposer.getClient(), {
+          workspaceId: threadWorkspaceId ?? resolvedWorkspaceId,
+          threadKey: payload.threadKey,
+          recipientSbId: resolvedIdentityId,
+        });
+        if (conversationNote) triggerMessage += `\n\n${conversationNote}`;
       }
     }
     triggerMessage += `

@@ -11,6 +11,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
 import { connectorsRouter } from './admin-connectors';
+import { calendarShareRouter } from './admin-calendar-share';
 import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
 import { parseListSearch, listSearchFilter } from './list-search';
@@ -81,10 +82,7 @@ import {
 import { tokenIdentityState } from '../auth/token-identity';
 import { isSpaceTurnScope } from '../auth/token-scope';
 import type { Database } from '../data/supabase/types';
-import {
-  BrowserCompanionGrantService,
-  isInstallationCommitment,
-} from '../services/browser-companion-grant.service';
+import { createBrowserPairingAdminRouter } from './browser-pairing-admin';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { ThreadKeyService } from '../services/thread-key/thread-key.service';
@@ -139,6 +137,16 @@ import {
   parseConversationMode,
   storedConversationMode,
 } from '../services/threads/conversation-mode';
+import {
+  OPEN_THREADS_FILTER,
+  PARTICIPANT_ONLY_COLUMN,
+  PARTICIPANT_ONLY_PATH,
+  SHARED_GROUP_COLUMN,
+  isParticipantOnlyThread,
+  isSharedGroupRow,
+  isSharedGroupThread,
+  mayReadThread,
+} from '../services/threads/thread-read-access';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -1927,6 +1935,9 @@ router.use(adminAuthMiddleware);
 // The app's view of its Google connection (routes/admin-connectors.ts).
 router.use('/connectors', connectorsRouter);
 
+// A member's own "share my busy times here" switch (routes/admin-calendar-share.ts).
+router.use(calendarShareRouter);
+
 // Saved logins, a person's own (routes/admin-vault.ts).
 router.use('/vault', vaultRouter);
 
@@ -2041,7 +2052,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/browser-companion/pairing-code
- * Body: { installationId, installationCommitment } → { grantId, pairingCode, … }
+ * Body: { installationId, installationCommitment, recipientId?, fullToolsApproved? }
  *
  * Mints the code the browser extension claims. It lives on the admin router
  * because the human doing the granting is signed into the dashboard — this is
@@ -2055,9 +2066,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
  * locally and has not sent anywhere. Without it, the claim would be gated on a
  * code read off a screen plus an installation id handed to this endpoint —
  * neither secret, so any installation observing both could claim a pairing it
- * did not start. Getting the commitment from the extension to the dashboard is
- * browser-side transport and is NOT in this PR: what ships here is the
- * server's half of pairing, unexposed, not a complete pairing flow.
+ * did not start. The dashboard binds explicit recipient consent to this offer.
  *
  * Unlike the mobile pairing code above, the row goes into
  * `browser_companion_grants`, never `mcp_tokens`. A row in `mcp_tokens` is
@@ -2067,45 +2076,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
  * it namespaces nothing. Storing a browser grant there would have made the
  * companion route allowlist bypassable in one request.
  */
-router.post('/browser-companion/pairing-code', async (req: Request, res: Response) => {
-  try {
-    const authReq = req as AdminAuthRequest;
-    const installationId =
-      typeof req.body?.installationId === 'string' ? req.body.installationId.trim() : '';
-    if (!installationId) {
-      res.status(400).json({ error: 'installationId is required' });
-      return;
-    }
-
-    const installationCommitment =
-      typeof req.body?.installationCommitment === 'string'
-        ? req.body.installationCommitment.trim().toLowerCase()
-        : '';
-    if (!isInstallationCommitment(installationCommitment)) {
-      res.status(400).json({ error: 'installationCommitment must be a sha256 hex digest' });
-      return;
-    }
-
-    const dataComposer = await getDataComposer();
-    const grants = new BrowserCompanionGrantService(dataComposer.getClient());
-    const created = await grants.createPairingCode({
-      userId: authReq.inkUserId,
-      workspaceId: authReq.inkWorkspaceId,
-      installationId,
-      installationCommitment,
-    });
-
-    res.json({
-      grantId: created.grantId,
-      pairingCode: formatPairingCode(created.pairingCode),
-      pairingCodeExpiresAt: created.pairingCodeExpiresAt,
-      installationId,
-    });
-  } catch (error) {
-    logger.error('Browser companion pairing code error:', error);
-    res.status(500).json(errorJson('Failed to create browser pairing code', error));
-  }
-});
+router.use('/browser-companion', createBrowserPairingAdminRouter(getDataComposer));
 
 // =============================================================================
 // Workspaces
@@ -5668,15 +5639,33 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       const threadIds = [...new Set((threadParticipantRows || []).map((p) => p.thread_id))];
 
       if (threadIds.length > 0) {
-        const { data: threadRows, error: threadErr } = await supabase
+        const { data: agentThreadRows, error: threadErr } = await supabase
           .from('inbox_threads')
           .select('*')
           .eq('workspace_id', authReq.inkWorkspaceId)
           .in('id', threadIds)
           .order('updated_at', { ascending: false });
         if (threadErr) throw threadErr;
+        // A participant-only conversation (D3) shows here only to a person
+        // on it: owning one of its SBs is not being in it.
+        const privateIds = (agentThreadRows ?? [])
+          .filter((t) => isParticipantOnlyThread(t.metadata))
+          .map((t) => t.id);
+        const viewerOn = new Set<string>();
+        if (privateIds.length > 0) {
+          const { data: viewerRows, error: viewerErr } = await supabase
+            .from('inbox_thread_participants')
+            .select('thread_id')
+            .eq('user_id', authReq.inkUserId)
+            .in('thread_id', privateIds);
+          if (viewerErr) throw viewerErr;
+          for (const row of viewerRows ?? []) viewerOn.add(row.thread_id);
+        }
+        const threadRows = (agentThreadRows ?? []).filter(
+          (t) => !isParticipantOnlyThread(t.metadata) || viewerOn.has(t.id)
+        );
 
-        if (threadRows?.length) {
+        if (threadRows.length) {
           const visibleIds = threadRows.map((t) => t.id);
 
           const { data: readStatusRows, error: readErr } = await supabase
@@ -8503,14 +8492,19 @@ router.get('/threads', async (req: Request, res: Response) => {
     // same-key session from another workspace is another conversation.
     const carrierScope = carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId);
 
-    // One list for both thread reads below (the newest window and the
-    // hydration of older carrier keys), so neither can drop a column alone.
+    // One list for every thread read below (the newest window and the
+    // hydration of older carrier keys), so none can drop a column alone.
     // The embed carries each thread's newest message for the list preview.
-    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, conversation_mode, ${LAST_MESSAGE_EMBED}`;
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, conversation_mode, ${PARTICIPANT_ONLY_COLUMN}, ${SHARED_GROUP_COLUMN}, ${LAST_MESSAGE_EMBED}`;
 
-    const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
+    // The newest window is two reads (D3): the threads every reader here may
+    // read (threadsRes), and the participant-only ones this viewer is in
+    // (privateRes). Leaving the others out in the query, not after it, keeps
+    // them from taking a place in the window or in its count.
+    const [threadsRes, sessionsRes, studiosRes, groupsRes, privateRes] = await Promise.all([
       withLastMessage(supabase.from('inbox_threads').select(THREAD_COLUMNS, { count: 'exact' }))
         .eq('workspace_id', workspaceId)
+        .or(OPEN_THREADS_FILTER)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
       supabase
@@ -8537,9 +8531,24 @@ router.get('/threads', async (req: Request, res: Response) => {
         .not('thread_key', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(GROUPS_CAP),
+      withLastMessage(
+        supabase
+          .from('inbox_threads')
+          .select(
+            `${THREAD_COLUMNS}, viewer:inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(user_id)`,
+            { count: 'exact' }
+          )
+      )
+        .eq('workspace_id', workspaceId)
+        .eq(PARTICIPANT_ONLY_PATH, true)
+        .eq('viewer.user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(THREADS_CAP),
     ]);
 
-    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes].find((r) => r.error);
+    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes, privateRes].find(
+      (r) => r.error
+    );
     if (failed?.error) {
       logger.error('Failed to list thread spines:', failed.error);
       res.status(500).json(errorJson('Failed to list threads', failed.error));
@@ -8581,7 +8590,15 @@ router.get('/threads', async (req: Request, res: Response) => {
       updatedAt: g.updated_at,
     }));
 
-    const threadRows = [...(threadsRes.data || [])];
+    // One newest-first window over both reads, cut to the cap; the count is
+    // both reads' together, so `truncated` still means "there is more".
+    const openRows = threadsRes.data || [];
+    const privateRows = privateRes.data || [];
+    let threadRows = [...openRows, ...privateRows]
+      .sort((a, b) => (Date.parse(b.updated_at ?? '') || 0) - (Date.parse(a.updated_at ?? '') || 0))
+      .slice(0, THREADS_CAP);
+    const threadsTotal =
+      (threadsRes.count ?? openRows.length) + (privateRes.count ?? privateRows.length);
 
     // Hydrate thread rows for carrier keys outside the newest-THREADS_CAP
     // window. Without this, a session referencing an older real thread
@@ -8622,7 +8639,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     const participantSbIds = new Set<string>();
     // The viewer's own pin per thread, from their own participant row only.
     const viewerPinByThreadId = new Map<string, boolean | null>();
-    const participantRows: Array<{
+    let participantRows: Array<{
       thread_id: string;
       sb_id: string | null;
       user_id: string | null;
@@ -8646,11 +8663,27 @@ router.get('/threads', async (req: Request, res: Response) => {
         res.status(500).json(errorJson('Failed to list threads', participantsError));
         return;
       }
-      for (const row of pageRows || []) {
-        participantRows.push(row);
-        if (row.sb_id) participantSbIds.add(row.sb_id);
-      }
+      participantRows.push(...(pageRows || []));
       if (!pageRows || pageRows.length < PARTICIPANT_PAGE) break;
+    }
+
+    // A participant-only thread the viewer isn't in can still arrive by
+    // hydration, when a carrier holds its key; the window reads never return
+    // one. It is dropped here, with its participants, and its key's spine
+    // with every carrier on it is dropped after the merge (D3).
+    const viewerThreadIds = new Set(
+      participantRows.filter((row) => row.user_id === userId).map((row) => row.thread_id)
+    );
+    const hiddenThreadKeys = new Set<string>();
+    threadRows = threadRows.filter((t) => {
+      if (t.participant_only !== true || viewerThreadIds.has(t.id)) return true;
+      hiddenThreadKeys.add(t.thread_key);
+      return false;
+    });
+    const shownThreadIds = new Set(threadRows.map((t) => t.id));
+    participantRows = participantRows.filter((row) => shownThreadIds.has(row.thread_id));
+    for (const row of participantRows) {
+      if (row.sb_id) participantSbIds.add(row.sb_id);
     }
     const slugBySbId = new Map(
       (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.sbSlug])
@@ -8692,7 +8725,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       parseUnavailable = true;
     }
 
-    const spines = mergeThreadSpines({
+    const merged = mergeThreadSpines({
       // One instant for every session in this response; see isSessionLive.
       nowMs: Date.now(),
       threads: threadRows.map((t) => ({
@@ -8709,6 +8742,8 @@ router.get('/threads', async (req: Request, res: Response) => {
             : t.created_by_kind,
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
+        // A group chat created with other people of the space.
+        shared: isSharedGroupRow(t),
         participants: participantsByThreadId.get(t.id) ?? [],
         // Named for THIS viewer: a person's own row says so (spec §3).
         people: describePeople(peopleByThreadId.get(t.id) ?? [], personNames, authReq.inkUserId),
@@ -8725,6 +8760,9 @@ router.get('/threads', async (req: Request, res: Response) => {
       groups: groupRows,
       parse,
     });
+    // A hidden conversation's key leaves no spine: not its sessions,
+    // studios or task groups either, which would name it.
+    const spines = merged.filter((spine) => !hiddenThreadKeys.has(spine.key));
 
     const capMeta = (fetched: number, total: number | null, cap: number) => ({
       fetched,
@@ -8735,7 +8773,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     res.json({
       spines,
       meta: {
-        threads: capMeta(threadRows.length, threadsRes.count, THREADS_CAP),
+        threads: capMeta(threadRows.length, threadsTotal, THREADS_CAP),
         sessions: capMeta((sessionsRes.data || []).length, sessionsRes.count, SESSIONS_CAP),
         taskGroups: capMeta((groupsRes.data || []).length, groupsRes.count, GROUPS_CAP),
         parseUnavailable,
@@ -8907,6 +8945,12 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to load thread messages', threadError));
       return;
     }
+    // An inkling conversation is its participants' alone (D3). Anyone else
+    // gets what a key nobody has used gets: no thread, no studio history.
+    if (thread && !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
+      res.json({ thread: null, messages: [], studioHistory: [] });
+      return;
+    }
     const studioHistory = await loadThreadStudioHistory(
       supabase as SupabaseClient<Database>,
       authReq.inkUserId,
@@ -9023,6 +9067,8 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
         conversationMode: storedConversationMode(thread.conversation_mode),
+        // A group chat created with other people of the space.
+        shared: isSharedGroupThread(thread.metadata),
       },
       messages: (messageRows || [])
         .map((m) => ({
@@ -9211,6 +9257,20 @@ router.post('/threads', async (req: Request, res: Response) => {
       });
       return;
     }
+    // Other people of a team space this group is shared with, beside its
+    // inkling (inkling-shared-space.ts). The thread gate holds each to a
+    // write-role membership of the inkling's team space.
+    const rawPeople: unknown = req.body?.people;
+    if (
+      rawPeople !== undefined &&
+      (!Array.isArray(rawPeople) || rawPeople.length > 15 || !rawPeople.every(isUuid))
+    ) {
+      res.status(400).json({ error: 'people must list up to 15 user ids' });
+      return;
+    }
+    const people = [
+      ...new Set(((rawPeople ?? []) as string[]).map((id) => id.toLowerCase())),
+    ].filter((id) => id !== authReq.inkUserId.toLowerCase());
 
     // The workspace role before any lookup. What keeps a replay to the
     // person who sent the original is the sender check inside
@@ -9241,7 +9301,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     // people (as a set), the same title and the same mode, beside the same
     // sender and words.
     const createRequest = clientMessageId.value
-      ? createRequestOf(uniqueRecipients, title, conversationMode.mode)
+      ? createRequestOf(uniqueRecipients, title, people, conversationMode.mode)
       : undefined;
     // A client-identified create never joins a thread that exists. Either it
     // is a retry of the submission that created the thread, which answers
@@ -9345,7 +9405,17 @@ router.post('/threads', async (req: Request, res: Response) => {
         throw new Error(`Failed to read the conversation's members: ${membersError.message}`);
       }
       const rows = (members ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
-      if (rows.some((r) => r.user_id && r.user_id !== authReq.inkUserId)) return false;
+      // People besides this person only as this create named them.
+      if (
+        rows.some(
+          (r) =>
+            r.user_id &&
+            r.user_id !== authReq.inkUserId &&
+            !people.includes(r.user_id.toLowerCase())
+        )
+      ) {
+        return false;
+      }
       const present = new Set(rows.map((r) => r.sb_id).filter((id): id is string => !!id));
       let requested: SbPrincipal[];
       try {
@@ -9397,7 +9467,11 @@ router.post('/threads', async (req: Request, res: Response) => {
               principal: userPrincipal(authReq.inkUserId),
               workspaceId: authReq.inkWorkspaceId,
             },
-            ...(send.createOnly ? { createOnly: true } : {}),
+            // People join only a conversation this send makes: never one a
+            // concurrent create made first. A retry adopting its own create
+            // is the exception, held to the same people by its intent.
+            ...(send.createOnly || (people.length > 0 && send.created) ? { createOnly: true } : {}),
+            ...(people.length > 0 ? { people: people.map((id) => userPrincipal(id)) } : {}),
             // Written by the insert that creates the thread. An adopting retry
             // completes a thread its original already created with this mode
             // (the intent it matched names it), so only the creating send
@@ -9435,6 +9509,13 @@ router.post('/threads', async (req: Request, res: Response) => {
             await answerForExistingThread(taken);
             return;
           }
+        }
+        // A group create with no client message id has nothing to replay: a
+        // concurrent create took its key, so the key is taken (Lumen's review
+        // of 4f7896e6).
+        if (error instanceof ThreadKeyTakenError) {
+          res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
+          return;
         }
         throw error;
       }
@@ -9477,6 +9558,10 @@ router.post('/threads', async (req: Request, res: Response) => {
     const existing = await findThread();
     if (clientMessageId.value && existing) {
       await answerForExistingThread(existing);
+      return;
+    }
+    if (people.length > 0 && existing) {
+      res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
       return;
     }
     await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });
@@ -9587,7 +9672,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key')
+      .select('id, thread_key, metadata')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -9596,7 +9681,9 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to send reply', threadError));
       return;
     }
-    if (!thread) {
+    // A participant-only conversation (D3) the person is not in is answered
+    // as no thread, before its members are read for `wake`.
+    if (!thread || !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }
@@ -9916,7 +10003,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status')
+      .select('id, thread_key, status, metadata')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -9925,7 +10012,9 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to reopen thread', threadError));
       return;
     }
-    if (!thread) {
+    // A participant-only conversation (D3) the person is not in is answered
+    // as no thread: no role recovers it, and its status is not disclosed.
+    if (!thread || !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }
@@ -9984,6 +10073,24 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
+
+    // A participant-only conversation's key (D3) carries nothing for anyone
+    // not in it: the answer a key with no graph gets (Lumen, #874 r1).
+    const { data: keyedThread, error: keyedThreadError } = await supabase
+      .from('inbox_threads')
+      .select('id, metadata')
+      .eq('workspace_id', authReq.inkWorkspaceId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (keyedThreadError) {
+      logger.error('Failed to load thread for graph evidence:', keyedThreadError);
+      res.status(500).json(errorJson('Failed to load graph evidence', keyedThreadError));
+      return;
+    }
+    if (keyedThread && !(await mayReadThread(supabase, keyedThread, userId))) {
+      res.json({ groups: [], meta: { groups: { fetched: 0, total: 0, truncated: false } } });
+      return;
+    }
 
     // All statuses deliberately: a merged PR's group is 'completed' and its
     // evidence trail is exactly what the viewer exists to show. GRAPH

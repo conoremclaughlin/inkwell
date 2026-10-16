@@ -1617,4 +1617,29 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
     ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
     expect(enriched?.sbSlug).toBeUndefined();
   });
+
+  // A token bound by its canonical id alone keeps that binding (Lumen, #874 r3).
+  const enrich = (server: unknown, user: unknown) =>
+    (
+      server as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ sbSlug?: string; sbId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(user, { sessionId: SID, sbSlug: 'myra' });
+
+  it('fills the slug for an id-bound token from a session of the same identity', async () => {
+    const server = makeServer(liveSession('sb-uuid-B'));
+    expect(await enrich(server, { ...USER, sbId: 'sb-uuid-B' })).toMatchObject({
+      sbId: 'sb-uuid-B',
+      sbSlug: 'myra',
+    });
+  });
+
+  it("never replaces an id-bound token's identity with a sibling session's", async () => {
+    const server = makeServer(liveSession('sb-uuid-B'));
+    const token = { ...USER, sbId: 'sb-uuid-A' };
+    expect(await enrich(server, token)).toEqual(token);
+  });
 });

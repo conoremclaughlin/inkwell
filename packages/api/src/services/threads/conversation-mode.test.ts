@@ -41,22 +41,24 @@ describe('a create request and its intent carry the mode it named', () => {
 
   it('records a mode only when one was named, so older records keep their shape', () => {
     expect(createRequestOf(['Pip'], '')).toEqual({ recipients: ['pip'], title: null });
-    expect(createRequestOf(['pip'], '', 'public')).toEqual({
+    expect(createRequestOf(['pip'], '', [], 'public')).toEqual({
       recipients: ['pip'],
       title: null,
       mode: 'public',
     });
     expect(createIntentOf(ID, createRequestOf(['pip'], ''), 'hi', null)).not.toHaveProperty('mode');
-    expect(createIntentOf(ID, createRequestOf(['pip'], '', 'private'), 'hi', null)).toMatchObject({
+    expect(
+      createIntentOf(ID, createRequestOf(['pip'], '', [], 'private'), 'hi', null)
+    ).toMatchObject({
       mode: 'private',
     });
   });
 
   it('matches a retry naming the same mode, and none naming another or none', () => {
     const intent = (mode: 'public' | 'private' | null) => ({
-      createIntent: createIntentOf(ID, createRequestOf(['pip'], '', mode), 'hi', null),
+      createIntent: createIntentOf(ID, createRequestOf(['pip'], '', [], mode), 'hi', null),
     });
-    const retry = (mode: 'public' | 'private' | null) => createRequestOf(['pip'], '', mode);
+    const retry = (mode: 'public' | 'private' | null) => createRequestOf(['pip'], '', [], mode);
     expect(matchesCreateIntent(intent('private'), ID, retry('private'), 'hi', null)).toBe(true);
     expect(matchesCreateIntent(intent('private'), ID, retry('public'), 'hi', null)).toBe(false);
     expect(matchesCreateIntent(intent('private'), ID, retry(null), 'hi', null)).toBe(false);

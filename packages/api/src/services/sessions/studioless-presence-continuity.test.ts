@@ -105,7 +105,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
        RoutingRefusedError, BackendFailureError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
-       inTurnNote
+       inTurnNote, inklingConversationNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -513,6 +513,8 @@ function makeWorld(opts: WorldOptions = {}) {
     // What a member of an inkling group answering in turn is told
     // (inkling-reply-chain.ts): production, and silent for these wakes.
     inTurnNote,
+    // An inkling conversation's note (inkling-conversation-note.ts): none here.
+    inklingConversationNote: vi.fn(async () => null),
   });
 
   const stamp = () => tables.inbox_thread_participants[0].session_id as string | null;
