@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerHostedChatWorker } from './hosted-chat-worker';
 import { ConnectionError } from './connection';
+import { assertFresh, SNAPSHOT_TTL_MS } from './protocol';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   chat: vi.fn(),
@@ -98,12 +99,47 @@ beforeEach(() => {
 afterEach(() => {
   worker.disconnect();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 const message = {
   type: 'chat',
   operation: { kind: 'message', inklingId, operationId, body: 'Synthetic text.' },
 };
 describe('document-bound hosted chat worker', () => {
+  it('reports expired snapshots as rejected before persistence or dispatch', async () => {
+    vi.useFakeTimers();
+    const snapshot = {
+      version: 1 as const,
+      id: operationId,
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Expired fixture',
+      mode: 'page' as const,
+      text: 'Synthetic steps.',
+      truncated: false,
+      fields: [],
+    };
+    worker = registerHostedChatWorker(record as never, async () => {
+      assertFresh(snapshot);
+      const { version, mode, fields, ...page } = snapshot;
+      return page;
+    });
+    const p = port();
+    await p.request({ type: 'connect' });
+    vi.setSystemTime(snapshot.capturedAt + SNAPSHOT_TTL_MS + 1);
+    expect(
+      await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })
+    ).toMatchObject({ ok: true, value: { operationId, status: 'rejected' } });
+    expect(write).not.toHaveBeenCalled();
+    expect(mocks.chat).not.toHaveBeenCalled();
+    // An existing uncertain request with the same ID is not a definite rejection.
+    stored.chatPending = {
+      [`${grantId}:${inklingId}`]: { operationId, body: message.operation.body },
+    };
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
+    ).toBe(false);
+  });
   it('saves the exact worker snapshot before dispatch and reuses it without recapturing', async () => {
     const page = {
       id: operationId,
@@ -140,8 +176,8 @@ describe('document-bound hosted chat worker', () => {
       (await p.request({ ...message, operation: { ...message.operation, page: {} } })).ok
     ).toBe(false);
     expect(
-      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
-    ).toBe(false);
+      await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })
+    ).toMatchObject({ ok: true, value: { operationId, status: 'rejected' } });
     expect(write).not.toHaveBeenCalled();
     expect(mocks.chat).not.toHaveBeenCalled();
   });

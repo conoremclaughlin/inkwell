@@ -157,16 +157,7 @@ export function registerHostedChatWorker(
           let outgoing = op;
           const key = op.kind === 'inklings' ? '' : `${grantId}:${op.inklingId}`;
           if (op.kind === 'message') {
-            const pageId = object(message.operation).pageId;
-            const page =
-              message.type !== 'retry' && pageId !== undefined
-                ? parseBrowserChatPage(
-                    await (typeof pageId === 'string' && getPage
-                      ? getPage(pageId)
-                      : Promise.reject(new Error('Invalid page capture.')))
-                  )
-                : undefined;
-            alive();
+            let rejected = false;
             await serial(async () => {
               alive();
               const entries = await pending();
@@ -193,6 +184,21 @@ export function registerHostedChatWorker(
               }
               if (previous || Object.keys(entries).length >= 100)
                 throw new Error('Check the previous delivery before sending again.');
+              let page: BrowserChatPage | undefined;
+              const pageId = object(message.operation).pageId;
+              if (pageId !== undefined) {
+                try {
+                  if (typeof pageId !== 'string' || !getPage)
+                    throw new Error('Invalid page capture.');
+                  page = parseBrowserChatPage(await getPage(pageId));
+                } catch {
+                  // No prior pending request, write or dispatch: this refusal is
+                  // definitely not sent. Storage/transport failures stay unknown.
+                  rejected = true;
+                  return;
+                }
+              }
+              alive();
               // Durable-before-dispatch. A crash may leave an unsent unknown,
               // but cannot silently replay a potentially accepted send.
               await chrome.storage.session.set({
@@ -210,6 +216,7 @@ export function registerHostedChatWorker(
               };
             });
             alive();
+            if (rejected) return { operationId: op.operationId, status: 'rejected' };
           }
           const result = await connection.chat(outgoing);
           alive();

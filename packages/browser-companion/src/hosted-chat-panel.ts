@@ -4,7 +4,7 @@ import './chat-panel.css';
 import { cleanBrowserText } from './browser-text';
 import { parseBrowserChatPage, type BrowserChatPage } from '@inklabs/shared/browser-chat';
 import { panelRequest, type CompanionState } from './state';
-import { assertFresh, parseSnapshot } from './protocol';
+import { assertFresh, parseSnapshot, SNAPSHOT_TTL_MS } from './protocol';
 
 const object = (v: unknown): Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
@@ -33,6 +33,8 @@ export function mountHostedChatPanel() {
   let capturing = false;
   let attachment: BrowserChatPage | undefined;
   let attachmentRevision = 0;
+  let attachmentTimer: ReturnType<typeof setTimeout> | undefined;
+  let needsPageChoice = false;
   const requests = new Map<
     string,
     { resolve(value: Record<string, unknown>): void; reject(): void }
@@ -47,6 +49,11 @@ export function mountHostedChatPanel() {
   const panel = createChatPanel(host, state, {
     async send(request) {
       if (!intent || !identity || !select.value || busy) throw new Error('Connect first.');
+      if (needsPageChoice || (attachment && Date.now() - attachment.capturedAt > SNAPSHOT_TTL_MS)) {
+        expireAttachment();
+        render();
+        return { status: 'rejected' };
+      }
       busy = true;
       const version = revision;
       const attached = attachment;
@@ -68,6 +75,10 @@ export function mountHostedChatPanel() {
         });
         if (version !== revision || result.operationId !== request.operationId)
           return { status: 'unknown' };
+        if (result.status === 'rejected') {
+          if (attached) expireAttachment();
+          return { status: 'rejected' };
+        }
         return {
           status:
             result.status === 'stored' || result.status === 'queued' ? result.status : 'unknown',
@@ -108,14 +119,23 @@ export function mountHostedChatPanel() {
   host.querySelector('form')!.prepend(pageTools);
   function clearAttachment(message?: string) {
     ++attachmentRevision;
+    clearTimeout(attachmentTimer);
+    needsPageChoice = false;
     attachment = undefined;
     if (message) pageStatus.textContent = message;
+  }
+  function expireAttachment() {
+    clearAttachment(
+      'Snapshot expired or unavailable. Nothing was sent. Share the page again, or Remove page to send text only.'
+    );
+    needsPageChoice = true;
   }
   sharePage.onclick = async () => {
     if (!intent || !identity || !select.value || busy || capturing || pendingOperationId) return;
     const version = revision;
     const captureVersion = ++attachmentRevision;
     capturing = true;
+    clearTimeout(attachmentTimer);
     attachment = undefined;
     pageStatus.textContent = 'Capturing the page you opened this panel from…';
     render();
@@ -125,6 +145,15 @@ export function mountHostedChatPanel() {
       if (!intent || version !== revision || captureVersion !== attachmentRevision) return;
       const { id, capturedAt, url, title, text, truncated } = snapshot;
       attachment = parseBrowserChatPage({ id, capturedAt, url, title, text, truncated });
+      needsPageChoice = false;
+      attachmentTimer = setTimeout(
+        () => {
+          if (captureVersion !== attachmentRevision) return;
+          expireAttachment();
+          render();
+        },
+        Math.max(0, capturedAt + SNAPSHOT_TTL_MS + 1 - Date.now())
+      );
       pageStatus.textContent =
         'Attached for your next message only. Review the snapshot or remove it before sending.';
     } catch {
@@ -144,9 +173,13 @@ export function mountHostedChatPanel() {
     if (area !== 'session' || !attachment) return;
     const version = attachmentRevision;
     const id = attachment.id;
+    const capturedAt = attachment.capturedAt;
     void panelRequest<CompanionState>({ type: 'state' })
       .then((current) => {
-        if (version === attachmentRevision && current.snapshot?.id !== id) {
+        if (version === attachmentRevision && Date.now() - capturedAt > SNAPSHOT_TTL_MS) {
+          expireAttachment();
+          render();
+        } else if (version === attachmentRevision && current.snapshot?.id !== id) {
           clearAttachment(
             'The page changed or the capture expired. Share it again before sending.'
           );
@@ -230,7 +263,7 @@ export function mountHostedChatPanel() {
           : '');
     sharePage.disabled =
       !intent || !identity || !select.value || busy || capturing || !!pendingOperationId;
-    removePage.hidden = !attachment;
+    removePage.hidden = !attachment && !needsPageChoice;
     removePage.disabled = busy;
     pagePreview.hidden = !attachment;
     pageLabel.textContent = attachment
