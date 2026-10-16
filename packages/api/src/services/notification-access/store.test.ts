@@ -195,6 +195,16 @@ describe('private notification target', () => {
 });
 
 describe('sign-in and grant binding', () => {
+  it.each([
+    ['23503', 'target_refused'],
+    ['NPA02', 'access_inactive'],
+  ])('maps create race %s without inspecting database error text', async (code, expected) => {
+    fault = { table: 'sb_notification_watchers', code };
+    await expect(store.create(scope, input, NOW)).rejects.toMatchObject({
+      code: expected,
+      message: expected,
+    });
+  });
   it('reports exhausted grant capacity without exposing a database error', async () => {
     fault = { table: 'sb_notification_watchers', code: 'NPA08' };
     await expect(store.create(scope, input, NOW)).rejects.toMatchObject({

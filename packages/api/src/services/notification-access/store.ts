@@ -201,6 +201,10 @@ export class NotificationAccessStore {
       })
       .select(WATCHER_COLUMNS)
       .single();
+    // A foreign key may disappear after the target check. Refuse this target,
+    // not the owner's login; do not inspect potentially private database text.
+    // Explicit sign-in refusals (NPA02) still use the authentication mapping.
+    if (created.error?.code === '23503') throw new NotificationAccessError('target_refused');
     check(created.error);
     return { watcher: watcherFrom(created.data), deviceToken: credential.token };
   }

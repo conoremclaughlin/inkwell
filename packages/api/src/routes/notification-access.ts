@@ -37,12 +37,14 @@ export interface NotificationRouterDependencies {
   now?: () => number;
 }
 
-function failure(res: Response, error: unknown): void {
+function failure(res: Response, error: unknown, surface: 'owner' | 'device'): void {
   const code =
     error instanceof NotificationAccessError
       ? error.code
       : error instanceof GateClosedError
-        ? 'access_inactive'
+        ? surface === 'owner'
+          ? 'target_refused'
+          : 'access_inactive'
         : 'unavailable';
   const statuses = {
     invalid_request: 422,
@@ -120,7 +122,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
       const rows = await underGates(scope, async () => (await requireStore(deps)).list(scope));
       res.json({ watchers: rows.map((row) => publicWatcher(row, now())) });
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.post('/watchers', async (req, res) => {
@@ -135,7 +137,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
         .status(201)
         .json({ watcher: publicWatcher(result.watcher, now()), deviceToken: result.deviceToken });
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.post('/watchers/:watcherId/revoke', async (req, res) => {
@@ -146,7 +148,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
       await underGates(scope, async () => (await requireStore(deps)).revoke(scope, id.data));
       res.status(204).end();
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.delete('/watchers/:watcherId', async (req, res) => {
@@ -157,7 +159,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
       await underGates(scope, async () => (await requireStore(deps)).remove(scope, id.data));
       res.status(204).end();
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.get('/watchers/:watcherId/events', async (req, res) => {
@@ -170,7 +172,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
       );
       res.json({ events });
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.get('/watchers/:watcherId/rules', async (req, res) => {
@@ -182,7 +184,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
         await underGates(scope, async () => (await requireStore(deps)).rules(scope, id.data))
       );
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   router.put('/watchers/:watcherId/rules', async (req, res) => {
@@ -197,7 +199,7 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
         )
       );
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'owner');
     }
   });
   return router;
@@ -219,7 +221,7 @@ export function createNotificationIntakeRouter(deps: NotificationRouterDependenc
       return;
     }
     if (attempts.hit(req.ip || 'unknown', 1200, now())) {
-      failure(res, new NotificationAccessError('rate_limited'));
+      failure(res, new NotificationAccessError('rate_limited'), 'device');
       return;
     }
     const auth = req.headers.authorization;
@@ -227,7 +229,7 @@ export function createNotificationIntakeRouter(deps: NotificationRouterDependenc
       auth?.startsWith('Bearer ') ? auth.slice(7) : null
     );
     if (!digest) {
-      failure(res, new NotificationAccessError('access_inactive'));
+      failure(res, new NotificationAccessError('access_inactive'), 'device');
       return;
     }
     res.locals.notificationDigest = digest;
@@ -242,7 +244,7 @@ export function createNotificationIntakeRouter(deps: NotificationRouterDependenc
       res.locals.notificationWatcher = watcher;
       next();
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'device');
     }
   });
   router.use(json({ limit: NOTIFICATION_BODY_LIMIT, strict: true, inflate: false }));
@@ -271,7 +273,7 @@ export function createNotificationIntakeRouter(deps: NotificationRouterDependenc
       );
       res.status(202).json({ accepted: true });
     } catch (error) {
-      failure(res, error);
+      failure(res, error, 'device');
     }
   });
   router.use((error: unknown, _req: Request, res: Response, _next: (error?: unknown) => void) => {

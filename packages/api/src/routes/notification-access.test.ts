@@ -370,6 +370,80 @@ describe('owner-only mutable rules', () => {
 });
 
 describe('owner management surface', () => {
+  describe.each(['account', 'space'])('closed %s gate', (kind) => {
+    it.each([
+      ['/watchers', 'GET', undefined, 'list'],
+      ['/watchers', 'POST', consent, 'create'],
+      [`/watchers/${id(1)}/revoke`, 'POST', undefined, 'revoke'],
+      [`/watchers/${id(1)}`, 'DELETE', undefined, 'remove'],
+      [`/watchers/${id(1)}/events`, 'GET', undefined, 'events'],
+      [`/watchers/${id(1)}/rules`, 'GET', undefined, 'rules'],
+      [`/watchers/${id(1)}/rules`, 'PUT', { rules: [] }, 'setRules'],
+    ] as const)('preserves the owner login for %s %s', async (path, method, body, operation) => {
+      (kind === 'account' ? accountGate : spaceGate).close(kind === 'account' ? id(2) : id(3));
+      const response = await admin(path, method, body);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: 'target_refused' });
+      expect(store[operation]).not.toHaveBeenCalled();
+      expect(accountGate.inFlightCount(id(2))).toBe(0);
+      expect(spaceGate.inFlightCount(id(3))).toBe(0);
+      expect((await admin(path, method, body, '')).status).toBe(401);
+    });
+  });
+  it.each([
+    ['23503', 403, 'target_refused'],
+    ['NPA02', 401, 'access_inactive'],
+  ] as const)(
+    'maps create write refusal %s through the real store',
+    async (code, status, error) => {
+      const db = new FakePostgrest();
+      db.seed('mcp_tokens', {
+        id: watcher.signin_id,
+        user_id: watcher.owner_id,
+        client_id: 'mobile',
+        refresh_token: consent.refreshToken,
+        expires_at: watcher.expires_at,
+      });
+      db.seed('agent_identities', {
+        id: watcher.recipient_id,
+        user_id: watcher.owner_id,
+        workspace_id: watcher.workspace_id,
+      });
+      db.seed('inbox_threads', {
+        id: watcher.thread_id,
+        thread_key: consent.conversationId,
+        workspace_id: watcher.workspace_id,
+        metadata: { inklingConversation: true },
+      });
+      db.seed('inbox_thread_participants', {
+        thread_id: watcher.thread_id,
+        user_id: watcher.owner_id,
+        sb_id: null,
+      });
+      db.seed('inbox_thread_participants', {
+        thread_id: watcher.thread_id,
+        user_id: null,
+        sb_id: watcher.recipient_id,
+      });
+      const from = db.from.bind(db);
+      const refusedWrite = vi.fn().mockResolvedValue({
+        data: null,
+        error: { code, message: 'synthetic confidential database detail' },
+      });
+      vi.spyOn(db, 'from').mockImplementation((table) => {
+        const query = from(table);
+        if (table === 'sb_notification_watchers') query.single = refusedWrite;
+        return query;
+      });
+      const realStore = new NotificationAccessStore(db as unknown as SupabaseClient);
+      store.create.mockImplementation(realStore.create.bind(realStore));
+      const response = await admin('/watchers', 'POST', consent);
+      expect(refusedWrite).toHaveBeenCalledOnce();
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({ error });
+      expect((await admin('/watchers')).status).toBe(200);
+    }
+  );
   it('reports grant capacity as a conflict, not a transient retry', async () => {
     store.create.mockRejectedValue(new NotificationAccessError('grant_limit'));
     const response = await admin('/watchers', 'POST', consent);
