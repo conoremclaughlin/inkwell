@@ -3440,3 +3440,243 @@ describe('send_to_inbox links precondition', () => {
     expect(sb.from).not.toHaveBeenCalledWith('agent_inbox');
   });
 });
+
+// Reviewer regression: a bound SB must not become its person by omitting sbSlug.
+describe('PR 874 reviewer principal boundary', () => {
+  function privateInboxClient(sbParticipant = false) {
+    const privateThread = THREAD_ROW({
+      id: 'private-review-thread',
+      thread_key: 'chat:conversation-synthetic-review',
+      metadata: { inklingConversation: true },
+    });
+    const parts = sbParticipant
+      ? [{ thread_id: privateThread.id, user_id: null, sb_id: SB_IDS.lumen }]
+      : [{ thread_id: privateThread.id, user_id: 'user-123', sb_id: null }];
+    const rows: Record<string, Array<Record<string, unknown>>> = {
+      workspace_members: [{ workspace_id: WS, user_id: 'user-123', role: 'owner' }],
+      inbox_threads: [privateThread],
+      inbox_thread_participants: parts,
+      inbox_thread_messages: [
+        {
+          thread_id: privateThread.id,
+          sender_kind: 'user',
+          sender_sb_id: null,
+          sender_agent_id: null,
+          content: 'synthetic private review canary',
+          message_type: 'message',
+          created_at: '2026-10-15T00:00:00Z',
+          metadata: {},
+        },
+      ],
+    };
+    return {
+      from(name: string) {
+        if (name === 'agent_identities') return createIdentityChain();
+        let data = [...(rows[name] ?? [])];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const q: any = {};
+        for (const method of ['select', 'order', 'limit', 'not']) q[method] = () => q;
+        q.eq = (column: string, value: unknown) => {
+          if (name === 'inbox_threads' && column === 'metadata->inklingConversation') {
+            data = data.filter(
+              (r) => (r.metadata as Record<string, unknown>)?.inklingConversation === value
+            );
+          } else if (name === 'inbox_threads' && column === 'viewer.user_id') {
+            data = data.filter((r) =>
+              parts.some((p) => p.thread_id === r.id && p.user_id === value)
+            );
+          } else if (
+            name === 'inbox_threads' &&
+            ['inbox_thread_participants.sb_id', 'viewer.sb_id'].includes(column)
+          ) {
+            data = data.filter((r) => parts.some((p) => p.thread_id === r.id && p.sb_id === value));
+          } else data = data.filter((r) => r[column] === value);
+          return q;
+        };
+        q.in = (column: string, values: unknown[]) => {
+          data = data.filter((r) => values.includes(r[column]));
+          return q;
+        };
+        q.or = (expression: string) => {
+          if (name === 'inbox_threads' && expression.includes('metadata->inklingConversation')) {
+            data = data.filter(
+              (r) => (r.metadata as Record<string, unknown>)?.inklingConversation !== true
+            );
+          }
+          return q;
+        };
+        q.maybeSingle = () => Promise.resolve({ data: data[0] ?? null, error: null });
+        q.then = (resolve: (v: unknown) => unknown) =>
+          Promise.resolve({ data, error: null, count: data.length }).then(resolve);
+        return q;
+      },
+    };
+  }
+  async function read(pinned: string | undefined, explicit: boolean) {
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
+      await import('../../utils/request-context');
+    vi.mocked(getPinnedSlug).mockReturnValue(pinned as never);
+    vi.mocked(getRequestContext).mockReturnValue(
+      pinned
+        ? ({ userId: 'user-123', sbSlug: pinned, sbId: SB_IDS[pinned] } as never)
+        : ({ userId: 'user-123' } as never)
+    );
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    const response = await handleGetInbox(
+      {
+        status: 'unread',
+        markRead: false,
+        ...(explicit ? { sbSlug: pinned } : {}),
+      },
+      { getClient: () => privateInboxClient(), repositories: {} } as never
+    );
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    return body.threadsWithUnread ?? [];
+  }
+  it('allows the unbound person to read their own private conversation (control)', async () => {
+    expect(JSON.stringify(await read(undefined, false))).toContain(
+      'synthetic private review canary'
+    );
+  });
+  it('excludes the private conversation for a bound nonparticipant with explicit sbSlug (control)', async () => {
+    expect(await read('lumen', true)).toEqual([]);
+  });
+  it('excludes the same private conversation when that bound SB omits sbSlug', async () => {
+    expect(await read('lumen', false)).toEqual([]);
+  });
+
+  async function readCanonical(
+    sbParticipant: boolean,
+    includeSlug: boolean,
+    tokenSbId = SB_IDS.lumen,
+    enrichAs?: string,
+    explicit = false
+  ) {
+    const ctx = await import('../../utils/request-context');
+    const actual = await vi.importActual<typeof ctx>('../../utils/request-context');
+    vi.mocked(ctx.getPinnedSlug).mockImplementation(actual.getPinnedSlug);
+    vi.mocked(ctx.getRequestContext).mockImplementation(actual.getRequestContext);
+    vi.mocked(ctx.getSessionContext).mockReturnValue(undefined as never);
+    const claims = {
+      userId: 'user-123',
+      email: 'owner@example.test',
+      sbId: tokenSbId,
+      ...(includeSlug ? { sbSlug: 'lumen' } : {}),
+    };
+    const client = privateInboxClient(sbParticipant);
+    const { signRunnerAccessToken } = await import('../../auth/ink-tokens');
+    const { InkAuthProvider } = await import('../auth/ink-auth-provider');
+    const provider = new InkAuthProvider();
+    // The database is synthetic; signing, verification, context and handler are real.
+    (provider as unknown as { supabase: unknown }).supabase = client;
+    const verdict = await provider.verifyAccessToken(`Bearer ${signRunnerAccessToken(claims)}`);
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) throw new Error('Synthetic token was unexpectedly refused');
+    const token = verdict.token;
+    expect(token.sbId).toBe(tokenSbId);
+    expect(token.sbSlug).toBe(includeSlug ? 'lumen' : undefined);
+    const requestContext = { ...token, ...actual.tokenIdentityContext(token) };
+    if (enrichAs) {
+      const { MCPServer } = await import('../server');
+      // No constructor, listener, or background services. Exercise the actual
+      // server enrichment against a synthetic live session owned by this user.
+      const server = Object.create(MCPServer.prototype);
+      const sessionId = '00000000-0000-4000-8000-000000000874';
+      server.dataComposer = {
+        getClient: () => client,
+        repositories: {
+          memory: {
+            getSession: async () => ({
+              id: sessionId,
+              userId: 'user-123',
+              sbSlug: enrichAs,
+              sbId: SB_IDS[enrichAs],
+              lifecycle: 'running',
+            }),
+          },
+        },
+      };
+      const effective = await server.enrichIdentityFromContextSession(token, {
+        sessionId,
+        sbSlug: enrichAs,
+      });
+      Object.assign(requestContext, { sbId: effective.sbId, sbSlug: effective.sbSlug });
+      expect(requestContext.tokenSbId).toBe(tokenSbId);
+    }
+    const response = await actual.runWithRequestContext(requestContext, () =>
+      handleGetInbox(
+        { status: 'unread', markRead: false, ...(explicit ? { sbSlug: enrichAs } : {}) },
+        {
+          getClient: () => client,
+          repositories: {},
+        } as never
+      )
+    );
+    const body = JSON.parse(response.content[0].text);
+    if (explicit && body.success !== true) {
+      // An identity-mismatch refusal is also safe; do not require the
+      // implementation to answer with a successful empty inbox.
+      expect(JSON.stringify(body)).not.toContain('synthetic private review canary');
+      expect(JSON.stringify(body)).not.toContain('chat:conversation-synthetic-review');
+      return [];
+    }
+    expect(body.success).toBe(true);
+    return body.threadsWithUnread ?? [];
+  }
+
+  it('excludes a person-only conversation for a UUID-only bound SB', async () => {
+    expect(await readCanonical(false, false)).toEqual([]);
+  });
+
+  it('allows a UUID-only bound SB its own conversation without its owner (control)', async () => {
+    expect(JSON.stringify(await readCanonical(true, false))).toContain(
+      'synthetic private review canary'
+    );
+  });
+
+  it('allows a slug-and-UUID bound SB its own conversation without its owner (control)', async () => {
+    expect(JSON.stringify(await readCanonical(true, true))).toContain(
+      'synthetic private review canary'
+    );
+  });
+
+  it.each([false, true])(
+    'does not replace a signed SB with a sibling session identity (explicit slug: %s)',
+    async (explicit) => {
+      expect(await readCanonical(true, false, SB_IDS.wren, 'lumen', explicit)).toEqual([]);
+    }
+  );
+
+  it.each([false, true])(
+    'still allows a participant using its own session (explicit slug: %s, control)',
+    async (explicit) => {
+      expect(
+        JSON.stringify(await readCanonical(true, false, SB_IDS.lumen, 'lumen', explicit))
+      ).toContain('synthetic private review canary');
+    }
+  );
+
+  it('fails closed when the bound id names no identity: not even the person’s own conversation', async () => {
+    const ctx = await import('../../utils/request-context');
+    const actual = await vi.importActual<typeof ctx>('../../utils/request-context');
+    vi.mocked(ctx.getPinnedSlug).mockImplementation(actual.getPinnedSlug);
+    vi.mocked(ctx.getRequestContext).mockImplementation(actual.getRequestContext);
+    vi.mocked(ctx.getSessionContext).mockReturnValue(undefined as never);
+    // The person is the private thread's participant; the token is bound to
+    // an id no identity row carries.
+    const client = privateInboxClient(false);
+    const identity = { sbId: 'sb-gone' };
+    const response = await actual.runWithRequestContext(
+      { userId: 'user-123', ...identity, ...actual.tokenIdentityContext(identity) },
+      () =>
+        handleGetInbox({ status: 'unread', markRead: false }, {
+          getClient: () => client,
+          repositories: {},
+        } as never)
+    );
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.threadsWithUnread ?? []).toEqual([]);
+  });
+});

@@ -32,8 +32,8 @@ vi.mock('../../utils/request-context', async (importOriginal) => ({
 const USER_A = '00000000-0000-4000-8000-000000000001';
 const USER_B = '00000000-0000-4000-8000-000000000002';
 const WS = 'ws-review';
-const FULL = { kind: 'full' } as const;
 /** The team's view, in the fixture's workspace, as the workspace owner. */
+const FULL = { kind: 'full', principal: { kind: 'user', userId: USER_A } } as const;
 const FULL_SCOPE = { workspaceId: WS, callerUserId: USER_A, reader: FULL };
 
 /**
@@ -501,5 +501,97 @@ describe('Lumen round 3 spec twin metadata boundary', () => {
       await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
     );
     expect(read.linksTo[0].title).toBe('Synthetic private conversation title');
+  });
+});
+
+describe('a participant-only conversation’s links (D3)', () => {
+  // pr:1 as an inkling conversation that beta and its person are on, and
+  // alpha, the workspace owner's own SB, is not. The artifact is beta's
+  // user's, so beta may see that end as a restricted reader.
+  function privateFixture() {
+    const f = fixture({ roles: { a: 'owner', b: 'member' }, artifactOwner: USER_B });
+    f.tables.inbox_threads[0] = {
+      ...f.tables.inbox_threads[0],
+      metadata: { inklingConversation: true },
+      // What PARTICIPANT_ONLY_COLUMN projects; this fake returns whole rows.
+      participant_only: true,
+    };
+    f.tables.inbox_thread_participants = [
+      { thread_id: 'source', sb_id: 'sb-b', user_id: null },
+      { thread_id: 'source', sb_id: null, user_id: USER_B },
+    ];
+    return f;
+  }
+  const ALPHA_FULL = {
+    workspaceId: WS,
+    callerUserId: USER_A,
+    reader: { kind: 'full', principal: { kind: 'sb', sbId: 'sb-a' } },
+  } as const;
+  const uris = (views: Array<{ uri?: string }>) => views.map((v) => v.uri);
+
+  it('leaves them out of the team’s view for a reader not on it, existence included', async () => {
+    const { dc, client } = privateFixture();
+    const alpha = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(alpha).toMatchObject({ success: true, threadExists: false, linksTo: [] });
+    // The views themselves, given the thread outright: its edge is held back.
+    const views = await threadLinkViewsFor(client, ALPHA_FULL, {
+      threadKey: 'pr:1',
+      threadId: 'source',
+    });
+    expect(views).toEqual({ linksTo: [], linkedFrom: [] });
+    expect(
+      await artifactBacklinks(client, FULL_SCOPE, { id: 'artifact', uri: 'ink://specs/example' })
+    ).toEqual({ threads: [], count: 0 });
+  });
+
+  it('shows them to a participant', async () => {
+    const { dc } = privateFixture();
+    const beta = parsed(
+      await handleListThreadLinks({ userId: USER_B, sbSlug: 'beta', threadKey: 'pr:1' }, dc)
+    );
+    expect(beta.threadExists).toBe(true);
+    expect(uris(beta.linksTo)).toEqual(['ink://specs/example']);
+  });
+
+  it('shows them to the team’s view when the reader is on it, as an SB or in person', async () => {
+    const { dc, client, tables } = privateFixture();
+    tables.inbox_thread_participants.push({ thread_id: 'source', sb_id: 'sb-a', user_id: null });
+    const alpha = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(alpha.threadExists).toBe(true);
+    expect(uris(alpha.linksTo)).toEqual(['ink://specs/example']);
+
+    tables.inbox_thread_participants.push({ thread_id: 'source', sb_id: null, user_id: USER_A });
+    const backlinks = await artifactBacklinks(client, FULL_SCOPE, {
+      id: 'artifact',
+      uri: 'ink://specs/example',
+    });
+    expect(
+      'threads' in backlinks && backlinks.threads.map((t) => t.threadKey),
+      JSON.stringify(backlinks)
+    ).toEqual(['pr:1']);
+  });
+
+  it('keeps an ordinary thread in the team’s view for a reader not on it', async () => {
+    const { client, tables } = fixture({ roles: { a: 'owner', b: 'member' } });
+    tables.inbox_thread_participants = [{ thread_id: 'source', sb_id: 'sb-b', user_id: null }];
+    const views = await threadLinkViewsFor(client, ALPHA_FULL, {
+      threadKey: 'pr:1',
+      threadId: 'source',
+    });
+    expect(uris(views.linksTo)).toEqual(['ink://specs/example']);
+  });
+
+  it('shows the system none of them', async () => {
+    const { client } = privateFixture();
+    const views = await threadLinkViewsFor(
+      client,
+      { workspaceId: WS, callerUserId: USER_A, reader: { kind: 'full', principal: null } },
+      { threadKey: 'pr:1', threadId: 'source' }
+    );
+    expect(views.linksTo).toEqual([]);
   });
 });

@@ -25,6 +25,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { SbPrincipal, UserPrincipal } from '../principals';
+import { isParticipantOnlyThread } from './thread-read-access';
 import {
   assertInklingThreadAllowed,
   InklingThreadRefusedError,
@@ -263,7 +264,7 @@ export async function reactToMessage(
 
   const { data: thread, error: threadError } = await client
     .from('inbox_threads')
-    .select('id, workspace_id')
+    .select('id, workspace_id, metadata')
     .eq('workspace_id', workspaceId)
     .eq('thread_key', threadKey)
     .maybeSingle();
@@ -271,7 +272,24 @@ export async function reactToMessage(
   if (!thread) {
     throw new ReactionRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
   }
-  const threadRow = thread as { id: string; workspace_id: string };
+  const threadRow = thread as { id: string; workspace_id: string; metadata: unknown };
+
+  // Members only. A person who is not in the thread is reading it in the
+  // background, and a background thread stays read-only for them.
+  const reactorColumn = reactor.kind === 'sb' ? 'sb_id' : 'user_id';
+  const reactorId = reactor.kind === 'sb' ? reactor.sbId : reactor.userId;
+  const { data: member, error: memberError } = await client
+    .from('inbox_thread_participants')
+    .select('thread_id')
+    .eq('thread_id', threadRow.id)
+    .eq(reactorColumn, reactorId)
+    .maybeSingle();
+  if (memberError) throw new Error(`Failed to check membership: ${memberError.message}`);
+  // A participant-only conversation (D3) is no thread at all to anyone not
+  // in it: answered before its messages are looked up.
+  if (!member && isParticipantOnlyThread(threadRow.metadata)) {
+    throw new ReactionRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
+  }
 
   const { data: message, error: messageError } = await client
     .from('inbox_thread_messages')
@@ -288,17 +306,6 @@ export async function reactToMessage(
   // read-back and the answer, uses the row's id, never the request's.
   const canonicalMessageId = (message as { id: string }).id;
 
-  // Members only. A person who is not in the thread is reading it in the
-  // background, and a background thread stays read-only for them.
-  const reactorColumn = reactor.kind === 'sb' ? 'sb_id' : 'user_id';
-  const reactorId = reactor.kind === 'sb' ? reactor.sbId : reactor.userId;
-  const { data: member, error: memberError } = await client
-    .from('inbox_thread_participants')
-    .select('thread_id')
-    .eq('thread_id', threadRow.id)
-    .eq(reactorColumn, reactorId)
-    .maybeSingle();
-  if (memberError) throw new Error(`Failed to check membership: ${memberError.message}`);
   if (!member) {
     throw reactor.kind === 'user'
       ? new ReactionRefusedError(

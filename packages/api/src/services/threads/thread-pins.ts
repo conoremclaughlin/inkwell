@@ -13,6 +13,8 @@
  * recency, and wakes nobody. The caller checks the workspace role first.
  */
 
+import { isParticipantOnlyThread } from './thread-read-access';
+
 // A narrow client both the typed client and the test fakes satisfy.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Client = { from: (table: string) => any };
@@ -75,7 +77,7 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
 
   const { data: thread, error: threadError } = await client
     .from('inbox_threads')
-    .select('id')
+    .select('id, metadata')
     .eq('workspace_id', workspaceId)
     .eq('thread_key', threadKey)
     .maybeSingle();
@@ -83,7 +85,7 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
   if (!thread) {
     throw new PinRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
   }
-  const threadId = (thread as { id: string }).id;
+  const { id: threadId, metadata } = thread as { id: string; metadata: unknown };
 
   // The person's own row or nothing: no row matched means they are not in
   // this conversation (a background thread), and it stays theirs to read only.
@@ -95,6 +97,11 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
     .select('thread_id');
   if (updateError) throw new Error(`Failed to set the pin: ${updateError.message}`);
   if (!Array.isArray(updated) || updated.length === 0) {
+    // A participant-only conversation (D3) is no thread at all to anyone
+    // not in it.
+    if (isParticipantOnlyThread(metadata)) {
+      throw new PinRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
+    }
     throw new PinRefusedError(
       403,
       'background_thread',

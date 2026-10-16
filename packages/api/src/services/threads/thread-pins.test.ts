@@ -132,7 +132,7 @@ describe('setThreadPin', () => {
 
       expect(queries.map((q) => q.table)).toEqual(['inbox_threads', 'inbox_thread_participants']);
       expect(queries[0].calls).toEqual([
-        ['select', 'id'],
+        ['select', 'id, metadata'],
         ['eq', 'workspace_id', WS],
         ['eq', 'thread_key', 'chat:pip'],
         ['maybeSingle'],
@@ -161,6 +161,26 @@ describe('setThreadPin', () => {
       status: 403,
       code: 'background_thread',
     });
+  });
+
+  // D3: a participant-only conversation is no thread at all to anyone not in
+  // it, so the person who has no row gets the missing-thread answer.
+  it('answers 404 thread_not_found for a participant-only conversation the person is not in', async () => {
+    const { client } = recordingClient({
+      thread: { data: { id: THREAD_ID, metadata: { inklingConversation: true } }, error: null },
+      update: { data: [], error: null },
+    });
+    expect(await refusal(setThreadPin(client, request()))).toEqual({
+      status: 404,
+      code: 'thread_not_found',
+    });
+  });
+
+  it('pins a participant-only conversation for a person on it', async () => {
+    const { client } = recordingClient({
+      thread: { data: { id: THREAD_ID, metadata: { inklingConversation: true } }, error: null },
+    });
+    expect(await setThreadPin(client, request())).toEqual({ threadKey: 'chat:pip', pinned: true });
   });
 
   it('throws, not refuses, when either query fails', async () => {
