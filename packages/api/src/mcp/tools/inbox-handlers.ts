@@ -2326,10 +2326,20 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             'thread_page_recency'
           );
         } else {
-          // The agent-less view reads as the account: every thread in its
-          // workspaces, except a participant-only conversation (D3), which
-          // appears only when the account is on it as a person. Two reads,
-          // so the others never take a place on the page.
+          // The agent-less view: every thread in the account's workspaces,
+          // except a participant-only conversation (D3), which appears only
+          // to someone on it. An unbound person reads as the account, by
+          // their own participant row. A token bound to an SB reads as that
+          // SB even when it names none, by the SB's row (Lumen, #874 r1); a
+          // bound slug that resolves to none of the account's SBs sees none.
+          // Two reads, so the others never take a place on the page.
+          const boundSlug = getPinnedSlug();
+          const privateReader = boundSlug
+            ? await resolveCallerSb(supabase, resolved.user.id, boundSlug).then(
+                (sb) => ({ column: 'viewer.sb_id', id: sb.sbId }),
+                () => null
+              )
+            : { column: 'viewer.user_id', id: resolved.user.id };
           const [open, ownPrivate] = await Promise.all([
             threadTable(supabase, 'inbox_threads')
               .select(THREAD_PAGE_COLUMNS)
@@ -2337,15 +2347,17 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               .or(OPEN_THREADS_FILTER)
               .order('updated_at', { ascending: false })
               .limit(THREAD_PAGE_LIMIT),
-            threadTable(supabase, 'inbox_threads')
-              .select(
-                `${THREAD_PAGE_COLUMNS}, viewer:inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(user_id)`
-              )
-              .in('workspace_id', threadWorkspaceIds)
-              .eq(PARTICIPANT_ONLY_PATH, true)
-              .eq('viewer.user_id', resolved.user.id)
-              .order('updated_at', { ascending: false })
-              .limit(THREAD_PAGE_LIMIT),
+            privateReader
+              ? threadTable(supabase, 'inbox_threads')
+                  .select(
+                    `${THREAD_PAGE_COLUMNS}, viewer:inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(user_id, sb_id)`
+                  )
+                  .in('workspace_id', threadWorkspaceIds)
+                  .eq(PARTICIPANT_ONLY_PATH, true)
+                  .eq(privateReader.column, privateReader.id)
+                  .order('updated_at', { ascending: false })
+                  .limit(THREAD_PAGE_LIMIT)
+              : Promise.resolve({ data: [] as ThreadPageRow[], error: null }),
           ]);
           threads = [
             ...(checkedRead<ThreadPageRow[]>(open, 'thread_page_recency') ?? []),

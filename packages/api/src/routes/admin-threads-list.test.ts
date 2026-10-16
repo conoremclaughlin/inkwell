@@ -569,3 +569,86 @@ describe('GET /threads', () => {
     });
   });
 });
+
+// Reviewer regression: graph evidence is another read surface on a thread key.
+describe('PR 874 reviewer graph evidence', () => {
+  async function read(privateThread: boolean, participant: boolean) {
+    const key = 'chat:conversation-synthetic-review';
+    const rows: Record<string, Array<Record<string, unknown>>> = {
+      inbox_threads: [
+        threadRow({
+          thread_key: key,
+          workspace_id: 'ws-review',
+          metadata: { inklingConversation: privateThread },
+        }),
+      ],
+      inbox_thread_participants: [
+        { thread_id: 'thread-1', user_id: participant ? 'user-1' : 'someone-else' },
+      ],
+      agent_identities: [{ id: 'workspace-sb', workspace_id: 'ws-review' }],
+      task_groups: [
+        {
+          id: 'synthetic-group',
+          sb_id: 'workspace-sb',
+          user_id: 'someone-else',
+          title: 'synthetic private graph canary',
+          thread_key: key,
+          execution_model: 'graph',
+          status: 'active',
+          created_at: ago(3),
+        },
+      ],
+      tasks: [],
+    };
+    mockSupabaseFrom.mockImplementation((name: string) => {
+      let data = [...(rows[name] ?? [])];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const q: any = {};
+      for (const method of ['select', 'order', 'limit']) q[method] = () => q;
+      q.eq = (column: string, value: unknown) => {
+        data = data.filter((r) => r[column] === value);
+        return q;
+      };
+      q.in = (column: string, values: unknown[]) => {
+        data = data.filter((r) => values.includes(r[column]));
+        return q;
+      };
+      q.or = (expression: string) => {
+        expect(expression).toBe('sb_id.in.(workspace-sb),and(sb_id.is.null,user_id.eq.user-1)');
+        data = data.filter(
+          (r) => r.sb_id === 'workspace-sb' || (r.sb_id == null && r.user_id === 'user-1')
+        );
+        return q;
+      };
+      q.maybeSingle = () => Promise.resolve({ data: data[0] ?? null, error: null });
+      q.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data, error: null, count: data.length }).then(resolve);
+      return q;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const layer = (router as any).stack.find(
+      (x: any) => x.route?.path === '/threads/graph-evidence'
+    );
+    const res = createRes();
+    await layer.route.stack.at(-1).handle(
+      {
+        query: { key },
+        inkUserId: 'user-1',
+        inkWorkspaceId: 'ws-review',
+        inkWorkspaceRole: 'member',
+      } as unknown as Request,
+      res
+    );
+    expect(res._status).toBe(200);
+    return (res._json as { groups: unknown[] }).groups;
+  }
+  it('allows an ordinary thread (control)', async () => {
+    expect(await read(false, false)).toHaveLength(1);
+  });
+  it('allows a private participant (control)', async () => {
+    expect(await read(true, true)).toHaveLength(1);
+  });
+  it('refuses a private conversation to a nonparticipant', async () => {
+    expect(await read(true, false)).toEqual([]);
+  });
+});

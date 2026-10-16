@@ -10027,6 +10027,24 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
 
+    // A participant-only conversation's key (D3) carries nothing for anyone
+    // not in it: the answer a key with no graph gets (Lumen, #874 r1).
+    const { data: keyedThread, error: keyedThreadError } = await supabase
+      .from('inbox_threads')
+      .select('id, metadata')
+      .eq('workspace_id', authReq.inkWorkspaceId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (keyedThreadError) {
+      logger.error('Failed to load thread for graph evidence:', keyedThreadError);
+      res.status(500).json(errorJson('Failed to load graph evidence', keyedThreadError));
+      return;
+    }
+    if (keyedThread && !(await mayReadThread(supabase, keyedThread, userId))) {
+      res.json({ groups: [], meta: { groups: { fetched: 0, total: 0, truncated: false } } });
+      return;
+    }
+
     // All statuses deliberately: a merged PR's group is 'completed' and its
     // evidence trail is exactly what the viewer exists to show. GRAPH
     // groups only — ordinary linear groups default execution_model and

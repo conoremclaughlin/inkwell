@@ -3398,3 +3398,104 @@ describe('send_to_inbox links precondition', () => {
     expect(sb.from).not.toHaveBeenCalledWith('agent_inbox');
   });
 });
+
+// Reviewer regression: a bound SB must not become its person by omitting sbSlug.
+describe('PR 874 reviewer principal boundary', () => {
+  function privateInboxClient() {
+    const privateThread = THREAD_ROW({
+      id: 'private-review-thread',
+      thread_key: 'chat:conversation-synthetic-review',
+      metadata: { inklingConversation: true },
+    });
+    const parts = [{ thread_id: privateThread.id, user_id: 'user-123', sb_id: null }];
+    const rows: Record<string, Array<Record<string, unknown>>> = {
+      workspace_members: [{ workspace_id: WS, user_id: 'user-123', role: 'owner' }],
+      inbox_threads: [privateThread],
+      inbox_thread_participants: parts,
+      inbox_thread_messages: [
+        {
+          thread_id: privateThread.id,
+          sender_kind: 'user',
+          sender_sb_id: null,
+          sender_agent_id: null,
+          content: 'synthetic private review canary',
+          message_type: 'message',
+          created_at: '2026-10-15T00:00:00Z',
+          metadata: {},
+        },
+      ],
+    };
+    return {
+      from(name: string) {
+        if (name === 'agent_identities') return createIdentityChain();
+        let data = [...(rows[name] ?? [])];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const q: any = {};
+        for (const method of ['select', 'order', 'limit', 'not']) q[method] = () => q;
+        q.eq = (column: string, value: unknown) => {
+          if (name === 'inbox_threads' && column === 'metadata->inklingConversation') {
+            data = data.filter(
+              (r) => (r.metadata as Record<string, unknown>)?.inklingConversation === value
+            );
+          } else if (name === 'inbox_threads' && column === 'viewer.user_id') {
+            data = data.filter((r) =>
+              parts.some((p) => p.thread_id === r.id && p.user_id === value)
+            );
+          } else if (name === 'inbox_threads' && column === 'inbox_thread_participants.sb_id') {
+            data = data.filter((r) => parts.some((p) => p.thread_id === r.id && p.sb_id === value));
+          } else data = data.filter((r) => r[column] === value);
+          return q;
+        };
+        q.in = (column: string, values: unknown[]) => {
+          data = data.filter((r) => values.includes(r[column]));
+          return q;
+        };
+        q.or = (expression: string) => {
+          if (name === 'inbox_threads' && expression.includes('metadata->inklingConversation')) {
+            data = data.filter(
+              (r) => (r.metadata as Record<string, unknown>)?.inklingConversation !== true
+            );
+          }
+          return q;
+        };
+        q.maybeSingle = () => Promise.resolve({ data: data[0] ?? null, error: null });
+        q.then = (resolve: (v: unknown) => unknown) =>
+          Promise.resolve({ data, error: null, count: data.length }).then(resolve);
+        return q;
+      },
+    };
+  }
+  async function read(pinned: string | undefined, explicit: boolean) {
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
+      await import('../../utils/request-context');
+    vi.mocked(getPinnedSlug).mockReturnValue(pinned as never);
+    vi.mocked(getRequestContext).mockReturnValue(
+      pinned
+        ? ({ userId: 'user-123', sbSlug: pinned, sbId: SB_IDS[pinned] } as never)
+        : ({ userId: 'user-123' } as never)
+    );
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    const response = await handleGetInbox(
+      {
+        status: 'unread',
+        markRead: false,
+        ...(explicit ? { sbSlug: pinned } : {}),
+      },
+      { getClient: () => privateInboxClient(), repositories: {} } as never
+    );
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    return body.threadsWithUnread ?? [];
+  }
+  it('allows the unbound person to read their own private conversation (control)', async () => {
+    expect(JSON.stringify(await read(undefined, false))).toContain(
+      'synthetic private review canary'
+    );
+  });
+  it('excludes the private conversation for a bound nonparticipant with explicit sbSlug (control)', async () => {
+    expect(await read('lumen', true)).toEqual([]);
+  });
+  it('excludes the same private conversation when that bound SB omits sbSlug', async () => {
+    expect(await read('lumen', false)).toEqual([]);
+  });
+});

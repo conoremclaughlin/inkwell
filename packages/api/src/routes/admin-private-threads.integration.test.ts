@@ -128,6 +128,9 @@ const get = (
 const run = randomUUID().slice(0, 8);
 let spaceId: string;
 let inklingSbId: string;
+/** One of the owner's SBs that isn't an inkling and isn't in any conversation here. */
+let ownersSbId: string;
+const taskGroupIds: string[] = [];
 let owner: Person;
 let member: Person;
 let viewer: Person;
@@ -236,6 +239,12 @@ beforeAll(async () => {
     ]
   );
   inklingSbId = inkling[0].id;
+  const { rows: ownersSb } = await db.query<{ id: string }>(
+    `INSERT INTO agent_identities (user_id, workspace_id, agent_id, name, role, backend, metadata)
+     VALUES ($1, $2, $3, 'Ivy', 'Integration SB', 'claude', '{"fixture": true}') RETURNING id`,
+    [owner.userId, spaceId, `ivy-${run}`]
+  );
+  ownersSbId = ownersSb[0].id;
 
   // The space is new, so these five are every thread in it.
   await thread(keys.ownerChat, { inklingConversation: true }, [owner.userId], canary.ownerChat);
@@ -265,7 +274,11 @@ afterAll(async () => {
     if (sessionIds.length > 0) {
       await db.query('DELETE FROM sessions WHERE id = ANY($1)', [sessionIds]);
     }
+    if (taskGroupIds.length > 0) {
+      await db.query('DELETE FROM task_groups WHERE id = ANY($1)', [taskGroupIds]);
+    }
     if (inklingSbId) await db.query('DELETE FROM agent_identities WHERE id = $1', [inklingSbId]);
+    if (ownersSbId) await db.query('DELETE FROM agent_identities WHERE id = $1', [ownersSbId]);
     await db.end();
   }
 });
@@ -400,12 +413,17 @@ describe("an inkling's own inbox (GET /individuals/:sbSlug/inbox)", () => {
 });
 
 describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
+  /** get_inbox naming no SB, as an unbound person: a request context with no SB. */
   async function inbox(who: Person) {
     const { handleGetInbox } = await import('../mcp/tools/inbox-handlers');
     const { getDataComposer } = await import('../data/composer');
-    const res = await handleGetInbox(
-      { userId: who.userId, status: 'unread', limit: 5, markRead: false },
-      await getDataComposer()
+    const { runWithRequestContext } = await import('../utils/request-context');
+    const dataComposer = await getDataComposer();
+    const res = await runWithRequestContext({ userId: who.userId }, () =>
+      handleGetInbox(
+        { userId: who.userId, status: 'unread', limit: 5, markRead: false },
+        dataComposer
+      )
     );
     const body = JSON.parse((res as { content: Array<{ text: string }> }).content[0].text);
     const threads = body.threadsWithUnread as Array<{ threadKey: string }>;
@@ -429,6 +447,69 @@ describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
     for (const who of [owner, member, viewer]) {
       expect((await inbox(who)).keys.has(keys.open), who.label).toBe(true);
     }
+  });
+});
+
+describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1)', () => {
+  async function inbox(bound: { sbSlug: string; sbId: string }) {
+    const { handleGetInbox } = await import('../mcp/tools/inbox-handlers');
+    const { getDataComposer } = await import('../data/composer');
+    const { runWithRequestContext } = await import('../utils/request-context');
+    const dataComposer = await getDataComposer();
+    const res = await runWithRequestContext({ userId: owner.userId, ...bound }, () =>
+      handleGetInbox(
+        { userId: owner.userId, status: 'unread', limit: 5, markRead: false },
+        dataComposer
+      )
+    );
+    const body = JSON.parse((res as { content: Array<{ text: string }> }).content[0].text);
+    const threads = body.threadsWithUnread as Array<{ threadKey: string }>;
+    return { keys: new Set(threads.map((t) => t.threadKey)), text: JSON.stringify(body) };
+  }
+
+  it("reads as the SB, not its person: the owner's own SB sees none of the owner's 1:1s", async () => {
+    const seen = await inbox({ sbSlug: `ivy-${run}`, sbId: ownersSbId });
+    expect(seen.keys.has(keys.ownerChat)).toBe(false);
+    expect(seen.text).not.toContain(canary.ownerChat);
+    expect(seen.keys.has(keys.open)).toBe(true);
+  });
+
+  it('shows a bound SB the conversations it is in (control)', async () => {
+    const seen = await inbox({ sbSlug: `moss-${run}`, sbId: inklingSbId });
+    expect(seen.keys.has(keys.ownerChat)).toBe(true);
+  });
+});
+
+describe('graph evidence on a conversation key (Lumen, #874 r1)', () => {
+  beforeAll(async () => {
+    const { rows } = await db.query<{ id: string }>(
+      `INSERT INTO task_groups (user_id, sb_id, title, thread_key, execution_model, status)
+       VALUES ($1, $2, $3, $4, 'graph', 'active') RETURNING id`,
+      [owner.userId, inklingSbId, `graph-canary-${run}`, keys.ownerChat]
+    );
+    taskGroupIds.push(rows[0].id);
+  });
+
+  const evidence = async (who: Person) => {
+    const { status, body } = await get(who, '/threads/graph-evidence', {
+      query: { key: keys.ownerChat },
+    });
+    expect(status).toBe(200);
+    return body as { groups: unknown[] };
+  };
+
+  it("gives a member nothing for the owner's 1:1, as for a key with no graph", async () => {
+    const seen = await evidence(member);
+    expect(seen).toEqual({
+      groups: [],
+      meta: { groups: { fetched: 0, total: 0, truncated: false } },
+    });
+  });
+
+  it('shows the owner, a participant, its graph (control)', async () => {
+    const seen = await evidence(owner);
+    expect(seen.groups).toHaveLength(1);
+    expect(JSON.stringify(seen)).toContain(`graph-canary-${run}`);
   });
 });
 
