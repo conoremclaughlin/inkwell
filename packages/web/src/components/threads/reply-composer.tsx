@@ -32,14 +32,23 @@ export function ReplyComposer({
   threadKey,
   closed,
   onSent,
+  disabled = false,
 }: {
   threadKey: string;
   closed: boolean;
   /** The reply landed. Called for the thread it was sent to. */
   onSent?: (reply: ReplyResponse) => void;
+  /** A read outage withholds writes without discarding the draft or mutation evidence. */
+  disabled?: boolean;
 }) {
   return (
-    <ThreadReplyComposer key={threadKey} threadKey={threadKey} closed={closed} onSent={onSent} />
+    <ThreadReplyComposer
+      key={threadKey}
+      threadKey={threadKey}
+      closed={closed}
+      onSent={onSent}
+      disabled={disabled}
+    />
   );
 }
 
@@ -47,10 +56,12 @@ function ThreadReplyComposer({
   threadKey,
   closed,
   onSent,
+  disabled,
 }: {
   threadKey: string;
   closed: boolean;
   onSent?: (reply: ReplyResponse) => void;
+  disabled: boolean;
 }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState('');
@@ -73,7 +84,7 @@ function ThreadReplyComposer({
 
   const content = draft.trim();
   const send = () => {
-    if (!content || reply.isPending) return;
+    if (!content || reply.isPending || disabled) return;
     reply.mutate({ key: threadKey, content });
   };
 
@@ -83,6 +94,7 @@ function ThreadReplyComposer({
       onChange={setDraft}
       onSubmit={send}
       sending={reply.isPending}
+      disabled={disabled}
       placeholder={`Reply to ${threadKey}…`}
       ariaLabel={`Reply to ${threadKey}`}
       error={reply.isError ? reply.error.message : null}

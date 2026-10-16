@@ -32,10 +32,93 @@ vi.mock('@supabase/ssr', () => ({
 }));
 
 import { updateSession } from './middleware';
+import { createServerClient } from '@supabase/ssr';
 
 function makeRequest(path: string): NextRequest {
   return new NextRequest(new URL(path, WEB_ORIGIN));
 }
+
+describe('browser companion credential-only proxy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: 'synthetic-ambient-session' } },
+    });
+  });
+
+  it.each([
+    ['GET', '/api/browser-companion/session'],
+    ['POST', '/api/browser-companion/auth/pair-claim'],
+    ['POST', '/api/browser-companion/auth/token'],
+    ['POST', '/api/browser-companion/auth/revoke'],
+    ['OPTIONS', '/api/browser-companion/auth/token'],
+  ])('forwards cookie-free %s %s without converting ambient auth', async (method, path) => {
+    const response = await updateSession(
+      new NextRequest(new URL(path, WEB_ORIGIN), {
+        method,
+        headers: {
+          origin: 'chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef',
+          authorization: 'Bearer synthetic-browser-client',
+          'X-Inkwell-CSRF': 'forged',
+        },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-authorization')).toBe(
+      'Bearer synthetic-browser-client'
+    );
+    expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBeNull();
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+    expect(createServerClient).not.toHaveBeenCalled();
+  });
+
+  it('leaves a pairing-material request without a bearer exactly that', async () => {
+    const response = await updateSession(
+      new NextRequest(`${WEB_ORIGIN}/api/browser-companion/auth/pair-claim`, {
+        method: 'POST',
+        headers: { origin: 'moz-extension://synthetic-extension' },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-authorization')).toBeNull();
+    expect(createServerClient).not.toHaveBeenCalled();
+  });
+
+  it.each(['GET', 'POST', 'OPTIONS'])(
+    'refuses cookies on %s even with same-origin provenance and a bearer',
+    async (method) => {
+      const response = await updateSession(
+        new NextRequest(`${WEB_ORIGIN}/api/browser-companion/session`, {
+          method,
+          headers: {
+            cookie: 'pcp-admin-token=synthetic-admin',
+            origin: WEB_ORIGIN,
+            authorization: 'Bearer synthetic-browser-client',
+            'X-Inkwell-CSRF': '1',
+          },
+        })
+      );
+      expect(response.status).toBe(403);
+      expect(createServerClient).not.toHaveBeenCalled();
+      expect(response.headers.get('x-middleware-request-authorization')).toBeNull();
+    }
+  );
+
+  it.each([
+    '/api/browser-companion-other/auth/token',
+    '/api/admin/browser-companion/pairing-code',
+    '/api/admin/tasks',
+  ])('does not exempt the neighboring route %s', async (path) => {
+    const response = await updateSession(
+      new NextRequest(new URL(path, WEB_ORIGIN), {
+        method: 'POST',
+        headers: { origin: 'https://attacker.example', authorization: 'Bearer synthetic' },
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(createServerClient).not.toHaveBeenCalled();
+  });
+});
 
 describe('middleware updateSession', () => {
   beforeEach(() => {

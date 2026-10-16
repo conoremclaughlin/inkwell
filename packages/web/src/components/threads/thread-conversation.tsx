@@ -50,6 +50,7 @@ export function ThreadConversation({
   onBack,
   detailsOpen,
   onToggleDetails,
+  readUnavailable = false,
 }: {
   spine: ThreadSpine;
   /** The workspace the thread was opened in. The same key can be another thread elsewhere. */
@@ -59,6 +60,8 @@ export function ThreadConversation({
   onBack: () => void;
   detailsOpen: boolean;
   onToggleDetails: () => void;
+  /** Preserve the view and draft through a recovered thread's read outage. */
+  readUnavailable?: boolean;
 }) {
   const key = spine.key;
   const hasThread = spine.sources.includes('thread');
@@ -323,7 +326,12 @@ export function ThreadConversation({
       />
 
       {hasThread && (
-        <ReplyComposer threadKey={key} closed={closed} onSent={() => setUnreadAfter(null)} />
+        <ReplyComposer
+          threadKey={key}
+          closed={closed}
+          onSent={() => setUnreadAfter(null)}
+          disabled={readUnavailable}
+        />
       )}
     </div>
   );

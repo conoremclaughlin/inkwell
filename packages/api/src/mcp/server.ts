@@ -1166,7 +1166,10 @@ export class MCPServer {
     // The only surface a `browser_client` credential can reach. Its own
     // middleware denies by default, so mounting it does not widen anything
     // that is not on its allowlist.
-    app.use('/api/browser-companion', createBrowserCompanionRouter(this.dataComposer.getClient()));
+    app.use(
+      '/api/browser-companion',
+      createBrowserCompanionRouter(this.dataComposer.getClient(), async () => this.dataComposer)
+    );
     logger.info('Browser companion routes registered at /api/browser-companion');
 
     if (this.config.getSessionService) {

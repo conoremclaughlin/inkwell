@@ -4,6 +4,23 @@ import { hasSameOrigin } from './cookie-csrf';
 
 export async function updateSession(request: NextRequest) {
   const path = request.nextUrl.pathname;
+  // The companion uses its own installation credential, never dashboard
+  // cookies or a Supabase session. In particular, an extension worker's
+  // Origin is not dashboard provenance. Forward it without converting auth;
+  // the API's browser_client verifier and route allowlist remain the boundary.
+  // Refuse cookies on every method rather than granting a CSRF exception to
+  // a request that could carry ambient authority. Do this before any refresh.
+  if (path === '/api/browser-companion' || path.startsWith('/api/browser-companion/')) {
+    if (request.headers.has('cookie')) {
+      return NextResponse.json(
+        { error: 'Browser companion requests must omit cookies' },
+        { status: 403 }
+      );
+    }
+    const headers = new Headers(request.headers);
+    headers.delete('X-Inkwell-CSRF');
+    return NextResponse.next({ request: { headers } });
+  }
   const isApiMutation =
     path.startsWith('/api/') && !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
   const sameOrigin = isApiMutation && hasSameOrigin(request);

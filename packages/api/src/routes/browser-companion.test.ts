@@ -240,13 +240,22 @@ describe('browser companion router', () => {
       expect(await res.json()).toEqual({ error: 'companion_route_not_allowed' });
     });
 
-    it('the allowlist is four auth-gate entries and nothing else', () => {
+    it('the allowlist has auth and scoped chat entries, but no page authority', () => {
       // This PR ships the credential boundary, not the companion API. If an
       // endpoint is added, this assertion is the review gate it has to pass
       // through.
       expect(
         BROWSER_COMPANION_ALLOWLIST.map((route) => `${route.method} ${route.path}`).sort()
-      ).toEqual(['GET /session', 'POST /auth/pair-claim', 'POST /auth/revoke', 'POST /auth/token']);
+      ).toEqual([
+        'GET /chat/inklings',
+        'GET /chat/messages',
+        'GET /chat/receipt',
+        'GET /session',
+        'POST /auth/pair-claim',
+        'POST /auth/revoke',
+        'POST /auth/token',
+        'POST /chat/message',
+      ]);
     });
   });
 

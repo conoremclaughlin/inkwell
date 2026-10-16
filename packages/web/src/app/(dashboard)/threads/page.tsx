@@ -3,14 +3,19 @@
 import { Suspense, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { MessagesSquare } from 'lucide-react';
-import { useApiQuery } from '@/lib/api';
+import { useApiQuery, useWorkspaceApiQuery } from '@/lib/api';
 import { getSelectedWorkspaceId, subscribeSelectedWorkspace } from '@/lib/workspace-selection';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useReadCursors } from '@/components/threads/read-cursors';
 import { ThreadConversation } from '@/components/threads/thread-conversation';
 import { ThreadDetails } from '@/components/threads/thread-details';
 import { ThreadList } from '@/components/threads/thread-list';
-import type { ThreadsResponse } from '@inklabs/shared/stories/threads-api';
+import {
+  threadMessagesPath,
+  type ThreadMessagesResponse,
+  type ThreadSpine,
+  type ThreadsResponse,
+} from '@inklabs/shared/stories/threads-api';
 import { byLatestMessage, isConversation } from '@inklabs/shared/stories/thread-browsing';
 import { nameLookup } from '@inklabs/shared/stories/thread-viewing';
 
@@ -91,7 +96,7 @@ function ThreadsChat() {
   // studio or task group references has nothing to read yet; it stays
   // reachable by link.
   const threads = useMemo(() => spines.filter(isConversation).sort(byLatestMessage), [spines]);
-  const selected = useMemo(
+  const listedSelection = useMemo(
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]
   );
@@ -102,6 +107,40 @@ function ThreadsChat() {
     getSelectedWorkspaceId,
     () => null
   );
+  // The activity feed is capped. A recovery link must read its exact key,
+  // not mistake absence from that list for absence of the attempted send.
+  // Share the conversation's workspace-bound cache, never invent membership.
+  const recovering = !!selectedKey && !listedSelection;
+  const recovered = useWorkspaceApiQuery<ThreadMessagesResponse>(
+    ['thread-messages', selectedKey],
+    threadMessagesPath(selectedKey ?? ''),
+    workspaceId,
+    {
+      enabled: recovering,
+      // Once found, ThreadConversation owns polling. Until then, a late
+      // original request can still arrive without another send.
+      refetchInterval: (query) =>
+        query.state.status === 'success' && query.state.data?.thread?.threadKey === selectedKey
+          ? false
+          : 5_000,
+    }
+  );
+  const recoveredThread = recovered.data?.thread;
+  const recoveredSelection: ThreadSpine | null =
+    recovering && recoveredThread?.threadKey === selectedKey
+      ? {
+          key: selectedKey,
+          identity: null,
+          thread: { ...recoveredThread, participants: [] },
+          participants: [],
+          sessions: [],
+          studios: [],
+          taskGroups: [],
+          sources: ['thread'],
+          lastActivityAt: recoveredThread.createdAt,
+        }
+      : null;
+  const selected = listedSelection ?? recoveredSelection;
 
   const select = useCallback(
     (key: string | null) => {
@@ -165,6 +204,18 @@ function ThreadsChat() {
             : 'hidden min-w-0 flex-1 flex-col md:flex'
         }
       >
+        {recoveredSelection && !isLoading && !error && (
+          <p className="border-b px-4 py-2 text-xs text-muted-foreground">
+            This conversation is outside the current activity feed. Its messages are read directly;
+            finding it is not a receipt for any particular send.
+          </p>
+        )}
+        {recoveredSelection && recovered.error && (
+          <p role="alert" className="border-b px-4 py-2 text-xs text-destructive">
+            Could not refresh this thread. Showing the last confirmed messages; your draft and reply
+            errors are kept. Sending is paused while we check again.
+          </p>
+        )}
         {selected ? (
           <ThreadConversation
             key={JSON.stringify([workspaceId, selected.key])}
@@ -175,12 +226,19 @@ function ThreadsChat() {
             onBack={() => select(null)}
             detailsOpen={detailsOpen}
             onToggleDetails={() => setDetailsOpen(!detailsOpen)}
+            readUnavailable={!!recoveredSelection && !!recovered.error}
           />
         ) : (
           <NoConversation
             state={
-              selectedKey && !isLoading
-                ? 'missing'
+              recovering
+                ? recovered.error
+                  ? 'unconfirmed'
+                  : recoveredThread && recoveredThread.threadKey !== selectedKey
+                    ? 'mismatch'
+                    : recovered.isPending
+                      ? 'loading'
+                      : 'missing'
                 : threads.length === 0 && !isLoading
                   ? 'empty'
                   : 'idle'
@@ -216,7 +274,7 @@ function NoConversation({
   state,
   onBack,
 }: {
-  state: 'idle' | 'empty' | 'missing';
+  state: 'idle' | 'empty' | 'missing' | 'loading' | 'unconfirmed' | 'mismatch';
   onBack: () => void;
 }) {
   return (
@@ -225,11 +283,29 @@ function NoConversation({
         <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500/15 to-violet-500/15">
           <MessagesSquare className="h-6 w-6 text-sky-600 dark:text-sky-400" />
         </div>
-        {state === 'missing' ? (
+        {state === 'missing' ||
+        state === 'loading' ||
+        state === 'unconfirmed' ||
+        state === 'mismatch' ? (
           <>
-            <p className="mt-4 text-sm font-medium">That thread isn’t in the list</p>
+            <p
+              className="mt-4 text-sm font-medium"
+              role={state === 'unconfirmed' || state === 'mismatch' ? 'alert' : 'status'}
+            >
+              {state === 'loading'
+                ? 'Reading this thread…'
+                : state === 'unconfirmed'
+                  ? 'Could not read this thread — thread unconfirmed'
+                  : state === 'mismatch'
+                    ? 'The response did not match this key — thread unconfirmed'
+                    : 'No conversation was found for this key yet'}
+            </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              It may be older than the newest window of threads, or the key may be mistyped.
+              {state === 'loading'
+                ? 'Checking the exact key, including conversations outside the activity feed.'
+                : state === 'unconfirmed' || state === 'mismatch'
+                  ? 'This read cannot confirm whether your send was stored. We will keep checking; do not retry based on this result.'
+                  : 'This is not a delivery receipt. An in-flight request may still arrive; we will keep checking before you retry.'}
             </p>
             <button
               type="button"

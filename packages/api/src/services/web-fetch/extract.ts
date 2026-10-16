@@ -1,3 +1,13 @@
+import {
+  stripInvisibleUnicode,
+  isStyleHidden,
+  HIDDEN_CLASS_NAMES,
+  DROPPED_ELEMENTS,
+  VOID_ELEMENTS,
+  cachedPattern,
+} from '@inklabs/shared/security/untrusted-content';
+export { stripInvisibleUnicode } from '@inklabs/shared/security/untrusted-content';
+
 /**
  * Turning a fetched body into text an agent can read.
  *
@@ -96,14 +106,6 @@ export function decodeBody(bytes: Uint8Array, contentType: string | undefined): 
 
 // ============== Text cleanup ==============
 
-/** Zero-width and invisible characters, a known prompt-injection carrier. */
-const INVISIBLE_UNICODE =
-  /[\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{2064}\u{206A}-\u{206F}\u{FEFF}\u{E0000}-\u{E007F}]/gu;
-
-export function stripInvisibleUnicode(text: string): string {
-  return text.replace(INVISIBLE_UNICODE, '');
-}
-
 /**
  * Collapse runs of spaces and tabs, trim line ends, keep at most one blank
  * line. Line by line, because `[ \t]+\n` over the whole text backtracks
@@ -161,126 +163,6 @@ export function decodeEntities(text: string): string {
 }
 
 // ============== Hidden elements (OpenClaw's visibility rules) ==============
-
-const HIDDEN_STYLE_PATTERNS: Array<[string, RegExp]> = [
-  ['display', /^\s*none\s*$/i],
-  ['visibility', /^\s*hidden\s*$/i],
-  ['opacity', /^\s*0\s*$/],
-  ['font-size', /^\s*0(px|em|rem|pt|%)?\s*$/i],
-  ['text-indent', /^\s*-\d{4,}px\s*$/],
-  ['color', /^\s*transparent\s*$/i],
-  ['color', /^\s*rgba\s*\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
-  ['color', /^\s*hsla\s*\(\s*[\d.]+\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
-];
-
-const HIDDEN_CLASS_NAMES = new Set([
-  'sr-only',
-  'visually-hidden',
-  'd-none',
-  'hidden',
-  'invisible',
-  'screen-reader-only',
-  'offscreen',
-]);
-
-/** Elements dropped with everything inside them. */
-const DROPPED_ELEMENTS = new Set([
-  'meta',
-  'template',
-  'svg',
-  'canvas',
-  'iframe',
-  'object',
-  'embed',
-]);
-
-const VOID_ELEMENTS = new Set([
-  'area',
-  'base',
-  'br',
-  'col',
-  'embed',
-  'hr',
-  'img',
-  'input',
-  'link',
-  'meta',
-  'param',
-  'source',
-  'track',
-  'wbr',
-]);
-
-/** One compiled pattern per name: a tag is checked against several, and a page has many tags. */
-function cachedPattern(cache: Map<string, RegExp>, key: string, build: () => RegExp): RegExp {
-  let pattern = cache.get(key);
-  if (!pattern) {
-    pattern = build();
-    cache.set(key, pattern);
-  }
-  return pattern;
-}
-
-/**
- * A style attribute's declarations, property name lowercased. A later
- * declaration replaces an earlier one, as it does in CSS: OpenClaw read the
- * first, so `display:block;display:none` counted as visible and its hidden
- * text reached the reader.
- */
-function parseStyle(style: string): Map<string, string> {
-  const declarations = new Map<string, string>();
-  for (const declaration of style.split(';')) {
-    const colon = declaration.indexOf(':');
-    if (colon <= 0) continue;
-    const property = declaration.slice(0, colon).trim().toLowerCase();
-    if (property) declarations.set(property, declaration.slice(colon + 1));
-  }
-  return declarations;
-}
-
-function isStyleHidden(style: string): boolean {
-  const declarations = parseStyle(style);
-  const styleProperty = (property: string) => declarations.get(property);
-  for (const [property, pattern] of HIDDEN_STYLE_PATTERNS) {
-    const value = styleProperty(property);
-    if (value !== undefined && pattern.test(value)) return true;
-  }
-  const clipPath = styleProperty('clip-path');
-  if (
-    clipPath &&
-    !/^\s*none\s*$/i.test(clipPath) &&
-    /inset\s*\(\s*(?:0*\.\d+|[1-9]\d*(?:\.\d+)?)%/i.test(clipPath)
-  ) {
-    return true;
-  }
-  const transform = styleProperty('transform');
-  if (
-    transform &&
-    (/scale\s*\(\s*0\s*\)/i.test(transform) ||
-      /translate[XY]\s*\(\s*-\d{4,}px\s*\)/i.test(transform))
-  ) {
-    return true;
-  }
-  const width = styleProperty('width');
-  const height = styleProperty('height');
-  const overflow = styleProperty('overflow');
-  if (
-    width !== undefined &&
-    /^\s*0(px)?\s*$/i.test(width) &&
-    height !== undefined &&
-    /^\s*0(px)?\s*$/i.test(height) &&
-    overflow !== undefined &&
-    /^\s*hidden\s*$/i.test(overflow)
-  ) {
-    return true;
-  }
-  const left = styleProperty('left');
-  const top = styleProperty('top');
-  return (
-    (left !== undefined && /^\s*-\d{4,}px\s*$/i.test(left)) ||
-    (top !== undefined && /^\s*-\d{4,}px\s*$/i.test(top))
-  );
-}
 
 const attributePatterns = new Map<string, RegExp>();
 
@@ -514,7 +396,10 @@ export function htmlToReadable(html: string, mode: ExtractMode): { text: string;
       const found = ending.exec(html);
       const contentEnd = found ? found.index : length;
       if (tag.name === 'title' && title === undefined && dropStack.length === 0) {
-        title = normalizeWhitespace(decodeEntities(html.slice(cursor, contentEnd))) || undefined;
+        title =
+          normalizeWhitespace(
+            stripInvisibleUnicode(decodeEntities(html.slice(cursor, contentEnd)))
+          ) || undefined;
       } else if (tag.name === 'textarea' && !isHiddenElement(tag.name, tag.attrs)) {
         emitText(html.slice(cursor, contentEnd));
       }

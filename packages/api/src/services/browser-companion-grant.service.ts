@@ -18,6 +18,8 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../data/supabase/types';
 import { logger } from '../utils/logger';
 import type { BrowserClientTokenPayload } from '../auth/browser-client-tokens';
+import { browserChatRecipients, BrowserRecipientRefusedError } from './browser-chat-recipient';
+import { assertWriteRole, roleOfUserIn } from '../mcp/tools/caller-principal';
 
 /**
  * Local types for the two new tables and the RPC.
@@ -35,6 +37,7 @@ interface BrowserCompanionGrantRow {
   workspace_id: string;
   installation_id: string;
   installation_commitment: string;
+  recipient_id: string | null;
   pairing_code_hash: string | null;
   pairing_code_expires_at: string | null;
   pairing_secret_hash: string | null;
@@ -150,8 +153,24 @@ function generatePairingSecret(): string {
 export class BrowserCompanionGrantService {
   private readonly client: UntypedTableClient;
 
-  constructor(client: SupabaseClient<Database>) {
-    this.client = client as unknown as UntypedTableClient;
+  constructor(private readonly typedClient: SupabaseClient<Database>) {
+    this.client = typedClient as unknown as UntypedTableClient;
+  }
+
+  /** Null is the old app-only contract, never implicit access to workspace SBs. */
+  async recipientBinding(payload: BrowserClientTokenPayload): Promise<string | null> {
+    const { data, error } = await this.client
+      .from('browser_companion_grants')
+      .select('recipient_id')
+      .eq('id', payload.grantId)
+      .eq('user_id', payload.sub)
+      .eq('workspace_id', payload.workspaceId)
+      .eq('installation_id', payload.installationId)
+      .maybeSingle();
+    if (error || !data || (data.recipient_id !== null && typeof data.recipient_id !== 'string')) {
+      throw new Error('browser_recipient_binding_unavailable');
+    }
+    return data.recipient_id;
   }
 
   /**
@@ -224,9 +243,20 @@ export class BrowserCompanionGrantService {
     installationId: string;
     /** sha256 hex of a secret the installation generated and never sent. */
     installationCommitment: string;
+    /** An explicitly consented ordinary hosted recipient; omitted for app-only pairing. */
+    recipientId?: string;
   }): Promise<{ grantId: string; pairingCode: string; pairingCodeExpiresAt: string }> {
     if (!isInstallationCommitment(params.installationCommitment)) {
       throw new Error('installation_commitment_invalid');
+    }
+
+    if (params.recipientId !== undefined) {
+      const role = await roleOfUserIn(this.typedClient, params.workspaceId, params.userId, 'You');
+      assertWriteRole(role, 'approve browser chat');
+      const recipients = await browserChatRecipients(this.typedClient, params, params.recipientId);
+      if (!recipients.some((recipient) => recipient.id === params.recipientId)) {
+        throw new BrowserRecipientRefusedError();
+      }
     }
 
     const pairingCode = generatePairingCode();
@@ -240,6 +270,7 @@ export class BrowserCompanionGrantService {
         workspace_id: params.workspaceId,
         installation_id: params.installationId,
         installation_commitment: params.installationCommitment,
+        ...(params.recipientId !== undefined ? { recipient_id: params.recipientId } : {}),
         pairing_code_hash: sha256(pairingCode),
         pairing_code_expires_at: pairingCodeExpiresAt,
         expires_at: new Date(now + GRANT_LIFETIME_SECONDS * 1000).toISOString(),
