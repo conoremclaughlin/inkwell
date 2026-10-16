@@ -2312,6 +2312,7 @@ export class SessionService implements ISessionService {
                   threadMessageId: typeof source === 'string' ? source : undefined,
                   inklingId: identity.id,
                   ownerUserId: identity.userId,
+                  workspaceId: identity.workspaceId,
                 });
               })
             );
@@ -2714,6 +2715,7 @@ export class SessionService implements ISessionService {
                 threadMessageId: metadata?.triggerThreadMessageId,
                 inklingId: inklingIdentity.id,
                 ownerUserId: inklingIdentity.userId,
+                workspaceId: inklingIdentity.workspaceId,
               });
       const inklingRefusal = inklingTurnRefusal(
         { identity: inklingIdentity, userId, ownerMessage },

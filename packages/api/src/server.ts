@@ -121,6 +121,7 @@ import { closeDeletionsInProgress } from './services/account-deletion/worker';
 import { configureDeletionWorker, nudgeDeletionWorker } from './services/account-deletion/runtime';
 import { cancelInklingTurns } from './services/inklings/inkling-turns';
 import { inklingsRoot } from './services/inklings/inkling-folder';
+import { sharedGroupNote } from './services/inklings/inkling-shared-space';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
@@ -1318,6 +1319,15 @@ Type: ${payload.triggerType}`;
         for (const line of formatThreadDescriptorLines(descriptor)) {
           triggerMessage += `\n${line}`;
         }
+        // A group shared with the space's people: who is present, and that
+        // the private stays private (inkling-shared-space.ts). Told only to a
+        // participant, like the descriptor above.
+        const groupNote = await sharedGroupNote(dataComposer.getClient(), {
+          workspaceId: threadWorkspaceId ?? resolvedWorkspaceId,
+          threadKey: payload.threadKey,
+          recipientSbId: resolvedIdentityId,
+        });
+        if (groupNote) triggerMessage += `\n\n${groupNote}`;
       }
     }
     triggerMessage += `

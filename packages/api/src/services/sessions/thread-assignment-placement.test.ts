@@ -71,7 +71,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
        RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope,
-       inTurnNote
+       inTurnNote, sharedGroupNote
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -301,6 +301,8 @@ function makeWorld() {
     // What a member of an inkling group answering in turn is told
     // (inkling-reply-chain.ts): production, and silent for these wakes.
     inTurnNote,
+    // A shared group's presence note (inkling-shared-space.ts): none here.
+    sharedGroupNote: vi.fn(async () => null),
   });
 
   async function trigger(extra: Record<string, unknown> = {}) {

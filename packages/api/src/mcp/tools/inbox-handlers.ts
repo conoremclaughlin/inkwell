@@ -69,7 +69,10 @@ import { ThreadKeyTakenError } from './thread-key-taken.js';
 import {
   assertInklingThreadAllowed,
   INKLING_CONVERSATION_MARK,
+  INKLING_THREAD_REFUSED,
+  InklingThreadRefusedError,
 } from '../../services/inklings/inkling-thread-gate.js';
+import { INKLING_SHARED_MARK } from '../../services/inklings/inkling-shared-space.js';
 import {
   inklingWakeDue,
   openReplyChain,
@@ -448,6 +451,15 @@ export interface InternalSendContext {
    */
   createIntent?: Record<string, unknown>;
   /**
+   * People besides the sender that a create puts on the conversation: a
+   * group shared with a team space's people beside its inkling
+   * (inkling-shared-space.ts). The thread gate holds each one to a
+   * write-role membership of the inkling's team space, and the thread is
+   * marked shared in the insert that creates it. Refused for any other
+   * conversation. POST /api/admin/threads sets it from `people`.
+   */
+  people?: UserPrincipal[];
+  /**
    * How an owner's message to a group of their inklings wakes it
    * (ink://specs/inkling-group-dynamics). `wake` names the members the
    * person addressed, by slug: only they are woken. Without it, `inTurn`
@@ -801,11 +813,22 @@ export async function handleSendToInbox(
     // A conversation with an inkling is only between its owner and the
     // owner's own inklings, in the owner test (Lumen 97b1d66a). Asked before
     // anything is written. An inkling's own send wakes nobody (`quiet`).
+    const addedPeople = internal?.people ?? [];
     let inklingVerdict = await assertInklingThreadAllowed(supabase, {
       sender,
       participantSbs,
       existingThreadId: existingThread?.id ?? null,
+      // A retry adopting its own interrupted create finds the thread made and
+      // marked; its people are checked again, as they are now, before any of
+      // them is added.
+      addedPeople: addedPeople.map((person) => person.userId),
     });
+    if (addedPeople.length > 0 && !inklingVerdict.shared) {
+      throw new InklingThreadRefusedError(
+        INKLING_THREAD_REFUSED,
+        "People are added only to a new group shared with a team space's inkling"
+      );
+    }
 
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.
@@ -848,6 +871,7 @@ export async function handleSendToInbox(
     const newThreadMetadata: Record<string, unknown> = {
       ...(internal?.createIntent ? { createIntent: internal.createIntent } : {}),
       ...(inklingVerdict.inklingConversation ? { [INKLING_CONVERSATION_MARK]: true } : {}),
+      ...(inklingVerdict.shared ? { [INKLING_SHARED_MARK]: true } : {}),
     };
     // A send bound to a checked thread never looks the key up again, so every
     // write below lands on that id; a thread deleted since fails the writes.
@@ -878,7 +902,14 @@ export async function handleSendToInbox(
         sender,
         participantSbs,
         existingThreadId: thread.id,
+        addedPeople: addedPeople.map((person) => person.userId),
       });
+      if (addedPeople.length > 0 && !inklingVerdict.shared) {
+        throw new InklingThreadRefusedError(
+          INKLING_THREAD_REFUSED,
+          "People are added only to a new group shared with a team space's inkling"
+        );
+      }
     }
 
     // Cross-studio self-message: sender targets themselves in a different studio.
@@ -933,12 +964,18 @@ export async function handleSendToInbox(
 
     // A person's reply upserts their participant row BEFORE the message
     // lands (§7), so the author is a real principal by the time anything
-    // reads the thread. No session stamp: people are never spawned.
-    if (sender.kind === 'user') {
+    // reads the thread. No session stamp: people are never spawned. The
+    // people a shared group is created with join the same way.
+    const people: UserPrincipal[] = [];
+    if (sender.kind === 'user') people.push(sender);
+    for (const person of addedPeople) {
+      if (!people.some((p) => p.userId === person.userId)) people.push(person);
+    }
+    for (const person of people) {
       const { data: personRow } = await threadTable(supabase, 'inbox_thread_participants')
         .select('user_id')
         .eq('thread_id', thread.id)
-        .eq('user_id', sender.userId)
+        .eq('user_id', person.userId)
         .maybeSingle();
       if (!personRow) {
         const { error: personErr } = await threadTable(
@@ -947,7 +984,7 @@ export async function handleSendToInbox(
         ).insert({
           thread_id: thread.id,
           workspace_id: workspaceId,
-          ...principalColumns(sender),
+          ...principalColumns(person),
         });
         // A concurrent reply by the same person may have won the insert
         // (UNIQUE (thread_id, principal_key)); that row is the one we want.

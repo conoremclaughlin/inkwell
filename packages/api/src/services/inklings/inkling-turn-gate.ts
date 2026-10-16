@@ -18,6 +18,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { isInklingOwnerTestUser, type OwnerTestAllowlist } from '../../config/inkling-flags';
 import { INKLING_CLIENT } from './inkling-service';
+import { areSpaceWriters, INKLING_SHARED_MARK, isSharedInklingSpace } from './inkling-shared-space';
 
 /**
  * What the SB a turn is for is, as far as the database can say:
@@ -101,7 +102,17 @@ export type OwnerMessageProof = 'yes' | 'no' | 'unreadable';
 
 export async function isOwnersOwnMessage(
   supabase: SupabaseClient,
-  input: { threadMessageId: string | undefined; inklingId: string; ownerUserId: string | null }
+  input: {
+    threadMessageId: string | undefined;
+    inklingId: string;
+    ownerUserId: string | null;
+    /**
+     * The inkling's space. In a group shared with the space's people
+     * (inkling-shared-space.ts), a message from any write-role member of a
+     * team space wakes it too.
+     */
+    workspaceId?: string | null;
+  }
 ): Promise<OwnerMessageProof> {
   if (!input.threadMessageId || !input.ownerUserId) return 'no';
   const { data: message, error } = await supabase
@@ -117,7 +128,15 @@ export async function isOwnersOwnMessage(
   } | null;
   if (!row) return 'no';
   if (row.sender_kind !== 'user') return 'no';
-  if ((row.sender_user_id ?? '').toLowerCase() !== input.ownerUserId.toLowerCase()) return 'no';
+  const sender = (row.sender_user_id ?? '').toLowerCase();
+  if (sender !== input.ownerUserId.toLowerCase()) {
+    const shared = await isSpaceMembersMessage(supabase, {
+      threadId: row.thread_id,
+      senderUserId: sender,
+      workspaceId: input.workspaceId ?? null,
+    });
+    if (shared !== 'yes') return shared;
+  }
   const { data: member, error: memberError } = await supabase
     .from('inbox_thread_participants')
     .select('sb_id')
@@ -126,6 +145,33 @@ export async function isOwnersOwnMessage(
     .maybeSingle();
   if (memberError) return 'unreadable';
   return member ? 'yes' : 'no';
+}
+
+/**
+ * Did a person other than the owner send this in a group shared with the
+ * space's people? The thread must be marked shared, live in the inkling's
+ * own space, and that space must be a team space the sender writes in.
+ */
+async function isSpaceMembersMessage(
+  supabase: SupabaseClient,
+  input: { threadId: string; senderUserId: string; workspaceId: string | null }
+): Promise<OwnerMessageProof> {
+  if (!input.workspaceId || !input.senderUserId) return 'no';
+  const { data, error } = await supabase
+    .from('inbox_threads')
+    .select('workspace_id, metadata')
+    .eq('id', input.threadId)
+    .maybeSingle();
+  if (error) return 'unreadable';
+  const thread = data as { workspace_id: string; metadata: Record<string, unknown> | null } | null;
+  if (!thread || thread.metadata?.[INKLING_SHARED_MARK] !== true) return 'no';
+  if (thread.workspace_id !== input.workspaceId) return 'no';
+  const [teamSpace, writer] = await Promise.all([
+    isSharedInklingSpace(supabase, input.workspaceId),
+    areSpaceWriters(supabase, input.workspaceId, [input.senderUserId]),
+  ]);
+  if (teamSpace === 'unreadable' || writer === 'unreadable') return 'unreadable';
+  return teamSpace === 'yes' && writer === 'yes' ? 'yes' : 'no';
 }
 
 export interface InklingTurnInput {
