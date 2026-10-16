@@ -3,7 +3,7 @@
  * Cleanup and prompt boundaries reduce ambiguity, not tool authority. */
 
 /** Narrow intake cleanup, not prompt-injection detection. Preserve writing,
- * individual joiners/selectors and the three Unicode subdivision-flag sequences.
+ * joiners, presentation/Han selectors and the three subdivision-flag sequences.
  * Do not normalise scripts or log the removed text. */
 export function cleanUntrustedText(input: string): { text: string; removed: number } {
   let removed = 0;
@@ -15,18 +15,31 @@ export function cleanUntrustedText(input: string): { text: string; removed: numb
       return '';
     }
   );
-  // A selector applies to one base; legitimate joiner sequences alternate
-  // joiners with visible characters. Repeated selectors can encode bytes.
-  // Run this after stripping, which can bring previously separated runs together.
-  const text = stripped.replace(
-    /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]{2,}|[\u200C\u200D]{2,}/gu,
-    (run) => {
-      const characters = Array.from(run);
-      removed += characters.length - 1;
-      return characters[0]!;
+  // Selectors must immediately follow a base, not another selector or a joiner.
+  // Keep text/emoji presentation selectors; restrict other selectors to Han to
+  // remove byte-per-letter payloads. This is a conservative intake policy, not
+  // Unicode validation: it also drops legitimate non-Han glyph variants, such
+  // as mathematical FE00 sequences. Preserved selectors can still encode data.
+  // Track kept points after stripping so removals cannot separate hidden runs.
+  const characters: string[] = [];
+  let previous = '';
+  for (const character of stripped) {
+    const selector = /^[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]$/u.test(character);
+    const joiner = character === '\u200c' || character === '\u200d';
+    const presentation = character === '\ufe0e' || character === '\ufe0f';
+    if (
+      (selector &&
+        (!/^[\p{L}\p{N}\p{P}\p{S}]$/u.test(previous) ||
+          (!presentation && !/^\p{Script=Han}$/u.test(previous)))) ||
+      (joiner && (previous === '\u200c' || previous === '\u200d'))
+    ) {
+      ++removed;
+      continue;
     }
-  );
-  return { text, removed };
+    characters.push(character);
+    previous = character;
+  }
+  return { text: characters.join(''), removed };
 }
 
 export const stripInvisibleUnicode = (text: string): string => cleanUntrustedText(text).text;
