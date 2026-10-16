@@ -57,6 +57,26 @@ export const notificationRuleSchema = z
 
 export type NotificationRule = z.infer<typeof notificationRuleSchema>;
 
+/** The person consents through the existing signed-in transport, not a device token. */
+export const createNotificationWatcherSchema = z
+  .object({
+    installationId: z.string().uuid(),
+    recipientId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    refreshToken: z.string().min(1).max(2048),
+    selectedPackages: notificationPackagesSchema,
+    rules: z.array(notificationRuleSchema).min(1).max(20),
+    disclosureAccepted: z.literal(true),
+    // A report by the phone, not server attestation of an OS permission.
+    permissionReported: z.literal('granted'),
+  })
+  .strict()
+  .refine((input) =>
+    input.rules.every((rule) => input.selectedPackages.includes(rule.packageName))
+  );
+
+export type CreateNotificationWatcher = z.infer<typeof createNotificationWatcherSchema>;
+
 export type NotificationRefusal =
   | 'invalid_event'
   | 'access_inactive'
