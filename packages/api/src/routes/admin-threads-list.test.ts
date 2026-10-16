@@ -130,10 +130,12 @@ function projector(columns: string): (row: Record<string, unknown>) => Record<st
   const names = entries
     .filter((c) => c.length > 0 && !c.includes('!'))
     // An aliased embed ("last_message:inbox_thread_messages(...)") projects
-    // under its alias, which is where fixtures put the embedded rows. An
-    // unaliased join spec ("inbox_threads!inner(user_id)") is filtered above:
-    // the route never reads it off the row.
-    .map((c) => (c.includes('(') ? c.slice(0, c.indexOf(':')) : c))
+    // under its alias, which is where fixtures put the embedded rows, and so
+    // does an aliased JSON path ("inkling_shared:metadata->inklingShared"),
+    // whose value fixtures carry under the alias too. An unaliased join spec
+    // ("inbox_threads!inner(user_id)") is filtered above: the route never
+    // reads it off the row.
+    .map((c) => (c.includes(':') ? c.slice(0, c.indexOf(':')) : c))
     .filter((c) => !c.includes('('));
   return (row) => Object.fromEntries(names.filter((n) => n in row).map((n) => [n, row[n]]));
 }
@@ -289,6 +291,18 @@ const sessionRow = (over: Record<string, unknown> = {}) => ({
 });
 
 describe('GET /threads', () => {
+  it('says which threads are group chats made with other people', async () => {
+    const spines = await listSpines({
+      inbox_threads: [
+        // What SHARED_GROUP_COLUMN projects; this mock returns rows as given.
+        threadRow({ inkling_shared: true }),
+        threadRow({ id: 'thread-2', thread_key: 'inkwell:pr:1' }),
+      ],
+    });
+    expect(spines.find((s) => s.key === 'inkwell:pr:632')?.thread?.shared).toBe(true);
+    expect(spines.find((s) => s.key === 'inkwell:pr:1')?.thread?.shared).toBe(false);
+  });
+
   it('carries the thread summary through to the client', async () => {
     const [spine] = await listSpines({ inbox_threads: [threadRow()] });
     expect(spine.thread?.summary).toBe('Grants rotate, slide on use, and expire for real.');

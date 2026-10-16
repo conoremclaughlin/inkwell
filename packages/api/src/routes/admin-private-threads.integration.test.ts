@@ -7,8 +7,9 @@
  * owner's inklings. The owner's 1:1 with the inkling and a member's 1:1 with
  * it are both participant-only: nobody else reads either, by list, preview,
  * count, timeline or a carrier's spine, and a workspace role confers nothing,
- * the space owner's included. An ordinary thread in the same space stays
- * readable by everyone in it.
+ * the space owner's included. So is a group chat the owner made with the
+ * member: its people read it, marked shared, and nobody else does. An
+ * ordinary thread in the same space stays readable by everyone in it.
  *
  * Run via: yarn test:integration:db:local src/routes/admin-private-threads.integration.test.ts
  *
@@ -145,11 +146,13 @@ const keys = {
   open: `chat:open-${run}`,
   markFalse: `chat:mark-false-${run}`,
   markString: `chat:mark-string-${run}`,
+  group: `chat:group-${run}`,
 };
 const canary = {
   ownerChat: `owner-chat-canary-${run}`,
   memberChat: `member-chat-canary-${run}`,
   open: `open-thread-words-${run}`,
+  group: `group-chat-canary-${run}`,
 };
 
 async function person(
@@ -246,12 +249,19 @@ beforeAll(async () => {
   );
   ownersSbId = ownersSb[0].id;
 
-  // The space is new, so these five are every thread in it.
+  // The space is new, so these six are every thread in it.
   await thread(keys.ownerChat, { inklingConversation: true }, [owner.userId], canary.ownerChat);
   await thread(keys.memberChat, { inklingConversation: true }, [member.userId], canary.memberChat);
   await thread(keys.open, {}, [owner.userId], canary.open);
   await thread(keys.markFalse, { inklingConversation: false }, [owner.userId], 'mark false');
   await thread(keys.markString, { inklingConversation: 'true' }, [owner.userId], 'mark string');
+  // A group chat the owner made with the member, marked in its creating insert.
+  await thread(
+    keys.group,
+    { inklingConversation: true, inklingShared: true },
+    [owner.userId, member.userId],
+    canary.group
+  );
 
   // The inkling's session on the owner's 1:1: a carrier that names its key.
   const { rows: session } = await db.query<{ id: string }>(
@@ -287,9 +297,10 @@ afterAll(async () => {
 async function list(who: Person) {
   const { status, body } = await get(who, '/threads');
   expect(status, `${who.label} lists threads`).toBe(200);
-  const spines = body.spines as Array<{ key: string }>;
+  const spines = body.spines as Array<{ key: string; thread: { shared?: boolean } | null }>;
   return {
     keys: new Set(spines.map((s) => s.key)),
+    shared: new Map(spines.map((s) => [s.key, s.thread?.shared])),
     text: JSON.stringify(body),
     meta: (body.meta as { threads: { fetched: number; total: number } }).threads,
   };
@@ -299,7 +310,7 @@ async function timeline(who: Person, key: string) {
   const { status, body } = await get(who, '/threads/messages', { query: { key } });
   expect(status, `${who.label} reads ${key}`).toBe(200);
   return body as {
-    thread: { threadKey: string } | null;
+    thread: { threadKey: string; shared?: boolean } | null;
     messages: Array<{ content: string }>;
     studioHistory: unknown[];
   };
@@ -340,19 +351,38 @@ describe('the list (GET /threads)', () => {
     }
   });
 
+  it('shows a group chat to its people, marked shared, and nothing of it to anyone else', async () => {
+    for (const who of [owner, member]) {
+      const seen = await list(who);
+      expect(seen.keys.has(keys.group), `${who.label} sees the group`).toBe(true);
+      expect(seen.shared.get(keys.group), who.label).toBe(true);
+      expect(seen.text).toContain(canary.group);
+      expect(seen.shared.get(keys.open), `${who.label}: an ordinary thread`).toBe(false);
+    }
+    expect((await list(owner)).shared.get(keys.ownerChat)).toBe(false);
+    for (const who of [viewer, admin]) {
+      const seen = await list(who);
+      expect(seen.keys.has(keys.group), `${who.label} sees the group`).toBe(false);
+      expect(seen.text).not.toContain(canary.group);
+      expect(seen.text).not.toContain(keys.group);
+    }
+  });
+
   it('counts only what the person may read', async () => {
-    // The viewer reads the three open threads; the owner and the member
-    // each read one 1:1 besides. The viewer's window also hydrated the
-    // owner's 1:1 for the inkling's session, and dropped it.
-    const [ownerSeen, memberSeen, viewerSeen] = await Promise.all([
+    // The viewer and the admin read the three open threads; the owner and
+    // the member each read their own 1:1 and the group besides. The
+    // viewer's window also hydrated the owner's 1:1 for the inkling's
+    // session, and dropped it.
+    const [ownerSeen, memberSeen, viewerSeen, adminSeen] = await Promise.all([
       list(owner),
       list(member),
       list(viewer),
+      list(admin),
     ]);
-    expect(ownerSeen.meta.total).toBe(viewerSeen.meta.total + 1);
-    expect(memberSeen.meta.total).toBe(viewerSeen.meta.total + 1);
-    expect(viewerSeen.meta.total).toBe(3);
-    expect(viewerSeen.meta.fetched).toBe(3);
+    expect(viewerSeen.meta).toMatchObject({ total: 3, fetched: 3 });
+    expect(adminSeen.meta).toMatchObject({ total: 3, fetched: 3 });
+    expect(ownerSeen.meta).toMatchObject({ total: 5, fetched: 5 });
+    expect(memberSeen.meta).toMatchObject({ total: 5, fetched: 5 });
   });
 });
 
@@ -381,6 +411,25 @@ describe('the timeline (GET /threads/messages)', () => {
     const memberSeen = await timeline(member, keys.memberChat);
     expect(memberSeen.thread?.threadKey).toBe(keys.memberChat);
     expect(memberSeen.messages).toHaveLength(2);
+  });
+
+  it('serves a group chat to its people, marked shared, and to nobody else', async () => {
+    for (const who of [owner, member]) {
+      const seen = await timeline(who, keys.group);
+      expect(seen.thread, who.label).toMatchObject({ threadKey: keys.group, shared: true });
+      expect(seen.messages.map((m) => m.content)).toEqual([
+        `hello ${canary.group}`,
+        `reply ${canary.group}`,
+      ]);
+    }
+    expect((await timeline(owner, keys.ownerChat)).thread?.shared).toBe(false);
+    for (const who of [viewer, admin]) {
+      expect(await timeline(who, keys.group), who.label).toEqual({
+        thread: null,
+        messages: [],
+        studioHistory: [],
+      });
+    }
   });
 
   it('serves an ordinary thread to everyone in the space, unchanged', async () => {
@@ -436,6 +485,8 @@ describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
       expect(seen.keys.has(keys.ownerChat), who.label).toBe(false);
       expect(seen.text).not.toContain(canary.ownerChat);
     }
+    // Nor a viewer the group chat they are not in.
+    expect((await inbox(viewer)).text).not.toContain(canary.group);
     const ownerSeen = await inbox(owner);
     expect(ownerSeen.keys.has(keys.memberChat)).toBe(false);
     expect(ownerSeen.text).not.toContain(canary.memberChat);
@@ -487,6 +538,8 @@ describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1 and r2
       const seen = await inbox(await bound(`ivy-${run}`, ownersSbId, slug));
       expect(seen.keys.has(keys.ownerChat)).toBe(false);
       expect(seen.text).not.toContain(canary.ownerChat);
+      expect(seen.keys.has(keys.group)).toBe(false);
+      expect(seen.text).not.toContain(canary.group);
       expect(seen.keys.has(keys.open)).toBe(true);
     }
   );

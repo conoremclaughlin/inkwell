@@ -82,6 +82,12 @@ export interface ThreadSpine {
     /** People on the thread, named for the viewer — never woken, never in `participants`. */
     people?: ThreadPerson[];
     closedAt: string | null;
+    /**
+     * A group chat created with other people of the space, beside the
+     * space's inkling. Only its people read it, as in any inkling chat.
+     * False on every other thread. Absent from servers that predate it.
+     */
+    shared?: boolean;
     /** Newest deliverable message; absent from servers that predate it. */
     lastMessage?: ThreadLastMessage | null;
     /**
@@ -189,6 +195,8 @@ export interface ThreadMessagesResponse {
     createdByKind?: 'sb' | 'user' | 'system';
     createdAt: string;
     closedAt: string | null;
+    /** As on ThreadSpine's thread: a group chat created with other people. */
+    shared?: boolean;
   } | null;
   messages: ThreadMessage[];
   /** The Inkwell user this response was rendered for. */

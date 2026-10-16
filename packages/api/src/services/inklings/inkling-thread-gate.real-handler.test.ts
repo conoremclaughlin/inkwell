@@ -73,7 +73,11 @@ import { getRequestContext } from '../../utils/request-context';
 import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
 import { resetReplyChains } from './inkling-reply-chain';
 import { isOwnersOwnMessage } from './inkling-turn-gate';
-import { sharedGroupNote } from './inkling-shared-space';
+import {
+  GROUP_PRIVACY_RULE,
+  inklingConversationNote,
+  PRIVATE_CONVERSATION_NOTE,
+} from './inkling-conversation-note';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -84,6 +88,11 @@ const route = (path: string): Handler =>
 /* eslint-enable @typescript-eslint/no-explicit-any */
 const create = route('/threads');
 const reply = route('/threads/reply');
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const messagesRoute: Handler = (router as any).stack
+  .find((x: any) => x.route?.path === '/threads/messages' && x.route.methods.get)
+  .route.stack.at(-1).handle;
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 async function call(
   handler: Handler,
@@ -929,6 +938,9 @@ describe('membership is fixed for every writer: add_thread_participant (Lumen 0d
 describe('a group shared with a team space’s people (Conor, 2026-10-15)', () => {
   const B = '33333333-3333-4333-8333-333333333333';
   const VIEWER = '44444444-4444-4444-8444-444444444444';
+  /** A member of the space who is not added to the group. */
+  const C = '66666666-6666-4666-8666-666666666666';
+  const ADMIN = '77777777-7777-4777-8777-777777777777';
   const GROUP = 'chat:group-two-people';
 
   /** A person's call with their own role, as the middleware resolves it. */
@@ -971,7 +983,88 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   beforeEach(() => {
     db.seed('workspace_members', { workspace_id: WS, user_id: B, role: 'member' });
     db.seed('workspace_members', { workspace_id: WS, user_id: VIEWER, role: 'viewer' });
+    db.seed('workspace_members', { workspace_id: WS, user_id: C, role: 'member' });
+    db.seed('workspace_members', { workspace_id: WS, user_id: ADMIN, role: 'admin' });
   });
+
+  /** GET /threads/messages as a person with their role, as the middleware resolves it. */
+  async function read(key: string, as: string, role = 'member') {
+    const answer = { status: 200, body: {} as Row };
+    const res = {
+      status(n: number) {
+        answer.status = n;
+        return res;
+      },
+      json(r: Row) {
+        answer.body = r;
+        return res;
+      },
+    };
+    // The route's studio history filters studio_lease_events with an `.or()`
+    // the fake does not evaluate. The table is empty here, so passing every
+    // row answers exactly what PostgREST would: none.
+    const realFrom = db.from.bind(db);
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'studio_lease_events') {
+        expect(db.rows(table)).toHaveLength(0);
+        Object.assign(query, { or: () => query });
+      }
+      return query;
+    }) as typeof db.from;
+    try {
+      await messagesRoute(
+        {
+          query: { key },
+          headers: {},
+          cookies: {},
+          params: {},
+          inkUserId: as,
+          inkWorkspaceId: WS,
+          inkWorkspaceRole: role,
+        } as unknown as Request,
+        res as unknown as Response
+      );
+    } finally {
+      db.from = realFrom;
+    }
+    expect(answer.status, JSON.stringify(answer.body)).toBe(200);
+    return answer.body as {
+      thread: { threadKey: string; shared?: boolean } | null;
+      messages: Array<{ content: string }>;
+    };
+  }
+
+  /** A member's 1:1 with the space's inkling, as the database holds one. */
+  function membersOwnChat(key: string, userId: string): void {
+    const thread = db.seed('inbox_threads', {
+      id: `thread-${key}`,
+      workspace_id: WS,
+      thread_key: key,
+      status: 'open',
+      created_by_kind: 'user',
+      created_by_user_id: userId,
+      metadata: { inklingConversation: true },
+    });
+    db.seed('inbox_thread_participants', {
+      thread_id: thread.id,
+      workspace_id: WS,
+      user_id: userId,
+      principal_key: `user:${userId}`,
+    });
+    db.seed('inbox_thread_participants', {
+      thread_id: thread.id,
+      workspace_id: WS,
+      sb_id: 'sb-pip',
+      principal_key: 'sb:sb-pip',
+    });
+    db.seed('inbox_thread_messages', {
+      thread_id: thread.id,
+      sender_kind: 'user',
+      sender_user_id: userId,
+      content: `${key} words`,
+    });
+  }
 
   const people = () =>
     db
@@ -1120,6 +1213,75 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
     expect(res.status).toBe(409);
     expect(written()).toEqual(before);
   });
+
+  it('its people read it, marked shared; anyone else in the space reads nothing and cannot post (#874)', async () => {
+    space('team');
+    await call(create, { key: GROUP, recipients: ['pip'], people: [B], content: 'hi both' });
+    for (const [who, role] of [
+      [ME, 'owner'],
+      [B, 'member'],
+    ]) {
+      const seen = await read(GROUP, who, role);
+      expect(seen.thread, role).toMatchObject({ threadKey: GROUP, shared: true });
+      expect(seen.messages.map((m) => m.content)).toEqual(['hi both']);
+    }
+    const nothing = { thread: null, messages: [], studioHistory: [] };
+    for (const [who, role] of [
+      [C, 'member'],
+      [ADMIN, 'admin'],
+      [VIEWER, 'viewer'],
+    ]) {
+      expect(await read(GROUP, who, role), role).toEqual(nothing);
+    }
+    gateway.dispatchTrigger.mockClear();
+    const before = written();
+    expect(await callAs(reply, { key: GROUP, content: 'me too' }, C)).toEqual({
+      status: 404,
+      body: { error: `No thread with key "${GROUP}"` },
+    });
+    expect(written()).toEqual(before);
+    expect(woken()).toEqual([]);
+  });
+
+  it('D3 holds: a 1:1 with the inkling stays its people’s, whoever else reads, the owner and an admin included', async () => {
+    space('team');
+    await call(create, { key: KEY, recipients: ['pip'], content: 'just us' });
+    membersOwnChat('chat:b-and-pip', B);
+    const nothing = { thread: null, messages: [], studioHistory: [] };
+    for (const [who, role] of [
+      [C, 'member'],
+      [ADMIN, 'admin'],
+      [VIEWER, 'viewer'],
+    ]) {
+      expect(await read(KEY, who, role), `${role} reads the owner's 1:1`).toEqual(nothing);
+      expect(await read('chat:b-and-pip', who, role), `${role} reads B's 1:1`).toEqual(nothing);
+    }
+    // The space's owner, who owns the inkling, reads nothing of B's.
+    expect(await read('chat:b-and-pip', ME, 'owner')).toEqual(nothing);
+    // Each reads their own, which is not shared.
+    expect((await read(KEY, ME, 'owner')).thread).toMatchObject({ threadKey: KEY, shared: false });
+    expect((await read('chat:b-and-pip', B)).thread).toMatchObject({ shared: false });
+    // And a reply into someone else's 1:1 is answered as no thread at all.
+    const before = written();
+    expect(await callAs(reply, { key: KEY, content: 'me too' }, C)).toEqual({
+      status: 404,
+      body: { error: `No thread with key "${KEY}"` },
+    });
+    expect(written()).toEqual(before);
+  });
+
+  it('a personal space is unchanged: no shared group, and its 1:1 is its owner’s alone', async () => {
+    space('personal', { starter: 'inkling' });
+    const refused = await call(create, {
+      key: GROUP,
+      recipients: ['pip'],
+      people: [B],
+      content: 'hi',
+    });
+    expect(refused.status).toBe(403);
+    await call(create, { key: KEY, recipients: ['pip'], content: 'just me' });
+    expect(await read(KEY, B)).toEqual({ thread: null, messages: [], studioHistory: [] });
+  });
 });
 
 describe('shared group retries, races and the presence note (Lumen’s review of 4f7896e6)', () => {
@@ -1241,7 +1403,7 @@ describe('shared group retries, races and the presence note (Lumen’s review of
       db.seed('users', { id: B, first_name: 'Blair', last_name: 'Example', username: null });
       // server.ts already has the canonical recipient ID when building the prompt.
       // The proposed recipient parameter is ignored by the reviewed implementation.
-      const note = await sharedGroupNote(
+      const note = await inklingConversationNote(
         db as never,
         {
           workspaceId: WS,
@@ -1253,4 +1415,58 @@ describe('shared group retries, races and the presence note (Lumen’s review of
       else expect(note).toBeNull();
     }
   );
+});
+
+describe('what an inkling is told about who reads the conversation (Conor, 2026-10-16)', () => {
+  const B = '33333333-3333-4333-8333-333333333333';
+  const note = (threadKey: string, recipientSbId = 'sb-pip') =>
+    inklingConversationNote(db as never, { workspaceId: WS, threadKey, recipientSbId });
+
+  beforeEach(() => {
+    db.seed('workspaces', { id: WS, name: 'Team', type: 'team', metadata: {} });
+    db.seed('workspace_members', { workspace_id: WS, user_id: B, role: 'member' });
+    db.seed('users', { id: ME, first_name: 'Alex', last_name: 'Example', username: null });
+    db.seed('users', { id: B, first_name: 'Blair', last_name: 'Example', username: null });
+  });
+
+  it('pins the group chat’s rule: only its people read it, and nothing private goes there', async () => {
+    expect(GROUP_PRIVACY_RULE).toBe(
+      [
+        'Never share personal things someone told you, especially in a private chat, unless that person is the one asking here or has said you may. That covers health, relationships, money, trouble at work, family, and anything they called private.',
+        "If you aren't sure whether something is private, leave it out here, and ask that person privately the next time you talk with them alone.",
+        "When you leave something private out, answer as you would if you'd never heard it. Don't say or hint that you're keeping something back.",
+        'What you know about people can still help, such as their preferences when you plan something together, as long as no private detail shows.',
+      ].join('\n')
+    );
+    await call(create, { key: 'chat:shared', recipients: ['pip'], people: [B], content: 'hi' });
+    expect(await note('chat:shared')).toBe(
+      [
+        'This is a group chat. Only the people here can read it: Alex Example, Blair Example.',
+        'Each message names who sent it; answer that person, in front of everyone here.',
+        GROUP_PRIVACY_RULE,
+      ].join('\n')
+    );
+  });
+
+  it('pins the private conversation’s rule, told in a 1:1 and in an owner’s own group', async () => {
+    expect(PRIVATE_CONVERSATION_NOTE).toBe(
+      [
+        'This conversation is private: only the people in it can read it.',
+        'When you remember something from it, note who told you and that they told you privately.',
+        "Don't repeat personal things from here in a group, or to anyone else, unless that person asks you to or says you may.",
+      ].join('\n')
+    );
+    await call(create, { key: KEY, recipients: ['pip'], content: 'just us' });
+    expect(await note(KEY)).toBe(PRIVATE_CONVERSATION_NOTE);
+    sb('sage', OWNER_TEST_INKLING);
+    await call(create, { key: 'chat:own-group', recipients: ['pip', 'sage'], content: 'hi both' });
+    expect(await note('chat:own-group', 'sb-sage')).toBe(PRIVATE_CONVERSATION_NOTE);
+  });
+
+  it('tells nothing to an SB not on the conversation, or about a thread with no inkling', async () => {
+    await call(create, { key: KEY, recipients: ['pip'], content: 'just us' });
+    expect(await note(KEY, 'sb-fern')).toBeNull();
+    await call(create, { key: 'chat:plain', recipients: ['fern'], content: 'hello fern' });
+    expect(await note('chat:plain', 'sb-fern')).toBeNull();
+  });
 });

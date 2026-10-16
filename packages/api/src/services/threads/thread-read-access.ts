@@ -18,6 +18,7 @@
  * conversation out before it takes its window, not after.
  */
 
+import { INKLING_SHARED_MARK } from '../inklings/inkling-shared-space';
 import { INKLING_CONVERSATION_MARK } from '../inklings/inkling-thread-gate';
 
 // A narrow client both the typed client and the test fakes satisfy.
@@ -35,6 +36,28 @@ export const OPEN_THREADS_FILTER = `metadata->${INKLING_CONVERSATION_MARK}.is.nu
 
 /** The mark's path, for `.eq(PARTICIPANT_ONLY_PATH, true)` on an inbox_threads query. */
 export const PARTICIPANT_ONLY_PATH = `metadata->${INKLING_CONVERSATION_MARK}`;
+
+/**
+ * The thread-row column a list selects to learn whether a row is a group
+ * chat created with other people of the space (INKLING_SHARED_MARK). It
+ * says what kind of chat it is, for the wire; who reads it is decided
+ * above, as for every inkling conversation.
+ */
+export const SHARED_GROUP_COLUMN = `inkling_shared:metadata->${INKLING_SHARED_MARK}`;
+
+/** True when a thread row's metadata marks a group chat created with other people. */
+export function isSharedGroupThread(metadata: unknown): boolean {
+  return (
+    !!metadata &&
+    typeof metadata === 'object' &&
+    (metadata as Record<string, unknown>)[INKLING_SHARED_MARK] === true
+  );
+}
+
+/** isSharedGroupThread, for a row read with SHARED_GROUP_COLUMN. */
+export function isSharedGroupRow(row: { inkling_shared?: unknown }): boolean {
+  return row.inkling_shared === true;
+}
 
 /** True when a thread row's metadata makes it readable only by its participants. */
 export function isParticipantOnlyThread(metadata: unknown): boolean {
