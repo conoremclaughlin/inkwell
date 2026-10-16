@@ -61,7 +61,7 @@ vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { calendarShareRouter } from './admin-calendar-share';
+import { calendarShareRouter, parseRevision, revisionOf } from './admin-calendar-share';
 
 type Handler = (req: Request, res: Response) => unknown;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -111,8 +111,14 @@ async function call(
   return res;
 }
 
-const shareOf = (userId: string) =>
-  fake.tables.workspace_members.find((row) => row.user_id === userId)?.calendar_share;
+const ADA_ROW = '00000000-0000-4000-8000-0000000000a1';
+const SAM_ROW = '00000000-0000-4000-8000-0000000000a2';
+const SAM_REJOINED = '00000000-0000-4000-8000-0000000000a3';
+
+const rowOf = (userId: string) =>
+  fake.tables.workspace_members.find((row) => row.user_id === userId)!;
+const shareOf = (userId: string) => rowOf(userId).calendar_share;
+const rev = (membershipId: string, version: number) => `${membershipId}.${version}`;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -121,21 +127,63 @@ beforeEach(() => {
   fake.sources = ['cloud'];
   fake.tables = {
     workspace_members: [
-      { workspace_id: SPACE, user_id: ADA, role: 'owner', calendar_share: 'none' },
-      { workspace_id: SPACE, user_id: SAM, role: 'member', calendar_share: 'none' },
+      {
+        id: ADA_ROW,
+        workspace_id: SPACE,
+        user_id: ADA,
+        role: 'owner',
+        calendar_share: 'none',
+        calendar_share_version: 0,
+      },
+      {
+        id: SAM_ROW,
+        workspace_id: SPACE,
+        user_id: SAM,
+        role: 'member',
+        calendar_share: 'none',
+        calendar_share_version: 0,
+      },
     ],
     connected_accounts: [],
   };
 });
 
+describe('revisions', () => {
+  it('name the membership row and its version, and parse back only from that shape', () => {
+    expect(revisionOf({ id: SAM_ROW, calendar_share_version: 7 })).toBe(`${SAM_ROW}.7`);
+    expect(revisionOf({ id: SAM_ROW, calendar_share_version: null })).toBe(`${SAM_ROW}.0`);
+    expect(parseRevision(`${SAM_ROW}.7`)).toEqual({ membershipId: SAM_ROW, version: 7 });
+    for (const value of [
+      undefined,
+      null,
+      7,
+      '7',
+      SAM_ROW,
+      `${SAM_ROW}.`,
+      `${SAM_ROW}.-1`,
+      `${SAM_ROW}.01`,
+      `${SAM_ROW}.1.5`,
+      `${SAM_ROW}.99999999999999999`,
+      `not-a-row.1`,
+      ` ${SAM_ROW}.1`,
+    ]) {
+      expect(parseRevision(value)).toBeNull();
+    }
+  });
+});
+
 describe('GET calendar-share', () => {
-  it("reads the person's own level, starting at none, and whether a calendar is connected", async () => {
+  it("reads the person's own level and revision, starting at none, and whether a calendar is connected", async () => {
     const res = await call(read);
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ level: 'none', calendarConnected: false });
+    expect(res.body).toEqual({
+      level: 'none',
+      calendarConnected: false,
+      revision: rev(ADA_ROW, 0),
+    });
     expect(res.headers['Cache-Control']).toBe('no-store');
 
-    fake.tables.workspace_members[0].calendar_share = 'busy';
+    Object.assign(rowOf(ADA), { calendar_share: 'busy', calendar_share_version: 3 });
     fake.tables.connected_accounts = [
       {
         user_id: ADA,
@@ -145,7 +193,11 @@ describe('GET calendar-share', () => {
         scopes: [CALENDAR],
       },
     ];
-    expect((await call(read)).body).toEqual({ level: 'busy', calendarConnected: true });
+    expect((await call(read)).body).toEqual({
+      level: 'busy',
+      calendarConnected: true,
+      revision: rev(ADA_ROW, 3),
+    });
   });
 
   it('counts a credential the server holds for the person, when it can read free/busy', async () => {
@@ -154,9 +206,9 @@ describe('GET calendar-share', () => {
       error: null,
       credentials: [{ state: 'active', scopes: [CALENDAR] }],
     });
-    expect((await call(read)).body).toEqual({ level: 'none', calendarConnected: true });
+    expect((await call(read)).body).toMatchObject({ level: 'none', calendarConnected: true });
     fake.desktop.mockResolvedValue({ error: 'unreadable', credentials: [] });
-    expect((await call(read)).body).toEqual({ level: 'none', calendarConnected: null });
+    expect((await call(read)).body).toMatchObject({ level: 'none', calendarConnected: null });
   });
 
   it('is 404 for someone who is not a member, and for a malformed space', async () => {
@@ -166,42 +218,141 @@ describe('GET calendar-share', () => {
 });
 
 describe('PUT calendar-share', () => {
-  it("changes the person's own row and no one else's", async () => {
-    const res = await call(change, { as: SAM, body: { level: 'busy' } });
+  it("changes the person's own row from the revision they read, and no one else's", async () => {
+    const res = await call(change, {
+      as: SAM,
+      body: { level: 'busy', ifRevision: rev(SAM_ROW, 0) },
+    });
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ level: 'busy' });
-    expect(shareOf(SAM)).toBe('busy');
-    expect(shareOf(ADA)).toBe('none');
+    expect(res.body).toEqual({ level: 'busy', revision: rev(SAM_ROW, 1) });
+    expect(rowOf(SAM)).toMatchObject({ calendar_share: 'busy', calendar_share_version: 1 });
+    expect(rowOf(ADA)).toMatchObject({ calendar_share: 'none', calendar_share_version: 0 });
+    // One statement: the fence and the change together.
     expect(fake.writes).toEqual([
       {
         table: 'workspace_members',
-        fields: { calendar_share: 'busy' },
+        fields: { calendar_share: 'busy', calendar_share_version: 1 },
         filters: [
+          ['id', SAM_ROW],
           ['workspace_id', SPACE],
           ['user_id', SAM],
+          ['calendar_share_version', 0],
         ],
       },
     ]);
   });
 
-  it("gives the space's owner no way to set another member's level", async () => {
-    const res = await call(change, { as: ADA, body: { level: 'busy', userId: SAM, user_id: SAM } });
-    expect(res.statusCode).toBe(200);
+  it("gives the space's owner no way to set another member's level, even with that member's revision", async () => {
+    const own = await call(change, {
+      as: ADA,
+      body: { level: 'busy', ifRevision: rev(ADA_ROW, 0), userId: SAM, user_id: SAM },
+    });
+    expect(own.statusCode).toBe(200);
     expect(shareOf(SAM)).toBe('none');
     expect(shareOf(ADA)).toBe('busy');
+    const theirs = await call(change, {
+      as: ADA,
+      body: { level: 'busy', ifRevision: rev(SAM_ROW, 0) },
+    });
+    expect(theirs.statusCode).toBe(409);
+    expect(rowOf(SAM)).toMatchObject({ calendar_share: 'none', calendar_share_version: 0 });
   });
 
-  it('turns it back off', async () => {
-    fake.tables.workspace_members[1].calendar_share = 'busy';
-    expect((await call(change, { as: SAM, body: { level: 'none' } })).body).toEqual({
-      level: 'none',
+  it('turns it back off, and every acknowledged write moves the revision, a same-level one too', async () => {
+    Object.assign(rowOf(SAM), { calendar_share: 'busy', calendar_share_version: 4 });
+    expect(
+      (await call(change, { as: SAM, body: { level: 'none', ifRevision: rev(SAM_ROW, 4) } })).body
+    ).toEqual({ level: 'none', revision: rev(SAM_ROW, 5) });
+    expect(
+      (await call(change, { as: SAM, body: { level: 'none', ifRevision: rev(SAM_ROW, 5) } })).body
+    ).toEqual({ level: 'none', revision: rev(SAM_ROW, 6) });
+    expect(rowOf(SAM)).toMatchObject({ calendar_share: 'none', calendar_share_version: 6 });
+  });
+
+  it('refuses a write from a revision that has moved on, answering what is held now', async () => {
+    Object.assign(rowOf(SAM), { calendar_share: 'busy', calendar_share_version: 2 });
+    const res = await call(change, {
+      as: SAM,
+      body: { level: 'none', ifRevision: rev(SAM_ROW, 1) },
     });
-    expect(shareOf(SAM)).toBe('none');
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({
+      code: 'revision_changed',
+      level: 'busy',
+      revision: rev(SAM_ROW, 2),
+    });
+    expect(rowOf(SAM)).toMatchObject({ calendar_share: 'busy', calendar_share_version: 2 });
+  });
+
+  it('lets a lost grant never land after a revoke sent from the same revision (Lumen, app r4)', async () => {
+    // Both were sent from revision 0. The revoke arrives first and is acknowledged.
+    const revoke = await call(change, {
+      as: SAM,
+      body: { level: 'none', ifRevision: rev(SAM_ROW, 0) },
+    });
+    expect(revoke.body).toEqual({ level: 'none', revision: rev(SAM_ROW, 1) });
+    // The grant whose answer was lost arrives late, still claiming revision 0.
+    const lateGrant = await call(change, {
+      as: SAM,
+      body: { level: 'busy', ifRevision: rev(SAM_ROW, 0) },
+    });
+    expect(lateGrant.statusCode).toBe(409);
+    expect(lateGrant.body).toMatchObject({ code: 'revision_changed', level: 'none' });
+    expect(rowOf(SAM)).toMatchObject({ calendar_share: 'none', calendar_share_version: 1 });
+  });
+
+  it('never lands a write read from an earlier membership on a later one (Lumen, membership generation)', async () => {
+    // Sam left and rejoined: a new row, its version back at 0.
+    fake.tables.workspace_members[1] = {
+      id: SAM_REJOINED,
+      workspace_id: SPACE,
+      user_id: SAM,
+      role: 'member',
+      calendar_share: 'none',
+      calendar_share_version: 0,
+    };
+    // A grant read from the old membership, at the same version number, arrives now.
+    const late = await call(change, {
+      as: SAM,
+      body: { level: 'busy', ifRevision: rev(SAM_ROW, 0) },
+    });
+    expect(late.statusCode).toBe(409);
+    expect(late.body).toMatchObject({
+      code: 'revision_changed',
+      level: 'none',
+      revision: rev(SAM_REJOINED, 0),
+    });
+    expect(rowOf(SAM)).toMatchObject({
+      id: SAM_REJOINED,
+      calendar_share: 'none',
+      calendar_share_version: 0,
+    });
+  });
+
+  it('refuses a missing or malformed ifRevision, writing nothing', async () => {
+    for (const ifRevision of [
+      undefined,
+      null,
+      0,
+      '0',
+      `${ADA_ROW}.-1`,
+      `${ADA_ROW}.1.5`,
+      ADA_ROW,
+    ]) {
+      const res = await call(change, { body: { level: 'busy', ifRevision } });
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toMatchObject({ code: 'invalid_if_revision' });
+    }
+    // The old field name is not a way around the fence.
+    const legacy = await call(change, { body: { level: 'busy', ifVersion: 0 } });
+    expect(legacy.statusCode).toBe(400);
+    expect(fake.writes).toEqual([]);
+    expect(shareOf(ADA)).toBe('none');
   });
 
   it('refuses any level but none or busy, writing nothing', async () => {
     for (const level of ['details', 'BUSY', '', null, undefined, true]) {
-      const res = await call(change, { body: { level } });
+      const res = await call(change, { body: { level, ifRevision: rev(ADA_ROW, 0) } });
       expect(res.statusCode).toBe(400);
       expect(res.body).toMatchObject({ code: 'invalid_level' });
     }
@@ -209,14 +360,20 @@ describe('PUT calendar-share', () => {
   });
 
   it('is 404 for someone who is not a member, and changes nothing', async () => {
-    const res = await call(change, { as: STRANGER, body: { level: 'busy' } });
+    const res = await call(change, {
+      as: STRANGER,
+      body: { level: 'busy', ifRevision: rev(ADA_ROW, 0) },
+    });
     expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ code: 'not_a_member' });
     expect(shareOf(ADA)).toBe('none');
     expect(shareOf(SAM)).toBe('none');
   });
 
   it('is 500 when the row cannot be written', async () => {
     fake.failOn = 'workspace_members';
-    expect((await call(change, { body: { level: 'busy' } })).statusCode).toBe(500);
+    expect(
+      (await call(change, { body: { level: 'busy', ifRevision: rev(ADA_ROW, 0) } })).statusCode
+    ).toBe(500);
   });
 });

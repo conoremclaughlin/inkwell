@@ -1,6 +1,7 @@
 /**
- * The calendar sharing migration, run for real against a THROWAWAY Postgres
- * (20261016075003_workspace_members_calendar_share.sql).
+ * The calendar sharing migrations, run for real against a THROWAWAY Postgres
+ * (20261016075003_workspace_members_calendar_share.sql, then
+ * 20261016085833_workspace_members_calendar_share_version.sql).
  *
  * What only a database can prove: every member, existing ones included,
  * starts at 'none'; the column takes 'none' and 'busy' and refuses anything
@@ -37,6 +38,10 @@ const ADMIN_URL = process.env.CALENDAR_SHARE_PG_TEST_ADMIN_URL;
 const MIGRATION = path.resolve(
   __dirname,
   '../../../../supabase/migrations/20261016075003_workspace_members_calendar_share.sql'
+);
+const VERSION_MIGRATION = path.resolve(
+  __dirname,
+  '../../../../supabase/migrations/20261016085833_workspace_members_calendar_share_version.sql'
 );
 
 /** The shared local stacks' ports. This suite must never run there. */
@@ -85,6 +90,7 @@ describe.skipIf(!ADMIN_URL)(
     let dbName: string;
     let created = false;
     let migration: string;
+    let versionMigration: string;
     let existingMember: string;
 
     /** One migration file, applied the way db-migrate applies it: one transaction. */
@@ -127,6 +133,8 @@ describe.skipIf(!ADMIN_URL)(
       );
       existingMember = member.rows[0].id as string;
       await inTransaction(migration);
+      versionMigration = await readFile(VERSION_MIGRATION, 'utf8');
+      await inTransaction(versionMigration);
     }, 60_000);
 
     afterAll(async () => {
@@ -205,6 +213,80 @@ describe.skipIf(!ADMIN_URL)(
           AND conname = 'workspace_members_calendar_share_check'`
       );
       expect(rows[0].n).toBe(1);
+    });
+
+    describe('the version (20261016085833)', () => {
+      it('adds a not-null integer defaulting to 0, existing members included', async () => {
+        const { rows } = await db.query(
+          `SELECT data_type, is_nullable, column_default
+             FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'workspace_members'
+              AND column_name = 'calendar_share_version'`
+        );
+        expect(rows).toEqual([{ data_type: 'integer', is_nullable: 'NO', column_default: '0' }]);
+        const existing = await db.query(
+          `SELECT calendar_share_version FROM public.workspace_members WHERE id = $1`,
+          [existingMember]
+        );
+        expect(existing.rows).toEqual([{ calendar_share_version: 0 }]);
+      });
+
+      it('refuses a negative version and NULL from any writer', async () => {
+        const id = await newMember();
+        const negative = await db
+          .query(`UPDATE public.workspace_members SET calendar_share_version = -1 WHERE id = $1`, [
+            id,
+          ])
+          .then(
+            () => null,
+            (error: PgError) => error
+          );
+        expect(negative?.code).toBe('23514');
+        expect(negative?.constraint).toBe('workspace_members_calendar_share_version_check');
+        const nulled = await db
+          .query(
+            `UPDATE public.workspace_members SET calendar_share_version = NULL WHERE id = $1`,
+            [id]
+          )
+          .then(
+            () => null,
+            (error: PgError) => error
+          );
+        expect(nulled?.code).toBe('23502');
+      });
+
+      it("applies exactly one of two writes from the same version: the route's statement", async () => {
+        const id = await newMember();
+        // The PUT's one statement, as PostgREST runs it for routes/admin-calendar-share.ts.
+        const fenced = (level: string, ifVersion: number) =>
+          db.query(
+            `UPDATE public.workspace_members
+                SET calendar_share = $2, calendar_share_version = $3 + 1
+              WHERE id = $1 AND calendar_share_version = $3
+              RETURNING calendar_share, calendar_share_version`,
+            [id, level, ifVersion]
+          );
+        const revoke = await fenced('none', 0);
+        expect(revoke.rows).toEqual([{ calendar_share: 'none', calendar_share_version: 1 }]);
+        // The lost grant, from the same version, arrives after.
+        const lateGrant = await fenced('busy', 0);
+        expect(lateGrant.rows).toEqual([]);
+        const held = await db.query(
+          `SELECT calendar_share, calendar_share_version FROM public.workspace_members WHERE id = $1`,
+          [id]
+        );
+        expect(held.rows).toEqual([{ calendar_share: 'none', calendar_share_version: 1 }]);
+      });
+
+      it('applies a second time without error, leaving one constraint', async () => {
+        await inTransaction(versionMigration);
+        const { rows } = await db.query(
+          `SELECT count(*)::int AS n FROM pg_constraint
+          WHERE conrelid = 'public.workspace_members'::regclass
+            AND conname = 'workspace_members_calendar_share_version_check'`
+        );
+        expect(rows[0].n).toBe(1);
+      });
     });
   }
 );

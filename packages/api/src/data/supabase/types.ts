@@ -5513,6 +5513,7 @@ export type Database = {
       workspace_members: {
         Row: {
           calendar_share: string;
+          calendar_share_version: number;
           created_at: string | null;
           id: string;
           role: string;
@@ -5521,6 +5522,7 @@ export type Database = {
         };
         Insert: {
           calendar_share?: string;
+          calendar_share_version?: number;
           created_at?: string | null;
           id?: string;
           role?: string;
@@ -5529,6 +5531,7 @@ export type Database = {
         };
         Update: {
           calendar_share?: string;
+          calendar_share_version?: number;
           created_at?: string | null;
           id?: string;
           role?: string;
