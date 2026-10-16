@@ -385,6 +385,72 @@ describe('a public conversation in a shared space', () => {
   });
 });
 
+describe('a public conversation outlives a participant losing write access (Lumen’s review of 074ea6d5)', () => {
+  beforeEach(() => space('team'));
+
+  it.each([
+    ['viewer', 'member'],
+    ['removed', 'member'],
+    ['viewer', 'owner'],
+    ['removed', 'owner'],
+    ['viewer', 'inkling'],
+    ['removed', 'inkling'],
+  ])('keeps current %s / %s writers able to post', async (state, sender) => {
+    expect(
+      (
+        await create({
+          key: PUBLIC_KEY,
+          recipients: ['pip'],
+          content: 'hello',
+          clientMessageId: ID,
+          mode: 'public',
+        })
+      ).status
+    ).toBe(200);
+    expect((await reply(PUBLIC_KEY, 'joining', C)).status).toBe(200);
+    if (state === 'viewer') {
+      db.rows('workspace_members').find((row) => row.user_id === C)!.role = 'viewer';
+    } else {
+      await db.from('workspace_members').delete().eq('user_id', C);
+    }
+    // C lost write access, so C may no longer post.
+    const before = written();
+    expect((await reply(PUBLIC_KEY, 'still me', C, 'member')).status).not.toBe(200);
+    expect(written()).toEqual(before);
+    if (sender === 'inkling') {
+      const error = await handleSendToInbox(
+        { userId: A, threadKey: PUBLIC_KEY, recipientSlug: 'pip', content: 'still here' },
+        { repositories: {}, getClient: () => db } as never,
+        {
+          sender: {
+            principal: {
+              kind: 'sb',
+              sbId: 'sb-pip',
+              sbSlug: 'pip',
+              userId: A,
+              workspaceId: WS,
+            } as never,
+            workspaceId: WS,
+          },
+        }
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(error).toBeNull();
+    } else {
+      const as = sender === 'owner' ? A : B;
+      const answer = await reply(PUBLIC_KEY, 'still here', as);
+      expect(answer.status, JSON.stringify(answer.body)).toBe(200);
+      expect(
+        db
+          .rows('inbox_thread_messages')
+          .some((row) => row.sender_user_id === as && row.content === 'still here')
+      ).toBe(true);
+    }
+  });
+});
+
 describe('private conversations stay their people’s', () => {
   beforeEach(() => space('team'));
 
@@ -405,6 +471,14 @@ describe('private conversations stay their people’s', () => {
     });
     const before = written();
     expect((await reply('chat:a-and-b', 'hello?', C)).status).toBe(404);
+    expect(written()).toEqual(before);
+  });
+
+  it('a group made with people is still held to all of them: one losing write access stops it', async () => {
+    await create({ key: 'chat:a-and-b', recipients: ['pip'], people: [B], content: 'just us two' });
+    db.rows('workspace_members').find((row) => row.user_id === B)!.role = 'viewer';
+    const before = written();
+    expect((await reply('chat:a-and-b', 'still there?', A)).status).toBe(403);
     expect(written()).toEqual(before);
   });
 

@@ -247,7 +247,13 @@ export async function assertInklingThreadAllowed(
     inklings.every((inkling) => inkling.workspace_id === space) &&
     (sender.kind === 'user' || (fromMemberInkling && people.size > 0));
   if (sharedShape && space) {
-    const writers = [...people, ...addedPeople];
+    // Who must write in the space now. A group made with people is held to
+    // all of them, as at its creation. A public conversation is the space's,
+    // so only the person writing, and anyone this create adds, must be: one
+    // who posted before and has since lost write access stops only
+    // themselves (Lumen's review of 074ea6d5).
+    const publicConversation = publicMode || input.creatingPublic === true;
+    const writers = publicConversation ? [...addedPeople] : [...people, ...addedPeople];
     if (sender.kind === 'user') writers.push(sender.userId.toLowerCase());
     const [teamSpace, allWriters] = await Promise.all([
       isSharedInklingSpace(supabase, space),
