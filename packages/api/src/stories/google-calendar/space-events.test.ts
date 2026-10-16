@@ -241,11 +241,53 @@ describe("the event's time", () => {
     }
   });
 
+  it('takes minute precision and sends Google RFC 3339 with seconds (Lumen, PR #885)', () => {
+    expect(eventWindow('2026-10-20T19:00-07:00', '2026-10-20T20:30-07:00', NOW)).toEqual({
+      start: '2026-10-20T19:00:00-07:00',
+      end: '2026-10-20T20:30:00-07:00',
+    });
+    expect(eventWindow('2026-10-20T19:00:05.250Z', '2026-10-20T20:00Z', NOW)).toEqual({
+      start: '2026-10-20T19:00:05.250Z',
+      end: '2026-10-20T20:00:00Z',
+    });
+  });
+
+  it('refuses a time that names no real instant, before any conversion (Lumen, PR #885)', () => {
+    for (const bad of [
+      '2027-02-30T10:00:00Z', // Date would roll it to March 2
+      '2026-13-01T10:00:00Z',
+      '2026-10-20T24:00:00Z',
+      '2026-10-20T19:60:00Z',
+      '2026-10-20T19:00:60Z',
+      '2026-10-20T19:00:00+25:00',
+      '2026-10-20T19:00:00-07:60',
+    ]) {
+      expect(() => eventWindow(bad, '2027-03-01T11:00:00Z', NOW)).toThrow('real instants');
+    }
+  });
+
+  it('holds the end to the year as well as the start (Lumen, PR #885)', () => {
+    expect(() => eventWindow('2026-10-20T19:00:00Z', '2030-01-01T00:00:00Z', NOW)).toThrow(
+      'would end more than a year from now'
+    );
+    expect(eventWindow('2027-10-16T17:00:00Z', '2027-10-16T18:00:00Z', NOW).end).toBe(
+      '2027-10-16T18:00:00Z'
+    );
+  });
+
   it('creates nothing for a time outside it', async () => {
     await expect(
       create({ start: '2026-10-16T17:00:00Z', end: '2026-10-16T19:00:00Z' })
     ).rejects.toThrow('in the past');
     expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it('sends Google the times with seconds', async () => {
+    await create({ start: '2026-10-20T19:00-07:00', end: '2026-10-20T21:00-07:00' });
+    expect(createEvent.mock.calls[0]![1]).toMatchObject({
+      start: { dateTime: '2026-10-20T19:00:00-07:00' },
+      end: { dateTime: '2026-10-20T21:00:00-07:00' },
+    });
   });
 });
 

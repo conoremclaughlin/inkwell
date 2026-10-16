@@ -36,7 +36,35 @@ import {
 
 const DAY_MS = 86_400_000;
 /** An instant with its offset: 2026-10-20T19:00:00-07:00 or …Z. */
-const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+/**
+ * An instant with its offset, seconds optional: 2026-10-20T19:00:00-07:00,
+ * 2026-10-20T19:00-07:00 or …Z. Every part is checked by `instant` below.
+ */
+const INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * An instant as Google's RFC 3339 wants it, with seconds, or null for anything
+ * that names no real time: an impossible day (February 30), hour, minute or
+ * second, checked before any conversion so `Date` can't roll an impossible
+ * day into a real one (Lumen, PR #885). An offset past ±23:59 fails the parse
+ * itself.
+ */
+export function instant(value: string): { text: string; ms: number } | null {
+  const match = INSTANT.exec(value);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, fraction, zone] = match;
+  const civil = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  const realDay =
+    civil.getUTCFullYear() === Number(year) &&
+    civil.getUTCMonth() === Number(month) - 1 &&
+    civil.getUTCDate() === Number(day);
+  const realClock = Number(hour) <= 23 && Number(minute) <= 59 && Number(second ?? '0') <= 59;
+  if (!realDay || !realClock) return null;
+  const text = `${year}-${month}-${day}T${hour}:${minute}:${second ?? '00'}${fraction ?? ''}${zone}`;
+  const ms = Date.parse(text);
+  return Number.isNaN(ms) ? null : { text, ms };
+}
 
 export const createSpaceEventSchema = z.object({
   sbSlug: z
@@ -148,22 +176,24 @@ function memberNamed(members: Member[], name: string, role: string): Member {
   return member;
 }
 
-/** Start and end as instants, inside now … a year ahead, end after start. */
+/**
+ * Start and end as Google takes them, both inside now … a year ahead (D7),
+ * end after start.
+ */
 export function eventWindow(start: string, end: string, now: Date): { start: string; end: string } {
-  if (!INSTANT.test(start) || !INSTANT.test(end)) {
+  const from = instant(start);
+  const to = instant(end);
+  if (!from || !to) {
     throw new Error(
-      'start and end must be instants with an offset, e.g. 2026-10-20T19:00:00-07:00'
+      'start and end must be real instants with an offset, e.g. 2026-10-20T19:00:00-07:00'
     );
   }
-  const from = Date.parse(start);
-  const to = Date.parse(end);
-  if (Number.isNaN(from) || Number.isNaN(to)) throw new Error('start or end is not a real time');
-  if (from < now.getTime()) throw new Error('The event would start in the past');
-  if (from > now.getTime() + BUSY_DAYS_AHEAD * DAY_MS) {
-    throw new Error('The event would start more than a year from now');
-  }
-  if (to <= from) throw new Error('The event must end after it starts');
-  return { start, end };
+  const horizon = now.getTime() + BUSY_DAYS_AHEAD * DAY_MS;
+  if (from.ms < now.getTime()) throw new Error('The event would start in the past');
+  if (to.ms <= from.ms) throw new Error('The event must end after it starts');
+  // With the end after the start, this bounds the start too.
+  if (to.ms > horizon) throw new Error('The event would end more than a year from now');
+  return { start: from.text, end: to.text };
 }
 
 export interface SpaceEventDeps {
