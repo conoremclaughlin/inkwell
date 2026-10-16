@@ -48,6 +48,15 @@ export const notificationEventSchema = z
 
 export type NotificationEvent = z.infer<typeof notificationEventSchema>;
 
+/**
+ * The send-time sample is transport metadata, never part of an event's
+ * identity. Sample it again on every retry, from the same epoch-ms wall clock
+ * as postedAt and consent's deviceTime (never a monotonic clock).
+ */
+export const notificationIntakeSchema = notificationEventSchema.extend({
+  deviceTime: notificationDeviceTimeSchema,
+});
+
 /** Literal matching only. Arbitrary scripts belong to a separately approved runner. */
 export const notificationRuleSchema = z
   .object({
@@ -96,7 +105,8 @@ export type NotificationRefusal =
   | 'app_not_selected'
   | 'event_before_consent'
   | 'event_expired'
-  | 'event_from_future';
+  | 'event_from_future'
+  | 'clock_resync_required';
 
 export type NotificationAdmission =
   | { ok: true; event: NotificationEvent; expiresAt: number }

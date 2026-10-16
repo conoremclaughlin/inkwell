@@ -3,6 +3,7 @@ import {
   NOTIFICATION_CLOCK_SKEW_MS,
   NOTIFICATION_RETENTION_MS,
   notificationEventSchema,
+  notificationIntakeSchema,
   notificationPackagesSchema,
   notificationRuleSchema,
   type NotificationAdmission,
@@ -21,7 +22,7 @@ export interface NotificationAccessState {
 }
 
 /**
- * Pure intake policy. The caller must first resolve an opaque credential to
+ * Pure event policy. The caller must first resolve an opaque credential to
  * its live grant and authenticated owner. This does not authenticate requests,
  * check account liveness, or authorize a model/chat reader.
  */
@@ -29,6 +30,32 @@ export function admitNotification(
   raw: unknown,
   access: NotificationAccessState | null,
   now: number
+): NotificationAdmission {
+  return admit(raw, access, now);
+}
+
+/**
+ * Intake requires a fresh clock sample, but never uses it to redate an event.
+ * On correction, the client must end this generation: discard its queue and
+ * obtain a fresh grant, never replaying captures under a different estimate.
+ * Stored-event matching deliberately uses admitNotification without a sample.
+ */
+export function admitNotificationIntake(
+  raw: unknown,
+  access: NotificationAccessState | null,
+  now: number
+): NotificationAdmission {
+  const parsed = notificationIntakeSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, reason: 'invalid_event' };
+  const { deviceTime, ...event } = parsed.data;
+  return admit(event, access, now, deviceTime);
+}
+
+function admit(
+  raw: unknown,
+  access: NotificationAccessState | null,
+  now: number,
+  deviceTime?: number
 ): NotificationAdmission {
   if (
     !Number.isSafeInteger(now) ||
@@ -48,12 +75,21 @@ export function admitNotification(
   const parsed = notificationEventSchema.safeParse(raw);
   if (!parsed.success) return { ok: false, reason: 'invalid_event' };
   const event = parsed.data;
-  const postedAt = event.postedAt + access.clockOffsetMs;
-  if (!Number.isSafeInteger(postedAt) || postedAt < 0 || postedAt > 8_640_000_000_000_000)
-    return { ok: false, reason: 'invalid_event' };
   if (!access.selectedPackages.includes(event.packageName)) {
     return { ok: false, reason: 'app_not_selected' };
   }
+  // An unchanged slow OR fast clock cancels the consent offset. A correction
+  // in either direction must be visible before time-based event refusals.
+  // This remains a device report, not clock or permission attestation.
+  if (
+    deviceTime !== undefined &&
+    Math.abs(deviceTime + access.clockOffsetMs - now) > NOTIFICATION_CLOCK_SKEW_MS
+  ) {
+    return { ok: false, reason: 'clock_resync_required' };
+  }
+  const postedAt = event.postedAt + access.clockOffsetMs;
+  if (!Number.isSafeInteger(postedAt) || postedAt < 0 || postedAt > 8_640_000_000_000_000)
+    return { ok: false, reason: 'invalid_event' };
   if (postedAt < access.activeSince) {
     return { ok: false, reason: 'event_before_consent' };
   }

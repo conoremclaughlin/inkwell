@@ -24,6 +24,7 @@ export type NotificationErrorCode =
   | 'already_active'
   | 'grant_limit'
   | 'grant_inactive'
+  | 'clock_resync_required'
   | 'event_refused'
   | 'event_conflict'
   | 'rate_limited'

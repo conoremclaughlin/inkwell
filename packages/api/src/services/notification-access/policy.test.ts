@@ -8,6 +8,7 @@ import {
 } from './contract';
 import {
   admitNotification,
+  admitNotificationIntake,
   issueNotificationDeviceToken,
   notificationDeviceTokenDigest,
   notificationDeviceTokenMatches,
@@ -35,6 +36,91 @@ const rule = {
   packageName: event.packageName,
   match: { kind: 'contains', field: 'text', value: 'parcel', caseSensitive: false },
 };
+
+describe('request clock recovery', () => {
+  it.each([
+    -600_000,
+    600_000,
+    -8 * 86_400_000,
+    8 * 86_400_000,
+    -NOW - 1,
+    NOW - 8_640_000_000_000_000,
+  ])(
+    'detects a corrected clock after offset %s while accepting the unchanged clock',
+    (clockOffsetMs) => {
+      const calibrated = { ...access, clockOffsetMs };
+      const unchanged = {
+        ...event,
+        postedAt: NOW - clockOffsetMs,
+        deviceTime: NOW - clockOffsetMs,
+      };
+      expect(admitNotificationIntake(unchanged, calibrated, NOW)).toMatchObject({ ok: true });
+      expect(admitNotificationIntake({ ...event, deviceTime: NOW }, calibrated, NOW)).toEqual({
+        ok: false,
+        reason: 'clock_resync_required',
+      });
+      expect(calibrated.clockOffsetMs).toBe(clockOffsetMs);
+    }
+  );
+  it('uses the event time for consent and expiry, not the current send sample', () => {
+    const queued = { ...event, postedAt: NOW - 3_600_000 };
+    const first = admitNotificationIntake({ ...queued, deviceTime: NOW }, access, NOW);
+    const retry = admitNotificationIntake(
+      { ...queued, deviceTime: NOW + 1000 },
+      access,
+      NOW + 1000
+    );
+    expect(first).toEqual(retry);
+    expect(first).toEqual({
+      ok: true,
+      event: queued,
+      expiresAt: queued.postedAt + NOTIFICATION_RETENTION_MS,
+    });
+    if (!first.ok || !retry.ok) throw new Error('Expected admitted fixture');
+    expect(notificationFingerprint(first.event)).toBe(notificationFingerprint(retry.event));
+    expect(notificationMatches(first.event, rule, access, NOW + 1000, first.expiresAt)).toBe(true);
+    expect(
+      admitNotificationIntake(
+        { ...queued, postedAt: access.activeSince - 1, deviceTime: NOW },
+        access,
+        NOW
+      )
+    ).toEqual({ ok: false, reason: 'event_before_consent' });
+    expect(
+      admitNotificationIntake(
+        { ...queued, postedAt: NOW - NOTIFICATION_RETENTION_MS, deviceTime: NOW },
+        access,
+        NOW
+      )
+    ).toEqual({ ok: false, reason: 'event_expired' });
+  });
+  it('does not let clock recovery mask inactive consent or an unselected package', () => {
+    const changed = { ...event, deviceTime: NOW + 600_000 };
+    expect(admitNotificationIntake(changed, { ...access, status: 'revoked' }, NOW)).toEqual({
+      ok: false,
+      reason: 'access_inactive',
+    });
+    expect(
+      admitNotificationIntake(changed, { ...access, selectedPackages: ['com.example.other'] }, NOW)
+    ).toEqual({
+      ok: false,
+      reason: 'app_not_selected',
+    });
+  });
+  it('keeps the intake envelope strict instead of accepting event authority', () => {
+    expect(
+      admitNotificationIntake(
+        { ...event, deviceTime: NOW, ownerId: 'synthetic-owner' },
+        access,
+        NOW
+      )
+    ).toEqual({
+      ok: false,
+      reason: 'invalid_event',
+    });
+    expect(notificationEventSchema.safeParse({ ...event, deviceTime: NOW }).success).toBe(false);
+  });
+});
 
 describe('notification intake', () => {
   it.each([-90_000, 90_000])('calibrates a device clock offset of %s at consent', (offset) => {

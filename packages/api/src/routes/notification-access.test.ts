@@ -113,7 +113,9 @@ async function postEvent(body: unknown = event, token = deviceToken) {
   return fetch(`${origin}/api/notification-access/events`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(
+      body && typeof body === 'object' && !Array.isArray(body) ? { deviceTime: NOW, ...body } : body
+    ),
   });
 }
 async function admin(path: string, method = 'GET', body?: unknown, auth = 'synthetic-admin') {
@@ -125,6 +127,66 @@ async function admin(path: string, method = 'GET', body?: unknown, auth = 'synth
 }
 
 describe('post-only device intake', () => {
+  describe('request clock recovery', () => {
+    it.each([600_000, -600_000, 8 * 86_400_000, -8 * 86_400_000])(
+      'requests clock recovery after correcting consent offset %s, without writing an event',
+      async (clockOffsetMs) => {
+        store.deviceAccess.mockResolvedValue({
+          ...watcher,
+          clock_offset_ms: clockOffsetMs,
+          active_since: new Date(NOW - 86_400_000).toISOString(),
+        });
+        const result = await postEvent({ ...event, deviceTime: NOW });
+        expect(result.status).toBe(409);
+        expect(await result.json()).toEqual({ error: 'clock_resync_required' });
+        expect(store.record).not.toHaveBeenCalled();
+      }
+    );
+    it.each([-600_000, 600_000])(
+      'accepts a still-skewed clock and strips the send-time sample for offset %s',
+      async (clockOffsetMs) => {
+        store.deviceAccess.mockResolvedValue({ ...watcher, clock_offset_ms: clockOffsetMs });
+        const source = { ...event, postedAt: NOW - clockOffsetMs };
+        const result = await postEvent({ ...source, deviceTime: NOW - clockOffsetMs });
+        expect(result.status).toBe(202);
+        expect(store.record.mock.calls[0][1]).toEqual(source);
+      }
+    );
+    it('does not interpret queue age or a fresh retry sample as a clock change', async () => {
+      store.deviceAccess.mockResolvedValue({
+        ...watcher,
+        active_since: new Date(NOW - 7_200_000).toISOString(),
+      });
+      const queued = { ...event, postedAt: NOW - 3_600_000 };
+      expect((await postEvent({ ...queued, deviceTime: NOW })).status).toBe(202);
+      expect((await postEvent({ ...queued, deviceTime: NOW + 1000 })).status).toBe(202);
+      expect(store.record.mock.calls.map((call) => call[1])).toEqual([queued, queued]);
+    });
+    it.each([-300_001, -300_000, 300_000, 300_001])(
+      'uses a two-sided inclusive five-minute tolerance for send-time drift %s',
+      async (drift) => {
+        const result = await postEvent({ ...event, deviceTime: NOW + drift });
+        const corrected = Math.abs(drift) > 300_000;
+        expect(result.status).toBe(corrected ? 409 : 202);
+        if (corrected) {
+          expect(await result.json()).toEqual({ error: 'clock_resync_required' });
+          expect(store.record).not.toHaveBeenCalled();
+        }
+      }
+    );
+    it.each([undefined, null, -1, 1.5, '1800000000000', 8_640_000_000_000_001])(
+      'requires a bounded epoch-ms send-time sample: %s',
+      async (deviceTime) => {
+        expect((await postEvent({ ...event, deviceTime })).status).toBe(422);
+        expect(store.record).not.toHaveBeenCalled();
+      }
+    );
+    it('accepts new events after recovery issues a fresh zero-offset grant', async () => {
+      store.deviceAccess.mockResolvedValue({ ...watcher, clock_offset_ms: 0 });
+      expect((await postEvent({ ...event, deviceTime: NOW })).status).toBe(202);
+      expect(store.record).toHaveBeenCalledWith(watcher, event);
+    });
+  });
   it('accepts an app label and calibrates a slow device without an admin or workspace header', async () => {
     store.deviceAccess.mockResolvedValue({
       ...watcher,

@@ -8,7 +8,7 @@ import {
   updateNotificationRulesSchema,
 } from '../services/notification-access/contract';
 import {
-  admitNotification,
+  admitNotificationIntake,
   notificationDeviceTokenDigest,
 } from '../services/notification-access/policy';
 import {
@@ -52,6 +52,7 @@ function failure(res: Response, error: unknown): void {
     already_active: 409,
     grant_limit: 409,
     grant_inactive: 409,
+    clock_resync_required: 409,
     event_refused: 422,
     event_conflict: 409,
     rate_limited: 429,
@@ -252,10 +253,16 @@ export function createNotificationIntakeRouter(deps: NotificationRouterDependenc
       await underGates(
         { ownerId: watcher.owner_id, workspaceId: watcher.workspace_id },
         async () => {
-          const admitted = admitNotification(req.body, notificationAccessState(watcher), now());
+          const admitted = admitNotificationIntake(
+            req.body,
+            notificationAccessState(watcher),
+            now()
+          );
           if (!admitted.ok)
             throw new NotificationAccessError(
-              admitted.reason === 'access_inactive' ? 'access_inactive' : 'event_refused'
+              admitted.reason === 'access_inactive' || admitted.reason === 'clock_resync_required'
+                ? admitted.reason
+                : 'event_refused'
             );
           // The INSERT trigger rechecks revocation/sign-in and deduplicates in
           // the same transaction as the write; this read cannot fence that race.
