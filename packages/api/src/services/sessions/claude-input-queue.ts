@@ -6,7 +6,8 @@ import type { NativeSteeringBinding } from './native-steering-binding.js';
 export async function openClaudeInputQueue(ports: {
   binding: NativeSteeringBinding;
   nativeSessionId: string;
-  write(line: string): void;
+  /** false means no write was attempted. A throw leaves the outcome uncertain. */
+  write(line: string): void | false;
   endInput(): void;
   failed(): void;
 }) {
@@ -36,7 +37,7 @@ export async function openClaudeInputQueue(ports: {
     const uuid = randomUUID();
     // Register before writing: a write can synchronously produce output in a host adapter.
     inputs.set(uuid, { messageId, started: false, completed: false, result: false });
-    ports.write(
+    const written = ports.write(
       JSON.stringify({
         type: 'user',
         uuid,
@@ -45,6 +46,11 @@ export async function openClaudeInputQueue(ports: {
         message: { role: 'user', content: text },
       }) + '\n'
     );
+    if (written === false) {
+      inputs.delete(uuid);
+      return false;
+    }
+    return true;
   }
   const mailbox = createNativeSessionSteering({
     turnEpoch: binding.turnEpoch,
@@ -53,7 +59,8 @@ export async function openClaudeInputQueue(ports: {
     dispatch: async (request) => {
       if (!admitting) return { status: 'refused', reason: 'input_closed' };
       try {
-        writeInput(request.text, request.messageId);
+        if (!writeInput(request.text, request.messageId))
+          return { status: 'refused', reason: 'input_closed' };
         // A successful pipe write is NOT insertion evidence.
         return { status: 'accepted' };
       } catch {
@@ -99,7 +106,7 @@ export async function openClaudeInputQueue(ports: {
           request: { subtype: 'initialize', hooks: {} },
         }) + '\n'
       );
-      writeInput(text);
+      if (!writeInput(text)) throw new Error('Claude input closed before original write');
     },
     receive(frame: Record<string, unknown>) {
       if (!admitting || frame.session_id !== ports.nativeSessionId || frame.parent_tool_use_id)

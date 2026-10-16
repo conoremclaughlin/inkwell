@@ -3381,8 +3381,17 @@ export class SessionService implements ISessionService {
       let nativeRefusal: string | undefined;
       let nativeSteering: ReturnType<typeof createNativeSteeringBinding> = undefined;
       try {
+        // Experimental Claude transport: merging is not activation. Only exact
+        // canonical IDs in the operator's allowlist opt in; metadata cannot.
+        const claudeQueueEnabled =
+          !!session.sbId &&
+          (process.env.INK_CLAUDE_NATIVE_QUEUE_SB_IDS ?? '')
+            .split(',')
+            .map((id) => id.trim())
+            .includes(session.sbId);
         nativeSteering =
-          resolvedBackend === 'codex-cli' || resolvedBackend === 'claude-code'
+          resolvedBackend === 'codex-cli' ||
+          (resolvedBackend === 'claude-code' && claudeQueueEnabled)
             ? createNativeSteeringBinding({
                 sessionId: session.id,
                 turnEpoch,

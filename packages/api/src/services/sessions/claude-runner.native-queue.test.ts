@@ -251,6 +251,65 @@ describe('ClaudeRunner native queue integration', () => {
     expect(f.releaseChild).toHaveBeenCalledOnce();
   });
 
+  it('seals admission synchronously on child close, before promise settlement', async () => {
+    const f = await fixture();
+    f.init();
+    f.close(1);
+    const receipt = await f.steer();
+    expect(receipt).toMatchObject({ status: 'refused', reason: 'no_active_turn' });
+    expect(f.writes).toHaveLength(2);
+    expect(f.log.append).not.toHaveBeenCalled();
+    expect((await f.running).success).toBe(false);
+  });
+
+  it('refuses a correction when the pipe is already closed before any write', async () => {
+    const f = await fixture();
+    f.init();
+    f.child.stdin.destroyed = true;
+    const receipt = await f.steer();
+    await vi.waitFor(() =>
+      expect(f.log.append).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'refused', reason: 'input_closed' })
+      )
+    );
+    expect(receipt.status).not.toBe('unknown');
+    expect(f.writes).toHaveLength(2);
+    f.close(1);
+    expect((await f.running).success).toBe(false);
+    expect(f.log.append).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'unknown' }));
+  });
+
+  it('keeps a backpressured write accepted rather than reporting a pre-write refusal', async () => {
+    const f = await fixture();
+    f.init();
+    const write = f.child.stdin.write.getMockImplementation()!;
+    f.child.stdin.write.mockImplementation((line: string) => {
+      write(line);
+      return false;
+    });
+    expect(await f.steer()).toMatchObject({ status: 'pending' });
+    const correction = f.writes[2].uuid as string;
+    f.receive({ type: 'command_lifecycle', command_uuid: correction, state: 'started' });
+    f.result([f.original, correction], 'Updated');
+    f.complete(correction);
+    f.complete(f.original);
+    expect((await f.running).success).toBe(true);
+    expect(f.log.append).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'refused' }));
+  });
+
+  it('does not replay the original when completed lacks result membership and the ceiling fires', async () => {
+    vi.useFakeTimers();
+    const f = await fixture({ timeoutMs: 1000 });
+    f.init();
+    f.complete(f.original);
+    f.result([], 'Uncorrelated result');
+    await vi.advanceTimersByTimeAsync(1001);
+    expect((await f.running).success).toBe(false);
+    expect(stopProcessAndWait).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(f.writes).toHaveLength(2);
+  });
+
   it('an unsupported lifecycle contract fails before admitting corrections', async () => {
     const f = await fixture();
     f.receive({ type: 'system', subtype: 'init', capabilities: [] });

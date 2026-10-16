@@ -295,6 +295,7 @@ beforeEach(() => {
   vi.stubEnv('INK_EXECUTION_TIER', 'full');
   vi.stubEnv('INK_EXECUTION_TIER_CLIENTS', '');
   vi.stubEnv('INK_EXECUTION_TIER_SBS', '');
+  vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', '');
   vi.stubGlobal(
     'fetch',
     vi.fn(() => {
@@ -480,8 +481,21 @@ async function realNativeTransport(
 }
 
 describe('production native steering selection', () => {
+  it.each(['', 'echo', '00000000-0000-4000-8000-000000000002', '*'])(
+    'keeps Claude on its existing transport without exact opt-in: %s',
+    async (allowed) => {
+      row.backend = 'claude-code';
+      vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', allowed);
+      await run({ nativeSteering: {}, nativeQueueEnabled: true });
+      expect(claude).toHaveBeenCalledOnce();
+      expect(seenConfigs[0].nativeSteering).toBeUndefined();
+      expect(spawn).not.toHaveBeenCalled();
+    }
+  );
+
   it('selects the Claude input queue with the same owner-bound credential', async () => {
     row.backend = 'claude-code';
+    vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', ` ${sbId} `);
     expect((await run()).success).toBe(true);
     expect(claude).toHaveBeenCalledOnce();
     expect(native).not.toHaveBeenCalled();
@@ -506,6 +520,7 @@ describe('production native steering selection', () => {
     'container',
   ])('keeps Claude on its existing transport for %s', async (kind) => {
     row.backend = 'claude-code';
+    vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', sbId);
     if (kind === 'attached') row.cli_attached = true;
     if (kind === 'unknown-attachment') row.cli_attached = null;
     if (kind === 'contact') row.contact_id = 'synthetic-contact';

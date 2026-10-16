@@ -601,7 +601,7 @@ export class ClaudeRunner implements IRunner {
         Promise.resolve().then(() => launchSettings?.cleanup()),
       ]).then(() => undefined));
     let nativeQueue: ClaudeInputQueue | undefined;
-    let nativeWrite = (_line: string): void => {
+    let nativeWrite = (_line: string): void | false => {
       throw new Error('Claude input not ready');
     };
     let nativeEnd = (): void => {
@@ -1010,6 +1010,9 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('close', (code) => {
+        // Seal synchronously: promise settlement/disposal is too late for a
+        // new arrival from another close listener or a queued microtask.
+        void nativeQueue?.stop();
         closed = true;
         reconcileExit();
         if (ownership && !released && !survivorPoll) {
@@ -1071,9 +1074,11 @@ export class ClaudeRunner implements IRunner {
 
       if (nativeQueue) {
         nativeWrite = (line) => {
-          if (settled || proc.stdin.destroyed || proc.stdin.writableEnded)
-            throw new Error('Claude input is closed');
+          if (settled || proc.stdin.destroyed || proc.stdin.writableEnded) return false;
+          // Do not return Writable.write's boolean: false there is accepted
+          // backpressure, whereas this port's false means no attempt was made.
           proc.stdin.write(line);
+          return undefined;
         };
         nativeEnd = () => proc.stdin.end();
         proc.stdin.on('error', nativeFailed);
