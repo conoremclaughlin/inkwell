@@ -3504,7 +3504,13 @@ describe('PR 874 reviewer principal boundary', () => {
     expect(await read('lumen', false)).toEqual([]);
   });
 
-  async function readCanonical(sbParticipant: boolean, includeSlug: boolean) {
+  async function readCanonical(
+    sbParticipant: boolean,
+    includeSlug: boolean,
+    tokenSbId = SB_IDS.lumen,
+    enrichAs?: string,
+    explicit = false
+  ) {
     const ctx = await import('../../utils/request-context');
     const actual = await vi.importActual<typeof ctx>('../../utils/request-context');
     vi.mocked(ctx.getPinnedSlug).mockImplementation(actual.getPinnedSlug);
@@ -3513,7 +3519,7 @@ describe('PR 874 reviewer principal boundary', () => {
     const claims = {
       userId: 'user-123',
       email: 'owner@example.test',
-      sbId: SB_IDS.lumen,
+      sbId: tokenSbId,
       ...(includeSlug ? { sbSlug: 'lumen' } : {}),
     };
     const client = privateInboxClient(sbParticipant);
@@ -3526,17 +3532,53 @@ describe('PR 874 reviewer principal boundary', () => {
     expect(verdict.ok).toBe(true);
     if (!verdict.ok) throw new Error('Synthetic token was unexpectedly refused');
     const token = verdict.token;
-    expect(token.sbId).toBe(SB_IDS.lumen);
+    expect(token.sbId).toBe(tokenSbId);
     expect(token.sbSlug).toBe(includeSlug ? 'lumen' : undefined);
-    const response = await actual.runWithRequestContext(
-      { ...token, ...actual.tokenIdentityContext(token) },
-      () =>
-        handleGetInbox({ status: 'unread', markRead: false }, {
+    const requestContext = { ...token, ...actual.tokenIdentityContext(token) };
+    if (enrichAs) {
+      const { MCPServer } = await import('../server');
+      // No constructor, listener, or background services. Exercise the actual
+      // server enrichment against a synthetic live session owned by this user.
+      const server = Object.create(MCPServer.prototype);
+      const sessionId = '00000000-0000-4000-8000-000000000874';
+      server.dataComposer = {
+        getClient: () => client,
+        repositories: {
+          memory: {
+            getSession: async () => ({
+              id: sessionId,
+              userId: 'user-123',
+              sbSlug: enrichAs,
+              sbId: SB_IDS[enrichAs],
+              lifecycle: 'running',
+            }),
+          },
+        },
+      };
+      const effective = await server.enrichIdentityFromContextSession(token, {
+        sessionId,
+        sbSlug: enrichAs,
+      });
+      Object.assign(requestContext, { sbId: effective.sbId, sbSlug: effective.sbSlug });
+      expect(requestContext.tokenSbId).toBe(tokenSbId);
+    }
+    const response = await actual.runWithRequestContext(requestContext, () =>
+      handleGetInbox(
+        { status: 'unread', markRead: false, ...(explicit ? { sbSlug: enrichAs } : {}) },
+        {
           getClient: () => client,
           repositories: {},
-        } as never)
+        } as never
+      )
     );
     const body = JSON.parse(response.content[0].text);
+    if (explicit && body.success !== true) {
+      // An identity-mismatch refusal is also safe; do not require the
+      // implementation to answer with a successful empty inbox.
+      expect(JSON.stringify(body)).not.toContain('synthetic private review canary');
+      expect(JSON.stringify(body)).not.toContain('chat:conversation-synthetic-review');
+      return [];
+    }
     expect(body.success).toBe(true);
     return body.threadsWithUnread ?? [];
   }
@@ -3556,6 +3598,22 @@ describe('PR 874 reviewer principal boundary', () => {
       'synthetic private review canary'
     );
   });
+
+  it.each([false, true])(
+    'does not replace a signed SB with a sibling session identity (explicit slug: %s)',
+    async (explicit) => {
+      expect(await readCanonical(true, false, SB_IDS.wren, 'lumen', explicit)).toEqual([]);
+    }
+  );
+
+  it.each([false, true])(
+    'still allows a participant using its own session (explicit slug: %s, control)',
+    async (explicit) => {
+      expect(
+        JSON.stringify(await readCanonical(true, false, SB_IDS.lumen, 'lumen', explicit))
+      ).toContain('synthetic private review canary');
+    }
+  );
 
   it('fails closed when the bound id names no identity: not even the person’s own conversation', async () => {
     const ctx = await import('../../utils/request-context');
