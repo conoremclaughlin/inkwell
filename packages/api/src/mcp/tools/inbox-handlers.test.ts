@@ -3556,4 +3556,27 @@ describe('PR 874 reviewer principal boundary', () => {
       'synthetic private review canary'
     );
   });
+
+  it('fails closed when the bound id names no identity: not even the person’s own conversation', async () => {
+    const ctx = await import('../../utils/request-context');
+    const actual = await vi.importActual<typeof ctx>('../../utils/request-context');
+    vi.mocked(ctx.getPinnedSlug).mockImplementation(actual.getPinnedSlug);
+    vi.mocked(ctx.getRequestContext).mockImplementation(actual.getRequestContext);
+    vi.mocked(ctx.getSessionContext).mockReturnValue(undefined as never);
+    // The person is the private thread's participant; the token is bound to
+    // an id no identity row carries.
+    const client = privateInboxClient(false);
+    const identity = { sbId: 'sb-gone' };
+    const response = await actual.runWithRequestContext(
+      { userId: 'user-123', ...identity, ...actual.tokenIdentityContext(identity) },
+      () =>
+        handleGetInbox({ status: 'unread', markRead: false }, {
+          getClient: () => client,
+          repositories: {},
+        } as never)
+    );
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.threadsWithUnread ?? []).toEqual([]);
+  });
 });
