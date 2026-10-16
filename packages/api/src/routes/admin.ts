@@ -11,6 +11,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
 import { connectorsRouter } from './admin-connectors';
+import { calendarShareRouter } from './admin-calendar-share';
 import { vaultRouter } from './admin-vault';
 import { threadUploadsRouter } from './thread-uploads';
 import { parseListSearch, listSearchFilter } from './list-search';
@@ -1928,6 +1929,9 @@ router.use(adminAuthMiddleware);
 
 // The app's view of its Google connection (routes/admin-connectors.ts).
 router.use('/connectors', connectorsRouter);
+
+// A member's own "share my busy times here" switch (routes/admin-calendar-share.ts).
+router.use(calendarShareRouter);
 
 // Saved logins, a person's own (routes/admin-vault.ts).
 router.use('/vault', vaultRouter);

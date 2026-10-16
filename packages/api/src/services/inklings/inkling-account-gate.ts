@@ -14,7 +14,9 @@
  * account is read. When the calling SB is an inkling, no token is handed
  * out unless the tool the call runs inside is named in
  * INK_INKLING_ACCOUNT_TOOLS (inklingAccountToolAllowlist). Unset, that is
- * none. A tool added later that reaches an account is covered without being
+ * none, apart from get_space_busy_times, which reads only what each member
+ * consented to share in the space (INKLING_CONSENTED_ACCOUNT_TOOLS below).
+ * A tool added later that reaches an account is covered without being
  * listed anywhere: it is refused to inklings until it is named.
  *
  * Who is calling, from the request context:
@@ -53,6 +55,21 @@ export class InklingAccountRefusedError extends Error {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The tool a space's SB reads its members' shared busy times with. */
+export const SPACE_BUSY_TIMES_TOOL = 'get_space_busy_times';
+
+/**
+ * Tools an inkling's turn may use accounts in without INK_INKLING_ACCOUNT_TOOLS
+ * naming them, because the consent each account read needs is its holder's
+ * own, given in the space, not the owner's. That is one tool:
+ * get_space_busy_times reads a member's calendar only after that member
+ * switched "share my busy times here" on in the space (D6), and only as
+ * free/busy, from now to a year ahead (D7). It never returns a token.
+ */
+export const INKLING_CONSENTED_ACCOUNT_TOOLS: ReadonlySet<string> = new Set([
+  SPACE_BUSY_TIMES_TOOL,
+]);
 
 /** The SBs a request context says are calling, UUIDs and slugs apart. */
 export interface AccountGateCaller {
@@ -153,7 +170,9 @@ export async function assertAccountTokenAllowed(
   if (inklings.length === 0 && unidentified.length === 0) return;
   const toolName = options.toolName ?? currentToolName();
   const allowlist = options.allowlist ?? inklingAccountToolAllowlist().tools;
-  if (toolName && allowlist.has(toolName)) return;
+  if (toolName && (allowlist.has(toolName) || INKLING_CONSENTED_ACCOUNT_TOOLS.has(toolName))) {
+    return;
+  }
   logger.warn("Refused an inkling's turn its owner's connected account", {
     provider,
     tool: toolName ?? null,
