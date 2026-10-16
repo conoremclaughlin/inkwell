@@ -4,8 +4,8 @@ An opt-in Chrome MV3 extension for deliberately sharing page context and reviewi
 suggested field changes. Built with WXT, following Inkah's build pattern rather
 than copying its all-sites content script. No browsing recorder or background agent.
 
-The panel now connects explicitly to hosted chat with one of the paired owner's
-inklings. Messages use the existing inbox dispatch and hosted runtime, not a
+The panel connects explicitly to hosted chat with the paired owner's app inklings,
+or one ordinary hosted companion selected during pairing. Messages use the existing inbox dispatch and hosted runtime, not a
 second extension agent loop. Page control is still separate: connecting or
 chatting does not read a tab. The older snapshot/confirmed-fill prototype remains
 under its own disclosure. This is local source, not a deployed or real-account
@@ -70,11 +70,22 @@ connection. Every chat endpoint checks current workspace membership; writes also
 require the same write role as a person's ordinary inbox send. Grant liveness
 alone is not current membership.
 
-Only owned, self-serve app inklings appear in the picker; workspace development
-SBs are not implicitly included. Conversation history is scoped to the pairing
-grant. A new pairing (including after a browser restart or grant expiry) starts
-a new conversation; old threads remain in Inkwell but are not exposed to that
-new installation grant.
+Existing grants list only owned, self-serve app inklings. A new dashboard pairing
+can instead explicitly select one owned, same-workspace companion using the Ink
+runtime and acknowledge their ordinary tools. Its recipient UUID is stored on the
+grant and rechecked on chat requests; old grants gain no workspace-SB access.
+The inbox send also checks that the recipient slug still resolves to that UUID.
+
+Panel history is scoped to the pairing grant. A new pairing (including after a
+browser restart or grant expiry) starts a new browser thread; old threads remain
+in Inkwell but are not exposed to the new installation grant. This is not runtime
+context isolation: the existing dispatcher may route the companion to their
+configured home session, shared with other channels. Tool policy is unchanged.
+A stolen pairing can read this browser thread and submit requests to those tools.
+
+Apply `20261016020744_browser_companion_recipient.sql` before running this server
+version. It adds a nullable recipient binding without changing an RPC signature.
+No live database or real-account acceptance is claimed by the local unit tests.
 
 The selected inkling retains its ordinary tools. Page content will be labelled
 untrusted when page integration lands; no claim of a restricted runtime or prompt

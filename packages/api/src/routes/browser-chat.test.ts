@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   lookup: vi.fn(),
   record: vi.fn(),
   check: vi.fn(),
+  binding: vi.fn(),
 }));
 vi.mock('../data/composer', () => ({
   getDataComposer: async () => ({ getClient: () => ({ from: mocks.from }) }),
@@ -31,6 +32,7 @@ vi.mock('../services/send-receipt', () => ({
 vi.mock('../services/browser-companion-grant.service', () => ({
   BrowserCompanionGrantService: class {
     checkGrant = mocks.check;
+    recipientBinding = mocks.binding;
   },
   normalizePairingCode: (v: string) => v,
 }));
@@ -73,6 +75,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.list.mockResolvedValue([inkling]);
   mocks.check.mockResolvedValue({ ok: true });
+  mocks.binding.mockResolvedValue(null);
   mocks.lookup.mockResolvedValue({ kind: 'none' });
   mocks.send.mockResolvedValue({
     content: [
@@ -125,6 +128,44 @@ const existing = () => {
 };
 
 describe('installation-scoped hosted chat', () => {
+  it('an explicit grant lists and dispatches only its current owned hosted recipient', async () => {
+    mocks.binding.mockResolvedValue(inkling.id);
+    rows.agent_identities = [
+      { id: inkling.id, agent_id: 'fixture-companion', name: 'River', metadata: {} },
+    ];
+    expect((await call('/chat/inklings')).body).toEqual({
+      inklings: [{ id: inkling.id, name: 'River' }],
+    });
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect((await send()).status).toBe(200);
+    expect(mocks.send.mock.calls[0][0]).toMatchObject({
+      recipientSlug: 'fixture-companion',
+      threadKey: browserChatKey(claims.grantId, inkling.id),
+    });
+    expect(mocks.send.mock.calls[0][2]).toMatchObject({ recipientId: inkling.id });
+    expect(queries.find((query) => query.table === 'agent_identities')!.filters).toEqual([
+      ['user_id', claims.sub],
+      ['workspace_id', claims.workspaceId],
+      ['backend', 'ink'],
+      ['id', inkling.id],
+    ]);
+  });
+  it('does not fall back to app recipients when a bound recipient disappears or changes owner/runtime', async () => {
+    mocks.binding.mockResolvedValue(inkling.id);
+    rows.agent_identities = [];
+    expect((await call('/chat/inklings')).body).toEqual({ inklings: [] });
+    expect((await history()).status).toBe(403);
+    expect((await send()).status).toBe(403);
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('refuses an unavailable grant binding rather than upgrading legacy access', async () => {
+    mocks.binding.mockRejectedValue(new Error('fixture read outage'));
+    expect((await call('/chat/inklings')).status).toBe(503);
+    expect((await send()).status).toBe(503);
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
   it('checks current membership before listing, history, receipt or dispatch', async () => {
     rows.workspace_members = null;
     expect((await call('/chat/inklings')).status).toBe(503);

@@ -1,6 +1,7 @@
 /** The paired installation's own conversations. No caller-supplied thread,
  * workspace, slug, runtime or page authority. Dispatch uses the existing inbox
- * path, including its inkling owner gate and hosted runtime selection. */
+ * path, including its inkling owner gate and hosted runtime selection.
+ * Ordinary recipients are explicit new-grant bindings, not an implicit upgrade. */
 import { Router } from 'express';
 import { z } from 'zod';
 import type { DataComposer } from '../data/composer';
@@ -15,6 +16,8 @@ import {
   recordDelivery,
 } from '../services/send-receipt';
 import type { BrowserCompanionRequest } from './browser-companion';
+import { BrowserCompanionGrantService } from '../services/browser-companion-grant.service';
+import { browserChatRecipients } from '../services/browser-chat-recipient';
 
 const selection = z.object({ inklingId: z.string().uuid() }).strict();
 const submission = selection
@@ -40,14 +43,16 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
     const client = composer.getClient();
     // Grant liveness does not prove current workspace membership.
     const role = await roleOfUserIn(client, claims.workspaceId, claims.sub, 'You');
-    const inklings = await new InklingService(client).list({
-      userId: claims.sub,
-      workspaceId: claims.workspaceId,
-    });
+    const recipientId = await new BrowserCompanionGrantService(client).recipientBinding(claims);
+    const ownerScope = { userId: claims.sub, workspaceId: claims.workspaceId };
+    const inklings =
+      recipientId === null
+        ? await new InklingService(client).list(ownerScope)
+        : await browserChatRecipients(client, ownerScope, recipientId);
     const inkling = inklings.find((entry) => entry.id === inklingId);
     return { composer, client, claims, inklings, inkling, role };
   }
-  const publicInkling = (inkling: Inkling) => ({
+  const publicInkling = (inkling: Pick<Inkling, 'id' | 'displayName'>) => ({
     id: inkling.id,
     name: inkling.displayName ?? 'Unnamed inkling',
   });
@@ -270,6 +275,7 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
           },
           composer,
           {
+            recipientId: inkling.id,
             sender: { principal: userPrincipal(claims.sub), workspaceId: claims.workspaceId },
           }
         );

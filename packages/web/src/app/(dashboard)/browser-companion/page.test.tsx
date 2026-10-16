@@ -82,6 +82,10 @@ describe('browser dashboard human-send boundary', () => {
     expect(scan).toHaveBeenCalledTimes(2);
   });
   it('stages a valid offer but never sends without instruction, recipient and human action', async () => {
+    // Production boundaries are fresh; pin randomness only for this exact payload assertion.
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue(
+      '00000000-0000-4000-8000-000000000009'
+    );
     render(<BrowserCompanionPage />);
     act(() => offer());
     expect(post).not.toHaveBeenCalled();

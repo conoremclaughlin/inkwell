@@ -408,6 +408,9 @@ async function warnOnUnregisteredProjectPrefix(
  * server code pass it here, after authenticating it themselves.
  */
 export interface InternalSendContext {
+  /** A server-authorized single thread recipient must still resolve to this identity.
+   * A slug reassigned between authorization and send must not retarget a grant. */
+  recipientId?: string;
   /**
    * The trusted server-side sender. A system sender may leave `workspaceId`
    * null: the message lands in the first recipient's workspace, as a
@@ -755,6 +758,12 @@ export async function handleSendToInbox(
       sender.kind === 'sb' ? sender.sbSlug : sender.kind === 'system' ? 'system' : 'user';
     const senderSb: SbPrincipal | null = sender.kind === 'sb' ? sender : null;
     const recipientSbs = await resolveSbsInWorkspace(supabase, workspaceId, allRecipients);
+    if (
+      internal?.recipientId &&
+      (recipientSbs.length !== 1 || recipientSbs[0].sbId !== internal.recipientId)
+    ) {
+      throw new Error('The authorized recipient identity changed');
+    }
 
     // A caller-named session (spec session-lifecycle-model §3, T4) is checked
     // here, before the thread, its participant rows or the message exist, so
