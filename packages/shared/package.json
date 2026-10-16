@@ -59,6 +59,26 @@
         "types": "./dist/cjs/node-host/index.d.ts",
         "default": "./dist/cjs/node-host/index.js"
       }
+    },
+    "./security/untrusted-content": {
+      "import": {
+        "types": "./dist/security/untrusted-content.d.ts",
+        "default": "./dist/security/untrusted-content.js"
+      },
+      "require": {
+        "types": "./dist/cjs/security/untrusted-content.d.ts",
+        "default": "./dist/cjs/security/untrusted-content.js"
+      }
+    },
+    "./browser-chat": {
+      "import": {
+        "types": "./dist/browser-chat.d.ts",
+        "default": "./dist/browser-chat.js"
+      },
+      "require": {
+        "types": "./dist/cjs/browser-chat.d.ts",
+        "default": "./dist/cjs/browser-chat.js"
+      }
     }
   },
   "scripts": {

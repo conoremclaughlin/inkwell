@@ -81,10 +81,7 @@ import {
 import { tokenIdentityState } from '../auth/token-identity';
 import { isSpaceTurnScope } from '../auth/token-scope';
 import type { Database } from '../data/supabase/types';
-import {
-  BrowserCompanionGrantService,
-  isInstallationCommitment,
-} from '../services/browser-companion-grant.service';
+import { createBrowserPairingAdminRouter } from './browser-pairing-admin';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { ThreadKeyService } from '../services/thread-key/thread-key.service';
@@ -2043,7 +2040,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/browser-companion/pairing-code
- * Body: { installationId, installationCommitment } → { grantId, pairingCode, … }
+ * Body: { installationId, installationCommitment, recipientId?, fullToolsApproved? }
  *
  * Mints the code the browser extension claims. It lives on the admin router
  * because the human doing the granting is signed into the dashboard — this is
@@ -2057,9 +2054,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
  * locally and has not sent anywhere. Without it, the claim would be gated on a
  * code read off a screen plus an installation id handed to this endpoint —
  * neither secret, so any installation observing both could claim a pairing it
- * did not start. Getting the commitment from the extension to the dashboard is
- * browser-side transport and is NOT in this PR: what ships here is the
- * server's half of pairing, unexposed, not a complete pairing flow.
+ * did not start. The dashboard binds explicit recipient consent to this offer.
  *
  * Unlike the mobile pairing code above, the row goes into
  * `browser_companion_grants`, never `mcp_tokens`. A row in `mcp_tokens` is
@@ -2069,45 +2064,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
  * it namespaces nothing. Storing a browser grant there would have made the
  * companion route allowlist bypassable in one request.
  */
-router.post('/browser-companion/pairing-code', async (req: Request, res: Response) => {
-  try {
-    const authReq = req as AdminAuthRequest;
-    const installationId =
-      typeof req.body?.installationId === 'string' ? req.body.installationId.trim() : '';
-    if (!installationId) {
-      res.status(400).json({ error: 'installationId is required' });
-      return;
-    }
-
-    const installationCommitment =
-      typeof req.body?.installationCommitment === 'string'
-        ? req.body.installationCommitment.trim().toLowerCase()
-        : '';
-    if (!isInstallationCommitment(installationCommitment)) {
-      res.status(400).json({ error: 'installationCommitment must be a sha256 hex digest' });
-      return;
-    }
-
-    const dataComposer = await getDataComposer();
-    const grants = new BrowserCompanionGrantService(dataComposer.getClient());
-    const created = await grants.createPairingCode({
-      userId: authReq.inkUserId,
-      workspaceId: authReq.inkWorkspaceId,
-      installationId,
-      installationCommitment,
-    });
-
-    res.json({
-      grantId: created.grantId,
-      pairingCode: formatPairingCode(created.pairingCode),
-      pairingCodeExpiresAt: created.pairingCodeExpiresAt,
-      installationId,
-    });
-  } catch (error) {
-    logger.error('Browser companion pairing code error:', error);
-    res.status(500).json(errorJson('Failed to create browser pairing code', error));
-  }
-});
+router.use('/browser-companion', createBrowserPairingAdminRouter(getDataComposer));
 
 // =============================================================================
 // Workspaces
@@ -9261,6 +9218,20 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'clientMessageId must be a UUID' });
       return;
     }
+    // Other people of a team space this group is shared with, beside its
+    // inkling (inkling-shared-space.ts). The thread gate holds each to a
+    // write-role membership of the inkling's team space.
+    const rawPeople: unknown = req.body?.people;
+    if (
+      rawPeople !== undefined &&
+      (!Array.isArray(rawPeople) || rawPeople.length > 15 || !rawPeople.every(isUuid))
+    ) {
+      res.status(400).json({ error: 'people must list up to 15 user ids' });
+      return;
+    }
+    const people = [
+      ...new Set(((rawPeople ?? []) as string[]).map((id) => id.toLowerCase())),
+    ].filter((id) => id !== authReq.inkUserId.toLowerCase());
 
     // The workspace role before any lookup. What keeps a replay to the
     // person who sent the original is the sender check inside
@@ -9290,7 +9261,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     // What a client-identified create is held to on a retry: the same
     // people (as a set) and the same title, beside the same sender and words.
     const createRequest = clientMessageId.value
-      ? createRequestOf(uniqueRecipients, title)
+      ? createRequestOf(uniqueRecipients, title, people)
       : undefined;
     // A client-identified create never joins a thread that exists. Either it
     // is a retry of the submission that created the thread, which answers
@@ -9394,7 +9365,17 @@ router.post('/threads', async (req: Request, res: Response) => {
         throw new Error(`Failed to read the conversation's members: ${membersError.message}`);
       }
       const rows = (members ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
-      if (rows.some((r) => r.user_id && r.user_id !== authReq.inkUserId)) return false;
+      // People besides this person only as this create named them.
+      if (
+        rows.some(
+          (r) =>
+            r.user_id &&
+            r.user_id !== authReq.inkUserId &&
+            !people.includes(r.user_id.toLowerCase())
+        )
+      ) {
+        return false;
+      }
       const present = new Set(rows.map((r) => r.sb_id).filter((id): id is string => !!id));
       let requested: SbPrincipal[];
       try {
@@ -9446,7 +9427,11 @@ router.post('/threads', async (req: Request, res: Response) => {
               principal: userPrincipal(authReq.inkUserId),
               workspaceId: authReq.inkWorkspaceId,
             },
-            ...(send.createOnly ? { createOnly: true } : {}),
+            // People join only a conversation this send makes: never one a
+            // concurrent create made first. A retry adopting its own create
+            // is the exception, held to the same people by its intent.
+            ...(send.createOnly || (people.length > 0 && send.created) ? { createOnly: true } : {}),
+            ...(people.length > 0 ? { people: people.map((id) => userPrincipal(id)) } : {}),
             // Recorded on the thread row if this send creates it.
             ...(clientMessageId.value && createRequest
               ? {
@@ -9477,6 +9462,13 @@ router.post('/threads', async (req: Request, res: Response) => {
             await answerForExistingThread(taken);
             return;
           }
+        }
+        // A group create with no client message id has nothing to replay: a
+        // concurrent create took its key, so the key is taken (Lumen's review
+        // of 4f7896e6).
+        if (error instanceof ThreadKeyTakenError) {
+          res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
+          return;
         }
         throw error;
       }
@@ -9519,6 +9511,10 @@ router.post('/threads', async (req: Request, res: Response) => {
     const existing = await findThread();
     if (clientMessageId.value && existing) {
       await answerForExistingThread(existing);
+      return;
+    }
+    if (people.length > 0 && existing) {
+      res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
       return;
     }
     await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });

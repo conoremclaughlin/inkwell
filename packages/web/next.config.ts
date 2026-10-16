@@ -14,6 +14,12 @@ const nextConfig: NextConfig = {
   // Allow API calls to the backend
   async rewrites() {
     return [
+      // Installation credentials only. The proxy never injects dashboard
+      // auth here; the backend enforces its companion-only route allowlist.
+      {
+        source: '/api/browser-companion/:path*',
+        destination: `${apiUrl}/api/browser-companion/:path*`,
+      },
       // Other admin endpoints go to MCP server
       {
         source: '/api/admin/:path*',

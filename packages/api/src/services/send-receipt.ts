@@ -168,13 +168,40 @@ export type ReplayLookup =
 export interface CreateRequest {
   recipients: string[];
   title: string | null;
+  /**
+   * The people besides the sender a shared group was created with, by user
+   * id, as a set. Absent when it named none, so a create recorded before
+   * groups could name people is the same create as one naming nobody.
+   */
+  people?: string[];
 }
 
-export function createRequestOf(recipients: string[], title: string): CreateRequest {
+export function createRequestOf(
+  recipients: string[],
+  title: string,
+  people: string[] = []
+): CreateRequest {
+  const peopleSet = [...new Set(people.map((p) => p.toLowerCase()))].sort();
   return {
     recipients: [...new Set(recipients.map((r) => r.toLowerCase()))].sort(),
     title: title || null,
+    ...(peopleSet.length > 0 ? { people: peopleSet } : {}),
   };
+}
+
+/** The same create: the same recipients, title and people, each as a set. */
+function sameRequest(a: CreateRequest, b: CreateRequest): boolean {
+  const sameList = (x: string[], y: string[]) =>
+    x.length === y.length && x.every((item, i) => item === y[i]);
+  return (
+    a.title === b.title &&
+    sameList(a.recipients, b.recipients) &&
+    sameList(a.people ?? [], b.people ?? [])
+  );
+}
+
+function stringsOf(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }
 
 /** A digest of the words, so the intent can pin them without storing them twice. */
@@ -201,6 +228,7 @@ export function createIntentOf(
     clientMessageId,
     recipients: request.recipients,
     title: request.title,
+    ...(request.people ? { people: request.people } : {}),
     contentDigest: contentDigestOf(content),
     wake,
   };
@@ -226,6 +254,7 @@ export function matchesCreateIntent(
         clientMessageId?: unknown;
         recipients?: unknown;
         title?: unknown;
+        people?: unknown;
         contentDigest?: unknown;
         wake?: unknown;
       }
@@ -240,14 +269,11 @@ export function matchesCreateIntent(
     return false;
   }
   const recorded = createRequestOf(
-    intent.recipients.filter((r): r is string => typeof r === 'string'),
-    typeof intent.title === 'string' ? intent.title : ''
+    stringsOf(intent.recipients),
+    typeof intent.title === 'string' ? intent.title : '',
+    stringsOf(intent.people)
   );
-  return (
-    recorded.title === request.title &&
-    recorded.recipients.length === request.recipients.length &&
-    recorded.recipients.every((r, i) => r === request.recipients[i])
-  );
+  return sameRequest(recorded, request);
 }
 
 /**
@@ -275,14 +301,11 @@ function sameCreateRequest(metadata: Record<string, unknown> | null, request: Cr
     ?.createRequest;
   if (!stored || !Array.isArray(stored.recipients)) return false;
   const storedSet = createRequestOf(
-    stored.recipients.filter((r): r is string => typeof r === 'string'),
-    stored.title ?? ''
+    stringsOf(stored.recipients),
+    stored.title ?? '',
+    stringsOf(stored.people)
   );
-  return (
-    storedSet.title === request.title &&
-    storedSet.recipients.length === request.recipients.length &&
-    storedSet.recipients.every((r, i) => r === request.recipients[i])
-  );
+  return sameRequest(storedSet, request);
 }
 
 function sameUploads(

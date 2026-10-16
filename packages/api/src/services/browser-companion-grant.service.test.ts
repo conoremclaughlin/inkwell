@@ -62,6 +62,9 @@ const predicates: Array<{ table: string; op: string; column: string; value: unkn
  * is a revocation, none is an already-revoked grant.
  */
 let updateReturns: Array<{ id: string }> = [];
+let recipientRows: Array<Record<string, unknown>> = [];
+let recipientBinding: string | null = null;
+let memberRole = 'owner';
 
 function makeRecordingClient() {
   return {
@@ -85,6 +88,8 @@ function makeRecordingClient() {
         return builder;
       };
       builder.select = chain;
+      builder.order = chain;
+      builder.limit = async () => ({ data: recipientRows, error: null });
       builder.eq = record('eq');
       builder.gt = record('gt');
       builder.is = record('is');
@@ -101,12 +106,16 @@ function makeRecordingClient() {
         return builder;
       };
       builder.maybeSingle = async () => ({
-        data: {
-          id: GRANT_ID,
-          user_id: USER_ID,
-          workspace_id: WORKSPACE_ID,
-          expires_at: new Date().toISOString(),
-        },
+        data:
+          table === 'workspace_members'
+            ? { role: memberRole }
+            : {
+                id: GRANT_ID,
+                user_id: USER_ID,
+                workspace_id: WORKSPACE_ID,
+                expires_at: new Date().toISOString(),
+                recipient_id: recipientBinding,
+              },
         error: null,
       });
       builder.single = builder.maybeSingle;
@@ -128,7 +137,81 @@ describe('browser companion grant storage', () => {
     updatePayloads.length = 0;
     predicates.length = 0;
     updateReturns = [{ id: GRANT_ID }];
+    recipientRows = [];
+    recipientBinding = null;
+    memberRole = 'owner';
     service = new BrowserCompanionGrantService(makeRecordingClient());
+  });
+
+  it('stores an explicitly selected, currently owned hosted recipient only on the new grant', async () => {
+    const recipientId = '55555555-5555-4555-8555-555555555555';
+    recipientRows = [
+      { id: recipientId, agent_id: 'fixture-companion', name: 'River', metadata: {} },
+    ];
+    await service.createPairingCode({
+      userId: USER_ID,
+      workspaceId: WORKSPACE_ID,
+      installationId: INSTALLATION_ID,
+      installationCommitment: INSTALLATION_COMMITMENT,
+      recipientId,
+    });
+    expect(
+      insertPayloads.find((entry) => entry.table === 'browser_companion_grants')?.payload
+    ).toMatchObject({ recipient_id: recipientId });
+    expect(
+      predicates
+        .filter((entry) => entry.table === 'agent_identities')
+        .map(({ column, value }) => [column, value])
+    ).toEqual([
+      ['user_id', USER_ID],
+      ['workspace_id', WORKSPACE_ID],
+      ['backend', 'ink'],
+      ['id', recipientId],
+    ]);
+  });
+  it.each(['missing', 'viewer', 'app'])(
+    'does not mint ordinary access for %s recipient authority',
+    async (kind) => {
+      const recipientId = '55555555-5555-4555-8555-555555555555';
+      if (kind !== 'missing')
+        recipientRows = [
+          {
+            id: recipientId,
+            agent_id: 'fixture-companion',
+            name: 'River',
+            metadata: kind === 'app' ? { client: 'inkling-mobile' } : {},
+          },
+        ];
+      if (kind === 'viewer') memberRole = 'viewer';
+      await expect(
+        service.createPairingCode({
+          userId: USER_ID,
+          workspaceId: WORKSPACE_ID,
+          installationId: INSTALLATION_ID,
+          installationCommitment: INSTALLATION_COMMITMENT,
+          recipientId,
+        })
+      ).rejects.toThrow();
+      expect(insertPayloads).toEqual([]);
+    }
+  );
+  it('reads the recipient from the exact grant rather than a token or caller-supplied identity', async () => {
+    const payload = {
+      type: 'browser_client' as const,
+      sub: USER_ID,
+      workspaceId: WORKSPACE_ID,
+      installationId: INSTALLATION_ID,
+      grantId: GRANT_ID,
+    };
+    expect(await service.recipientBinding(payload)).toBeNull();
+    recipientBinding = '55555555-5555-4555-8555-555555555555';
+    expect(await service.recipientBinding(payload)).toBe(recipientBinding);
+    expect(predicates.slice(0, 4).map(({ column, value }) => [column, value])).toEqual([
+      ['id', GRANT_ID],
+      ['user_id', USER_ID],
+      ['workspace_id', WORKSPACE_ID],
+      ['installation_id', INSTALLATION_ID],
+    ]);
   });
 
   async function runFullLifecycle() {

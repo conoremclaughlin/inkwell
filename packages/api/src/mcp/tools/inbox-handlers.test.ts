@@ -2924,6 +2924,48 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     expect(wren.threadUnread).toBe(1);
   });
 
+  it('refuses a server-authorized recipient whose slug now resolves to another identity before writes', async () => {
+    const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-person' } });
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'fixture@example.invalid',
+          threadKey: 'thread:synthetic-browser',
+          recipientSlug: 'wren',
+          content: 'Synthetic message.',
+        },
+        createThreadMockDataComposer(mockSb) as never,
+        {
+          recipientId: SB_IDS.lumen,
+          sender: { principal: userPrincipal('user-123'), workspaceId: WS },
+        }
+      )
+    ).rejects.toThrow('authorized recipient identity changed');
+    expect(mockSb.getWrites()).toEqual([]);
+  });
+
+  it('allows the same single recipient when the server identity binding matches', async () => {
+    const { findThread, getParticipants } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW({ id: 'thread-person' }));
+    vi.mocked(getParticipants).mockResolvedValue([P('wren')]);
+    const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-person' } });
+    const result = await handleSendToInbox(
+      {
+        email: 'fixture@example.invalid',
+        threadKey: 'thread:synthetic-browser',
+        recipientSlug: 'wren',
+        content: 'Synthetic message.',
+      },
+      createThreadMockDataComposer(mockSb) as never,
+      {
+        recipientId: SB_IDS.wren,
+        sender: { principal: userPrincipal('user-123'), workspaceId: WS },
+      }
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(mockSb.getWrites().some((write) => write.table === 'inbox_thread_messages')).toBe(true);
+  });
+
   it("a person's reply lands as a real principal: their participant row first, then a message authored by user", async () => {
     // Spec inkmail-thread-scope §3, §7: the author of a person's reply is the
     // person — sender_kind 'user' with their id, never an 'unknown' slug —
