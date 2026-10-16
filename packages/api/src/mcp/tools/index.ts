@@ -266,6 +266,11 @@ import {
   updateCalendarEventSchema,
   createCalendarEventSchema,
 } from '../../stories/google-calendar/handlers';
+import {
+  BUSY_DAYS_AHEAD,
+  getSpaceBusyTimesSchema,
+  handleGetSpaceBusyTimes,
+} from '../../stories/google-calendar/space-busy-times';
 
 import {
   handleListEmails,
@@ -5066,6 +5071,37 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleCreateCalendarEvent(args, dataComposer);
       } catch (error) {
         logger.error('Error in create_calendar_event:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_space_busy_times',
+    {
+      description: `When the people in your space are busy, for finding a time that suits everyone.
+
+Returns busy blocks only (start and end, UTC), never event titles or details, from now to a year (${BUSY_DAYS_AHEAD} days) ahead; never the past. Pass days to look less far ahead. Only members who switched "share my busy times here" on in this space are read, each with their own Google calendar. "notSharing" lists those who haven't; they can turn it on in the space screen. "unavailable" lists sharers whose calendar couldn't be read. For anyone in either list, say you can't see their calendar, and never fill the gap from anything else you know about them.
+
+The space is always your own; it reads no other space.`,
+      inputSchema: getSpaceBusyTimesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSpaceBusyTimes(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_space_busy_times:', error);
         return {
           content: [
             {
