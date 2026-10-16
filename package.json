@@ -75,7 +75,7 @@
     "ai-assistant"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "devDependencies": {
     "concurrently": "^9.2.1",
     "husky": "^9.1.7",
