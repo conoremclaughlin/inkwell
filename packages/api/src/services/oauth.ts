@@ -5,7 +5,8 @@
  * Manages token storage, refresh, and revocation.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../data/supabase/client';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   GOOGLE_AUTH_URL,
   GOOGLE_OAUTH_SCOPES,
@@ -149,7 +150,7 @@ class OAuthService {
   private readonly userEmails = new Map<string, { email: string | null; at: number }>();
 
   constructor(options: OAuthServiceOptions = {}) {
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.supabase = createServerSupabaseClient();
     this.sources = options.sources ?? parseGoogleCredentialSources(env.GOOGLE_CREDENTIAL_SOURCES);
     this.desktopStore = options.desktopStore ?? getDesktopGoogleCredentialStore();
     this.accountGate = options.accountGate ?? assertAccountTokenAllowed;

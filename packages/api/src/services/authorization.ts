@@ -5,9 +5,9 @@
  * Controls who can interact with Myra and which groups she responds in.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../data/supabase/client';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
-import { env } from '../config/env';
 import { getRequestContext, getSessionContext } from '../utils/request-context';
 import crypto from 'crypto';
 
@@ -42,7 +42,7 @@ export class AuthorizationService {
 
   constructor() {
     // Use SUPABASE_SECRET_KEY (normalized from either SECRET_KEY or SERVICE_KEY in env.ts)
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.supabase = createServerSupabaseClient();
   }
 
   private resolveWorkspaceId(workspaceId?: string): string | undefined {

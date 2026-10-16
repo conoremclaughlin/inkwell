@@ -5,9 +5,9 @@
  * All external requests, permission changes, and auth events are logged.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../data/supabase/client';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
-import { env } from '../config/env';
 
 export type AuditAction =
   | 'web_search'
@@ -73,9 +73,7 @@ export class AuditService {
   private supabase: SupabaseClient;
 
   constructor() {
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    this.supabase = createServerSupabaseClient();
   }
 
   /**

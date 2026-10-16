@@ -7,11 +7,10 @@
  * - GET /agents - List available agents
  */
 
+import { createServerSupabaseClient } from '../data/supabase/client';
 import { Router, Response } from 'express';
-import { createClient } from '@supabase/supabase-js';
 import { chatAuthMiddleware, type ChatAuthRequest } from './chat-auth';
 import { logger } from '../utils/logger';
-import { env } from '../config/env';
 import type { SessionService } from '../services/sessions/session-service';
 import type { SessionRequest } from '../services/sessions/types';
 import { isSafeStudioComponent } from '@inklabs/shared';
@@ -94,7 +93,7 @@ export function createChatRouter(getSessionService: () => SessionService | null)
         return;
       }
 
-      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+      const supabase = createServerSupabaseClient();
 
       // Query activity_stream for web chat messages
       const { data, error } = await supabase
@@ -137,7 +136,7 @@ export function createChatRouter(getSessionService: () => SessionService | null)
     try {
       const { userId } = req as ChatAuthRequest;
 
-      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+      const supabase = createServerSupabaseClient();
 
       // Query agent_identities for this user
       const { data, error } = await supabase

@@ -9,7 +9,8 @@
  * See ink://specs/2fa-permission-grants for the full design.
  */
 
-import { createClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../data/supabase/client';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import {
@@ -145,9 +146,7 @@ export async function checkApprovalResponse(
     return { intercepted: false };
   }
 
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  const supabase = createServerSupabaseClient();
 
   // Fetch all pending requests for this user (up to 20)
   const { data: pendingRequests, error } = await supabase
@@ -409,9 +408,7 @@ async function flushNotificationBuffer(bufferKey: string): Promise<void> {
   const { requests } = entry;
   const userId = requests[0].userId;
 
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  const supabase = createServerSupabaseClient();
 
   const { data: trustedUsers } = await supabase
     .from('trusted_users')
@@ -518,7 +515,7 @@ export function formatBatchNotification(requests: BufferedRequest[]): string {
 }
 
 async function sendTelegramNotification(
-  supabase: ReturnType<typeof createClient<any, 'public', any>>,
+  supabase: SupabaseClient,
   tu: { platform: string; platform_user_id: string },
   requests: BufferedRequest[],
   message: string,

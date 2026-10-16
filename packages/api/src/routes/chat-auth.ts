@@ -11,9 +11,8 @@
  * - Does NOT check trusted_users table (any authenticated user can chat)
  */
 
+import { createServerSupabaseClient } from '../data/supabase/client';
 import { Request, Response, NextFunction } from 'express';
-import { createClient } from '@supabase/supabase-js';
-import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { Database } from '../data/supabase/types';
 import { resolveAccountForPrincipal } from '../services/account-deletion/principal';
@@ -39,9 +38,7 @@ export async function chatAuthMiddleware(
     const token = authHeader.substring(7);
 
     // Verify the JWT with Supabase
-    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient<Database>();
     const {
       data: { user },
       error,
