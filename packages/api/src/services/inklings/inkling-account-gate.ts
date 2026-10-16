@@ -14,8 +14,9 @@
  * account is read. When the calling SB is an inkling, no token is handed
  * out unless the tool the call runs inside is named in
  * INK_INKLING_ACCOUNT_TOOLS (inklingAccountToolAllowlist). Unset, that is
- * none, apart from get_space_busy_times, which reads only what each member
- * consented to share in the space (INKLING_CONSENTED_ACCOUNT_TOOLS below).
+ * none, apart from get_space_busy_times and create_space_event, which use
+ * only what each member consented to share in the space
+ * (INKLING_CONSENTED_ACCOUNT_TOOLS below).
  * A tool added later that reaches an account is covered without being
  * listed anywhere: it is refused to inklings until it is named.
  *
@@ -59,16 +60,25 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** The tool a space's SB reads its members' shared busy times with. */
 export const SPACE_BUSY_TIMES_TOOL = 'get_space_busy_times';
 
+/** The tool a space's SB creates an event on a sharing member's calendar with. */
+export const SPACE_EVENT_TOOL = 'create_space_event';
+
 /**
  * Tools an inkling's turn may use accounts in without INK_INKLING_ACCOUNT_TOOLS
- * naming them, because the consent each account read needs is its holder's
- * own, given in the space, not the owner's. That is one tool:
- * get_space_busy_times reads a member's calendar only after that member
- * switched "share my busy times here" on in the space (D6), and only as
- * free/busy, from now to a year ahead (D7). It never returns a token.
+ * naming them, because the consent each account use needs is its holder's
+ * own, given in the space, not the owner's. Two tools, and only these:
+ * - get_space_busy_times reads a member's calendar only after that member
+ *   switched "share my busy times here" on in the space (D6), and only as
+ *   free/busy, from now to a year ahead (D7);
+ * - create_space_event creates one event on the calendar of a member who
+ *   asked for it in the conversation and confirmed it there, inviting other
+ *   members, every one of whom has that same switch on (Conor's choice on
+ *   Oct 16: the confirmation is the inkling's to judge).
+ * Neither returns a token.
  */
 export const INKLING_CONSENTED_ACCOUNT_TOOLS: ReadonlySet<string> = new Set([
   SPACE_BUSY_TIMES_TOOL,
+  SPACE_EVENT_TOOL,
 ]);
 
 /** The SBs a request context says are calling, UUIDs and slugs apart. */

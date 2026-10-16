@@ -546,10 +546,17 @@ export class GoogleCalendarService {
   }
 
   /**
-   * Create a new calendar event.
+   * Create a new calendar event. `connection` picks which of the user's Google
+   * connections writes it; left out, the request's own.
    */
-  async createEvent(userId: string, options: CreateEventOptions): Promise<CalendarEvent> {
-    const calendar = await this.getClient(userId);
+  async createEvent(
+    userId: string,
+    options: CreateEventOptions,
+    connection?: { workspaceId: string | null; accountId?: string }
+  ): Promise<CalendarEvent> {
+    const calendar = connection
+      ? await this.getClient(userId, connection.workspaceId, connection.accountId)
+      : await this.getClient(userId);
 
     const {
       calendarId = 'primary',
