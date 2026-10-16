@@ -13,6 +13,7 @@ const manifest = (path) => JSON.parse(read(`${path}/package.json`));
 const server = read('packages/api/LICENSE');
 const root = read('LICENSE');
 const mit = root.slice(root.indexOf('MIT License\n'));
+const compact = (text) => text.replace(/\s+/g, ' ');
 
 test('the original server future MIT grant remains byte-for-byte unchanged', () => {
   const marker = '## Grant of Future License\n';
@@ -40,7 +41,7 @@ test('the extension is identified as modified and connected to the grant', () =>
 test('root and API metadata point to scoped license texts', () => {
   assert.equal(JSON.parse(read('package.json')).license, 'SEE LICENSE IN LICENSE');
   assert.equal(manifest('packages/api').license, 'SEE LICENSE IN LICENSE');
-  assert.match(root, /server in packages\/api and its modifications and derivatives/);
+  assert.match(root, /packages\/api/);
   assert.match(root, /governed by packages\/api\/LICENSE/);
 });
 
@@ -71,4 +72,69 @@ test('the MIT runtime entry points remain exported without an API dependency', (
   ]) {
     assert.equal(shared[field]?.['@inklabs/api'], undefined, field);
   }
+});
+
+test('the operative and root scope name the API, dashboard and first-party database files', () => {
+  const scope = server.slice(
+    server.indexOf('### The Software\n'),
+    server.indexOf('### License Grant\n')
+  );
+  for (const path of ['packages/api', 'packages/web', 'supabase/']) {
+    assert.ok(scope.includes(path), `operative scope: ${path}`);
+    assert.ok(root.includes(path), `root scope: ${path}`);
+  }
+  assert.match(compact(scope), /first-party/);
+  assert.match(
+    compact(scope),
+    /does not include the Supabase platform, third-party components, or users' stored data/
+  );
+});
+
+for (const path of ['packages/web', 'supabase']) {
+  test(`${path} carries the complete, identical server license`, () => {
+    assert.equal(read(`${path}/LICENSE`), server);
+  });
+}
+
+test('dashboard metadata and scope documentation agree with the expanded license', () => {
+  assert.equal(manifest('packages/web').license, 'SEE LICENSE IN LICENSE');
+  const docs = read('docs/licensing.md');
+  for (const path of ['packages/api', 'packages/web', 'supabase/']) {
+    const row = docs
+      .split('\n')
+      .find((line) => line.startsWith('|') && line.includes(`\`${path}\``));
+    assert.ok(row?.includes('Inkwell Server License 1.0'), `scope table: ${path}`);
+  }
+  const readmeLicense = read('README.md').split('## License\n')[1];
+  for (const path of ['packages/api', 'packages/web', 'supabase/']) {
+    assert.ok(readmeLicense.includes(`\`${path}\``), `README scope: ${path}`);
+  }
+  assert.match(readmeLicense, /Inkwell Server License/);
+  assert.match(
+    compact(docs),
+    /Earlier MIT grants for the dashboard and database files remain available/
+  );
+});
+
+test('the community invitation requests permission rather than granting an exemption', () => {
+  const docs = compact(read('docs/licensing.md'));
+  assert.match(
+    docs,
+    /Community-run projects, including donation- or sponsor-supported deployments/
+  );
+  assert.match(docs, /contact the Licensor to request written permission/);
+  assert.match(docs, /This invitation does not itself authorize a use outside the license grant/);
+});
+
+test('the commercial-use wording and exceptions remain byte-for-byte unchanged', () => {
+  const start = '### Permitted Purpose\n';
+  const end = '### Patents\n';
+  assert.equal(server.split(start).length, 2);
+  assert.equal(server.split(end).length, 2);
+  const terms = server.slice(server.indexOf(start), server.indexOf(end));
+  // The complete restriction/boundary block at the previously reviewed 9b58183a.
+  assert.equal(
+    createHash('sha256').update(terms).digest('hex'),
+    '110d65a3a6054cad0bf086b5249f576df611bb9b01b7dcfa6754f3d0e6869619'
+  );
 });

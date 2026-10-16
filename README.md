@@ -372,8 +372,8 @@ Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aste
 
 ## License
 
-The Inkwell server (`packages/api`) uses the [Inkwell Server License](./packages/api/LICENSE), an **extension of FSL 1.1** with additional commercial hosting and server-backed application restrictions. Each server version becomes available under MIT on the second anniversary of when that version was made available.
+The Inkwell API server (`packages/api`), web dashboard (`packages/web`), and first-party database source and configuration (`supabase/`) use the [Inkwell Server License](./packages/api/LICENSE), an **extension of FSL 1.1** with additional commercial hosting and server-backed application restrictions. Each version of the covered software becomes available under MIT on the second anniversary of when that version was made available. This scope does not include the Supabase platform or users' stored data.
 
-The runtime, providers, and node-host exports in `packages/shared`, the CLI, and other first-party files outside the server remain [MIT](./LICENSE) unless separately marked. Their MIT permissions apply immediately, including commercial use. Third-party components retain their own licenses.
+The whole `packages/shared` package (including runtime, providers, and node-host), the CLI, and other first-party files outside those three directories remain [MIT](./LICENSE) unless separately marked. Their MIT permissions apply immediately, including commercial use. Third-party components retain their own licenses, and earlier license grants are not revoked.
 
 See the [license scope and usage examples](./docs/licensing.md) for the distinction between permitted self-hosting and commercial server offerings. This is a modified, source-available server license, not unmodified FSL-1.1-MIT.

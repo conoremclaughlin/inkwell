@@ -1,0 +1,199 @@
+# Inkwell Server License, Version 1.0
+
+## Relationship to FSL 1.1
+
+This license is an extension of the Functional Source License, Version 1.1,
+MIT Future License (FSL-1.1-MIT), with additional Inkwell provisions. It is a
+modified license, not the unmodified FSL-1.1-MIT license. The Terms and
+Conditions below, including the Additional Provisions, form one license.
+
+Custom license reference: LicenseRef-Inkwell-Server-1.0
+
+## Notice
+
+Copyright 2026 Conor McLaughlin
+
+## Terms and Conditions
+
+### Licensor ("We")
+
+The party offering the Software under these Terms and Conditions.
+
+### The Software
+
+The "Software" is each version of the software that we make available under
+these Terms and Conditions, as indicated by our inclusion of these Terms and
+Conditions with the Software.
+
+This license covers the following first-party Inkwell components supplied
+with it, identified by their locations in the source repository:
+
+1. The API server in packages/api;
+2. The web dashboard in packages/web; and
+3. The database source and configuration in supabase/, including its schema,
+   migrations, and seed files.
+
+It also covers modifications and derivatives of those components. This scope
+does not include the Supabase platform, third-party components, or users' stored
+data. Separately licensed components, including packages/shared and the CLI in
+packages/cli, retain their own licenses; these Terms and Conditions do not
+relicense them.
+
+### License Grant
+
+Subject to your compliance with this License Grant and the Patents,
+Redistribution and Trademark clauses below, we hereby grant you the right to
+use, copy, modify, create derivative works, publicly perform, publicly display
+and redistribute the Software for any Permitted Purpose identified below.
+
+### Permitted Purpose
+
+A Permitted Purpose is any purpose other than a Competing Use or a Restricted
+Commercial Use, unless We separately authorize that use in writing.
+A Competing Use means making the Software available to others in a commercial
+product or service that:
+
+1. substitutes for the Software;
+
+2. substitutes for any other product or service we offer using the Software
+   that exists as of the date we make the Software available; or
+
+3. offers the same or substantially similar functionality as the Software.
+
+Permitted Purposes specifically include using the Software:
+
+1. for your internal use and access;
+
+2. for non-commercial education;
+
+3. for non-commercial research; and
+
+4. in connection with professional services that you provide to a licensee
+   using the Software in accordance with these Terms and Conditions.
+
+The examples above do not authorize a Restricted Commercial Use. The
+Additional Provisions below define that restriction and its boundaries.
+
+### Additional Provisions (Inkwell Extension)
+
+#### Restricted Commercial Use
+
+A "Commercial Offering" is a product or service for which fees or other
+monetary consideration are charged or received in connection with its
+provision or use. This includes subscriptions, usage charges, one-time fees,
+paid bundles, advertising-supported or sponsor-supported offerings, and free
+trials or free tiers of an otherwise monetized offering.
+
+"Restricted Commercial Use" means either of the following:
+
+1. Selling, reselling, or providing hosting, managed operation, or access to
+   the Software for another party as part of a Commercial Offering; or
+
+2. Using or operating the Software to provide any of its functionality to
+   users outside your organization as part of a Commercial Offering,
+   whether directly or through an application, API, proxy, intermediary, or
+   other backend integration.
+
+These restrictions apply whether or not the Commercial Offering is a
+Competing Use, whether or not users can access the Software directly, and
+whether the Software is modified, rebranded, or combined with other software.
+Restricted Commercial Use requires Our separate written authorization.
+
+#### Boundaries and permitted activities
+
+The following activities do not, by themselves, constitute Restricted
+Commercial Use, provided they are not a Competing Use:
+
+1. Personal use, or use within your organization, including access by
+   employees and contractors acting on your behalf, without providing
+   Software-backed application or service functionality to outside users.
+
+2. Development, testing, evaluation, non-commercial education, non-commercial
+   research, and contributions to the Software, without providing a
+   Commercial Offering described above to outside users.
+
+3. Consulting, installation, customization, maintenance, or support for a
+   licensee's otherwise permitted deployment. This does not include hosting
+   or operating the Software as a managed service for that licensee, even if
+   described as consulting or support.
+
+4. Supplying general-purpose computing, storage, or network resources on
+   which a customer installs and operates their own permitted deployment.
+   Supplying a managed instance of the Software, or an application or service
+   backed by the Software, is not merely supplying those resources.
+
+5. Selling work products, such as documents or reports, created through your
+   permitted internal use, where the recipient receives the work product
+   rather than access to Software-backed application or service
+   functionality. This does not exempt an application or service that
+   supplies Software functionality in response to its users' requests.
+
+#### Other licenses and earlier grants
+
+These Additional Provisions do not limit the separate MIT licenses for the
+runtime or other separately licensed components. They do not revoke rights
+already granted under earlier licenses or restart any earlier version's
+future-license period.
+
+The Grant of Future License below is unchanged and applies to each version
+of the Software. Once that grant takes effect for a version, you may choose
+the MIT license for that version without these Additional Provisions or the
+other restrictions in these Terms and Conditions. Making a later version
+available does not postpone an earlier version's eligibility.
+
+### Patents
+
+To the extent your use for a Permitted Purpose would necessarily infringe our
+patents, the license grant above includes a license under our patents. If you
+make a claim against any party that the Software infringes or contributes to
+the infringement of any patent, then your patent license to the Software ends
+immediately.
+
+### Redistribution
+
+The Terms and Conditions apply to all copies, modifications and derivatives of
+the Software.
+
+If you redistribute any copies, modifications or derivatives of the Software,
+you must include a copy of or a link to these Terms and Conditions and not
+remove any copyright notices provided in or with the Software.
+
+### Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTIES OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF FITNESS FOR A PARTICULAR
+PURPOSE, MERCHANTABILITY, TITLE OR NON-INFRINGEMENT.
+
+IN NO EVENT WILL WE HAVE ANY LIABILITY TO YOU ARISING OUT OF OR RELATED TO THE
+SOFTWARE, INCLUDING INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES,
+EVEN IF WE HAVE BEEN INFORMED OF THEIR POSSIBILITY IN ADVANCE.
+
+### Trademarks
+
+Except for displaying the License Details and identifying us as the origin of
+the Software, you have no right under these Terms and Conditions to use our
+trademarks, trade names, service marks or product names.
+
+## Grant of Future License
+
+We hereby irrevocably grant you an additional license to use the Software under
+the MIT license that is effective on the second anniversary of the date we make
+the Software available. On or after that date, you may use the Software under
+the MIT license, in which case the following will apply:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

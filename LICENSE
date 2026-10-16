@@ -2,16 +2,19 @@ Inkwell license scope
 
 The MIT license below applies to this repository except for:
 
-- The Inkwell server in packages/api and its modifications and derivatives,
-  which are governed by packages/api/LICENSE (the Inkwell Server License,
-  an extension of FSL 1.1 with additional provisions and a two-year MIT
-  future grant).
+- The first-party Inkwell API server in packages/api, web dashboard in
+  packages/web, database source and configuration in supabase/, and their
+  modifications and derivatives, which are governed by packages/api/LICENSE
+  (the Inkwell Server License, an extension of FSL 1.1 with additional
+  provisions and a two-year MIT future grant).
 - Components or files carrying separate third-party license notices, which
   remain governed by their respective licenses.
 
-The MIT-licensed runtime, providers, and node-host exports in packages/shared,
-and the CLI in packages/cli, remain MIT-licensed immediately. This notice
-neither relicenses server code copied elsewhere nor revokes earlier grants.
+The whole packages/shared package, including its runtime, providers, and
+node-host exports, and the CLI in packages/cli remain MIT-licensed immediately.
+Moving covered code alone does not change its license. Separate grants by the
+relevant rights holders and earlier license grants remain unaffected.
+The database scope does not include the Supabase platform or users' stored data.
 See docs/licensing.md for the scope map and explanatory examples.
 
 MIT License

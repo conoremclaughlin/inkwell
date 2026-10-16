@@ -25,10 +25,18 @@ The "Software" is each version of the software that we make available under
 these Terms and Conditions, as indicated by our inclusion of these Terms and
 Conditions with the Software.
 
-This license covers the Inkwell server supplied with it (located in
-packages/api in the source repository), and modifications and derivatives of
-that server. Separately licensed components, including the MIT-licensed
-runtime, retain their own licenses; these Terms and Conditions do not
+This license covers the following first-party Inkwell components supplied
+with it, identified by their locations in the source repository:
+
+1. The API server in packages/api;
+2. The web dashboard in packages/web; and
+3. The database source and configuration in supabase/, including its schema,
+   migrations, and seed files.
+
+It also covers modifications and derivatives of those components. This scope
+does not include the Supabase platform, third-party components, or users' stored
+data. Separately licensed components, including packages/shared and the CLI in
+packages/cli, retain their own licenses; these Terms and Conditions do not
 relicense them.
 
 ### License Grant
