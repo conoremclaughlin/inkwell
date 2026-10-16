@@ -135,7 +135,10 @@ import {
   OPEN_THREADS_FILTER,
   PARTICIPANT_ONLY_COLUMN,
   PARTICIPANT_ONLY_PATH,
+  SHARED_GROUP_COLUMN,
   isParticipantOnlyThread,
+  isSharedGroupRow,
+  isSharedGroupThread,
   mayReadThread,
 } from '../services/threads/thread-read-access';
 import {
@@ -8483,7 +8486,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     // One list for every thread read below (the newest window and the
     // hydration of older carrier keys), so none can drop a column alone.
     // The embed carries each thread's newest message for the list preview.
-    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${PARTICIPANT_ONLY_COLUMN}, ${LAST_MESSAGE_EMBED}`;
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${PARTICIPANT_ONLY_COLUMN}, ${SHARED_GROUP_COLUMN}, ${LAST_MESSAGE_EMBED}`;
 
     // The newest window is two reads (D3): the threads every reader here may
     // read (threadsRes), and the participant-only ones this viewer is in
@@ -8730,6 +8733,8 @@ router.get('/threads', async (req: Request, res: Response) => {
             : t.created_by_kind,
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
+        // A group chat created with other people of the space.
+        shared: isSharedGroupRow(t),
         participants: participantsByThreadId.get(t.id) ?? [],
         // Named for THIS viewer: a person's own row says so (spec §3).
         people: describePeople(peopleByThreadId.get(t.id) ?? [], personNames, authReq.inkUserId),
@@ -9051,6 +9056,8 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
         createdByUserId: thread.created_by_user_id ?? null,
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
+        // A group chat created with other people of the space.
+        shared: isSharedGroupThread(thread.metadata),
       },
       messages: (messageRows || [])
         .map((m) => ({
