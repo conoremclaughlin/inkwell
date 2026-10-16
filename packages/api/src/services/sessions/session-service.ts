@@ -3382,7 +3382,7 @@ export class SessionService implements ISessionService {
       let nativeSteering: ReturnType<typeof createNativeSteeringBinding> = undefined;
       try {
         nativeSteering =
-          resolvedBackend === 'codex-cli'
+          resolvedBackend === 'codex-cli' || resolvedBackend === 'claude-code'
             ? createNativeSteeringBinding({
                 sessionId: session.id,
                 turnEpoch,
