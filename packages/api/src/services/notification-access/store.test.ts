@@ -11,10 +11,11 @@ const scope = { ownerId: id(1), workspaceId: id(2) };
 const input = {
   installationId: id(6),
   recipientId: id(3),
-  conversationId: id(4),
+  conversationId: 'inkling:chat:synthetic-notifications',
+  deviceTime: NOW,
   refreshToken: 'synthetic-refresh',
   selectedPackages: ['com.example.messages'],
-  rules: [{ packageName: 'com.example.messages', match: { kind: 'all' as const } }],
+  rules: [],
   disclosureAccepted: true as const,
   permissionReported: 'granted' as const,
 };
@@ -27,7 +28,7 @@ const watcher = {
   signin_id: id(5),
   installation_id: id(6),
   selected_packages: input.selectedPackages,
-  rules: input.rules,
+  clock_offset_ms: 0,
   status: 'active' as const,
   active_since: iso(-1000),
   expires_at: iso(100000),
@@ -44,7 +45,14 @@ let db: ReturnType<typeof createClient>;
 beforeEach(() => {
   tables = {
     agent_identities: [{ id: id(3), user_id: id(1), workspace_id: id(2) }],
-    inbox_threads: [{ id: id(4), workspace_id: id(2), metadata: { inklingConversation: true } }],
+    inbox_threads: [
+      {
+        id: id(4),
+        thread_key: input.conversationId,
+        workspace_id: id(2),
+        metadata: { inklingConversation: true },
+      },
+    ],
     inbox_thread_participants: [
       { thread_id: id(4), user_id: id(1), sb_id: null },
       { thread_id: id(4), sb_id: id(3), user_id: null },
@@ -60,6 +68,7 @@ beforeEach(() => {
     ],
     sb_notification_watchers: [{ ...watcher }],
     sb_notification_events: [],
+    sb_notification_rule_versions: [],
   };
   calls = [];
   fault = null;
@@ -101,6 +110,8 @@ beforeEach(() => {
         active_since: iso(0),
         created_at: iso(0),
         status: 'active',
+        clock_offset_ms: 0,
+        revision: all.length + 1,
         ...body,
       };
       all.push(inserted);
@@ -110,6 +121,9 @@ beforeEach(() => {
     } else if (method === 'DELETE') {
       tables[table] = all.filter((row) => !rows.includes(row));
     }
+    const order = url.searchParams.get('order');
+    if (order === 'revision.desc')
+      rows = [...rows].sort((a, b) => Number(b.revision) - Number(a.revision));
     if (url.searchParams.has('limit')) rows = rows.slice(0, Number(url.searchParams.get('limit')));
     const columns = url.searchParams.get('select')?.split(',');
     const projected = columns
@@ -130,7 +144,12 @@ beforeEach(() => {
 
 describe('private notification target', () => {
   it('requires the actual private owner-and-recipient participant pair', async () => {
-    await expect(assertNotificationTarget(db, scope, id(3), id(4))).resolves.toBeUndefined();
+    await expect(assertNotificationTarget(db, scope, id(3), input.conversationId)).resolves.toBe(
+      id(4)
+    );
+    await expect(assertNotificationTarget(db, scope, id(3), id(4))).rejects.toMatchObject({
+      code: 'target_refused',
+    });
   });
   it.each([
     'unmarked',
@@ -155,7 +174,9 @@ describe('private notification target', () => {
       tables.inbox_thread_participants.push({ thread_id: id(4), user_id: id(32), sb_id: null });
     if (variant === 'foreign-workspace') tables.inbox_threads[0].workspace_id = id(33);
     if (variant === 'foreign-owner') tables.agent_identities[0].user_id = id(34);
-    await expect(assertNotificationTarget(db, scope, id(3), id(4))).rejects.toMatchObject({
+    await expect(
+      assertNotificationTarget(db, scope, id(3), input.conversationId)
+    ).rejects.toMatchObject({
       code: 'target_refused',
     });
   });
@@ -163,7 +184,9 @@ describe('private notification target', () => {
     'refuses unreadable %s',
     async (table) => {
       fault = { table, code: 'synthetic_failure' };
-      await expect(assertNotificationTarget(db, scope, id(3), id(4))).rejects.toMatchObject({
+      await expect(
+        assertNotificationTarget(db, scope, id(3), input.conversationId)
+      ).rejects.toMatchObject({
         code: 'unavailable',
         message: 'unavailable',
       });
@@ -186,6 +209,9 @@ describe('sign-in and grant binding', () => {
       (call) => call.table === 'sb_notification_watchers' && call.method === 'POST'
     )!.body!;
     expect(written.signin_id).toBe(id(5));
+    expect(written.thread_id).toBe(id(4));
+    expect(written.device_time_ms).toBe(NOW);
+    expect(written).not.toHaveProperty('rules');
     expect(written.token_digest).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(written)).not.toContain('synthetic-refresh');
     expect(JSON.stringify(written)).not.toContain(created.deviceToken);
@@ -228,6 +254,77 @@ describe('sign-in and grant binding', () => {
   it('does not query a malformed digest', async () => {
     expect(await store.deviceAccess('synthetic', NOW)).toBeNull();
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('separate mutable owner rules', () => {
+  const rules = [{ packageName: 'com.example.messages', match: { kind: 'all' } }];
+  it('starts empty and appends a new version without rotating device consent', async () => {
+    expect(await store.rules(scope, id(7))).toEqual({ revision: 0, rules: [] });
+    expect(await store.setRules(scope, id(7), { rules }, NOW)).toEqual({ revision: 1, rules });
+    expect(await store.setRules(scope, id(7), { rules: [] }, NOW)).toEqual({
+      revision: 2,
+      rules: [],
+    });
+    expect(await store.rules(scope, id(7))).toEqual({ revision: 2, rules: [] });
+    expect(tables.sb_notification_rule_versions).toHaveLength(2);
+    expect(tables.sb_notification_watchers[0]).toEqual(watcher);
+    expect(
+      calls
+        .filter((call) => call.table === 'sb_notification_rule_versions' && call.method === 'POST')
+        .every((call) => call.body?.actor_id === scope.ownerId)
+    ).toBe(true);
+  });
+  it('cannot read or edit another owner or workspace', async () => {
+    for (const other of [
+      { ...scope, ownerId: id(98) },
+      { ...scope, workspaceId: id(99) },
+    ]) {
+      await expect(store.rules(other, id(7))).rejects.toMatchObject({ code: 'not_found' });
+      await expect(store.setRules(other, id(7), { rules }, NOW)).rejects.toMatchObject({
+        code: 'not_found',
+      });
+    }
+    expect(tables.sb_notification_rule_versions).toHaveLength(0);
+  });
+  it('refuses unselected apps, code, destination and client-supplied revision', async () => {
+    for (const raw of [
+      { rules: [{ ...rules[0], packageName: 'com.example.other' }] },
+      { rules: [{ ...rules[0], source: 'synthetic-code' }] },
+      { rules, destination: 'synthetic-target' },
+      { rules, revision: 2 },
+    ])
+      await expect(store.setRules(scope, id(7), raw, NOW)).rejects.toMatchObject({
+        code: 'invalid_request',
+      });
+    expect(tables.sb_notification_rule_versions).toHaveLength(0);
+  });
+  it('refuses inactive grants and newly shared conversations', async () => {
+    tables.sb_notification_watchers[0].status = 'revoked';
+    await expect(store.setRules(scope, id(7), { rules }, NOW)).rejects.toMatchObject({
+      code: 'access_inactive',
+    });
+    tables.sb_notification_watchers[0].status = 'active';
+    tables.inbox_threads[0].metadata = { inklingConversation: true, inklingShared: true };
+    await expect(store.setRules(scope, id(7), { rules }, NOW)).rejects.toMatchObject({
+      code: 'target_refused',
+    });
+  });
+  it('keeps app label and raw device time while the database owns calibration', async () => {
+    await store.record(watcher, {
+      eventId: id(8),
+      packageName: 'com.example.messages',
+      appLabel: 'Demo app',
+      title: '',
+      text: '',
+      postedAt: NOW - 90_000,
+    });
+    const written = calls.find(
+      (call) => call.table === 'sb_notification_events' && call.method === 'POST'
+    )!.body!;
+    expect(written.app_label).toBe('Demo app');
+    expect(written.device_posted_at_ms).toBe(NOW - 90_000);
+    expect(written).not.toHaveProperty('posted_at');
   });
 });
 

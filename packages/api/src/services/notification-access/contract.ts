@@ -3,6 +3,11 @@ import { z } from 'zod';
 export const NOTIFICATION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const NOTIFICATION_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const NOTIFICATION_BODY_LIMIT = 48 * 1024;
+export const notificationDeviceTimeSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(8_640_000_000_000_000);
 
 // PostgreSQL text/jsonb cannot represent NUL or an unpaired surrogate.
 // Unicode-mode matching leaves valid surrogate pairs (such as emoji) intact.
@@ -34,9 +39,10 @@ export const notificationEventSchema = z
       .uuid()
       .transform((id) => id.toLowerCase()),
     packageName: notificationPackageSchema,
+    appLabel: databaseText(255).optional(),
     title: databaseText(512),
     text: databaseText(8192),
-    postedAt: z.number().int().nonnegative().max(8_640_000_000_000_000),
+    postedAt: notificationDeviceTimeSchema,
   })
   .strict();
 
@@ -61,24 +67,26 @@ export const notificationRuleSchema = z
   .strict();
 
 export type NotificationRule = z.infer<typeof notificationRuleSchema>;
+export const notificationRulesSchema = z.array(notificationRuleSchema).max(20);
+export const updateNotificationRulesSchema = z.object({ rules: notificationRulesSchema }).strict();
 
 /** The person consents through the existing signed-in transport, not a device token. */
 export const createNotificationWatcherSchema = z
   .object({
     installationId: z.string().uuid(),
     recipientId: z.string().uuid(),
-    conversationId: z.string().uuid(),
+    // The mobile conversation identifier is a thread key, resolved in owner/workspace scope.
+    conversationId: databaseText(255).min(1),
+    deviceTime: notificationDeviceTimeSchema,
     refreshToken: z.string().min(1).max(2048),
     selectedPackages: notificationPackagesSchema,
-    rules: z.array(notificationRuleSchema).min(1).max(20),
+    // No automatic matching at consent. Rules are a separate owner-managed resource.
+    rules: notificationRulesSchema.length(0),
     disclosureAccepted: z.literal(true),
     // A report by the phone, not server attestation of an OS permission.
     permissionReported: z.literal('granted'),
   })
-  .strict()
-  .refine((input) =>
-    input.rules.every((rule) => input.selectedPackages.includes(rule.packageName))
-  );
+  .strict();
 
 export type CreateNotificationWatcher = z.infer<typeof createNotificationWatcherSchema>;
 

@@ -5,6 +5,7 @@ import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import {
   NOTIFICATION_BODY_LIMIT,
   createNotificationWatcherSchema,
+  updateNotificationRulesSchema,
 } from '../services/notification-access/contract';
 import {
   admitNotification,
@@ -20,7 +21,15 @@ import {
 
 type Store = Pick<
   NotificationAccessStore,
-  'create' | 'deviceAccess' | 'list' | 'revoke' | 'remove' | 'record' | 'events'
+  | 'create'
+  | 'deviceAccess'
+  | 'list'
+  | 'revoke'
+  | 'remove'
+  | 'record'
+  | 'events'
+  | 'rules'
+  | 'setRules'
 >;
 export interface NotificationRouterDependencies {
   /** Null means not configured. No hidden in-memory production fallback. */
@@ -77,9 +86,8 @@ function publicWatcher(watcher: NotificationWatcher, now: number) {
     id: watcher.id,
     installationId: watcher.installation_id,
     recipientId: watcher.recipient_id,
-    conversationId: watcher.thread_id,
+    threadId: watcher.thread_id,
     selectedPackages: watcher.selected_packages,
-    rules: watcher.rules,
     status:
       watcher.status === 'active' && Date.parse(watcher.expires_at) <= now
         ? 'expired'
@@ -159,6 +167,33 @@ export function createNotificationAccessAdminRouter(deps: NotificationRouterDepe
         (await requireStore(deps)).events(scope, id.data, now())
       );
       res.json({ events });
+    } catch (error) {
+      failure(res, error);
+    }
+  });
+  router.get('/watchers/:watcherId/rules', async (req, res) => {
+    try {
+      const scope = scopeOf(req);
+      const id = z.string().uuid().safeParse(req.params.watcherId);
+      if (!id.success) throw new NotificationAccessError('invalid_request');
+      res.json(
+        await underGates(scope, async () => (await requireStore(deps)).rules(scope, id.data))
+      );
+    } catch (error) {
+      failure(res, error);
+    }
+  });
+  router.put('/watchers/:watcherId/rules', async (req, res) => {
+    try {
+      const scope = scopeOf(req);
+      const id = z.string().uuid().safeParse(req.params.watcherId);
+      const input = updateNotificationRulesSchema.safeParse(req.body);
+      if (!id.success || !input.success) throw new NotificationAccessError('invalid_request');
+      res.json(
+        await underGates(scope, async () =>
+          (await requireStore(deps)).setRules(scope, id.data, input.data, now())
+        )
+      );
     } catch (error) {
       failure(res, error);
     }

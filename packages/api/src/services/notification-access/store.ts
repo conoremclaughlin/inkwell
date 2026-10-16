@@ -3,7 +3,8 @@ import { z } from 'zod';
 import {
   createNotificationWatcherSchema,
   notificationPackagesSchema,
-  notificationRuleSchema,
+  notificationRulesSchema,
+  updateNotificationRulesSchema,
   type CreateNotificationWatcher,
   type NotificationEvent,
 } from './contract';
@@ -61,7 +62,7 @@ const watcherSchema = z.object({
   signin_id: z.string().uuid(),
   installation_id: z.string().uuid(),
   selected_packages: notificationPackagesSchema,
-  rules: z.array(notificationRuleSchema).min(1).max(20),
+  clock_offset_ms: z.number().int().safe(),
   status: z.enum(['active', 'paused', 'revoked']),
   active_since: timestamp,
   expires_at: timestamp,
@@ -72,7 +73,12 @@ export type NotificationWatcher = z.infer<typeof watcherSchema>;
 
 // Never select refresh_token or token_digest on a listing or response path.
 const WATCHER_COLUMNS =
-  'id, owner_id, workspace_id, recipient_id, thread_id, signin_id, installation_id, selected_packages, rules, status, active_since, expires_at, created_at';
+  'id, owner_id, workspace_id, recipient_id, thread_id, signin_id, installation_id, selected_packages, clock_offset_ms, status, active_since, expires_at, created_at';
+
+const ruleVersionSchema = z.object({
+  revision: z.number().int().positive(),
+  rules: notificationRulesSchema,
+});
 
 function watcherFrom(raw: unknown): NotificationWatcher {
   const parsed = watcherSchema.safeParse(raw);
@@ -86,6 +92,7 @@ export function notificationAccessState(watcher: NotificationWatcher): Notificat
     selectedPackages: watcher.selected_packages,
     activeSince: Date.parse(watcher.active_since),
     expiresAt: Date.parse(watcher.expires_at),
+    clockOffsetMs: watcher.clock_offset_ms,
   };
 }
 
@@ -94,8 +101,9 @@ export async function assertNotificationTarget(
   db: SupabaseClient,
   scope: NotificationOwner,
   recipientId: string,
-  conversationId: string
-): Promise<void> {
+  conversationId: string,
+  lookup: 'thread_key' | 'id' = 'thread_key'
+): Promise<string> {
   const identity = await db
     .from('agent_identities')
     .select('id')
@@ -107,7 +115,7 @@ export async function assertNotificationTarget(
   const thread = await db
     .from('inbox_threads')
     .select('id, metadata')
-    .eq('id', conversationId)
+    .eq(lookup, conversationId)
     .eq('workspace_id', scope.workspaceId)
     .maybeSingle();
   check(thread.error);
@@ -115,6 +123,7 @@ export async function assertNotificationTarget(
   if (
     !identity.data ||
     !thread.data ||
+    !z.string().uuid().safeParse(thread.data.id).success ||
     metadata?.inklingConversation !== true ||
     metadata?.inklingShared === true
   ) {
@@ -123,7 +132,7 @@ export async function assertNotificationTarget(
   const members = await db
     .from('inbox_thread_participants')
     .select('sb_id, user_id')
-    .eq('thread_id', conversationId)
+    .eq('thread_id', thread.data.id)
     .limit(3);
   check(members.error);
   const parsed = z
@@ -136,6 +145,7 @@ export async function assertNotificationTarget(
     !parsed.data.some((row) => row.sb_id === recipientId && row.user_id === null)
   )
     throw new NotificationAccessError('target_refused');
+  return thread.data.id;
 }
 
 /**
@@ -166,7 +176,7 @@ export class NotificationAccessStore {
       .object({ id: z.string().uuid(), expires_at: timestamp })
       .safeParse(signin.data);
     if (!session.success) throw new NotificationAccessError('access_inactive');
-    await assertNotificationTarget(
+    const threadId = await assertNotificationTarget(
       this.db,
       scope,
       parsed.data.recipientId,
@@ -179,11 +189,11 @@ export class NotificationAccessStore {
         owner_id: scope.ownerId,
         workspace_id: scope.workspaceId,
         recipient_id: parsed.data.recipientId,
-        thread_id: parsed.data.conversationId,
+        thread_id: threadId,
         signin_id: session.data.id,
         installation_id: parsed.data.installationId,
         selected_packages: parsed.data.selectedPackages,
-        rules: parsed.data.rules,
+        device_time_ms: parsed.data.deviceTime,
         token_digest: credential.digest,
         expires_at: session.data.expires_at,
       })
@@ -254,6 +264,57 @@ export class NotificationAccessStore {
     check(result.error);
   }
 
+  async rules(
+    scope: NotificationOwner,
+    id: string
+  ): Promise<{ revision: number; rules: z.infer<typeof notificationRulesSchema> }> {
+    if (!(await this.find(scope, id))) throw new NotificationAccessError('not_found');
+    const result = await this.db
+      .from('sb_notification_rule_versions')
+      .select('revision, rules')
+      .eq('watcher_id', id)
+      .order('revision', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    check(result.error);
+    if (!result.data) return { revision: 0, rules: [] };
+    const parsed = ruleVersionSchema.safeParse(result.data);
+    if (!parsed.success) throw new NotificationAccessError('unavailable');
+    return parsed.data;
+  }
+
+  async setRules(
+    scope: NotificationOwner,
+    id: string,
+    raw: unknown,
+    now: number
+  ): Promise<{ revision: number; rules: z.infer<typeof notificationRulesSchema> }> {
+    const parsed = updateNotificationRulesSchema.safeParse(raw);
+    if (!parsed.success) throw new NotificationAccessError('invalid_request');
+    const watcher = await this.find(scope, id);
+    if (!watcher) throw new NotificationAccessError('not_found');
+    if (watcher.status !== 'active' || Date.parse(watcher.expires_at) <= now)
+      throw new NotificationAccessError('access_inactive');
+    if (!parsed.data.rules.every((rule) => watcher.selected_packages.includes(rule.packageName)))
+      throw new NotificationAccessError('invalid_request');
+    await assertNotificationTarget(this.db, scope, watcher.recipient_id, watcher.thread_id, 'id');
+    // Append-only snapshots are both the current rule resource and its change log.
+    // The trigger serializes the revision with revoke/logout, not a read/write race here.
+    const result = await this.db
+      .from('sb_notification_rule_versions')
+      .insert({
+        watcher_id: id,
+        actor_id: scope.ownerId,
+        rules: parsed.data.rules,
+      })
+      .select('revision, rules')
+      .single();
+    check(result.error);
+    const version = ruleVersionSchema.safeParse(result.data);
+    if (!version.success) throw new NotificationAccessError('unavailable');
+    return version.data;
+  }
+
   async remove(scope: NotificationOwner, id: string): Promise<void> {
     const result = await this.db
       .from('sb_notification_watchers')
@@ -274,11 +335,12 @@ export class NotificationAccessStore {
         watcher_id: watcher.id,
         event_id: event.eventId,
         package_name: event.packageName,
+        app_label: event.appLabel ?? null,
         title: event.title,
         text: event.text,
-        posted_at: new Date(event.postedAt).toISOString(),
+        device_posted_at_ms: event.postedAt,
         fingerprint: notificationFingerprint(event),
-        // The trigger sets received_at/expires_at and refuses stale consent.
+        // The trigger calibrates posted_at, sets receipt/expiry and refuses stale consent.
       })
       .select('id');
     // A non-representable event is terminal, not a temporary backend failure.
@@ -293,7 +355,9 @@ export class NotificationAccessStore {
     if (!(await this.find(scope, id))) throw new NotificationAccessError('not_found');
     const result = await this.db
       .from('sb_notification_events')
-      .select('id, event_id, package_name, title, text, posted_at, received_at, expires_at')
+      .select(
+        'id, event_id, package_name, app_label, title, text, device_posted_at_ms, posted_at, received_at, expires_at'
+      )
       .eq('watcher_id', id)
       .gt('expires_at', new Date(now).toISOString())
       .order('received_at', { ascending: false })

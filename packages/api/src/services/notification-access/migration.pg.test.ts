@@ -9,7 +9,7 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Client } from 'pg';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const ROOT = process.env.NOTIFICATION_PG_TEST_ROOT;
 const DATABASE = 'notification_access_fixture';
@@ -106,6 +106,9 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     if (created) await admin.query(`DROP DATABASE ${DATABASE}`);
     await admin?.end();
   });
+  afterEach(async () => {
+    await Promise.all(clients.splice(0).map((client) => client.end()));
+  });
   beforeEach(async () => {
     await db.query('TRUNCATE public.sb_notification_watchers CASCADE');
     await db.query('DELETE FROM public.mcp_tokens');
@@ -117,9 +120,15 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
   });
 
   const WATCHER_INSERT = `INSERT INTO public.sb_notification_watchers
-      (id, owner_id, workspace_id, recipient_id, thread_id, signin_id, installation_id, selected_packages, rules, token_digest, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, ARRAY['com.example.messages'], '[{"packageName":"com.example.messages","match":{"kind":"all"}}]', $8, clock_timestamp() + interval '2 days') RETURNING *`;
-  async function createWatcher(owner = id(1), sequence = 7, signin = id(5), connection = db) {
+      (id, owner_id, workspace_id, recipient_id, thread_id, signin_id, installation_id, selected_packages, device_time_ms, token_digest, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, ARRAY['com.example.messages'], floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + $9::bigint, $8, clock_timestamp() + interval '2 days') RETURNING *`;
+  async function createWatcher(
+    owner = id(1),
+    sequence = 7,
+    signin = id(5),
+    connection = db,
+    deviceSkew = 0
+  ) {
     return connection.query(WATCHER_INSERT, [
       id(sequence),
       owner,
@@ -129,23 +138,30 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
       signin,
       id(sequence + 1000),
       sequence.toString(16).padStart(64, '0'),
+      deviceSkew,
     ]);
   }
 
   const INSERT = `INSERT INTO public.sb_notification_events
-    (watcher_id, event_id, package_name, title, text, posted_at, fingerprint)
-    VALUES ($1, $2, $3, 'Demo', 'Synthetic preview', $4::timestamptz, $5) RETURNING *`;
+    (watcher_id, event_id, package_name, title, text, device_posted_at_ms, fingerprint)
+    VALUES ($1, $2, $3, 'Demo', 'Synthetic preview', $4::bigint, $5) RETURNING *`;
+  const RULE_INSERT = `INSERT INTO public.sb_notification_rule_versions (watcher_id, actor_id, rules)
+    VALUES ($1, $2, $3::jsonb) RETURNING revision, rules`;
+  const RULES = JSON.stringify([{ packageName: 'com.example.messages', match: { kind: 'all' } }]);
   async function eventArgs(eventId = id(8)) {
-    const { rows } = await db.query<{ at: string }>('SELECT clock_timestamp()::text AS at');
+    const { rows } = await db.query<{ at: string }>(
+      'SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - clock_offset_ms AS at FROM sb_notification_watchers WHERE id = $1',
+      [id(7)]
+    );
     return [id(7), eventId, 'com.example.messages', rows[0].at, 'b'.repeat(64)];
   }
-  async function assertWaiting(client: Client) {
+  async function assertWaiting(client: Client, query = INSERT) {
     // A real lock wait, not a timer assumed to mean the other transaction ran.
     await vi.waitFor(
       async () => {
         const result = await admin.query(
           'SELECT wait_event_type FROM pg_stat_activity WHERE datname = $1 AND pid = $2 AND query = $3',
-          [DATABASE, backendIds.get(client), INSERT]
+          [DATABASE, backendIds.get(client), query]
         );
         expect(result.rows.some((row) => row.wait_event_type === 'Lock')).toBe(true);
       },
@@ -156,7 +172,7 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
   it('keeps grants and events closed to client roles', async () => {
     const result =
       await db.query(`SELECT r, t, has_table_privilege(r, t, 'SELECT,INSERT,UPDATE,DELETE') AS allowed
-      FROM unnest(ARRAY['anon','authenticated']) r, unnest(ARRAY['sb_notification_watchers','sb_notification_events']) t`);
+      FROM unnest(ARRAY['anon','authenticated']) r, unnest(ARRAY['sb_notification_watchers','sb_notification_events','sb_notification_rule_versions']) t`);
     expect(result.rows.every((row) => row.allowed === false)).toBe(true);
     const role = await db.query(
       "SELECT has_table_privilege('service_role','sb_notification_events','INSERT') AS allowed"
@@ -188,12 +204,22 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     try {
       expect((await db.query(INSERT, args)).rowCount).toBe(1);
       expect((await createWatcher(id(1), 20)).rowCount).toBe(1);
+      expect((await db.query(RULE_INSERT, [id(7), id(1), RULES])).rows[0].revision).toBe(1);
+      await expect(
+        db.query("UPDATE sb_notification_rule_versions SET rules = '[]'")
+      ).rejects.toMatchObject({ code: '42501' });
     } finally {
       await db.query('RESET ROLE');
     }
   });
 
   it('never mutates selection or reactivates revoked consent', async () => {
+    await expect(
+      db.query('UPDATE sb_notification_watchers SET clock_offset_ms = clock_offset_ms + 1')
+    ).rejects.toMatchObject({ code: 'NPA01' });
+    await expect(
+      db.query('UPDATE sb_notification_watchers SET device_time_ms = device_time_ms + 1')
+    ).rejects.toMatchObject({ code: 'NPA01' });
     await expect(
       db.query("UPDATE sb_notification_watchers SET selected_packages = ARRAY['com.example.other']")
     ).rejects.toMatchObject({ code: 'NPA01' });
@@ -272,10 +298,10 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
       db.query(INSERT, [args[0], args[1], 'com.example.other', args[3], args[4]])
     ).rejects.toMatchObject({ code: 'NPA05' });
     await expect(
-      db.query(INSERT, [args[0], args[1], args[2], '2000-01-01T00:00:00Z', args[4]])
+      db.query(INSERT, [args[0], args[1], args[2], Date.parse('2000-01-01T00:00:00Z'), args[4]])
     ).rejects.toMatchObject({ code: 'NPA05' });
     await expect(
-      db.query(INSERT, [args[0], args[1], args[2], '2100-01-01T00:00:00Z', args[4]])
+      db.query(INSERT, [args[0], args[1], args[2], Date.parse('2100-01-01T00:00:00Z'), args[4]])
     ).rejects.toMatchObject({ code: 'NPA05' });
   });
 
@@ -339,11 +365,111 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     'deletes retained event bytes with %s deletion',
     async (target) => {
       await db.query(INSERT, await eventArgs());
+      await db.query(RULE_INSERT, [id(7), id(1), RULES]);
       await db.query(
         target === 'watcher' ? 'DELETE FROM sb_notification_watchers' : 'DELETE FROM mcp_tokens'
       );
       expect((await db.query('SELECT * FROM sb_notification_watchers')).rowCount).toBe(0);
       expect((await db.query('SELECT * FROM sb_notification_events')).rowCount).toBe(0);
+      expect((await db.query('SELECT * FROM sb_notification_rule_versions')).rowCount).toBe(0);
     }
   );
+
+  it.each([-90_000, 90_000])(
+    'calibrates device skew %s without extending retention or admitting old consent',
+    async (skew) => {
+      await db.query('DELETE FROM sb_notification_watchers');
+      const grant = (await createWatcher(id(1), 7, id(5), db, skew)).rows[0];
+      expect(Math.abs(Number(grant.clock_offset_ms) + skew)).toBeLessThan(20);
+      const args = await eventArgs();
+      const result = await db.query(INSERT, args);
+      expect(result.rowCount).toBe(1);
+      const retained = (
+        await db.query(
+          `SELECT extract(epoch FROM (expires_at - received_at)) <= 604800 AS bounded,
+      extract(epoch FROM posted_at) * 1000 = device_posted_at_ms + $1::bigint AS calibrated
+      FROM sb_notification_events`,
+          [grant.clock_offset_ms]
+        )
+      ).rows[0];
+      expect(retained).toEqual({ bounded: true, calibrated: true });
+      await expect(
+        db.query(INSERT, [id(7), id(80), args[2], Number(grant.device_time_ms) - 1, args[4]])
+      ).rejects.toMatchObject({ code: 'NPA05' });
+    }
+  );
+
+  it('keeps rules separate, logs every version and refuses unselected apps or a foreign actor', async () => {
+    const before = (await db.query('SELECT * FROM sb_notification_watchers')).rows[0];
+    expect((await db.query('SELECT * FROM sb_notification_rule_versions')).rowCount).toBe(0);
+    expect((await db.query(RULE_INSERT, [id(7), id(1), RULES])).rows[0].revision).toBe(1);
+    expect((await db.query(RULE_INSERT, [id(7), id(1), '[]'])).rows[0].revision).toBe(2);
+    expect((await db.query('SELECT * FROM sb_notification_watchers')).rows[0]).toEqual(before);
+    await expect(db.query(RULE_INSERT, [id(7), id(9), RULES])).rejects.toMatchObject({
+      code: 'NPA02',
+    });
+    await expect(
+      db.query(RULE_INSERT, [
+        id(7),
+        id(1),
+        RULES.replace('com.example.messages', 'com.example.other'),
+      ])
+    ).rejects.toMatchObject({ code: 'NPA04' });
+    expect(
+      (await db.query('SELECT revision FROM sb_notification_rule_versions ORDER BY revision')).rows
+    ).toEqual([{ revision: 1 }, { revision: 2 }]);
+  });
+
+  it('serializes simultaneous rule edits into distinct logged revisions', async () => {
+    const writer = await second();
+    await db.query('BEGIN');
+    await db.query(RULE_INSERT, [id(7), id(1), RULES]);
+    const pending = writer.query(RULE_INSERT, [id(7), id(1), '[]']).then(
+      (result) => ({ revision: result.rows[0].revision }),
+      (error: unknown) => ({ error })
+    );
+    try {
+      await assertWaiting(writer, RULE_INSERT);
+    } finally {
+      await db.query('COMMIT');
+    }
+    expect(await pending).toEqual({ revision: 2 });
+  });
+
+  it('does not take an owner-row lock after the sign-in and grant for a rule edit', async () => {
+    const deleter = await second();
+    await db.query('BEGIN');
+    await db.query(RULE_INSERT, [id(7), id(1), RULES]);
+    try {
+      // Account deletion must be able to acquire its first lock. A redundant
+      // actor -> users FK would acquire KEY SHARE late and invert this order.
+      expect(
+        (await deleter.query('SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT', [id(1)]))
+          .rowCount
+      ).toBe(1);
+    } finally {
+      await db.query('ROLLBACK');
+    }
+  });
+
+  it.each(['revoke', 'logout'])('refuses a rule change after concurrent %s', async (operation) => {
+    const writer = await second();
+    await db.query('BEGIN');
+    await db.query(
+      operation === 'revoke'
+        ? "UPDATE sb_notification_watchers SET status = 'revoked'"
+        : 'DELETE FROM mcp_tokens'
+    );
+    const pending = writer.query(RULE_INSERT, [id(7), id(1), RULES]).then(
+      () => null,
+      (error: unknown) => error
+    );
+    try {
+      await assertWaiting(writer, RULE_INSERT);
+    } finally {
+      await db.query('COMMIT');
+    }
+    expect(await pending).toMatchObject({ code: 'NPA02' });
+    expect((await db.query('SELECT * FROM sb_notification_rule_versions')).rowCount).toBe(0);
+  });
 });

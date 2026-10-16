@@ -29,6 +29,7 @@ const access: NotificationAccessState = {
   selectedPackages: ['com.example.messages'],
   activeSince: NOW - 14 * 24 * 60 * 60 * 1000,
   expiresAt: NOW + NOTIFICATION_RETENTION_MS,
+  clockOffsetMs: 0,
 };
 const rule = {
   packageName: event.packageName,
@@ -36,6 +37,48 @@ const rule = {
 };
 
 describe('notification intake', () => {
+  it.each([-90_000, 90_000])('calibrates a device clock offset of %s at consent', (offset) => {
+    const calibrated = { ...access, activeSince: NOW, clockOffsetMs: offset };
+    expect(admitNotification({ ...event, postedAt: NOW - offset }, calibrated, NOW)).toMatchObject({
+      ok: true,
+      expiresAt: NOW + NOTIFICATION_RETENTION_MS,
+    });
+    expect(admitNotification({ ...event, postedAt: NOW - offset - 1 }, calibrated, NOW)).toEqual({
+      ok: false,
+      reason: 'event_before_consent',
+    });
+    expect(
+      admitNotification(
+        { ...event, postedAt: NOW - offset + NOTIFICATION_CLOCK_SKEW_MS + 1 },
+        calibrated,
+        NOW
+      )
+    ).toEqual({ ok: false, reason: 'event_from_future' });
+    expect(
+      admitNotification(
+        { ...event, postedAt: NOW - offset - NOTIFICATION_RETENTION_MS },
+        { ...calibrated, activeSince: 0 },
+        NOW
+      )
+    ).toEqual({ ok: false, reason: 'event_expired' });
+  });
+
+  it('treats app labels as bounded display text, not matching or package authority', () => {
+    const labeled = { ...event, appLabel: 'A different app' };
+    expect(admitNotification(labeled, access, NOW).ok).toBe(true);
+    expect(notificationMatches(labeled, rule, access, NOW, NOW + 1)).toBe(true);
+    expect(notificationFingerprint(labeled)).not.toBe(notificationFingerprint(event));
+    for (const appLabel of ['x'.repeat(256), 'a\u0000b', '\ud83d'])
+      expect(notificationEventSchema.safeParse({ ...event, appLabel }).success).toBe(false);
+  });
+
+  it('refuses corrupt calibration and out-of-range calibrated dates', () => {
+    for (const clockOffsetMs of [NaN, Infinity, 0.5, Number.MAX_SAFE_INTEGER])
+      expect(admitNotification(event, { ...access, clockOffsetMs }, NOW).ok).toBe(false);
+    expect(
+      admitNotification({ ...event, postedAt: 0 }, { ...access, clockOffsetMs: -1 }, NOW).ok
+    ).toBe(false);
+  });
   it('accepts only the selected app under active consent', () => {
     expect(admitNotification(event, access, NOW)).toEqual({
       ok: true,

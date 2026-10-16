@@ -23,7 +23,7 @@ const watcher: NotificationWatcher = {
   signin_id: id(6),
   installation_id: id(7),
   selected_packages: ['com.example.messages'],
-  rules: [{ packageName: 'com.example.messages', match: { kind: 'all' } }],
+  clock_offset_ms: 0,
   status: 'active',
   active_since: new Date(NOW - 1000).toISOString(),
   expires_at: new Date(NOW + 86_400_000).toISOString(),
@@ -40,10 +40,11 @@ const deviceToken = `ink-na-${'1'.repeat(64)}`;
 const consent = {
   installationId: id(7),
   recipientId: id(4),
-  conversationId: id(5),
+  conversationId: 'inkling:chat:synthetic-notifications',
+  deviceTime: NOW,
   refreshToken: 'synthetic-refresh',
   selectedPackages: watcher.selected_packages,
-  rules: watcher.rules,
+  rules: [],
   disclosureAccepted: true,
   permissionReported: 'granted',
 };
@@ -56,6 +57,8 @@ const store = {
   remove: vi.fn(),
   record: vi.fn(),
   events: vi.fn(),
+  rules: vi.fn(),
+  setRules: vi.fn(),
 };
 let configured = true;
 let server: Server;
@@ -99,6 +102,8 @@ beforeEach(() => {
   store.create.mockResolvedValue({ watcher, deviceToken });
   store.list.mockResolvedValue([watcher]);
   store.events.mockResolvedValue([]);
+  store.rules.mockResolvedValue({ revision: 0, rules: [] });
+  store.setRules.mockResolvedValue({ revision: 1, rules: [] });
 });
 
 async function postEvent(body: unknown = event, token = deviceToken) {
@@ -117,6 +122,17 @@ async function admin(path: string, method = 'GET', body?: unknown, auth = 'synth
 }
 
 describe('post-only device intake', () => {
+  it('accepts an app label and calibrates a slow device without an admin or workspace header', async () => {
+    store.deviceAccess.mockResolvedValue({
+      ...watcher,
+      clock_offset_ms: 90_000,
+      active_since: new Date(NOW).toISOString(),
+    });
+    const labeled = { ...event, postedAt: NOW - 90_000, appLabel: 'Demo app' };
+    expect((await postEvent(labeled)).status).toBe(202);
+    expect(store.record.mock.calls[0][1]).toEqual(labeled);
+    expect((await postEvent({ ...labeled, postedAt: labeled.postedAt - 1 })).status).toBe(422);
+  });
   it.each(['title', 'text'] as const)(
     'returns terminal 422 for unrepresentable %s before storage',
     async (field) => {
@@ -242,6 +258,40 @@ describe('post-only device intake', () => {
   });
 });
 
+describe('owner-only mutable rules', () => {
+  it('reads and writes through the signed owner scope', async () => {
+    const resource = `/watchers/${id(1)}/rules`;
+    expect(await (await admin(resource)).json()).toEqual({ revision: 0, rules: [] });
+    expect(await (await admin(resource, 'PUT', { rules: [] })).json()).toEqual({
+      revision: 1,
+      rules: [],
+    });
+    expect(store.setRules).toHaveBeenCalledWith(
+      { ownerId: id(2), workspaceId: id(3) },
+      id(1),
+      { rules: [] },
+      NOW
+    );
+  });
+  it('refuses device credentials and does not add a device self-revoke surface', async () => {
+    expect(
+      (await admin(`/watchers/${id(1)}/rules`, 'PUT', { rules: [] }, deviceToken)).status
+    ).toBe(401);
+    const response = await fetch(`${origin}/api/notification-access/revoke`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${deviceToken}` },
+    });
+    expect(response.status).toBe(404);
+    expect(store.setRules).not.toHaveBeenCalled();
+  });
+  it('rejects authority injection before calling storage', async () => {
+    expect(
+      (await admin(`/watchers/${id(1)}/rules`, 'PUT', { rules: [], ownerId: id(99) })).status
+    ).toBe(422);
+    expect(store.setRules).not.toHaveBeenCalled();
+  });
+});
+
 describe('owner management surface', () => {
   it('reports grant capacity as a conflict, not a transient retry', async () => {
     store.create.mockRejectedValue(new NotificationAccessError('grant_limit'));
@@ -270,6 +320,10 @@ describe('owner management surface', () => {
   it.each([
     { ...consent, ownerId: id(20) },
     { ...consent, workspaceId: id(21) },
+    { ...consent, deviceTime: undefined },
+    { ...consent, deviceTime: -1 },
+    { ...consent, clockOffsetMs: 90_000 },
+    { ...consent, rules: [{ packageName: 'com.example.messages', match: { kind: 'all' } }] },
     { ...consent, disclosureAccepted: false },
     { ...consent, permissionReported: 'denied' },
     { ...consent, rules: [{ packageName: 'com.example.other', match: { kind: 'all' } }] },

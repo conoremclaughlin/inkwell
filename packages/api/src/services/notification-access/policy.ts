@@ -16,6 +16,8 @@ export interface NotificationAccessState {
   /** A new grant/selection epoch must not drain a queue from older consent. */
   activeSince: number;
   expiresAt: number;
+  /** Immutable consent-time estimate: server milliseconds minus device milliseconds. */
+  clockOffsetMs: number;
 }
 
 /**
@@ -38,6 +40,7 @@ export function admitNotification(
     access.activeSince > now ||
     !Number.isSafeInteger(access.expiresAt) ||
     access.expiresAt <= now ||
+    !Number.isSafeInteger(access.clockOffsetMs) ||
     !notificationPackagesSchema.safeParse(access.selectedPackages).success
   ) {
     return { ok: false, reason: 'access_inactive' };
@@ -45,18 +48,21 @@ export function admitNotification(
   const parsed = notificationEventSchema.safeParse(raw);
   if (!parsed.success) return { ok: false, reason: 'invalid_event' };
   const event = parsed.data;
+  const postedAt = event.postedAt + access.clockOffsetMs;
+  if (!Number.isSafeInteger(postedAt) || postedAt < 0 || postedAt > 8_640_000_000_000_000)
+    return { ok: false, reason: 'invalid_event' };
   if (!access.selectedPackages.includes(event.packageName)) {
     return { ok: false, reason: 'app_not_selected' };
   }
-  if (event.postedAt < access.activeSince) {
+  if (postedAt < access.activeSince) {
     return { ok: false, reason: 'event_before_consent' };
   }
-  if (event.postedAt > now + NOTIFICATION_CLOCK_SKEW_MS) {
+  if (postedAt > now + NOTIFICATION_CLOCK_SKEW_MS) {
     return { ok: false, reason: 'event_from_future' };
   }
   // Delayed delivery does not buy another seven days. A slightly fast device
   // clock cannot extend retention beyond seven days from the first receipt.
-  const expiresAt = Math.min(event.postedAt, now) + NOTIFICATION_RETENTION_MS;
+  const expiresAt = Math.min(postedAt, now) + NOTIFICATION_RETENTION_MS;
   if (expiresAt <= now) return { ok: false, reason: 'event_expired' };
   return { ok: true, event, expiresAt };
 }
@@ -86,7 +92,15 @@ export function notificationMatches(
 /** Stable content fingerprint for identical retry versus conflicting event-id reuse. */
 export function notificationFingerprint(event: NotificationEvent): string {
   return createHash('sha256')
-    .update(JSON.stringify([event.packageName, event.title, event.text, event.postedAt]))
+    .update(
+      JSON.stringify([
+        event.packageName,
+        event.appLabel ?? null,
+        event.title,
+        event.text,
+        event.postedAt,
+      ])
+    )
     .digest('hex');
 }
 
