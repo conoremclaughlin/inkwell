@@ -268,6 +268,8 @@ export interface ThreadRow {
   summary_updated_by_sb_id: string | null;
   status: string;
   metadata: Json;
+  /** The conversation's mode, fixed at creation (services/threads/conversation-mode.ts). */
+  conversation_mode: string | null;
   created_at: string;
   updated_at: string;
   closed_at: string | null;

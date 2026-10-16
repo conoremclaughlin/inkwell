@@ -77,7 +77,7 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
 
   const { data: thread, error: threadError } = await client
     .from('inbox_threads')
-    .select('id, metadata')
+    .select('id, metadata, conversation_mode')
     .eq('workspace_id', workspaceId)
     .eq('thread_key', threadKey)
     .maybeSingle();
@@ -85,7 +85,8 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
   if (!thread) {
     throw new PinRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
   }
-  const { id: threadId, metadata } = thread as { id: string; metadata: unknown };
+  const threadRow = thread as { id: string; metadata: unknown; conversation_mode: unknown };
+  const threadId = threadRow.id;
 
   // The person's own row or nothing: no row matched means they are not in
   // this conversation (a background thread), and it stays theirs to read only.
@@ -99,7 +100,7 @@ export async function setThreadPin(client: Client, request: PinRequest): Promise
   if (!Array.isArray(updated) || updated.length === 0) {
     // A participant-only conversation (D3) is no thread at all to anyone
     // not in it.
-    if (isParticipantOnlyThread(metadata)) {
+    if (isParticipantOnlyThread(threadRow)) {
       throw new PinRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
     }
     throw new PinRefusedError(

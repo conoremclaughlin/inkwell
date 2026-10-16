@@ -19,7 +19,8 @@
  *
  * GET /:id streams one upload to a person allowed to read it
  * (services/uploads/authorize.ts): its uploader before the message commits,
- * or a current person participant once it has. Every refusal is the same
+ * and a current person participant once it has, or anyone in the space when
+ * the thread is a public conversation. Every refusal is the same
  * 404. The bytes are checked against the row before any is sent.
  */
 
@@ -28,6 +29,7 @@ import { randomUUID } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
 import { authorizeUpload } from '../services/uploads/authorize';
+import { isPublicConversation } from '../services/threads/conversation-mode';
 import {
   readUploadFile,
   removeUploadBytes,
@@ -95,6 +97,22 @@ async function findThread(
     .maybeSingle();
   if (error) throw new Error(`Failed to read a thread: ${error.message}`);
   return (data as { id: string } | null) ?? null;
+}
+
+/** Is this thread, in this workspace, a public conversation (thread-read-access.ts)? */
+async function isPublicThread(
+  db: SupabaseClient,
+  threadId: string,
+  workspaceId: string
+): Promise<boolean> {
+  const { data, error } = await db
+    .from('inbox_threads')
+    .select('conversation_mode')
+    .eq('id', threadId)
+    .eq('workspace_id', workspaceId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to read a thread: ${error.message}`);
+  return isPublicConversation((data as { conversation_mode: unknown } | null) ?? {});
 }
 
 /**
@@ -289,11 +307,14 @@ export async function getUpload(
   if (!upload) return notFound();
   const claim = await loadClaim(db, id);
   const message = claim ? await loadClaimedMessage(db, claim) : null;
-  const participant = await isPersonParticipant(db, {
-    threadId: upload.thread_id,
-    userId: auth.inkUserId,
-    workspaceId: auth.inkWorkspaceId,
-  });
+  const [participant, threadIsPublic] = await Promise.all([
+    isPersonParticipant(db, {
+      threadId: upload.thread_id,
+      userId: auth.inkUserId,
+      workspaceId: auth.inkWorkspaceId,
+    }),
+    isPublicThread(db, upload.thread_id, auth.inkWorkspaceId),
+  ]);
   const decision = authorizeUpload({
     upload,
     claim,
@@ -303,6 +324,7 @@ export async function getUpload(
       userId: auth.inkUserId,
       workspaceId: auth.inkWorkspaceId,
       isPersonParticipant: participant,
+      threadIsPublic,
     },
     now: now(),
     retentionMs: deps.retentionMs,

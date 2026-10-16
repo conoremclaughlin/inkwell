@@ -24,7 +24,7 @@ import { apiSourceFiles, tableWritesIn } from '../../test/write-census';
 
 const API_SRC = fileURLToPath(new URL('../../', import.meta.url));
 const MIGRATIONS = fileURLToPath(new URL('../../../../../supabase/migrations/', import.meta.url));
-const COLUMN_MIGRATION = '20261016011435_inbox_threads_conversation_mode.sql';
+const COLUMN_MIGRATION = '20261016182006_inbox_threads_conversation_mode.sql';
 const COLUMN = 'conversation_mode';
 
 const threadWritesIn = (fileName: string, source: string) =>

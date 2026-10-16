@@ -11,8 +11,12 @@
 -- needs Conor's OK first (Oct 4 rule; D9 approved one trigger, on sessions,
 -- and nothing else), so a service-role or raw SQL write could still change it.
 --
--- Nothing reads it to decide anything yet: the shared-turn and read rules
--- that use it are later pieces of Phase 3.
+-- 'public' makes an inkling conversation readable by every member of its
+-- space and joinable by posting (thread-read-access.ts, the thread and turn
+-- gates). NULL and 'private' read as before: participant-only (D3).
+--
+-- Re-timestamped from 20261016011435 so it sorts after
+-- 20261016075003_workspace_members_calendar_share.sql, which merged first.
 
 ALTER TABLE public.inbox_threads
   ADD COLUMN IF NOT EXISTS conversation_mode text

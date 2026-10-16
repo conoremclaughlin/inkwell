@@ -508,13 +508,14 @@ describe('a participant-only conversation’s links (D3)', () => {
   // pr:1 as an inkling conversation that beta and its person are on, and
   // alpha, the workspace owner's own SB, is not. The artifact is beta's
   // user's, so beta may see that end as a restricted reader.
-  function privateFixture() {
+  function privateFixture(mode: 'public' | 'private' | null = null) {
     const f = fixture({ roles: { a: 'owner', b: 'member' }, artifactOwner: USER_B });
     f.tables.inbox_threads[0] = {
       ...f.tables.inbox_threads[0],
       metadata: { inklingConversation: true },
-      // What PARTICIPANT_ONLY_COLUMN projects; this fake returns whole rows.
-      participant_only: true,
+      conversation_mode: mode,
+      // What READ_ACCESS_COLUMNS projects; this fake returns whole rows.
+      inkling_conversation: true,
     };
     f.tables.inbox_thread_participants = [
       { thread_id: 'source', sb_id: 'sb-b', user_id: null },
@@ -583,6 +584,32 @@ describe('a participant-only conversation’s links (D3)', () => {
       threadId: 'source',
     });
     expect(uris(views.linksTo)).toEqual(['ink://specs/example']);
+  });
+
+  it('keeps a public conversation in the team’s view for a reader not on it', async () => {
+    const { dc, client } = privateFixture('public');
+    const alpha = parsed(
+      await handleListThreadLinks({ userId: USER_A, sbSlug: 'alpha', threadKey: 'pr:1' }, dc)
+    );
+    expect(alpha.threadExists).toBe(true);
+    expect(uris(alpha.linksTo)).toEqual(['ink://specs/example']);
+    const views = await threadLinkViewsFor(client, ALPHA_FULL, {
+      threadKey: 'pr:1',
+      threadId: 'source',
+    });
+    expect(uris(views.linksTo)).toEqual(['ink://specs/example']);
+    expect(
+      await artifactBacklinks(client, FULL_SCOPE, { id: 'artifact', uri: 'ink://specs/example' })
+    ).toMatchObject({ count: 1 });
+  });
+
+  it('keeps one named private out, as one with no mode', async () => {
+    const { client } = privateFixture('private');
+    const views = await threadLinkViewsFor(client, ALPHA_FULL, {
+      threadKey: 'pr:1',
+      threadId: 'source',
+    });
+    expect(views).toEqual({ linksTo: [], linkedFrom: [] });
   });
 
   it('shows the system none of them', async () => {

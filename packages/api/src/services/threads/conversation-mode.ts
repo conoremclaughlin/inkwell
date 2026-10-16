@@ -16,8 +16,11 @@
  * create its thread, and that thread must be an inkling conversation;
  * anything else is refused before anything is written.
  *
- * Nothing reads the mode to decide anything yet. The shared-turn and read
- * rules that use it are later pieces of Phase 3.
+ * Who reads and writes by it (Conor, 2026-10-16 11:12 AM): a public inkling
+ * conversation reads like an ordinary thread (thread-read-access.ts), and a
+ * write-role member of a team space may start one or join it by posting
+ * (the thread and turn gates). 'private' and no mode both read as private,
+ * participant-only. A public conversation is made only in a team space.
  */
 
 export const CONVERSATION_MODES = ['public', 'private'] as const;
@@ -56,4 +59,9 @@ export function storedConversationMode(value: unknown): ConversationMode | null 
   return typeof value === 'string' && (CONVERSATION_MODES as readonly string[]).includes(value)
     ? (value as ConversationMode)
     : null;
+}
+
+/** True when a thread row's mode opens it to its space. */
+export function isPublicConversation(row: { conversation_mode?: unknown }): boolean {
+  return row.conversation_mode === 'public';
 }

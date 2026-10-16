@@ -73,8 +73,12 @@ import {
   INKLING_THREAD_REFUSED,
   InklingThreadRefusedError,
 } from '../../services/inklings/inkling-thread-gate.js';
-import { INKLING_SHARED_MARK } from '../../services/inklings/inkling-shared-space.js';
 import {
+  INKLING_SHARED_MARK,
+  isSharedInklingSpace,
+} from '../../services/inklings/inkling-shared-space.js';
+import {
+  NOT_PUBLIC_FILTER,
   OPEN_THREADS_FILTER,
   PARTICIPANT_ONLY_PATH,
 } from '../../services/threads/thread-read-access.js';
@@ -848,6 +852,8 @@ export async function handleSendToInbox(
       // marked; its people are checked again, as they are now, before any of
       // them is added.
       addedPeople: addedPeople.map((person) => person.userId),
+      // A public conversation a write-role member of a team space starts.
+      creatingPublic: internal?.createOnly === true && internal.conversationMode === 'public',
     });
     if (addedPeople.length > 0 && !inklingVerdict.shared) {
       throw new InklingThreadRefusedError(
@@ -869,6 +875,17 @@ export async function handleSendToInbox(
       }
       if (!inklingVerdict.inklingConversation) {
         throw new ConversationModeRefusedError('Only a conversation with an inkling has a mode');
+      }
+      // Public is to a space's people, so only a team space has it: a
+      // person's own space stays as it was.
+      if (internal.conversationMode === 'public') {
+        const teamSpace = await isSharedInklingSpace(supabase, workspaceId);
+        if (teamSpace === 'unreadable') throw new Error("Failed to read the conversation's space");
+        if (teamSpace !== 'yes') {
+          throw new ConversationModeRefusedError(
+            'A public conversation is made only in a shared space'
+          );
+        }
       }
     }
 
@@ -2410,12 +2427,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           );
         } else {
           // The agent-less view: every thread in the account's workspaces,
-          // except a participant-only conversation (D3), which appears only
-          // to someone on it. An unbound person reads as the account, by
-          // their own participant row. A token bound to an SB, by slug or by
-          // its canonical id alone, reads as that SB even when it names none,
-          // by the SB's row (Lumen, #874 r1 and r2). A binding that resolves
-          // to no identity sees no participant-only conversation.
+          // public conversations included, except a participant-only
+          // conversation (D3), which appears only to someone on it. An
+          // unbound person reads as the account, by their own participant
+          // row. A token bound to an SB, by slug or by its canonical id
+          // alone, reads as that SB even when it names none, by the SB's row
+          // (Lumen, #874 r1 and r2). A binding that resolves to no identity
+          // sees no participant-only conversation.
           // Two reads, so the others never take a place on the page.
           const privateReader = await (async (): Promise<{
             column: 'viewer.user_id' | 'viewer.sb_id';
@@ -2453,6 +2471,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                   )
                   .in('workspace_id', threadWorkspaceIds)
                   .eq(PARTICIPANT_ONLY_PATH, true)
+                  // A public conversation comes from the open read, never both.
+                  .or(NOT_PUBLIC_FILTER)
                   .eq(privateReader.column, privateReader.id)
                   .order('updated_at', { ascending: false })
                   .limit(THREAD_PAGE_LIMIT)

@@ -264,7 +264,7 @@ export async function reactToMessage(
 
   const { data: thread, error: threadError } = await client
     .from('inbox_threads')
-    .select('id, workspace_id, metadata')
+    .select('id, workspace_id, metadata, conversation_mode')
     .eq('workspace_id', workspaceId)
     .eq('thread_key', threadKey)
     .maybeSingle();
@@ -272,7 +272,12 @@ export async function reactToMessage(
   if (!thread) {
     throw new ReactionRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
   }
-  const threadRow = thread as { id: string; workspace_id: string; metadata: unknown };
+  const threadRow = thread as {
+    id: string;
+    workspace_id: string;
+    metadata: unknown;
+    conversation_mode: unknown;
+  };
 
   // Members only. A person who is not in the thread is reading it in the
   // background, and a background thread stays read-only for them.
@@ -287,7 +292,7 @@ export async function reactToMessage(
   if (memberError) throw new Error(`Failed to check membership: ${memberError.message}`);
   // A participant-only conversation (D3) is no thread at all to anyone not
   // in it: answered before its messages are looked up.
-  if (!member && isParticipantOnlyThread(threadRow.metadata)) {
+  if (!member && isParticipantOnlyThread(threadRow)) {
     throw new ReactionRefusedError(404, 'thread_not_found', `No thread with key "${threadKey}"`);
   }
 

@@ -100,9 +100,10 @@ export interface ThreadSpine {
      */
     pinned?: boolean | null;
     /**
-     * The conversation's mode, fixed when it was created: 'public' to the
-     * space's members, 'private' to its participants, null for none. Absent
-     * from servers that predate it.
+     * The conversation's mode, fixed when it was created: 'public' is read by
+     * everyone in the space and joined by posting; 'private' is read by its
+     * participants only; null is no mode, read like 'private' in a
+     * conversation with an inkling. Absent from servers that predate it.
      */
     conversationMode?: ConversationMode | null;
   } | null;

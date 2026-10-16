@@ -5,7 +5,10 @@
  * Two kinds of read, never mixed:
  *
  * - Shared read: a current person participant of the thread, in its
- *   workspace, once the upload's message has committed. "Committed" means
+ *   workspace, once the upload's message has committed. In a public
+ *   conversation (conversation_mode 'public'), which everyone in its space
+ *   reads, anyone the route admits to that workspace reads it too, as they
+ *   read the thread's words (thread-read-access.ts). "Committed" means
  *   the upload's claim, plus the message stored under that claim's (thread,
  *   clientMessageId) from the claim's own person, with the same words and
  *   exactly the claimed manifest (content and full manifest digests, not
@@ -45,6 +48,8 @@ export type UploadAccess =
       userId: string;
       workspaceId: string;
       isPersonParticipant: boolean;
+      /** The upload's thread is a public conversation, read fresh by the caller. */
+      threadIsPublic: boolean;
     }
   /** A dispatch attaching media from the stored message it is delivering. */
   | { kind: 'resolve'; messageId: string };
@@ -112,9 +117,9 @@ export function authorizeUpload({
 
   if (access.workspaceId !== upload.workspace_id) return deny('not-yours');
   if (committed) {
-    // Shared read. A person removed from the thread loses access at once,
-    // the uploader too.
-    return access.isPersonParticipant ? { ok: true } : deny('not-yours');
+    // Shared read. A person removed from a private thread loses access at
+    // once, the uploader too; a public thread's are read like its words.
+    return access.isPersonParticipant || access.threadIsPublic ? { ok: true } : deny('not-yours');
   }
   // Owner preview.
   return access.userId === upload.user_id ? { ok: true } : deny('not-committed');

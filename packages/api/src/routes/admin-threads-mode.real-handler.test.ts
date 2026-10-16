@@ -121,6 +121,8 @@ beforeEach(() => {
   db = createInklingDb();
   db.rpcHandlers.advance_thread_read_pointer = () => ({ data: true, error: null });
   db.seed('workspace_members', { workspace_id: WS, user_id: ME, role: 'owner' });
+  // A shared space: a public conversation is made only in one.
+  db.seed('workspaces', { id: WS, name: 'Choir', type: 'team', metadata: {} });
   vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
   vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', ME);
   db.seed('agent_identities', {

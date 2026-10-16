@@ -19,6 +19,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { isInklingOwnerTestUser, type OwnerTestAllowlist } from '../../config/inkling-flags';
 import { INKLING_CLIENT } from './inkling-service';
 import { areSpaceWriters, INKLING_SHARED_MARK, isSharedInklingSpace } from './inkling-shared-space';
+import { isPublicConversation } from '../threads/conversation-mode';
 
 /**
  * What the SB a turn is for is, as far as the database can say:
@@ -107,9 +108,10 @@ export async function isOwnersOwnMessage(
     inklingId: string;
     ownerUserId: string | null;
     /**
-     * The inkling's space. In a group shared with the space's people
-     * (inkling-shared-space.ts), a message from any write-role member of a
-     * team space wakes it too.
+     * The inkling's space. In a conversation shared with the space's people
+     * (inkling-shared-space.ts), a group made with people or a public
+     * conversation, a message from any write-role member of a team space
+     * wakes it too.
      */
     workspaceId?: string | null;
   }
@@ -148,9 +150,10 @@ export async function isOwnersOwnMessage(
 }
 
 /**
- * Did a person other than the owner send this in a group shared with the
- * space's people? The thread must be marked shared, live in the inkling's
- * own space, and that space must be a team space the sender writes in.
+ * Did a person other than the owner send this in a conversation shared with
+ * the space's people? The thread must be a group marked shared or a public
+ * conversation, live in the inkling's own space, and that space must be a
+ * team space the sender writes in.
  */
 async function isSpaceMembersMessage(
   supabase: SupabaseClient,
@@ -159,12 +162,19 @@ async function isSpaceMembersMessage(
   if (!input.workspaceId || !input.senderUserId) return 'no';
   const { data, error } = await supabase
     .from('inbox_threads')
-    .select('workspace_id, metadata')
+    .select('workspace_id, metadata, conversation_mode')
     .eq('id', input.threadId)
     .maybeSingle();
   if (error) return 'unreadable';
-  const thread = data as { workspace_id: string; metadata: Record<string, unknown> | null } | null;
-  if (!thread || thread.metadata?.[INKLING_SHARED_MARK] !== true) return 'no';
+  const thread = data as {
+    workspace_id: string;
+    metadata: Record<string, unknown> | null;
+    conversation_mode: string | null;
+  } | null;
+  if (!thread) return 'no';
+  if (thread.metadata?.[INKLING_SHARED_MARK] !== true && !isPublicConversation(thread)) {
+    return 'no';
+  }
   if (thread.workspace_id !== input.workspaceId) return 'no';
   const [teamSpace, writer] = await Promise.all([
     isSharedInklingSpace(supabase, input.workspaceId),

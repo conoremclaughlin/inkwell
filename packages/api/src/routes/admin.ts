@@ -138,10 +138,12 @@ import {
   storedConversationMode,
 } from '../services/threads/conversation-mode';
 import {
+  NOT_PUBLIC_FILTER,
   OPEN_THREADS_FILTER,
-  PARTICIPANT_ONLY_COLUMN,
   PARTICIPANT_ONLY_PATH,
+  READ_ACCESS_COLUMNS,
   SHARED_GROUP_COLUMN,
+  isParticipantOnlyRow,
   isParticipantOnlyThread,
   isSharedGroupRow,
   isSharedGroupThread,
@@ -5649,7 +5651,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
         // A participant-only conversation (D3) shows here only to a person
         // on it: owning one of its SBs is not being in it.
         const privateIds = (agentThreadRows ?? [])
-          .filter((t) => isParticipantOnlyThread(t.metadata))
+          .filter((t) => isParticipantOnlyThread(t))
           .map((t) => t.id);
         const viewerOn = new Set<string>();
         if (privateIds.length > 0) {
@@ -5662,7 +5664,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
           for (const row of viewerRows ?? []) viewerOn.add(row.thread_id);
         }
         const threadRows = (agentThreadRows ?? []).filter(
-          (t) => !isParticipantOnlyThread(t.metadata) || viewerOn.has(t.id)
+          (t) => !isParticipantOnlyThread(t) || viewerOn.has(t.id)
         );
 
         if (threadRows.length) {
@@ -8495,12 +8497,13 @@ router.get('/threads', async (req: Request, res: Response) => {
     // One list for every thread read below (the newest window and the
     // hydration of older carrier keys), so none can drop a column alone.
     // The embed carries each thread's newest message for the list preview.
-    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, conversation_mode, ${PARTICIPANT_ONLY_COLUMN}, ${SHARED_GROUP_COLUMN}, ${LAST_MESSAGE_EMBED}`;
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${READ_ACCESS_COLUMNS}, ${SHARED_GROUP_COLUMN}, ${LAST_MESSAGE_EMBED}`;
 
     // The newest window is two reads (D3): the threads every reader here may
-    // read (threadsRes), and the participant-only ones this viewer is in
-    // (privateRes). Leaving the others out in the query, not after it, keeps
-    // them from taking a place in the window or in its count.
+    // read (threadsRes), public conversations included, and the
+    // participant-only ones this viewer is in (privateRes). Leaving the
+    // others out in the query, not after it, keeps them from taking a place
+    // in the window or in its count, and no thread is in both reads.
     const [threadsRes, sessionsRes, studiosRes, groupsRes, privateRes] = await Promise.all([
       withLastMessage(supabase.from('inbox_threads').select(THREAD_COLUMNS, { count: 'exact' }))
         .eq('workspace_id', workspaceId)
@@ -8541,6 +8544,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       )
         .eq('workspace_id', workspaceId)
         .eq(PARTICIPANT_ONLY_PATH, true)
+        .or(NOT_PUBLIC_FILTER)
         .eq('viewer.user_id', userId)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
@@ -8676,7 +8680,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     );
     const hiddenThreadKeys = new Set<string>();
     threadRows = threadRows.filter((t) => {
-      if (t.participant_only !== true || viewerThreadIds.has(t.id)) return true;
+      if (!isParticipantOnlyRow(t) || viewerThreadIds.has(t.id)) return true;
       hiddenThreadKeys.add(t.thread_key);
       return false;
     });
@@ -9672,7 +9676,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, metadata')
+      .select('id, thread_key, metadata, conversation_mode')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -10003,7 +10007,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status, metadata')
+      .select('id, thread_key, status, metadata, conversation_mode')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -10078,7 +10082,7 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     // not in it: the answer a key with no graph gets (Lumen, #874 r1).
     const { data: keyedThread, error: keyedThreadError } = await supabase
       .from('inbox_threads')
-      .select('id, metadata')
+      .select('id, metadata, conversation_mode')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
