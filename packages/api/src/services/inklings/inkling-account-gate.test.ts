@@ -142,6 +142,7 @@ import {
   INKLING_CONSENTED_ACCOUNT_TOOLS,
   InklingAccountRefusedError,
   SPACE_BUSY_TIMES_TOOL,
+  SPACE_EVENT_TOOL,
 } from './inkling-account-gate';
 import { INKLING_CLIENT } from './inkling-client';
 import { classifyIdentityById, inklingTurnRefusal } from './inkling-turn-gate';
@@ -246,12 +247,20 @@ describe('assertAccountTokenAllowed', () => {
     await expect(gate(caller, 'send_email', allowlist)).rejects.toThrow(InklingAccountRefusedError);
   });
 
-  it('admits get_space_busy_times with nothing turned on, and no other tool (D6/D7)', async () => {
+  it('admits get_space_busy_times and create_space_event with nothing turned on, and no other tool', async () => {
     const caller = { ...tokenIdentityContext({ sbId: INKLING }), workspaceId: WORKSPACE };
-    expect([...INKLING_CONSENTED_ACCOUNT_TOOLS]).toEqual([SPACE_BUSY_TIMES_TOOL]);
+    expect([...INKLING_CONSENTED_ACCOUNT_TOOLS]).toEqual([SPACE_BUSY_TIMES_TOOL, SPACE_EVENT_TOOL]);
     expect(SPACE_BUSY_TIMES_TOOL).toBe('get_space_busy_times');
+    expect(SPACE_EVENT_TOOL).toBe('create_space_event');
     await expect(gate(caller, SPACE_BUSY_TIMES_TOOL)).resolves.toBeUndefined();
-    for (const tool of ['list_calendars', 'list_calendar_events', 'get_calendar_event']) {
+    await expect(gate(caller, SPACE_EVENT_TOOL)).resolves.toBeUndefined();
+    for (const tool of [
+      'list_calendars',
+      'list_calendar_events',
+      'get_calendar_event',
+      'create_calendar_event',
+      'update_calendar_event',
+    ]) {
       await expect(gate(caller, tool)).rejects.toThrow(InklingAccountRefusedError);
     }
     // A name only like it is not it.
@@ -565,6 +574,39 @@ describe('a Google tool from an inkling turn, end to end', () => {
       expect(result.notSharing).toEqual(['Ada', 'Sam', 'Kit']);
       expect(accountReads()).toEqual([]);
       expect(fake.provider).not.toHaveBeenCalled();
+    });
+
+    describe('create_space_event (Conor, Oct 16, option (a))', () => {
+      const day = 86_400_000;
+      const at = (offset: number) => new Date(Date.now() + offset).toISOString();
+      const event = (organizer: string) => ({
+        title: 'Dinner',
+        start: at(2 * day),
+        end: at(2 * day + 7_200_000),
+        organizer,
+        attendees: [],
+        organizerConfirmed: true,
+      });
+
+      it("reaches the sharing organizer's own account with INK_INKLING_ACCOUNT_TOOLS unset", async () => {
+        fake.tables.connected_accounts[0].scopes = [
+          CALENDAR,
+          'https://www.googleapis.com/auth/calendar.events',
+        ];
+        const result = await call(registered(), 'create_space_event', inklingTurn, event('Sam'));
+        // The token was handed out and Google reached; this file stubs Google out.
+        expect(result.error ?? '').not.toContain("can't use its owner's google account");
+        expect(fake.provider).toHaveBeenCalledTimes(1);
+        expect(readsFor(SAM).length).toBeGreaterThan(0);
+      });
+
+      it("refuses an organizer who hasn't switched sharing on, before any account is read", async () => {
+        const result = await call(registered(), 'create_space_event', inklingTurn, event('Kit'));
+        expect(result).toMatchObject({ success: false });
+        expect(result.error).toContain(`Kit hasn't switched "share my busy times here" on`);
+        expect(accountReads()).toEqual([]);
+        expect(fake.provider).not.toHaveBeenCalled();
+      });
     });
   });
 

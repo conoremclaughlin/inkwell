@@ -271,6 +271,10 @@ import {
   getSpaceBusyTimesSchema,
   handleGetSpaceBusyTimes,
 } from '../../stories/google-calendar/space-busy-times';
+import {
+  createSpaceEventSchema,
+  handleCreateSpaceEvent,
+} from '../../stories/google-calendar/space-events';
 
 import {
   handleListEmails,
@@ -5102,6 +5106,37 @@ The space is always your own; it reads no other space.`,
         return await handleGetSpaceBusyTimes(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_space_busy_times:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'create_space_event',
+    {
+      description: `Create one event on the calendar of a person in your space, inviting others in your space. For when people here ask you to set something up together.
+
+Before calling, show the exact event in the conversation (title, start and end with their time zone, who's invited) and ask the person it's for. Call only after that person says yes to it, and pass organizerConfirmed: true. If anything changes, ask again.
+
+The event goes on the organizer's own Google calendar; everyone else named gets an email invitation from it. Name people exactly as get_space_busy_times gives them. Everyone named must have "share my busy times here" on in this space; anyone who hasn't can't be included. Times are instants with an offset, from now to a year ahead.`,
+      inputSchema: createSpaceEventSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateSpaceEvent(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_space_event:', error);
         return {
           content: [
             {

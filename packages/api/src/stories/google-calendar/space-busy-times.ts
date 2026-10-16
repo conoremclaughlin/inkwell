@@ -50,6 +50,18 @@ export function canReadFreeBusy(scopes: readonly string[] | null | undefined): b
   return (scopes ?? []).some((scope) => FREE_BUSY_SCOPES.has(scope));
 }
 
+/** The scopes Google's events.insert accepts. */
+const EVENT_WRITE_SCOPES: ReadonlySet<string> = new Set([
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/calendar.events.owned',
+]);
+
+/** Whether a connection with these scopes can create an event on its calendar. */
+export function canWriteEvents(scopes: readonly string[] | null | undefined): boolean {
+  return (scopes ?? []).some((scope) => EVENT_WRITE_SCOPES.has(scope));
+}
+
 export interface BusyBlock {
   start: string;
   end: string;
@@ -133,6 +145,20 @@ export async function freeBusyConnection(
   userId: string,
   spaceId: string
 ): Promise<BusyConnection> {
+  return calendarConnection(client, userId, spaceId, canReadFreeBusy);
+}
+
+/**
+ * The person's Google connection whose scopes `accepts` admits: the one in
+ * `spaceId` if there is one, else their most recent. `found` is false when no
+ * stored connection qualifies.
+ */
+export async function calendarConnection(
+  client: Client,
+  userId: string,
+  spaceId: string,
+  accepts: (scopes: readonly string[] | null | undefined) => boolean
+): Promise<BusyConnection> {
   const { data, error } = await client
     .from('connected_accounts')
     .select('id, workspace_id, scopes')
@@ -143,7 +169,7 @@ export async function freeBusyConnection(
   if (error) throw new Error(`Could not read a member's Google connection: ${error.message}`);
   const usable = (
     (data ?? []) as Array<{ id: string; workspace_id: string | null; scopes: string[] | null }>
-  ).filter((row) => canReadFreeBusy(row.scopes));
+  ).filter((row) => accepts(row.scopes));
   if (usable.length === 0) return { found: false, workspaceId: spaceId };
   const chosen = usable.find((row) => row.workspace_id === spaceId) ?? usable[0];
   return { found: true, workspaceId: chosen.workspace_id, accountId: chosen.id };
@@ -249,13 +275,16 @@ export const getSpaceBusyTimesSchema = z.object({
 type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 
 /** get_space_busy_times: the calling SB's space, its sharing members' busy blocks. */
-export async function handleGetSpaceBusyTimes(
-  args: unknown,
+/**
+ * The calling SB's own space: its identity's workspace, never one a request
+ * names. A caller with no SB, or one whose identity isn't the resolved
+ * user's, is refused with `refusal`.
+ */
+export async function resolveCallerSpace(
+  params: { sbSlug?: string; userId?: string; email?: string },
   dataComposer: DataComposer,
-  options: { busyFor?: SpaceBusyDeps['busyFor']; now?: () => Date } = {}
-): Promise<ToolResult> {
-  const params = getSpaceBusyTimesSchema.parse(args);
-  const refusal = "Only a space's SB can read its members' busy times";
+  refusal: string
+): Promise<{ client: ReturnType<DataComposer['getClient']>; workspaceId: string; sbId: string }> {
   // A person has no space of their own to ask about here; only an SB does.
   if (!params.sbSlug && !(getRequestContext() ?? getSessionContext())?.sbId) {
     throw new Error(refusal);
@@ -264,6 +293,20 @@ export async function handleGetSpaceBusyTimes(
   const client = dataComposer.getClient();
   const { workspaceId, sb } = await resolveCallerWorkspace(client, user.id, params.sbSlug);
   if (!sb || sb.userId !== user.id) throw new Error(refusal);
+  return { client, workspaceId, sbId: sb.sbId };
+}
+
+export async function handleGetSpaceBusyTimes(
+  args: unknown,
+  dataComposer: DataComposer,
+  options: { busyFor?: SpaceBusyDeps['busyFor']; now?: () => Date } = {}
+): Promise<ToolResult> {
+  const params = getSpaceBusyTimesSchema.parse(args);
+  const { client, workspaceId, sbId } = await resolveCallerSpace(
+    params,
+    dataComposer,
+    "Only a space's SB can read its members' busy times"
+  );
   const calendar = getGoogleCalendarService();
   const result = await readSpaceBusyTimes(
     {
@@ -278,7 +321,7 @@ export async function handleGetSpaceBusyTimes(
   );
   logger.info('Read shared busy times', {
     workspaceId,
-    sbId: sb.sbId,
+    sbId,
     sharing: result.sharing.length,
     unavailable: result.unavailable.length,
   });

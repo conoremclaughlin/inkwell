@@ -755,8 +755,11 @@ class OAuthService {
    * saw.
    *
    * `accountId` names one stored connection, for a caller that has already
-   * chosen it (by its scopes, say); without it the most recent active row in
-   * the workspace is used.
+   * chosen it (by its scopes, say): the token is that row's or there is none.
+   * No other credential source is tried, whatever their order, so a write
+   * meant for the chosen account never lands on another one, a desktop
+   * credential for a different address included (Lumen, PR #885). Without
+   * it the most recent active row in the workspace is used.
    */
   async getValidAccessToken(
     userId: string,
@@ -768,7 +771,7 @@ class OAuthService {
     // inklings, checked before any account is read (inkling-account-gate.ts).
     await this.accountGate(this.supabase, provider, userId);
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
-    if (!this.usesDesktopSource(provider)) {
+    if (options.accountId || !this.usesDesktopSource(provider)) {
       const cloud = await this.getCloudAccessToken(
         userId,
         provider,
