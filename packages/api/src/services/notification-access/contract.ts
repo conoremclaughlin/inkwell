@@ -4,6 +4,15 @@ export const NOTIFICATION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const NOTIFICATION_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const NOTIFICATION_BODY_LIMIT = 48 * 1024;
 
+// PostgreSQL text/jsonb cannot represent NUL or an unpaired surrogate.
+// Unicode-mode matching leaves valid surrogate pairs (such as emoji) intact.
+// Refuse, never rewrite, so the stored preview stays exactly what was sent.
+const databaseText = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .refine((value) => !/[\u0000\uD800-\uDFFF]/u.test(value));
+
 // App identifiers are exact, case-sensitive values, never globs or expressions.
 export const notificationPackageSchema = z
   .string()
@@ -25,8 +34,8 @@ export const notificationEventSchema = z
       .uuid()
       .transform((id) => id.toLowerCase()),
     packageName: notificationPackageSchema,
-    title: z.string().max(512),
-    text: z.string().max(8192),
+    title: databaseText(512),
+    text: databaseText(8192),
     postedAt: z.number().int().nonnegative().max(8_640_000_000_000_000),
   })
   .strict();
@@ -43,11 +52,7 @@ export const notificationRuleSchema = z
         .object({
           kind: z.literal('contains'),
           field: z.enum(['title', 'text']),
-          value: z
-            .string()
-            .min(1)
-            .max(512)
-            .refine((value) => value.trim().length > 0),
+          value: databaseText(512).refine((value) => value.trim().length > 0),
           caseSensitive: z.boolean(),
         })
         .strict(),

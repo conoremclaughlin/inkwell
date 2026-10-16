@@ -130,6 +130,30 @@ describe('notification intake', () => {
     );
   });
 
+  it.each(['title', 'text'] as const)(
+    'refuses NUL and lone surrogates in %s without rewriting content',
+    (field) => {
+      for (const value of ['a\u0000b', 'a\ud83d', '\ude00b', '\ude00\ud83d']) {
+        expect(notificationEventSchema.safeParse({ ...event, [field]: value }).success).toBe(false);
+      }
+      for (const value of ['', 'a\ud83d\ude00b', '  demo\n\t', '\\u0000']) {
+        expect(notificationEventSchema.parse({ ...event, [field]: value })[field]).toBe(value);
+      }
+    }
+  );
+
+  it('refuses unrepresentable literal rules while preserving valid Unicode', () => {
+    for (const value of ['a\u0000b', '\ud83d', '\ude00']) {
+      expect(
+        notificationRuleSchema.safeParse({ ...rule, match: { ...rule.match, value } }).success
+      ).toBe(false);
+    }
+    expect(
+      notificationRuleSchema.safeParse({ ...rule, match: { ...rule.match, value: '\ud83d\ude00' } })
+        .success
+    ).toBe(true);
+  });
+
   it('requires a bounded exact app selection, with no duplicates', () => {
     for (const apps of [
       [],

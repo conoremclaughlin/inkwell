@@ -117,6 +117,17 @@ async function admin(path: string, method = 'GET', body?: unknown, auth = 'synth
 }
 
 describe('post-only device intake', () => {
+  it.each(['title', 'text'] as const)(
+    'returns terminal 422 for unrepresentable %s before storage',
+    async (field) => {
+      for (const value of ['a\u0000b', 'a\ud83d', '\ude00b']) {
+        const response = await postEvent({ ...event, [field]: value });
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({ error: 'event_refused' });
+      }
+      expect(store.record).not.toHaveBeenCalled();
+    }
+  );
   it('accepts a valid event and gives an identical acknowledgement on duplicate', async () => {
     const first = await postEvent();
     expect(first.status).toBe(202);
@@ -232,6 +243,13 @@ describe('post-only device intake', () => {
 });
 
 describe('owner management surface', () => {
+  it('reports grant capacity as a conflict, not a transient retry', async () => {
+    store.create.mockRejectedValue(new NotificationAccessError('grant_limit'));
+    const response = await admin('/watchers', 'POST', consent);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'grant_limit' });
+    expect(response.headers.get('retry-after')).toBeNull();
+  });
   it('requires the existing signed-in owner scope, never the device token', async () => {
     expect((await admin('/watchers', 'GET', undefined, deviceToken)).status).toBe(401);
     expect(store.list).not.toHaveBeenCalled();

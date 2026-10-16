@@ -2,6 +2,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { NotificationAccessStore, assertNotificationTarget } from './store';
+import { FakePostgrest } from '../../test/fake-postgrest';
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const NOW = Date.parse('2026-01-10T12:00:00Z');
@@ -171,6 +172,13 @@ describe('private notification target', () => {
 });
 
 describe('sign-in and grant binding', () => {
+  it('reports exhausted grant capacity without exposing a database error', async () => {
+    fault = { table: 'sb_notification_watchers', code: 'NPA08' };
+    await expect(store.create(scope, input, NOW)).rejects.toMatchObject({
+      code: 'grant_limit',
+      message: 'grant_limit',
+    });
+  });
   it('stores a digest and the sign-in row, never another copy of its secret', async () => {
     const created = await store.create(scope, input, NOW);
     expect(created.deviceToken).toMatch(/^ink-na-[0-9a-f]{64}$/);
@@ -224,6 +232,35 @@ describe('sign-in and grant binding', () => {
 });
 
 describe('owner reads, mutation scope and retention', () => {
+  it('purges a full backlog through bounded PostgREST in-lists', async () => {
+    const fake = new FakePostgrest();
+    fake.maxInList = 50;
+    for (let index = 0; index < 501; index++)
+      fake.seed('sb_notification_events', { id: id(index + 100), expires_at: iso(0) });
+    fake.seed('sb_notification_events', { id: id(999), expires_at: iso(1) });
+    const bounded = new NotificationAccessStore(fake as unknown as typeof db);
+    expect(await bounded.purgeExpired(NOW)).toBe(500);
+    expect(fake.rows('sb_notification_events')).toHaveLength(2);
+    expect(await bounded.purgeExpired(NOW)).toBe(1);
+    expect(fake.rows('sb_notification_events').map((row) => row.id)).toEqual([id(999)]);
+    expect(fake.log.filter((entry) => entry.op === 'delete')).toHaveLength(11);
+  });
+
+  it('keeps older active grants visible ahead of a long revoked history', async () => {
+    const fake = new FakePostgrest();
+    fake.seed('sb_notification_watchers', watcher);
+    for (let index = 0; index < 101; index++)
+      fake.seed('sb_notification_watchers', {
+        ...watcher,
+        id: id(index + 100),
+        status: 'revoked',
+        created_at: iso(index),
+      });
+    const rows = await new NotificationAccessStore(fake as unknown as typeof db).list(scope);
+    expect(rows).toHaveLength(100);
+    expect(rows[0].id).toBe(watcher.id);
+    expect(rows.filter((row) => row.status === 'active')).toHaveLength(1);
+  });
   it('lists only this owner in this workspace, without credential material', async () => {
     tables.sb_notification_watchers.push(
       { ...watcher, id: id(8), owner_id: id(20) },
@@ -271,6 +308,8 @@ describe('owner reads, mutation scope and retention', () => {
     ['NPA05', 'event_refused'],
     ['NPA06', 'event_conflict'],
     ['NPA07', 'rate_limited'],
+    ['22P05', 'event_refused'],
+    ['22P02', 'event_refused'],
     ['other', 'unavailable'],
   ])('maps database code %s without reflecting query details', async (code, expected) => {
     fault = { table: 'sb_notification_events', code };

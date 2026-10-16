@@ -21,6 +21,7 @@ export type NotificationErrorCode =
   | 'target_refused'
   | 'not_found'
   | 'already_active'
+  | 'grant_limit'
   | 'event_refused'
   | 'event_conflict'
   | 'rate_limited'
@@ -43,6 +44,7 @@ function check(error: { code?: string } | null): void {
     NPA05: 'event_refused',
     NPA06: 'event_conflict',
     NPA07: 'rate_limited',
+    NPA08: 'grant_limit',
     '23505': 'already_active',
     '23503': 'access_inactive',
   };
@@ -233,6 +235,9 @@ export class NotificationAccessStore {
       .select(WATCHER_COLUMNS)
       .eq('owner_id', scope.ownerId)
       .eq('workspace_id', scope.workspaceId)
+      // The database bounds all active-state grants for an owner at 10.
+      // Keep them before historical rows so a busy history cannot hide revoke.
+      .order('status', { ascending: true })
       .order('created_at', { ascending: false })
       .limit(100);
     check(result.error);
@@ -276,6 +281,10 @@ export class NotificationAccessStore {
         // The trigger sets received_at/expires_at and refuses stale consent.
       })
       .select('id');
+    // A non-representable event is terminal, not a temporary backend failure.
+    // This backstop is deliberately local to event writes.
+    if (result.error?.code === '22P05' || result.error?.code === '22P02')
+      throw new NotificationAccessError('event_refused');
     check(result.error);
     return { inserted: Array.isArray(result.data) && result.data.length === 1 };
   }
@@ -307,16 +316,22 @@ export class NotificationAccessStore {
     const ids = z.array(z.object({ id: z.string().uuid() })).safeParse(batch.data);
     if (!ids.success) throw new NotificationAccessError('unavailable');
     if (ids.data.length === 0) return 0;
-    const result = await this.db
-      .from('sb_notification_events')
-      .delete()
-      .in(
-        'id',
-        ids.data.map((row) => row.id)
-      )
-      .lte('expires_at', cutoff)
-      .select('id');
-    check(result.error);
-    return result.data?.length ?? 0;
+    let deleted = 0;
+    // .in() is encoded in the URL: 500 UUIDs exceed the gateway limit.
+    // Retain the 500-row pass bound but issue short, retry-safe deletes.
+    for (let offset = 0; offset < ids.data.length; offset += 50) {
+      const result = await this.db
+        .from('sb_notification_events')
+        .delete()
+        .in(
+          'id',
+          ids.data.slice(offset, offset + 50).map((row) => row.id)
+        )
+        .lte('expires_at', cutoff)
+        .select('id');
+      check(result.error);
+      deleted += result.data?.length ?? 0;
+    }
+    return deleted;
   }
 }

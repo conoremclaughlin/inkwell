@@ -33,9 +33,9 @@ INSERT INTO public.users VALUES ('${id(1)}'), ('${id(9)}');
 INSERT INTO public.workspaces VALUES ('${id(2)}');
 INSERT INTO public.agent_identities VALUES ('${id(3)}', '${id(1)}', '${id(2)}');
 INSERT INTO public.inbox_threads VALUES ('${id(4)}', '${id(2)}', '{"inklingConversation":true}');
--- Model the existing server writer's token-table access: FOR SHARE requires
--- UPDATE as well as SELECT. This fixture is not the deployed ACL baseline.
-GRANT SELECT, UPDATE ON public.mcp_tokens TO service_role;
+-- Model the existing server writer's owner/token access: these row locks
+-- require UPDATE and SELECT. This fixture is not the deployed ACL baseline.
+GRANT SELECT, UPDATE ON public.mcp_tokens, public.users TO service_role;
 GRANT SELECT ON public.agent_identities, public.inbox_threads TO service_role;
 `;
 
@@ -116,13 +116,20 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     await createWatcher();
   });
 
-  async function createWatcher(owner = id(1)) {
-    return db.query(
-      `INSERT INTO public.sb_notification_watchers
+  const WATCHER_INSERT = `INSERT INTO public.sb_notification_watchers
       (id, owner_id, workspace_id, recipient_id, thread_id, signin_id, installation_id, selected_packages, rules, token_digest, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, ARRAY['com.example.messages'], '[{"packageName":"com.example.messages","match":{"kind":"all"}}]', $8, clock_timestamp() + interval '2 days') RETURNING *`,
-      [id(7), owner, id(2), id(3), id(4), id(5), id(6), 'a'.repeat(64)]
-    );
+      VALUES ($1, $2, $3, $4, $5, $6, $7, ARRAY['com.example.messages'], '[{"packageName":"com.example.messages","match":{"kind":"all"}}]', $8, clock_timestamp() + interval '2 days') RETURNING *`;
+  async function createWatcher(owner = id(1), sequence = 7, signin = id(5), connection = db) {
+    return connection.query(WATCHER_INSERT, [
+      id(sequence),
+      owner,
+      id(2),
+      id(3),
+      id(4),
+      signin,
+      id(sequence + 1000),
+      sequence.toString(16).padStart(64, '0'),
+    ]);
   }
 
   const INSERT = `INSERT INTO public.sb_notification_events
@@ -180,6 +187,7 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     await db.query('SET ROLE service_role');
     try {
       expect((await db.query(INSERT, args)).rowCount).toBe(1);
+      expect((await createWatcher(id(1), 20)).rowCount).toBe(1);
     } finally {
       await db.query('RESET ROLE');
     }
@@ -193,6 +201,55 @@ describe.skipIf(!ROOT)('notification migration (verified disposable PostgreSQL)'
     await expect(
       db.query("UPDATE sb_notification_watchers SET status = 'active'")
     ).rejects.toMatchObject({ code: 'NPA01' });
+  });
+
+  it('bounds outstanding active grants and frees capacity on revoke', async () => {
+    for (let sequence = 20; sequence < 29; sequence++) await createWatcher(id(1), sequence);
+    await expect(createWatcher(id(1), 40)).rejects.toMatchObject({ code: 'NPA08' });
+    await db.query("UPDATE sb_notification_watchers SET status = 'revoked' WHERE id = $1", [id(7)]);
+    expect((await createWatcher(id(1), 40)).rowCount).toBe(1);
+    expect(
+      (await db.query("SELECT * FROM sb_notification_watchers WHERE status = 'active'")).rowCount
+    ).toBe(10);
+  });
+
+  it('serializes grant capacity across different sign-ins for the same owner', async () => {
+    for (let sequence = 20; sequence < 28; sequence++) await createWatcher(id(1), sequence);
+    await db.query(
+      "INSERT INTO mcp_tokens VALUES ($1, $2, 'mobile', clock_timestamp() + interval '1 day')",
+      [id(50), id(1)]
+    );
+    const writer = await second();
+    await db.query('BEGIN');
+    await createWatcher(id(1), 40);
+    let settled = false;
+    const pending = createWatcher(id(1), 41, id(50), writer).then(
+      () => {
+        settled = true;
+        return { accepted: true };
+      },
+      (error: { code: string }) => {
+        settled = true;
+        return { code: error.code };
+      }
+    );
+    try {
+      // An old implementation can complete instead of waiting: let the
+      // outcome assertion expose its extra grant, not a lock-wait timeout.
+      await vi.waitFor(async () => {
+        const state = await admin.query(
+          'SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1 AND query = $2',
+          [backendIds.get(writer), WATCHER_INSERT]
+        );
+        expect(settled || state.rows.some((row) => row.wait_event_type === 'Lock')).toBe(true);
+      });
+    } finally {
+      await db.query('COMMIT');
+    }
+    expect(await pending).toEqual({ code: 'NPA08' });
+    expect(
+      (await db.query("SELECT * FROM sb_notification_watchers WHERE status = 'active'")).rowCount
+    ).toBe(10);
   });
 
   it('sets retention from posting/receipt and ignores retry without charging again', async () => {

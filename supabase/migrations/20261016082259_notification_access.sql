@@ -27,6 +27,8 @@ CREATE UNIQUE INDEX sb_notification_watchers_one_active
   ON public.sb_notification_watchers(signin_id, installation_id, recipient_id)
   WHERE status = 'active';
 CREATE INDEX sb_notification_watchers_owner ON public.sb_notification_watchers(owner_id, workspace_id, created_at DESC);
+CREATE INDEX sb_notification_watchers_active_owner ON public.sb_notification_watchers(owner_id)
+  WHERE status = 'active';
 
 CREATE TABLE public.sb_notification_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,10 +74,27 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- Capacity is per owner, not per client-chosen installation or sign-in.
+  -- Serialize creators on that owner before taking the sign-in lock. This
+  -- matches account deletion's owner -> sign-in -> grant order and leaves
+  -- the intake/logout sign-in -> grant order unchanged.
+  PERFORM id FROM public.users WHERE id = NEW.owner_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'NPA02', MESSAGE = 'notification_access_inactive';
+  END IF;
   SELECT * INTO signin FROM public.mcp_tokens WHERE id = NEW.signin_id FOR SHARE;
+  captured_now := clock_timestamp();
   IF NOT FOUND OR signin.user_id <> NEW.owner_id OR signin.client_id <> 'mobile'
      OR signin.expires_at <= captured_now THEN
     RAISE EXCEPTION USING ERRCODE = 'NPA02', MESSAGE = 'notification_access_inactive';
+  END IF;
+  -- Expired active-state rows still occupy capacity until explicitly revoked
+  -- or removed. This also bounds the active-first owner listing at every age.
+  IF NEW.status = 'active' AND (
+    SELECT count(*) FROM public.sb_notification_watchers
+      WHERE owner_id = NEW.owner_id AND status = 'active'
+  ) >= 10 THEN
+    RAISE EXCEPTION USING ERRCODE = 'NPA08', MESSAGE = 'notification_grant_limit';
   END IF;
   -- API-side audience authorization also checks exact participants. This
   -- invariant prevents a grant bound to an unrelated SB or workspace even

@@ -41,6 +41,7 @@ function failure(res: Response, error: unknown): void {
     target_refused: 403,
     not_found: 404,
     already_active: 409,
+    grant_limit: 409,
     event_refused: 422,
     event_conflict: 409,
     rate_limited: 429,
