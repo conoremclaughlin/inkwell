@@ -11,6 +11,10 @@ export default defineConfig({
         replacement: path.resolve(__dirname, '../shared/src/index.ts'),
       },
       {
+        find: '@inklabs/shared/browser-chat',
+        replacement: path.resolve(__dirname, '../shared/src/browser-chat.ts'),
+      },
+      {
         find: '@inklabs/shared/node-host',
         replacement: path.resolve(__dirname, '../shared/src/node-host/index.ts'),
       },

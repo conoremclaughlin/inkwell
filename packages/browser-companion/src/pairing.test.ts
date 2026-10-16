@@ -49,6 +49,16 @@ function fixture(initial?: PairingRecord) {
 }
 
 describe('pairing state (synthetic storage and network only)', () => {
+  it('does not let a late automatic callback claim a replacement installation', async () => {
+    const f = fixture();
+    const first = await f.client.prepare(origin);
+    await f.client.disconnect();
+    await f.client.prepare(origin);
+    await expect(
+      f.client.claim('ABCD-EFGH-JKLM', { installationId: first.installationId!, origin })
+    ).rejects.toThrow('Pairing changed');
+    expect(f.transport.claim).not.toHaveBeenCalled();
+  });
   it('refuses an invalid stored record rather than silently clearing its receipt', () => {
     expect(() => parsePairingRecord({ phase: 'paired' })).toThrow(
       'Stored pairing state is invalid'

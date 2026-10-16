@@ -2,6 +2,9 @@ import { createChatPanel, type ChatPanelMessage, type ChatPanelViewState } from 
 import type { ConnectionView } from './connection';
 import './chat-panel.css';
 import { cleanBrowserText } from './browser-text';
+import { parseBrowserChatPage, type BrowserChatPage } from '@inklabs/shared/browser-chat';
+import { panelRequest, type CompanionState } from './state';
+import { assertFresh, parseSnapshot } from './protocol';
 
 const object = (v: unknown): Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
@@ -16,7 +19,9 @@ export function mountHostedChatPanel() {
   const retryBox = document.getElementById('chat-retry')!;
   const retryBody = document.getElementById('chat-retry-body')!;
   const retryButton = document.getElementById('chat-retry-send') as HTMLButtonElement;
-  let pendingRetry: { inklingId: string; operationId: string; body: string } | undefined;
+  let pendingRetry:
+    | { inklingId: string; operationId: string; body: string; page?: BrowserChatPage }
+    | undefined;
   let pendingOperationId: string | undefined;
   let intent = false;
   let revision = 0;
@@ -25,6 +30,9 @@ export function mountHostedChatPanel() {
   let identity: ConnectionView | undefined;
   let poll: ReturnType<typeof setTimeout> | undefined;
   let busy = false;
+  let capturing = false;
+  let attachment: BrowserChatPage | undefined;
+  let attachmentRevision = 0;
   const requests = new Map<
     string,
     { resolve(value: Record<string, unknown>): void; reject(): void }
@@ -40,8 +48,13 @@ export function mountHostedChatPanel() {
     async send(request) {
       if (!intent || !identity || !select.value || busy) throw new Error('Connect first.');
       busy = true;
-      render();
       const version = revision;
+      const attached = attachment;
+      // Consume the staging slot once, even if delivery becomes uncertain.
+      // Only the worker's immutable pending request may retain it for retry.
+      if (attached)
+        clearAttachment('Snapshot selected for this message only. Check delivery below.');
+      render();
       try {
         const result = await rpc({
           type: 'chat',
@@ -50,6 +63,7 @@ export function mountHostedChatPanel() {
             inklingId: select.value,
             operationId: request.operationId,
             body: request.body,
+            ...(attached ? { pageId: attached.id } : {}),
           },
         });
         if (version !== revision || result.operationId !== request.operationId)
@@ -72,6 +86,79 @@ export function mountHostedChatPanel() {
     inspectDelivery() {
       void refresh();
     },
+  });
+  const pageTools = document.createElement('div');
+  pageTools.className = 'chat-page-tools';
+  const sharePage = document.createElement('button');
+  sharePage.type = 'button';
+  sharePage.textContent = 'Share this page';
+  const removePage = document.createElement('button');
+  removePage.type = 'button';
+  removePage.className = 'secondary';
+  removePage.textContent = 'Remove page';
+  const pageStatus = document.createElement('p');
+  pageStatus.setAttribute('role', 'status');
+  pageStatus.textContent =
+    'One snapshot, sent with your next message. Review it first; page text can be private. No form values.';
+  const pagePreview = document.createElement('details');
+  const pageLabel = document.createElement('summary');
+  const pageText = document.createElement('pre');
+  pagePreview.append(pageLabel, pageText);
+  pageTools.append(sharePage, removePage, pageStatus, pagePreview);
+  host.querySelector('form')!.prepend(pageTools);
+  function clearAttachment(message?: string) {
+    ++attachmentRevision;
+    attachment = undefined;
+    if (message) pageStatus.textContent = message;
+  }
+  sharePage.onclick = async () => {
+    if (!intent || !identity || !select.value || busy || capturing || pendingOperationId) return;
+    const version = revision;
+    const captureVersion = ++attachmentRevision;
+    capturing = true;
+    attachment = undefined;
+    pageStatus.textContent = 'Capturing the page you opened this panel from…';
+    render();
+    try {
+      const snapshot = parseSnapshot(await panelRequest({ type: 'capture', mode: 'page' }));
+      assertFresh(snapshot);
+      if (!intent || version !== revision || captureVersion !== attachmentRevision) return;
+      const { id, capturedAt, url, title, text, truncated } = snapshot;
+      attachment = parseBrowserChatPage({ id, capturedAt, url, title, text, truncated });
+      pageStatus.textContent =
+        'Attached for your next message only. Review the snapshot or remove it before sending.';
+    } catch {
+      if (version === revision && captureVersion === attachmentRevision)
+        pageStatus.textContent =
+          'Could not capture. Click the extension icon on the page, then try Share this page.';
+    } finally {
+      capturing = false;
+      render();
+    }
+  };
+  removePage.onclick = () => {
+    clearAttachment('Page removed. Nothing was sent.');
+    render();
+  };
+  chrome.storage.onChanged.addListener((_changes, area) => {
+    if (area !== 'session' || !attachment) return;
+    const version = attachmentRevision;
+    const id = attachment.id;
+    void panelRequest<CompanionState>({ type: 'state' })
+      .then((current) => {
+        if (version === attachmentRevision && current.snapshot?.id !== id) {
+          clearAttachment(
+            'The page changed or the capture expired. Share it again before sending.'
+          );
+          render();
+        }
+      })
+      .catch(() => {
+        if (version === attachmentRevision) {
+          clearAttachment('Capture unavailable. Share the page again.');
+          render();
+        }
+      });
   });
   const composer = host.querySelector('textarea')!;
   composer.addEventListener('paste', (event) => {
@@ -135,12 +222,27 @@ export function mountHostedChatPanel() {
     select.disabled = !identity || !intent || busy;
     retryBox.hidden = !pendingRetry || pendingRetry.inklingId !== select.value;
     retryButton.disabled = !intent || !identity || busy || retryBox.hidden;
-    retryBody.textContent = retryBox.hidden ? '' : pendingRetry!.body;
-    panel.setState({ ...state, busy: busy || !!pendingOperationId });
+    retryBody.textContent = retryBox.hidden
+      ? ''
+      : pendingRetry!.body +
+        (pendingRetry!.page
+          ? `\n\nOriginal page snapshot: ${pendingRetry!.page.title}\n${pendingRetry!.page.url}\n${pendingRetry!.page.text}`
+          : '');
+    sharePage.disabled =
+      !intent || !identity || !select.value || busy || capturing || !!pendingOperationId;
+    removePage.hidden = !attachment;
+    removePage.disabled = busy;
+    pagePreview.hidden = !attachment;
+    pageLabel.textContent = attachment
+      ? `Review: ${attachment.title || 'Untitled page'}${attachment.truncated ? ' (truncated)' : ''}`
+      : '';
+    pageText.textContent = attachment ? `${attachment.url}\n\n${attachment.text}` : '';
+    panel.setState({ ...state, busy: busy || capturing || !!pendingOperationId });
   }
   function stop() {
     intent = false; // Synchronous, before disconnecting the port or any await.
     ++revision;
+    clearAttachment('No page attached. Nothing is watched in the background.');
     clearTimeout(poll);
     const old = port;
     port = undefined;
@@ -193,7 +295,14 @@ export function mountHostedChatPanel() {
         uncertain.operationId === result.pendingOperationId &&
         typeof uncertain.body === 'string' &&
         uncertain.body.length <= 4_000
-          ? { inklingId, operationId: uncertain.operationId, body: uncertain.body }
+          ? {
+              inklingId,
+              operationId: uncertain.operationId,
+              body: uncertain.body,
+              ...(uncertain.page === undefined
+                ? {}
+                : { page: parseBrowserChatPage(uncertain.page) }),
+            }
           : undefined;
       if (
         typeof receipt.operationId === 'string' &&
@@ -222,7 +331,7 @@ export function mountHostedChatPanel() {
         ? pendingRetry
           ? 'Checking an uncertain delivery. Review the saved message below to retry it explicitly.'
           : 'Checking an uncertain delivery. No saved retry body is available; nothing will be resent.'
-        : 'Connected. Chat uses your inkling’s usual tools. No page is shared.';
+        : 'Connected. Chat uses your companion’s usual tools. Page snapshots are shared only when you send them.';
     } catch {
       if (version === revision) {
         state = { ...state, connection: 'disconnected' };
@@ -264,6 +373,7 @@ export function mountHostedChatPanel() {
       if (next !== port) return;
       port = undefined;
       identity = undefined;
+      clearAttachment('Connection interrupted. Share the page again after reconnecting.');
       ++revision;
       for (const request of requests.values()) request.reject();
       requests.clear();
@@ -305,15 +415,17 @@ export function mountHostedChatPanel() {
       status.textContent = 'Could not connect. Check pairing and the server, then Reconnect.';
     }
   }
-  connect.onclick = () => {
+  const start = () => {
     if (!intent) {
       intent = true;
       attempted = true;
       void open();
     }
   };
+  connect.onclick = start;
   select.onchange = () => {
     ++revision;
+    clearAttachment('Recipient changed. No page attached.');
     pendingRetry = undefined;
     pendingOperationId = undefined;
     // The pending send keeps its immutable target; prevent switching until it settles.
@@ -328,7 +440,15 @@ export function mountHostedChatPanel() {
     busy = true;
     render();
     try {
-      await rpc({ type: 'retry', operation: { kind: 'message', ...saved } });
+      await rpc({
+        type: 'retry',
+        operation: {
+          kind: 'message',
+          inklingId: saved.inklingId,
+          operationId: saved.operationId,
+          body: saved.body,
+        },
+      });
     } catch {
       // Still unknown. Keep the original request; never create a replacement ID.
     } finally {
@@ -346,5 +466,5 @@ export function mountHostedChatPanel() {
   });
   window.addEventListener('pagehide', stop);
   render();
-  return { stop };
+  return { stop, connect: start };
 }

@@ -29,9 +29,84 @@ afterEach(async () => {
 });
 function approve() {
   fireEvent.click(screen.getByRole('checkbox'));
-  fireEvent.click(screen.getByRole('button', { name: 'Create pairing code' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Approve and connect' }));
 }
 describe('dashboard pairing consent', () => {
+  it('does not hand a code to a mismatched window, origin or installation', async () => {
+    const outbound = vi.spyOn(window, 'postMessage');
+    render(<Page />);
+    approve();
+    await screen.findByText(receipt.pairingCode);
+    const data = {
+      type: 'inkwell:pairing-ready',
+      bridgeId: '33333333-3333-4333-8333-333333333333',
+      installationId: id,
+    };
+    for (const wrong of [
+      { source: null },
+      { origin: 'https://other.example' },
+      { data: { ...data, installationId: b } },
+    ]) {
+      act(() =>
+        window.dispatchEvent(
+          new MessageEvent('message', { source: window, origin: location.origin, data, ...wrong })
+        )
+      );
+    }
+    expect(outbound).not.toHaveBeenCalled();
+    outbound.mockRestore();
+  });
+  it('hands off only after consent and once, then displays a non-secret receipt', async () => {
+    const bridgeId = '33333333-3333-4333-8333-333333333333';
+    const outbound = vi.spyOn(window, 'postMessage');
+    const emit = (type: string, extra: Record<string, unknown> = {}) =>
+      act(() => {
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            source: window,
+            origin: location.origin,
+            data: { type, bridgeId, installationId: id, ...extra },
+          })
+        );
+      });
+    render(<Page />);
+    emit('inkwell:pairing-ready');
+    expect(outbound).not.toHaveBeenCalled();
+    approve();
+    await screen.findByText(receipt.pairingCode);
+    emit('inkwell:pairing-ready');
+    emit('inkwell:pairing-ready');
+    expect(outbound).toHaveBeenCalledExactlyOnceWith(
+      { type: 'inkwell:pairing-approved', bridgeId, installationId: id, code: receipt.pairingCode },
+      location.origin
+    );
+    emit('inkwell:pairing-receipt', { phase: 'paired' });
+    expect(screen.getByRole('status').textContent).toContain('Browser paired');
+    expect(screen.queryByText(receipt.pairingCode)).toBeNull();
+    outbound.mockRestore();
+  });
+  it('never automatically relays after workspace or page scope changes', async () => {
+    const outbound = vi.spyOn(window, 'postMessage');
+    render(<Page />);
+    approve();
+    await screen.findByText(receipt.pairingCode);
+    act(() => setSelectedWorkspaceId(b));
+    act(() =>
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window,
+          origin: location.origin,
+          data: {
+            type: 'inkwell:pairing-ready',
+            bridgeId: '33333333-3333-4333-8333-333333333333',
+            installationId: id,
+          },
+        })
+      )
+    );
+    expect(outbound).not.toHaveBeenCalled();
+    outbound.mockRestore();
+  });
   it('requires renewed consent for a named ordinary companion and checks the echoed binding', async () => {
     get.mockResolvedValue({ recipients: [{ id: b, name: 'River' }] });
     post.mockResolvedValue({ ...receipt, recipientId: b });

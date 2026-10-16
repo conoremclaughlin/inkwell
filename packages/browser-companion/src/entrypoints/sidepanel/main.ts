@@ -4,8 +4,8 @@ import { panelRequest, type CompanionState } from '../../state';
 import { mountPairingPanel } from '../../pairing-panel';
 import { mountHostedChatPanel } from '../../hosted-chat-panel';
 
-mountHostedChatPanel();
-mountPairingPanel();
+const hostedChat = mountHostedChatPanel();
+mountPairingPanel({ onPaired: hostedChat.connect });
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 let state: CompanionState = {};

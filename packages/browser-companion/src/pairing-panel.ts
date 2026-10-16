@@ -4,12 +4,13 @@ import type { PairingView } from './pairing';
 
 /** Worker replies are redacted; no credential is rendered or forwarded by this UI.
  * Disconnect bypasses the busy action. */
-export function mountPairingPanel() {
+export function mountPairingPanel(options: { onPaired?(): void } = {}) {
   const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
   let current: PairingView = { phase: 'unpaired' };
   let busy = false;
   let revision = 0;
   let stopped = 0;
+  let autoConnectId: string | undefined;
   function render() {
     el<HTMLButtonElement>('pair-open').disabled =
       busy ||
@@ -36,7 +37,7 @@ export function mountPairingPanel() {
             ? 'Disconnected locally. Remote revocation is not confirmed. Retry remote revocation to finish disconnecting.'
             : 'Disconnected locally. Remote revocation is not confirmed. Check pairing status before starting again.';
     const messages: Record<PairingView['phase'], string> = {
-      unpaired: 'Not paired. Start in Inkwell, then enter the code here.',
+      unpaired: 'Not paired. Open approval in Inkwell; pairing finishes here automatically.',
       ready: 'Waiting for your approval in Inkwell. No page access is granted.',
       claiming: 'Waiting for a pairing receipt. You can disconnect now.',
       unknown:
@@ -63,6 +64,10 @@ export function mountPairingPanel() {
       if (version !== revision) return;
       current = next;
       render();
+      if (current.phase === 'paired' && autoConnectId && autoConnectId === current.installationId) {
+        autoConnectId = undefined;
+        options.onPaired?.();
+      }
     } catch {
       el('pair-status').textContent = 'Pairing unavailable. No connection is confirmed.';
     }
@@ -105,7 +110,8 @@ export function mountPairingPanel() {
     void run(async () => {
       if (!(await permission)) throw new Error('Dashboard access was not granted.');
       if (generation !== stopped) return;
-      await panelRequest({ type: 'pair:prepare', origin });
+      const prepared = await panelRequest<PairingView>({ type: 'pair:prepare', origin });
+      if (generation === stopped) autoConnectId = prepared.installationId;
     });
   };
   el('pair-claim').onclick = () => {
@@ -114,6 +120,7 @@ export function mountPairingPanel() {
     void run(() => panelRequest({ type: 'pair:claim', code }));
   };
   el('pair-disconnect').onclick = () => {
+    autoConnectId = undefined;
     ++stopped;
     ++revision;
     el<HTMLInputElement>('pair-code').value = '';

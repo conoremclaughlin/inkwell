@@ -104,6 +104,47 @@ const message = {
   operation: { kind: 'message', inklingId, operationId, body: 'Synthetic text.' },
 };
 describe('document-bound hosted chat worker', () => {
+  it('saves the exact worker snapshot before dispatch and reuses it without recapturing', async () => {
+    const page = {
+      id: operationId,
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Setup',
+      text: 'Synthetic steps.',
+      truncated: false,
+    };
+    const capture = vi.fn(async () => page);
+    worker = registerHostedChatWorker(record as never, capture);
+    const p = port();
+    await p.request({ type: 'connect' });
+    mocks.chat.mockRejectedValueOnce(new Error('Fixture network loss'));
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
+    ).toBe(false);
+    expect(stored.chatPending).toEqual({
+      [`${grantId}:${inklingId}`]: { operationId, body: message.operation.body, page },
+    });
+    page.text = 'Changed after dispatch';
+    expect((await p.request({ type: 'retry', operation: message.operation })).ok).toBe(true);
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(mocks.chat.mock.lastCall![0].page.text).toBe('Synthetic steps.');
+  });
+  it('refuses caller-supplied page bytes and invalidated capture references', async () => {
+    const capture = vi.fn(async () => {
+      throw new Error('Capture changed');
+    });
+    worker = registerHostedChatWorker(record as never, capture);
+    const p = port();
+    await p.request({ type: 'connect' });
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, page: {} } })).ok
+    ).toBe(false);
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
+    ).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+    expect(mocks.chat).not.toHaveBeenCalled();
+  });
   it.each(['expired', 'refused', 'closed'] as const)(
     'ends panel intent on terminal %s instead of leaving a poisoned port',
     async (code) => {

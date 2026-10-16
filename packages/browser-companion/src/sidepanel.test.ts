@@ -5,7 +5,9 @@ const request = vi.hoisted(() => vi.fn());
 vi.mock('./state', () => ({ panelRequest: request }));
 // Pairing has its own mounted UI tests; these isolate the capture controls.
 vi.mock('./pairing-panel', () => ({ mountPairingPanel: vi.fn() }));
-vi.mock('./hosted-chat-panel', () => ({ mountHostedChatPanel: vi.fn() }));
+vi.mock('./hosted-chat-panel', () => ({
+  mountHostedChatPanel: vi.fn(() => ({ connect: vi.fn() })),
+}));
 const changed = vi.fn();
 const permission = vi.fn();
 const originInput = () => document.getElementById('origin') as HTMLInputElement;

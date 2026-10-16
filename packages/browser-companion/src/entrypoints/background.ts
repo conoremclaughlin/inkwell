@@ -11,6 +11,8 @@ import { connectDashboard } from '../dashboard-bridge';
 import type { CompanionState, Reply } from '../state';
 import { createPairingClient, parsePairingRecord } from '../pairing';
 import { registerHostedChatWorker } from '../hosted-chat-worker';
+import { parseBrowserChatPage } from '@inklabs/shared/browser-chat';
+import { createPairingApprovalBridge } from '../pairing-bridge';
 
 export default defineBackground(() => {
   // MV3 suspension is normal. Captures and pairing material use session
@@ -54,12 +56,21 @@ export default defineBackground(() => {
       const state = await client.prepare(origin, () =>
         chrome.permissions.contains({ origins: [dashboardPermission(origin)] })
       );
-      if (state.approvalUrl) await chrome.tabs.create({ url: state.approvalUrl });
+      await pairingApproval.open(state);
       return state;
     }
     throw new Error('Unsupported pairing action.');
   }
-  const hostedChat = registerHostedChatWorker(async () => (await getPairing()).connectionRecord());
+  const pairingApproval = createPairingApprovalBridge(getPairing);
+  const hostedChat = registerHostedChatWorker(
+    async () => (await getPairing()).connectionRecord(),
+    async (snapshotId) => {
+      const state = await read();
+      const snapshot = requireSnapshot(state, snapshotId);
+      const { id, capturedAt, url, title, text, truncated } = snapshot;
+      return parseBrowserChatPage({ id, capturedAt, url, title, text, truncated });
+    }
+  );
   const requireSnapshot = (state: CompanionState, id: unknown) => {
     if (
       !state.snapshot ||
@@ -105,6 +116,7 @@ export default defineBackground(() => {
     });
   });
   chrome.tabs.onRemoved.addListener((id) => {
+    pairingApproval.removed(id);
     void serialized(async () => {
       const state = await read();
       if (state.sourceTabId === id || state.dashboardTabId === id)
@@ -112,6 +124,7 @@ export default defineBackground(() => {
     });
   });
   chrome.tabs.onUpdated.addListener((id, change) => {
+    pairingApproval.changed(id, change);
     if (change.status !== 'complete' && change.status !== 'loading' && !change.url) return;
     void serialized(async () => {
       const state = await read();
@@ -134,8 +147,18 @@ export default defineBackground(() => {
   });
 
   chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, respond) => {
+    if (message?.type === 'bridge:pairing') {
+      void pairingApproval.claim(message, sender).then(
+        (value) => respond({ ok: true, value }),
+        () => respond({ ok: false, error: 'Pairing callback unavailable. Check the extension.' })
+      );
+      return true;
+    }
     if (typeof message?.type === 'string' && message.type.startsWith('pair:')) {
-      if (message.type === 'pair:disconnect' && isPanel(sender)) hostedChat.disconnect();
+      if (message.type === 'pair:disconnect' && isPanel(sender)) {
+        pairingApproval.stop();
+        hostedChat.disconnect();
+      }
       // This lane never queues behind captures, page fills, or an auth fetch.
       // In particular, Disconnect reaches its local fence while claim waits.
       const action = isPanel(sender)

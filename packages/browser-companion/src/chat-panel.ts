@@ -367,7 +367,7 @@ export function createChatPanel(
             ? 'Page sharing stop requested'
             : state.sharing.state === 'stopped'
               ? 'Page sharing stopped locally'
-              : 'Page not shared'
+              : 'No live page access'
     );
     setText(connection, connectionLabels[state.connection]);
     const suppliedIds = new Set(state.messages.map((message) => message.id));
@@ -534,6 +534,8 @@ export function createChatPanel(
     const copy = snapshot(next);
     if (targetKey(state) !== targetKey(copy)) {
       const operation = pending;
+      const hadTargetOrDraft =
+        !!state.conversation || !!state.page || !!composer.value || !!operation;
       // Only the same conversation's newest snapshot can supersede retained evidence.
       const supplied = conversationKey(copy) === operation?.key ? copy.messages : [];
       const observed = operation && observedStatus(operation.id, supplied);
@@ -544,8 +546,9 @@ export function createChatPanel(
       composer.value = '';
       revision++;
       // Stop is bound to its read-session identity, not the selected view.
-      notice.textContent =
-        'Conversation or page binding changed. Drafts are not carried to another target.';
+      notice.textContent = hadTargetOrDraft
+        ? 'Conversation or page binding changed. Drafts are not carried to another target.'
+        : '';
       state = copy;
       operation?.abort.abort();
     } else {

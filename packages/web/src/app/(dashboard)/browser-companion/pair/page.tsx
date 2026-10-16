@@ -25,7 +25,60 @@ export default function BrowserPairingPage() {
   } | null>(null);
   const attempted = useRef(false);
   const [code, setCode] = useState('');
+  const [handoff, setHandoff] = useState<'waiting' | 'sending' | 'paired' | 'unknown'>('waiting');
+  const approval = useRef<{
+    installationId: string;
+    url: string;
+    workspaceId: string | null;
+    code: string;
+  } | null>(null);
+  const deliveredBridge = useRef<string | null>(null);
   const [status, setStatus] = useState('Open this page from the installed extension to begin.');
+  useEffect(() => {
+    const receive = (event: MessageEvent) => {
+      const approved = approval.current;
+      if (
+        !approved ||
+        event.source !== window ||
+        event.origin !== window.location.origin ||
+        window.location.href !== approved.url ||
+        getSelectedWorkspaceId() !== approved.workspaceId ||
+        event.data?.installationId !== approved.installationId ||
+        typeof event.data.bridgeId !== 'string' ||
+        !/^[0-9a-f-]{36}$/i.test(event.data.bridgeId)
+      )
+        return;
+      if (event.data.type === 'inkwell:pairing-ready' && !deliveredBridge.current) {
+        deliveredBridge.current = event.data.bridgeId;
+        setHandoff('sending');
+        setStatus('Approval sent to the extension. Waiting for its pairing receipt…');
+        window.postMessage(
+          {
+            type: 'inkwell:pairing-approved',
+            bridgeId: event.data.bridgeId,
+            installationId: approved.installationId,
+            code: approved.code,
+          },
+          window.location.origin
+        );
+      } else if (
+        event.data.type === 'inkwell:pairing-receipt' &&
+        event.data.bridgeId === deliveredBridge.current
+      ) {
+        if (event.data.phase === 'paired') {
+          setHandoff('paired');
+          setStatus('Browser paired. Return to the side chat. No page has been shared.');
+        } else {
+          setHandoff('unknown');
+          setStatus(
+            'Automatic pairing was not confirmed. Check the extension status before using the fallback code; do not retry an unknown claim.'
+          );
+        }
+      }
+    };
+    window.addEventListener('message', receive);
+    return () => window.removeEventListener('message', receive);
+  }, []);
   useEffect(() => {
     const read = () => {
       if (attempted.current) return;
@@ -74,7 +127,8 @@ export default function BrowserPairingPage() {
       return;
     attempted.current = true;
     setAttempt({ workspaceId, recipientName: recipient?.name ?? 'App inklings only' });
-    setStatus('Requesting a pairing code for this workspace…');
+    const approvedUrl = window.location.href;
+    setStatus('Approving this browser for the selected workspace…');
     try {
       const result = await apiPost<{
         installationId: string;
@@ -99,8 +153,14 @@ export default function BrowserPairingPage() {
       )
         throw new Error('Invalid pairing receipt.');
       setCode(result.pairingCode);
+      approval.current = {
+        installationId: offer.installationId,
+        url: approvedUrl,
+        workspaceId,
+        code: result.pairingCode,
+      };
       setStatus(
-        'Code created. Enter it only in the extension that opened this request. The code expires in ten minutes.'
+        'Approved. The extension will finish pairing automatically. If no handoff starts, use the manual code below in the extension that opened this request.'
       );
     } catch {
       setStatus(
@@ -192,16 +252,20 @@ export default function BrowserPairingPage() {
               disabled={!offer || !consent || (recipientId !== '' && !recipient)}
               onClick={() => void approve()}
             >
-              Create pairing code
+              Approve and connect
             </button>
           </>
         )}
       </div>
-      {code && (
-        <div className="rounded-lg border p-5">
-          <p>Enter in the extension</p>
+      {code && handoff !== 'paired' && (
+        <details className="rounded-lg border p-5">
+          <summary className="cursor-pointer font-medium">Manual pairing code (fallback)</summary>
+          <p className="mt-3">
+            Use only if the extension is waiting for a code. Never retry an unknown claim. This code
+            expires in ten minutes.
+          </p>
           <code className="mt-2 block break-all text-2xl tracking-widest">{code}</code>
-        </div>
+        </details>
       )}
       <p role="status" className="rounded-lg border p-4">
         {status}

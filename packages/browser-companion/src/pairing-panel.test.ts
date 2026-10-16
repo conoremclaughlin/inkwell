@@ -29,6 +29,37 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 describe('pairing panel with actual markup', () => {
+  it('auto-connects only a pairing initiated by this surviving panel', async () => {
+    const onPaired = vi.fn();
+    const id = '11111111-1111-4111-8111-111111111111';
+    request.mockImplementation(async (message) => {
+      if (message.type === 'pair:prepare') view = { phase: 'ready', installationId: id };
+      return view;
+    });
+    mountPairingPanel({ onPaired });
+    await vi.waitFor(() => expect(request).toHaveBeenCalled());
+    button('pair-open').click();
+    await vi.waitFor(() =>
+      expect(request).toHaveBeenCalledWith({
+        type: 'pair:prepare',
+        origin: 'http://localhost:3002',
+      })
+    );
+    view = { phase: 'paired', installationId: id };
+    const changed = vi.mocked(chrome.storage.onChanged.addListener).mock.calls[0]![0];
+    changed({}, 'session');
+    await vi.waitFor(() => expect(onPaired).toHaveBeenCalledTimes(1));
+    changed({}, 'session');
+    await Promise.resolve();
+    expect(onPaired).toHaveBeenCalledTimes(1);
+  });
+  it('does not auto-connect when a new panel finds an already paired installation', async () => {
+    view = { phase: 'paired', installationId: '11111111-1111-4111-8111-111111111111' };
+    const onPaired = vi.fn();
+    mountPairingPanel({ onPaired });
+    await vi.waitFor(() => expect(button('pair-disconnect').disabled).toBe(false));
+    expect(onPaired).not.toHaveBeenCalled();
+  });
   it.each(['pending', 'confirmed'] as const)(
     'keeps storage failure distinct from %s revocation and fences new pairing',
     async (revocation) => {
