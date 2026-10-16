@@ -6,6 +6,8 @@ import {
   parseProposal,
   type BrowserSnapshot,
 } from './protocol';
+import { stripInvisibleUnicode } from '@inklabs/shared/security/untrusted-content';
+import { renderedElement, renderedText } from './rendered-text';
 
 const OMIT =
   'script,style,noscript,template,input,textarea,select,[contenteditable],[hidden],[aria-hidden="true"]';
@@ -16,13 +18,7 @@ const PRIVATE_AUTOCOMPLETE =
 type Field = HTMLInputElement | HTMLTextAreaElement;
 
 function visible(element: Element): boolean {
-  if (element.closest('[hidden],[aria-hidden="true"],dialog:not([open])')) return false;
-  for (let node: Element | null = element; node; node = node.parentElement) {
-    const style = getComputedStyle(node);
-    if (style.display === 'none' || style.visibility !== 'visible' || style.opacity === '0')
-      return false;
-  }
-  return element.getClientRects().length > 0;
+  return renderedElement(element);
 }
 function label(field: Field): string {
   // A wrapping label can contain textarea text or hidden descendants. Never
@@ -34,16 +30,16 @@ function label(field: Field): string {
     let visited = 0;
     while (walker.nextNode() && labelText.length < 160 && ++visited <= 1000) {
       const parent = walker.currentNode.parentElement;
-      if (parent && !parent.closest(OMIT) && visible(parent))
+      if (parent && !parent.closest(OMIT) && renderedText(walker.currentNode))
         labelText += walker.currentNode.textContent || '';
     }
   }
-  return (
+  return stripInvisibleUnicode(
     labelText ||
-    field.getAttribute('aria-label') ||
-    field.getAttribute('placeholder') ||
-    field.name ||
-    'Text field'
+      field.getAttribute('aria-label') ||
+      field.getAttribute('placeholder') ||
+      field.name ||
+      'Text field'
   )
     .trim()
     .slice(0, 160);
@@ -95,7 +91,7 @@ export class PageSession {
       id: crypto.randomUUID(),
       capturedAt: Date.now(),
       url,
-      title: document.title.slice(0, 200),
+      title: stripInvisibleUnicode(document.title).slice(0, 200),
       mode,
       text: '',
       truncated: false,
@@ -112,7 +108,7 @@ export class PageSession {
       }
       const node = walker.currentNode;
       const parent = node.parentElement;
-      if (!parent || parent.closest(OMIT) || !visible(parent)) continue;
+      if (!parent || parent.closest(OMIT) || !renderedText(node)) continue;
       let part = node.textContent || '';
       if (mode === 'selection') {
         const chunks: string[] = [];
@@ -128,7 +124,7 @@ export class PageSession {
         }
         part = chunks.join(' ');
       }
-      part = part.trim();
+      part = stripInvisibleUnicode(part).trim();
       if (part) snapshot.text += `${part}\n`;
     }
     if (snapshot.text.length > MAX_TEXT) {

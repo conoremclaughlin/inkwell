@@ -5,11 +5,38 @@ import { PageSession } from './page-session';
 beforeEach(() => {
   vi.restoreAllMocks();
   // jsdom has no layout. Only this unit fixture supplies a visible rectangle.
-  vi.spyOn(Element.prototype, 'getClientRects').mockReturnValue({ length: 1 } as DOMRectList);
+  vi.spyOn(Element.prototype, 'getClientRects').mockReturnValue([
+    new DOMRect(10, 10, 200, 20),
+  ] as unknown as DOMRectList);
+  Object.defineProperty(Range.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(10, 10, 200, 20)],
+  });
+  vi.spyOn(document.documentElement, 'clientWidth', 'get').mockReturnValue(1440);
   document.body.innerHTML =
     '<p>Visible synthetic text</p><label for="topic">Topic</label><input id="topic" value="not shared"><label for="details">Details</label><textarea id="details">private draft not shared</textarea><button type="submit">Submit</button>';
 });
 describe('isolated page capture and confirm-only fill', () => {
+  it('uses the common Unicode cleaner for body, title and field labels', () => {
+    document.title = 'Ti\u202etle';
+    document.body.innerHTML = '<p>Be\u200blow</p><input aria-label="La\u2066bel">';
+    const capture = new PageSession().capture('page');
+    expect(capture.title).toBe('Title');
+    expect(capture.text).toBe('Below\n');
+    expect(capture.fields[0]!.label).toBe('Label');
+  });
+  it.each([
+    '<span style="font-size:0px">hidden marker</span>',
+    '<span style="color:transparent">hidden marker</span>',
+    '<div style="content-visibility:hidden">hidden marker</div>',
+    '<details><summary>Visible summary</summary>hidden marker</details>',
+    '<p aria-hidden="TRUE">hidden marker</p>',
+  ])('omits common hidden DOM text: %s', (hidden) => {
+    document.body.innerHTML = '<p>Visible control</p>' + hidden;
+    const capture = new PageSession().capture('page');
+    expect(capture.text).not.toContain('hidden marker');
+    expect(capture.text).toContain('Visible control');
+  });
   it('does not leak wrapping-label textarea or hidden contents via field labels', () => {
     document.body.innerHTML =
       '<label>Details<textarea>private synthetic draft</textarea><span hidden>private hidden text</span></label>';

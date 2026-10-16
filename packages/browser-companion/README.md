@@ -326,6 +326,31 @@ credential allowlist and use existing owner-scoped inkling listing, inbox dispat
 and durable client-message deduplication. Page-grant admission and real Chrome
 targeting remain unwired. Unit tests use synthetic state and fake callbacks.
 
+### Shared external-content cleanup
+
+Page capture, paste, and `web_fetch` use the same browser-safe Unicode policy in
+`@inklabs/shared/security/untrusted-content`. It removes control, bidi, zero-width
+spacing and tag payloads without normalizing scripts; writing/emoji joiners,
+variation selectors and recognized subdivision flags are preserved. Titles and
+field labels are cleaned too. Page requests use the same fresh, randomized
+untrusted-data boundary as `web_fetch`, around all page-sourced fields. Neither
+cleanup nor the boundary is a prompt-injection detector or an authorization gate.
+
+The DOM adapter feeds computed styles into the shared hidden-style rules, then
+checks text-range geometry and clipping. Ordinary below-the-fold text stays in;
+there is no vertical viewport cutoff for normal flow. Current form values remain
+excluded. Deep ancestry and large rectangle lists are bounded; partially clipped
+text runs are conservatively omitted, which can omit some visible text too.
+Near-transparent text, same-color foreground/background, complex occlusion and
+canvas-painted text are not covered by a general visibility guarantee.
+
+The compiled capture path was exercised on a locally served planted page through
+the panel, worker and isolated content script. Whole-page capture retained
+below-the-fold and above-the-scroll-position controls; selection clipping,
+Unicode cleanup, form-value exclusion and the 390 px overflow check passed.
+The private test supplied a loopback host permission and source-tab binding, so
+it does not establish the browser-action permission gesture or model acceptance.
+
 The compiled extension also passed a two-message synthetic HTTP conversation in
 real isolated Chromium, including authenticated extension-document ports, two
 panels with separate Connect intent, cross-panel Disconnect, and a 390 px overflow

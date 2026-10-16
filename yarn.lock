@@ -3229,6 +3229,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@inklabs/browser-companion@workspace:packages/browser-companion"
   dependencies:
+    "@inklabs/shared": "workspace:*"
     "@types/chrome": "npm:^0.1.14"
     jsdom: "npm:^30.0.1"
     typescript: "npm:^5.3.3"

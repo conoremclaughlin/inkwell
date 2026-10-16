@@ -1,6 +1,11 @@
-/** Browser-only, dependency-free wire contract shared with the dashboard.
+/** Browser-safe wire contract shared with the dashboard.
  * Everything from a page or an agent is data, never executable authority.
  */
+import {
+  formatUntrustedData,
+  stripInvisibleUnicode,
+} from '@inklabs/shared/security/untrusted-content';
+
 export const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 export const MAX_TEXT = 12_000;
 export const MAX_FIELDS = 40;
@@ -234,9 +239,20 @@ export function formatBrowserRequest(snapshot: BrowserSnapshot, instruction: str
     'For suggested fills, reply with a fenced inkwell-browser-proposal JSON block:',
     '{"version":1,"snapshotId":"<snapshot id>","changes":[{"fieldId":"f0","value":"suggested text"}]}',
     'Use only the supplied field IDs. Do not submit, click, execute code, or request secrets. The human reviews and applies locally.',
-    'BEGIN UNTRUSTED SNAPSHOT',
-    JSON.stringify(snapshot),
-    'END UNTRUSTED SNAPSHOT',
+    formatUntrustedData(
+      JSON.stringify({
+        ...snapshot,
+        url: stripInvisibleUnicode(snapshot.url),
+        title: stripInvisibleUnicode(snapshot.title),
+        text: stripInvisibleUnicode(snapshot.text),
+        fields: snapshot.fields.map((field) => ({
+          ...field,
+          label: stripInvisibleUnicode(field.label),
+        })),
+      }),
+      'browser_page',
+      crypto.randomUUID()
+    ),
   ].join('\n');
   if (new TextEncoder().encode(content).length > 60_000)
     throw new Error('Snapshot too large to send. Shorten the excerpt.');
