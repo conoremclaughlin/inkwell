@@ -19,7 +19,9 @@
  *
  * The two-person cases come in two kinds, named in each test:
  * - "outsider": a person writing into a conversation they were never part
- *   of. These stay refused when two-person groups ship.
+ *   of. These stay refused when two-person groups ship. A reply through the
+ *   route is answered as no thread at all (404), so it does not disclose
+ *   the conversation either (D3).
  * - "today": a conversation two people are both in. Refused today; two-person
  *   groups would add consented-member success cases beside these, on their
  *   own path, rather than loosen the outsider refusals.
@@ -258,15 +260,30 @@ function expectRefused(outcome: unknown, label?: string): void {
 }
 
 /**
+ * An outsider's reply to an inkling conversation through the route: answered
+ * as no thread at all, before the gate, so the conversation is not disclosed
+ * (D3, services/threads/thread-read-access.ts).
+ */
+function expectHidden(outcome: unknown, label?: string): void {
+  expect(outcome, label).toMatchObject({
+    status: 404,
+    body: { error: expect.stringMatching(/^No thread with key /) },
+  });
+}
+
+/**
  * Each attempt, in turn, is refused, leaves every stored thread, member and
  * message exactly as it found them (rows compared whole, so a changed row
  * fails as well as an added one), and wakes nobody.
  */
-async function refusedWithoutTrace(attempts: Record<string, () => Promise<unknown>>) {
+async function refusedWithoutTrace(
+  attempts: Record<string, () => Promise<unknown>>,
+  refused: (outcome: unknown, label?: string) => void = expectRefused
+) {
   for (const [label, attempt] of Object.entries(attempts)) {
     const before = stored();
     const wakesBefore = wakes().length;
-    expectRefused(await attempt(), label);
+    refused(await attempt(), label);
     expect(stored(), label).toEqual(before);
     expect(wakes().length, label).toBe(wakesBefore);
   }
@@ -389,10 +406,13 @@ describe('two people and one inkling: refused today', () => {
     await accepted(
       call(create, { key: THEIRS, recipients: ['moss'], content: 'hi moss' }, SOMEONE)
     );
-    await refusedWithoutTrace({
-      "B into A's 1:1": personReplies(MINE, SOMEONE),
-      "A into B's 1:1": personReplies(THEIRS, ME),
-    });
+    await refusedWithoutTrace(
+      {
+        "B into A's 1:1": personReplies(MINE, SOMEONE),
+        "A into B's 1:1": personReplies(THEIRS, ME),
+      },
+      expectHidden
+    );
   });
 
   it('today: in a conversation holding both people and the inkling, nobody may write', async () => {
@@ -472,7 +492,7 @@ describe("two people and two of one owner's inklings: refused today", () => {
     await accepted(call(create, { key: GROUP, recipients: ['pip', 'tam'], content: 'hi both' }));
     const [first] = wakes();
     expect(first?.toSlug).toBe('pip');
-    await refusedWithoutTrace({ 'B into the group': personReplies(GROUP, SOMEONE) });
+    await refusedWithoutTrace({ 'B into the group': personReplies(GROUP, SOMEONE) }, expectHidden);
 
     // The refusal left the owner's chain alone: pip's turn ending still
     // wakes tam, once, for the owner's same message.

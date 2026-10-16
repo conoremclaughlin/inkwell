@@ -528,3 +528,47 @@ describe('the write routes answer a non-participant as for a key nobody has used
     }
   });
 });
+
+describe('link views (artifact backlinks)', () => {
+  let artifactId: string;
+  const uri = `ink://specs/d3-fixture-${run}`;
+
+  beforeAll(async () => {
+    const { rows } = await db.query<{ id: string }>(
+      `INSERT INTO artifacts (uri, title, content, artifact_type, user_id, workspace_id)
+       VALUES ($1, 'Invented spec', 'Invented content.', 'spec', $2, $3) RETURNING id`,
+      [uri, owner.userId, spaceId]
+    );
+    artifactId = rows[0].id;
+    for (const key of [keys.ownerChat, keys.memberChat, keys.open]) {
+      await db.query(
+        `INSERT INTO thread_links (workspace_id, source_thread_id, target_kind, target_artifact_id,
+         relation, linked_by_kind, linked_by_user_id)
+         VALUES ($1, $2, 'artifact', $3, 'relates', 'user', $4)`,
+        [spaceId, threadIdByKey.get(key), artifactId, owner.userId]
+      );
+    }
+  });
+
+  afterAll(async () => {
+    if (artifactId) await db.query('DELETE FROM artifacts WHERE id = $1', [artifactId]);
+  });
+
+  it("gives the space owner's full view every thread's link but a member's 1:1", async () => {
+    const { artifactBacklinks, linkReaderForUser } = await import('../services/thread-links');
+    const { getDataComposer } = await import('../data/composer');
+    const supabase = (await getDataComposer()).getClient();
+    const backlinks = await artifactBacklinks(
+      supabase,
+      {
+        workspaceId: spaceId,
+        callerUserId: owner.userId,
+        reader: linkReaderForUser('owner', owner.userId),
+      },
+      { id: artifactId, uri }
+    );
+    expect('threads' in backlinks, JSON.stringify(backlinks)).toBe(true);
+    const threadKeys = 'threads' in backlinks ? backlinks.threads.map((t) => t.threadKey) : [];
+    expect(threadKeys.sort()).toEqual([keys.open, keys.ownerChat].sort());
+  });
+});
