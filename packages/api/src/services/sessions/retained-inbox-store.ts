@@ -10,6 +10,8 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 
 const uuid = z.string().uuid();
+// sessions.turn_epoch is opaque text, not a UUID-typed database column.
+const turnEpoch = z.string().min(1).max(256);
 const scopeSchema = z.object({ ownerId: uuid, recipientId: uuid, sessionId: uuid }).strict();
 const sourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('thread'), messageId: uuid }).strict(),
@@ -18,7 +20,7 @@ const sourceSchema = z.discriminatedUnion('kind', [
 const launchSchema = z
   .object({
     launchId: uuid,
-    turnEpoch: uuid,
+    turnEpoch,
     // Null is uncorrelated, never evidence that an input was not delivered.
     native: z
       .object({ sessionId: z.string().min(1).max(256), inputId: uuid })
@@ -37,7 +39,7 @@ const rowFields = z
     state: z.enum(['pending', 'bound', 'held', 'settled']),
     revision: z.number().int().min(0).max(2_147_483_647),
     launch_id: uuid.nullable(),
-    turn_epoch: uuid.nullable(),
+    turn_epoch: turnEpoch.nullable(),
     native_session_id: z.string().min(1).max(256).nullable(),
     native_input_id: uuid.nullable(),
     created_at: z.string().datetime({ offset: true }),
@@ -61,6 +63,7 @@ export type RetainedInboxLaunch = z.infer<typeof launchSchema>;
 export type RetainedInboxDelivery = Readonly<z.infer<typeof rowSchema>>;
 export type RetainedInboxWrite =
   | { status: 'written'; delivery: RetainedInboxDelivery }
+  | { status: 'refused'; reason: 'invalid-input' }
   | { status: 'conflict' }
   | { status: 'unknown' };
 
@@ -77,6 +80,14 @@ function readRow(value: unknown): RetainedInboxDelivery {
     changed_at: new Date(row.changed_at).toISOString(),
     settled_at: row.settled_at === null ? null : new Date(row.settled_at).toISOString(),
   });
+}
+
+function transitionInput(value: unknown): RetainedInboxDelivery | undefined {
+  try {
+    return readRow(value);
+  } catch {
+    return undefined;
+  }
 }
 
 /** No global client, environment loader, logger, or credential fallback. */
@@ -141,8 +152,10 @@ export function retainedInboxStore(client: SupabaseClient) {
       expectedInput: RetainedInboxDelivery,
       launchInput: RetainedInboxLaunch
     ): Promise<RetainedInboxWrite> {
-      const expected = readRow(expectedInput);
-      const launch = launchSchema.parse(launchInput);
+      const expected = transitionInput(expectedInput);
+      const parsed = launchSchema.safeParse(launchInput);
+      if (!expected || !parsed.success) return { status: 'refused', reason: 'invalid-input' };
+      const launch = parsed.data;
       if (expected.state !== 'pending') return { status: 'conflict' };
       return change(expected, {
         state: 'bound',
@@ -153,9 +166,28 @@ export function retainedInboxStore(client: SupabaseClient) {
       });
     },
 
+    /**
+     * Queue re-resolution may choose a different session before dispatch.
+     * Preserve the original source identity; fence the old session/revision
+     * and require pending (no launch could have consumed it). Authorization
+     * of the replacement session remains the trusted routing caller's job.
+     */
+    async movePending(
+      expectedInput: RetainedInboxDelivery,
+      sessionIdInput: string
+    ): Promise<RetainedInboxWrite> {
+      const expected = transitionInput(expectedInput);
+      const parsed = uuid.safeParse(sessionIdInput);
+      if (!expected || !parsed.success) return { status: 'refused', reason: 'invalid-input' };
+      if (expected.state !== 'pending' || parsed.data === expected.session_id)
+        return { status: 'conflict' };
+      return change(expected, { session_id: parsed.data });
+    },
+
     /** Ambiguous death/dispatch remains retained. No expiry-based retry. */
     async hold(expectedInput: RetainedInboxDelivery): Promise<RetainedInboxWrite> {
-      const expected = readRow(expectedInput);
+      const expected = transitionInput(expectedInput);
+      if (!expected) return { status: 'refused', reason: 'invalid-input' };
       if (expected.state !== 'bound') return { status: 'conflict' };
       return change(expected, { state: 'held' });
     },
@@ -169,7 +201,8 @@ export function retainedInboxStore(client: SupabaseClient) {
     async settleAfterFinalization(
       expectedInput: RetainedInboxDelivery
     ): Promise<RetainedInboxWrite> {
-      const expected = readRow(expectedInput);
+      const expected = transitionInput(expectedInput);
+      if (!expected) return { status: 'refused', reason: 'invalid-input' };
       if (expected.state !== 'bound') return { status: 'conflict' };
       return change(expected, { state: 'settled', settled_at: new Date().toISOString() });
     },

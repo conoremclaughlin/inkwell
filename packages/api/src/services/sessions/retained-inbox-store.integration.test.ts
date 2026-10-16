@@ -12,7 +12,8 @@ describe('retained inbox delivery database', () => {
   const sessionId = randomUUID();
   const threadId = randomUUID();
   const launchId = randomUUID();
-  const epoch = randomUUID();
+  const epoch = 'synthetic:turn-epoch';
+  const replacementSessionId = randomUUID();
 
   beforeAll(async () => {
     const composer = await getDataComposer();
@@ -26,6 +27,16 @@ describe('retained inbox delivery database', () => {
       status: 'active',
     });
     expect(session.error).toBeNull();
+    expect(
+      (
+        await client.from('sessions').insert({
+          id: replacementSessionId,
+          user_id: fixture.userId,
+          agent_id: 'echo',
+          status: 'active',
+        })
+      ).error
+    ).toBeNull();
     const thread = await client.from('inbox_threads').insert({
       id: threadId,
       thread_key: `test:retained-${threadId}`,
@@ -47,13 +58,14 @@ describe('retained inbox delivery database', () => {
 
   afterAll(async () => {
     if (!client) return;
-    // Only this suite's rows. RESTRICT makes obligation cleanup explicit.
+    // Only this suite's rows. Derived references cascade on explicit erasure.
     for (const [table, column, value] of [
       ['sb_inbox_deliveries', 'session_id', sessionId],
       ['launched_processes', 'id', launchId],
       ['inbox_thread_messages', 'thread_id', threadId],
       ['inbox_threads', 'id', threadId],
       ['sessions', 'id', sessionId],
+      ['sessions', 'id', replacementSessionId],
     ]) {
       const result = await client.from(table).delete().eq(column, value);
       expect(result.error).toBeNull();
@@ -142,6 +154,8 @@ describe('retained inbox delivery database', () => {
       { thread_message_id: null },
       { inbox_message_id: randomUUID() },
       { state: 'bound' },
+      { state: 'bound', launch_id: launchId, turn_epoch: '' },
+      { state: 'bound', launch_id: launchId, turn_epoch: 'x'.repeat(257) },
       { revision: -1 },
       { launch_id: launchId },
       { native_input_id: randomUUID() },
@@ -167,20 +181,34 @@ describe('retained inbox delivery database', () => {
     expect(remaining.data).toEqual([]);
   });
 
-  it('refuses deletion of a retained source, session, or launch until explicit cleanup', async () => {
+  it('moves only pending sources during session handoff and refuses the old launch attempt', async () => {
+    const store = retainedInboxStore(client);
+    const [row] = await store.retain(scope, [await source()]);
+    const moved = await store.movePending(row, replacementSessionId);
+    expect(moved.status).toBe('written');
+    if (moved.status !== 'written') throw new Error('Handoff was not confirmed');
+    expect(await store.bind(row, { launchId, turnEpoch: epoch, native: null })).toEqual({
+      status: 'conflict',
+    });
+    expect(await store.movePending(row, randomUUID())).toEqual({ status: 'conflict' });
+    const open = await store.listUnsettled({ ...scope, sessionId: replacementSessionId });
+    expect(open).toEqual([moved.delivery]);
+  });
+
+  it('cascades erased source references without marking other sources delivered', async () => {
     const store = retainedInboxStore(client);
     const message = await source();
     const [row] = await store.retain(scope, [message]);
     expect((await store.bind(row, { launchId, turnEpoch: epoch, native: null })).status).toBe(
       'written'
     );
-    for (const [table, id] of [
-      ['inbox_thread_messages', message.messageId],
-      ['sessions', sessionId],
-      ['launched_processes', launchId],
-    ]) {
-      const result = await client.from(table).delete().eq('id', id);
-      expect(result.error?.code).toBe('23503');
-    }
+    const [other] = await store.retain(scope, [await source()]);
+    expect(
+      (await client.from('inbox_thread_messages').delete().eq('id', message.messageId)).error
+    ).toBeNull();
+    const erased = await client.from('sb_inbox_deliveries').select('id').eq('id', row.id);
+    expect(erased.error).toBeNull();
+    expect(erased.data).toEqual([]);
+    expect(await store.listUnsettled(scope)).toContainEqual(other);
   });
 });

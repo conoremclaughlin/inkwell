@@ -276,6 +276,81 @@ describe('retained inbox delivery store (unwired)', () => {
     expect(outcomes.map((o) => o.status).sort()).toEqual(['conflict', 'written']);
   });
 
+  it('accepts a non-UUID opaque turn epoch without rewriting it', async () => {
+    const h = harness();
+    const [pending] = await h.store.retain(scope, sources.slice(0, 1));
+    expect(await h.store.bind(pending, { ...launch, turnEpoch: 'fixture:epoch-2' })).toMatchObject({
+      status: 'written',
+      delivery: { turn_epoch: 'fixture:epoch-2' },
+    });
+  });
+
+  it('moves pending input to its re-resolved session without replacing the source', async () => {
+    const h = harness();
+    const [pending] = await h.store.retain(scope, sources.slice(0, 1));
+    const moved = await h.store.movePending(pending, id(20));
+    expect(moved).toMatchObject({
+      status: 'written',
+      delivery: {
+        id: pending.id,
+        session_id: id(20),
+        thread_message_id: pending.thread_message_id,
+        state: 'pending',
+        revision: 1,
+        launch_id: null,
+        turn_epoch: null,
+      },
+    });
+    expect(await h.store.listUnsettled(scope)).toEqual([]);
+    expect(await h.store.listUnsettled({ ...scope, sessionId: id(20) })).toHaveLength(1);
+    expect(await h.store.bind(pending, launch)).toEqual({ status: 'conflict' });
+    expect(await h.store.movePending(pending, id(21))).toEqual({ status: 'conflict' });
+    await expect(
+      h.store.retain({ ...scope, sessionId: id(20) }, sources.slice(0, 1))
+    ).rejects.toThrow('do not dispatch');
+  });
+
+  it('lets only one racing pending-session handoff win', async () => {
+    const h = harness();
+    const [pending] = await h.store.retain(scope, sources.slice(0, 1));
+    const replies = await Promise.all([
+      h.store.movePending(pending, id(20)),
+      h.store.movePending(pending, id(21)),
+    ]);
+    expect(replies.map((r) => r.status).sort()).toEqual(['conflict', 'written']);
+    expect(h.rows.size).toBe(1);
+  });
+
+  it('does not hand off a bound, held, or settled source, or claim a no-op was confirmed', async () => {
+    const h = harness();
+    const [pending] = await h.store.retain(scope, sources.slice(0, 1));
+    expect(await h.store.movePending(pending, scope.sessionId)).toEqual({ status: 'conflict' });
+    for (const state of ['bound', 'held', 'settled'] as const) {
+      const expected = {
+        ...pending,
+        state,
+        launch_id: id(7),
+        turn_epoch: 'fixture-epoch',
+        settled_at: state === 'settled' ? stamp : null,
+      };
+      expect(await h.store.movePending(expected, id(20))).toEqual({ status: 'conflict' });
+    }
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('retains an uncertain handoff as unknown instead of giving the old route permission', async () => {
+    const h = harness();
+    const [pending] = await h.store.retain(scope, sources.slice(0, 1));
+    h.setFault(() => {
+      throw new Error('synthetic lost acknowledgement');
+    });
+    expect(await h.store.movePending(pending, id(20))).toEqual({ status: 'unknown' });
+    h.setFault(undefined);
+    expect(await h.store.bind(pending, launch)).toEqual({ status: 'conflict' });
+    const [moved] = await h.store.listUnsettled({ ...scope, sessionId: id(20) });
+    expect(moved).toMatchObject({ id: pending.id, session_id: id(20), state: 'pending' });
+  });
+
   it('recognizes equivalent PostgREST timestamp spelling on write acknowledgements', async () => {
     const h = harness();
     h.setFault((_query, reply) => {
@@ -415,11 +490,20 @@ describe('retained inbox delivery store (unwired)', () => {
     await expect(h.store.listUnsettled(scope, 'not-a-uuid')).rejects.toThrow();
     expect(h.calls).toHaveLength(0);
     const [pending] = await h.store.retain(scope, sources.slice(0, 1));
-    await expect(
-      h.store.bind(pending, { ...launch, native: { sessionId: '', inputId: id(9) } })
-    ).rejects.toThrow();
+    expect(
+      await h.store.bind(pending, { ...launch, native: { sessionId: '', inputId: id(9) } })
+    ).toEqual({ status: 'refused', reason: 'invalid-input' });
     const broken = { ...pending, inbox_message_id: id(99) } as RetainedInboxDelivery;
-    await expect(h.store.bind(broken, launch)).rejects.toThrow();
+    for (const reply of [
+      await h.store.bind(broken, launch),
+      await h.store.hold(broken),
+      await h.store.settleAfterFinalization(broken),
+      await h.store.movePending(broken, id(20)),
+      await h.store.movePending(pending, ''),
+      await h.store.bind(pending, { ...launch, turnEpoch: '' }),
+      await h.store.bind(pending, { ...launch, turnEpoch: 'x'.repeat(257) }),
+    ])
+      expect(reply).toEqual({ status: 'refused', reason: 'invalid-input' });
     expect(h.calls).toHaveLength(1);
   });
 });

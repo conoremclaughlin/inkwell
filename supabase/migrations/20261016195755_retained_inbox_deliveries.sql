@@ -1,18 +1,20 @@
 -- Per-source delivery ownership, separate from reader cursors and native
 -- transcripts. This schema does not enable intake, replay, or recovery.
--- Source/session/launch deletion is refused while referenced: cleanup must
--- explicitly reconcile these obligations rather than silently discard them.
+-- These are derived references: authorized account/source/run erasure must
+-- remove them, not be blocked by them (including another account's source).
+-- A cascade is erasure, never delivery acknowledgement. Ordinary maintenance
+-- must not prune unsettled source/run rows as if they were disposable logs.
 CREATE TABLE public.sb_inbox_deliveries (
   id uuid PRIMARY KEY,
-  owner_id uuid NOT NULL REFERENCES public.users(id) ON DELETE RESTRICT,
-  recipient_id uuid NOT NULL REFERENCES public.agent_identities(id) ON DELETE RESTRICT,
-  session_id uuid NOT NULL REFERENCES public.sessions(id) ON DELETE RESTRICT,
-  thread_message_id uuid REFERENCES public.inbox_thread_messages(id) ON DELETE RESTRICT,
-  inbox_message_id uuid REFERENCES public.agent_inbox(id) ON DELETE RESTRICT,
+  owner_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  recipient_id uuid NOT NULL REFERENCES public.agent_identities(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES public.sessions(id) ON DELETE CASCADE,
+  thread_message_id uuid REFERENCES public.inbox_thread_messages(id) ON DELETE CASCADE,
+  inbox_message_id uuid REFERENCES public.agent_inbox(id) ON DELETE CASCADE,
   state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'bound', 'held', 'settled')),
   revision integer NOT NULL DEFAULT 0 CHECK (revision >= 0),
-  launch_id uuid REFERENCES public.launched_processes(id) ON DELETE RESTRICT,
-  turn_epoch uuid,
+  launch_id uuid REFERENCES public.launched_processes(id) ON DELETE CASCADE,
+  turn_epoch text CHECK (turn_epoch IS NULL OR length(turn_epoch) BETWEEN 1 AND 256),
   native_session_id text,
   native_input_id uuid,
   created_at timestamptz NOT NULL DEFAULT now(),
