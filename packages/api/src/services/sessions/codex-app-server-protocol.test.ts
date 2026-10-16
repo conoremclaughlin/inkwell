@@ -83,6 +83,21 @@ describe('owned Codex app-server protocol', () => {
     f.protocol.close();
   });
 
+  it('resumes without the thread history, so a long thread fits the frame bound', async () => {
+    const resumed = fixture();
+    await resumed.start('thread-resumed');
+    const resume = resumed.sent.find((x) => x.method === 'thread/resume');
+    expect(resume?.params).toMatchObject({ threadId: 'thread-resumed', excludeTurns: true });
+    resumed.protocol.close();
+
+    const fresh = fixture();
+    await fresh.start();
+    const start = fresh.sent.find((x) => x.method === 'thread/start');
+    expect(start?.params).not.toHaveProperty('excludeTurns');
+    expect(start?.params).not.toHaveProperty('threadId');
+    fresh.protocol.close();
+  });
+
   it('matches only its exact transport-tagged user input and can observe before acknowledgment', async () => {
     const f = fixture();
     await f.start();
