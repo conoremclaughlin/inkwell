@@ -20,6 +20,7 @@
 
 import { isTerminalPhaseMarker } from '../sessions/phase-markers';
 import type { ThreadLastMessage } from './thread-conversation';
+import type { ConversationMode } from '../threads/conversation-mode';
 
 export interface SpineThreadRow {
   threadKey: string;
@@ -42,6 +43,8 @@ export interface SpineThreadRow {
    * choice yet. Absent on threads the viewer isn't a participant in.
    */
   pinned?: boolean | null;
+  /** The conversation's mode, fixed at creation (conversation-mode.ts); null for none. */
+  conversationMode?: ConversationMode | null;
 }
 
 export interface SpinePerson {
@@ -116,6 +119,8 @@ export interface ThreadSpine {
      * choice yet. Absent on threads the viewer isn't a participant in.
      */
     pinned?: boolean | null;
+    /** The conversation's mode: 'public', 'private', or null for none. */
+    conversationMode?: ConversationMode | null;
   } | null;
   sessions: Array<{
     id: string;
@@ -406,6 +411,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       lastMessage: t.lastMessage ?? null,
       // Only the viewer's own row carries a pin; no row, no field.
       ...(t.pinned !== undefined ? { pinned: t.pinned } : {}),
+      ...(t.conversationMode !== undefined ? { conversationMode: t.conversationMode } : {}),
     };
     // Pinned identity is authoritative even when all three components are
     // null (a pre-pinning thread awaiting reconciliation stays "unknown",

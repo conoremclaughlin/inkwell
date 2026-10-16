@@ -135,6 +135,11 @@ import {
 } from '../services/threads/thread-reactions';
 import { PinRefusedError, parsePinBody, setThreadPin } from '../services/threads/thread-pins';
 import {
+  ConversationModeRefusedError,
+  parseConversationMode,
+  storedConversationMode,
+} from '../services/threads/conversation-mode';
+import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
   OWN_CREATE_SETTLE_INTERVAL_MS,
@@ -8501,7 +8506,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     // One list for both thread reads below (the newest window and the
     // hydration of older carrier keys), so neither can drop a column alone.
     // The embed carries each thread's newest message for the list preview.
-    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${LAST_MESSAGE_EMBED}`;
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, conversation_mode, ${LAST_MESSAGE_EMBED}`;
 
     const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
       withLastMessage(supabase.from('inbox_threads').select(THREAD_COLUMNS, { count: 'exact' }))
@@ -8713,6 +8718,7 @@ router.get('/threads', async (req: Request, res: Response) => {
         ),
         // The viewer's pin, only when the viewer has a row on the thread.
         ...(viewerPinByThreadId.has(t.id) ? { pinned: viewerPinByThreadId.get(t.id) ?? null } : {}),
+        conversationMode: storedConversationMode(t.conversation_mode),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -8891,7 +8897,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select(
-        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at, metadata'
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at, conversation_mode, metadata'
       )
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
@@ -9016,6 +9022,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
         createdByUserId: thread.created_by_user_id ?? null,
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
+        conversationMode: storedConversationMode(thread.conversation_mode),
       },
       messages: (messageRows || [])
         .map((m) => ({
@@ -9057,7 +9064,13 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 /**
  * POST /api/admin/threads
  * Body: { key, recipients: string[], content, title?, priority?, studioSlug?,
- *         clientMessageId?: uuid, wake?: string[] }
+ *         clientMessageId?: uuid, wake?: string[], mode?: 'public' | 'private' }
+ *
+ * `mode` is the conversation's mode (services/threads/conversation-mode.ts),
+ * written once by the insert that creates the thread. It needs a
+ * clientMessageId, and only a conversation with an inkling takes one; either
+ * failing is a 400 before anything is written. A retry naming another mode is
+ * a 409, like other words.
  *
  * In a conversation of the person's own inklings, `wake` names the members
  * they addressed (slugs, each a recipient): only those are woken. Without
@@ -9183,6 +9196,21 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'clientMessageId must be a UUID' });
       return;
     }
+    // The conversation's mode, fixed at creation (conversation-mode.ts). Only
+    // a client-identified create may name one: it never joins a thread that
+    // exists, so a mode is only ever written by the create that creates.
+    const conversationMode = parseConversationMode(req.body?.mode);
+    if (!conversationMode.ok) {
+      res.status(400).json({ error: "mode must be 'public' or 'private'", code: 'mode_invalid' });
+      return;
+    }
+    if (conversationMode.mode && !clientMessageId.value) {
+      res.status(400).json({
+        error: 'clientMessageId is required when naming a mode',
+        code: 'mode_needs_client_message_id',
+      });
+      return;
+    }
 
     // The workspace role before any lookup. What keeps a replay to the
     // person who sent the original is the sender check inside
@@ -9210,9 +9238,10 @@ router.post('/threads', async (req: Request, res: Response) => {
       return (data as KeyedThread | null) ?? null;
     };
     // What a client-identified create is held to on a retry: the same
-    // people (as a set) and the same title, beside the same sender and words.
+    // people (as a set), the same title and the same mode, beside the same
+    // sender and words.
     const createRequest = clientMessageId.value
-      ? createRequestOf(uniqueRecipients, title)
+      ? createRequestOf(uniqueRecipients, title, conversationMode.mode)
       : undefined;
     // A client-identified create never joins a thread that exists. Either it
     // is a retry of the submission that created the thread, which answers
@@ -9369,6 +9398,13 @@ router.post('/threads', async (req: Request, res: Response) => {
               workspaceId: authReq.inkWorkspaceId,
             },
             ...(send.createOnly ? { createOnly: true } : {}),
+            // Written by the insert that creates the thread. An adopting retry
+            // completes a thread its original already created with this mode
+            // (the intent it matched names it), so only the creating send
+            // carries it.
+            ...(send.createOnly && conversationMode.mode
+              ? { conversationMode: conversationMode.mode }
+              : {}),
             // Recorded on the thread row if this send creates it.
             ...(clientMessageId.value && createRequest
               ? {
@@ -9446,6 +9482,10 @@ router.post('/threads', async (req: Request, res: Response) => {
     await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });
   } catch (error) {
     if (answerInklingThreadRefusal(res, error)) return;
+    if (error instanceof ConversationModeRefusedError) {
+      res.status(400).json({ error: error.message, code: error.code });
+      return;
+    }
     logger.error('Failed to start thread:', error);
     res.status(500).json(errorJson('Failed to start thread', error));
   }

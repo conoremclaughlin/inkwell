@@ -71,6 +71,10 @@ import {
   INKLING_CONVERSATION_MARK,
 } from '../../services/inklings/inkling-thread-gate.js';
 import {
+  ConversationModeRefusedError,
+  type ConversationMode,
+} from '../../services/threads/conversation-mode.js';
+import {
   inklingWakeDue,
   openReplyChain,
   replyOrder,
@@ -448,6 +452,14 @@ export interface InternalSendContext {
    */
   createIntent?: Record<string, unknown>;
   /**
+   * The conversation's mode (services/threads/conversation-mode.ts), written
+   * by the insert that creates the thread and never after. Only a
+   * create-only send may name one, and only for an inkling conversation;
+   * anything else throws ConversationModeRefusedError before any write.
+   * POST /api/admin/threads sets it on a client-identified create.
+   */
+  conversationMode?: ConversationMode;
+  /**
    * How an owner's message to a group of their inklings wakes it
    * (ink://specs/inkling-group-dynamics). `wake` names the members the
    * person addressed, by slug: only they are woken. Without it, `inTurn`
@@ -807,6 +819,22 @@ export async function handleSendToInbox(
       existingThreadId: existingThread?.id ?? null,
     });
 
+    // A mode is fixed at creation and belongs to an inkling conversation
+    // (conversation-mode.ts): only a send that must create its thread may
+    // name one, and that thread must hold an inkling. Asked before anything
+    // is written; a create-only send that finds the key taken still stops at
+    // ThreadKeyTakenError below.
+    if (internal?.conversationMode !== undefined) {
+      if (!internal.createOnly) {
+        throw new ConversationModeRefusedError(
+          'A conversation mode is set only by the send that creates the conversation'
+        );
+      }
+      if (!inklingVerdict.inklingConversation) {
+        throw new ConversationModeRefusedError('Only a conversation with an inkling has a mode');
+      }
+    }
+
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.
     if (!existingThread) {
@@ -862,6 +890,7 @@ export async function handleSendToInbox(
             participants: participantSbs,
             person: sender.kind === 'user' ? sender : null,
             ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
+            ...(internal?.conversationMode ? { conversationMode: internal.conversationMode } : {}),
           });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
@@ -1734,6 +1763,12 @@ export async function findOrCreateThread(
     person?: UserPrincipal | null;
     /** Written with the new thread row only; an existing thread is not touched. */
     metadata?: Record<string, unknown>;
+    /**
+     * The conversation's mode, written with the new thread row only and
+     * never after (conversation-mode.ts). This insert is the one place the
+     * server sets inbox_threads.conversation_mode.
+     */
+    conversationMode?: ConversationMode;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
@@ -1762,6 +1797,7 @@ export async function findOrCreateThread(
       created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: boundThreadTitle(opts.title),
       ...(opts.metadata ? { metadata: opts.metadata } : {}),
+      ...(opts.conversationMode ? { conversation_mode: opts.conversationMode } : {}),
     })
     .select()
     .single();

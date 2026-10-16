@@ -21,11 +21,11 @@
  * (approved by Conor, Oct 15, 2026, as defense in depth).
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
+import { apiSourceFiles, tableWritesIn } from '../../test/write-census';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -43,236 +43,10 @@ const MARKER_MIGRATION = '20261015070518_sessions_turn_scope_marker.sql';
 const TRIGGER_MIGRATION = '20261015203541_sessions_turn_scope_immutable.sql';
 const FORBIDDEN = 'turn_scope';
 
-interface SessionWrite {
-  site: string;
-  keys: string[];
-  problems: string[];
-}
+const sessionWritesIn = (fileName: string, source: string) =>
+  tableWritesIn(fileName, source, 'sessions');
 
-type FunctionLike = ts.FunctionLikeDeclaration;
-
-function unwrap(expression: ts.Expression): ts.Expression {
-  let e = expression;
-  while (
-    ts.isParenthesizedExpression(e) ||
-    ts.isAsExpression(e) ||
-    ts.isNonNullExpression(e) ||
-    ts.isSatisfiesExpression(e) ||
-    ts.isTypeAssertionExpression(e)
-  ) {
-    e = e.expression;
-  }
-  return e;
-}
-
-/** Whether a call chain contains from('sessions'). */
-function chainsFromSessions(expression: ts.Expression): boolean {
-  let e: ts.Expression | undefined = expression;
-  while (e) {
-    e = unwrap(e);
-    if (ts.isCallExpression(e)) {
-      const callee = e.expression;
-      const [first] = e.arguments;
-      if (
-        ts.isPropertyAccessExpression(callee) &&
-        callee.name.text === 'from' &&
-        first &&
-        ts.isStringLiteralLike(first) &&
-        first.text === 'sessions'
-      ) {
-        return true;
-      }
-      e = ts.isPropertyAccessExpression(callee) ? callee.expression : undefined;
-    } else if (ts.isPropertyAccessExpression(e)) {
-      e = e.expression;
-    } else {
-      e = undefined;
-    }
-  }
-  return false;
-}
-
-function enclosingFunction(node: ts.Node): FunctionLike | undefined {
-  let n: ts.Node | undefined = node.parent;
-  while (n && !ts.isFunctionLike(n)) n = n.parent;
-  return n as FunctionLike | undefined;
-}
-
-function findDeclaration(scope: ts.Node, name: string): ts.VariableDeclaration | undefined {
-  let found: ts.VariableDeclaration | undefined;
-  const visit = (n: ts.Node): void => {
-    if (found) return;
-    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name) {
-      found = n;
-      return;
-    }
-    ts.forEachChild(n, visit);
-  };
-  visit(scope);
-  return found;
-}
-
-function findMethod(node: ts.Node, name: string): ts.MethodDeclaration | undefined {
-  let n: ts.Node | undefined = node;
-  while (n && !ts.isClassLike(n)) n = n.parent;
-  return (n as ts.ClassLikeDeclaration | undefined)?.members.find(
-    (m): m is ts.MethodDeclaration =>
-      ts.isMethodDeclaration(m) && ts.isIdentifier(m.name) && m.name.text === name
-  );
-}
-
-/**
- * The keys a payload expression can carry, or what makes them unknowable.
- * Object literals give their named keys; a conditional gives both branches';
- * a spread is followed only into a literal or a conditional of literals; a
- * local variable gives its initializer's keys plus every `x.key =` written
- * to it in its function, and may otherwise only be read.
- */
-function payloadKeys(expression: ts.Expression, out: SessionWrite, depth = 0): void {
-  const e = unwrap(expression);
-  if (depth > 4) {
-    out.problems.push(`payload too indirect: ${e.getText()}`);
-  } else if (ts.isObjectLiteralExpression(e)) {
-    for (const property of e.properties) {
-      if (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)) {
-        if (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) {
-          out.keys.push(property.name.text);
-        } else {
-          out.problems.push(`computed key ${property.name.getText()}`);
-        }
-      } else if (ts.isSpreadAssignment(property)) {
-        const spread = unwrap(property.expression);
-        if (ts.isObjectLiteralExpression(spread) || ts.isConditionalExpression(spread)) {
-          payloadKeys(spread, out, depth + 1);
-        } else {
-          out.problems.push(`spread of ${spread.getText()}`);
-        }
-      } else {
-        out.problems.push(`unsupported member ${property.getText()}`);
-      }
-    }
-  } else if (ts.isConditionalExpression(e)) {
-    payloadKeys(e.whenTrue, out, depth + 1);
-    payloadKeys(e.whenFalse, out, depth + 1);
-  } else if (ts.isIdentifier(e)) {
-    variableKeys(e, out, depth);
-  } else {
-    out.problems.push(`payload is ${ts.SyntaxKind[e.kind]}: ${e.getText()}`);
-  }
-}
-
-function variableKeys(identifier: ts.Identifier, out: SessionWrite, depth: number): void {
-  const name = identifier.text;
-  const fn = enclosingFunction(identifier);
-  const declaration = fn && findDeclaration(fn, name);
-  if (!fn || !declaration?.initializer) {
-    out.problems.push(`no local declaration for ${name}`);
-    return;
-  }
-
-  const init = unwrap(declaration.initializer);
-  if (
-    ts.isCallExpression(init) &&
-    ts.isPropertyAccessExpression(init.expression) &&
-    init.expression.expression.kind === ts.SyntaxKind.ThisKeyword
-  ) {
-    // A payload built by a method of the same class: the keys are the ones
-    // that method's returned variable gets.
-    const method = findMethod(init, init.expression.name.text);
-    const returned = method?.body?.statements.find(ts.isReturnStatement)?.expression;
-    const returnedVariable = returned && unwrap(returned);
-    if (returnedVariable && ts.isIdentifier(returnedVariable)) {
-      variableKeys(returnedVariable, out, depth + 1);
-    } else {
-      out.problems.push(
-        `${name} comes from ${init.expression.name.text}, which returns no variable`
-      );
-    }
-  } else {
-    payloadKeys(init, out, depth + 1);
-  }
-
-  const visit = (n: ts.Node): void => {
-    if (ts.isIdentifier(n) && n.text === name && n !== declaration.name) {
-      const parent = n.parent;
-      let use: ts.Node = n;
-      while (
-        ts.isParenthesizedExpression(use.parent) ||
-        ts.isAsExpression(use.parent) ||
-        ts.isNonNullExpression(use.parent) ||
-        ts.isSatisfiesExpression(use.parent)
-      ) {
-        use = use.parent;
-      }
-      const user = use.parent;
-      const isPropertyName =
-        (ts.isPropertyAccessExpression(parent) && parent.name === n) ||
-        (ts.isPropertyAssignment(parent) && parent.name === n);
-      if (isPropertyName) {
-        // `other.name` or `{ name: ... }`: not this variable.
-      } else if (ts.isPropertyAccessExpression(user) && user.expression === use) {
-        const assignment = user.parent;
-        if (
-          ts.isBinaryExpression(assignment) &&
-          assignment.left === user &&
-          assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
-        ) {
-          out.keys.push(user.name.text);
-        }
-        // Otherwise a read of one field.
-      } else if (ts.isShorthandPropertyAssignment(user) || ts.isReturnStatement(user)) {
-        // Logged, or returned to the caller that writes it.
-      } else if (
-        ts.isCallExpression(user) &&
-        user.expression.getText() === 'Object.keys' &&
-        user.arguments[0] === use
-      ) {
-        // Counted.
-      } else if (ts.isCallExpression(user) && chainsFromSessions(user.expression)) {
-        // The write itself.
-      } else {
-        out.problems.push(`${name} used as ${user.getText().slice(0, 80)}`);
-      }
-    }
-    ts.forEachChild(n, visit);
-  };
-  visit(fn);
-}
-
-function sessionWritesIn(fileName: string, source: string): SessionWrite[] {
-  const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
-  const writes: SessionWrite[] = [];
-  const visit = (n: ts.Node): void => {
-    if (
-      ts.isCallExpression(n) &&
-      ts.isPropertyAccessExpression(n.expression) &&
-      ['update', 'upsert'].includes(n.expression.name.text) &&
-      chainsFromSessions(n.expression.expression)
-    ) {
-      const line = sf.getLineAndCharacterOfPosition(n.getStart()).line + 1;
-      const write: SessionWrite = { site: `${fileName}:${line}`, keys: [], problems: [] };
-      const [payload] = n.arguments;
-      if (payload) payloadKeys(payload, write);
-      else write.problems.push('no payload');
-      writes.push(write);
-    }
-    ts.forEachChild(n, visit);
-  };
-  visit(sf);
-  return writes;
-}
-
-function apiSourceFiles(dir = API_SRC): string[] {
-  return readdirSync(dir).flatMap((name) => {
-    const path = join(dir, name);
-    if (statSync(path).isDirectory()) {
-      return path === join(API_SRC, 'test') ? [] : apiSourceFiles(path);
-    }
-    return /\.ts$/.test(name) && !/\.(test|test-support|d)\.ts$/.test(name) ? [path] : [];
-  });
-}
-
-const census = apiSourceFiles().flatMap((path) =>
+const census = apiSourceFiles(API_SRC).flatMap((path) =>
   sessionWritesIn(relative(API_SRC, path), readFileSync(path, 'utf8'))
 );
 
@@ -316,7 +90,12 @@ describe('the census catches what it is for (controls)', () => {
     const [built] = judge(
       `const p = this.payload(input); await db.from('sessions').update(p).eq('id', 1);`
     );
-    expect(built).toEqual({ site: 'fixture.ts:1', keys: ['lifecycle'], problems: [] });
+    expect(built).toEqual({
+      site: 'fixture.ts:1',
+      method: 'update',
+      keys: ['lifecycle'],
+      problems: [],
+    });
   });
 
   it('finds turn_scope however it is named in the source', () => {

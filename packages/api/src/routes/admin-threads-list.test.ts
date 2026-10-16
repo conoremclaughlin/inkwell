@@ -229,6 +229,7 @@ interface Spine {
       createdAt: string;
     } | null;
     pinned?: boolean | null;
+    conversationMode?: string | null;
   } | null;
   sessions: Array<{ id: string; sbSlug: string | null; live: boolean }>;
 }
@@ -293,6 +294,19 @@ describe('GET /threads', () => {
     const [spine] = await listSpines({ inbox_threads: [threadRow()] });
     expect(spine.thread?.summary).toBe('Grants rotate, slide on use, and expire for real.');
     expect(spine.thread?.title).toBe('Rotating refresh grants');
+  });
+
+  // The mode is selected and passed through (D8); a thread created without
+  // one reads null, never absent, so a client can tell "none" from "unknown".
+  it('carries the conversation mode through to the client', async () => {
+    const spines = await listSpines({
+      inbox_threads: [
+        threadRow({ conversation_mode: 'private' }),
+        threadRow({ id: 'thread-2', thread_key: 'chat:open', conversation_mode: null }),
+      ],
+    });
+    const modeByKey = Object.fromEntries(spines.map((s) => [s.key, s.thread?.conversationMode]));
+    expect(modeByKey).toEqual({ 'inkwell:pr:632': 'private', 'chat:open': null });
   });
 
   it('answers liveness per session instead of leaving the client to guess', async () => {
