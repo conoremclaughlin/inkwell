@@ -26,6 +26,7 @@ import { INKLING_CONVERSATION_MARK } from './inkling-thread-gate';
 export const GROUP_PRIVACY_RULE = [
   'Never share personal things someone told you, especially in a private chat, unless that person is the one asking here or has said you may. That covers health, relationships, money, trouble at work, family, and anything they called private.',
   "If you aren't sure whether something is private, leave it out here, and ask that person privately the next time you talk with them alone.",
+  "When you leave something private out, answer as you would if you'd never heard it. Don't say or hint that you're keeping something back.",
   'What you know about people can still help, such as their preferences when you plan something together, as long as no private detail shows.',
 ].join('\n');
 
