@@ -292,13 +292,16 @@ interface ObserverSubscriber {
 }
 
 interface ObserverChannel {
+  sessionId: string;
+  /** Runtime registration/publication started a turn that has not released. */
+  turnActive: boolean;
   ledgerPath?: string;
   ring: ObserverEntry[];
   lastEid: number;
   subscribers: Set<ObserverSubscriber>;
   evictTimer?: NodeJS.Timeout;
   /** Subscribers waiting for the runtime's session_meta announcement. */
-  pathWaiters?: Array<() => void>;
+  pathWaiters?: Set<() => void>;
 }
 
 const observerEntryBytes = (entry: ObserverEntry): number => JSON.stringify(entry).length;
@@ -443,19 +446,21 @@ export class SessionEventBus extends EventEmitter {
         settled = true;
         clearTimeout(timer);
         signal?.removeEventListener('abort', finish);
+        ch.pathWaiters?.delete(finish);
+        if (ch.pathWaiters?.size === 0) ch.pathWaiters = undefined;
         resolve();
       };
       const timer = setTimeout(finish, this.locatorWaitMs);
       timer.unref?.();
       signal?.addEventListener('abort', finish, { once: true });
-      (ch.pathWaiters ??= []).push(finish);
+      (ch.pathWaiters ??= new Set()).add(finish);
     });
   }
 
   private obsChannel(sessionId: string): ObserverChannel {
     let ch = this.obsChannels.get(sessionId);
     if (!ch) {
-      ch = { ring: [], lastEid: 0, subscribers: new Set() };
+      ch = { sessionId, turnActive: false, ring: [], lastEid: 0, subscribers: new Set() };
       this.obsChannels.set(sessionId, ch);
     }
     if (ch.evictTimer) {
@@ -487,6 +492,7 @@ export class SessionEventBus extends EventEmitter {
       return;
     }
     const channel = this.obsChannel(sessionId);
+    channel.turnActive = true;
     channel.ledgerPath = ledgerPath;
     // Wake any subscriber holding for the session_meta announcement.
     const waiters = channel.pathWaiters;
@@ -522,6 +528,7 @@ export class SessionEventBus extends EventEmitter {
     const entry = projectObserverEntry(rawEntry);
     if (!entry) return;
     const ch = this.obsChannel(sessionId);
+    ch.turnActive = true;
     if (entry.eid > ch.lastEid) ch.lastEid = entry.eid;
     ch.ring.push(entry);
     if (ch.ring.length > OBS_RING_CAPACITY) {
@@ -662,12 +669,20 @@ export class SessionEventBus extends EventEmitter {
   releaseObserverSession(sessionId: string): void {
     const ch = this.obsChannels.get(sessionId);
     if (!ch) return;
+    ch.turnActive = false;
+    this.scheduleObserverEviction(ch);
+  }
+
+  /** Idle attachments can outlive turn release or never run a turn at all. */
+  private scheduleObserverEviction(ch: ObserverChannel): void {
     if (ch.evictTimer) clearTimeout(ch.evictTimer);
+    ch.evictTimer = undefined;
+    if (ch.turnActive || ch.subscribers.size > 0) return;
     ch.evictTimer = setTimeout(() => {
-      const current = this.obsChannels.get(sessionId);
-      if (!current) return;
-      if (current.subscribers.size > 0) return; // watchers ride across turns
-      this.obsChannels.delete(sessionId);
+      ch.evictTimer = undefined;
+      if (this.obsChannels.get(ch.sessionId) !== ch) return;
+      if (ch.turnActive || ch.subscribers.size > 0) return;
+      this.obsChannels.delete(ch.sessionId);
     }, OBS_RETENTION_MS);
     ch.evictTimer.unref?.();
   }
@@ -815,6 +830,7 @@ export class SessionEventBus extends EventEmitter {
     sub.capture = [];
     sub.captureBytes = 0;
     ch.subscribers.delete(sub);
+    this.scheduleObserverEviction(ch);
     try {
       sub.sink.end(reason);
     } catch {
