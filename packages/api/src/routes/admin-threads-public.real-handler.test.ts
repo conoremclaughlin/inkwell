@@ -298,6 +298,8 @@ describe('a public conversation in a shared space', () => {
     );
     expect(started.status, JSON.stringify(started.body)).toBe(200);
     expect(threadOf(PUBLIC_KEY)).toMatchObject({ conversation_mode: 'public' });
+    // Through the gate's shared branch, still without the group-with-people mark.
+    expect(threadOf(PUBLIC_KEY)?.metadata).not.toHaveProperty('inklingShared');
     expect((await read(PUBLIC_KEY, C)).thread).toMatchObject({ conversationMode: 'public' });
   });
 
