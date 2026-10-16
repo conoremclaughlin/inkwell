@@ -3,16 +3,27 @@
  * Cleanup and prompt boundaries reduce ambiguity, not tool authority. */
 
 /** Narrow intake cleanup, not prompt-injection detection. Preserve writing,
- * joiners, variation selectors and the three Unicode subdivision-flag sequences.
+ * individual joiners/selectors and the three Unicode subdivision-flag sequences.
  * Do not normalise scripts or log the removed text. */
 export function cleanUntrustedText(input: string): { text: string; removed: number } {
   let removed = 0;
-  const text = input.replace(
+  const stripped = input.replace(
     /\u{1F3F4}\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073})\u{E007F}|[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u061C\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\u{E0000}-\u{E007F}]/gu,
     (match) => {
       if (match.startsWith('\u{1F3F4}')) return match;
       ++removed;
       return '';
+    }
+  );
+  // A selector applies to one base; legitimate joiner sequences alternate
+  // joiners with visible characters. Repeated selectors can encode bytes.
+  // Run this after stripping, which can bring previously separated runs together.
+  const text = stripped.replace(
+    /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]{2,}|[\u200C\u200D]{2,}/gu,
+    (run) => {
+      const characters = Array.from(run);
+      removed += characters.length - 1;
+      return characters[0]!;
     }
   );
   return { text, removed };

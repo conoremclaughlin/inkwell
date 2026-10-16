@@ -27,11 +27,27 @@ describe('shared external-content policy', () => {
     expect(isStyleHidden('margin-top:1400px;display:block;color:black')).toBe(false);
   });
   it('strips controls and tag payloads, preserving ordinary writing and emoji', () => {
-    const visible = 'می\u200cروم 👩\u200d💻 ❤️';
+    const visible = 'می\u200cروم 👩\u200d💻 ❤️ 👁️‍🗨️';
     expect(cleanUntrustedText('\u061c\u2066' + visible + '\u{e0061}')).toEqual({
       text: visible,
       removed: 3,
     });
+  });
+  it('removes a run of variation selectors encoding a planted message', () => {
+    const selectors = Array.from('synthetic fixture', (letter) =>
+      String.fromCodePoint(0xe0100 + letter.charCodeAt(0) - 16)
+    );
+    const result = cleanUntrustedText('😀' + selectors.join(''));
+    expect(result).toEqual({ text: '😀' + selectors[0], removed: selectors.length - 1 });
+    expect(cleanUntrustedText(result.text)).toEqual({ text: result.text, removed: 0 });
+    expect(cleanUntrustedText('a\ufe0e\ufe0f\u{e0100}').text).toBe('a\ufe0e');
+  });
+  it('removes repeated joiners, including runs exposed by control removal', () => {
+    expect(cleanUntrustedText('a' + '\u200c\u200d'.repeat(4) + 'b')).toEqual({
+      text: 'a\u200cb',
+      removed: 7,
+    });
+    expect(cleanUntrustedText('a\u200d\u200b\u200cb')).toEqual({ text: 'a\u200db', removed: 2 });
   });
   it('delimits data without treating a planted old delimiter as authority', () => {
     const content = formatUntrustedData(
