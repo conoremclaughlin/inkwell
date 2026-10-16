@@ -66,7 +66,7 @@ describe('server Supabase construction policy', () => {
 
   it('routes API production constructors through the safe factory', async () => {
     const root = resolve(__dirname, '../..');
-    const violations: string[] = [];
+    const constructors: Record<string, number[]> = {};
     async function scan(dir: string): Promise<void> {
       for (const entry of await readdir(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);
@@ -75,16 +75,15 @@ describe('server Supabase construction policy', () => {
           if (entry.name !== 'scripts' && entry.name !== 'test') await scan(path);
         } else if (
           entry.name.endsWith('.ts') &&
-          !/\.(test|spec|test-support|d)\.ts$/.test(entry.name) &&
-          path !== join(root, 'data/supabase/client.ts')
+          !/\.(test|spec|test-support|d)\.ts$/.test(entry.name)
         ) {
-          for (const line of clientConstructorLines(await readFile(path, 'utf8'))) {
-            violations.push(`${relative(root, path)}:${line}`);
-          }
+          const lines = clientConstructorLines(await readFile(path, 'utf8'));
+          if (lines.length) constructors[relative(root, path)] = lines;
         }
       }
     }
     await scan(root);
-    expect(violations).toEqual([]);
+    // A positive control in the scanned tree catches an empty or misrooted scan.
+    expect(constructors).toEqual({ 'data/supabase/client.ts': [expect.any(Number)] });
   });
 });

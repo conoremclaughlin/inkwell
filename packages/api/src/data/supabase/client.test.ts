@@ -12,7 +12,7 @@ vi.mock('../../config/env', async () => ({
 }));
 vi.mock('../../utils/logger', () => ({ logger: { info: vi.fn(), error: vi.fn() } }));
 
-import { createServerSupabaseClient, createSupabaseClient, getSupabaseClient } from './client';
+import { createServerSupabaseClient, getSupabaseClient } from './client';
 import { fakeEnv } from '../../test/fake-env';
 
 afterEach(() => {
@@ -111,6 +111,9 @@ describe('server database client lifetime', () => {
 
   it('reuses one service client without starting auth refresh timers', async () => {
     vi.useFakeTimers();
+    // Construct this singleton under this test's clock, not a previous test's.
+    vi.resetModules();
+    const { createSupabaseClient, getSupabaseClient } = await import('./client');
     const fetch = vi.fn(() => Promise.reject(new Error('Network forbidden in this test')));
     vi.stubGlobal('fetch', fetch);
 
