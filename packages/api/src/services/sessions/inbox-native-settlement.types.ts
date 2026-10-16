@@ -3,6 +3,8 @@ export interface InboxNativeBinding {
   readonly userId: string;
   readonly sbId: string;
   readonly sessionId: string;
+  /** Captured native key; never inferred from a replacement session row. */
+  readonly backend: 'claude-code';
   readonly nativeSessionId: string;
 }
 
@@ -43,8 +45,9 @@ export type InboxNativeObservation =
 /**
  * A conditional, whole-batch write plan ONLY. A repository must persist the
  * exact claim revisions and outcome atomically/idempotently before separately
- * acknowledging the native obligation ID + revision + outcome + evidence digest
- * and original ordered claim batch. A planned fallback is not
+ * acknowledging the captured backend/nativeSessionId + native obligation ID +
+ * revision + outcome + evidence digest and original ordered claim batch. Reads
+ * must use that native key even when the record is absent. A planned fallback is not
  * permission to dispatch; unresolved native recovery still gates later launch.
  */
 export interface InboxNativeSettlementPlan extends InboxNativeExpectedBatch {

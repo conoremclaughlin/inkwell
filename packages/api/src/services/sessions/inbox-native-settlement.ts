@@ -9,7 +9,15 @@ const MAX_CLAIMS = 128;
 const id = z.string().min(1).max(256).regex(/^\S+$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const evidenceDigest = z.string().regex(/^[0-9a-f]{64}$/);
-const binding = z.object({ userId: id, sbId: id, sessionId: id, nativeSessionId: id }).strict();
+const binding = z
+  .object({
+    userId: id,
+    sbId: id,
+    sessionId: id,
+    backend: z.literal('claude-code'),
+    nativeSessionId: id,
+  })
+  .strict();
 const claim = z
   .object({ claimId: id, claimRevision: revision, deliveryId: id, messageId: id, threadId: id })
   .strict();
@@ -79,7 +87,7 @@ export function planInboxNativeSettlement(
     if (observed.kind === 'unavailable') return { status: 'held', reason: 'native-unavailable' };
     if (observed.kind === 'empty') return { status: 'held', reason: 'native-missing' };
     if (observed.kind !== 'obligation') return { status: 'held', reason: 'invalid-input' };
-    for (const key of ['userId', 'sbId', 'sessionId', 'nativeSessionId'] as const) {
+    for (const key of ['userId', 'sbId', 'sessionId', 'backend', 'nativeSessionId'] as const) {
       if (expected.binding[key] !== observed.binding[key]) {
         return { status: 'held', reason: 'binding-mismatch' };
       }

@@ -9,7 +9,13 @@ const digest = '0123456789abcdef'.repeat(4);
 
 function expectedBatch(): InboxNativeExpectedBatch {
   return {
-    binding: { userId: 'owner', sbId: 'sb', sessionId: 'session', nativeSessionId: 'native' },
+    binding: {
+      userId: 'owner',
+      sbId: 'sb',
+      sessionId: 'session',
+      backend: 'claude-code',
+      nativeSessionId: 'native',
+    },
     obligationId: 'obligation',
     originatingTurnEpoch: 'original-epoch',
     claims: ['a', 'b'].map((id) => ({
@@ -95,6 +101,47 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
     );
   });
 
+  describe.each(['expected', 'observed'] as const)('%s native key', (side) => {
+    it.each([undefined, null, '', 'codex'])(
+      'rejects invalid backend (%#), without a default',
+      (backend) => {
+        const expected = expectedBatch();
+        const observation = resolved();
+        expect(
+          planInboxNativeSettlement(
+            side === 'expected'
+              ? { ...expected, binding: { ...expected.binding, backend } }
+              : expected,
+            side === 'observed'
+              ? { ...observation, binding: { ...observation.binding, backend } }
+              : observation
+          )
+        ).toEqual({ status: 'held', reason: 'invalid-input' });
+      }
+    );
+
+    it('rejects an omitted backend, not just an explicit undefined value', () => {
+      const expected = expectedBatch();
+      const observation = resolved();
+      const { backend: _backend, ...withoutBackend } = expected.binding;
+      expect(
+        planInboxNativeSettlement(
+          side === 'expected' ? { ...expected, binding: withoutBackend } : expected,
+          side === 'observed' ? { ...observation, binding: withoutBackend } : observation
+        )
+      ).toEqual({ status: 'held', reason: 'invalid-input' });
+    });
+  });
+
+  it('does not grant another backend capability merely because both projections agree', () => {
+    const expected = expectedBatch();
+    const observation = resolved();
+    const binding = { ...expected.binding, backend: 'codex' };
+    expect(
+      planInboxNativeSettlement({ ...expected, binding }, { ...observation, binding })
+    ).toEqual({ status: 'held', reason: 'invalid-input' });
+  });
+
   it('carries the originating epoch and observed revision, not a guessed current turn', () => {
     const observation = { ...resolved(), revision: 101 };
     expect(planInboxNativeSettlement(expectedBatch(), observation)).toMatchObject({
@@ -103,17 +150,23 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
     });
   });
 
-  it.each([undefined, null, '', 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(64), 'g'.repeat(64), 7])(
-    'refuses a missing or malformed resolution evidence digest (%#)',
-    (evidenceDigest) => {
-      expect(planInboxNativeSettlement(expectedBatch(), { ...resolved(), evidenceDigest })).toEqual(
-        {
-          status: 'held',
-          reason: 'invalid-input',
-        }
-      );
-    }
-  );
+  it.each([
+    undefined,
+    null,
+    '',
+    'a'.repeat(63),
+    'a'.repeat(65),
+    'A'.repeat(64),
+    'g'.repeat(64),
+    7,
+    `${digest}\n`,
+    `${digest}\r\n`,
+  ])('refuses a missing or malformed resolution evidence digest (%#)', (evidenceDigest) => {
+    expect(planInboxNativeSettlement(expectedBatch(), { ...resolved(), evidenceDigest })).toEqual({
+      status: 'held',
+      reason: 'invalid-input',
+    });
+  });
 
   it('preserves the exact observed digest without normalizing or later rereading evidence', () => {
     const observation = resolved();
