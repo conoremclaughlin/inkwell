@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import ts from 'typescript';
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
@@ -47,6 +48,51 @@ const runners = {
   gemini: () => new GeminiRunner(),
   antigravity: () => new AntigravityRunner(),
 };
+
+/**
+ * Claude disposes its native mailbox asynchronously only on the refusal path.
+ * That branch returns, so its awaits cannot suspend the admitted spawn path.
+ * Recognize only this terminal shape, not arbitrary conditional awaits. Keep
+ * offsets intact, and refuse to hide a physical spawn inside the branch.
+ */
+function withoutTerminalRefusal(source: string): string {
+  const ast = ts.createSourceFile('runner.ts', source, ts.ScriptTarget.Latest, true);
+  const ranges: Array<[number, number]> = [];
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isIfStatement(node) &&
+      node.expression.getText(ast) === 'refusal !== undefined' &&
+      !node.elseStatement &&
+      ts.isBlock(node.thenStatement) &&
+      node.thenStatement.statements.length > 0 &&
+      ts.isReturnStatement(node.thenStatement.statements.at(-1)!)
+    ) {
+      const body = node.thenStatement.getText(ast);
+      expect(body).not.toMatch(/\bspawn\(/);
+      ranges.push([node.getStart(ast), node.end]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  for (const [start, end] of ranges.reverse())
+    source =
+      source.slice(0, start) + source.slice(start, end).replace(/[^\n]/g, ' ') + source.slice(end);
+  return source;
+}
+
+function expectAdmittedSpawns(source: string, file: string): number {
+  source = withoutTerminalRefusal(
+    source.replace(/\/\/.*$/gm, (comment) => ' '.repeat(comment.length))
+  );
+  let seams = 0;
+  for (const match of source.matchAll(/\bspawn\(/g)) {
+    const before = source.slice(0, match.index);
+    const sinceAwait = before.slice(Math.max(0, before.lastIndexOf('await ')));
+    expect(sinceAwait, `${file} at offset ${match.index}`).toContain('config.admitSpawn?.()');
+    seams += 1;
+  }
+  return seams;
+}
 
 describe('admitSpawn at the spawn seam', () => {
   beforeEach(() => {
@@ -113,18 +159,30 @@ describe('admitSpawn at the spawn seam', () => {
     const files = RUNNER_FILES;
     let seams = 0;
     for (const file of files) {
-      // Line comments blanked, offsets kept: a comment's "await" or "spawn(" is not code.
-      const source = readFileSync(join(__dirname, file), 'utf-8').replace(/\/\/.*$/gm, (comment) =>
-        ' '.repeat(comment.length)
-      );
-      for (const match of source.matchAll(/\bspawn\(/g)) {
-        const before = source.slice(0, match.index);
-        const sinceAwait = before.slice(before.lastIndexOf('await '));
-        expect(sinceAwait, `${file} at offset ${match.index}`).toContain('config.admitSpawn?.()');
-        seams += 1;
-      }
+      seams += expectAdmittedSpawns(readFileSync(join(__dirname, file), 'utf-8'), file);
     }
     // One physical spawn per runner today; a new one must come with its own check.
     expect(seams).toBe(files.length);
+  });
+
+  it('ignores terminal refusal cleanup but rejects admitted-path suspension and hidden spawns', () => {
+    const source = `
+      await prepare();
+      const refusal = config.admitSpawn?.();
+      if (refusal !== undefined) {
+        await cleanup();
+        return { refusedBeforeSpawn: refusal };
+      }
+      spawn('synthetic');
+    `;
+    expect(expectAdmittedSpawns(source, 'control')).toBe(1);
+    for (const mutant of [
+      source.replace('config.admitSpawn?.()', 'undefined'),
+      source.replace("spawn('synthetic');", "await suspend(); spawn('synthetic');"),
+      source.replace('return { refusedBeforeSpawn: refusal };', 'record(refusal);'),
+      source.replace('await cleanup();', "await cleanup(); spawn('hidden');"),
+      source.replace('if (refusal !== undefined)', 'if (otherCondition)'),
+    ])
+      expect(() => expectAdmittedSpawns(mutant, 'mutant')).toThrow();
   });
 });
