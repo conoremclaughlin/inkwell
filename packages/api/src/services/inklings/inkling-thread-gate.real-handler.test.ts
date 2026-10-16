@@ -963,8 +963,8 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
     return answer;
   }
 
-  function space(metadata: Row): void {
-    db.seed('workspaces', { id: WS, name: 'Team', metadata });
+  function space(type: 'team' | 'personal', metadata: Row = {}): void {
+    db.seed('workspaces', { id: WS, name: 'Space', type, metadata });
   }
 
   beforeEach(() => {
@@ -980,7 +980,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
       .sort();
 
   it('allowed: the owner creates it with a member; both post and each wakes the inkling, which answers', async () => {
-    space({});
+    space('team');
     const started = await call(create, {
       key: GROUP,
       recipients: ['pip'],
@@ -1007,7 +1007,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   });
 
   it('allowed: the turn gate accepts the member’s message in the shared group', async () => {
-    space({});
+    space('team');
     await call(create, { key: GROUP, recipients: ['pip'], people: [B], content: 'hi' });
     await callAs(reply, { key: GROUP, content: 'hello from B' }, B);
     const fromB = db.rows('inbox_thread_messages').find((m) => m.sender_user_id === B);
@@ -1028,8 +1028,22 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
     ).toBe('no');
   });
 
-  it('still refused: a starter (personal) space keeps the owner-only rule', async () => {
-    space({ starter: 'inkling' });
+  it('allowed: a team space its inkling gave the starter set to is still a team space', async () => {
+    // Awakening an inkling stamps the starter mark on whatever space it is
+    // in, so the mark cannot be what tells a team space from a personal one.
+    space('team', { starter: 'inkling', membershipMode: 'invite_only' });
+    const started = await call(create, {
+      key: GROUP,
+      recipients: ['pip'],
+      people: [B],
+      content: 'hi',
+    });
+    expect(started.status).toBe(200);
+    expect(people()).toEqual([ME, B].sort());
+  });
+
+  it('still refused: a personal space keeps the owner-only rule', async () => {
+    space('personal', { starter: 'inkling' });
     const res = await call(create, {
       key: GROUP,
       recipients: ['pip'],
@@ -1041,7 +1055,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   });
 
   it('still refused: a person who is not a member of the space', async () => {
-    space({});
+    space('team');
     const res = await call(create, {
       key: GROUP,
       recipients: ['pip'],
@@ -1053,7 +1067,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   });
 
   it('still refused: a viewer, added or posting', async () => {
-    space({});
+    space('team');
     const added = await call(create, {
       key: GROUP,
       recipients: ['pip'],
@@ -1072,7 +1086,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   });
 
   it('still refused: B into the owner’s 1:1, created without people, posts nothing and wakes nobody', async () => {
-    space({});
+    space('team');
     await call(create, { key: KEY, recipients: ['pip'], content: 'just us' });
     gateway.dispatchTrigger.mockClear();
     const before = written();
@@ -1093,7 +1107,7 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
   });
 
   it('still refused: people on a key already in use are never added to that conversation', async () => {
-    space({});
+    space('team');
     await call(create, { key: KEY, recipients: ['pip'], content: 'just us' });
     const before = written();
     const res = await call(create, {

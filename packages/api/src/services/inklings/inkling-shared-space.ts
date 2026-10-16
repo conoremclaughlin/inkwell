@@ -3,15 +3,16 @@
  * people of the space, beside the space's inkling (Conor, 2026-10-15: two
  * people in one group chat with the space's inkling).
  *
- * Only a team space shares its inklings this way. A starter (personal) space
- * keeps the owner-only rule of inkling-thread-gate.ts unchanged, and so does
- * every conversation not created as a group: a member never writes into the
- * owner's 1:1 with its inkling. The inkling still runs as an ordinary turn on
+ * Only a team space (`workspaces.type = 'team'`) shares its inklings this
+ * way. A personal space keeps the owner-only rule of inkling-thread-gate.ts
+ * unchanged, and so does every conversation not created as a group: a member
+ * never writes into the owner's 1:1 with its inkling. The inkling starter
+ * mark (`metadata.starter`) does not tell them apart: awakening an inkling
+ * gives any space the starter set, a team space included. The inkling still runs as an ordinary turn on
  * its owner's account; the space's people are who it answers.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { isInklingStarterSpace } from './starter-space';
 
 /** The thread-row metadata key that marks a conversation shared with the space's people. */
 export const INKLING_SHARED_MARK = 'inklingShared';
@@ -21,19 +22,19 @@ const WRITE_ROLES: ReadonlySet<string> = new Set(['owner', 'admin', 'member']);
 
 export type SpaceProof = 'yes' | 'no' | 'unreadable';
 
-/** Is this space a team space, one that is not a person's starter space? */
+/** Is this space a team space, not a person's own? */
 export async function isSharedInklingSpace(
   supabase: SupabaseClient,
   workspaceId: string
 ): Promise<SpaceProof> {
   const { data, error } = await supabase
     .from('workspaces')
-    .select('metadata')
+    .select('type')
     .eq('id', workspaceId)
     .maybeSingle();
   if (error) return 'unreadable';
   if (!data) return 'no';
-  return isInklingStarterSpace((data as { metadata: unknown }).metadata) ? 'no' : 'yes';
+  return (data as { type: string | null }).type === 'team' ? 'yes' : 'no';
 }
 
 /** Is every one of these people a member of the space with a role that writes? */
