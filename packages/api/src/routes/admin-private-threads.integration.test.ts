@@ -292,14 +292,12 @@ beforeAll(async () => {
     [owner.userId, member.userId],
     canary.group
   );
-  // A public conversation the owner and the member are in, with Reed.
-  await thread(
-    keys.public,
-    { inklingConversation: true },
-    [owner.userId, member.userId],
-    canary.public,
-    { mode: 'public', sbId: reedSbId }
-  );
+  // A public conversation the member started with Reed, the owner's
+  // inkling. The owner is not in it.
+  await thread(keys.public, { inklingConversation: true }, [member.userId], canary.public, {
+    mode: 'public',
+    sbId: reedSbId,
+  });
 
   // The inkling's session on the owner's 1:1: a carrier that names its key.
   const { rows: session } = await db.query<{ id: string }>(
@@ -423,10 +421,10 @@ describe('the list (GET /threads)', () => {
   });
 
   it('counts only what the person may read, and a public conversation its people are in once', async () => {
-    // The viewer and the admin read the three open threads and the public
-    // conversation; the owner and the member are in the public one too, and
-    // each reads their own 1:1 and the group besides. The viewer's window
-    // also hydrated the owner's 1:1 for the inkling's session, and dropped it.
+    // Everyone reads the three open threads and the public conversation,
+    // which the member is in. The owner and the member each read their own
+    // 1:1 and the group besides. The viewer's window also hydrated the
+    // owner's 1:1 for the inkling's session, and dropped it.
     const [ownerSeen, memberSeen, viewerSeen, adminSeen] = await Promise.all([
       list(owner),
       list(member),
@@ -539,8 +537,8 @@ describe("an inkling's own inbox (GET /individuals/:sbSlug/inbox)", () => {
     );
   });
 
-  it("shows anyone in the space the public conversation in its inkling's inbox", async () => {
-    const { status, body } = await get(admin, '/individuals/:sbSlug/inbox', {
+  it("shows its owner a public conversation of its inkling's that the owner is not in", async () => {
+    const { status, body } = await get(owner, '/individuals/:sbSlug/inbox', {
       params: { sbSlug: `reed-${run}` },
     });
     expect(status).toBe(200);
