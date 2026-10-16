@@ -1,4 +1,5 @@
 import { parsePairingRecord, type PairingRecord } from './pairing';
+import { parseBrowserChatPage, type BrowserChatPage } from '@inklabs/shared/browser-chat';
 
 /** Installation identity only. Neither a thread grant nor permission to read a page. */
 export interface ConnectionView {
@@ -330,9 +331,15 @@ export type BrowserChatOperation =
   | { kind: 'inklings' }
   | { kind: 'messages'; inklingId: string }
   | { kind: 'receipt'; inklingId: string; operationId: string }
-  | { kind: 'message'; inklingId: string; operationId: string; body: string };
+  | {
+      kind: 'message';
+      inklingId: string;
+      operationId: string;
+      body: string;
+      page?: BrowserChatPage;
+    };
 
-function chatRequest(op: BrowserChatOperation): { path: string; body?: Record<string, string> } {
+function chatRequest(op: BrowserChatOperation): { path: string; body?: Record<string, unknown> } {
   if (op.kind === 'inklings') return { path: 'inklings' };
   if (!uuid(op.inklingId)) throw invalid();
   if (op.kind === 'messages') return { path: `messages?inklingId=${op.inklingId}` };
@@ -348,6 +355,11 @@ function chatRequest(op: BrowserChatOperation): { path: string; body?: Record<st
     throw invalid();
   return {
     path: 'message',
-    body: { inklingId: op.inklingId, operationId: op.operationId, body: op.body },
+    body: {
+      inklingId: op.inklingId,
+      operationId: op.operationId,
+      body: op.body,
+      ...(op.page ? { page: parseBrowserChatPage(op.page) } : {}),
+    },
   };
 }

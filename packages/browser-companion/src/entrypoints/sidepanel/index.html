@@ -40,21 +40,24 @@
           <input id="origin" value="http://localhost:3002" spellcheck="false" />
           <button id="pair-open" data-pairing>Open pairing approval ↗</button>
           <p class="small">
-            Approve this installation in your signed-in dashboard, then enter its code below.
+            Approve this installation in your signed-in dashboard. Pairing finishes automatically.
             Pairing grants no page access.
           </p>
-          <label for="pair-code">Pairing code</label>
-          <input
-            id="pair-code"
-            autocomplete="off"
-            spellcheck="false"
-            maxlength="20"
-            placeholder="ABCD-EFGH-JKLM"
-          />
-          <div class="row">
-            <button id="pair-claim" data-pairing>Pair this browser</button>
-            <button id="pair-disconnect" data-pairing class="secondary">Disconnect</button>
-          </div>
+          <details>
+            <summary>Use a pairing code instead</summary>
+            <label for="pair-code">Manual fallback code</label>
+            <input
+              id="pair-code"
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="20"
+              placeholder="ABCD-EFGH-JKLM"
+            />
+            <div class="row">
+              <button id="pair-claim" data-pairing>Pair this browser</button>
+            </div>
+          </details>
+          <button id="pair-disconnect" data-pairing class="secondary">Disconnect</button>
           <p id="pair-origin" class="small"></p>
           <p id="pair-status" role="status" aria-live="polite"></p>
           <button id="pair-retry" data-pairing class="secondary">Retry remote revocation</button>

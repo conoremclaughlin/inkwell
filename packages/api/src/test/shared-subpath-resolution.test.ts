@@ -12,6 +12,7 @@ describe.each([
 ] as const)('%s shared source imports', (_name, project) => {
   it.each([
     ['@inklabs/shared', 'index.ts'],
+    ['@inklabs/shared/browser-chat', 'browser-chat.ts'],
     ['@inklabs/shared/node-host', 'node-host/index.ts'],
     ['@inklabs/shared/runtime', 'runtime/index.ts'],
     ['@inklabs/shared/providers', 'providers/index.ts'],

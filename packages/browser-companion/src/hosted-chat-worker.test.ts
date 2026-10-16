@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerHostedChatWorker } from './hosted-chat-worker';
 import { ConnectionError } from './connection';
+import { assertFresh, SNAPSHOT_TTL_MS } from './protocol';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   chat: vi.fn(),
@@ -98,12 +99,88 @@ beforeEach(() => {
 afterEach(() => {
   worker.disconnect();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 const message = {
   type: 'chat',
   operation: { kind: 'message', inklingId, operationId, body: 'Synthetic text.' },
 };
 describe('document-bound hosted chat worker', () => {
+  it('reports expired snapshots as rejected before persistence or dispatch', async () => {
+    vi.useFakeTimers();
+    const snapshot = {
+      version: 1 as const,
+      id: operationId,
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Expired fixture',
+      mode: 'page' as const,
+      text: 'Synthetic steps.',
+      truncated: false,
+      fields: [],
+    };
+    worker = registerHostedChatWorker(record as never, async () => {
+      assertFresh(snapshot);
+      const { version, mode, fields, ...page } = snapshot;
+      return page;
+    });
+    const p = port();
+    await p.request({ type: 'connect' });
+    vi.setSystemTime(snapshot.capturedAt + SNAPSHOT_TTL_MS + 1);
+    expect(
+      await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })
+    ).toMatchObject({ ok: true, value: { operationId, status: 'rejected' } });
+    expect(write).not.toHaveBeenCalled();
+    expect(mocks.chat).not.toHaveBeenCalled();
+    // An existing uncertain request with the same ID is not a definite rejection.
+    stored.chatPending = {
+      [`${grantId}:${inklingId}`]: { operationId, body: message.operation.body },
+    };
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
+    ).toBe(false);
+  });
+  it('saves the exact worker snapshot before dispatch and reuses it without recapturing', async () => {
+    const page = {
+      id: operationId,
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Setup',
+      text: 'Synthetic steps.',
+      truncated: false,
+    };
+    const capture = vi.fn(async () => page);
+    worker = registerHostedChatWorker(record as never, capture);
+    const p = port();
+    await p.request({ type: 'connect' });
+    mocks.chat.mockRejectedValueOnce(new Error('Fixture network loss'));
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })).ok
+    ).toBe(false);
+    expect(stored.chatPending).toEqual({
+      [`${grantId}:${inklingId}`]: { operationId, body: message.operation.body, page },
+    });
+    page.text = 'Changed after dispatch';
+    expect((await p.request({ type: 'retry', operation: message.operation })).ok).toBe(true);
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(mocks.chat.mock.lastCall![0].page.text).toBe('Synthetic steps.');
+  });
+  it('refuses caller-supplied page bytes and invalidated capture references', async () => {
+    const capture = vi.fn(async () => {
+      throw new Error('Capture changed');
+    });
+    worker = registerHostedChatWorker(record as never, capture);
+    const p = port();
+    await p.request({ type: 'connect' });
+    expect(
+      (await p.request({ ...message, operation: { ...message.operation, page: {} } })).ok
+    ).toBe(false);
+    expect(
+      await p.request({ ...message, operation: { ...message.operation, pageId: operationId } })
+    ).toMatchObject({ ok: true, value: { operationId, status: 'rejected' } });
+    expect(write).not.toHaveBeenCalled();
+    expect(mocks.chat).not.toHaveBeenCalled();
+  });
   it.each(['expired', 'refused', 'closed'] as const)(
     'ends panel intent on terminal %s instead of leaving a poisoned port',
     async (code) => {

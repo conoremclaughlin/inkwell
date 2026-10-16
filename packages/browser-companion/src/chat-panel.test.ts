@@ -92,6 +92,17 @@ afterEach(() => {
 });
 
 describe('chat panel view', () => {
+  it.each(['', 'A draft before connecting'])(
+    'initial connection warns only when a draft is actually discarded: %j',
+    (draft) => {
+      const p = setup(view({ conversation: null, page: null, sharing: { state: 'off' } }));
+      p.input(draft);
+      p.panel.setState(view({ page: null, sharing: { state: 'off' } }));
+      expect(p.composer.value).toBe('');
+      if (draft) expect(p.host.textContent).toContain('Drafts are not carried');
+      else expect(p.host.textContent).not.toContain('binding changed');
+    }
+  );
   it('shows a storage receipt only on the latest row while keeping uncertainty visible', () => {
     const p = setup(
       view({
@@ -175,7 +186,7 @@ describe('chat panel view', () => {
     p.submit();
     expect(p.host.textContent).toContain('Choose an inkling');
     expect(p.host.textContent).toContain('No page attached');
-    expect(p.host.textContent).toContain('Page not shared');
+    expect(p.host.textContent).toContain('No live page access');
     expect(p.send).not.toHaveBeenCalled();
     expect(p.stopButton.disabled).toBe(true);
     expect(p.composer.value).toBe('Keep this draft');

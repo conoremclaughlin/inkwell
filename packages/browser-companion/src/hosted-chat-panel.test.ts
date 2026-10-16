@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { webcrypto } from 'node:crypto';
 import markup from './entrypoints/sidepanel/index.html?raw';
 import { mountHostedChatPanel } from './hosted-chat-panel';
+import { SNAPSHOT_TTL_MS } from './protocol';
 const inklingId = '22222222-2222-4222-8222-222222222222';
 let connections: ReturnType<typeof makePort>[];
 let send: ReturnType<
@@ -16,6 +17,8 @@ let send: ReturnType<
 >;
 let broadcast: (message: unknown, sender: unknown) => void;
 let panel: ReturnType<typeof mountHostedChatPanel>;
+let changed: (changes: unknown, area: string) => void;
+const requestPage = vi.fn<() => Promise<unknown>>();
 function makePort() {
   let message: (data: unknown) => void;
   let lost: () => void;
@@ -45,6 +48,7 @@ beforeEach(() => {
   vi.stubGlobal('crypto', webcrypto);
   document.body.innerHTML = markup;
   connections = [];
+  requestPage.mockReset();
   send = vi.fn(async (request) => {
     if (request.type === 'connect')
       return {
@@ -72,6 +76,14 @@ beforeEach(() => {
           broadcast = fn;
         },
       },
+      sendMessage: requestPage,
+    },
+    storage: {
+      onChanged: {
+        addListener: (fn: typeof changed) => {
+          changed = fn;
+        },
+      },
     },
   });
   panel = mountHostedChatPanel();
@@ -93,6 +105,228 @@ async function ready() {
   );
 }
 describe('mounted hosted panel with synthetic worker replies', () => {
+  it.each([true, false])(
+    'rejects an expired attachment without a silent text-only send (timer runs: %s)',
+    async (runTimer) => {
+      await ready();
+      vi.useFakeTimers();
+      const capturedAt = Date.now();
+      requestPage.mockResolvedValue({
+        ok: true,
+        value: {
+          version: 1,
+          id: '44444444-4444-4444-8444-444444444444',
+          capturedAt,
+          url: 'https://fixture.example/setup',
+          title: 'Expiring fixture',
+          mode: 'page',
+          text: 'Synthetic steps.',
+          truncated: false,
+          fields: [],
+        },
+      });
+      [...document.querySelectorAll('button')]
+        .find((b) => b.textContent === 'Share this page')!
+        .click();
+      await vi.waitFor(() =>
+        expect(document.body.textContent).toContain('Review: Expiring fixture')
+      );
+      composer().value = 'Keep this draft.';
+      composer().dispatchEvent(new Event('input'));
+      if (runTimer) {
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_TTL_MS + 1);
+        expect(document.body.textContent).not.toContain('Attached for your next message only');
+        expect(document.body.textContent).not.toContain('Review: Expiring fixture');
+      } else {
+        // A sleeping panel may see the clock jump before its timeout is delivered.
+        vi.setSystemTime(capturedAt + SNAPSHOT_TTL_MS + 1);
+      }
+      submit().click();
+      await vi.waitFor(() =>
+        expect(document.body.textContent).toContain('Rejected — not accepted')
+      );
+      expect(composer().value).toBe('Keep this draft.');
+      expect(submit().disabled).toBe(false);
+      expect(document.body.textContent).not.toContain('Outcome unknown');
+      expect(send.mock.calls.some(([request]) => request.operation?.kind === 'message')).toBe(
+        false
+      );
+      [...document.querySelectorAll('button')]
+        .find((b) => b.textContent === 'Remove page')!
+        .click();
+      submit().click();
+      await vi.waitFor(() => expect(composer().value).toBe(''));
+      const dispatched = send.mock.calls.filter(
+        ([request]) => request.operation?.kind === 'message'
+      );
+      expect(dispatched).toHaveLength(1);
+      expect(dispatched[0]![0].operation).not.toHaveProperty('pageId');
+    }
+  );
+  it('keeps a definitely rejected snapshot send editable without losing the intended attachment silently', async () => {
+    await ready();
+    requestPage.mockResolvedValue({
+      ok: true,
+      value: {
+        version: 1,
+        id: '44444444-4444-4444-8444-444444444444',
+        capturedAt: Date.now(),
+        url: 'https://fixture.example/setup',
+        title: 'Racing fixture',
+        mode: 'page',
+        text: 'Synthetic steps.',
+        truncated: false,
+        fields: [],
+      },
+    });
+    [...document.querySelectorAll('button')]
+      .find((b) => b.textContent === 'Share this page')!
+      .click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Review: Racing fixture'));
+    const original = send.getMockImplementation()!;
+    send.mockImplementation(async (request) =>
+      request.operation?.kind === 'message'
+        ? { operationId: request.operation.operationId, status: 'rejected' }
+        : original(request)
+    );
+    composer().value = 'Keep the rejected draft.';
+    composer().dispatchEvent(new Event('input'));
+    submit().click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Rejected — not accepted'));
+    expect(submit().disabled).toBe(false);
+    expect(composer().value).toBe('Keep the rejected draft.');
+    submit().click();
+    await vi.waitFor(() => expect(submit().disabled).toBe(false));
+    expect(
+      send.mock.calls.filter(([request]) => request.operation?.kind === 'message')
+    ).toHaveLength(1);
+  });
+  it('consumes a staged snapshot even when delivery is uncertain, without claiming plain chat shared one', async () => {
+    await ready();
+    composer().value = 'A plain message.';
+    composer().dispatchEvent(new Event('input'));
+    submit().click();
+    await vi.waitFor(() => expect(composer().value).toBe(''));
+    expect(document.body.textContent).not.toContain('Snapshot sent with that message');
+    requestPage.mockResolvedValue({
+      ok: true,
+      value: {
+        version: 1,
+        id: '44444444-4444-4444-8444-444444444444',
+        capturedAt: Date.now(),
+        url: 'https://fixture.example/setup',
+        title: 'Uncertain fixture',
+        mode: 'page',
+        text: 'Synthetic steps.',
+        truncated: false,
+        fields: [],
+      },
+    });
+    [...document.querySelectorAll('button')]
+      .find((b) => b.textContent === 'Share this page')!
+      .click();
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain('Review: Uncertain fixture')
+    );
+    const original = send.getMockImplementation()!;
+    send.mockImplementation(async (request) =>
+      request.operation?.kind === 'message'
+        ? { operationId: request.operation.operationId, status: 'unknown' }
+        : original(request)
+    );
+    composer().value = 'An uncertain attachment.';
+    composer().dispatchEvent(new Event('input'));
+    submit().click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Delivery is uncertain'));
+    expect(document.body.textContent).not.toContain('Review: Uncertain fixture');
+    expect(document.body.textContent).toContain('Check delivery below');
+  });
+  it('discards capture completion after Stop without sending page bytes', async () => {
+    await ready();
+    let finish!: (value: unknown) => void;
+    requestPage.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      })
+    );
+    [...document.querySelectorAll('button')]
+      .find((b) => b.textContent === 'Share this page')!
+      .click();
+    expect(submit().disabled).toBe(true);
+    panel.stop();
+    finish({
+      ok: true,
+      value: {
+        version: 1,
+        id: '44444444-4444-4444-8444-444444444444',
+        capturedAt: Date.now(),
+        url: 'https://fixture.example/setup',
+        title: 'Late fixture',
+        mode: 'page',
+        text: 'Do not attach this.',
+        truncated: false,
+        fields: [],
+      },
+    });
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain('Capturing the page'));
+    expect(document.body.textContent).not.toContain('Review: Late fixture');
+    expect(send.mock.calls.some(([request]) => request.operation?.kind === 'message')).toBe(false);
+  });
+  it('attaches only on a click, previews privately, then sends its worker reference', async () => {
+    await ready();
+    const snapshot = {
+      version: 1,
+      id: '44444444-4444-4444-8444-444444444444',
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Setup fixture',
+      mode: 'page',
+      text: 'Synthetic steps.',
+      truncated: false,
+      fields: [],
+    };
+    requestPage.mockResolvedValue({ ok: true, value: snapshot });
+    expect(chrome.runtime.sendMessage).not.toHaveBeenCalled();
+    [...document.querySelectorAll('button')]
+      .find((b) => b.textContent === 'Share this page')!
+      .click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Review: Setup fixture'));
+    expect(send.mock.calls.some(([request]) => request.operation?.kind === 'message')).toBe(false);
+    composer().value = 'Help me understand this.';
+    composer().dispatchEvent(new Event('input'));
+    submit().click();
+    await vi.waitFor(() =>
+      expect(send.mock.calls.some(([request]) => request.operation?.kind === 'message')).toBe(true)
+    );
+    expect(
+      send.mock.calls.find(([request]) => request.operation?.kind === 'message')![0].operation
+    ).toMatchObject({ pageId: snapshot.id, body: 'Help me understand this.' });
+    expect(document.body.textContent).not.toContain('Review: Setup fixture');
+  });
+  it('discards a staged snapshot when the source capture changes', async () => {
+    await ready();
+    const snapshot = {
+      version: 1,
+      id: '44444444-4444-4444-8444-444444444444',
+      capturedAt: Date.now(),
+      url: 'https://fixture.example/setup',
+      title: 'Setup fixture',
+      mode: 'page',
+      text: 'Synthetic steps.',
+      truncated: false,
+      fields: [],
+    };
+    requestPage.mockResolvedValueOnce({ ok: true, value: snapshot });
+    [...document.querySelectorAll('button')]
+      .find((b) => b.textContent === 'Share this page')!
+      .click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Review: Setup fixture'));
+    requestPage.mockResolvedValue({ ok: true, value: {} });
+    changed({}, 'session');
+    await vi.waitFor(() =>
+      expect(document.body.textContent).not.toContain('Review: Setup fixture')
+    );
+  });
   it('shows a saved unknown message after reload and retries only on an explicit click', async () => {
     const operationId = '33333333-3333-4333-8333-333333333333';
     const original = send.getMockImplementation()!;

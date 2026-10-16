@@ -1,5 +1,6 @@
 import { ConnectionError, createBrowserConnection, type BrowserChatOperation } from './connection';
 import type { PairingRecord } from './pairing';
+import { parseBrowserChatPage, type BrowserChatPage } from '@inklabs/shared/browser-chat';
 
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -7,21 +8,33 @@ const object = (value: unknown): Record<string, unknown> =>
     : {};
 const uuid = (v: unknown): v is string =>
   typeof v === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
-type PendingMessage = { operationId: string; body: string };
+type PendingMessage = { operationId: string; body: string; page?: BrowserChatPage };
 type Pending = string | PendingMessage; // Old references remain read-only recoverable.
 const pendingId = (entry: Pending) => (typeof entry === 'string' ? entry : entry.operationId);
+const validPage = (page: unknown) => {
+  try {
+    parseBrowserChatPage(page);
+    return true;
+  } catch {
+    return false;
+  }
+};
 const validPending = (entry: unknown): entry is Pending =>
   uuid(entry) ||
   (uuid(object(entry).operationId) &&
     typeof object(entry).body === 'string' &&
     String(object(entry).body).trim().length > 0 &&
-    String(object(entry).body).length <= 4_000);
+    String(object(entry).body).length <= 4_000 &&
+    (object(entry).page === undefined || validPage(object(entry).page)));
 
 /** A port is bound by Chrome to one authenticated extension document. Opening it
  * does no IO; only the panel's in-memory Connect intent starts a connection.
  * Port loss closes every bearer. A surviving panel may explicitly re-send its
  * intent after worker suspension; a new/reloaded document starts without it. */
-export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>) {
+export function registerHostedChatWorker(
+  getRecord: () => Promise<PairingRecord>,
+  getPage?: (snapshotId: string) => Promise<BrowserChatPage>
+) {
   const stops = new Set<() => void>();
   let epoch = 0;
   let tail: Promise<unknown> = Promise.resolve();
@@ -125,6 +138,8 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
         if (!connection || !grantId) throw new Error('Connect first.');
         if (busy) throw new Error('A chat operation is already pending.');
         const op = object(message.operation) as unknown as BrowserChatOperation;
+        // Page bytes must come from a worker-held capture, never an RPC-supplied page.
+        if ('page' in object(message.operation)) throw new Error('Invalid page authority.');
         if (message.type === 'retry' && op.kind !== 'message') throw new Error('Invalid retry.');
         if (!['inklings', 'messages', 'message'].includes(op.kind))
           throw new Error('Unsupported chat operation.');
@@ -139,8 +154,10 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
           throw new Error('Invalid message.');
         busy = true;
         try {
+          let outgoing = op;
           const key = op.kind === 'inklings' ? '' : `${grantId}:${op.inklingId}`;
           if (op.kind === 'message') {
+            let rejected = false;
             await serial(async () => {
               alive();
               const entries = await pending();
@@ -156,19 +173,52 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
                   previous.body !== op.body
                 )
                   throw new Error('Retry must match the original message.');
+                outgoing = {
+                  kind: 'message',
+                  inklingId: op.inklingId,
+                  operationId: op.operationId,
+                  body: op.body,
+                  ...(previous.page ? { page: parseBrowserChatPage(previous.page) } : {}),
+                };
                 return;
               }
               if (previous || Object.keys(entries).length >= 100)
                 throw new Error('Check the previous delivery before sending again.');
+              let page: BrowserChatPage | undefined;
+              const pageId = object(message.operation).pageId;
+              if (pageId !== undefined) {
+                try {
+                  if (typeof pageId !== 'string' || !getPage)
+                    throw new Error('Invalid page capture.');
+                  page = parseBrowserChatPage(await getPage(pageId));
+                } catch {
+                  // No prior pending request, write or dispatch: this refusal is
+                  // definitely not sent. Storage/transport failures stay unknown.
+                  rejected = true;
+                  return;
+                }
+              }
+              alive();
               // Durable-before-dispatch. A crash may leave an unsent unknown,
               // but cannot silently replay a potentially accepted send.
               await chrome.storage.session.set({
-                chatPending: { ...entries, [key]: { operationId: op.operationId, body: op.body } },
+                chatPending: {
+                  ...entries,
+                  [key]: { operationId: op.operationId, body: op.body, ...(page ? { page } : {}) },
+                },
               });
+              outgoing = {
+                kind: 'message',
+                inklingId: op.inklingId,
+                operationId: op.operationId,
+                body: op.body,
+                ...(page ? { page } : {}),
+              };
             });
             alive();
+            if (rejected) return { operationId: op.operationId, status: 'rejected' };
           }
-          const result = await connection.chat(op);
+          const result = await connection.chat(outgoing);
           alive();
           if (
             op.kind === 'message' &&
@@ -194,7 +244,11 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
               } else {
                 result.pendingOperationId = operationId;
                 if (typeof entry !== 'string')
-                  result.pendingMessage = { operationId, body: entry.body };
+                  result.pendingMessage = {
+                    operationId,
+                    body: entry.body,
+                    ...(entry.page ? { page: parseBrowserChatPage(entry.page) } : {}),
+                  };
               }
             }
           }

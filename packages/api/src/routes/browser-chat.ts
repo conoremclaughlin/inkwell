@@ -4,6 +4,7 @@
  * Ordinary recipients are explicit new-grant bindings, not an implicit upgrade. */
 import { Router } from 'express';
 import { z } from 'zod';
+import { formatBrowserChatMessage, parseBrowserChatPage } from '@inklabs/shared/browser-chat';
 import type { DataComposer } from '../data/composer';
 import { InklingService, type Inkling } from '../services/inklings/inkling-service';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
@@ -23,6 +24,17 @@ const selection = z.object({ inklingId: z.string().uuid() }).strict();
 const submission = selection
   .extend({
     operationId: z.string().uuid(),
+    page: z
+      .unknown()
+      .transform((value, context) => {
+        try {
+          return parseBrowserChatPage(value);
+        } catch {
+          context.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid page attachment.' });
+          return z.NEVER;
+        }
+      })
+      .optional(),
     body: z
       .string()
       .min(1)
@@ -34,7 +46,7 @@ const submission = selection
 export const browserChatKey = (grantId: string, inklingId: string) =>
   `thread:browser-${grantId}-${inklingId}`;
 
-export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>) {
+export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>): Router {
   const router = Router();
 
   async function scope(req: BrowserCompanionRequest, inklingId?: string) {
@@ -185,7 +197,13 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
               : row.sender_kind === 'sb' && row.sender_sb_id === inkling.id
                 ? publicInkling(inkling).name
                 : 'System',
-            body: row.content.slice(0, 8_000),
+            body:
+              mine && typeof metadata?.browserMessageBody === 'string'
+                ? metadata.browserMessageBody.slice(0, 4_000) +
+                  (typeof metadata.browserPageTitle === 'string'
+                    ? `\n\nShared page: ${metadata.browserPageTitle.slice(0, 200)}`
+                    : '')
+                : row.content.slice(0, 8_000),
             // Existence proves storage, not execution or completion.
             status: 'stored',
           };
@@ -218,7 +236,8 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
         return;
       }
       const key = browserChatKey(claims.grantId, inkling.id);
-      const { body, operationId } = parsed.data;
+      const { operationId, page } = parsed.data;
+      const body = formatBrowserChatMessage(parsed.data.body, page, operationId);
       const replay = async () => {
         const { data: thread, error } = await client
           .from('inbox_threads')
@@ -271,6 +290,9 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
               sentBy: 'user',
               channel: 'browser-companion',
               clientMessageId: operationId,
+              ...(page
+                ? { browserMessageBody: parsed.data.body, browserPageTitle: page.title }
+                : {}),
             },
           },
           composer,

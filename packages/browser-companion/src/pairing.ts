@@ -283,7 +283,7 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
         return view();
       });
     },
-    async claim(input: string) {
+    async claim(input: string, expected?: { installationId: string; origin: string }) {
       const code = input.toUpperCase().replace(/[\s-]/g, '');
       if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}$/.test(code))
         throw new Error('Enter the 12-character pairing code from Inkwell.');
@@ -291,6 +291,11 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
       const pending = await transition(async () => {
         if (generation !== stopped || record?.phase !== 'ready' || !record.installationSecret)
           throw new Error('This pairing cannot be claimed again. Check its status.');
+        if (
+          expected &&
+          (record.installationId !== expected.installationId || record.origin !== expected.origin)
+        )
+          throw new Error('Pairing changed. Reopen approval from the extension.');
         const intent = record;
         await save({ ...record, phase: 'claiming', installationSecret: undefined });
         if (generation !== stopped) {

@@ -128,6 +128,47 @@ const existing = () => {
 };
 
 describe('installation-scoped hosted chat', () => {
+  it('wraps a bounded snapshot as private untrusted context and keeps retries deterministic', async () => {
+    const page = {
+      id: operationId,
+      capturedAt: 1,
+      url: 'https://fixture.example/setup',
+      title: 'Setup fixture',
+      text: 'A\u200BB',
+      truncated: false,
+    };
+    expect((await send({ page })).status).toBe(200);
+    const content = mocks.send.mock.calls[0][0].content;
+    expect(content).toContain('[BROWSER_CONTEXT_PRIVATE]');
+    expect(content).toContain('UNTRUSTED');
+    expect(content).toContain('AB');
+    expect(content).not.toContain('\u200B');
+    expect(mocks.send.mock.calls[0][0].metadata).toMatchObject({
+      browserPageTitle: page.title,
+      browserMessageBody: 'Hello from a synthetic panel.',
+    });
+    existing();
+    mocks.lookup.mockResolvedValue({ kind: 'stored' });
+    expect((await send({ page })).status).toBe(200);
+    expect(mocks.lookup.mock.lastCall![1].content).toBe(content);
+    expect(mocks.send).toHaveBeenCalledTimes(1);
+  });
+  it('refuses page URLs with private query material and unsupported page authority fields', async () => {
+    const page = {
+      id: operationId,
+      capturedAt: 1,
+      url: 'https://fixture.example/setup?private=synthetic',
+      title: 'Setup',
+      text: 'Synthetic',
+      truncated: false,
+    };
+    expect((await send({ page })).status).toBe(400);
+    expect(
+      (await send({ page: { ...page, url: 'https://fixture.example/setup', click: 'next' } }))
+        .status
+    ).toBe(400);
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
   it('an explicit grant lists and dispatches only its current owned hosted recipient', async () => {
     mocks.binding.mockResolvedValue(inkling.id);
     rows.agent_identities = [
