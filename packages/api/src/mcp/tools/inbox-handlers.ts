@@ -71,6 +71,10 @@ import {
   INKLING_CONVERSATION_MARK,
 } from '../../services/inklings/inkling-thread-gate.js';
 import {
+  OPEN_THREADS_FILTER,
+  PARTICIPANT_ONLY_PATH,
+} from '../../services/threads/thread-read-access.js';
+import {
   inklingWakeDue,
   openReplyChain,
   replyOrder,
@@ -2298,32 +2302,61 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Recency page (mission timeline / non-delivery callers): membership
         // is filtered with an !inner join on participants when an agent is
         // given — never a client-side `.in(id-list)`, which blows the URL
-        // past 8KB once a user has a few hundred threads (HTTP 414). Threads
-        // are user-scoped rows, so the agent-less unified view needs no
-        // participant filter at all.
+        // past 8KB once a user has a few hundred threads (HTTP 414).
         //
         // No status filter: closed is a work-state signal, not a delivery
         // filter (spec inkmail-thread-scope §2). A reply on a closed thread
         // is unread until it is read, so the thread stays on this page.
         // list_threads(status='open') is the explicit work-list filter.
-        let recencyQuery = threadTable(supabase, 'inbox_threads')
-          .select(
-            callerSb
-              ? // The FK is named: since the cutover there are two relationships
-                // between the tables (thread_id, and (thread_id, workspace_id)),
-                // and an unqualified embed is PGRST201-ambiguous (Lumen, #618).
-                'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at, inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(sb_id)'
-              : 'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at'
-          )
-          .in('workspace_id', threadWorkspaceIds);
+        const THREAD_PAGE_COLUMNS =
+          'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at';
         if (callerSb) {
-          recencyQuery = recencyQuery.eq('inbox_thread_participants.sb_id', callerSb.sbId);
+          // The FK is named: since the cutover there are two relationships
+          // between the tables (thread_id, and (thread_id, workspace_id)),
+          // and an unqualified embed is PGRST201-ambiguous (Lumen, #618).
+          threads = checkedRead<ThreadPageRow[]>(
+            await threadTable(supabase, 'inbox_threads')
+              .select(
+                `${THREAD_PAGE_COLUMNS}, inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(sb_id)`
+              )
+              .in('workspace_id', threadWorkspaceIds)
+              .eq('inbox_thread_participants.sb_id', callerSb.sbId)
+              .order('updated_at', { ascending: false })
+              .limit(THREAD_PAGE_LIMIT),
+            'thread_page_recency'
+          );
+        } else {
+          // The agent-less view reads as the account: every thread in its
+          // workspaces, except a participant-only conversation (D3), which
+          // appears only when the account is on it as a person. Two reads,
+          // so the others never take a place on the page.
+          const [open, ownPrivate] = await Promise.all([
+            threadTable(supabase, 'inbox_threads')
+              .select(THREAD_PAGE_COLUMNS)
+              .in('workspace_id', threadWorkspaceIds)
+              .or(OPEN_THREADS_FILTER)
+              .order('updated_at', { ascending: false })
+              .limit(THREAD_PAGE_LIMIT),
+            threadTable(supabase, 'inbox_threads')
+              .select(
+                `${THREAD_PAGE_COLUMNS}, viewer:inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(user_id)`
+              )
+              .in('workspace_id', threadWorkspaceIds)
+              .eq(PARTICIPANT_ONLY_PATH, true)
+              .eq('viewer.user_id', resolved.user.id)
+              .order('updated_at', { ascending: false })
+              .limit(THREAD_PAGE_LIMIT),
+          ]);
+          threads = [
+            ...(checkedRead<ThreadPageRow[]>(open, 'thread_page_recency') ?? []),
+            ...(checkedRead<ThreadPageRow[]>(ownPrivate, 'thread_page_recency_private') ?? []),
+          ]
+            .sort(
+              (a, b) =>
+                (Date.parse(b.updated_at ?? '') || 0) - (Date.parse(a.updated_at ?? '') || 0)
+            )
+            .slice(0, THREAD_PAGE_LIMIT);
         }
-        const data = checkedRead<ThreadPageRow[]>(
-          await recencyQuery.order('updated_at', { ascending: false }).limit(THREAD_PAGE_LIMIT),
-          'thread_page_recency'
-        );
-        threads = data;
       }
 
       if (threads?.length) {

@@ -14,6 +14,7 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import { assertWriteRole, resolveCallerSb, type CallerSb } from './caller-principal';
 import { findThread, isParticipant, type ThreadRow } from './thread-handlers';
+import { isParticipantOnlyThread } from '../../services/threads/thread-read-access';
 import { resolveLinkTarget, threadLinkViewsFor, type LinkScope } from './thread-link-views';
 import {
   THREAD_LINK_NOTE_MAX,
@@ -341,9 +342,10 @@ export async function handleUnlinkThread(args: unknown, dataComposer: DataCompos
 /**
  * Read links. The team (the workspace owner's own SBs) may read any thread's
  * links, participant or not: the point is navigation for an SB that was never
- * in the conversation. Anyone else sees only links between threads it takes
- * part in, because a view carries thread titles and titles carry real content
- * (LinkReader). Never message content, for anyone.
+ * in the conversation. An inkling conversation is the exception: only its
+ * participants see its links (D3). Anyone else sees only links between
+ * threads it takes part in, because a view carries thread titles and titles
+ * carry real content (LinkReader). Never message content, for anyone.
  */
 export async function handleListThreadLinks(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
@@ -357,7 +359,15 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   const options = { direction: parsed.direction, relation: parsed.relation };
 
   if (parsed.threadKey) {
-    const thread = await findThread(supabase, caller.workspaceId, parsed.threadKey);
+    const found = await findThread(supabase, caller.workspaceId, parsed.threadKey);
+    // A participant-only conversation (D3) the caller is not in reads as no
+    // thread at all, so `threadExists` says nothing about it either.
+    const thread =
+      found &&
+      (!isParticipantOnlyThread(found.metadata) ||
+        (await isParticipant(supabase, found.id, caller)))
+        ? found
+        : null;
     const views = await threadLinkViewsFor(
       supabase,
       scope,
@@ -416,7 +426,7 @@ export const threadLinkToolDefinitions = [
   {
     name: 'list_thread_links',
     description:
-      'List what a thread links to (linksTo) and what links to it (linkedFrom), or, given an ink:// URI, every thread linking to that artifact ("which PRs touch this spec?"). The thread spec:<slug> and the artifact ink://specs/<slug> are read as one subject. Returns keys, titles and statuses, never message content. The SBs of the workspace owner see every link, participant or not; any other reader (the SB of a member or viewer, an inkling) sees only links between threads it takes part in.',
+      'List what a thread links to (linksTo) and what links to it (linkedFrom), or, given an ink:// URI, every thread linking to that artifact ("which PRs touch this spec?"). The thread spec:<slug> and the artifact ink://specs/<slug> are read as one subject. Returns keys, titles and statuses, never message content. The SBs of the workspace owner see every link, participant or not, except the links of an inkling conversation, which only its participants see; any other reader (the SB of a member or viewer, an inkling) sees only links between threads it takes part in.',
     schema: listThreadLinksSchema,
     handler: handleListThreadLinks,
   },

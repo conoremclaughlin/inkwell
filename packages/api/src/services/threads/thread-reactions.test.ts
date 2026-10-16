@@ -418,6 +418,30 @@ describe('reactToMessage', () => {
         ...extra,
       });
 
+    // D3: marked as an inkling conversation, it is no thread at all to anyone
+    // not in it, answered before its messages are looked up, so neither the
+    // conversation nor a message id in it is disclosed.
+    it('answers a person or an SB not in it as no thread, when it is marked participant-only', async () => {
+      inklingThread.metadata = { inklingConversation: true };
+      for (const reactor of [userPrincipal(SOMEONE), wren]) {
+        for (const messageId of [inklingMessage.id as string, uuid(999_998)]) {
+          expect(await refusal(inInklingThread(reactor, { messageId }))).toEqual({
+            status: 404,
+            code: 'thread_not_found',
+          });
+        }
+      }
+      expect(db.rows(REACTIONS_TABLE)).toHaveLength(0);
+    });
+
+    it('lets its owner react when it is marked participant-only', async () => {
+      inklingThread.metadata = { inklingConversation: true };
+      const answer = await inInklingThread(asMe, { emoji: '❤️' });
+      expect(answer.reactions).toEqual([
+        { emoji: '❤️', count: 1, reactors: [{ kind: 'user', id: ME }], mine: true },
+      ]);
+    });
+
     it('lets the owner react, since the reactor is the person', async () => {
       const answer = await inInklingThread(asMe, { emoji: '❤️' });
       expect(answer.reactions).toEqual([

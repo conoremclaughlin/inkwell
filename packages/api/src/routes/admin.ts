@@ -135,6 +135,13 @@ import {
 } from '../services/threads/thread-reactions';
 import { PinRefusedError, parsePinBody, setThreadPin } from '../services/threads/thread-pins';
 import {
+  OPEN_THREADS_FILTER,
+  PARTICIPANT_ONLY_COLUMN,
+  PARTICIPANT_ONLY_PATH,
+  isParticipantOnlyThread,
+  mayReadThread,
+} from '../services/threads/thread-read-access';
+import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
   OWN_CREATE_SETTLE_INTERVAL_MS,
@@ -5663,15 +5670,33 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       const threadIds = [...new Set((threadParticipantRows || []).map((p) => p.thread_id))];
 
       if (threadIds.length > 0) {
-        const { data: threadRows, error: threadErr } = await supabase
+        const { data: agentThreadRows, error: threadErr } = await supabase
           .from('inbox_threads')
           .select('*')
           .eq('workspace_id', authReq.inkWorkspaceId)
           .in('id', threadIds)
           .order('updated_at', { ascending: false });
         if (threadErr) throw threadErr;
+        // A participant-only conversation (D3) shows here only to a person
+        // on it: owning one of its SBs is not being in it.
+        const privateIds = (agentThreadRows ?? [])
+          .filter((t) => isParticipantOnlyThread(t.metadata))
+          .map((t) => t.id);
+        const viewerOn = new Set<string>();
+        if (privateIds.length > 0) {
+          const { data: viewerRows, error: viewerErr } = await supabase
+            .from('inbox_thread_participants')
+            .select('thread_id')
+            .eq('user_id', authReq.inkUserId)
+            .in('thread_id', privateIds);
+          if (viewerErr) throw viewerErr;
+          for (const row of viewerRows ?? []) viewerOn.add(row.thread_id);
+        }
+        const threadRows = (agentThreadRows ?? []).filter(
+          (t) => !isParticipantOnlyThread(t.metadata) || viewerOn.has(t.id)
+        );
 
-        if (threadRows?.length) {
+        if (threadRows.length) {
           const visibleIds = threadRows.map((t) => t.id);
 
           const { data: readStatusRows, error: readErr } = await supabase
@@ -8498,14 +8523,19 @@ router.get('/threads', async (req: Request, res: Response) => {
     // same-key session from another workspace is another conversation.
     const carrierScope = carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId);
 
-    // One list for both thread reads below (the newest window and the
-    // hydration of older carrier keys), so neither can drop a column alone.
+    // One list for every thread read below (the newest window and the
+    // hydration of older carrier keys), so none can drop a column alone.
     // The embed carries each thread's newest message for the list preview.
-    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${LAST_MESSAGE_EMBED}`;
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${PARTICIPANT_ONLY_COLUMN}, ${LAST_MESSAGE_EMBED}`;
 
-    const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
+    // The newest window is two reads (D3): the threads every reader here may
+    // read (threadsRes), and the participant-only ones this viewer is in
+    // (privateRes). Leaving the others out in the query, not after it, keeps
+    // them from taking a place in the window or in its count.
+    const [threadsRes, sessionsRes, studiosRes, groupsRes, privateRes] = await Promise.all([
       withLastMessage(supabase.from('inbox_threads').select(THREAD_COLUMNS, { count: 'exact' }))
         .eq('workspace_id', workspaceId)
+        .or(OPEN_THREADS_FILTER)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
       supabase
@@ -8532,9 +8562,24 @@ router.get('/threads', async (req: Request, res: Response) => {
         .not('thread_key', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(GROUPS_CAP),
+      withLastMessage(
+        supabase
+          .from('inbox_threads')
+          .select(
+            `${THREAD_COLUMNS}, viewer:inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(user_id)`,
+            { count: 'exact' }
+          )
+      )
+        .eq('workspace_id', workspaceId)
+        .eq(PARTICIPANT_ONLY_PATH, true)
+        .eq('viewer.user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(THREADS_CAP),
     ]);
 
-    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes].find((r) => r.error);
+    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes, privateRes].find(
+      (r) => r.error
+    );
     if (failed?.error) {
       logger.error('Failed to list thread spines:', failed.error);
       res.status(500).json(errorJson('Failed to list threads', failed.error));
@@ -8576,7 +8621,15 @@ router.get('/threads', async (req: Request, res: Response) => {
       updatedAt: g.updated_at,
     }));
 
-    const threadRows = [...(threadsRes.data || [])];
+    // One newest-first window over both reads, cut to the cap; the count is
+    // both reads' together, so `truncated` still means "there is more".
+    const openRows = threadsRes.data || [];
+    const privateRows = privateRes.data || [];
+    let threadRows = [...openRows, ...privateRows]
+      .sort((a, b) => (Date.parse(b.updated_at ?? '') || 0) - (Date.parse(a.updated_at ?? '') || 0))
+      .slice(0, THREADS_CAP);
+    const threadsTotal =
+      (threadsRes.count ?? openRows.length) + (privateRes.count ?? privateRows.length);
 
     // Hydrate thread rows for carrier keys outside the newest-THREADS_CAP
     // window. Without this, a session referencing an older real thread
@@ -8617,7 +8670,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     const participantSbIds = new Set<string>();
     // The viewer's own pin per thread, from their own participant row only.
     const viewerPinByThreadId = new Map<string, boolean | null>();
-    const participantRows: Array<{
+    let participantRows: Array<{
       thread_id: string;
       sb_id: string | null;
       user_id: string | null;
@@ -8641,11 +8694,27 @@ router.get('/threads', async (req: Request, res: Response) => {
         res.status(500).json(errorJson('Failed to list threads', participantsError));
         return;
       }
-      for (const row of pageRows || []) {
-        participantRows.push(row);
-        if (row.sb_id) participantSbIds.add(row.sb_id);
-      }
+      participantRows.push(...(pageRows || []));
       if (!pageRows || pageRows.length < PARTICIPANT_PAGE) break;
+    }
+
+    // A participant-only thread the viewer isn't in can still arrive by
+    // hydration, when a carrier holds its key; the window reads never return
+    // one. It is dropped here, with its participants, and its key's spine
+    // with every carrier on it is dropped after the merge (D3).
+    const viewerThreadIds = new Set(
+      participantRows.filter((row) => row.user_id === userId).map((row) => row.thread_id)
+    );
+    const hiddenThreadKeys = new Set<string>();
+    threadRows = threadRows.filter((t) => {
+      if (t.participant_only !== true || viewerThreadIds.has(t.id)) return true;
+      hiddenThreadKeys.add(t.thread_key);
+      return false;
+    });
+    const shownThreadIds = new Set(threadRows.map((t) => t.id));
+    participantRows = participantRows.filter((row) => shownThreadIds.has(row.thread_id));
+    for (const row of participantRows) {
+      if (row.sb_id) participantSbIds.add(row.sb_id);
     }
     const slugBySbId = new Map(
       (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.sbSlug])
@@ -8687,7 +8756,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       parseUnavailable = true;
     }
 
-    const spines = mergeThreadSpines({
+    const merged = mergeThreadSpines({
       // One instant for every session in this response; see isSessionLive.
       nowMs: Date.now(),
       threads: threadRows.map((t) => ({
@@ -8719,6 +8788,9 @@ router.get('/threads', async (req: Request, res: Response) => {
       groups: groupRows,
       parse,
     });
+    // A hidden conversation's key leaves no spine: not its sessions,
+    // studios or task groups either, which would name it.
+    const spines = merged.filter((spine) => !hiddenThreadKeys.has(spine.key));
 
     const capMeta = (fetched: number, total: number | null, cap: number) => ({
       fetched,
@@ -8729,7 +8801,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     res.json({
       spines,
       meta: {
-        threads: capMeta(threadRows.length, threadsRes.count, THREADS_CAP),
+        threads: capMeta(threadRows.length, threadsTotal, THREADS_CAP),
         sessions: capMeta((sessionsRes.data || []).length, sessionsRes.count, SESSIONS_CAP),
         taskGroups: capMeta((groupsRes.data || []).length, groupsRes.count, GROUPS_CAP),
         parseUnavailable,
@@ -8899,6 +8971,12 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     if (threadError) {
       logger.error('Failed to load thread:', threadError);
       res.status(500).json(errorJson('Failed to load thread messages', threadError));
+      return;
+    }
+    // An inkling conversation is its participants' alone (D3). Anyone else
+    // gets what a key nobody has used gets: no thread, no studio history.
+    if (thread && !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
+      res.json({ thread: null, messages: [], studioHistory: [] });
       return;
     }
     const studioHistory = await loadThreadStudioHistory(
@@ -9547,7 +9625,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key')
+      .select('id, thread_key, metadata')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -9556,7 +9634,9 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to send reply', threadError));
       return;
     }
-    if (!thread) {
+    // A participant-only conversation (D3) the person is not in is answered
+    // as no thread, before its members are read for `wake`.
+    if (!thread || !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }
@@ -9876,7 +9956,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status')
+      .select('id, thread_key, status, metadata')
       .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -9885,7 +9965,9 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to reopen thread', threadError));
       return;
     }
-    if (!thread) {
+    // A participant-only conversation (D3) the person is not in is answered
+    // as no thread: no role recovers it, and its status is not disclosed.
+    if (!thread || !(await mayReadThread(supabase, thread, authReq.inkUserId))) {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }

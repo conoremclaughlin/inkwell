@@ -24,6 +24,8 @@ const tables = vi.hoisted(() => ({
   messages: [] as Array<Record<string, unknown>>,
   users: [] as Array<Record<string, unknown>>,
   identities: [] as Array<Record<string, unknown>>,
+  /** inbox_thread_participants rows, the one table whose `eq` filters apply here. */
+  participants: [] as Array<Record<string, unknown>>,
   /** Every filter applied, per table: [table, method, column-or-expression]. */
   filters: [] as Array<[string, string, string]>,
 }));
@@ -38,13 +40,17 @@ function chainFor(table: string) {
         ? tables.users
         : table === 'agent_identities'
           ? tables.identities
-          : [];
+          : table === 'inbox_thread_participants'
+            ? tables.participants
+            : [];
   let filteredIds: unknown[] | null = null;
+  const equalities: Array<[string, unknown]> = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const q: any = {};
   for (const m of ['select', 'order', 'limit', 'is', 'not']) q[m] = () => q;
-  q.eq = (col: string) => {
+  q.eq = (col: string, value: unknown) => {
     tables.filters.push([table, 'eq', col]);
+    equalities.push([col, value]);
     return q;
   };
   q.or = (expr: string) => {
@@ -61,7 +67,10 @@ function chainFor(table: string) {
   });
   q.single = q.maybeSingle;
   q.then = (resolve: (v: unknown) => unknown) => {
-    const data = filteredIds ? rows.filter((r) => filteredIds!.includes(r.id)) : rows;
+    let data = filteredIds ? rows.filter((r) => filteredIds!.includes(r.id)) : rows;
+    if (table === 'inbox_thread_participants') {
+      data = data.filter((r) => equalities.every(([col, value]) => r[col] === value));
+    }
     return Promise.resolve({ data, error: null, count: data.length }).then(resolve);
   };
   return q;
@@ -226,6 +235,11 @@ beforeEach(() => {
     { id: 'user-a', first_name: 'Conor', last_name: null, username: null, email: 'c@x' },
     { id: 'user-b', first_name: null, last_name: null, username: 'second', email: null },
   ];
+  // user-a is on the thread; user-b, a workspace member, is not.
+  tables.participants = [
+    { thread_id: 'thread-1', user_id: 'user-a' },
+    { thread_id: 'thread-1', sb_id: 'sb-1', user_id: null },
+  ];
 });
 
 describe('GET /threads/messages names every author for the viewer', () => {
@@ -357,5 +371,46 @@ describe('error text in an inkling conversation (task 935af241)', () => {
     tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
     tables.messages = [{ ...oldNotice, sender_kind: 'user', sender_user_id: 'user-a' }];
     expect((await served())[0].metadata).toEqual(oldNotice.metadata);
+  });
+});
+
+describe('an inkling conversation is its participants alone (D3)', () => {
+  const read = async (viewerUserId: string) => {
+    const res = createRes();
+    await messages(createReq(viewerUserId), res);
+    expect(res._status).toBe(200);
+    return res._json as Record<string, unknown>;
+  };
+
+  it('answers a workspace member who is not on it as a key nobody has used, reading no message', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    expect(await read('user-b')).toEqual({ thread: null, messages: [], studioHistory: [] });
+    const reads = mockSupabaseFrom.mock.calls.map(([t]) => t);
+    expect(reads).not.toContain('inbox_thread_messages');
+    expect(reads).not.toContain('studio_lease_events');
+  });
+
+  it('serves it to a participant', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    const body = await read('user-a');
+    expect((body.thread as { threadKey: string }).threadKey).toBe('pr:620');
+    expect(body.messages).toHaveLength(4);
+  });
+
+  it('checks the participant row by this thread and this person', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
+    await read('user-a');
+    const membership = tables.filters.filter(([t]) => t === 'inbox_thread_participants');
+    expect(membership).toEqual([
+      ['inbox_thread_participants', 'eq', 'thread_id'],
+      ['inbox_thread_participants', 'eq', 'user_id'],
+    ]);
+  });
+
+  it('leaves a thread without the mark readable by anyone in the workspace, asking no membership', async () => {
+    tables.thread = { ...tables.thread!, metadata: { inklingConversation: 'true' } };
+    const body = await read('user-b');
+    expect(body.messages).toHaveLength(4);
+    expect(mockSupabaseFrom.mock.calls.map(([t]) => t)).not.toContain('inbox_thread_participants');
   });
 });

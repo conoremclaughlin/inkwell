@@ -22,7 +22,10 @@ const SB = { sbId: 'sb-1', userId: 'user-1' };
 describe('linkReaderForSb', () => {
   it("gives the workspace owner's own SB the full view", async () => {
     const { client } = identityClient({ data: { id: 'sb-1', user_id: 'user-1', metadata: {} } });
-    expect(await linkReaderForSb(client, { ...SB, ownerRole: 'owner' })).toEqual({ kind: 'full' });
+    expect(await linkReaderForSb(client, { ...SB, ownerRole: 'owner' })).toEqual({
+      kind: 'full',
+      principal: { kind: 'sb', sbId: 'sb-1' },
+    });
   });
 
   it('restricts an inkling even when its owner owns the workspace', async () => {
@@ -55,7 +58,10 @@ describe('linkReaderForSb', () => {
 
 describe('linkReaderForUser', () => {
   it('gives the owner the full view and restricts everyone else by their own participation', () => {
-    expect(linkReaderForUser('owner', 'u')).toEqual({ kind: 'full' });
+    expect(linkReaderForUser('owner', 'u')).toEqual({
+      kind: 'full',
+      principal: { kind: 'user', userId: 'u' },
+    });
     expect(linkReaderForUser('member', 'u')).toEqual({
       kind: 'participant',
       principal: { kind: 'user', userId: 'u' },
