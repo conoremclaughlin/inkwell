@@ -1,5 +1,6 @@
 /** Real Express routing, invented stores, and loopback only. No production auth, DB or model. */
 import express from 'express';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { createServer, type Server } from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -8,9 +9,11 @@ import {
 } from './notification-access';
 import {
   NotificationAccessError,
+  NotificationAccessStore,
   type NotificationWatcher,
 } from '../services/notification-access/store';
 import { accountGate, spaceGate } from '../services/account-deletion/gate';
+import { FakePostgrest } from '../test/fake-postgrest';
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const NOW = Date.parse('2026-01-10T12:00:00Z');
@@ -259,6 +262,18 @@ describe('post-only device intake', () => {
 });
 
 describe('owner-only mutable rules', () => {
+  it('returns 409 for inactive rule state without invalidating the owner sign-in', async () => {
+    const db = new FakePostgrest();
+    db.seed('sb_notification_watchers', { ...watcher, status: 'revoked' });
+    const realStore = new NotificationAccessStore(db as unknown as SupabaseClient);
+    store.setRules.mockImplementation(realStore.setRules.bind(realStore));
+    const response = await admin(`/watchers/${id(1)}/rules`, 'PUT', { rules: [] });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'grant_inactive' });
+    expect((await admin('/watchers')).status).toBe(200);
+    // Missing owner authentication is still 401, independent of the grant state.
+    expect((await admin(`/watchers/${id(1)}/rules`, 'PUT', { rules: [] }, '')).status).toBe(401);
+  });
   it('reads and writes through the signed owner scope', async () => {
     const resource = `/watchers/${id(1)}/rules`;
     expect(await (await admin(resource)).json()).toEqual({ revision: 0, rules: [] });

@@ -23,6 +23,7 @@ export type NotificationErrorCode =
   | 'not_found'
   | 'already_active'
   | 'grant_limit'
+  | 'grant_inactive'
   | 'event_refused'
   | 'event_conflict'
   | 'rate_limited'
@@ -294,7 +295,7 @@ export class NotificationAccessStore {
     const watcher = await this.find(scope, id);
     if (!watcher) throw new NotificationAccessError('not_found');
     if (watcher.status !== 'active' || Date.parse(watcher.expires_at) <= now)
-      throw new NotificationAccessError('access_inactive');
+      throw new NotificationAccessError('grant_inactive');
     if (!parsed.data.rules.every((rule) => watcher.selected_packages.includes(rule.packageName)))
       throw new NotificationAccessError('invalid_request');
     await assertNotificationTarget(this.db, scope, watcher.recipient_id, watcher.thread_id, 'id');
@@ -309,6 +310,10 @@ export class NotificationAccessStore {
       })
       .select('revision, rules')
       .single();
+    // This owner is authenticated; losing the grant or its bound sign-in is
+    // resource state, not a reason to invalidate the owner's current login.
+    if (result.error?.code === 'NPA02' || result.error?.code === '23503')
+      throw new NotificationAccessError('grant_inactive');
     check(result.error);
     const version = ruleVersionSchema.safeParse(result.data);
     if (!version.success) throw new NotificationAccessError('unavailable');

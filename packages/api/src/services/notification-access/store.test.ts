@@ -302,7 +302,7 @@ describe('separate mutable owner rules', () => {
   it('refuses inactive grants and newly shared conversations', async () => {
     tables.sb_notification_watchers[0].status = 'revoked';
     await expect(store.setRules(scope, id(7), { rules }, NOW)).rejects.toMatchObject({
-      code: 'access_inactive',
+      code: 'grant_inactive',
     });
     tables.sb_notification_watchers[0].status = 'active';
     tables.inbox_threads[0].metadata = { inklingConversation: true, inklingShared: true };
@@ -310,6 +310,26 @@ describe('separate mutable owner rules', () => {
       code: 'target_refused',
     });
   });
+  it.each(['revoked', 'paused', 'expired'])(
+    'reports an owner rule edit on a %s grant as resource state, not authentication',
+    async (state) => {
+      if (state === 'expired') tables.sb_notification_watchers[0].expires_at = iso(0);
+      else tables.sb_notification_watchers[0].status = state;
+      await expect(store.setRules(scope, id(7), { rules }, NOW)).rejects.toMatchObject({
+        code: 'grant_inactive',
+      });
+      expect(tables.sb_notification_rule_versions).toHaveLength(0);
+    }
+  );
+  it.each(['NPA02', '23503'])(
+    'maps a rule-write revocation/deletion race (%s) to grant state',
+    async (code) => {
+      fault = { table: 'sb_notification_rule_versions', code };
+      await expect(store.setRules(scope, id(7), { rules }, NOW)).rejects.toMatchObject({
+        code: 'grant_inactive',
+      });
+    }
+  );
   it('keeps app label and raw device time while the database owns calibration', async () => {
     await store.record(watcher, {
       eventId: id(8),
