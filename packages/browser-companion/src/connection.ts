@@ -13,7 +13,13 @@ export interface ConnectionView {
 
 export class ConnectionError extends Error {
   constructor(
-    readonly code: 'closed' | 'expired' | 'refused' | 'unavailable' | 'invalid-response'
+    readonly code:
+      | 'closed'
+      | 'expired'
+      | 'refused'
+      | 'resource-denied'
+      | 'unavailable'
+      | 'invalid-response'
   ) {
     super(`Browser connection ${code}.`);
   }
@@ -293,10 +299,14 @@ export function createBrowserConnection(
       });
       guard(signal);
       if (response.redirected || (response.url && response.url !== url)) throw invalid();
-      if (response.status !== 200)
+      if (response.status === 401) throw new ConnectionError('refused');
+      if (response.status === 403) {
+        const failure = await readJson(response, signal);
         throw new ConnectionError(
-          response.status === 401 || response.status === 403 ? 'refused' : 'unavailable'
+          failure.error === 'grant_not_live' ? 'refused' : 'resource-denied'
         );
+      }
+      if (response.status !== 200) throw new ConnectionError('unavailable');
       const result = await readJson(response, signal, 4_000_000);
       guard(signal);
       return result;

@@ -1,13 +1,18 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerHostedChatWorker } from './hosted-chat-worker';
+import { ConnectionError } from './connection';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   chat: vi.fn(),
   close: vi.fn(),
   refresh: vi.fn(),
 }));
-vi.mock('./connection', () => ({ createBrowserConnection: mocks.create }));
+vi.mock('./connection', async () => ({
+  ConnectionError: (await vi.importActual<typeof import('./connection')>('./connection'))
+    .ConnectionError,
+  createBrowserConnection: mocks.create,
+}));
 const grantId = '11111111-1111-4111-8111-111111111111';
 const inklingId = '22222222-2222-4222-8222-222222222222';
 const operationId = '33333333-3333-4333-8333-333333333333';
@@ -99,6 +104,18 @@ const message = {
   operation: { kind: 'message', inklingId, operationId, body: 'Synthetic text.' },
 };
 describe('document-bound hosted chat worker', () => {
+  it.each(['expired', 'refused', 'closed'] as const)(
+    'ends panel intent on terminal %s instead of leaving a poisoned port',
+    async (code) => {
+      const p = port();
+      await p.request({ type: 'connect' });
+      mocks.chat.mockRejectedValueOnce(new ConnectionError(code));
+      expect((await p.request({ type: 'chat', operation: { kind: 'inklings' } })).ok).toBe(false);
+      expect(p.postMessage).toHaveBeenCalledWith({ type: 'connection-ended', reason: code });
+      expect(p.disconnect).toHaveBeenCalled();
+      expect(mocks.close).toHaveBeenCalled();
+    }
+  );
   it('does nothing when a port opens or a status is requested without Connect', async () => {
     const p = port();
     expect(record).not.toHaveBeenCalled();
@@ -149,7 +166,9 @@ describe('document-bound hosted chat worker', () => {
     const p = port();
     await p.request({ type: 'connect' });
     mocks.chat.mockImplementation(async () => {
-      expect(stored.chatPending).toEqual({ [`${grantId}:${inklingId}`]: operationId });
+      expect(stored.chatPending).toEqual({
+        [`${grantId}:${inklingId}`]: { operationId, body: message.operation.body },
+      });
       return { status: 'stored', operationId };
     });
     expect((await p.request(message)).ok).toBe(true);
@@ -174,6 +193,46 @@ describe('document-bound hosted chat worker', () => {
     await next.request({ type: 'connect' });
     expect((await next.request(message)).ok).toBe(false);
     expect(mocks.chat).toHaveBeenCalledTimes(1);
+  });
+  it('recovers an uncertain send only through an explicit byte-identical retry after worker replacement', async () => {
+    const p = port();
+    await p.request({ type: 'connect' });
+    mocks.chat.mockRejectedValueOnce(new Error('invented pre-insert failure'));
+    await p.request(message);
+    worker.disconnect();
+    worker = registerHostedChatWorker(record as never);
+    const next = port();
+    await next.request({ type: 'connect' });
+    mocks.chat.mockImplementation(async (op) =>
+      op.kind === 'receipt' ? { operationId, status: 'unknown' } : { messages: [] }
+    );
+    const view = await next.request({ type: 'chat', operation: { kind: 'messages', inklingId } });
+    expect(view.value.pendingMessage).toEqual({ operationId, body: message.operation.body });
+    expect(
+      (
+        await next.request({
+          ...message,
+          type: 'retry',
+          operation: { ...message.operation, body: 'Changed text.' },
+        })
+      ).ok
+    ).toBe(false);
+    expect(
+      (
+        await next.request({
+          ...message,
+          type: 'retry',
+          operation: { ...message.operation, operationId: crypto.randomUUID() },
+        })
+      ).ok
+    ).toBe(false);
+    expect((await next.request(message)).ok).toBe(false);
+    expect(mocks.chat.mock.calls.filter(([op]) => op.kind === 'message')).toHaveLength(1);
+    mocks.chat.mockResolvedValueOnce({ status: 'stored', operationId });
+    expect((await next.request({ ...message, type: 'retry' })).ok).toBe(true);
+    expect(mocks.chat.mock.calls.filter(([op]) => op.kind === 'message')).toHaveLength(2);
+    expect(stored.chatPending).toEqual({});
+    expect((await next.request({ ...message, type: 'retry' })).ok).toBe(false);
   });
   it('checks the exact uncertain receipt and does not turn absence into rejection', async () => {
     const p = port();

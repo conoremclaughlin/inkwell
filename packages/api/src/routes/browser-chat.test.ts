@@ -80,6 +80,7 @@ beforeEach(() => {
     ],
   });
   rows = {
+    workspace_members: { role: 'owner' },
     inbox_threads: null,
     inbox_thread_participants: [{ sb_id: inkling.id, user_id: null }],
     inbox_thread_messages: [],
@@ -124,6 +125,28 @@ const existing = () => {
 };
 
 describe('installation-scoped hosted chat', () => {
+  it('checks current membership before listing, history, receipt or dispatch', async () => {
+    rows.workspace_members = null;
+    expect((await call('/chat/inklings')).status).toBe(503);
+    expect((await history()).status).toBe(503);
+    expect(
+      (await call(`/chat/receipt?inklingId=${inkling.id}&operationId=${operationId}`)).status
+    ).toBe(503);
+    expect((await send()).status).toBe(503);
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('allows a viewer to read but never to dispatch or replay a write', async () => {
+    rows.workspace_members = { role: 'viewer' };
+    expect((await call('/chat/inklings')).status).toBe(200);
+    expect((await send()).status).toBe(403);
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(mocks.lookup).not.toHaveBeenCalled();
+    expect(queries.find((query) => query.table === 'workspace_members')!.filters).toEqual([
+      ['workspace_id', claims.workspaceId],
+      ['user_id', claims.sub],
+    ]);
+  });
   it.each([
     '/chat/inklings',
     `/chat/messages?inklingId=${inkling.id}`,
@@ -156,7 +179,7 @@ describe('installation-scoped hosted chat', () => {
       messages: [],
     });
     expect(mocks.send).not.toHaveBeenCalled();
-    expect(queries[0]?.filters).toEqual([
+    expect(queries.find((query) => query.table === 'inbox_threads')?.filters).toEqual([
       ['workspace_id', claims.workspaceId],
       ['thread_key', browserChatKey(claims.grantId, inkling.id)],
     ]);
@@ -165,7 +188,7 @@ describe('installation-scoped hosted chat', () => {
     mocks.list.mockResolvedValue([]);
     expect((await history()).status).toBe(403);
     expect((await send()).status).toBe(403);
-    expect(mocks.from).not.toHaveBeenCalled();
+    expect(queries.every((query) => query.table === 'workspace_members')).toBe(true);
     expect(mocks.send).not.toHaveBeenCalled();
   });
   it.each(['workspaceId', 'userId', 'threadKey', 'sbSlug', 'runtime', 'pageBinding'])(

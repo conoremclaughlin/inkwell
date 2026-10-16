@@ -93,6 +93,49 @@ async function ready() {
   );
 }
 describe('mounted hosted panel with synthetic worker replies', () => {
+  it('shows a saved unknown message after reload and retries only on an explicit click', async () => {
+    const operationId = '33333333-3333-4333-8333-333333333333';
+    const original = send.getMockImplementation()!;
+    send.mockImplementation(async (request) =>
+      request.operation?.kind === 'messages'
+        ? {
+            threadKey: 'thread:fixture-chat',
+            messages: [],
+            pendingOperationId: operationId,
+            pendingMessage: { operationId, body: 'Exact original text.' },
+          }
+        : original(request)
+    );
+    connect().click();
+    await vi.waitFor(() => expect(document.getElementById('chat-retry')?.hidden).toBe(false));
+    expect(submit().disabled).toBe(true);
+    expect(document.getElementById('chat-retry-body')!.textContent).toBe('Exact original text.');
+    expect(document.getElementById('hosted-chat')!.textContent).not.toContain('Disconnected');
+    expect(send.mock.calls.some(([request]) => request.type === 'retry')).toBe(false);
+    composer().value = 'A different draft must not be sent.';
+    composer().dispatchEvent(new Event('input'));
+    document.getElementById('chat-retry-send')!.click();
+    await vi.waitFor(() =>
+      expect(send.mock.calls.some(([request]) => request.type === 'retry')).toBe(true)
+    );
+    expect(send.mock.calls.find(([request]) => request.type === 'retry')![0].operation).toEqual({
+      kind: 'message',
+      inklingId,
+      operationId,
+      body: 'Exact original text.',
+    });
+  });
+  it('offers Reconnect after grant expiry rather than automatically resuming stale intent', async () => {
+    vi.useFakeTimers();
+    await ready();
+    connections[0]!.deliver({ type: 'connection-ended', reason: 'expired' });
+    expect(connect().textContent).toBe('Reconnect');
+    expect(connect().disabled).toBe(false);
+    expect(submit().disabled).toBe(true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(connections).toHaveLength(1);
+    expect(document.getElementById('chat-status')!.textContent).toContain('pair again');
+  });
   it('does not turn a click during background refresh into an uncertain send', async () => {
     vi.useFakeTimers();
     await ready();

@@ -1,4 +1,4 @@
-import { createBrowserConnection, type BrowserChatOperation } from './connection';
+import { ConnectionError, createBrowserConnection, type BrowserChatOperation } from './connection';
 import type { PairingRecord } from './pairing';
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -7,6 +7,15 @@ const object = (value: unknown): Record<string, unknown> =>
     : {};
 const uuid = (v: unknown): v is string =>
   typeof v === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
+type PendingMessage = { operationId: string; body: string };
+type Pending = string | PendingMessage; // Old references remain read-only recoverable.
+const pendingId = (entry: Pending) => (typeof entry === 'string' ? entry : entry.operationId);
+const validPending = (entry: unknown): entry is Pending =>
+  uuid(entry) ||
+  (uuid(object(entry).operationId) &&
+    typeof object(entry).body === 'string' &&
+    String(object(entry).body).trim().length > 0 &&
+    String(object(entry).body).length <= 4_000);
 
 /** A port is bound by Chrome to one authenticated extension document. Opening it
  * does no IO; only the panel's in-memory Connect intent starts a connection.
@@ -23,23 +32,24 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
   };
   async function pending() {
     const value: unknown = (await chrome.storage.session.get('chatPending')).chatPending;
-    if (value === undefined) return {} as Record<string, string>;
+    if (value === undefined) return {} as Record<string, Pending>;
     if (value === null || typeof value !== 'object' || Array.isArray(value))
       throw new Error('Pending delivery state unavailable.');
     const entries = object(value);
     if (
       Object.keys(entries).length > 100 ||
       Object.entries(entries).some(
-        ([key, id]) => key.split(':').length !== 2 || !key.split(':').every(uuid) || !uuid(id)
+        ([key, entry]) =>
+          key.split(':').length !== 2 || !key.split(':').every(uuid) || !validPending(entry)
       )
     )
       throw new Error('Pending delivery state unavailable.');
-    return entries as Record<string, string>;
+    return entries as Record<string, Pending>;
   }
   async function clearPending(key: string, operationId: string) {
     await serial(async () => {
       const entries = await pending();
-      if (entries[key] !== operationId) return;
+      if (!entries[key] || pendingId(entries[key]) !== operationId) return;
       delete entries[key];
       await chrome.storage.session.set({ chatPending: entries });
     });
@@ -110,10 +120,12 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
           grantId = view.grantId;
           return view;
         }
-        if (message.type !== 'chat') throw new Error('Unsupported chat request.');
+        if (message.type !== 'chat' && message.type !== 'retry')
+          throw new Error('Unsupported chat request.');
         if (!connection || !grantId) throw new Error('Connect first.');
         if (busy) throw new Error('A chat operation is already pending.');
         const op = object(message.operation) as unknown as BrowserChatOperation;
+        if (message.type === 'retry' && op.kind !== 'message') throw new Error('Invalid retry.');
         if (!['inklings', 'messages', 'message'].includes(op.kind))
           throw new Error('Unsupported chat operation.');
         if (op.kind !== 'inklings' && !uuid(op.inklingId)) throw new Error('Invalid inkling.');
@@ -133,12 +145,25 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
               alive();
               const entries = await pending();
               alive();
-              if (entries[key] || Object.keys(entries).length >= 100)
+              const previous = entries[key];
+              if (message.type === 'retry') {
+                // Only an explicit retry of the byte-identical saved request.
+                // The server's unique client-message index supplies deduplication.
+                if (
+                  !previous ||
+                  typeof previous === 'string' ||
+                  previous.operationId !== op.operationId ||
+                  previous.body !== op.body
+                )
+                  throw new Error('Retry must match the original message.');
+                return;
+              }
+              if (previous || Object.keys(entries).length >= 100)
                 throw new Error('Check the previous delivery before sending again.');
               // Durable-before-dispatch. A crash may leave an unsent unknown,
-              // but cannot permit replay of a potentially accepted send.
+              // but cannot silently replay a potentially accepted send.
               await chrome.storage.session.set({
-                chatPending: { ...entries, [key]: op.operationId },
+                chatPending: { ...entries, [key]: { operationId: op.operationId, body: op.body } },
               });
             });
             alive();
@@ -154,8 +179,9 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
           if (op.kind === 'messages') {
             const entries = await pending();
             alive();
-            const operationId = entries[key];
-            if (operationId) {
+            const entry = entries[key];
+            if (entry) {
+              const operationId = pendingId(entry);
               const receipt = await connection.chat({
                 kind: 'receipt',
                 inklingId: op.inklingId,
@@ -165,7 +191,11 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
               if (receipt.operationId === operationId && receipt.status === 'stored') {
                 await clearPending(key, operationId);
                 result.receipt = { operationId, status: 'stored' };
-              } else result.pendingOperationId = operationId;
+              } else {
+                result.pendingOperationId = operationId;
+                if (typeof entry !== 'string')
+                  result.pendingMessage = { operationId, body: entry.body };
+              }
             }
           }
           alive();
@@ -176,13 +206,26 @@ export function registerHostedChatWorker(getRecord: () => Promise<PairingRecord>
       };
       void run().then(
         (value) => post({ id, ok: true, value }),
-        () => {
+        (error: unknown) => {
           post({
             id,
             ok: false,
             error: 'Chat unavailable. Check connection and delivery before retrying.',
           });
-          if (message.type === 'connect') disconnect();
+          if (
+            error instanceof ConnectionError &&
+            ['expired', 'refused', 'closed'].includes(error.code)
+          ) {
+            post({ type: 'connection-ended', reason: error.code });
+            stop();
+            connection = undefined;
+            grantId = undefined;
+            try {
+              port.disconnect();
+            } catch {
+              /* Already closed. */
+            }
+          } else if (message.type === 'connect') disconnect();
         }
       );
     });

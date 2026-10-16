@@ -13,6 +13,11 @@ export function mountHostedChatPanel() {
   const connect = document.getElementById('chat-connect') as HTMLButtonElement;
   const select = document.getElementById('chat-inkling') as HTMLSelectElement;
   const status = document.getElementById('chat-status')!;
+  const retryBox = document.getElementById('chat-retry')!;
+  const retryBody = document.getElementById('chat-retry-body')!;
+  const retryButton = document.getElementById('chat-retry-send') as HTMLButtonElement;
+  let pendingRetry: { inklingId: string; operationId: string; body: string } | undefined;
+  let pendingOperationId: string | undefined;
   let intent = false;
   let revision = 0;
   let attempted = false;
@@ -128,7 +133,10 @@ export function mountHostedChatPanel() {
         ? 'Reconnect'
         : 'Connect';
     select.disabled = !identity || !intent || busy;
-    panel.setState({ ...state, busy });
+    retryBox.hidden = !pendingRetry || pendingRetry.inklingId !== select.value;
+    retryButton.disabled = !intent || !identity || busy || retryBox.hidden;
+    retryBody.textContent = retryBox.hidden ? '' : pendingRetry!.body;
+    panel.setState({ ...state, busy: busy || !!pendingOperationId });
   }
   function stop() {
     intent = false; // Synchronous, before disconnecting the port or any await.
@@ -177,6 +185,16 @@ export function mountHostedChatPanel() {
         };
       });
       const receipt = object(result.receipt);
+      pendingOperationId =
+        typeof result.pendingOperationId === 'string' ? result.pendingOperationId : undefined;
+      const uncertain = object(result.pendingMessage);
+      pendingRetry =
+        typeof uncertain.operationId === 'string' &&
+        uncertain.operationId === result.pendingOperationId &&
+        typeof uncertain.body === 'string' &&
+        uncertain.body.length <= 4_000
+          ? { inklingId, operationId: uncertain.operationId, body: uncertain.body }
+          : undefined;
       if (
         typeof receipt.operationId === 'string' &&
         receipt.status === 'stored' &&
@@ -198,10 +216,12 @@ export function mountHostedChatPanel() {
           sbName: select.selectedOptions[0]?.textContent ?? 'Inkling',
         },
         messages,
-        connection: result.pendingOperationId ? 'disconnected' : 'ready',
+        connection: 'ready',
       };
       status.textContent = result.pendingOperationId
-        ? 'Checking an uncertain delivery. Nothing will be resent automatically.'
+        ? pendingRetry
+          ? 'Checking an uncertain delivery. Review the saved message below to retry it explicitly.'
+          : 'Checking an uncertain delivery. No saved retry body is available; nothing will be resent.'
         : 'Connected. Chat uses your inkling’s usual tools. No page is shared.';
     } catch {
       if (version === revision) {
@@ -223,6 +243,12 @@ export function mountHostedChatPanel() {
     next.onMessage.addListener((raw: unknown) => {
       if (next !== port) return;
       const message = object(raw);
+      if (message.type === 'connection-ended') {
+        stop();
+        status.textContent =
+          'Connection ended. Reconnect, or pair again if authorization has expired or been revoked.';
+        return;
+      }
       if (message.type === 'disconnected') {
         stop();
         status.textContent = 'Disconnected across this browser.';
@@ -288,10 +314,28 @@ export function mountHostedChatPanel() {
   };
   select.onchange = () => {
     ++revision;
+    pendingRetry = undefined;
+    pendingOperationId = undefined;
     // The pending send keeps its immutable target; prevent switching until it settles.
     state = { ...state, conversation: null, messages: [], connection: 'disconnected' };
     render();
     void refresh();
+  };
+  retryButton.onclick = async () => {
+    const saved = pendingRetry;
+    if (!saved || saved.inklingId !== select.value || !intent || !identity || busy) return;
+    const version = revision;
+    busy = true;
+    render();
+    try {
+      await rpc({ type: 'retry', operation: { kind: 'message', ...saved } });
+    } catch {
+      // Still unknown. Keep the original request; never create a replacement ID.
+    } finally {
+      busy = false;
+      render();
+      if (version === revision) await refresh();
+    }
   };
   document.getElementById('pair-disconnect')!.addEventListener('click', stop);
   chrome.runtime.onMessage.addListener((message, sender) => {

@@ -7,6 +7,7 @@ import type { DataComposer } from '../data/composer';
 import { InklingService, type Inkling } from '../services/inklings/inkling-service';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { userPrincipal } from '../services/principals';
+import { assertWriteRole, roleOfUserIn } from '../mcp/tools/caller-principal';
 import {
   deliveryFromSendResult,
   isClientMessageConflict,
@@ -37,12 +38,14 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
     const claims = req.browserClient;
     const composer = await getComposer();
     const client = composer.getClient();
+    // Grant liveness does not prove current workspace membership.
+    const role = await roleOfUserIn(client, claims.workspaceId, claims.sub, 'You');
     const inklings = await new InklingService(client).list({
       userId: claims.sub,
       workspaceId: claims.workspaceId,
     });
     const inkling = inklings.find((entry) => entry.id === inklingId);
-    return { composer, client, claims, inklings, inkling };
+    return { composer, client, claims, inklings, inkling, role };
   }
   const publicInkling = (inkling: Inkling) => ({
     id: inkling.id,
@@ -195,12 +198,18 @@ export function createBrowserChatRouter(getComposer: () => Promise<DataComposer>
       return;
     }
     try {
-      const { composer, client, claims, inkling } = await scope(
+      const { composer, client, claims, inkling, role } = await scope(
         req as BrowserCompanionRequest,
         parsed.data.inklingId
       );
       if (!inkling) {
         res.status(403).json({ error: 'inkling_not_owned' });
+        return;
+      }
+      try {
+        assertWriteRole(role, 'send to a thread');
+      } catch {
+        res.status(403).json({ error: 'workspace_read_only' });
         return;
       }
       const key = browserChatKey(claims.grantId, inkling.id);

@@ -48,13 +48,33 @@ dashboard authentication and API authorization are unchanged.
    Bearers stay in worker memory. Disconnect in any panel stops every panel and
    requests installation revocation through the existing pairing path.
 
-Ambiguous sends are never replayed. A session-storage operation reference is
-written before dispatch and reconciled through an exact, read-only receipt lookup,
+Ambiguous sends are never replayed automatically. The exact message and operation
+reference are written to trusted-context session storage before dispatch and
+reconciled through an exact, read-only receipt lookup,
 even when its message is outside the recent-history window. A missing receipt
 stays unknown. A crash before dispatch can conservatively leave an unsent operation
-unknown too; it is not safe to infer rejection from absence. No message body or
-bearer is kept in that reference. Chat Stop closes the local connection, not a
-remote runtime or an already accepted message.
+unknown too; it is not safe to infer rejection from absence. The panel shows the
+saved message and offers **Retry this exact message**. Only that explicit click
+may resend the byte-identical body with the original operation ID; the server's
+unique client-message index prevents a second stored copy. A retry never invents
+a replacement ID or silently substitutes the current draft. Unconfirmed bodies
+remain in session storage, including across Disconnect, until a matching receipt
+clears them or the browser session ends. They never enter local/sync storage and
+no bearer is persisted. Older reference-only entries can still reconcile but
+cannot retry without their original body. Chat Stop closes the local connection,
+not a remote runtime or an already accepted message.
+
+Resource denials affect only that conversation request. A terminal credential
+failure ends the document's intent and offers Reconnect instead of polling a dead
+connection. Every chat endpoint checks current workspace membership; writes also
+require the same write role as a person's ordinary inbox send. Grant liveness
+alone is not current membership.
+
+Only owned, self-serve app inklings appear in the picker; workspace development
+SBs are not implicitly included. Conversation history is scoped to the pairing
+grant. A new pairing (including after a browser restart or grant expiry) starts
+a new conversation; old threads remain in Inkwell but are not exposed to that
+new installation grant.
 
 The selected inkling retains its ordinary tools. Page content will be labelled
 untrusted when page integration lands; no claim of a restricted runtime or prompt
@@ -311,6 +331,9 @@ real isolated Chromium, including authenticated extension-document ports, two
 panels with separate Connect intent, cross-panel Disconnect, and a 390 px overflow
 check. A DevTools-terminated worker reached stopped and restarted states; both
 surviving panels resumed, while reloading a panel required a fresh Connect.
+The follow-up smoke also recovered from a conversation-level 403, surfaced a
+terminal grant refusal as Reconnect, and recovered a pre-insert failure after
+reload only when Retry was clicked, preserving the exact operation ID and body.
 The test seeds an invented pairing record and supplies static replies: it
 does not demonstrate native sidepanel geometry, host-permission prompts, actual
 dashboard login, the database, or an LLM turn. Those remain acceptance work.

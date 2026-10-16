@@ -23,6 +23,14 @@
           Pair below, then Connect. No page is shared automatically.
         </p>
         <div id="hosted-chat"></div>
+        <div id="chat-retry" hidden>
+          <p class="small">
+            Delivery is uncertain. Retry sends only this exact message, with the same request ID to
+            prevent a duplicate. Nothing is resent automatically.
+          </p>
+          <pre id="chat-retry-body"></pre>
+          <button id="chat-retry-send" class="secondary">Retry this exact message</button>
+        </div>
       </section>
       <details>
         <summary>Pairing and connection settings</summary>

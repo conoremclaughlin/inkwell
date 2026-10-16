@@ -536,6 +536,32 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
 });
 
 describe('fixed chat transport (invented HTTP responses)', () => {
+  it('keeps resource denials local to one chat request', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockResolvedValueOnce(
+      Response.json({ error: 'conversation_members_changed' }, { status: 403 })
+    );
+    await expect(
+      f.connection.chat({ kind: 'messages', inklingId: otherId })
+    ).rejects.toBeInstanceOf(Error);
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockResolvedValueOnce(Response.json({ inklings: [] }));
+    expect(await f.connection.chat({ kind: 'inklings' })).toEqual({ inklings: [] });
+    expect(f.connection.current()).toEqual(view());
+    f.connection.close();
+  });
+  it('closes on a positive grant-not-live response, not a resource denial', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockResolvedValueOnce(Response.json({ error: 'grant_not_live' }, { status: 403 }));
+    await expect(f.connection.chat({ kind: 'inklings' })).rejects.toMatchObject({
+      code: 'refused',
+    });
+    await expect(f.connection.chat({ kind: 'inklings' })).rejects.toMatchObject({ code: 'closed' });
+  });
   it('sends only a fixed chat operation with the private bearer, no cookies or redirects', async () => {
     const f = fixture();
     await f.connection.refresh();
