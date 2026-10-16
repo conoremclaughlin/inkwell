@@ -277,6 +277,9 @@ describe('bearer-verification census', () => {
     // change to what every door downstream accepts.
     'auth/browser-client-tokens.ts',
     'auth/ink-tokens.ts',
+    // Strict human-login preflight: only unbound pcp_admin, no cookie fallback.
+    // It is not a grant endpoint. Signed-credential negatives live beside it.
+    'auth/require-human-login.ts',
     // Door 1 and its consumers.
     'mcp/auth/ink-auth-provider.ts',
     'mcp/server.ts',
