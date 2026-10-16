@@ -4233,7 +4233,7 @@ async function runChatSession(
     log: { append: (entry) => runtime.log.append(entry), flush: () => runtime.log.flush() },
     policy: toolPolicy,
     signalState: sessionSignal,
-    mintInvocationId: randomUUID,
+    mintInvocationId: () => randomUUID(),
     beginContextMutation: beginContextMutationFor,
     takeImages: takeCapturedImages,
     capture: (dispatch) =>

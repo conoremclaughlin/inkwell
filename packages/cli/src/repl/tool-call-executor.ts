@@ -21,7 +21,7 @@ export function executeToolCalls(
 ): Promise<ToolCallResult[]> {
   return executeSharedToolCalls(calls, {
     ...deps,
-    mintInvocationId: randomUUID,
+    mintInvocationId: () => randomUUID(),
     impossibleCallRefusal,
   });
 }

@@ -15,7 +15,17 @@ import {
   type StreamedLine,
 } from '../runtime/index.js';
 import { backendSendTarget, type TurnSend } from '../runner/turn-reply.js';
-import type { BackendTurnEvent } from './stream.js';
+import type { BackendMessageSource, BackendTextSource, BackendTurnEvent } from './stream.js';
+
+interface DisplayBlock {
+  text: string;
+  complete: boolean;
+  conflict: boolean;
+}
+
+function messageKey(source: BackendMessageSource): string {
+  return JSON.stringify([source.origin, source.parentToolUseId, source.messageId]);
+}
 
 export interface SessionStreamPorts {
   /** Live: a host may switch routing between turns. */
@@ -40,6 +50,11 @@ export class SessionStream {
   private dialogueMuted = false;
   private spawnSaid = '';
   private spawnEntryIndex = -1;
+  /** Display correlation only, cleared for every actual provider attempt. */
+  private readonly messages = new Map<string, Map<string, DisplayBlock>>();
+  private readonly renderedMessages = new Set<string>();
+  private readonly interleavedMessages = new Set<string>();
+  private lastRenderedMessage: string | undefined;
 
   constructor(private readonly ports: SessionStreamPorts) {
     this.renderer = new StreamedTurnRenderer(
@@ -58,6 +73,10 @@ export class SessionStream {
     this.renderer.reset();
     this.dialogue = [];
     this.dialogueMuted = false;
+    this.messages.clear();
+    this.renderedMessages.clear();
+    this.interleavedMessages.clear();
+    this.lastRenderedMessage = undefined;
   }
 
   resetSends(): void {
@@ -71,6 +90,10 @@ export class SessionStream {
     this.dialogueMuted = false;
     this.spawnSaid = '';
     this.spawnEntryIndex = -1;
+    this.messages.clear();
+    this.renderedMessages.clear();
+    this.interleavedMessages.clear();
+    this.lastRenderedMessage = undefined;
   }
 
   endSpawn(): void {
@@ -83,6 +106,32 @@ export class SessionStream {
 
   handle(evt: BackendTurnEvent): void {
     const { ports } = this;
+    if (evt.kind === 'text-boundary') {
+      if (
+        evt.boundary === 'block-start' &&
+        evt.source.blockId !== undefined &&
+        evt.text !== undefined
+      ) {
+        this.positionedText(
+          { ...evt.source, blockId: evt.source.blockId, offset: 0 },
+          evt.text ?? '',
+          false
+        );
+      }
+      return;
+    }
+    if ((evt.kind === 'text' || evt.kind === 'text-delta') && evt.source) {
+      this.positionedText(evt.source, evt.text, evt.kind === 'text');
+      return;
+    }
+    if (evt.kind === 'result' && evt.source && !evt.error && typeof evt.text === 'string') {
+      const blocks = this.messages.get(messageKey(evt.source));
+      if (blocks && [...blocks.values()].every((block) => block.complete && !block.conflict)) {
+        const text = [...blocks.values()].map((block) => block.text).join('');
+        if (text === evt.text) this.confirmMessage(messageKey(evt.source), text);
+      }
+      return;
+    }
     if (evt.kind === 'tool-use') {
       const target = backendSendTarget(evt.name, evt.input);
       if (target && evt.id) this.pendingBackendSends.set(evt.id, target);
@@ -112,31 +161,11 @@ export class SessionStream {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'text-delta') {
+      this.noteUnpositionedText(evt.text);
       ports.render(this.renderer.pushDelta(evt.text));
     } else if (evt.kind === 'text' && evt.text.trim()) {
-      // Judge the whole spawn, not each block: a later block can reveal that
-      // the prior block's trailing line was the beginning of a forged frame.
-      const guarded = this.previewGuard.onBlock(evt.text);
-      if (guarded.publish.trim() || guarded.imitationDiscarded) {
-        ports.append({
-          type: 'backend_text',
-          preview: compactForLedger(guarded.publish, 200),
-          ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
-        });
-      }
-      if (!this.dialogueMuted) {
-        this.spawnSaid += evt.text;
-        const said = spawnDialogueText(this.spawnSaid, guarded);
-        if (this.spawnEntryIndex === -1) {
-          if (said.trim()) {
-            this.dialogue.push({ role: 'assistant', text: said });
-            this.spawnEntryIndex = this.dialogue.length - 1;
-          }
-        } else {
-          this.dialogue[this.spawnEntryIndex] = { role: 'assistant', text: said };
-        }
-        if (guarded.imitationDiscarded) this.dialogueMuted = true;
-      }
+      this.noteUnpositionedText(evt.text);
+      this.recordText(evt.text);
       ports.render(
         this.renderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
       );
@@ -144,6 +173,94 @@ export class SessionStream {
       // Even a confirmation of the pinned model is fresh run evidence.
       this.currentModel = evt.model;
       ports.modelReported(evt.model);
+    }
+  }
+
+  private noteUnpositionedText(text: string): void {
+    if (!text) return;
+    if (this.lastRenderedMessage !== undefined) {
+      // The append-only renderer cannot attribute this output to the preceding
+      // positioned message. Persist the ambiguity so a later exact snapshot or
+      // result cannot restore a false claim that its intact final was shown.
+      this.interleavedMessages.add(this.lastRenderedMessage);
+      this.renderer.clearMessageConfirmation();
+    }
+    this.lastRenderedMessage = undefined;
+  }
+
+  private positionedText(source: BackendTextSource, text: string, complete: boolean): void {
+    const key = messageKey(source);
+    let message = this.messages.get(key);
+    if (!message) this.messages.set(key, (message = new Map()));
+    let block = message.get(source.blockId);
+    if (!block) {
+      block = { text: '', complete: false, conflict: false };
+      message.set(source.blockId, block);
+    }
+    if (block.conflict) return;
+    const offset = source.offset;
+    const overlap = Math.min(text.length, block.text.length - offset);
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      offset > block.text.length ||
+      block.text.slice(offset, offset + overlap) !== text.slice(0, overlap) ||
+      (complete && (offset !== 0 || text.length < block.text.length)) ||
+      (block.complete && offset + text.length > block.text.length)
+    ) {
+      // Do not publish a rewrite/gap as new dialogue. This is NOT effect
+      // validation: the original event remains untouched for that consumer.
+      block.conflict = true;
+      return;
+    }
+    const fresh = text.slice(overlap);
+    block.text += fresh;
+    if (fresh) {
+      if (this.lastRenderedMessage !== key && this.renderedMessages.has(key))
+        this.interleavedMessages.add(key);
+      this.renderedMessages.add(key);
+      this.lastRenderedMessage = key;
+      this.ports.render(this.renderer.pushDelta(fresh));
+    }
+    if (complete && !block.complete) {
+      block.complete = true;
+      this.recordText(block.text);
+      const completed = [...message.values()].filter((part) => part.complete);
+      this.confirmMessage(key, completed.map((part) => part.text).join(''));
+    }
+  }
+
+  private confirmMessage(key: string, text: string): void {
+    // The paragraph renderer is append-only. It cannot retract a foreign chunk
+    // that arrived between two fragments of this message. Do not claim that
+    // its intact final text is already on screen in that case.
+    if (this.interleavedMessages.has(key)) this.renderer.clearMessageConfirmation();
+    else this.renderer.confirmMessage(text);
+  }
+
+  private recordText(text: string): void {
+    // Judge the whole spawn, not each block: a later block can reveal that
+    // the prior block's trailing line was the beginning of a forged frame.
+    const guarded = this.previewGuard.onBlock(text);
+    if (guarded.publish.trim() || guarded.imitationDiscarded) {
+      this.ports.append({
+        type: 'backend_text',
+        preview: compactForLedger(guarded.publish, 200),
+        ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
+      });
+    }
+    if (!this.dialogueMuted) {
+      this.spawnSaid += text;
+      const said = spawnDialogueText(this.spawnSaid, guarded);
+      if (this.spawnEntryIndex === -1) {
+        if (said.trim()) {
+          this.dialogue.push({ role: 'assistant', text: said });
+          this.spawnEntryIndex = this.dialogue.length - 1;
+        }
+      } else {
+        this.dialogue[this.spawnEntryIndex] = { role: 'assistant', text: said };
+      }
+      if (guarded.imitationDiscarded) this.dialogueMuted = true;
     }
   }
 }

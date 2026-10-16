@@ -1,3 +1,5 @@
+import { fenceAfterLine, type OpenFence } from './imitation-grammar.js';
+
 interface LegacyToolBlock {
   start: number;
   end: number;
@@ -11,7 +13,10 @@ interface LegacyToolBlock {
  * without a closer ends the scan, rather than retrying the suffix for every
  * later opener (the old lazy regex was quadratic on model-controlled text).
  */
-export function findLegacyToolBlocks(text: string): LegacyToolBlock[] {
+export function findLegacyToolBlocks(
+  text: string,
+  options: { unquotedOnly?: boolean } = {}
+): LegacyToolBlock[] {
   const blocks: LegacyToolBlock[] = [];
   const opening = /<tool_call>/gi;
   const closing = /<\/tool_call>/gi;
@@ -28,7 +33,18 @@ export function findLegacyToolBlocks(text: string): LegacyToolBlock[] {
     });
     opening.lastIndex = closing.lastIndex;
   }
-  return blocks;
+  if (!options.unquotedOnly) return blocks;
+  let lineStart = 0;
+  let open: OpenFence | null = null;
+  return blocks.filter((block) => {
+    while (lineStart < block.start) {
+      const nl = text.indexOf('\n', lineStart);
+      if (nl < 0 || nl >= block.start) break;
+      open = fenceAfterLine(open, text.slice(lineStart, nl));
+      lineStart = nl + 1;
+    }
+    return open === null;
+  });
 }
 
 export function stripLegacyToolBlocks(text: string): string {

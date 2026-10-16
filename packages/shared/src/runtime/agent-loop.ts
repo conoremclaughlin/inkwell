@@ -27,6 +27,8 @@ import {
 import { findInvokeToolBlocks, stripInvokeToolBlocks } from './invoke-tool-blocks.js';
 import { findLegacyToolBlocks, stripLegacyToolBlocks } from './legacy-tool-blocks.js';
 import { LOCAL_TOOL_CALL_PLACEHOLDER } from './local-tool-placeholder.js';
+import type { StreamDispatchResult } from './stream-tool-dispatch.js';
+import type { ToolCallResult } from './tool-call-executor.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -34,6 +36,8 @@ export interface LocalToolCall {
   raw: string;
   /** Parsed from the deprecated <tool_call> XML variant, not an ink-tool fence. */
   variantFormat?: boolean;
+  /** Canonical parser provenance within one attempt; NOT durable invocation identity. */
+  sourceStart?: number;
 }
 
 /** One executed (or refused) tool call, as the loop accumulates them. */
@@ -42,6 +46,10 @@ export interface ToolResultRecord {
   result: unknown;
   status: string;
   args?: unknown;
+  invocationId?: string;
+  dispatchState?: ToolCallResult['dispatchState'];
+  /** Position within the owning attempt, for reporting order only. */
+  sourceStart?: number;
   /**
    * This record says how a call was READ, not what happened to it.
    *
@@ -141,7 +149,7 @@ export function describeMalformedBlock(block: MalformedToolBlock): string {
     : 'it was NOT executed because the response ended before its closing ``` fence';
   return (
     `${subject} (${block.payloadLength} bytes) was discarded: ${cause} — ${block.error}. ` +
-    `Nothing ran and nothing was written. Re-emit it as one balanced JSON object, ` +
+    `This block ran no tool and wrote nothing. Re-emit it as one balanced JSON object, ` +
     `checking that every { and [ you opened is closed.`
   );
 }
@@ -294,6 +302,8 @@ export interface AgentLoopPorts {
         signal?: AbortSignal;
         /** Only an ordinary continuation after the completed tool round. */
         completedToolRound?: true;
+        /** Explicit authority: final relay/correction output is never executable. */
+        toolExecution?: 'allowed' | 'forbidden';
       }
     ): Promise<BackendTurnOutcome>;
   };
@@ -352,6 +362,48 @@ export interface BackendTurnOutcome {
   stdout: string;
   stderr: string;
   exitCode?: number;
+  /** Already settled by the attempt owner. Never re-execute final extraction. */
+  toolStream?: StreamDispatchResult;
+}
+
+function streamResults(stream: StreamDispatchResult): ToolResultRecord[] {
+  return stream.results.map((result) => ({
+    tool: result.tool,
+    args: result.args,
+    status: result.status,
+    invocationId: result.invocationId,
+    dispatchState: result.dispatchState,
+    sourceStart: result.sourceStart,
+    result: result.status === 'error' ? result.error : (result.reason ?? result.result),
+  }));
+}
+
+function streamRefusals(stream: StreamDispatchResult): ToolResultRecord[] {
+  return stream.notRun.map(({ call, reason }) => ({
+    tool: call.tool,
+    args: call.args,
+    status: 'not-run',
+    result: reason,
+    dispatchState: 'not-dispatched',
+    sourceStart: call.sourceStart,
+  }));
+}
+
+/** Diagnostics without a source position keep their existing leading order. */
+function inEmissionOrder(results: ToolResultRecord[]): ToolResultRecord[] {
+  return results.sort((a, b) => (a.sourceStart ?? -1) - (b.sourceStart ?? -1));
+}
+
+/** A stream reports each refused call itself; don't repeat the batch drop note. */
+function dropsAlreadyReported(
+  dropped: ReadonlyArray<LocalToolCall>,
+  results: ReadonlyArray<ToolResultRecord>
+): boolean {
+  return dropped.every(
+    (call) =>
+      call.sourceStart !== undefined &&
+      results.some((r) => r.status === 'not-run' && r.sourceStart === call.sourceStart)
+  );
 }
 
 /**
@@ -488,11 +540,16 @@ function renderToolResults(
 function renderToolResult(r: ToolResultRecord, maxBytes: number): string {
   const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
   const tool = shortName(r.tool);
-  if (resultStr === undefined) return `Tool ${tool} (${r.status}): undefined`;
+  const uncertainty =
+    r.dispatchState === 'unknown'
+      ? '[dispatchState: unknown; outcome unknown; not retried automatically. Check effects before deciding whether to resend.]\n'
+      : '';
+  const head = `Tool ${tool} (${r.status}): ${uncertainty}`;
+  if (resultStr === undefined) return `${head}undefined`;
   const size = utf8Bytes(resultStr);
-  if (size <= maxBytes) return `Tool ${tool} (${r.status}): ${resultStr}`;
+  if (size <= maxBytes) return `${head}${resultStr}`;
   return (
-    `Tool ${tool} (${r.status}): ${cutUtf8(resultStr, maxBytes)}\n` +
+    `${head}${cutUtf8(resultStr, maxBytes)}\n` +
     `…[ink: result truncated — ${size.toLocaleString()} bytes total, ` +
     `${maxBytes.toLocaleString()} shown; the full payload is in this session's transcript. ` +
     'Ask for less next time (page, filter, or narrow the query).]'
@@ -594,7 +651,9 @@ export function buildContinuationBody(
   // cannot disagree about what an iteration contained, which is the failure
   // that produced this fix in the first place.
   const outcomes = outcomesOnly(results);
-  const nothingRan = outcomes.length > 0 && !outcomes.some((r) => RAN_STATUSES.has(r.status));
+  const nothingRan =
+    outcomes.length > 0 &&
+    !outcomes.some((r) => RAN_STATUSES.has(r.status) || r.dispatchState === 'unknown');
   const refusalNote = !nothingRan
     ? ''
     : hasUnseenFailure(results)
@@ -633,7 +692,7 @@ export function buildContinuationBody(
         `Up to ${dropped.length} of your calls did not run at all, or ran in altered form. ` +
         `Do not guess and do not re-emit blindly: read back the current state and act on what you ` +
         `find. Re-running a write that already succeeded is not safe.`
-      : dropped.length === 0
+      : dropped.length === 0 || dropsAlreadyReported(dropped, results)
         ? ''
         : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
           `outcomes are above, and some of those may themselves have been refused or failed. ` +
@@ -706,7 +765,7 @@ export function buildFinalRelayBody(
         `emitted, so the runtime cannot tell you which of yours reached it. Up to ` +
         `${dropped.length} of your calls did not run at all, or ran in altered form. The loop has ` +
         `ended. Say that plainly rather than reporting the work as done.`
-      : dropped.length === 0
+      : dropped.length === 0 || dropsAlreadyReported(dropped, results)
         ? ''
         : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${listDropped(dropped)}. They had no effect. Say so rather than reporting them as done.`;
 
@@ -728,6 +787,8 @@ export interface AgentLoopInput {
   prompt: string;
   /** Local tool routing off (`backend`) means the loop never extracts calls. */
   toolRouting: 'backend' | 'local';
+  /** Matches opt-in stream admission, including final display/correction checks. */
+  canonicalTools?: boolean;
   /**
    * Tool iterations allowed. Every cap check follows the first request, so a
    * value below one behaves as one: the model's first request always runs.
@@ -829,7 +890,7 @@ export async function runAgentLoop(
     phase: ProtocolViolation['phase']
   ): ImitatedToolResultsFrame | null => {
     if (input.toolRouting !== 'local') return null;
-    const imitation = findImitatedToolResults(text);
+    const imitation = findImitatedToolResults(text, { fenceBounded: input.canonicalTools });
     if (!imitation) return null;
     const violation: ProtocolViolation = {
       kind: 'imitated-tool-results',
@@ -861,7 +922,26 @@ export async function runAgentLoop(
   // answer, so nothing is cut here — but the violation is recorded, and
   // since no correction follows a failure it stays uncorrected: the host
   // fails closed and rolls the session.
+  const retainFailedStream = (failed: BackendTurnOutcome): void => {
+    const stream = failed.toolStream;
+    if (!stream) return;
+    const records = inEmissionOrder([
+      ...streamResults(stream),
+      ...streamRefusals(stream),
+      ...stream.extracted.malformed.map((block) => ({
+        tool: block.tool ?? 'unknown',
+        status: 'malformed',
+        result: describeMalformedBlock(block),
+      })),
+    ]);
+    if (stream.failure)
+      records.push({ tool: 'runtime', status: 'error', result: stream.failure.message });
+    allToolResults.push(...records);
+    for (const record of records) ports.observe?.recordToolCall(record);
+    if (records.length || stream.admitted.length) iteration++;
+  };
   const noteImitationInFailedOutcome = (failed: BackendTurnOutcome): void => {
+    retainFailedStream(failed);
     if (failed.responseText) noteImitation(failed.responseText, 'turn');
   };
 
@@ -884,18 +964,20 @@ export async function runAgentLoop(
     iteration,
     isContinuation: false,
     signal: input.signal,
+    toolExecution: 'allowed',
   });
 
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
-  // A failed opening spawn is a failed turn, whatever text it left behind:
-  // nothing in it is screened, executed, or corrected — a tool it asked for
-  // must not run on the say-so of a process that died, and a correction it
-  // earned would only mark the session clean. Any imitation in that text is
+  // A failed opening spawn is a failed turn, whatever text it left behind.
+  // Never batch-execute or correct that failed text. Streaming effects may
+  // already exist: retain their owned outcomes without running them again.
+  // A correction here would only mark the session clean. Any imitation in that text is
   // recorded, uncorrected, so the host fails closed and rolls the session
   // (Lumen, PR #575 round 3). The text itself is still cut for display.
   if (!outcome.success) {
+    retainFailedStream(outcome);
     responseText = discardImitatedResults(responseText, 'turn').text;
     stopReason = 'backend-failure';
   }
@@ -913,7 +995,8 @@ export async function runAgentLoop(
 
     const blocks =
       input.toolRouting === 'local'
-        ? extractToolBlocks(responseText)
+        ? (outcome.toolStream?.extracted ??
+          extractToolBlocks(responseText, { canonicalOnly: input.canonicalTools }))
         : { calls: [] as LocalToolCall[], malformed: [], repaired: [] };
     const extracted = blocks.calls;
     // Taken before `screen` can touch these objects — see snapshotCalls.
@@ -935,6 +1018,7 @@ export async function runAgentLoop(
     // authored a miscounted brace and nobody witnessed it, which is precisely
     // the emergent class that predicate is a denylist for.
     const unrunnable: ToolResultRecord[] = [
+      ...(outcome.toolStream ? streamRefusals(outcome.toolStream) : []),
       ...blocks.malformed.map((block) => ({
         tool: block.tool ?? 'unknown',
         status: 'malformed',
@@ -958,10 +1042,13 @@ export async function runAgentLoop(
           `the runtime cannot close is discarded.`,
       })),
     ];
+    // With an admitted stream prefix, record results and refusals together
+    // below. A no-admission response still needs its diagnostics before break.
+    const deferStreamRecords = (outcome.toolStream?.admitted.length ?? 0) > 0;
     if (unrunnable.length > 0) {
-      allToolResults.push(...unrunnable);
+      if (!deferStreamRecords) allToolResults.push(...unrunnable);
       for (const record of unrunnable) {
-        ports.observe?.recordToolCall(record);
+        if (!deferStreamRecords) ports.observe?.recordToolCall(record);
         ports.ui.printEvent(`  ⋯ ${record.status}: ${record.tool} — ${String(record.result)}`);
       }
     }
@@ -969,9 +1056,11 @@ export async function runAgentLoop(
     // Screening sees every call the model emitted, before the per-iteration cap
     // discards any — a rule about what may accompany what cannot be enforced on
     // a truncated list.
-    const screened = ports.tools.screen
-      ? ports.tools.screen(extracted)
-      : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
+    const screened = outcome.toolStream
+      ? { calls: outcome.toolStream.admitted }
+      : ports.tools.screen
+        ? ports.tools.screen(extracted)
+        : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
 
     if ('rejected' in screened) {
       // Refused whole. Tell the model why and let it try again; the iteration
@@ -1022,6 +1111,7 @@ export async function runAgentLoop(
             iteration,
             isContinuation: true,
             signal: input.signal,
+            toolExecution: 'allowed',
           }
         );
       } finally {
@@ -1048,7 +1138,10 @@ export async function runAgentLoop(
       ports.ui.printEvent(
         `  ⋯ ${selection.unmatched} of ${selection.reached} calls that reached the runner match nothing emitted — which of the model's calls reached it is not determinable`
       );
-    } else if (selection.dropped.length > 0) {
+    } else if (
+      selection.dropped.length > 0 &&
+      !dropsAlreadyReported(selection.dropped, unrunnable)
+    ) {
       ports.ui.printEvent(
         `  ⋯ ${selection.dropped.length} of ${selection.emitted} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration): ${selection.dropped.map((c) => c.tool).join(', ')}`
       );
@@ -1121,6 +1214,7 @@ export async function runAgentLoop(
               iteration,
               isContinuation: true,
               signal: input.signal,
+              toolExecution: 'allowed',
             }
           );
         } finally {
@@ -1162,19 +1256,24 @@ export async function runAgentLoop(
     // A provider can resolve after cancellation (including a successful final
     // frame racing abort). Do not hand its calls to a new host's executor.
     // The executor must still fence each approval/commit/dispatch await.
-    if (input.signal?.aborted) {
+    if (input.signal?.aborted && !outcome.toolStream) {
       stopReason = 'aborted';
       break;
     }
 
-    const executed = await ports.tools.execute(calls, { iteration, signal: input.signal });
-    allToolResults.push(...executed);
-    for (const r of executed) ports.observe?.recordToolCall(r);
+    const executed = outcome.toolStream
+      ? streamResults(outcome.toolStream)
+      : await ports.tools.execute(calls, { iteration, signal: input.signal });
     // What the model is shown for this iteration: the blocks that could not be
-    // run, then the calls that were. `executed` alone still drives the stop
+    // run and the calls that were, in stream emission order where known.
+    // `executed` alone still drives the stop
     // reason below — a malformed block is a reporting obligation, not a
     // refusal, and must not turn a healthy turn into `all-refused`.
-    const results = unrunnable.length > 0 ? [...unrunnable, ...executed] : executed;
+    const results = [...unrunnable, ...executed];
+    if (outcome.toolStream) inEmissionOrder(results);
+    const newlyRecorded = deferStreamRecords ? results : executed;
+    allToolResults.push(...newlyRecorded);
+    for (const r of newlyRecorded) ports.observe?.recordToolCall(r);
     // Results and drops together, from the same iteration, at the one moment
     // both are known. Every exit below inherits exactly this.
     stranded = { results, selection };
@@ -1268,6 +1367,7 @@ export async function runAgentLoop(
           isContinuation: true,
           signal: input.signal,
           completedToolRound: true,
+          toolExecution: 'allowed',
         }
       );
     } finally {
@@ -1349,6 +1449,7 @@ export async function runAgentLoop(
         iteration,
         isContinuation: true,
         signal: input.signal,
+        toolExecution: 'forbidden',
       });
     } finally {
       stopRelayWaiting();
@@ -1535,10 +1636,20 @@ export { isPotentialImitationPrefix } from './imitation-grammar.js';
  * own frame (see ProtocolViolation). Line-anchored, and blind inside fenced
  * code (backtick or tilde, any length) — an ink-tool payload or a quoted code
  * block may legitimately contain the header; the imitation that matters is
- * the one written as if it were the next message.
+ * the one written as if it were the next message. Canonical (fence-bounded)
+ * payloads are different: a raw frame line cannot occur in valid JSON, so a
+ * malformed request must not hide it, regardless of where its closer lands.
  */
-export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
-  const inkBlocks = findInkToolBlocks(responseText);
+export function findImitatedToolResults(
+  responseText: string,
+  options: { fenceBounded?: boolean } = {}
+): ImitatedToolResultsFrame | null {
+  const inkBlocks = findInkToolBlocks(responseText, {
+    ...options,
+    // Example fences belong to the Markdown walk, not to request extents.
+    // Otherwise an inner request can swallow its enclosing example's closer.
+    unquotedOnly: options.fenceBounded,
+  });
   // The open fence, if any. CommonMark closes a fence only with the same
   // character, at least as long, and nothing but whitespace after it — a ```
   // in a ```` block, a ~~~ under a ```, or ```not-a-close inside an open
@@ -1551,6 +1662,18 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
     const lineEnd = nl === -1 ? responseText.length : nl;
     const line = responseText.slice(lineStart, lineEnd);
     const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
+    // Complete JSON cannot contain a raw frame LINE inside a string. Scan the
+    // canonical payload whether its closer is present, missing, or arrives
+    // later: an invalid payload never grants permission to hide a frame.
+    // Do not interpret its fence-looking content as a new Markdown example.
+    if (
+      insideInkBlock &&
+      options.fenceBounded &&
+      openFence === null &&
+      (isImitationHeaderLine(line) || isImitationResultLine(line))
+    ) {
+      return { header: line.trim(), index: lineStart, discarded: responseText.slice(lineStart) };
+    }
     if (!insideInkBlock) {
       const next = fenceAfterLine(openFence, line);
       if (next !== openFence) {
@@ -1581,7 +1704,10 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
  * legacy to-first-``` treatment; a scanned JSON with a missing closing fence
  * is still accepted (executing beats leaking).
  */
-export function findInkToolBlocks(text: string): InkToolBlock[] {
+export function findInkToolBlocks(
+  text: string,
+  options: { unquotedOnly?: boolean; fenceBounded?: boolean } = {}
+): InkToolBlock[] {
   const blocks: InkToolBlock[] = [];
   // Derived from INK_TOOL_OPENER so the finder and the sibling-boundary rule
   // cannot disagree about what an opener is. The trailing run is about where
@@ -1601,7 +1727,11 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
   let m: RegExpExecArray | null;
   while ((m = openRe.exec(text))) {
     const payloadStart = m.index + m[0].length;
-    const scanned = scanJsonValueEnd(text, payloadStart);
+    // A stream's completed fence must never grow when later prose balances
+    // malformed JSON. Canonical mode bounds first, then parses that payload.
+    // A valid JSON string cannot contain a raw newline, so a closer LINE
+    // cannot be part of a valid string (mid-line backticks still are content).
+    const scanned = options.fenceBounded ? null : scanJsonValueEnd(text, payloadStart);
     if (scanned) {
       // The value parsed, so repair is not at stake here; what a closing fence
       // decides on this path is only how much text the block covers. Anything
@@ -1647,7 +1777,26 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     // than past it.
     openRe.lastIndex = boundary.payloadEnd;
   }
-  return blocks;
+  if (!options.unquotedOnly) return blocks;
+
+  // The streaming protocol accepts requests, not examples nested in another
+  // code fence. Keep the JSON-aware finder above as the single block grammar;
+  // walk only the prose BETWEEN its blocks with the shared fence grammar.
+  let lineStart = 0;
+  let open: OpenFence | null = null;
+  return blocks.filter((block) => {
+    while (lineStart < block.start) {
+      const nl = text.indexOf('\n', lineStart);
+      const end = nl === -1 ? text.length : nl;
+      open = fenceAfterLine(open, text.slice(lineStart, end));
+      lineStart = end + 1;
+    }
+    if (open !== null) return false;
+    // Do not interpret a request's own closer as the next example opener.
+    // An unclosed block may end exactly ON a sibling's opening line.
+    lineStart = text[block.end - 1] === '\n' ? block.end : nextLineStart(text, block.end);
+    return true;
+  });
 }
 
 /**
@@ -1864,7 +2013,15 @@ export function repairTruncatedJson(payload: string): string | null {
  * that genuinely want just the calls. The LOOP must use this one — dropping the
  * second half is the bug (see MalformedToolBlock).
  */
-export function extractToolBlocks(responseText: string): {
+export function extractToolBlocks(
+  responseText: string,
+  options: {
+    /** Opt-in stream protocol: closed canonical JSON only; no repair or XML fallback. */
+    canonicalOnly?: boolean;
+    /** More text may arrive: a closing line is not final until its newline arrives. */
+    partial?: boolean;
+  } = {}
+): {
   calls: LocalToolCall[];
   malformed: MalformedToolBlock[];
   /** Blocks that parsed only after their open containers were closed for them. */
@@ -1874,8 +2031,29 @@ export function extractToolBlocks(responseText: string): {
   const malformed: MalformedToolBlock[] = [];
   const repaired: MalformedToolBlock[] = [];
 
-  for (const block of findInkToolBlocks(responseText)) {
+  if (options.canonicalOnly) {
+    // The live and final readers cut at exactly the same imitation boundary.
+    const imitation = findImitatedToolResults(responseText, { fenceBounded: true });
+    if (imitation) responseText = responseText.slice(0, imitation.index);
+  }
+
+  for (const block of findInkToolBlocks(responseText, {
+    unquotedOnly: options.canonicalOnly,
+    fenceBounded: options.canonicalOnly,
+  })) {
     if (!block.payload) continue;
+    if (options.canonicalOnly) {
+      if (!block.fenceClosed || (options.partial && responseText.indexOf('\n', block.end) < 0)) {
+        malformed.push({
+          tool: readToolName(block.payload),
+          error:
+            'canonical tool calls require a complete closing fence line; this block was not executed',
+          payloadLength: block.payload.length,
+          fenceClosed: false,
+        });
+        continue;
+      }
+    }
     let payload = block.payload;
     let wasRepaired = false;
     try {
@@ -1886,7 +2064,8 @@ export function extractToolBlocks(responseText: string): {
       // provably open — but only for a block the model finished writing, and
       // never in silence. The repair is reported to the model alongside the
       // result, so a persistent miscounter is corrected rather than propped up.
-      const fixed = block.fenceClosed ? repairTruncatedJson(payload) : null;
+      const fixed =
+        block.fenceClosed && !options.canonicalOnly ? repairTruncatedJson(payload) : null;
       if (fixed === null) {
         // Report a REQUEST, not every fence-shaped string — see
         // `looksLikeToolRequest`.
@@ -1952,9 +2131,27 @@ export function extractToolBlocks(responseText: string): {
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
           : {};
+      if (
+        options.canonicalOnly &&
+        parsed.args !== undefined &&
+        (parsed.args === null || typeof parsed.args !== 'object' || Array.isArray(parsed.args))
+      ) {
+        malformed.push({
+          tool,
+          error: 'canonical tool args must be a JSON object',
+          payloadLength: payload.length,
+          fenceClosed: true,
+        });
+        continue;
+      }
       indexed.push({
         index: block.start,
-        call: { tool, args, raw: responseText.slice(block.start, block.end) },
+        call: {
+          tool,
+          args,
+          raw: responseText.slice(block.start, block.end),
+          ...(options.canonicalOnly ? { sourceStart: block.start } : {}),
+        },
       });
       if (wasRepaired) {
         repaired.push({
@@ -1975,9 +2172,19 @@ export function extractToolBlocks(responseText: string): {
   // via the fallback router, and text-form signal_status never halted the
   // continuation loop). Parse and execute the variant so the turn WORKS;
   // the continuation prompt separately steers the model back to the fence.
-  for (const block of findLegacyToolBlocks(responseText)) {
+  for (const block of findLegacyToolBlocks(responseText, { unquotedOnly: options.canonicalOnly })) {
     const payload = responseText.slice(block.payloadStart, block.payloadEnd).trim();
     if (!payload) continue;
+    if (options.canonicalOnly) {
+      malformed.push({
+        tool: readToolName(payload, 'name'),
+        error:
+          'Unsupported tool_call XML. Use a fenced ink-tool JSON object with tool and args; this XML was not executed.',
+        payloadLength: payload.length,
+        fenceClosed: true,
+      });
+      continue;
+    }
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
       const rawName = typeof parsed.name === 'string' ? parsed.name.trim() : '';

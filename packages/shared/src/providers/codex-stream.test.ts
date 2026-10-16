@@ -24,7 +24,7 @@ describe('Codex exec streaming adapter', () => {
       line(message('Working on it.', 'synthetic-first')) + line(message('Done.')) + line(complete);
     const events: BackendTurnEvent[] = [];
     for (const char of input) events.push(...p.push(char));
-    expect(events.filter((e) => e.kind === 'text')).toEqual([
+    expect(events.filter((e) => e.kind === 'text')).toMatchObject([
       { kind: 'text', text: 'Working on it.' },
       { kind: 'text', text: 'Done.' },
     ]);
@@ -120,7 +120,8 @@ describe('Codex exec streaming adapter', () => {
   it('never fabricates a usage sample when the provider reported none', () => {
     const p = parser();
     const events = p.push(line(message('Answer.')) + line({ type: 'turn.completed' }));
-    expect(events.at(-1)).toEqual({ kind: 'result', text: 'Answer.' });
+    expect(events.at(-1)).toMatchObject({ kind: 'result', text: 'Answer.' });
+    expect(events.at(-1)).not.toHaveProperty('usage');
   });
 });
 
@@ -150,7 +151,68 @@ describe('Codex frame limits', () => {
     const p = parser();
     const text = 'x'.repeat(limit - 200);
     const events = p.push(line(message(text)) + line(complete));
-    expect(events[0]).toEqual({ kind: 'text', text });
+    expect(events.find((event) => event.kind === 'text')).toMatchObject({ kind: 'text', text });
     expect(events.at(-1)).toMatchObject({ kind: 'result', text });
+  });
+});
+
+describe('Codex output correlation', () => {
+  it('retains conflicting snapshot text under its original identity for the consumer to refuse', () => {
+    const events = parser().push(
+      line(message('original')) + line(message('rewritten')) + line(complete)
+    );
+    const texts = events.filter((event) => event.kind === 'text');
+    expect(texts.map((event) => event.text)).toEqual(['original', 'rewritten']);
+    expect(texts[0].source).toEqual(texts[1].source);
+    expect(events.at(-1)).toMatchObject({ text: 'original' });
+  });
+
+  it('scopes reused item IDs to one attempt and ignores late events after success', () => {
+    for (const text of ['first attempt', 'second attempt']) {
+      const p = parser();
+      expect(p.push(line(message(text)) + line(complete)).at(-1)).toMatchObject({
+        text,
+        source: { messageId: 'synthetic-item' },
+      });
+      expect(p.push(line(message('late')))).toEqual([]);
+      expect(p.end()).toEqual([]);
+    }
+  });
+
+  it('keeps distinct equal-text items separate and names only the final item', () => {
+    const events = parser().push(
+      line(message('same', 'synthetic-one')) +
+        line(message('same', 'synthetic-two')) +
+        line(complete)
+    );
+    expect(events.filter((event) => event.kind === 'text').map((event) => event.source)).toEqual([
+      { messageId: 'synthetic-one', origin: 'unknown', blockId: 'synthetic-one', offset: 0 },
+      { messageId: 'synthetic-two', origin: 'unknown', blockId: 'synthetic-two', offset: 0 },
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      source: { messageId: 'synthetic-two', origin: 'unknown' },
+    });
+    expect(
+      events.filter((event) => event.kind === 'text-boundary').map((event) => event.boundary)
+    ).toEqual(['message-start', 'message-end', 'message-start', 'message-end']);
+  });
+
+  it('does not promote an older repeated snapshot to the final item', () => {
+    const events = parser().push(
+      line(message('one', 'synthetic-one')) +
+        line(message('two', 'synthetic-two')) +
+        line(message('one', 'synthetic-one')) +
+        line(complete)
+    );
+    expect(events.at(-1)).toMatchObject({ text: 'two', source: { messageId: 'synthetic-two' } });
+  });
+
+  it('does not invent identity for a completed item without an ID', () => {
+    const events = parser().push(
+      line({ type: 'item.completed', item: { type: 'agent_message', text: 'text' } }) +
+        line(complete)
+    );
+    expect(events.find((event) => event.kind === 'text')).not.toHaveProperty('source');
+    expect(events.at(-1)).not.toHaveProperty('source');
   });
 });

@@ -143,6 +143,8 @@ export interface BackendRunResult {
    * `stdout` (which is the raw event stream in streaming mode).
    */
   responseText?: string;
+  /** Provenance only; the provider attempt and execution authority are host-owned. */
+  responseSource?: Extract<BackendTurnEvent, { kind: 'result' }>['source'];
   /** The resumed provider session no longer exists — reseed a fresh one. */
   resumeFailedNoSession?: boolean;
   /** Whether the process was reaped by a timeout, and which kind. */
@@ -203,6 +205,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   // Streaming accumulators, populated as events arrive.
   let accumulatedText = '';
   let finalText: string | undefined;
+  let finalSource: BackendRunResult['responseSource'];
   let streamError: string | undefined;
   let streamedUsage: BackendTokenUsage | undefined;
   let resumeFailedNoSession = false;
@@ -212,7 +215,10 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       if (e.kind === 'text') {
         accumulatedText += e.text;
       } else if (e.kind === 'result') {
-        if (typeof e.text === 'string') finalText = e.text;
+        if (typeof e.text === 'string') {
+          finalText = e.text;
+          finalSource = e.source;
+        }
         if (e.error) streamError ??= e.error;
         if (e.usage) streamedUsage = e.usage;
         if (e.resumeFailedNoSession) resumeFailedNoSession = true;
@@ -460,6 +466,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
           streamedUsage ??
           extractBackendTokenUsage(request.backend, spawnResult.stdout, spawnResult.stderr),
         ...(responseText !== undefined ? { responseText } : {}),
+        ...(finalText !== undefined && finalSource ? { responseSource: finalSource } : {}),
         ...(resumeFailedNoSession ? { resumeFailedNoSession: true } : {}),
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,

@@ -108,7 +108,8 @@ describe('chat tool-intent boundary', () => {
       new URL('../../../shared/src/runtime/session-tool-batch.ts', import.meta.url),
       'utf8'
     );
-    expect(shared).toContain('commitIntent: createToolIntentCommitter(ports.log)');
+    expect(shared).toMatch(/commitIntent: createToolIntentCommitter\(\s*ports\.log,/);
+    expect(shared).toContain('(call) => ports.invocations?.stamp(call.args) ?? {}');
     expect(shared).toContain("type: 'local_tool_call'");
     expect(shared).toContain('invocationId: result.invocationId');
     expect(shared).toContain('dispatchState: result.dispatchState');

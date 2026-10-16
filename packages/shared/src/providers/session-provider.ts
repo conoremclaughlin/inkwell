@@ -6,6 +6,11 @@
  */
 import type { BackendRunRequest, BackendRunResult, BackendTurnHandle } from './backend-runner.js';
 import type { TurnMedia } from './types.js';
+import {
+  runToolStreamingAttempt,
+  type ProviderToolStreamPorts,
+  type ToolStreamingBackendResult,
+} from './tool-stream-attempt.js';
 import type { createSessionSteering } from '../runtime/session-steering.js';
 import {
   buildDeltaPrompt,
@@ -74,6 +79,8 @@ export interface SessionProviderPorts {
     result: Pick<BackendRunResult, 'success' | 'contextImagesDelivered'>
   ): void;
   startTurn(request: BackendRunRequest): BackendTurnHandle;
+  /** Opt-in composition only; final relay/correction requests never open it. */
+  toolStream?: ProviderToolStreamPorts;
   onEvent: NonNullable<BackendRunRequest['onEvent']>;
   beginSpawn(): void;
   endSpawn(): void;
@@ -85,6 +92,12 @@ export interface SessionProviderPorts {
   contextGeneration(): number;
   mutationsInFlight(): number;
   notice(reason: 'resume-missing' | 'mid-turn-roll'): void;
+}
+interface ProviderTurnContext {
+  isContinuation: boolean;
+  signal?: AbortSignal;
+  completedToolRound?: true;
+  toolExecution?: 'allowed' | 'forbidden';
 }
 
 export function createSessionProviderTurn(
@@ -212,7 +225,7 @@ export function createSessionProviderTurn(
   // when a resumed session vanished, and media delivery flags. The injected
   // host owns launches, cancellation, debug and activity logging. A shadow clone
   // supplies a far simpler runTurn and shares the loop unchanged.
-  let lastRunResult!: BackendRunResult;
+  let lastRunResult!: ToolStreamingBackendResult;
   // These entries remain durable user context. Only this turn's full-envelope
   // render excludes them because its ordered dialogue carries them instead.
   const steeringEids = new Set<number>();
@@ -324,19 +337,39 @@ export function createSessionProviderTurn(
 
   const runTurnForLoop = async (
     body: string,
-    ctx: { isContinuation: boolean; signal?: AbortSignal; completedToolRound?: true }
+    ctx: ProviderTurnContext,
+    settled: (result: ToolStreamingBackendResult) => void
   ): Promise<BackendTurnOutcome> => {
+    const runAttempt = async (request: BackendRunRequest): Promise<ToolStreamingBackendResult> => {
+      let result: ToolStreamingBackendResult;
+      if (ports.toolStream && runtime.toolRouting === 'local' && ctx.toolExecution === 'allowed') {
+        result = await runToolStreamingAttempt({
+          request,
+          startTurn: (request) => ports.startTurn(request),
+          onAbortHandle: (abort) => ports.onAbortHandle(abort),
+          ports: ports.toolStream,
+          signal: ctx.signal,
+        });
+      } else {
+        const turn = ports.startTurn(request);
+        ports.onAbortHandle(turn.abort);
+        result = await turn.result;
+      }
+      // Preserve effects before image/usage/teardown callbacks can throw.
+      settled(result);
+      return result;
+    };
     if (!ctx.isContinuation) {
       const openingSessionId =
         seedProviderSessionId ?? (resumeProviderSession ? state.id : undefined);
       const openingImages = ports.contextImagesFor?.(openingSessionId);
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = ports.contextGeneration();
-      let runResult: BackendRunResult;
+      let runResult: ToolStreamingBackendResult;
       await beforeDispatch(ctx.signal);
       ports.beginSpawn();
       try {
-        const turn = ports.startTurn({
+        runResult = await runAttempt({
           backend: runtime.backend,
           sbSlug,
           model: runtime.model,
@@ -364,9 +397,6 @@ export function createSessionProviderTurn(
           cliAttached,
           ...ports.spawnContext(),
         });
-        ports.onAbortHandle(turn.abort);
-
-        runResult = await turn.result;
       } finally {
         try {
           ports.onAbortHandle(null);
@@ -389,6 +419,10 @@ export function createSessionProviderTurn(
         resumeProviderSession &&
         !ctx.signal?.aborted &&
         !runResult.success &&
+        // Once any invocation was owned, a missing native session cannot
+        // authorize a second attempt at its effects. Nor can journal failure.
+        !runResult.toolStream?.admitted.length &&
+        !runResult.toolStream?.failure &&
         (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
       ) {
         // Mint a fresh native session, re-send the FULL envelope (the ledger
@@ -414,7 +448,7 @@ export function createSessionProviderTurn(
         await beforeDispatch(ctx.signal);
         ports.beginSpawn();
         try {
-          const reseedTurn = ports.startTurn({
+          runResult = await runAttempt({
             backend: runtime.backend,
             sbSlug,
             model: runtime.model,
@@ -438,8 +472,6 @@ export function createSessionProviderTurn(
             cliAttached,
             ...ports.spawnContext(),
           });
-          ports.onAbortHandle(reseedTurn.abort);
-          runResult = await reseedTurn.result;
         } finally {
           try {
             ports.onAbortHandle(null);
@@ -529,18 +561,13 @@ export function createSessionProviderTurn(
     const contSessionId =
       contSpawn.sessionArgs.backendSessionId ?? contSpawn.sessionArgs.backendSessionSeedId;
     const contImages = ports.contextImagesFor?.(contSessionId);
-    let contResult: BackendRunResult;
+    let contResult: ToolStreamingBackendResult;
     const ledgerIdBeforeSpawn = maxLedgerId();
     const generationBeforeSpawn = ports.contextGeneration();
     await beforeDispatch(ctx.signal);
     ports.beginSpawn();
     try {
-      const contTurn = ports.startTurn(
-        continuationRequest(continuationPrompt, contSpawn, contImages)
-      );
-      ports.onAbortHandle(contTurn.abort);
-
-      contResult = await contTurn.result;
+      contResult = await runAttempt(continuationRequest(continuationPrompt, contSpawn, contImages));
     } finally {
       try {
         ports.onAbortHandle(null);
@@ -562,7 +589,32 @@ export function createSessionProviderTurn(
 
   return {
     prompt,
-    runTurn: runTurnForLoop,
+    async runTurn(body: string, ctx: ProviderTurnContext): Promise<BackendTurnOutcome> {
+      let settledAttempt: ToolStreamingBackendResult | undefined;
+      try {
+        return await runTurnForLoop(body, ctx, (result) => {
+          settledAttempt = result;
+        });
+      } catch (error) {
+        if (!settledAttempt?.toolStream) throw error;
+        let message = `Provider settlement failed after stream admission: ${String(error)}`;
+        try {
+          await ports.toolStream!.reportFailure(message);
+        } catch {
+          message += ' The host failure alert could not be delivered.';
+        }
+        lastRunResult = {
+          ...settledAttempt,
+          success: false,
+          stderr: [settledAttempt.stderr, message].filter(Boolean).join('\n'),
+          toolStream: {
+            ...settledAttempt.toolStream,
+            failure: settledAttempt.toolStream.failure ?? { kind: 'executor', message },
+          },
+        };
+        return lastRunResult;
+      }
+    },
     relayOccupancy,
     get steeringDeliveryUncertain(): boolean {
       return steeringDeliveryUncertain;
