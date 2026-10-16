@@ -4827,6 +4827,11 @@ router.get('/inklings', async (req: Request, res: Response) => {
       // that: members answer in turn, and naming one wakes only it (`wake`
       // on POST /threads and /threads/reply).
       groupReplies: { inTurn: true, wake: true },
+      // This server keeps a conversation's mode and reads a public one as
+      // its space's (conversation-mode.ts, thread-read-access.ts), so the
+      // app may offer `mode: 'public'` on POST /threads. A server without it
+      // would leave the thread private, so the app offers it only on this.
+      publicThreads: true,
     });
   } catch (error) {
     answerInklingError(res, 'Failed to list inklings', error);
