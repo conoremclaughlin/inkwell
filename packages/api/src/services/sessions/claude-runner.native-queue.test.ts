@@ -170,6 +170,76 @@ async function fixture(overrides: Partial<ClaudeRunnerConfig> = {}) {
 }
 
 describe('ClaudeRunner native queue integration', () => {
+  it.each([false, true])(
+    'reports the native launch once, before input (group: %s)',
+    async (killProcessGroup) => {
+      const onSpawned = vi.fn();
+      const f = await fixture({ onSpawned, killProcessGroup });
+      expect(onSpawned).toHaveBeenCalledWith({
+        pid: f.child.pid,
+        ...(killProcessGroup ? { pgid: f.child.pid } : {}),
+      });
+      expect(vi.mocked(f.binding.ownChild).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(spawn).mock.invocationCallOrder[0]
+      );
+      expect(onSpawned.mock.invocationCallOrder[0]).toBeGreaterThan(
+        vi.mocked(spawn).mock.invocationCallOrder[0]
+      );
+      expect(onSpawned.mock.invocationCallOrder[0]).toBeLessThan(
+        f.child.stdin.write.mock.invocationCallOrder[0]
+      );
+      f.init();
+      f.result([f.original], 'Original');
+      f.complete(f.original);
+      expect((await f.running).success).toBe(true);
+      expect(onSpawned).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('rechecks admission after opening native evidence and disposes a refused run without spawning', async () => {
+    type EvidenceLog = Awaited<ReturnType<NativeSteeringBinding['openLog']>>;
+    let releaseLog!: (value: EvidenceLog) => void;
+    let refuse = false;
+    const log = { append: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}) };
+    const binding: NativeSteeringBinding = {
+      turnEpoch: 'synthetic-epoch',
+      assertCurrent: vi.fn(),
+      ownChild: vi.fn(),
+      bind: vi.fn(),
+      openLog: vi.fn(
+        () =>
+          new Promise<EvidenceLog>((resolve) => {
+            releaseLog = resolve;
+          })
+      ),
+    };
+    const restore = vi.fn(async () => {});
+    vi.mocked(applyPermissionOverlay).mockResolvedValueOnce(restore);
+    const admitSpawn = vi.fn(() => (refuse ? 'Synthetic refusal' : undefined));
+    const running = new ClaudeRunner().run('Synthetic original', {
+      config: {
+        workingDirectory: '/synthetic/studio',
+        mcpConfigPath: '',
+        permissionOverlay: {} as never,
+        nativeSteering: binding,
+        admitSpawn,
+      },
+    });
+    await vi.waitFor(() => expect(binding.openLog).toHaveBeenCalledOnce());
+    refuse = true;
+    releaseLog(log as never);
+    expect(await running).toMatchObject({
+      success: false,
+      refusedBeforeSpawn: true,
+      error: 'Synthetic refusal',
+    });
+    expect(admitSpawn).toHaveBeenCalledOnce();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(binding.ownChild).not.toHaveBeenCalled();
+    expect(log.close).toHaveBeenCalledOnce();
+    expect(restore).toHaveBeenCalledOnce();
+  });
+
   it('sums per-query usage but does not double-count cumulative model totals across native queries', async () => {
     const f = await fixture();
     f.init();
