@@ -62,13 +62,15 @@ export async function areSpaceWriters(
 /**
  * What an inkling's turn is told in a shared group with more than one
  * person: who is present, by display name, and that what someone said to it
- * privately stays private here. Null for any other conversation.
+ * privately stays private here. Null for any other conversation, and for a
+ * recipient that is not one of its participants: who is in a group is told
+ * only to the group's own inkling (Lumen's review of 4f7896e6).
  */
 export async function sharedGroupNote(
   supabase: SupabaseClient,
-  input: { workspaceId: string | undefined; threadKey: string }
+  input: { workspaceId: string | undefined; threadKey: string; recipientSbId: string | undefined }
 ): Promise<string | null> {
-  if (!input.workspaceId) return null;
+  if (!input.workspaceId || !input.recipientSbId) return null;
   const { data: thread, error } = await supabase
     .from('inbox_threads')
     .select('id, metadata')
@@ -80,12 +82,12 @@ export async function sharedGroupNote(
   if (row.metadata?.[INKLING_SHARED_MARK] !== true) return null;
   const { data: participants, error: participantError } = await supabase
     .from('inbox_thread_participants')
-    .select('user_id')
+    .select('sb_id, user_id')
     .eq('thread_id', row.id);
   if (participantError) return null;
-  const userIds = ((participants ?? []) as Array<{ user_id: string | null }>)
-    .map((p) => p.user_id)
-    .filter((id): id is string => !!id);
+  const rows = (participants ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
+  if (!rows.some((p) => p.sb_id === input.recipientSbId)) return null;
+  const userIds = rows.map((p) => p.user_id).filter((id): id is string => !!id);
   if (userIds.length < 2) return null;
   const { data: users } = await supabase
     .from('users')

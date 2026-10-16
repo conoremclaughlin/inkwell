@@ -73,6 +73,7 @@ import { getRequestContext } from '../../utils/request-context';
 import { assertInklingThreadAllowed, InklingThreadRefusedError } from './inkling-thread-gate';
 import { resetReplyChains } from './inkling-reply-chain';
 import { isOwnersOwnMessage } from './inkling-turn-gate';
+import { sharedGroupNote } from './inkling-shared-space';
 
 type Handler = (req: Request, res: Response) => Promise<void>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -1119,4 +1120,137 @@ describe('a group shared with a team space’s people (Conor, 2026-10-15)', () =
     expect(res.status).toBe(409);
     expect(written()).toEqual(before);
   });
+});
+
+describe('shared group retries, races and the presence note (Lumen’s review of 4f7896e6)', () => {
+  const B = '33333333-3333-4333-8333-333333333333';
+  const CLIENT = '55555555-5555-4555-8555-555555555555';
+  const body = {
+    key: 'chat:review-group',
+    recipients: ['pip'],
+    people: [B],
+    content: 'hi',
+    clientMessageId: CLIENT,
+  };
+  beforeEach(() => {
+    db.seed('workspaces', { id: WS, name: 'Team', type: 'team', metadata: {} });
+    db.seed('workspace_members', { workspace_id: WS, user_id: B, role: 'member' });
+  });
+
+  it('a completed create replays only for the same people', async () => {
+    expect((await call(create, body)).status).toBe(200);
+    gateway.dispatchTrigger.mockClear();
+    expect(await call(create, body)).toMatchObject({ status: 200, body: { replayed: true } });
+    expect((await call(create, { ...body, people: [] })).status).toBe(409);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+    expect(woken()).toEqual([]);
+  });
+
+  it.each(['member', 'viewer', 'removed'])(
+    'adoption checks an uninserted invitee whose current role is %s',
+    async (role) => {
+      const realFrom = db.from.bind(db);
+      db.from = ((table: string) => {
+        const query = realFrom(table);
+        if (table === 'inbox_thread_participants') {
+          const realInsert = query.insert.bind(query);
+          query.insert = (values) => {
+            if (!Array.isArray(values) && values.user_id === B) {
+              query.then = ((resolve: (value: unknown) => unknown) =>
+                Promise.resolve({
+                  data: null,
+                  error: { code: 'TEST', message: 'synthetic participant write failure' },
+                }).then(resolve)) as typeof query.then;
+              return query;
+            }
+            return realInsert(values);
+          };
+        }
+        return query;
+      }) as typeof db.from;
+      try {
+        expect((await call(create, body)).status).toBe(500);
+      } finally {
+        db.from = realFrom;
+      }
+      expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+      expect(db.rows('inbox_thread_participants').some((row) => row.user_id === B)).toBe(false);
+      db.rows('workspace_members').find((row) => row.user_id === B)!.role = role;
+      if (role === 'removed') {
+        const members = db.rows('workspace_members');
+        members.splice(
+          members.findIndex((row) => row.user_id === B),
+          1
+        );
+      }
+      const before = written();
+      const result = await call(create, body);
+      if (role === 'member') {
+        expect(result.status).toBe(200);
+        expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+      } else {
+        expect.soft(result).toMatchObject({ status: 403 });
+        expect.soft(written()).toEqual(before);
+      }
+    }
+  );
+
+  it('a non-idempotent create losing the key race returns 409, not 500', async () => {
+    const realFrom = db.from.bind(db);
+    let reached!: () => void;
+    let release!: () => void;
+    const atPause = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let armed = true;
+    db.from = ((table: string) => {
+      const query = realFrom(table);
+      if (table === 'inbox_threads' && armed) {
+        const realSingle = query.maybeSingle.bind(query);
+        query.maybeSingle = async () => {
+          const result = await realSingle();
+          if (armed) {
+            armed = false;
+            reached();
+            await released;
+          }
+          return result;
+        };
+      }
+      return query;
+    }) as typeof db.from;
+    const noId = { ...body, clientMessageId: undefined };
+    const loser = call(create, noId);
+    await atPause;
+    db.from = realFrom;
+    const winner = await call(create, noId);
+    expect(winner.status).toBe(200);
+    release();
+    expect((await loser).status).toBe(409);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it.each(['sb-pip', 'sb-fern'])(
+    'the shared presence note is only delivered to a participant: %s',
+    async (recipientSbId) => {
+      expect((await call(create, body)).status).toBe(200);
+      db.seed('users', { id: ME, first_name: 'Alex', last_name: 'Example', username: null });
+      db.seed('users', { id: B, first_name: 'Blair', last_name: 'Example', username: null });
+      // server.ts already has the canonical recipient ID when building the prompt.
+      // The proposed recipient parameter is ignored by the reviewed implementation.
+      const note = await sharedGroupNote(
+        db as never,
+        {
+          workspaceId: WS,
+          threadKey: body.key,
+          recipientSbId,
+        } as never
+      );
+      if (recipientSbId === 'sb-pip') expect(note).toContain('Alex Example, Blair Example');
+      else expect(note).toBeNull();
+    }
+  );
 });

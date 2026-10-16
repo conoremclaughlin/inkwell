@@ -135,8 +135,12 @@ export async function assertInklingThreadAllowed(
   const actorSbId =
     input.sender.kind === 'sb' && !sbIds.has(input.sender.sbId) ? input.sender.sbId : null;
   const addedPeople = [...new Set((input.addedPeople ?? []).map((id) => id.toLowerCase()))];
-  if (addedPeople.length > 0 && input.existingThreadId !== null) {
-    // People join a conversation only as it is made, never after.
+  if (addedPeople.length > 0 && input.existingThreadId !== null && !sharedMark) {
+    // People join a conversation only as it is made, never after. The one
+    // exception is a retry finishing its own interrupted create (POST
+    // /threads adoption), on the thread that create marked shared; the
+    // people it names are held to the same membership as at creation below
+    // (Lumen's review of 4f7896e6).
     throw new InklingThreadRefusedError(
       INKLING_THREAD_REFUSED,
       'People are added to a conversation only when it is created'

@@ -819,8 +819,9 @@ export async function handleSendToInbox(
       participantSbs,
       existingThreadId: existingThread?.id ?? null,
       // A retry adopting its own interrupted create finds the thread made and
-      // marked; the gate reads that mark rather than adding people again.
-      ...(existingThread ? {} : { addedPeople: addedPeople.map((person) => person.userId) }),
+      // marked; its people are checked again, as they are now, before any of
+      // them is added.
+      addedPeople: addedPeople.map((person) => person.userId),
     });
     if (addedPeople.length > 0 && !inklingVerdict.shared) {
       throw new InklingThreadRefusedError(
@@ -901,6 +902,7 @@ export async function handleSendToInbox(
         sender,
         participantSbs,
         existingThreadId: thread.id,
+        addedPeople: addedPeople.map((person) => person.userId),
       });
       if (addedPeople.length > 0 && !inklingVerdict.shared) {
         throw new InklingThreadRefusedError(

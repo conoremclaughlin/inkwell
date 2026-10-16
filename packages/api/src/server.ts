@@ -1320,10 +1320,12 @@ Type: ${payload.triggerType}`;
           triggerMessage += `\n${line}`;
         }
         // A group shared with the space's people: who is present, and that
-        // the private stays private (inkling-shared-space.ts).
+        // the private stays private (inkling-shared-space.ts). Told only to a
+        // participant, like the descriptor above.
         const groupNote = await sharedGroupNote(dataComposer.getClient(), {
           workspaceId: threadWorkspaceId ?? resolvedWorkspaceId,
           threadKey: payload.threadKey,
+          recipientSbId: resolvedIdentityId,
         });
         if (groupNote) triggerMessage += `\n\n${groupNote}`;
       }

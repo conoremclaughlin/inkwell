@@ -9428,6 +9428,13 @@ router.post('/threads', async (req: Request, res: Response) => {
             return;
           }
         }
+        // A group create with no client message id has nothing to replay: a
+        // concurrent create took its key, so the key is taken (Lumen's review
+        // of 4f7896e6).
+        if (error instanceof ThreadKeyTakenError) {
+          res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
+          return;
+        }
         throw error;
       }
 
