@@ -46,18 +46,22 @@ const CLOSED_TABLES = [
 
 const ANY_PRIVILEGE = 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER';
 
-/** Every open public table, with whether each client role holds any privilege on it. */
+/**
+ * Every open table in one schema ($1), with whether each client role holds
+ * any privilege on it. The checks ask about public; the control asks about a
+ * schema of its own.
+ */
 const OPEN_TABLES_SQL = `
   SELECT c.relname AS name,
          has_table_privilege('anon', c.oid, '${ANY_PRIVILEGE}') AS anon,
          has_table_privilege('authenticated', c.oid, '${ANY_PRIVILEGE}') AS authenticated
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public'
+   WHERE n.nspname = $1
      AND c.relkind IN ('r', 'p')
      AND (NOT c.relrowsecurity OR EXISTS (
            SELECT 1 FROM pg_policies p
-            WHERE p.schemaname = 'public'
+            WHERE p.schemaname = $1
               AND p.tablename = c.relname
               AND p.permissive = 'PERMISSIVE'
               AND p.roles && ARRAY['public', 'anon', 'authenticated']::name[]
@@ -86,12 +90,12 @@ afterAll(async () => {
 
 describe('client-role grants on open tables', () => {
   it('no open public table grants anon or authenticated any privilege', async () => {
-    const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL);
+    const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL, ['public']);
     expect(rows.filter((r) => r.anon || r.authenticated)).toEqual([]);
   });
 
   it('reads as open every table the migration closed, so the check above covers them', async () => {
-    const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL);
+    const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL, ['public']);
     const open = new Set(rows.map((r) => r.name));
     expect(CLOSED_TABLES.filter((t) => !open.has(t))).toEqual([]);
   });
@@ -119,24 +123,38 @@ describe('client-role grants on open tables', () => {
   });
 
   // The control: a new open table, made as any migration makes one, is
-  // caught. Created and dropped inside a transaction that rolls back.
+  // caught. Made and dropped inside a transaction that rolls back, in a schema
+  // of its own, so its DDL takes no lock any other suite contends for. Other
+  // DB suites run beside this one, and a CREATE POLICY in public deadlocked
+  // with one of them in CI (40P01, #874 at 1ea8361e). A deadlock or lock
+  // timeout is the fixture's, not the subject's, so the attempt is retried.
   it('catches a new table opened by a USING (true) policy, and one with RLS off', async () => {
-    const policed = `zz_open_policy_${randomUUID().slice(0, 8)}`;
-    const unpoliced = `zz_open_norls_${randomUUID().slice(0, 8)}`;
-    await db.query('BEGIN');
-    try {
-      await db.query(`CREATE TABLE public.${policed} (id int)`);
-      await db.query(`ALTER TABLE public.${policed} ENABLE ROW LEVEL SECURITY`);
-      await db.query(`CREATE POLICY open_to_all ON public.${policed} FOR ALL USING (true)`);
-      await db.query(`CREATE TABLE public.${unpoliced} (id int)`);
-      // Default privileges are not in force for every connecting role, so the
-      // grant they would make is made here explicitly.
-      await db.query(`GRANT ALL ON public.${policed}, public.${unpoliced} TO anon, authenticated`);
-      const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL);
-      const flagged = rows.filter((r) => r.anon || r.authenticated).map((r) => r.name);
-      expect(flagged.sort()).toEqual([policed, unpoliced].sort());
-    } finally {
-      await db.query('ROLLBACK');
+    const schema = `zz_open_tables_${randomUUID().slice(0, 8)}`;
+    const RETRYABLE = new Set(['40P01', '55P03']);
+    for (let attempt = 1; ; attempt += 1) {
+      await db.query('BEGIN');
+      try {
+        await db.query(`SET LOCAL lock_timeout = '10s'`);
+        await db.query(`CREATE SCHEMA ${schema}`);
+        await db.query(`CREATE TABLE ${schema}.policed (id int)`);
+        await db.query(`ALTER TABLE ${schema}.policed ENABLE ROW LEVEL SECURITY`);
+        await db.query(`CREATE POLICY open_to_all ON ${schema}.policed FOR ALL USING (true)`);
+        await db.query(`CREATE TABLE ${schema}.unpoliced (id int)`);
+        // Default privileges are not in force for every connecting role or
+        // schema, so the grant they would make in public is made explicitly.
+        await db.query(
+          `GRANT ALL ON ${schema}.policed, ${schema}.unpoliced TO anon, authenticated`
+        );
+        const { rows } = await db.query<OpenTable>(OPEN_TABLES_SQL, [schema]);
+        const flagged = rows.filter((r) => r.anon || r.authenticated).map((r) => r.name);
+        expect(flagged.sort()).toEqual(['policed', 'unpoliced']);
+        return;
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (!code || !RETRYABLE.has(code) || attempt >= 3) throw error;
+      } finally {
+        await db.query('ROLLBACK');
+      }
     }
   });
 });
