@@ -9,6 +9,7 @@
  * - Groups: Only authorized groups, with @mention or name trigger
  */
 
+import { EphemeralMessageCache } from './ephemeral-message-cache';
 import { EventEmitter } from 'events';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
@@ -59,9 +60,7 @@ export class WhatsAppListener extends EventEmitter {
   private maxReconnectAttempts = 10;
 
   // Ephemeral message cache
-  private messageCache = new Map<string, EphemeralMessage[]>();
-  private readonly maxMessagesPerChat = 100;
-  private readonly messageTtlMs = 30 * 60 * 1000; // 30 minutes
+  private messageCache = new EphemeralMessageCache<EphemeralMessage>();
 
   constructor(config?: WhatsAppListenerConfig) {
     super();
@@ -90,9 +89,16 @@ export class WhatsAppListener extends EventEmitter {
     }
 
     logger.info('Starting WhatsApp listener...', { accountId: this.config.accountId });
+    this.messageCache.start();
     this.isRunning = true;
 
-    await this.connect();
+    try {
+      await this.connect();
+    } catch (error) {
+      this.isRunning = false;
+      this.messageCache.stop();
+      throw error;
+    }
   }
 
   /**
@@ -196,6 +202,7 @@ export class WhatsAppListener extends EventEmitter {
    * Stop listening for messages
    */
   async stop(): Promise<void> {
+    this.messageCache.stop();
     if (!this.isRunning) {
       return;
     }
@@ -889,44 +896,12 @@ export class WhatsAppListener extends EventEmitter {
    * Cache a message for context
    */
   private cacheMessage(message: EphemeralMessage): void {
-    const { chatId } = message;
-
-    if (!this.messageCache.has(chatId)) {
-      this.messageCache.set(chatId, []);
-    }
-
-    const cache = this.messageCache.get(chatId)!;
-    cache.push(message);
-
-    if (cache.length > this.maxMessagesPerChat) {
-      cache.shift();
-    }
-
-    this.cleanExpiredMessages(chatId);
+    this.messageCache.add(message);
   }
 
-  /**
-   * Clean expired messages
-   */
-  private cleanExpiredMessages(chatId: string): void {
-    const cache = this.messageCache.get(chatId);
-    if (!cache) return;
-
-    const now = Date.now();
-    const filtered = cache.filter((msg) => now - msg.timestamp.getTime() < this.messageTtlMs);
-
-    if (filtered.length !== cache.length) {
-      this.messageCache.set(chatId, filtered);
-    }
-  }
-
-  /**
-   * Get recent messages from cache
-   */
+  /** Get recent messages from the ephemeral cache, newest last. */
   getRecentMessages(chatId: string, limit = 50): EphemeralMessage[] {
-    this.cleanExpiredMessages(chatId);
-    const cache = this.messageCache.get(chatId) || [];
-    return cache.slice(-limit);
+    return this.messageCache.getRecent(chatId, limit);
   }
 
   /**
@@ -940,14 +915,7 @@ export class WhatsAppListener extends EventEmitter {
    * Get cache stats
    */
   getCacheStats(): { chatCount: number; totalMessages: number } {
-    let totalMessages = 0;
-    for (const messages of this.messageCache.values()) {
-      totalMessages += messages.length;
-    }
-    return {
-      chatCount: this.messageCache.size,
-      totalMessages,
-    };
+    return this.messageCache.getStats();
   }
 
   get running(): boolean {
