@@ -17,8 +17,8 @@ import { randomUUID } from 'node:crypto';
 import { quietHoursAt } from './quiet-hours.js';
 import { mayRunDuringQuietHours } from './reminder-quiet-hours.js';
 import { CronExpressionParser } from 'cron-parser';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { env } from '../config/env.js';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../data/supabase/client.js';
 import { logger } from '../utils/logger.js';
 import {
   createHeartbeatNotificationStore,
@@ -267,7 +267,7 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   heartbeatCallback = onHeartbeat || null;
 
   // Initialize typed Supabase client
-  supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+  supabase = createServerSupabaseClient<Database>();
 
   // A fresh scheduler has not missed anything yet, and must not inherit the
   // previous one's gap: re-init is a new process's worth of history. The
@@ -568,7 +568,7 @@ export async function processHeartbeat(
   skipped: number;
 }> {
   if (!supabase) {
-    supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    supabase = createServerSupabaseClient<Database>();
   }
 
   const stats = { processed: 0, delivered: 0, failed: 0, skipped: 0 };
@@ -1263,7 +1263,7 @@ export async function createReminder(
   client?: SupabaseClient<Database>
 ): Promise<{ id: string } | null> {
   if (!client && !supabase) {
-    supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    supabase = createServerSupabaseClient<Database>();
   }
   const db = (client ?? supabase) as SupabaseClient<Database>;
 
@@ -1317,7 +1317,7 @@ export async function ensureDefaultReminders(params: {
 }): Promise<void> {
   try {
     if (!supabase) {
-      supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+      supabase = createServerSupabaseClient<Database>();
     }
 
     // Resolve delivery channel if not pre-resolved by caller
@@ -1456,7 +1456,7 @@ export async function ensureDefaultReminders(params: {
  */
 export async function listReminders(userId: string, status?: string): Promise<DueReminder[]> {
   if (!supabase) {
-    supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    supabase = createServerSupabaseClient<Database>();
   }
 
   let query = supabase
@@ -1484,7 +1484,7 @@ export async function listReminders(userId: string, status?: string): Promise<Du
  */
 export async function cancelReminder(reminderId: string, userId: string): Promise<boolean> {
   if (!supabase) {
-    supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    supabase = createServerSupabaseClient<Database>();
   }
 
   const { error } = await supabase

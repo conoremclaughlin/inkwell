@@ -8,10 +8,11 @@
  * Token chain: MCP client refresh_token (opaque, DB-backed) -> jwt.sign() -> self-issued JWT
  */
 
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env';
+import { createServerSupabaseClient } from '../../data/supabase/client';
 import { logger } from '../../utils/logger';
 import type { Database } from '../../data/supabase/types';
 import {
@@ -174,12 +175,7 @@ export class InkAuthProvider {
   private supabase: SupabaseClient<Database>;
 
   constructor() {
-    this.supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    });
+    this.supabase = createServerSupabaseClient<Database>();
   }
 
   // --------------------------------------------------------------------------

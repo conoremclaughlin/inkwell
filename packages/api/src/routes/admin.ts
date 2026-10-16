@@ -17,12 +17,13 @@ import { threadUploadsRouter } from './thread-uploads';
 import { parseListSearch, listSearchFilter } from './list-search';
 import { afterCursorFilter, encodeTasksCursor, parseTasksPage } from './tasks-page';
 import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oauth-attempts';
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { resolveParentJournal } from '@inklabs/shared/node-host';
 import { logger } from '../utils/logger';
 import { env, isDevelopment } from '../config/env';
+import { createServerSupabaseClient } from '../data/supabase/client';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
@@ -1144,9 +1145,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     const token = authHeader.substring(7);
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     let inkUserId: string | undefined;
     let userEmail: string | undefined;
@@ -1482,9 +1481,7 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
     const refreshToken = req.body?.refreshToken || req.cookies?.['pcp-admin-refresh'];
 
     if (refreshToken) {
-      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-        auth: { autoRefreshToken: false, persistSession: false },
-      });
+      const supabase = createServerSupabaseClient();
       await supabase
         .from('mcp_tokens')
         .delete()
@@ -1573,9 +1570,7 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
     // Dedicated throwaway client for the sign-in: signInWithPassword mutates
     // the client's internal auth state, so it must never run on a shared
     // instance (see CLAUDE.md "Supabase Client Footgun").
-    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const authClient = createServerSupabaseClient('publishable');
     const { data: signIn, error: signInError } = await authClient.auth.signInWithPassword({
       email,
       password,
@@ -1586,9 +1581,7 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const inkUser = await findOrProvisionInkUser(supabase, {
       authUid: signIn.user.id,
@@ -1715,9 +1708,7 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
     }
 
     // Throwaway client — signUp mutates client auth state like signIn does.
-    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const authClient = createServerSupabaseClient('publishable');
     const { data: signUp, error: signUpError } = await authClient.auth.signUp({ email, password });
 
     if (signUpError) {
@@ -1737,9 +1728,7 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authUid = signUp.user?.id ?? signUp.session.user?.id;
     if (!authUid) {
       res.status(500).json({ error: 'Failed to provision user' });
@@ -1840,9 +1829,7 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: consumed, error: consumeError } = await supabase
       .from('mcp_tokens')
@@ -1896,9 +1883,7 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const result = await exchangeRefreshToken(
       supabase,
       refreshToken,
@@ -1993,9 +1978,7 @@ function candidateServerUrls(req: Request): { urls: string[]; insecureTransport:
 router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // Codes nobody scanned would otherwise accumulate; sweep this user's
     // expired ones on the way in (best effort — a failure here is not ours to
@@ -2109,9 +2092,7 @@ router.use('/browser-companion', createBrowserPairingAdminRouter(getDataComposer
 router.post('/account/deletion', async (req: Request, res: Response) => {
   try {
     const userId = (req as AdminAuthRequest).inkUserId;
-    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient<Database>();
 
     const { data: existing, error: existingError } = await supabase
       .from('account_deletion_requests')
@@ -2481,9 +2462,7 @@ async function ownedDeletableSpace(
 router.get('/workspaces/:workspaceId/deletion-preview', async (req: Request, res: Response) => {
   try {
     const userId = (req as AdminAuthRequest).inkUserId;
-    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient<Database>();
     const owned = await ownedDeletableSpace(supabase, req.params.workspaceId, userId);
     if (!('space' in owned)) {
       res.status(owned.status).json({ error: owned.error });
@@ -2548,9 +2527,7 @@ export const SPACE_DRAIN_WAIT_MS = 30_000;
 router.delete('/workspaces/:workspaceId', async (req: Request, res: Response) => {
   try {
     const userId = (req as AdminAuthRequest).inkUserId;
-    const supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient<Database>();
     const owned = await ownedDeletableSpace(supabase, req.params.workspaceId, userId);
     if (!('space' in owned)) {
       res.status(owned.status).json({ error: owned.error });
@@ -3104,7 +3081,7 @@ router.post('/invitations/accept', async (req: Request, res: Response) => {
  */
 router.get('/trusted-users', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data: users, error } = await supabase
@@ -3153,7 +3130,7 @@ router.post('/trusted-users', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { error } = await supabase.from('trusted_users').insert({
       user_id: null,
       platform,
@@ -3185,7 +3162,7 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const authReq = req as AdminAuthRequest;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
 
     // Don't allow deleting owners
     const { data: user } = await supabase
@@ -3228,7 +3205,7 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
  */
 router.get('/groups', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
@@ -3268,7 +3245,7 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
     const { id } = req.params;
     const authReq = req as AdminAuthRequest;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
 
     const { error } = await supabase
       .from('authorized_groups')
@@ -3302,7 +3279,7 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
  */
 router.get('/challenge-codes', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
@@ -3340,7 +3317,7 @@ router.get('/challenge-codes', async (req: Request, res: Response) => {
  */
 router.post('/challenge-codes', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // Check rate limit
@@ -3642,9 +3619,7 @@ router.post('/heartbeat', async (req: Request, res: Response) => {
 router.get('/routing', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: routesData, error: routesError } = await supabase
       .from('channel_routes')
@@ -3778,9 +3753,7 @@ router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
   try {
     const { sbSlug } = req.params;
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
@@ -3942,9 +3915,7 @@ router.patch('/identities/:sbSlug/settings', async (req: Request, res: Response)
   try {
     const authReq = req as AdminAuthRequest;
     const { sbSlug } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // Find the identity for this agent + workspace
     const { data: identity, error: fetchErr } = await supabase
@@ -4060,9 +4031,7 @@ router.patch('/studios/:studioId', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const { studioId } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // Verify studio belongs to this user
     const { data: studio, error: fetchErr } = await supabase
@@ -4114,9 +4083,7 @@ router.patch('/studios/:studioId', async (req: Request, res: Response) => {
 router.post('/routing/routes', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const body = (req.body || {}) as Record<string, unknown>;
 
     const sbId = normalizeNullableText(body.sbId) || normalizeNullableText(body.identityId);
@@ -4214,9 +4181,7 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
   try {
     const { routeId } = req.params;
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: existing, error: existingError } = await supabase
       .from('channel_routes')
@@ -4363,9 +4328,7 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
   try {
     const { routeId } = req.params;
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: existing, error: existingError } = await supabase
       .from('channel_routes')
@@ -4419,9 +4382,7 @@ router.patch('/routing/identities/:sbId', async (req: Request, res: Response) =>
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // Verify identity belongs to user + workspace
     const { data: identity, error: fetchError } = await supabase
@@ -4471,9 +4432,7 @@ router.patch('/routing/reminders/:reminderId', async (req: Request, res: Respons
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // Verify reminder belongs to user
     const { data: reminder, error: fetchError } = await supabase
@@ -4512,7 +4471,7 @@ router.patch('/routing/reminders/:reminderId', async (req: Request, res: Respons
  */
 router.get('/reminders', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
@@ -4563,9 +4522,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
  */
 router.get('/automations', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const [remindersResult, strategyGroupsResult] = await Promise.all([
@@ -4625,7 +4582,7 @@ router.get('/automations', async (req: Request, res: Response) => {
  */
 router.get('/user-identity', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
@@ -4691,7 +4648,7 @@ router.get('/user-identity', async (req: Request, res: Response) => {
  */
 router.get('/user-identity/history', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // First get the user identity ID
@@ -4966,7 +4923,7 @@ router.post('/inklings/:id/cancel', async (req: Request, res: Response) => {
  */
 router.get('/individuals', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
@@ -5020,7 +4977,7 @@ router.get('/individuals', async (req: Request, res: Response) => {
 router.get('/individuals/:sbSlug/history', async (req: Request, res: Response) => {
   try {
     const { sbSlug } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // First get the identity ID
@@ -5107,7 +5064,7 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
     const offset = parseInt(req.query.offset as string) || 0;
     const authReq = req as AdminAuthRequest;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const timeline: TimelineEntry[] = [];
     const { data: identity } = await supabase
       .from('agent_identities')
@@ -5268,7 +5225,7 @@ router.get(
   async (req: Request, res: Response) => {
     try {
       const { sbSlug, memoryId } = req.params;
-      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+      const supabase = createServerSupabaseClient();
       const authReq = req as AdminAuthRequest;
 
       const { data: identity } = await supabase
@@ -5361,10 +5318,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 50);
     const offset = parseInt(req.query.offset as string) || 0;
 
-    const supabase: SupabaseClient<Database> = createClient(
-      env.SUPABASE_URL,
-      env.SUPABASE_SECRET_KEY
-    );
+    const supabase: SupabaseClient<Database> = createServerSupabaseClient();
 
     const { data: identityRows, error: identityError } = await supabase
       .from('agent_identities')
@@ -6110,7 +6064,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
 
     // Get the connected account
     const { data: account, error: accountError } = await supabase
@@ -6184,9 +6138,7 @@ router.get('/artifacts', async (req: Request, res: Response) => {
       res.status(400).json({ error: search.error });
       return;
     }
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     let query = supabase
@@ -6241,9 +6193,7 @@ router.get('/artifacts', async (req: Request, res: Response) => {
 router.get('/artifacts/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data: artifact, error } = await supabase
@@ -6305,9 +6255,7 @@ router.patch('/artifacts/permissions', async (req: Request, res: Response) => {
     const body = req.body as { editors?: unknown; collaborators?: unknown };
     const normalizedEditors = resolveArtifactEditorsFromBody(body);
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const updates: { edit_mode: ArtifactEditMode; collaborators?: string[]; updated_at: string } = {
@@ -6366,9 +6314,7 @@ router.patch('/artifacts/:id/permissions', async (req: Request, res: Response) =
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const inkUserId = authReq.inkUserId;
     const workspaceId = authReq.inkWorkspaceId;
@@ -6436,7 +6382,7 @@ router.patch('/artifacts/:id/permissions', async (req: Request, res: Response) =
 router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const inkUserId = authReq.inkUserId;
     const workspaceId = authReq.inkWorkspaceId;
@@ -6586,7 +6532,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const inkUserId = authReq.inkUserId;
     const workspaceId = authReq.inkWorkspaceId;
@@ -6711,7 +6657,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
 router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // Verify artifact ownership
@@ -6795,9 +6741,7 @@ router.delete('/connected-accounts/:id', async (req: Request, res: Response) => 
  */
 router.get('/sessions', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const includeCompleted = req.query.includeCompleted === 'true';
 
@@ -7193,9 +7137,7 @@ function describeLease(raw: unknown): {
 router.get('/studios', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     // 1. Fetch all agent identities for this user
     const { data: identities } = await supabase
@@ -7347,9 +7289,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
       Math.max(1, Number.parseInt(String(req.query.limit || 50), 10) || 50)
     );
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
@@ -7489,9 +7429,7 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
     const format: TranscriptFormat = requestedFormat === 'jsonl' ? 'jsonl' : 'json';
     const download = req.query.download === '1' || req.query.download === 'true';
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
@@ -7571,9 +7509,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
     const sessionId = req.params.id;
     const authReq = req as AdminAuthRequest;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
@@ -7735,9 +7671,7 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
       (req.body as Record<string, unknown>)?.backendSessionId
     );
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
@@ -7868,9 +7802,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     const offset = Math.max(0, Number.parseInt(String(req.query.offset || 0), 10) || 0);
     const includeLocal = req.query.includeLocal !== 'false';
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
 
     const { data: scopedIdentities, error: scopedIdentityError } = await supabase
       .from('agent_identities')
@@ -8065,7 +7997,7 @@ router.get('/skills/paths', async (_req: Request, res: Response) => {
 router.get('/skills/registry', async (req: Request, res: Response) => {
   try {
     const { type, category, search, official, limit, offset } = req.query;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8095,7 +8027,7 @@ router.get('/skills/registry', async (req: Request, res: Response) => {
 router.get('/skills/registry/:idOrName', async (req: Request, res: Response) => {
   try {
     const { idOrName } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8126,7 +8058,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8156,7 +8088,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
 router.delete('/skills/install/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8182,7 +8114,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
   try {
     const { installationId } = req.params;
     const { enabled, versionPinned } = req.body;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8223,7 +8155,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
 router.get('/skills/installed', async (req: Request, res: Response) => {
   try {
     const { type, category, search } = req.query;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
@@ -8273,7 +8205,7 @@ router.post('/skills/publish', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
@@ -8326,7 +8258,7 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
@@ -8360,7 +8292,7 @@ router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => 
     const { skillId } = req.params;
     const authReq = req as AdminAuthRequest;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
@@ -8385,7 +8317,7 @@ router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Respo
     const authReq = req as AdminAuthRequest;
     const { message } = req.body;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
@@ -8418,7 +8350,7 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createServerSupabaseClient();
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
@@ -8468,9 +8400,7 @@ function refuseThreadWrite(res: Response, role: string, action: string): void {
 
 router.get('/threads', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
     // Threads are workspace rows (spec inkmail-thread-scope §1): the page is
@@ -8921,9 +8851,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'before must be a message id' });
       return;
     }
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data: thread, error: threadError } = await supabase
@@ -9619,9 +9547,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     // The workspace role before any lookup; the sender check inside
     // lookUpClientMessage keeps a replay to the person who sent the original.
@@ -9830,10 +9756,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 router.use(
   '/threads/uploads',
   threadUploadsRouter({
-    db: () =>
-      createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-        auth: { autoRefreshToken: false, persistSession: false },
-      }),
+    db: () => createServerSupabaseClient(),
     root: uploadsRoot,
     writeRoles: THREAD_WRITE_ROLES,
     retentionMs: uploadsRetentionMs(),
@@ -9872,9 +9795,7 @@ router.post('/threads/reactions', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const result = await reactToMessage(supabase, {
       workspaceId: authReq.inkWorkspaceId,
       threadKey,
@@ -9914,9 +9835,7 @@ router.put('/threads/pin', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const result = await setThreadPin(supabase, {
       workspaceId: authReq.inkWorkspaceId,
       userId: authReq.inkUserId,
@@ -9956,9 +9875,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
       return;
     }
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data: thread, error: threadError } = await supabase
@@ -10028,9 +9945,7 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'key query parameter is required' });
       return;
     }
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
 
@@ -10382,9 +10297,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
     }
     const page = pageRequest.page;
 
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     let query = supabase
@@ -10597,9 +10510,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
  */
 router.get('/activity', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const limit = Math.min(Number(req.query.limit) || 50, 200);
 
@@ -10640,9 +10551,7 @@ router.get('/activity', async (req: Request, res: Response) => {
 router.put('/tasks/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const body = (req.body || {}) as Record<string, unknown>;
@@ -10742,9 +10651,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
  */
 router.get('/task-groups', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // Fetch task groups with joined agent identity and project. Count rides
@@ -10841,9 +10748,7 @@ router.get('/task-groups', async (req: Request, res: Response) => {
 router.get('/task-groups/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
 
@@ -10954,9 +10859,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const limit = Math.min(Number(req.query.limit) || 50, 200);
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // Verify the group belongs to this user
@@ -11010,9 +10913,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
 router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { data: group } = await supabase
@@ -11107,9 +11008,7 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
 router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     // Verify task belongs to user
@@ -11186,9 +11085,7 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { content, parentCommentId } = req.body;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
@@ -11253,9 +11150,7 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
 router.delete('/tasks/:taskId/comments/:commentId', async (req: Request, res: Response) => {
   try {
     const { taskId, commentId } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { error } = await supabase
@@ -11402,9 +11297,7 @@ async function signedApprovalRequester(
 
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
 
     const { tool, args, reason, studioId, sessionId, origin, timeoutSeconds = 300 } = req.body;
@@ -11599,9 +11492,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
  */
 router.post('/approval-requests/consume', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const { tool, args, cwd } = req.body ?? {};
     if (typeof tool !== 'string' || typeof args !== 'string' || typeof cwd !== 'string') {
@@ -11643,9 +11534,7 @@ router.post('/approval-requests/consume', async (req: Request, res: Response) =>
  */
 router.get('/approval-requests/:requestId/status', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createServerSupabaseClient();
     const authReq = req as AdminAuthRequest;
     const { requestId } = req.params;
 

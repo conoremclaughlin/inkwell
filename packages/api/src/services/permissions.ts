@@ -5,9 +5,9 @@
  * Permissions can be toggled per-user and translated to different backend formats.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
-import { env } from '../config/env';
+import { createServerSupabaseClient } from '../data/supabase/client';
 
 export type PermissionId =
   | 'web_search'
@@ -53,9 +53,7 @@ export class PermissionsService {
   private definitionsCache: Map<PermissionId, PermissionDefinition> | null = null;
 
   constructor() {
-    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    this.supabase = createServerSupabaseClient();
   }
 
   /**

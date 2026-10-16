@@ -10,8 +10,8 @@
  * - New human partner: who the new SB will collaborate with
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { env } from '../../config/env';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { createServerSupabaseClient } from '../../data/supabase/client';
 import { logger } from '../../utils/logger';
 
 export interface ValueSeed {
@@ -59,11 +59,7 @@ export class KindleService {
     // Server-side client: persistSession MUST be false (AGENTS.md §Security) —
     // without it a session-mutating auth call would silently swap the service
     // role key for a user JWT on later PostgREST queries.
-    this.supabase =
-      supabase ||
-      createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-        auth: { autoRefreshToken: false, persistSession: false },
-      });
+    this.supabase = supabase || createServerSupabaseClient();
   }
 
   /**

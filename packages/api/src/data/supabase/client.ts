@@ -5,6 +5,34 @@ import type { Database } from './types';
 
 let supabaseClient: SupabaseClient<Database> | null = null;
 
+/** What every client this server makes needs (AGENTS.md, Security rule 3). */
+const SERVER_CLIENT_OPTIONS = {
+  auth: { autoRefreshToken: false, persistSession: false },
+};
+
+/**
+ * A new Supabase client for one caller, with token refresh and session
+ * persistence off. This is the only place in packages/api that calls
+ * createClient; client.guard.test.ts holds it to that.
+ *
+ * With the library's defaults every client starts a refresh interval, and the
+ * timer keeps it reachable for the life of the process. 100 clients made that
+ * way were all alive after 20 forced collections, and none with refresh off
+ * (Lumen, 2026-10-16, thread inkwell:debug:api-memory-growth).
+ * `persistSession: false` alone still starts the timer.
+ *
+ * Each call returns its own client, so signing in or signing up on it changes
+ * no other caller's client. Plain data access can share getSupabaseClient().
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- createClient's own default
+export function createServerSupabaseClient<Db = any>(key: 'secret' | 'publishable' = 'secret') {
+  return createClient<Db>(
+    env.SUPABASE_URL,
+    key === 'secret' ? env.SUPABASE_SECRET_KEY : env.SUPABASE_PUBLISHABLE_KEY,
+    SERVER_CLIENT_OPTIONS
+  );
+}
+
 /**
  * Singleton Supabase client for PostgREST data queries using the service role key.
  *
@@ -24,12 +52,7 @@ export function createSupabaseClient(): SupabaseClient<Database> {
   }
 
   try {
-    supabaseClient = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    });
+    supabaseClient = createServerSupabaseClient<Database>();
 
     logger.info('Supabase client created successfully', {
       url: env.SUPABASE_URL,
