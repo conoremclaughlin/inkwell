@@ -94,13 +94,28 @@ interface UserRow {
   username: string | null;
 }
 
+/**
+ * A part of a member's name, or '' when it may be an email address: a
+ * username or name field can hold one, and the space must never read it.
+ */
+function namePart(value: string | null | undefined): string {
+  const part = (value ?? '').trim();
+  return part.includes('@') ? '' : part;
+}
+
 /** A member's name as the space reads it: never an email address. */
-function displayName(user: UserRow | undefined): string {
-  const full = [user?.first_name, user?.last_name]
-    .map((part) => (part ?? '').trim())
-    .filter(Boolean)
-    .join(' ');
-  return full || (user?.username ?? '').trim() || 'a member of this space';
+export function displayName(user: UserRow | undefined): string {
+  const full = [namePart(user?.first_name), namePart(user?.last_name)].filter(Boolean).join(' ');
+  return full || namePart(user?.username) || 'a member of this space';
+}
+
+/** The Google connection a member's busy times are read with. */
+export interface BusyConnection {
+  /** Whether a stored connection that can answer free/busy was found. */
+  found: boolean;
+  workspaceId: string | null;
+  /** The stored connection chosen, so the token read is that one and no other. */
+  accountId?: string;
 }
 
 /**
@@ -108,25 +123,30 @@ function displayName(user: UserRow | undefined): string {
  * one in `spaceId` if it can, else their most recent one that can. `found`
  * is false when no stored connection can; the call may still succeed through
  * a credential the server holds for them (GOOGLE_CREDENTIAL_SOURCES).
+ *
+ * The chosen row's id travels with it: a newer connection in the same
+ * workspace without a calendar scope must not be the one whose token is read
+ * (Lumen, PR #882).
  */
 export async function freeBusyConnection(
   client: Client,
   userId: string,
   spaceId: string
-): Promise<{ found: boolean; workspaceId: string | null }> {
+): Promise<BusyConnection> {
   const { data, error } = await client
     .from('connected_accounts')
-    .select('workspace_id, scopes')
+    .select('id, workspace_id, scopes')
     .eq('user_id', userId)
     .eq('provider', 'google')
     .eq('status', 'active')
     .order('updated_at', { ascending: false });
   if (error) throw new Error(`Could not read a member's Google connection: ${error.message}`);
-  const usable = ((data ?? []) as Array<{ workspace_id: string | null; scopes: string[] | null }>)
-    .filter((row) => canReadFreeBusy(row.scopes))
-    .map((row) => row.workspace_id);
+  const usable = (
+    (data ?? []) as Array<{ id: string; workspace_id: string | null; scopes: string[] | null }>
+  ).filter((row) => canReadFreeBusy(row.scopes));
   if (usable.length === 0) return { found: false, workspaceId: spaceId };
-  return { found: true, workspaceId: usable.includes(spaceId) ? spaceId : usable[0] };
+  const chosen = usable.find((row) => row.workspace_id === spaceId) ?? usable[0];
+  return { found: true, workspaceId: chosen.workspace_id, accountId: chosen.id };
 }
 
 export interface SpaceBusyTimes {
@@ -142,7 +162,7 @@ export interface SpaceBusyTimes {
 export interface SpaceBusyDeps {
   client: Client;
   /** A member's primary-calendar busy blocks, read with their own connection. */
-  busyFor: (userId: string, window: BusyWindow, workspaceId: string | null) => Promise<BusyBlock[]>;
+  busyFor: (userId: string, window: BusyWindow, connection: BusyConnection) => Promise<BusyBlock[]>;
   now?: () => Date;
 }
 
@@ -182,7 +202,7 @@ export async function readSpaceBusyTimes(
       try {
         const connection = await freeBusyConnection(deps.client, row.user_id, spaceId);
         found = connection.found;
-        const blocks = await deps.busyFor(row.user_id, window, connection.workspaceId);
+        const blocks = await deps.busyFor(row.user_id, window, connection);
         return { name, busy: clipToWindow(blocks, window) };
       } catch (readError) {
         logger.warn("Couldn't read a member's shared busy times", {
@@ -250,8 +270,7 @@ export async function handleGetSpaceBusyTimes(
       client,
       busyFor:
         options.busyFor ??
-        ((userId, window, connectionWorkspaceId) =>
-          calendar.primaryBusy(userId, window, connectionWorkspaceId)),
+        ((userId, window, connection) => calendar.primaryBusy(userId, window, connection)),
       now: options.now,
     },
     workspaceId,

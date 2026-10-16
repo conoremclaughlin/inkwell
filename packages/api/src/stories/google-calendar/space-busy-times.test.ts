@@ -79,10 +79,12 @@ import {
   busyWindow,
   canReadFreeBusy,
   clipToWindow,
+  displayName,
   freeBusyConnection,
   isCalendarShareLevel,
   readSpaceBusyTimes,
   type BusyBlock,
+  type BusyConnection,
 } from './space-busy-times';
 
 const SPACE = '00000000-0000-4000-8000-00000000000a';
@@ -98,6 +100,8 @@ const at = (offsetMs: number) => new Date(NOW.getTime() + offsetMs).toISOString(
 
 function google(userId: string, workspaceId: string | null, scopes: string[], updatedAt: string) {
   return {
+    // Invented row id, unique per person, place and age.
+    id: `acct-${userId.slice(-1)}-${workspaceId ?? 'none'}-${updatedAt}`,
     user_id: userId,
     provider: 'google',
     status: 'active',
@@ -164,6 +168,24 @@ describe('the window (D7)', () => {
   });
 });
 
+describe("a member's name", () => {
+  it('keeps every part that holds no address, and falls back past one that does', () => {
+    const user = (first: string | null, last: string | null, username: string | null) => ({
+      id: ADA,
+      first_name: first,
+      last_name: last,
+      username,
+    });
+    expect(displayName(user('Ada', 'Lovelace', 'ada'))).toBe('Ada Lovelace');
+    expect(displayName(user('a@example.test', 'Lovelace', 'ada'))).toBe('Lovelace');
+    expect(displayName(user(null, null, 'ada'))).toBe('ada');
+    expect(displayName(user(null, 'x@example.test', 'ada@example.test'))).toBe(
+      'a member of this space'
+    );
+    expect(displayName(undefined)).toBe('a member of this space');
+  });
+});
+
 describe('the share levels', () => {
   it("are 'none' and 'busy' only", () => {
     expect(['none', 'busy'].every(isCalendarShareLevel)).toBe(true);
@@ -187,14 +209,28 @@ describe("a member's connection", () => {
     expect(await freeBusyConnection(client, ADA, SPACE)).toEqual({
       found: true,
       workspaceId: SPACE,
+      accountId: `acct-1-${SPACE}-2026-10-01`,
     });
     expect(await freeBusyConnection(client, SAM, SPACE)).toEqual({
       found: true,
       workspaceId: null,
+      accountId: 'acct-2-none-2026-10-09',
     });
     expect(await freeBusyConnection(client, KIT, SPACE)).toEqual({
       found: false,
       workspaceId: SPACE,
+    });
+  });
+
+  it('names the connection it chose, so a newer mail-only one in the same space is never read (Lumen, PR #882)', async () => {
+    fake.tables.connected_accounts = [
+      google(ADA, SPACE, [CALENDAR], '2026-10-01'),
+      google(ADA, SPACE, ['https://www.googleapis.com/auth/gmail.readonly'], '2026-10-15'),
+    ];
+    expect(await freeBusyConnection(fakeClient(), ADA, SPACE)).toEqual({
+      found: true,
+      workspaceId: SPACE,
+      accountId: `acct-1-${SPACE}-2026-10-01`,
     });
   });
 
@@ -211,7 +247,7 @@ describe('readSpaceBusyTimes', () => {
   const oneHourFromWindowStart = async (
     _userId: string,
     window: { timeMin: string },
-    _workspaceId: string | null
+    _connection: BusyConnection
   ) => [{ start: window.timeMin, end: at(3_600_000) }];
   const busyFor = vi.fn(oneHourFromWindowStart);
 
@@ -225,9 +261,9 @@ describe('readSpaceBusyTimes', () => {
 
   it('reads only the members who switched it on, each with their own connection (D6)', async () => {
     const result = await read();
-    expect(busyFor.mock.calls.map(([userId, , workspaceId]) => [userId, workspaceId])).toEqual([
-      [ADA, SPACE],
-      [SAM, null],
+    expect(busyFor.mock.calls.map(([userId, , connection]) => [userId, connection])).toEqual([
+      [ADA, { found: true, workspaceId: SPACE, accountId: `acct-1-${SPACE}-2026-10-01` }],
+      [SAM, { found: true, workspaceId: null, accountId: 'acct-2-none-2026-10-01' }],
     ]);
     // Kit connected Google and shares in another space: nothing of theirs here.
     expect(busyFor.mock.calls.some(([userId]) => userId === KIT)).toBe(false);
@@ -284,8 +320,33 @@ describe('readSpaceBusyTimes', () => {
     ]);
   });
 
-  it('never carries an email address, whatever the users row holds', async () => {
-    expect(JSON.stringify(await read())).not.toMatch(/@example\.test/);
+  it('never carries an email address, even one held in a name field (Lumen, PR #882)', async () => {
+    // Ada shares; Kit doesn't. Each has an address where a name should be.
+    fake.tables.users[0] = {
+      id: ADA,
+      first_name: 'ada@example.test',
+      last_name: 'Lovelace',
+      username: 'ada@example.test',
+    };
+    fake.tables.users[1] = {
+      id: SAM,
+      first_name: null,
+      last_name: null,
+      username: 'sam@example.test',
+    };
+    fake.tables.users[2] = {
+      id: KIT,
+      first_name: ' kit@example.test ',
+      last_name: null,
+      username: null,
+    };
+    const result = await read();
+    expect(JSON.stringify(result)).not.toContain('@');
+    expect(result.sharing.map((person) => person.name)).toEqual([
+      'Lovelace',
+      'a member of this space',
+    ]);
+    expect(result.notSharing).toEqual(['a member of this space']);
   });
 
   it('refuses when the members cannot be read', async () => {
@@ -318,7 +379,7 @@ describe('GoogleCalendarService.primaryBusy', () => {
             : [];
       return { data: { calendars: { primary: { busy } } } };
     });
-    const busy = await new GoogleCalendarService().primaryBusy(SAM, year, null);
+    const busy = await new GoogleCalendarService().primaryBusy(SAM, year, { workspaceId: null });
     const asked = fake.freebusy.mock.calls.map(([{ requestBody }]) => [
       requestBody.timeMin,
       requestBody.timeMax,
@@ -346,8 +407,13 @@ describe('GoogleCalendarService.primaryBusy', () => {
         },
       },
     });
-    const busy = await new GoogleCalendarService().primaryBusy(SAM, window, null);
-    expect(fake.getValidAccessToken).toHaveBeenCalledWith(SAM, 'google', null);
+    const busy = await new GoogleCalendarService().primaryBusy(SAM, window, {
+      workspaceId: null,
+      accountId: 'acct-chosen',
+    });
+    expect(fake.getValidAccessToken).toHaveBeenCalledWith(SAM, 'google', null, {
+      accountId: 'acct-chosen',
+    });
     expect(fake.freebusy).toHaveBeenCalledWith({
       requestBody: { ...window, items: [{ id: 'primary' }] },
     });
@@ -359,15 +425,15 @@ describe('GoogleCalendarService.primaryBusy', () => {
     fake.freebusy.mockResolvedValue({
       data: { calendars: { primary: { errors: [{ domain: 'global', reason: 'notFound' }] } } },
     });
-    await expect(new GoogleCalendarService().primaryBusy(SAM, window, null)).rejects.toThrow(
-      'Google could not read free/busy: notFound'
-    );
+    await expect(
+      new GoogleCalendarService().primaryBusy(SAM, window, { workspaceId: null })
+    ).rejects.toThrow('Google could not read free/busy: notFound');
   });
 
   it('refuses when Google returns no calendar at all', async () => {
     fake.freebusy.mockResolvedValue({ data: { calendars: {} } });
-    await expect(new GoogleCalendarService().primaryBusy(SAM, window, null)).rejects.toThrow(
-      'no free/busy'
-    );
+    await expect(
+      new GoogleCalendarService().primaryBusy(SAM, window, { workspaceId: null })
+    ).rejects.toThrow('no free/busy');
   });
 });

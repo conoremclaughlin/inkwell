@@ -318,14 +318,21 @@ export class GoogleCalendarService {
   private oauthService = getOAuthService();
 
   /**
-   * Get an authenticated Calendar API client for a user. `workspaceId` picks
-   * which of the user's connections to use; left out, the request's own.
+   * Get an authenticated Calendar API client for a user. `workspaceId` and
+   * `accountId` pick which of the user's connections to use; left out, the
+   * request's workspace and its most recent connection.
    */
   private async getClient(
     userId: string,
-    workspaceId?: string | null
+    workspaceId?: string | null,
+    accountId?: string
   ): Promise<calendar_v3.Calendar> {
-    const accessToken = await this.oauthService.getValidAccessToken(userId, 'google', workspaceId);
+    const accessToken = await this.oauthService.getValidAccessToken(
+      userId,
+      'google',
+      workspaceId,
+      accountId ? { accountId } : {}
+    );
 
     const auth = new google.auth.OAuth2();
     auth.setCredentials({ access_token: accessToken });
@@ -593,14 +600,15 @@ export class GoogleCalendarService {
    * When the user's primary calendar is busy between two instants, from
    * Google's free/busy query: a start and an end per block, and nothing else.
    * No event is read, so no title, place or attendee can come back.
-   * `workspaceId` picks which of the user's Google connections to use.
+   * `connection` is the user's Google connection to use: its workspace, and
+   * the stored account when one was chosen.
    */
   async primaryBusy(
     userId: string,
     window: { timeMin: string; timeMax: string },
-    workspaceId: string | null
+    connection: { workspaceId: string | null; accountId?: string }
   ): Promise<Array<{ start: string; end: string }>> {
-    const calendar = await this.getClient(userId, workspaceId);
+    const calendar = await this.getClient(userId, connection.workspaceId, connection.accountId);
     const min = Date.parse(window.timeMin);
     const max = Date.parse(window.timeMax);
     if (Number.isNaN(min) || Number.isNaN(max)) throw new Error('Unreadable free/busy window');

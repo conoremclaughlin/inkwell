@@ -753,18 +753,28 @@ class OAuthService {
    * the error, so "the cloud row expired and the desktop file was refused" reads
    * as exactly that. A user with no desktop file sees the message they always
    * saw.
+   *
+   * `accountId` names one stored connection, for a caller that has already
+   * chosen it (by its scopes, say); without it the most recent active row in
+   * the workspace is used.
    */
   async getValidAccessToken(
     userId: string,
     provider: string,
-    workspaceId?: string | null
+    workspaceId?: string | null,
+    options: { accountId?: string } = {}
   ): Promise<string> {
     // An inkling's turn gets no token unless its tool is turned on for
     // inklings, checked before any account is read (inkling-account-gate.ts).
     await this.accountGate(this.supabase, provider, userId);
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     if (!this.usesDesktopSource(provider)) {
-      const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+      const cloud = await this.getCloudAccessToken(
+        userId,
+        provider,
+        resolvedWorkspaceId,
+        options.accountId
+      );
       if (cloud.token !== null) return cloud.token;
       throw new Error(cloud.reason);
     }
@@ -773,7 +783,12 @@ class OAuthService {
     let cloudReason: string | null = null;
     for (const source of this.sources) {
       if (source === 'cloud') {
-        const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+        const cloud = await this.getCloudAccessToken(
+          userId,
+          provider,
+          resolvedWorkspaceId,
+          options.accountId
+        );
         if (cloud.token !== null) return cloud.token;
         cloudReason = cloud.reason;
         failures.push(`cloud: ${cloud.reason}`);
@@ -850,7 +865,8 @@ class OAuthService {
   private async getCloudAccessToken(
     userId: string,
     provider: string,
-    resolvedWorkspaceId: string | null | undefined
+    resolvedWorkspaceId: string | null | undefined,
+    accountId?: string
   ): Promise<{ token: string; reason?: undefined } | { token: null; reason: string }> {
     interface CloudAccountRow {
       id: string;
@@ -872,6 +888,7 @@ class OAuthService {
     } else if (resolvedWorkspaceId) {
       query = query.eq('workspace_id', resolvedWorkspaceId);
     }
+    if (accountId) query = query.eq('id', accountId);
 
     const result = await query.order('updated_at', { ascending: false }).limit(1).maybeSingle();
     const account = result.data as CloudAccountRow | null;
