@@ -54,8 +54,17 @@ describe('classifyAddress', () => {
     ['::1', 'loopback'],
     ['[::1]', 'loopback'],
     ['::7f00:1', 'reserved'],
+    // The same IPv4-compatible block written with a dotted quad. ipaddr.js
+    // reads these as IPv4-mapped, which would make ::8.8.8.8 public.
+    ['::127.0.0.1', 'reserved'],
+    ['::8.8.8.8', 'reserved'],
     ['100::1', 'reserved'],
     ['2001::1', 'reserved'],
+    // 2001::/23 is refused whole. These two would pass OpenClaw's rules: a
+    // Teredo address whose client is the public 8.8.8.8, and AMT, a range
+    // ipaddr.js names but OpenClaw doesn't block.
+    ['2001::f7f7:f7f7', 'reserved'],
+    ['2001:3::1', 'reserved'],
     ['2001:2::1', 'reserved'],
     ['2001:db8::1', 'documentation'],
     ['fd00:ec2::254', 'unique-local'],
@@ -101,6 +110,14 @@ describe('classifyAddress', () => {
     // Just outside it on each side. Not a claim that either is routable.
     expect(classifyAddress('64:ff9b:0:ffff:ffff:ffff:ffff:ffff')).toBeNull();
     expect(classifyAddress('64:ff9b:2::1')).toBeNull();
+  });
+
+  it('refuses 3fff::/20 (RFC 9637) as documentation, up to its edge', () => {
+    // New with ipaddr.js 2.5; #792's tables didn't have it.
+    expect(classifyAddress('3fff::1')).toBe('documentation');
+    expect(classifyAddress('3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe('documentation');
+    // Just outside. Not a claim that it's routable.
+    expect(classifyAddress('3fff:1000::1')).toBeNull();
   });
 
   it.each([

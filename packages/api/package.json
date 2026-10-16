@@ -63,6 +63,7 @@
     "express-rate-limit": "^7.1.5",
     "googleapis": "^171.0.0",
     "helmet": "^7.1.0",
+    "ipaddr.js": "^2.3.0",
     "jsonwebtoken": "^9.0.2",
     "link-preview-js": "^4.0.1",
     "node-cron": "^4.2.1",
