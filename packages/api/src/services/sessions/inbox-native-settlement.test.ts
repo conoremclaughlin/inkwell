@@ -5,6 +5,8 @@ import type {
   InboxNativeOutcome,
 } from './inbox-native-settlement.types.js';
 
+const digest = '0123456789abcdef'.repeat(4);
+
 function expectedBatch(): InboxNativeExpectedBatch {
   return {
     binding: { userId: 'owner', sbId: 'sb', sessionId: 'session', nativeSessionId: 'native' },
@@ -28,6 +30,7 @@ function resolved(outcome: InboxNativeOutcome = 'consumed') {
     revision: 7,
     state: 'resolved-awaiting-ack' as const,
     outcome,
+    evidenceDigest: digest,
   };
 }
 
@@ -45,6 +48,7 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
           ...expectedBatch(),
           nativeRevision: 7,
           outcome,
+          evidenceDigest: digest,
           disposition,
           next: 'persist-source-settlement',
         },
@@ -53,7 +57,7 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
   );
 
   it.each(['pending', 'reconciling', 'unknown'])('holds a %s obligation', (state) => {
-    const { outcome: _outcome, ...observation } = resolved();
+    const { outcome: _outcome, evidenceDigest: _evidenceDigest, ...observation } = resolved();
     expect(planInboxNativeSettlement(expectedBatch(), { ...observation, state })).toEqual({
       status: 'held',
       reason: 'native-unresolved',
@@ -96,6 +100,39 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
     expect(planInboxNativeSettlement(expectedBatch(), observation)).toMatchObject({
       status: 'planned',
       plan: { originatingTurnEpoch: 'original-epoch', nativeRevision: 101 },
+    });
+  });
+
+  it.each([undefined, null, '', 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(64), 'g'.repeat(64), 7])(
+    'refuses a missing or malformed resolution evidence digest (%#)',
+    (evidenceDigest) => {
+      expect(planInboxNativeSettlement(expectedBatch(), { ...resolved(), evidenceDigest })).toEqual(
+        {
+          status: 'held',
+          reason: 'invalid-input',
+        }
+      );
+    }
+  );
+
+  it('preserves the exact observed digest without normalizing or later rereading evidence', () => {
+    const observation = resolved();
+    const first = planInboxNativeSettlement(expectedBatch(), observation);
+    observation.evidenceDigest = 'fedcba9876543210'.repeat(4);
+    const second = planInboxNativeSettlement(expectedBatch(), observation);
+    expect(first).toMatchObject({ status: 'planned', plan: { evidenceDigest: digest } });
+    expect(second).toMatchObject({
+      status: 'planned',
+      plan: { evidenceDigest: observation.evidenceDigest },
+    });
+    expect(first).not.toEqual(second);
+  });
+
+  it('rejects an omitted digest even though the outcome and revision match', () => {
+    const { evidenceDigest: _evidenceDigest, ...observation } = resolved();
+    expect(planInboxNativeSettlement(expectedBatch(), observation)).toEqual({
+      status: 'held',
+      reason: 'invalid-input',
     });
   });
 
@@ -204,7 +241,7 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
   });
 
   it('does not reinterpret one clean PostToolBatch request as removal', () => {
-    const { outcome: _outcome, ...observation } = resolved();
+    const { outcome: _outcome, evidenceDigest: _evidenceDigest, ...observation } = resolved();
     expect(
       planInboxNativeSettlement(expectedBatch(), { ...observation, state: 'unknown' })
     ).toEqual({

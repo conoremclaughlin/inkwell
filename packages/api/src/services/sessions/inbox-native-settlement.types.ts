@@ -33,18 +33,25 @@ export type InboxNativeObservation =
       readonly revision: number;
     } & (
         | { readonly state: 'pending' | 'reconciling' | 'unknown' }
-        | { readonly state: 'resolved-awaiting-ack'; readonly outcome: InboxNativeOutcome }
+        | {
+            readonly state: 'resolved-awaiting-ack';
+            readonly outcome: InboxNativeOutcome;
+            readonly evidenceDigest: string;
+          }
       ));
 
 /**
  * A conditional, whole-batch write plan ONLY. A repository must persist the
  * exact claim revisions and outcome atomically/idempotently before separately
- * acknowledging the native obligation ID + revision. A planned fallback is not
+ * acknowledging the native obligation ID + revision + outcome + evidence digest
+ * and original ordered claim batch. A planned fallback is not
  * permission to dispatch; unresolved native recovery still gates later launch.
  */
 export interface InboxNativeSettlementPlan extends InboxNativeExpectedBatch {
   readonly nativeRevision: number;
   readonly outcome: InboxNativeOutcome;
+  /** Native resolution identity to persist with the receipt, not proof by itself. */
+  readonly evidenceDigest: string;
   readonly disposition: 'mark-consumed' | 'make-queue-eligible';
   readonly next: 'persist-source-settlement';
 }

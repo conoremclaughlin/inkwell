@@ -8,6 +8,7 @@ import type {
 const MAX_CLAIMS = 128;
 const id = z.string().min(1).max(256).regex(/^\S+$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const evidenceDigest = z.string().regex(/^[0-9a-f]{64}$/);
 const binding = z.object({ userId: id, sbId: id, sessionId: id, nativeSessionId: id }).strict();
 const claim = z
   .object({ claimId: id, claimRevision: revision, deliveryId: id, messageId: id, threadId: id })
@@ -37,6 +38,7 @@ const observationSchema = z.union([
       ...obligationShape,
       state: z.literal('resolved-awaiting-ack'),
       outcome: z.enum(['consumed', 'definitely-not-written', 'confirmed-removed']),
+      evidenceDigest,
     })
     .strict(),
 ]);
@@ -112,6 +114,7 @@ export function planInboxNativeSettlement(
         claims: Object.freeze(expected.claims.map((item) => Object.freeze(item))),
         nativeRevision: observed.revision,
         outcome: observed.outcome,
+        evidenceDigest: observed.evidenceDigest,
         disposition: observed.outcome === 'consumed' ? 'mark-consumed' : 'make-queue-eligible',
         next: 'persist-source-settlement',
       }),
