@@ -19,17 +19,61 @@
  */
 
 /**
- * Deny rules: destructive commands that always require confirmation, even
- * in a fully auto-approved studio. Backstops (see the module comment).
+ * Deny rules: force pushes, refused even in a fully auto-approved studio.
+ * Backstops (see the module comment).
+ *
+ * The destructive local commands (`rm -rf`, `git reset --hard`, `git
+ * clean`, `git checkout -- .`) were denied here until 2026-10-13. A deny
+ * cannot be approved by anyone, so they are now decided by the PreToolUse
+ * hook (`destructive-commands.ts`), which allows a delete inside the
+ * session's own studio and asks for anything else. See
+ * RETIRED_DENY_RULES.
  */
 export const DEFAULT_CLAUDE_DENY_RULES: readonly string[] = [
-  'Bash(rm -rf *)',
   'Bash(git push --force *)',
   'Bash(git push -f *)',
+];
+
+/**
+ * Denies that earlier profiles carried and the current ones lift. A deny
+ * wins over every allow and every hook answer, so while one of these stays
+ * in a studio's settings the studio cannot do what its profile now allows.
+ * `ink permissions sync --apply` removes them, exactly as spelled here and
+ * nothing else, and only where the studio's own profile no longer denies
+ * them (a reviewer keeps its PR and SQL denies).
+ *
+ *   - the destructive local commands, which the PreToolUse hook now
+ *     decides (spec automated-turn-permissions §3.4);
+ *   - opening or updating a PR and running SQL, which the builder now
+ *     allows (Conor, 2026-10-15). Spelled here rather than spread from
+ *     GITHUB_PR_TOOLS and SUPABASE_SQL_TOOLS, which are declared below;
+ *   - dependency installs, which both profiles now allow (Conor,
+ *     2026-10-15). A session already runs its checkout's code through its
+ *     tests, so an install's scripts are not a new kind of trust;
+ *   - merging a pull request, which the builder now allows (Conor,
+ *     2026-10-15, 2:05 PM). Sibling review and green CI before a merge are
+ *     the process rule (AGENTS.md), not a permission.
+ */
+export const RETIRED_DENY_RULES: readonly string[] = [
+  'Bash(rm -rf *)',
   'Bash(git reset --hard *)',
   'Bash(git clean -fd *)',
   'Bash(git clean -f *)',
   'Bash(git checkout -- .)',
+  'mcp__github__create_pull_request',
+  'mcp__github__update_pull_request',
+  'mcp__github__update_pull_request_branch',
+  'mcp__supabase__execute_sql',
+  'Bash(yarn)',
+  'Bash(yarn install*)',
+  'Bash(yarn add *)',
+  'Bash(npm install*)',
+  'Bash(npm ci*)',
+  'Bash(pnpm add *)',
+  'Bash(pnpm install*)',
+  'mcp__github__merge_pull_request',
+  'Bash(gh pr merge*)',
+  'Bash(gh * pr merge*)',
 ];
 
 /**
@@ -88,23 +132,43 @@ export const GITHUB_READ_TOOLS: readonly string[] = [
 ];
 
 /**
- * GitHub MCP tools that publish code or change a repository, a branch or a
- * pull request's state: opening, merging, closing or retargeting a PR,
- * writing files or branches directly, creating, forking or deleting a
- * repository. Denied in both studio profiles.
+ * GitHub MCP tools that change a repository or a branch outside a push and
+ * a PR: writing files or branches directly (these can name main), creating,
+ * forking or deleting a repository. Denied in both studio profiles.
  */
 export const GITHUB_PUBLISH_TOOLS: readonly string[] = [
   'mcp__github__create_branch',
   'mcp__github__create_or_update_file',
-  'mcp__github__create_pull_request',
   'mcp__github__create_repository',
   'mcp__github__delete_file',
   'mcp__github__delete_repository',
   'mcp__github__fork_repository',
-  'mcp__github__merge_pull_request',
   'mcp__github__push_files',
+];
+
+/**
+ * GitHub MCP tools that open or update a pull request. A builder works on
+ * its own branch, so its PR is its own work, and Conor allowed it on
+ * 2026-10-15. The builder allows them and the reviewer denies them.
+ */
+export const GITHUB_PR_TOOLS: readonly string[] = [
+  'mcp__github__create_pull_request',
   'mcp__github__update_pull_request',
   'mcp__github__update_pull_request_branch',
+];
+
+/**
+ * Merging a pull request, by the GitHub tool or `gh pr merge`. Conor,
+ * 2026-10-15: every builder session can merge its PR. Sibling review and
+ * green CI first are the process rule (AGENTS.md); no permission rule can
+ * tell whether they happened. The builder allows the tool, and its
+ * `Bash(*)` already covers `gh`; the reviewer denies both, because merging
+ * is the author's step.
+ */
+export const GITHUB_MERGE_TOOLS: readonly string[] = ['mcp__github__merge_pull_request'];
+export const GH_MERGE_DENY_RULES: readonly string[] = [
+  'Bash(gh pr merge*)',
+  'Bash(gh * pr merge*)',
 ];
 
 /**
@@ -145,10 +209,23 @@ export const SUPABASE_READ_TOOLS: readonly string[] = [
   'mcp__supabase__search_docs',
 ];
 
+/**
+ * Applying a migration through the Supabase tool. Denied everywhere: the
+ * tool records the apply time as the version and the ledger drifts, so
+ * migrations go through `yarn db:migrate` (AGENTS.md).
+ */
+export const SUPABASE_MIGRATION_TOOLS: readonly string[] = ['mcp__supabase__apply_migration'];
+
+/**
+ * Arbitrary SQL, writes included. The builder allows it, as Conor did on
+ * 2026-10-15; the reviewer denies it.
+ */
+export const SUPABASE_SQL_TOOLS: readonly string[] = ['mcp__supabase__execute_sql'];
+
 /** Supabase MCP tools that can write: a migration, or arbitrary SQL. */
 export const SUPABASE_WRITE_TOOLS: readonly string[] = [
-  'mcp__supabase__apply_migration',
-  'mcp__supabase__execute_sql',
+  ...SUPABASE_MIGRATION_TOOLS,
+  ...SUPABASE_SQL_TOOLS,
 ];
 
 // ============================================================================
@@ -160,20 +237,6 @@ export interface StudioRuleSet {
   readonly allow: readonly string[];
   readonly deny: readonly string[];
 }
-
-/**
- * Dependency installs. Backstops: a studio profile does not pre-approve an
- * install, which runs code the package manager chooses.
- */
-export const INSTALL_DENY_RULES: readonly string[] = [
-  'Bash(yarn)',
-  'Bash(yarn install*)',
-  'Bash(yarn add *)',
-  'Bash(npm install*)',
-  'Bash(npm ci*)',
-  'Bash(pnpm add *)',
-  'Bash(pnpm install*)',
-];
 
 /**
  * Every push, by the spellings a rule can name. The reviewer profile denies
@@ -223,8 +286,9 @@ const PUSH_PREFIXES = ['git push', 'git -C * push'] as const;
  * that the push is clean. The session that pushes still checks that the
  * repository, the remote and the destination ref are the studio's
  * assigned ones, runs the preview, reads every message back and checks
- * authors. Opening and merging PRs stay behind review and Conor's OK; the
- * GitHub tools for them are denied in `GITHUB_PUBLISH_TOOLS`.
+ * authors. A builder opens its PR (GITHUB_PR_TOOLS) and merges it
+ * (GITHUB_MERGE_TOOLS) once a sibling has reviewed it and CI is green on
+ * that head; that order is the process rule, not a permission.
  */
 export const STUDIO_PUSH_RULES: StudioRuleSet = {
   allow: ['Bash(git push *)'],
@@ -297,9 +361,11 @@ export function scratchPathRules(sbSlug: string): string[] {
 /**
  * The builder profile: a development session in its own studio. Edits
  * anywhere in its checkout, commits locally and pushes its own branch
- * (STUDIO_PUSH_RULES), reads GitHub and Supabase, and is not pre-approved
- * to force-push, push to main, skip the pre-push hook, install, open or
- * merge a pull request, or write the database.
+ * (STUDIO_PUSH_RULES), opens and updates its pull request, reads GitHub,
+ * runs SQL, installs dependencies, merges its pull request, and is not
+ * pre-approved to force-push, push to main, skip the pre-push hook, write
+ * a branch through the GitHub API, or apply a migration through the
+ * Supabase tool.
  *
  * `Edit(/**)`: a single leading slash anchors at the session's primary
  * working directory when the rule lives in `.claude/settings.local.json`,
@@ -316,25 +382,27 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
     'mcp__inkwell__*',
     'mcp__playwright__*',
     ...GITHUB_READ_TOOLS,
+    ...GITHUB_PR_TOOLS,
+    ...GITHUB_MERGE_TOOLS,
     ...SUPABASE_READ_TOOLS,
+    ...SUPABASE_SQL_TOOLS,
     ...STUDIO_PUSH_RULES.allow,
   ],
   deny: [
     ...DEFAULT_CLAUDE_DENY_RULES,
-    ...INSTALL_DENY_RULES,
     ...STUDIO_PUSH_RULES.deny,
     ...GITHUB_PUBLISH_TOOLS,
-    ...SUPABASE_WRITE_TOOLS,
+    ...SUPABASE_MIGRATION_TOOLS,
   ],
 };
 
 /**
  * The reviewer profile: a detached checkout of code under review. Reads
  * everything, writes only its SB's scratch directories, posts its review,
- * and is not pre-approved to stage, commit or push, install, or use any
- * other write tool. Its `Bash(*)` is kept for running tests, so every
- * Bash deny here is a backstop too: a subprocess can still write the
- * checkout.
+ * and is not pre-approved to stage, commit or push, merge, or use any
+ * other write tool. Its `Bash(*)` is kept for running tests, and installing the
+ * dependencies they need, so every Bash deny here is a backstop too: a
+ * subprocess can still write the checkout.
  */
 export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
   allow: [
@@ -350,10 +418,12 @@ export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
   ],
   deny: [
     ...DEFAULT_CLAUDE_DENY_RULES,
-    ...INSTALL_DENY_RULES,
     ...COMMIT_DENY_RULES,
     ...PUSH_DENY_RULES,
     ...GITHUB_PUBLISH_TOOLS,
+    ...GITHUB_PR_TOOLS,
+    ...GITHUB_MERGE_TOOLS,
+    ...GH_MERGE_DENY_RULES,
     ...GITHUB_OTHER_WRITE_TOOLS,
     ...SUPABASE_WRITE_TOOLS,
   ],
@@ -373,6 +443,107 @@ export function studioPermissionRules(
     allow: [...new Set([...base.allow, ...scratchPathRules(sbSlug)])],
     deny: [...new Set(base.deny)],
   };
+}
+
+// ============================================================================
+// Automated turns: yolo with ironclad denies (spec automated-turn-permissions)
+// ============================================================================
+
+/**
+ * Skipping the hooks on a commit: `--no-verify`, or its short form `-n`.
+ * Backstops: a combined short flag (`-an`) or a script still gets through.
+ */
+export const NO_VERIFY_COMMIT_DENY_RULES: readonly string[] = [
+  'git commit',
+  'git -C * commit',
+].flatMap((commit) => [
+  `Bash(${commit} *--no-verify*)`,
+  `Bash(${commit} -n *)`,
+  `Bash(${commit} * -n *)`,
+  `Bash(${commit} * -n)`,
+]);
+
+/**
+ * The rules no automated turn is pre-approved to break, yolo included.
+ * Conor, 2026-10-06: "yolo should keep these ironclad rules about no push to
+ * main, no force-push, and no merging PRs without review still apply."
+ * AGENTS.md adds `--no-verify`, and migrations go through `yarn db:migrate`.
+ * On 2026-10-15 he narrowed it: builders merge their PRs, and the intent of
+ * the rules is no deletes in random places and no push or force-push to
+ * main. A merge is no longer denied here; review first stays a process
+ * rule, and a reviewer launch still denies merging through its profile.
+ *
+ *   - the builder's push denies: force, a `+` refspec, main as the
+ *     destination, `--no-verify`, and the wholesale ref rewrites;
+ *   - `--no-verify` on a commit;
+ *   - writing a branch or a repository without a push or a PR: the GitHub
+ *     tools that write files directly, or delete a repository;
+ *   - applying a migration through the Supabase tool. SQL itself is not
+ *     denied (Conor, 2026-10-15).
+ *
+ * Backstops, like every Bash deny here (see the module comment).
+ */
+export const IRONCLAD_DENY_RULES: readonly string[] = [
+  ...new Set([
+    ...STUDIO_PUSH_RULES.deny,
+    ...NO_VERIFY_COMMIT_DENY_RULES,
+    'mcp__github__push_files',
+    'mcp__github__create_or_update_file',
+    'mcp__github__delete_file',
+    'mcp__github__delete_repository',
+    ...SUPABASE_MIGRATION_TOOLS,
+  ]),
+];
+
+/**
+ * An MCP server name that can be put in an `mcp__<server>__*` rule. Claude
+ * Code has no cross-server wildcard, so each configured server is named.
+ */
+export const MCP_SERVER_NAME_FOR_RULES = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * The rules an automated turn gets when the server runs yolo
+ * (`INK_AUTOMATED_TURNS=yolo`): no prompt for the everyday tools, the shell,
+ * reads and edits anywhere, the web, every MCP server the launch connects,
+ * and the ironclad denies. A reviewer launch keeps the reviewer's own denies
+ * as well, because the code under review must not be able to commit or push
+ * through it. Stored denies in the checkout's settings still apply beside
+ * these (deny wins across sources; documented, not measured).
+ *
+ * `Read(//**)` and `Edit(//**)` are absolute already, so the launch file
+ * keeps them as written. A reviewer gets no `Edit(//**)`: it edits only its
+ * SB's scratch directories, as its profile does. Throws on an MCP server
+ * name that would not form a server-scoped rule, and on a reviewer with no
+ * owner.
+ */
+export function automatedLaunchRules(options: {
+  profile?: StudioPermissionProfile;
+  /** Whose scratch paths a reviewer may edit; required for a reviewer. */
+  owner?: string;
+  mcpServers: readonly string[];
+}): ClaudePermissionRules {
+  const reviewer = options.profile === 'reviewer';
+  if (reviewer && options.owner === undefined) {
+    throw new Error('a reviewer launch needs the SB whose scratch paths it may edit');
+  }
+  for (const server of options.mcpServers) {
+    if (!MCP_SERVER_NAME_FOR_RULES.test(server)) {
+      throw new Error(`not an MCP server name that can form a rule: ${JSON.stringify(server)}`);
+    }
+  }
+  // A reviewer edits only its SB's scratch, as its profile does: yolo removes
+  // prompts, not the reviewer's read-only stance on the code under review
+  // (Lumen, #853).
+  const allow = [
+    'Bash(*)',
+    'Read(//**)',
+    ...(reviewer ? scratchPathRules(options.owner as string) : ['Edit(//**)']),
+    'WebFetch(*)',
+    'WebSearch',
+    ...options.mcpServers.map((server) => `mcp__${server}__*`),
+  ];
+  const deny = [...IRONCLAD_DENY_RULES, ...(reviewer ? STUDIO_REVIEWER_RULES.deny : [])];
+  return { allow: [...new Set(allow)], deny: [...new Set(deny)] };
 }
 
 /** The studio record fields the profile is read from. */

@@ -4,7 +4,14 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { runInToolCall } from '../../utils/tool-call-context';
+import { getRequestContext } from '../../utils/request-context';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import {
+  decideSpaceTurnCall,
+  spaceTurnHandlerArgs,
+  spaceTurnRefusalResult,
+} from './space-turn-policy';
+import { createSpaceTurnThreadResolver } from './space-turn-thread-resolver';
 import {
   describeToolSchema,
   handleDescribeTool,
@@ -383,6 +390,7 @@ import { handleDebugRequestContext } from './debug-handlers';
 export { setResponseCallback } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
 export { setMiniAppsRegistry } from './skill-handlers';
+export { SPACE_TURN_TOOLS } from './space-turn-policy';
 
 // Shared schema for flexible user identification
 // Usually unnecessary — userId and email are auto-resolved from OAuth token.
@@ -440,6 +448,10 @@ export function registerAllTools(
   // registration order does not matter.
   const toolRegistry: ToolRegistry = new Map();
 
+  // Finds a space-turn call's thread with the handlers' own lookups, so the
+  // policy checks the thread the handler will act on.
+  const resolveSpaceTurnThread = createSpaceTurnThreadResolver(dataComposer);
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
     // Reject unknown args instead of silently stripping them. Applied here so
@@ -469,9 +481,30 @@ export function registerAllTools(
       const handler = (...handlerArgs: any[]) =>
         runInToolCall(name, () => registered(...handlerArgs));
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
+        // A space-turn token reaches only its allowlist, for its own thread,
+        // resolved as the handler will resolve it. Decided here, before the
+        // handler, so no tool body runs for a call the token may not make
+        // (space-turn-policy.ts).
+        const decision = await decideSpaceTurnCall(
+          name,
+          handlerArgs[0],
+          getRequestContext(),
+          resolveSpaceTurnThread
+        );
+        if (!decision.allowed) {
+          logger.warn('Refused a tool call outside the space-turn allowlist', {
+            tool: name,
+            code: decision.refusal.code,
+          });
+          return spaceTurnRefusalResult(decision.refusal);
+        }
+        // An allowed space-turn call acts on the thread that was checked.
+        const callArgs = decision.thread
+          ? spaceTurnHandlerArgs(name, handlerArgs, decision.thread)
+          : handlerArgs;
         const start = performance.now();
         try {
-          const result = await handler(...handlerArgs);
+          const result = await handler(...callArgs);
           const durationMs = Math.round(performance.now() - start);
           if (durationMs > SLOW_TOOL_THRESHOLD_MS) {
             logger.warn(`[timing] ${name}: ${durationMs}ms (SLOW)`);
@@ -486,7 +519,7 @@ export function registerAllTools(
             });
             await new Promise((r) => setTimeout(r, 150));
             try {
-              const result = await handler(...handlerArgs);
+              const result = await handler(...callArgs);
               const durationMs = Math.round(performance.now() - start);
               logger.info(`[retry] ${name}: retry succeeded (${durationMs}ms)`);
               return result;

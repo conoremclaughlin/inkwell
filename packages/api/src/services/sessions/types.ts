@@ -8,6 +8,7 @@ import type { ErrorClassification, TurnReply } from '@inklabs/shared';
 import type { SessionArchivedReason, SessionResumeRefused } from './session-archive';
 import type { GroupState } from './stop-process';
 import type { InkProvider } from './ink-provider';
+import type { NativeSteeringBinding } from './native-steering-binding';
 
 // ─── Channel Types ───
 
@@ -652,7 +653,8 @@ export interface ISessionService {
    * Sends compaction prompt, waits for agent to persist context,
    * then rotates to fresh Claude session.
    */
-  triggerCompaction(sessionId: string): Promise<void>;
+  // Credential admission can refuse with the same classification as a turn.
+  triggerCompaction(sessionId: string): Promise<void | SessionResult>;
 
   /**
    * End a session (for task agents or explicit termination).
@@ -832,8 +834,13 @@ export interface IContextBuilder {
 // ─── Runner Interface ───
 
 export interface ClaudeRunnerConfig {
+  /** Advisory only, invoked after launch policy preparation and before final
+   * admission. Absent means no inspection or notification (default). */
+  onPermissionWarning?: import('./spawn-permission-warning.js').SpawnPermissionWarningHandler;
   workingDirectory: string;
   mcpConfigPath: string;
+  /** Host-created capability for one admitted owner generation; never request metadata. */
+  nativeSteering?: NativeSteeringBinding;
   /**
    * This run's hard ceiling, when it must be lower than the runner's own
    * (an inkling turn's). The Claude runner honours it.
@@ -882,6 +889,13 @@ export interface ClaudeRunnerConfig {
   effort?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
+  /**
+   * What this turn must be told beyond the identity its runner loads: the
+   * conversation's reply contract and the execution tier, composed by the
+   * server. `ink chat` has no way to append to its system prompt, so the ink
+   * runner carries this in the turn's message, on every attempt.
+   */
+  turnInstructions?: string;
   inkAccessToken?: string;
   /**
    * The secret the ink chat child verifies and mints delegation tokens with,
@@ -982,6 +996,13 @@ export interface ClaudeRunnerConfig {
    * session; a profile that cannot be validated fails the launch.
    */
   launchPermissions?: {
+    /**
+     * `profile` (default): the studio's own profile. `automated`: the yolo
+     * rules for automated turns (INK_AUTOMATED_TURNS=yolo), for a studio, the
+     * root studio, or a spawn with no studio; `profile` is then the studio's
+     * profile when it has one, and undefined otherwise.
+     */
+    mode?: 'profile' | 'automated';
     profile: unknown;
     owner: unknown;
     /** The main checkout, for the record of sources; null when not a worktree. */

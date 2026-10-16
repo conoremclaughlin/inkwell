@@ -647,6 +647,13 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
 // ==============================================// SESSION STATE SCHEMA
 // ==============================================
 export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
+  moveToStudioId: z
+    .string()
+    .guid()
+    .optional()
+    .describe(
+      "Move the session you are running in to this studio of yours: your next turn runs there, with that studio's permissions (spec automated-turn-permissions §3.6). Acts only on the calling session, sent on its own. A headless session is woken there; an attached one is given the relaunch command. Refused out of a reviewer studio."
+    ),
   sessionId: z
     .string()
     .guid()
@@ -2125,6 +2132,47 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
+
+  // A move is its own request: it acts on the calling session only, so it
+  // takes no session selector and no other field (spec §3.6).
+  if (params.moveToStudioId !== undefined) {
+    const extra = Object.keys(params).filter(
+      (key) =>
+        ![
+          'moveToStudioId',
+          'userId',
+          'email',
+          'phone',
+          'platform',
+          'platformId',
+          'sbSlug',
+        ].includes(key) && (params as Record<string, unknown>)[key] !== undefined
+    );
+    const { moveSessionToStudio } = await import('../../services/sessions/move-session.js');
+    const result =
+      extra.length > 0
+        ? {
+            ok: false as const,
+            error: `moveToStudioId is sent alone, not with ${extra.join(', ')}`,
+          }
+        : await moveSessionToStudio(dataComposer, {
+            userId: user.id,
+            caller: resolveCallerIdentity(params.sbSlug),
+            targetStudioId: params.moveToStudioId,
+          });
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            result.ok ? { success: true, move: result } : { success: false, error: result.error },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
 
   // Require at least one field to update
   if (

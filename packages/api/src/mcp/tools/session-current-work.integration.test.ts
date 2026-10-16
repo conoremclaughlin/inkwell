@@ -11,9 +11,9 @@
  * Run via: yarn workspace @inklabs/api test:integration:db
  */
 
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 import {
   handleUpdateSessionState,
   handleListSessions,
@@ -22,6 +22,13 @@ import {
 } from './memory-handlers';
 import { runWithRequestContext } from '../../utils/request-context';
 import { resolveCallerIdentity, isSessionAuthorized } from './caller-identity';
+
+// Integration files run in parallel. The shared echo identity can acquire a
+// newer owner session between this suite's insert and its active-session read.
+// Keep these rows and their signed caller claims under one suite-owned identity;
+// retain the exact-ID assertions so a different selected row never counts as
+// evidence that the intended row's private context was withheld.
+const SUITE_AGENT = 'echo-current-work';
 
 function parse<T>(raw: { content: Array<{ text: string }> }): T {
   return JSON.parse(raw.content[0].text) as T;
@@ -39,12 +46,25 @@ interface SessionView {
 describe('Session current work (integration)', () => {
   let dataComposer: DataComposer;
   let userId: string;
+  let suiteSbId: string | undefined;
   const createdSessionIds: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     userId = fixture.userId;
+    suiteSbId = await ensureSuiteIdentity(dataComposer, fixture, SUITE_AGENT);
+  });
+
+  afterAll(async () => {
+    if (suiteSbId) {
+      const { error } = await dataComposer
+        .getClient()
+        .from('agent_identities')
+        .delete()
+        .eq('id', suiteSbId);
+      if (error) throw new Error(`suite identity cleanup: ${error.message}`);
+    }
   });
 
   afterEach(async () => {
@@ -62,7 +82,7 @@ describe('Session current work (integration)', () => {
       .from('sessions')
       .insert({
         user_id: userId,
-        agent_id: 'echo',
+        agent_id: SUITE_AGENT,
         lifecycle: 'running',
         started_at: new Date().toISOString(),
         ...fields,
@@ -76,7 +96,7 @@ describe('Session current work (integration)', () => {
 
   async function findInList(sessionId: string): Promise<SessionView | undefined> {
     const listed = parse<{ sessions: SessionView[] }>(
-      await handleListSessions({ userId, limit: 100 }, dataComposer)
+      await handleListSessions({ userId, sbSlug: SUITE_AGENT, limit: 100 }, dataComposer)
     );
     return listed.sessions.find((s) => s.id === sessionId);
   }
@@ -248,7 +268,7 @@ describe('Session current work (integration)', () => {
         {
           userId,
           agentTokenBound: true,
-          tokenSlug: 'echo',
+          tokenSlug: SUITE_AGENT,
           tokenContactId: contactId,
           ...(claimedSessionId ? { sessionId: claimedSessionId } : {}),
         },
@@ -265,7 +285,7 @@ describe('Session current work (integration)', () => {
       const target = await dataComposer.repositories.memory.getSession(foreignId);
 
       await asContact(CONTACT_A, async () => {
-        const caller = resolveCallerIdentity('echo');
+        const caller = resolveCallerIdentity(SUITE_AGENT);
         expect(caller.agentBound).toBe(true);
         expect(caller.contactId).toBe(CONTACT_A);
         expect(isSessionAuthorized(target!, userId, caller)).toBe(false);
@@ -274,7 +294,7 @@ describe('Session current work (integration)', () => {
       // ...and authorized for its own contact, so the gate turns on scope
       // rather than refusing everything.
       await asContact(CONTACT_B, async () => {
-        expect(isSessionAuthorized(target!, userId, resolveCallerIdentity('echo'))).toBe(true);
+        expect(isSessionAuthorized(target!, userId, resolveCallerIdentity(SUITE_AGENT))).toBe(true);
       });
     });
 
@@ -282,7 +302,7 @@ describe('Session current work (integration)', () => {
       const foreignId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
 
       const raw = await asContact(CONTACT_A, () =>
-        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+        handleListSessions({ userId, sbSlug: SUITE_AGENT, limit: 100 }, dataComposer)
       );
 
       expect(raw.content[0].text).not.toContain('Sentinel zebra');
@@ -294,12 +314,12 @@ describe('Session current work (integration)', () => {
       // The sharpest version of this path, and the one `getActiveSession`
       // actually produces: it scopes to `contact_id IS NULL`, so the row a
       // contact-bound caller gets back here is the account owner's own session.
-      // An SB talking to an outside contact asking "what is echo up to" was
+      // An SB talking to an outside contact asking about its own SB was
       // being handed the owner's private scratch board.
       const ownerSessionId = await createSession({ contact_id: null, context: PRIVATE_NOTE });
 
       const raw = await asContact(CONTACT_A, () =>
-        handleGetSession({ userId, sbSlug: 'echo' }, dataComposer)
+        handleGetSession({ userId, sbSlug: SUITE_AGENT }, dataComposer)
       );
 
       // Assert WHICH session came back first. Without this, a null session or
@@ -315,7 +335,7 @@ describe('Session current work (integration)', () => {
       await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
 
       const raw = await asContact(CONTACT_A, () =>
-        handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer)
+        handleBootstrap({ userId, sbSlug: SUITE_AGENT, includeMemories: false }, dataComposer)
       );
 
       expect(raw.content[0].text).not.toContain('Sentinel zebra');
@@ -335,7 +355,7 @@ describe('Session current work (integration)', () => {
       });
 
       const raw = await asContact(CONTACT_A, () =>
-        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+        handleListSessions({ userId, sbSlug: SUITE_AGENT, limit: 100 }, dataComposer)
       );
 
       expect(raw.content[0].text).not.toContain('Sentinel quokka');
@@ -359,7 +379,8 @@ describe('Session current work (integration)', () => {
 
       const raw = await asContact(
         CONTACT_A,
-        () => handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer),
+        () =>
+          handleBootstrap({ userId, sbSlug: SUITE_AGENT, includeMemories: false }, dataComposer),
         foreignId
       );
 
@@ -381,7 +402,8 @@ describe('Session current work (integration)', () => {
 
       const raw = await asContact(
         CONTACT_B,
-        () => handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer),
+        () =>
+          handleBootstrap({ userId, sbSlug: SUITE_AGENT, includeMemories: false }, dataComposer),
         ownId
       );
 
@@ -398,7 +420,7 @@ describe('Session current work (integration)', () => {
       const ownId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
 
       const raw = await asContact(CONTACT_B, () =>
-        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+        handleListSessions({ userId, sbSlug: SUITE_AGENT, limit: 100 }, dataComposer)
       );
 
       expect(raw.content[0].text).toContain('Sentinel zebra');

@@ -8,6 +8,7 @@
  * production environment. No database, server, credentials or provider process.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fakeProcessEnv } from '../../test/fake-env';
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -29,7 +30,9 @@ import type {
 } from './types.js';
 
 // Prevent transitive imports from loading the checkout's .env files or clients.
-vi.mock('../../config/env', () => ({ env: { NODE_ENV: 'test' } }));
+vi.mock('../../config/env', async () => ({
+  env: { ...(await import('../../test/fake-env')).fakeEnv, NODE_ENV: 'test' },
+}));
 vi.mock('../../data/supabase/client', () => {
   const forbidden = () => {
     throw new Error('No database in the hosted-input fixture');
@@ -120,7 +123,13 @@ function context(provider: 'claude' | 'codex'): InjectedContext {
       capabilities: [],
       relationships: {},
     },
-    user: { id: USER_ID, timezone: 'America/Los_Angeles', contacts: {}, preferences: {} },
+    user: {
+      id: USER_ID,
+      email: 'runner-owner@example.test',
+      timezone: 'America/Los_Angeles',
+      contacts: {},
+      preferences: {},
+    },
     temporal: {
       currentTime: '5:00 AM',
       currentDate: '2026-10-08',
@@ -148,7 +157,7 @@ async function fixture(provider: 'claude' | 'codex') {
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   await writeFile(join(root, 'fixture.txt'), 'harmless hosted file');
   // Only explicitly named, inert settings; never inspect inherited credentials.
-  vi.stubEnv('JWT_SECRET', '');
+  vi.stubEnv('JWT_SECRET', fakeProcessEnv.JWT_SECRET);
   vi.stubEnv('INK_EXECUTION_TIER', 'full');
   vi.stubEnv('INK_EXECUTION_TIER_SBS', '');
   vi.stubEnv('INK_EXECUTION_TIER_CLIENTS', '');

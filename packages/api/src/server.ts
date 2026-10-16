@@ -21,6 +21,7 @@
 import path from 'path';
 import { homedir, tmpdir } from 'os';
 import { createLocalHostedInkRunner } from './services/sessions/hosted-ink-local-host';
+import { createSpawnPermissionNotifier } from './services/sessions/spawn-permission-notifier';
 import { getDataComposer, DataComposer } from './data/composer';
 import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
@@ -108,7 +109,7 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
-import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { closeIntakeAndDrain, stopOwnedChildren } from './services/sessions/active-runs';
 import { parseHostedInkSbIds } from './services/sessions/hosted-ink-session';
 import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
@@ -233,6 +234,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       sbIds: [...hostedInkSbIds],
     });
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
+    ...(env.INK_SPAWN_PERMISSION_WARNINGS
+      ? { onPermissionWarning: createSpawnPermissionNotifier(dataComposer) }
+      : {}),
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,
@@ -2257,7 +2261,8 @@ function printStatus(): void {
 /**
  * Graceful shutdown with force-kill timeout.
  * If graceful teardown hangs (open connections, polling loops, etc.),
- * force-exit after 10 seconds so tsx --watch can restart cleanly.
+ * force-exit after 10 seconds so the dev watcher (scripts/dev-watch.mjs) can
+ * restart cleanly.
  *
  * `reason` is logged so a stop always says what caused it.
  */
@@ -2283,7 +2288,12 @@ async function shutdown(reason: string): Promise<void> {
     // the snapshot. Snapshotting first would race the very writes it needs to
     // order against — a pending `running` write would land after our
     // interruption and restore the zombie.
-    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    const draining = closeIntakeAndDrain(); // Closes admission synchronously.
+    // A registered child is owned even after its runner returned an uncertain
+    // stop. Ask all owned children to stop while lifecycle writes drain; never
+    // infer child exit from process.exit or a detached leader's disappearance.
+    const stoppingChildren = stopOwnedChildren(7_500);
+    const { runs: interrupted, drained } = await draining;
     if (interrupted.length > 0 && dataComposer) {
       // `drained` is passed through rather than swallowed: if a lifecycle
       // write was still outstanding, whatever we record here may be
@@ -2306,6 +2316,12 @@ async function shutdown(reason: string): Promise<void> {
         logger.error('Interruption bookkeeping failed', { error: err });
       });
     }
+
+    const stoppedChildren = await stoppingChildren;
+    if (stoppedChildren.unconfirmed.length > 0)
+      logger.warn('Owned children remain unconfirmed at shutdown', {
+        count: stoppedChildren.unconfirmed.length,
+      });
 
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();

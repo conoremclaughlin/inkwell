@@ -171,7 +171,7 @@ describe('sessionEnv', () => {
 
     const env = await host.sessionEnv({ hardTimeoutMs: 30 * 60 * 1000 });
 
-    expect(env).toEqual({ INK_ACCESS_TOKEN: 'synthetic-token' });
+    expect(env).toEqual({ INK_ACCESS_TOKEN: 'synthetic-token', INK_RUNNER_AUTH_REQUIRED: '1' });
     expect(given.mintAccessToken).toHaveBeenCalledWith({
       ttlSeconds: Math.ceil((30 * 60 * 1000 + GRACE_MS) / 1000),
     });
@@ -237,6 +237,7 @@ describe('sessionEnv', () => {
     );
     expect(await host.sessionEnv({ hardTimeoutMs: 1_000 })).toEqual({
       INK_ACCESS_TOKEN: 'synthetic-async-token',
+      INK_RUNNER_AUTH_REQUIRED: '1',
       INK_DELEGATION_SECRET: 'synthetic-delegation-secret',
     });
   });

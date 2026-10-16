@@ -9,6 +9,12 @@ import { registerActiveRun, resetActiveRuns, submitRunSteering } from './active-
 import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
 import type { ClaudeRunnerConfig } from './types';
 import type { HostedInkSessionPorts } from './hosted-ink-session';
+vi.mock('../../config/env', async () => ({
+  env: (await import('../../test/fake-env')).fakeEnv,
+}));
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 const roots: string[] = [];
 beforeEach(() => resetActiveRuns());
 afterEach(async () => {
@@ -90,6 +96,7 @@ describe('server binding, admitted identity and explicit resources', () => {
         INK_MCP_URL: 'http://127.0.0.1:49271/mcp',
       });
       const env = await host.sessionEnv({ hardTimeoutMs: 30_000 });
+      expect(env.INK_RUNNER_AUTH_REQUIRED).toBe('1');
       const minted = verifyInkAccessToken(env.INK_ACCESS_TOKEN!, 'mcp_access')!;
       expect(minted.sessionId).toBe(h.sessionId);
       expect(minted.sub).toBe('fixture-user');
@@ -118,6 +125,8 @@ describe('server binding, admitted identity and explicit resources', () => {
     expect(verifyInkAccessToken(headers.Authorization.slice(7))?.sessionId).toBe(h.sessionId);
   });
   it.each([
+    'missing',
+    'malformed',
     'other-session',
     'other-owner',
     'expired',
@@ -125,8 +134,12 @@ describe('server binding, admitted identity and explicit resources', () => {
     'permissions',
     'browser-token',
     'admin-token',
+    'space-turn-token',
+    'mixed-scope-token',
   ] as const)('refuses %s before effects or provider execution', async (kind) => {
     const h = await setup();
+    if (kind === 'missing') h.config.inkAccessToken = undefined;
+    if (kind === 'malformed') h.config.inkAccessToken = 'not-a-credential';
     if (kind === 'other-session')
       h.config.inkAccessToken = signRunnerAccessToken(
         {
@@ -166,6 +179,29 @@ describe('server binding, admitted identity and explicit resources', () => {
           sbSlug: 'echo',
           scope: 'mcp:tools',
           grantId: 'fixture-grant',
+        },
+        env.JWT_SECRET,
+        { expiresIn: 120 }
+      );
+    // A shared conversation's turn token for this very session. The hosted
+    // binding re-mints the runner's credential for its MCP client, and must
+    // not turn a space-turn token into a broad one: it refuses it instead
+    // (ink://specs/inkling-multi-person-groups, Phase 1).
+    // A mixed "mcp:tools mcp:space-turn" token includes mcp:tools, which the
+    // binding once accepted. It is not a plain runner credential, so it is
+    // refused before anything is minted from it (Phase 2 gate 6).
+    if (kind === 'space-turn-token' || kind === 'mixed-scope-token')
+      h.config.inkAccessToken = jwt.sign(
+        {
+          type: 'mcp_access',
+          sub: 'fixture-user',
+          email: 'fixture@example.invalid',
+          scope: kind === 'mixed-scope-token' ? 'mcp:tools mcp:space-turn' : 'mcp:space-turn',
+          sbSlug: 'echo',
+          sessionId: h.sessionId,
+          workspaceId: 'fixture-workspace',
+          threadId: 'fixture-thread',
+          threadKey: 'inkling:thread:fixture-group',
         },
         env.JWT_SECRET,
         { expiresIn: 120 }

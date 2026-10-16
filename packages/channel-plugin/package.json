@@ -9,7 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "^2.0.0"
+    "@modelcontextprotocol/server": "^2.3.1"
   },
   "devDependencies": {
     "tsx": "^4.23.13",

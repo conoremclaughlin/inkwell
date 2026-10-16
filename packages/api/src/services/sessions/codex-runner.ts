@@ -26,7 +26,8 @@ import { uploadDirsToGrant } from '../uploads/runner-media.js';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { ceilingFromEnv } from './turn-ceiling.js';
+import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
+import { buildCodexAppServerArgs, runOwnedCodexAppServer } from './codex-app-server.js';
 import {
   buildSessionEnv,
   writeRuntimeSessionHint,
@@ -105,6 +106,24 @@ export class CodexRunner implements IRunner {
       // The --add-dir grant below requires the directory to exist; async so
       // the event loop is never blocked.
       await ensureInkStudiosRoot();
+
+      // Only the server's immutable owner capability selects the new transport.
+      // Ineligible/container/compaction runs keep exec; app-server errors NEVER
+      // fall back to exec or start a second process on the same native thread.
+      if (runConfig.nativeSteering) {
+        const args = buildCodexAppServerArgs({
+          config: runConfig,
+          promptPath,
+          writableRoots: [inkStudiosRoot(), ...uploadDirs],
+        });
+        return await runOwnedCodexAppServer({
+          args,
+          message: fullMessage,
+          config: runConfig,
+          backendSessionId,
+          ceilingMs: lowestCeiling(PROCESS_TIMEOUT_MS, config.timeoutMs),
+        });
+      }
 
       // Only pass a session ID to buildArgs when resuming a known backend session.
       // For fresh runs, Codex assigns its own session UUID — we extract it from stdout.
@@ -312,6 +331,7 @@ export class CodexRunner implements IRunner {
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
+          requireAccessToken: true,
           inkSessionId: config.inkSessionId,
           runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,

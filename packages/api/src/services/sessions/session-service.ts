@@ -12,7 +12,8 @@ import { randomUUID } from 'crypto';
 import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { signRunnerAccessToken } from '../../auth/ink-tokens';
+import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
+import { isPlainToolsScope } from '../../auth/token-scope';
 import { deriveDelegationSecret } from '../../auth/delegation-secret';
 import type { Database } from '../../data/supabase/types.js';
 import type {
@@ -38,7 +39,12 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import {
+  createNativeSteeringBinding,
+  NativeSteeringAdmissionRefused,
+} from './native-steering-binding.js';
+import {
   registerActiveRun,
+  mayGenerationProceed,
   clearActiveRunIfOwner,
   widenActiveRunCandidates,
   getActiveRun,
@@ -126,14 +132,18 @@ import {
   executionTierPrompt,
   type TierSubject,
 } from '../../config/execution-tier.js';
+import { automatedTurnMode } from '../../config/automated-turns.js';
 import { INKLING_CLIENT } from '../inklings/inkling-client.js';
 import { isUuid } from '../inklings/inkling-service.js';
 import { isOwnersHeartbeat } from '../inklings/inkling-heartbeat.js';
+import type { SpawnPermissionNotifier } from './spawn-permission-notifier.js';
 
 /**
  * Configuration for SessionService.
  */
 export interface SessionServiceConfig {
+  /** Operator-enabled advisory; no settings mutation or authorization. */
+  onPermissionWarning?: SpawnPermissionNotifier;
   /** Default working directory for Claude Code */
   defaultWorkingDirectory: string;
   /** Where inklings' own folders are made; ~/.ink/inklings unless given (tests). */
@@ -2592,12 +2602,19 @@ export class SessionService implements ISessionService {
 
     // 3. Build runner config
     const inkDelegationSecret = this.createDelegationSecret();
-    const inkAccessToken = this.createRunnerAccessToken(
-      userId,
-      sbSlug,
-      injectedContext.user.email,
-      session
-    );
+    let inkAccessToken: string;
+    try {
+      inkAccessToken = this.createRunnerAccessToken(
+        userId,
+        sbSlug,
+        injectedContext.user.email,
+        session
+      );
+    } catch {
+      // Return through runTurn so the already-started turn's end hook runs.
+      // Mint/signing failures are not a retry into the machine's authority.
+      return this.runnerCredentialUnavailable(session);
+    }
 
     // 4. Select runtime backend and model. An inkling's session is stored as
     // ink, and its turn is refused below if it is not (inkling-runtime.ts).
@@ -2628,6 +2645,7 @@ export class SessionService implements ISessionService {
     let runtimeMaxTurns: number | undefined;
     // Set once an inkling's turn has passed the gate.
     let inklingTurn = false;
+    let nativeSteeringIdentityMetadata: unknown;
     let inklingSbId: string | null = null;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
     let runtimeEffort: RuntimeEffort | undefined;
@@ -2645,6 +2663,9 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      // Snapshot the canonical, user-scoped identity at admission. Later
+      // metadata edits cannot add a port to a restricted generation.
+      nativeSteeringIdentityMetadata = identity?.metadata;
 
       // An inkling's turn starts only in the owner test, on its owner's
       // account, for its owner's own message (Lumen 97b1d66a). Refused
@@ -2888,14 +2909,42 @@ export class SessionService implements ISessionService {
     // A service with no database (an embedded or test configuration) has no
     // studio rows at all, so there is no profile to deliver; that is logged,
     // not refused.
+    //
+    // Under INK_AUTOMATED_TURNS=yolo every Claude turn gets the automated
+    // rules at launch, the root studio and a spawn with no studio included
+    // (spec automated-turn-permissions §3.3). A studio row is still read, for
+    // its profile (a reviewer keeps its denies) and the working-directory
+    // check, and a row that cannot be read still fails the launch.
     let launchPermissions: ClaudeRunnerConfig['launchPermissions'];
-    if (resolvedBackend === 'claude-code' && session.studioId && session.studioId !== 'main') {
-      if (this.getStudiosRepo()) {
-        launchPermissions = await this.resolveLaunchPermissions(session.studioId);
-      } else {
+    if (resolvedBackend === 'claude-code') {
+      const turnMode = automatedTurnMode();
+      if (turnMode.problem) {
+        logger.warn('Automated-turn mode unreadable; running standard', {
+          problem: turnMode.problem,
+        });
+      }
+      const hasStudio = !!session.studioId && session.studioId !== 'main';
+      if (hasStudio && this.getStudiosRepo()) {
+        launchPermissions = await this.resolveLaunchPermissions(session.studioId as string);
+      } else if (hasStudio) {
         logger.warn('No studios repository: launch profile not delivered', {
           studioId: session.studioId,
         });
+      }
+      if (
+        turnMode.mode === 'yolo' &&
+        resolvedWorkingDirectory &&
+        (!hasStudio || this.getStudiosRepo())
+      ) {
+        launchPermissions = launchPermissions
+          ? { ...launchPermissions, mode: 'automated' }
+          : {
+              mode: 'automated',
+              profile: undefined,
+              owner: undefined,
+              mainRoot: null,
+              worktreePath: resolvedWorkingDirectory,
+            };
       }
     }
 
@@ -2917,8 +2966,23 @@ export class SessionService implements ISessionService {
         }
       : undefined;
 
+    // The turn's own instructions: its execution tier and, for an inkling, the
+    // conversation's reply contract. Claude takes them appended to its system
+    // prompt; ink has no such path, so they ride in the turn's message
+    // instead (task 9160180d: an inkling's ink turn was never told how to
+    // reply).
+    const turnInstructions =
+      executionTierPrompt(executionTier) +
+      (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : '');
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
+      ...(this.config.onPermissionWarning
+        ? {
+            onPermissionWarning: (warning, signal) =>
+              this.config.onPermissionWarning!(session, warning, signal),
+          }
+        : {}),
       // An inkling turn's stop takes the tools it started with it. It has a
       // ceiling only when INKLING_TURN_TIMEOUT_MS sets one.
       ...(inklingTurn ? inklingRunBounds(inklingTurnTimeoutMs()) : {}),
@@ -2936,12 +3000,11 @@ export class SessionService implements ISessionService {
             studioId: session.studioId || undefined,
             threadKey: session.threadKey || undefined,
           }
-        ) +
-        executionTierPrompt(executionTier) +
-        (inklingTurn ? inklingReplyPrompt(request.metadata?.threadKey as string | undefined) : ''),
+        ) + turnInstructions,
+      ...(resolvedBackend === 'ink' && turnInstructions.trim() ? { turnInstructions } : {}),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
-      ...(inkAccessToken ? { inkAccessToken } : {}),
+      inkAccessToken,
       ...(inkDelegationSecret ? { inkDelegationSecret } : {}),
       inkSessionId: session.id,
       sbSlug,
@@ -3259,7 +3322,12 @@ export class SessionService implements ISessionService {
     const admitSpawn = (): string | undefined =>
       (fencedSbId && inklingFenceHolds(fencedSbId)
         ? `Inkling turn refused: ${INKLING_FENCE_REASON}`
-        : undefined) ?? launchHoldFor(session.id);
+        : undefined) ??
+      (!mayGenerationProceed(session.id, turnEpoch)
+        ? 'Session generation cannot proceed while admission is closed or a previous child remains owned'
+        : undefined) ??
+      launchHoldFor(session.id) ??
+      this.runnerCredentialRefusal(inkAccessToken, userId, sbSlug, session);
     // The launch is written before its process exists, so a restarted server
     // can find the process whatever happens next (launched-processes.ts). A
     // launch that cannot be written is refused, and starts nothing.
@@ -3308,41 +3376,77 @@ export class SessionService implements ISessionService {
           )}\n\n${uploads.note}`;
 
     try {
-      result = await turnRunner
-        .run(runMessage, {
-          backendSessionId: session.backendSessionId || undefined,
-          // Always handed over, including on resume. Every runner already gates
-          // its own injection on `!isResume`, so this does not change what a
-          // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
-          // that re-bootstraps on every turn, and needs this copy on hand to
-          // recover when that bootstrap fails.
-          injectedContext,
-          // The epoch every terminal write for this turn is fenced on. A
-          // backend process that reports its own turns to the lifecycle route
-          // (ink chat) names this one instead of claiming its own, which fenced
-          // this run out of its own finalize on every ink-backed turn.
-          config: {
-            ...runnerConfig,
-            turnEpoch,
-            ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
-            admitSpawn,
-            ...(launch ? { launchEnv: launch.env } : {}),
-            onSpawned: (spawned) => launch?.spawned(spawned),
-          },
-          mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
-        })
-        .then((ran) => {
-          // A stop the runner could not confirm leaves its row open, for the
-          // next start's sweep to look at.
-          if (!ran.stopUnconfirmed) launch?.exited();
-          // Fenced before the turn is released below, so no admission can
-          // fall between the two.
-          if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
-            fenceInkling(inklingSbId, ran.stopUnconfirmed);
+      let nativeRefusal: string | undefined;
+      let nativeSteering: ReturnType<typeof createNativeSteeringBinding> = undefined;
+      try {
+        nativeSteering =
+          resolvedBackend === 'codex-cli'
+            ? createNativeSteeringBinding({
+                sessionId: session.id,
+                turnEpoch,
+                userId,
+                sbId: session.sbId,
+                sbSlug,
+                contactId: session.contactId ?? null,
+                cliAttached: session.cliAttached,
+                identityMetadata: nativeSteeringIdentityMetadata,
+                executionTier,
+                workingDirectory: resolvedWorkingDirectory,
+                inkAccessToken,
+                container: runnerConfig.container,
+                signal: inklingTracking?.signal,
+                admitSpawn,
+              })
+            : undefined;
+      } catch (error) {
+        if (!(error instanceof NativeSteeringAdmissionRefused)) throw error;
+        nativeRefusal = error.message;
+        launch?.exited(); // Nothing was spawned.
+      }
+      result = nativeRefusal
+        ? {
+            success: false,
+            backendSessionId: session.backendSessionId ?? null,
+            responses: [],
+            refusedBeforeSpawn: true,
+            error: nativeRefusal,
           }
-          return ran;
-        })
-        .finally(() => inklingTracking?.done());
+        : await turnRunner
+            .run(runMessage, {
+              backendSessionId: session.backendSessionId || undefined,
+              // Always handed over, including on resume. Every runner already gates
+              // its own injection on `!isResume`, so this does not change what a
+              // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+              // that re-bootstraps on every turn, and needs this copy on hand to
+              // recover when that bootstrap fails.
+              injectedContext,
+              // The epoch every terminal write for this turn is fenced on. A
+              // backend process that reports its own turns to the lifecycle route
+              // (ink chat) names this one instead of claiming its own, which fenced
+              // this run out of its own finalize on every ink-backed turn.
+              config: {
+                ...runnerConfig,
+                turnEpoch,
+                ...(nativeSteering ? { nativeSteering } : {}),
+                ...(inklingTracking ? { signal: inklingTracking.signal } : {}),
+                admitSpawn,
+                ...(launch ? { launchEnv: launch.env } : {}),
+                onSpawned: (spawned) => launch?.spawned(spawned),
+              },
+              mediaAttachments: uploads.attachments.length > 0 ? uploads.attachments : undefined,
+            })
+            .then((ran) => {
+              // A stop the runner could not confirm leaves its row open, for the
+              // next start's sweep to look at.
+              if (!ran.stopUnconfirmed) launch?.exited();
+              // Fenced before the turn is released below, so no admission can
+              // fall between the two.
+              if (inklingTracking && inklingSbId && ran.stopUnconfirmed) {
+                fenceInkling(inklingSbId, ran.stopUnconfirmed);
+              }
+              return ran;
+            })
+            .finally(() => inklingTracking?.done());
       turnDurationMs = Date.now() - turnStartMs;
       // Classified BEFORE the settled outcome is recorded, because the outcome
       // depends on it. The backend can refuse a run before accepting it — most
@@ -3896,24 +4000,24 @@ export class SessionService implements ISessionService {
     sbSlug: string,
     email: string | undefined,
     session: { id: string; sbId?: string; contactId?: string }
-  ): string | undefined {
-    if (!email) {
+  ): string {
+    if (!email?.trim()) {
       logger.warn('Cannot inject Inkwell access token for backend runner: missing user email', {
         userId,
         sbSlug,
       });
-      return undefined;
+      throw new Error('Runner credential unavailable: missing owner email');
     }
 
-    if (!process.env.JWT_SECRET) {
+    if (!process.env.JWT_SECRET?.trim()) {
       logger.warn('Cannot inject Inkwell access token for backend runner: JWT_SECRET missing', {
         userId,
         sbSlug,
       });
-      return undefined;
+      throw new Error('Runner credential unavailable: missing signing key');
     }
 
-    return signRunnerAccessToken({
+    const token = signRunnerAccessToken({
       userId,
       email,
       sbSlug,
@@ -3921,6 +4025,54 @@ export class SessionService implements ISessionService {
       sessionId: session.id,
       contactId: session.contactId,
     });
+    const refusal = this.runnerCredentialRefusal(token, userId, sbSlug, session);
+    if (refusal) throw new Error(refusal);
+    return token;
+  }
+
+  /** Do not leak mint/signing error text or bypass the normal turn-end path. */
+  private runnerCredentialUnavailable(session: Session): SessionResult {
+    const summary = 'Runner credential unavailable: re-admit the session before retrying';
+    logger.warn(summary, { sessionId: session.id, sbSlug: session.sbSlug });
+    return {
+      success: false,
+      sessionId: session.id,
+      backendSessionId: session.backendSessionId ?? null,
+      responses: [],
+      sessionStatus: 'failed',
+      compactionTriggered: false,
+      error: summary,
+      errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+      classification: { category: 'auth', summary, retryable: false },
+    };
+  }
+
+  /** Rechecked after preparation and at every physical spawn, including recovery. */
+  private runnerCredentialRefusal(
+    token: string,
+    userId: string,
+    sbSlug: string,
+    session: { id: string; sbId?: string; contactId?: string }
+  ): string | undefined {
+    const claims = verifyInkAccessToken(token, 'mcp_access');
+    if (
+      !claims ||
+      !userId?.trim() ||
+      !sbSlug?.trim() ||
+      !session.id?.trim() ||
+      claims.sub !== userId ||
+      claims.sbSlug !== sbSlug ||
+      claims.sessionId !== session.id ||
+      claims.sbId !== (session.sbId ?? undefined) ||
+      claims.contactId !== (session.contactId ?? undefined) ||
+      !isPlainToolsScope(claims.scope) ||
+      typeof claims.exp !== 'number' ||
+      !Number.isFinite(claims.exp) ||
+      claims.exp * 1000 <= Date.now() + 60_000
+    ) {
+      return 'Runner credential unavailable: re-admit the session before spawning';
+    }
+    return undefined;
   }
 
   /**
@@ -6113,7 +6265,7 @@ export class SessionService implements ISessionService {
     return this.repository.findByUser(userId, options);
   }
 
-  async triggerCompaction(sessionId: string): Promise<void> {
+  async triggerCompaction(sessionId: string): Promise<void | SessionResult> {
     const session = await this.repository.findById(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -6199,12 +6351,18 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const compactionDelegationSecret = this.createDelegationSecret();
-      const compactionToken = this.createRunnerAccessToken(
-        session.userId,
-        session.sbSlug,
-        fullContext.user.email,
-        session
-      );
+      let compactionToken: string;
+      try {
+        compactionToken = this.createRunnerAccessToken(
+          session.userId,
+          session.sbSlug,
+          fullContext.user.email,
+          session
+        );
+      } catch {
+        // The same classified refusal as a turn; finally releases the lock.
+        return this.runnerCredentialUnavailable(session);
+      }
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       // Compaction deliberately uses the FLEET default model, not the SB's
@@ -6222,6 +6380,12 @@ This session will continue with a fresh context after compaction. Your identity,
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
+        ...(this.config.onPermissionWarning
+          ? {
+              onPermissionWarning: (warning, signal) =>
+                this.config.onPermissionWarning!(session, warning, signal),
+            }
+          : {}),
         mcpConfigPath: this.config.mcpConfigPath,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
@@ -6232,7 +6396,10 @@ This session will continue with a fresh context after compaction. Your identity,
           context.agent.heartbeat
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
-        ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
+        inkAccessToken: compactionToken,
+        inkSessionId: session.id,
+        sbSlug: session.sbSlug,
+        ...(session.studioId ? { studioId: session.studioId } : {}),
         ...(compactionDelegationSecret ? { inkDelegationSecret: compactionDelegationSecret } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
         // No turnEpoch: compaction takes no turn of its own (no pre-spawn
@@ -6260,7 +6427,9 @@ This session will continue with a fresh context after compaction. Your identity,
       // Asked again past the awaits since the first check, and by the runner
       // at its spawn seam, as a turn's admission is.
       // The launch is written first, as a turn's is.
-      const compactionHold = (): string | undefined => launchHoldFor(sessionId);
+      const compactionHold = (): string | undefined =>
+        launchHoldFor(sessionId) ??
+        this.runnerCredentialRefusal(compactionToken, session.userId, session.sbSlug, session);
       const launch =
         compactionHold() === undefined ? await reserveLaunch(sessionId, runtimeBackend) : undefined;
       const refusedAtRun = compactionHold() ?? launch?.refused;

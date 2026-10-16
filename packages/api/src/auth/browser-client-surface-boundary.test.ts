@@ -45,8 +45,11 @@ import {
   registerActiveRun,
   attachRunControls,
   attachRunSteering,
+  getActiveRun,
+  submitRunSteering,
   resetActiveRuns,
 } from '../services/sessions/active-runs';
+import { createNativeSteeringBinding } from '../services/sessions/native-steering-binding';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import type { DataComposer } from '../data/composer';
 
@@ -294,6 +297,13 @@ describe('bearer-verification census', () => {
     // session, identity label and user. Browser grants are refused; regression in
     // hosted-ink-binding.test.ts. No human-auth fallback or token-type downgrade.
     'services/sessions/hosted-ink-binding.ts',
+    // Native steering uses the same mcp_access-only verifier, then requires
+    // the exact admitted owner/session/SB and full tier. Signed browser-token
+    // refusal and an admitted MCP-token control are exercised below.
+    'services/sessions/native-steering-binding.ts',
+    // Server launches require their minted mcp_access token with exact session,
+    // owner, agent and contact bindings. No browser or human-token downgrade.
+    'services/sessions/session-service.ts',
     // The companion router itself.
     'routes/browser-companion.ts',
   ].sort();
@@ -330,6 +340,80 @@ describe('bearer-verification census', () => {
       .sort();
 
     expect(found).toEqual(EXPECTED_CALL_SITES);
+  });
+});
+
+describe('native steering binding — browser grants cannot acquire a generation', () => {
+  const sessionId = 'native-boundary-session';
+  const turnEpoch = 'native-boundary-epoch';
+  const sbId = 'native-boundary-sb';
+  const sbSlug = 'echo';
+
+  // The real token verifier and registry run, but no log or child is opened.
+  const admission = (inkAccessToken: string) => {
+    resetActiveRuns();
+    registerActiveRun({
+      sessionId,
+      turnEpoch,
+      userId: USER_ID,
+      sbSlug,
+      backend: 'codex-cli',
+      startedAt: Date.now(),
+    });
+    return {
+      sessionId,
+      turnEpoch,
+      userId: USER_ID,
+      sbId,
+      sbSlug,
+      contactId: null,
+      cliAttached: false,
+      identityMetadata: {},
+      executionTier: 'full' as const,
+      workingDirectory: '/synthetic-unused-native-boundary',
+      inkAccessToken,
+    };
+  };
+
+  afterAll(() => resetActiveRuns());
+
+  it('refuses a signed browser_client credential without attaching an owner port', () => {
+    expect(createNativeSteeringBinding(admission(browserToken()))).toBeUndefined();
+    expect(getActiveRun(sessionId)?.hostedSteering).toBeUndefined();
+  });
+
+  it('also refuses an unbound mcp_access credential', () => {
+    expect(createNativeSteeringBinding(admission(mcpToken()))).toBeUndefined();
+    expect(getActiveRun(sessionId)?.hostedSteering).toBeUndefined();
+  });
+
+  it('CONTROL: a signed session/SB-bound mcp_access credential can bind the owner', async () => {
+    const token = signInkAccessToken(
+      {
+        type: 'mcp_access',
+        sub: USER_ID,
+        email: 'native@example.com',
+        scope: 'mcp:tools',
+        sessionId,
+        sbId,
+        sbSlug,
+      },
+      300
+    );
+    const binding = createNativeSteeringBinding(admission(token));
+    expect(binding).toBeDefined();
+    const enqueue = vi.fn(async () => ({ messageId: 'native-input', status: 'pending' as const }));
+    const release = binding!.bind(enqueue);
+    try {
+      const input = { messageId: 'native-input', text: 'Synthetic native boundary control.' };
+      expect(await submitRunSteering(sessionId, turnEpoch, input)).toEqual({
+        messageId: 'native-input',
+        status: 'pending',
+      });
+      expect(enqueue).toHaveBeenCalledExactlyOnceWith(input);
+    } finally {
+      release();
+    }
   });
 });
 

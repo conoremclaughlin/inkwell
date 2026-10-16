@@ -13,6 +13,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { Database } from '../data/supabase/types';
 import { tokenIdentityState } from './token-identity';
+import { SPACE_TURN_SCOPE, isSpaceTurnScope } from './token-scope';
 
 // ============================================================================
 // Types
@@ -51,6 +52,20 @@ export interface InkTokenPayload {
    */
   sessionId?: string;
   contactId?: string;
+  /**
+   * The conversation a space-turn token (`scope: 'mcp:space-turn'`) was minted
+   * for. Signed, so the tool allowlist can bind the turn to its own thread.
+   * Absent on every other token.
+   */
+  workspaceId?: string;
+  threadId?: string;
+  threadKey?: string;
+  /**
+   * The admitted turn a space-turn token belongs to: its session's
+   * turn_epoch when the token was minted. Every request it makes is checked
+   * against the session row, so the token stops working when the turn does.
+   */
+  turnEpoch?: string;
   /**
    * Absolute expiry, seconds since the epoch. Present on every verified
    * token. On a payload passed to signInkAccessToken it is a ceiling.
@@ -124,6 +139,49 @@ export function signRunnerAccessToken(
   );
 }
 
+/**
+ * Sign the access token for one turn in a shared conversation.
+ *
+ * The token names the conversation and the turn it serves, and the server
+ * lets it reach only the space-turn tools for that thread
+ * (mcp/tools/space-turn-policy.ts), and only while that turn is current. The
+ * verifier refuses one missing any of its seven binding claims: sbSlug,
+ * sbId, sessionId, workspaceId, threadId, threadKey and turnEpoch. Nothing
+ * mints these yet: SessionService still signs every runner with
+ * signRunnerAccessToken.
+ */
+export function signSpaceTurnAccessToken(
+  claims: {
+    userId: string;
+    email: string;
+    sbId: string;
+    sbSlug: string;
+    sessionId: string;
+    workspaceId: string;
+    threadId: string;
+    threadKey: string;
+    turnEpoch: string;
+  },
+  expiresInSeconds = 60 * 60
+): string {
+  return signInkAccessToken(
+    {
+      type: 'mcp_access',
+      sub: claims.userId,
+      email: claims.email,
+      scope: SPACE_TURN_SCOPE,
+      sbSlug: claims.sbSlug,
+      sbId: claims.sbId,
+      sessionId: claims.sessionId,
+      workspaceId: claims.workspaceId,
+      threadId: claims.threadId,
+      threadKey: claims.threadKey,
+      turnEpoch: claims.turnEpoch,
+    },
+    expiresInSeconds
+  );
+}
+
 // ============================================================================
 // Verify
 // ============================================================================
@@ -189,6 +247,12 @@ export async function createRefreshToken(
   sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
+  // A space-turn token lives for one turn and is bound to it; a refresh
+  // record would outlive the turn and mint the scope without its bindings
+  // (ink://specs/inkling-multi-person-groups, Phase 2 gate 4).
+  if (scopes.some((scope) => isSpaceTurnScope(scope))) {
+    throw new Error('A space-turn scope cannot have a refresh token');
+  }
   const refreshToken = `ink-rt-${crypto.randomBytes(32).toString('hex')}`;
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
 
@@ -251,6 +315,18 @@ export async function exchangeRefreshToken(
 
   if (new Date(tokenRecord.expires_at) < new Date()) {
     logger.warn('Refresh token expired', { userId: tokenRecord.user_id });
+    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
+    return null;
+  }
+
+  // No record may mint a space-turn token: the scope would come out with no
+  // conversation bound to it. Nothing creates such a record, so one that
+  // exists is removed rather than kept (ink://specs/inkling-multi-person-groups,
+  // Phase 2 gate 4).
+  if (isSpaceTurnScope((tokenRecord.scopes ?? []).join(' '))) {
+    logger.warn('Refused a refresh record with a space-turn scope', {
+      code: 'space_turn_refresh_refused',
+    });
     await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
     return null;
   }

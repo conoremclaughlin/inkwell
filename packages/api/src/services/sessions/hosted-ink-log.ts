@@ -1,9 +1,14 @@
 /** Async host for the existing JSONL ledger; preserves CLI continuity and observer eids. */
-import { appendFile, mkdir, readdir, open, lstat } from 'fs/promises';
+import { appendFile, mkdir, open } from 'fs/promises';
 import { setImmediate as yieldToHost } from 'timers/promises';
 import { join, basename, dirname, isAbsolute } from 'path';
 import { SessionLog } from '@inklabs/shared/runtime';
+import { describeJournalSplit, resolveParentJournal } from '@inklabs/shared/node-host';
+import { logger } from '../../utils/logger';
 import type { HostedSessionLog } from './hosted-ink-session';
+
+/** One warning per process for each split, not one per turn. */
+const reportedSplits = new Set<string>();
 
 export async function openHostedInkLog(input: {
   cwd: string;
@@ -17,24 +22,22 @@ export async function openHostedInkLog(input: {
   input.signal?.throwIfAborted();
   const dir = join(input.cwd, '.ink', 'runtime', 'repl');
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  const prefix = `${input.sessionId}-`;
-  const candidates = await Promise.all(
-    (await readdir(dir))
-      .filter(
-        (name) => name.startsWith(prefix) && name.endsWith('.jsonl') && !name.includes('.clone-')
-      )
-      .map(async (name) => {
-        const path = join(dir, name);
-        const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink()) return undefined;
-        return { path, time: info.mtimeMs };
-      })
-  );
-  const path =
-    candidates
-      .filter((x): x is NonNullable<typeof x> => Boolean(x))
-      .sort((a, b) => b.time - a.time)[0]?.path ??
-    join(dir, `${input.sessionId}-${Date.now()}.jsonl`);
+  // The session's own journal by the same rule as the CLI (task 65f3be41): a
+  // clone is never the parent unless an earlier ink chat attach adopted it,
+  // and then it holds this session's turns. Skipping adopted clones resumed
+  // Myra from a parent eleven days stale on 2026-10-13.
+  const journal = await resolveParentJournal(dir, input.sessionId);
+  const split = describeJournalSplit(journal);
+  if (split && !reportedSplits.has(`${input.sessionId}\0${split}`)) {
+    reportedSplits.add(`${input.sessionId}\0${split}`);
+    logger.warn('[HostedInkLog] Session journal history is split', {
+      sessionId: input.sessionId,
+      selected: journal.path ?? null,
+      parents: journal.parents,
+      adoptedClones: journal.adoptedClones,
+    });
+  }
+  const path = journal.path ?? join(dir, `${input.sessionId}-${Date.now()}.jsonl`);
   const log = new SessionLog({
     path,
     sink: { write: (line) => appendFile(path, line, { mode: 0o600 }) },

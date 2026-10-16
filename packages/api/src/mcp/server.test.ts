@@ -26,12 +26,13 @@ vi.mock('../config/env', async () => ({
 
 // The real signer, with one switch: move the clock on by N seconds at the
 // moment of signing, the boundary Lumen's 9372b0c7 probe found.
-const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0 }));
+const signerClock = vi.hoisted(() => ({ advanceSecondsAtSigning: 0, calls: 0 }));
 vi.mock('../auth/ink-tokens', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../auth/ink-tokens')>();
   return {
     ...actual,
     signInkAccessToken: (...args: Parameters<typeof actual.signInkAccessToken>) => {
+      signerClock.calls += 1;
       if (!signerClock.advanceSecondsAtSigning) return actual.signInkAccessToken(...args);
       const later = Date.now() + signerClock.advanceSecondsAtSigning * 1000;
       const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
@@ -85,15 +86,20 @@ vi.mock('../mini-apps', () => ({
   getMiniAppsInfo: vi.fn(() => []),
 }));
 
-vi.mock('./auth/ink-auth-provider', () => {
+vi.mock('./auth/ink-auth-provider', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./auth/ink-auth-provider')>();
   class MockInkAuthProvider {
     // The mock answers with the token's claims or null, as the provider's
     // signature check does; this wraps it in the verdict the routes read.
-    // A test can also hand back a verdict itself, e.g. a 503.
-    verifyAccessToken = async (header?: string) => {
+    // A test can also hand back a verdict itself, e.g. a 503. The space-turn
+    // seam rule is the real one, so a route's opt-in, or its absence, is
+    // tested as the route actually passes it. Without the rule (a provider
+    // that predates it) every signed token is admitted, as it then was.
+    verifyAccessToken = async (header?: string, options?: { allowSpaceTurn?: boolean }) => {
       const token = await mockVerifyAccessToken(header);
       if (token && typeof token === 'object' && 'ok' in token) return token;
-      return token ? { ok: true, token } : { ok: false, status: 401 };
+      if (!token) return { ok: false, status: 401 };
+      return actual.spaceTurnSeamRefusal?.(token, options) ?? { ok: true, token };
     };
     createPendingAuth = vi.fn(() => 'pending-id');
     handleAuthCallback = vi.fn(async () => ({ error: 'invalid_request' }));
@@ -150,6 +156,12 @@ vi.mock('@supabase/supabase-js', () => ({
 import { MCPServer } from './server';
 import { env } from '../config/env';
 import { registerAllTools } from './tools';
+import { runWithRequestContext } from '../utils/request-context';
+import {
+  registerActiveRun,
+  resetActiveRuns,
+  markRunnerSettled,
+} from '../services/sessions/active-runs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -793,6 +805,294 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(payload?.sessionId).toBeUndefined();
       expect(payload?.contactId).toBeUndefined();
     });
+
+    // A shared conversation's turn token for this same SB would otherwise come
+    // back as a broad mcp:tools token for the same session
+    // (ink://specs/inkling-multi-person-groups, Phase 1).
+    const SPACE_TURN = {
+      ...BOUND,
+      contactId: undefined,
+      scope: 'mcp:space-turn',
+      workspaceId: 'workspace-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: 'inkling:thread:fixture-group',
+    };
+
+    it.each(['mcp:space-turn', 'mcp:tools mcp:space-turn'])(
+      'refuses a %s token for its own SB, signing nothing',
+      async (scope) => {
+        mockVerifyAccessToken.mockResolvedValue({ ...SPACE_TURN, scope });
+        delegatedIdentity = SB_ALPHA;
+        signerClock.calls = 0;
+
+        const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+        expect(status).toBe(403);
+        expect(body.access_token).toBeUndefined();
+        expect(signerClock.calls).toBe(0);
+      }
+    );
+
+    it('still delegates for an mcp:tools token bound to the same SB (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, scope: 'mcp:tools' });
+      delegatedIdentity = SB_ALPHA;
+      signerClock.calls = 0;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(typeof body.access_token).toBe('string');
+      expect(signerClock.calls).toBe(1);
+    });
+
+    // Phase 2 gate 2: the route refuses on its own, so a seam that admitted
+    // the token by mistake still cannot turn delegation into a widening. The
+    // double hands back a ready verdict, as a seam that admitted it would.
+    it.each(['mcp:space-turn', 'mcp:tools mcp:space-turn'])(
+      'refuses a %s presenter even when the seam admitted it, signing nothing',
+      async (scope) => {
+        mockVerifyAccessToken.mockResolvedValue({ ok: true, token: { ...SPACE_TURN, scope } });
+        delegatedIdentity = SB_ALPHA;
+        signerClock.calls = 0;
+
+        const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+        expect(status).toBe(403);
+        expect(body.code).toBe('space_turn_token_refused');
+        expect(body.access_token).toBeUndefined();
+        expect(signerClock.calls).toBe(0);
+      }
+    );
+
+    it('mints the presenter’s own scope, not a literal', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND, scope: 'mcp:tools offline_access' });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.scope).toBe('mcp:tools offline_access');
+      const payload = verifyInkAccessToken(body.access_token as string, 'mcp_access');
+      expect(payload?.scope).toBe('mcp:tools offline_access');
+    });
+
+    it('mints mcp:tools for a presenter that names no scope (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ ...BOUND });
+      delegatedIdentity = SB_ALPHA;
+
+      const { status, body } = await delegate(SB_ALPHA.agent_id);
+
+      expect(status).toBe(200);
+      expect(body.scope).toBe('mcp:tools');
+      expect(verifyInkAccessToken(body.access_token as string, 'mcp_access')?.scope).toBe(
+        'mcp:tools'
+      );
+    });
+  });
+
+  // =========================================================================
+  // The token scope reaches the request context from the signed token alone
+  // (ink://specs/inkling-multi-person-groups, Phase 1)
+  // =========================================================================
+  describe('the request context takes its token scope from the verified token only', () => {
+    const KEY = 'inkling:thread:fixture-group';
+
+    function lastContext(): Record<string, unknown> {
+      const calls = vi.mocked(runWithRequestContext).mock.calls;
+      return calls[calls.length - 1]?.[0] as Record<string, unknown>;
+    }
+
+    beforeEach(() => {
+      expect(serverUnavailableError).toBeNull();
+      vi.mocked(runWithRequestContext).mockClear();
+    });
+
+    const EPOCH = 'epoch-synthetic-current';
+    const spaceTurnToken = {
+      userId: 'user-123',
+      email: 'user@example.com',
+      sbSlug: 'synthetic-inkling',
+      sbId: 'identity-inkling',
+      sessionId: 'session-synthetic',
+      scope: 'mcp:space-turn',
+      workspaceId: 'workspace-synthetic',
+      threadId: 'thread-synthetic',
+      threadKey: KEY,
+      turnEpoch: EPOCH,
+    };
+    const liveTurnSession = (overrides: Record<string, unknown> = {}) => ({
+      id: 'session-synthetic',
+      userId: 'user-123',
+      sbSlug: 'synthetic-inkling',
+      turnScope: 'space-turn',
+      turnEpoch: EPOCH,
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+      ...overrides,
+    });
+    /** This process admitted the token's turn (active-runs.ts), unless a case says otherwise. */
+    const admitTurn = (turnEpoch = EPOCH) => {
+      resetActiveRuns();
+      registerActiveRun({
+        sessionId: 'session-synthetic',
+        userId: 'user-123',
+        sbSlug: 'synthetic-inkling',
+        backend: 'ink',
+        startedAt: Date.now(),
+        turnEpoch,
+      });
+    };
+    beforeEach(() => admitTurn());
+    afterEach(() => resetActiveRuns());
+
+    it("carries a space-turn token's scope and thread into the request context", async () => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).toHaveBeenCalledWith('session-synthetic');
+      expect(lastContext()).toMatchObject({
+        tokenScope: 'mcp:space-turn',
+        tokenWorkspaceId: 'workspace-synthetic',
+        tokenThreadId: 'thread-synthetic',
+        tokenThreadKey: KEY,
+      });
+    });
+
+    // Phase 2 gate 7: the token lives only as long as its admitted turn. The
+    // turn stays admitted in this process for every case here, so each row
+    // change is the only thing refusing it. A settled turn keeps its epoch
+    // and an unended session (SessionService finalization; Lumen, #867).
+    it.each([
+      ['a settled idle turn', { lifecycle: 'idle' }],
+      ['a settled failed turn', { lifecycle: 'failed' }],
+      ['a completed turn, never ended', { lifecycle: 'completed' }],
+      ['a turn mid-compaction', { lifecycle: 'compacting' }],
+      ['no lifecycle', { lifecycle: undefined }],
+      ['an ended session', { endedAt: new Date() }],
+      ['a newer turn', { turnEpoch: 'epoch-synthetic-next' }],
+      ['an unmarked session', { turnScope: undefined }],
+      ['a session with no turn', { turnEpoch: undefined }],
+    ])('refuses a space-turn token whose session shows %s (401)', async (_label, change) => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession(change));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    // The row says running at the token's epoch in each of these; only this
+    // process's registry refuses: its runner has settled while finalization is
+    // still pending (admission outlives the runner; Lumen, #867 round 2), no
+    // turn is admitted here, or another generation is.
+    it.each([
+      [
+        'a successful runner awaiting finalization',
+        () => markRunnerSettled('session-synthetic', 'succeeded'),
+      ],
+      [
+        'a failed runner awaiting finalization',
+        () => markRunnerSettled('session-synthetic', 'failed'),
+      ],
+      ['no admitted turn in this process', () => resetActiveRuns()],
+      ['another generation admitted', () => admitTurn('epoch-synthetic-other')],
+    ])('refuses a running space-turn token with %s (401)', async (_label, arrange) => {
+      arrange();
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(liveTurnSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('refuses a space-turn token whose session is gone (401)', async () => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockResolvedValue(null);
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(401);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('answers 503 when the space-turn session cannot be read', async () => {
+      mockVerifyAccessToken.mockResolvedValue(spaceTurnToken);
+      mockGetSession.mockRejectedValue(new Error('synthetic read failure'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(503);
+      expect(vi.mocked(runWithRequestContext)).not.toHaveBeenCalled();
+    });
+
+    it('reads no session for an ordinary runner token (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({
+        userId: 'user-123',
+        email: 'user@example.com',
+        sbSlug: 'synthetic-alpha',
+        sbId: 'identity-alpha',
+        sessionId: 'session-synthetic',
+        scope: 'mcp:tools',
+      });
+      mockGetSession.mockClear();
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { Authorization: 'Bearer valid' });
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).not.toHaveBeenCalled();
+    });
+
+    it('gives an unsigned header claiming a scope or thread no effect', async () => {
+      mockVerifyAccessToken.mockResolvedValue({
+        userId: 'user-123',
+        email: 'user@example.com',
+        sbSlug: 'synthetic-alpha',
+        sbId: 'identity-alpha',
+        scope: 'mcp:tools',
+      });
+      const forged = Buffer.from(
+        JSON.stringify({
+          sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+          studioId: 'main',
+          sbSlug: 'synthetic-alpha',
+          cliAttached: false,
+          runtime: 'claude',
+          scope: 'mcp:space-turn',
+          tokenScope: 'mcp:space-turn',
+          threadKey: KEY,
+          tokenThreadKey: KEY,
+        })
+      ).toString('base64url');
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': forged,
+        'x-ink-token-scope': 'mcp:space-turn',
+      });
+
+      expect(res.status).toBe(200);
+      const ctx = lastContext();
+      expect(ctx.tokenScope).toBe('mcp:tools');
+      expect(ctx.tokenThreadKey).toBeUndefined();
+      expect(ctx.tokenThreadId).toBeUndefined();
+    });
+
+    it('leaves the scope unset when the request carried no token', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST);
+
+      expect(res.status).toBe(200);
+      expect(lastContext().tokenScope).toBeUndefined();
+    });
   });
 
   // =========================================================================
@@ -873,6 +1173,102 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     // The enrichment path consulted the session row under Authorization —
     // previously getSession was only reached in the no-auth fallback.
     expect(mockGetSession).toHaveBeenCalledWith('b2c3d4e5-f6a7-8901-bcde-f23456789012');
+  });
+
+  // A space-turn session never authenticates by context: its runner knows its
+  // own sessionId and slug (ink://specs/inkling-multi-person-groups, gate 1).
+  describe('a context naming a space-turn session authenticates nothing', () => {
+    const SESSION_ID = 'c3d4e5f6-a7b8-4901-8cde-f34567890123';
+    const contextHeader = () =>
+      encodeContextHeader({
+        sessionId: SESSION_ID,
+        studioId: 'studio-1',
+        sbSlug: 'synthetic-inkling',
+        cliAttached: false,
+        runtime: 'ink',
+      });
+    const liveSession = (turnScope?: string) => ({
+      id: SESSION_ID,
+      userId: 'user-456',
+      sbSlug: 'synthetic-inkling',
+      ...(turnScope ? { turnScope } : {}),
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    function lastContext(): Record<string, unknown> {
+      const calls = vi.mocked(runWithRequestContext).mock.calls;
+      return calls[calls.length - 1]?.[0] as Record<string, unknown>;
+    }
+
+    beforeEach(() => {
+      expect(serverUnavailableError).toBeNull();
+      vi.mocked(runWithRequestContext).mockClear();
+      contextIdentity = {
+        id: 'sb-synthetic-inkling',
+        user_id: 'user-456',
+        users: { email: 'test@example.com' },
+      };
+    });
+
+    it('the bearer-less fallback refuses a marked session, admitting no principal', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+      mockGetSession.mockResolvedValue(liveSession('space-turn'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { 'x-ink-context': contextHeader() });
+
+      expect(mockGetSession).toHaveBeenCalledWith(SESSION_ID);
+      // With no principal the request runs as nobody, exactly as for any
+      // context that does not resolve (401 instead when OAuth is required).
+      expect(res.status).toBe(200);
+      expect(lastContext().userId).toBeUndefined();
+      expect(lastContext().sbSlug).toBeUndefined();
+      expect(lastContext().agentTokenBound).toBeUndefined();
+    });
+
+    it('the bearer-less fallback still admits an unmarked session (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue(null);
+      mockGetSession.mockResolvedValue(liveSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, { 'x-ink-context': contextHeader() });
+
+      expect(res.status).toBe(200);
+      expect(lastContext()).toMatchObject({ userId: 'user-456', sbSlug: 'synthetic-inkling' });
+    });
+
+    it('enrichment leaves a user token unenriched for a marked session', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+      mockGetSession.mockResolvedValue(liveSession('space-turn'));
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': contextHeader(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).toHaveBeenCalledWith(SESSION_ID);
+      expect(lastContext().userId).toBe('user-456');
+      expect(lastContext().sbSlug).toBeUndefined();
+      expect(lastContext().sbId).toBeUndefined();
+    });
+
+    it('enrichment still attaches an unmarked session’s SB (control)', async () => {
+      mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+      mockGetSession.mockResolvedValue(liveSession());
+
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        Authorization: 'Bearer valid',
+        'x-ink-context': contextHeader(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(lastContext()).toMatchObject({
+        userId: 'user-456',
+        sbSlug: 'synthetic-inkling',
+        sbId: 'sb-synthetic-inkling',
+      });
+    });
   });
 
   it('does not fail the request when the context session belongs to a different user', async () => {

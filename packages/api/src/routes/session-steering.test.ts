@@ -16,7 +16,7 @@ import { INKLING_CLIENT } from '../services/inklings/inkling-client';
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-vi.mock('../config/env', async () => ({ env: (await import('../test/fake-env')).fakeEnv }));
+vi.mock('../config/env', async () => ({ env: (await import('../test/fake-env.js')).fakeEnv }));
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
     from: () => {
@@ -26,24 +26,24 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 afterEach(resetActiveRuns);
 const input = { messageId: 'fixture-message', text: 'Use the updated plan.' };
-function register(turnEpoch = 'fixture-epoch') {
+function register(turnEpoch = 'fixture-epoch', backend = 'ink') {
   registerActiveRun({
     sessionId: 'fixture-session',
     turnEpoch,
     userId: 'fixture-owner',
     sbSlug: 'echo',
-    backend: 'ink',
+    backend,
     startedAt: Date.now(),
   });
 }
-function fixture() {
+function fixture(backend = 'ink') {
   const enqueue = vi.fn(
     async (): Promise<SessionSteeringReceipt> => ({
       messageId: input.messageId,
       status: 'pending',
     })
   );
-  register();
+  register('fixture-epoch', backend);
   const release = attachRunSteering('fixture-session', 'fixture-epoch', enqueue);
   const auth: Record<string, unknown> = { userId: 'fixture-owner' };
   const session: Record<string, unknown> = {
@@ -104,20 +104,23 @@ function fixture() {
   };
 }
 
-describe('explicit hosted owner steering', () => {
-  it('passes text only to the current mailbox without a new wake or session write', async () => {
-    const h = fixture();
-    await h.run();
-    expect(h.verify).toHaveBeenCalledWith('Bearer fixture');
-    expect(h.enqueue).toHaveBeenCalledExactlyOnceWith(input);
-    expect(h.from.mock.calls).toEqual([['sessions'], ['agent_identities']]);
-    expect(h.res.status).toHaveBeenCalledWith(202);
-    expect(h.res.json).toHaveBeenCalledWith({
-      messageId: input.messageId,
-      status: 'pending',
-      turnEpoch: 'fixture-epoch',
-    });
-  });
+describe('explicit admitted owner steering', () => {
+  it.each(['ink', 'codex-cli'])(
+    'passes text only to the admitted %s mailbox without a new wake or session write',
+    async (backend) => {
+      const h = fixture(backend);
+      await h.run();
+      expect(h.verify).toHaveBeenCalledWith('Bearer fixture');
+      expect(h.enqueue).toHaveBeenCalledExactlyOnceWith(input);
+      expect(h.from.mock.calls).toEqual([['sessions'], ['agent_identities']]);
+      expect(h.res.status).toHaveBeenCalledWith(202);
+      expect(h.res.json).toHaveBeenCalledWith({
+        messageId: input.messageId,
+        status: 'pending',
+        turnEpoch: 'fixture-epoch',
+      });
+    }
+  );
   it('does not acknowledge until the owner finishes durable admission', async () => {
     const h = fixture();
     let finish!: (receipt: SessionSteeringReceipt) => void;

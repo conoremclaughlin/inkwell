@@ -19,6 +19,7 @@ import { oauthRedirectUri, oauthStateStore, settleAttempt } from '../services/oa
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
+import { resolveParentJournal } from '@inklabs/shared/node-host';
 import { logger } from '../utils/logger';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
@@ -41,6 +42,12 @@ import { describePeople, resolvePersonNames } from '../services/person-display';
 import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
+import {
+  approvalScopeKey,
+  consumeOneUseGrant,
+  readSignedSession,
+  type SignedSession,
+} from '../services/one-use-approvals';
 
 /**
  * Build a JSON error response. In development mode, includes the real error
@@ -72,6 +79,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/ink-tokens';
 import { tokenIdentityState } from '../auth/token-identity';
+import { isSpaceTurnScope } from '../auth/token-scope';
 import type { Database } from '../data/supabase/types';
 import {
   BrowserCompanionGrantService,
@@ -192,6 +200,12 @@ type AdminAuthRequest = Request & {
    * Absent for a person's cookie or token. Never read from a header.
    */
   inkTokenSbId?: string;
+  /**
+   * The session a runner's access token was signed for, on the same routes.
+   * The only source a one-use approval's scope is read from (spec
+   * automated-turn-permissions §3.5); never the body or a header.
+   */
+  inkTokenSessionId?: string;
 };
 
 type CommentAuthorUser = {
@@ -242,7 +256,7 @@ const MOBILE_PAIR_CODE_LENGTH = 12;
 // 32 symbols, none of 0/O/1/I: a code someone reads off a screen and types.
 const MOBILE_PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
-const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
+const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/consume|\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
@@ -799,12 +813,16 @@ async function findInkTranscriptFile(sessionId: string): Promise<string | null> 
   }
   roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
+  // Each root's own journal for the session, never a clone's (task 65f3be41);
+  // then the newest across roots, as before.
   const matches: string[] = [];
   for (const root of roots) {
-    const rootMatches = await collectMatchingFiles(root, 0, (name) => {
-      return name.startsWith(`${sessionId}-`) && name.endsWith('.jsonl');
-    });
-    matches.push(...rootMatches);
+    try {
+      const journal = await resolveParentJournal(root, sessionId);
+      if (journal.path) matches.push(journal.path);
+    } catch {
+      // Ignore unreadable repl directories.
+    }
   }
 
   return pickNewestPath(matches);
@@ -1125,6 +1143,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     let inkUserId: string | undefined;
     let userEmail: string | undefined;
     let tokenSbId: string | undefined;
+    let tokenSessionId: string | undefined;
     let issueTokenCookies = false;
     // Tier 3 resolves its account from the database; tiers 1 and 2 take it
     // from a signed token or a refresh row, which outlive a deleted account.
@@ -1146,6 +1165,17 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyInkAccessToken(token, 'mcp_access');
+      // A space-turn token serves one shared conversation through MCP and
+      // reaches nothing here (ink://specs/inkling-multi-person-groups).
+      // Refused outright, before any other tier could admit the request.
+      if (mcpPayload && isSpaceTurnScope(mcpPayload.scope)) {
+        logger.warn('Refused a space-turn token on an admin route', { path: req.path });
+        res.status(403).json({
+          error: 'A shared-conversation token cannot use this route',
+          code: 'space_turn_token_refused',
+        });
+        return;
+      }
       // The SB it names must still exist, as on every mcp_access seam
       // (token-identity.ts). A token whose SB is gone authenticates nothing
       // here and falls through to the refusal below.
@@ -1166,6 +1196,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         // A runner's token is signed for one identity; keep that, so an
         // approval request records who asked from a signed source.
         tokenSbId = mcpPayload.sbId ?? mcpPayload.identityId;
+        tokenSessionId = mcpPayload.sessionId;
       }
     }
 
@@ -1409,6 +1440,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     authReq.inkWorkspaceId = activeWorkspaceId;
     authReq.inkWorkspaceRole = activeWorkspaceRole || 'trusted';
     authReq.inkTokenSbId = tokenSbId;
+    authReq.inkTokenSessionId = tokenSessionId;
 
     // Wrap the rest of the request in context
     runWithRequestContext(
@@ -11275,6 +11307,45 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       return;
     }
 
+    // A one-use request (a destructive command a headless turn met) is scoped
+    // to the session its runner token was signed for, and that session's own
+    // studio and SB, read from the row; the body's ids are ignored for it
+    // (spec automated-turn-permissions §3.5).
+    let oneUse: { scopeKey: string; session: SignedSession } | null = null;
+    if (req.body.oneUse === true) {
+      if (typeof args !== 'string' || typeof req.body.cwd !== 'string') {
+        res.status(400).json({ error: 'a one-use request needs args and cwd' });
+        return;
+      }
+      const session = await readSignedSession(
+        supabase,
+        authReq.inkUserId,
+        authReq.inkTokenSessionId
+      );
+      if (!session) {
+        res.status(403).json({ error: 'a one-use request needs a runner token for a session' });
+        return;
+      }
+      // Who asked comes from the session's canonical identity only. With none,
+      // the request is refused, never labelled from the unsigned header.
+      if (!session.sbSlug) {
+        res.status(403).json({ error: 'a one-use request needs a session with a canonical SB' });
+        return;
+      }
+      oneUse = {
+        session,
+        scopeKey: approvalScopeKey({
+          userId: authReq.inkUserId,
+          sessionId: session.sessionId,
+          studioId: session.studioId,
+          sbId: session.sbId,
+          tool,
+          args,
+          cwd: req.body.cwd,
+        }),
+      };
+    }
+
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
     const cloneOrigin = normalizeApprovalOrigin(origin);
 
@@ -11334,11 +11405,13 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       .from('approval_requests')
       .insert({
         user_id: authReq.inkUserId,
-        studio_id: studioIdForInsert,
-        session_id: sessionIdForInsert,
+        studio_id: oneUse ? oneUse.session.studioId : studioIdForInsert,
+        session_id: oneUse ? oneUse.session.sessionId : sessionIdForInsert,
+        ...(oneUse ? { scope_key: oneUse.scopeKey } : {}),
         sb_id: requester.sbId,
         workspace_id: requester.workspaceId,
-        requesting_agent_id: requestingSlug,
+        requesting_agent_id: oneUse ? (oneUse.session.sbSlug as string) : requestingSlug,
+        ...(oneUse ? { cwd: req.body.cwd } : {}),
         tool,
         args: args || null,
         reason: reason || null,
@@ -11379,16 +11452,19 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
 
     // Send notification to connected platforms (non-blocking)
+    // A one-use request's notice names its signed scope, never the body's ids
+    // or the header slug, and shows the directory being approved (Lumen, #853).
     notifyPlatformOfApprovalRequest({
       id: data.id,
       userId: authReq.inkUserId,
       tool,
       args,
       reason: req.body.reason,
-      requestingSlug,
+      requestingSlug: oneUse ? (oneUse.session.sbSlug as string) : requestingSlug,
       origin: cloneOrigin,
-      studioId,
-      sessionId,
+      studioId: oneUse ? oneUse.session.studioId : studioId,
+      sessionId: oneUse ? oneUse.session.sessionId : sessionId,
+      ...(oneUse ? { oneUse: { cwd: req.body.cwd } } : {}),
       expiresAt,
     }).catch((err) => {
       logger.error('Failed to send platform notification for approval request', {
@@ -11405,6 +11481,51 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to create approval request:', error);
     res.status(500).json(errorJson('Failed to create approval request', error));
+  }
+});
+
+/**
+ * Spend a one-use grant (spec automated-turn-permissions §3.5). The hook
+ * calls this before asking again; the scope is the signed session's, plus
+ * the tool, command and directory sent. `{ granted: true }` at most once
+ * per grant.
+ */
+router.post('/approval-requests/consume', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const { tool, args, cwd } = req.body ?? {};
+    if (typeof tool !== 'string' || typeof args !== 'string' || typeof cwd !== 'string') {
+      res.status(400).json({ error: 'tool, args and cwd are required' });
+      return;
+    }
+    const session = await readSignedSession(supabase, authReq.inkUserId, authReq.inkTokenSessionId);
+    if (!session) {
+      res.status(403).json({ error: 'consuming a grant needs a runner token for a session' });
+      return;
+    }
+    const scopeKey = approvalScopeKey({
+      userId: authReq.inkUserId,
+      sessionId: session.sessionId,
+      studioId: session.studioId,
+      sbId: session.sbId,
+      tool,
+      args,
+      cwd,
+    });
+    const requestId = await consumeOneUseGrant(supabase, {
+      userId: authReq.inkUserId,
+      sessionId: session.sessionId,
+      scopeKey,
+    });
+    if (requestId)
+      logger.info('One-use approval spent', { requestId, sessionId: session.sessionId });
+    res.json(requestId ? { granted: true, requestId } : { granted: false });
+  } catch (error) {
+    logger.error('Failed to consume an approval grant:', error);
+    res.status(500).json(errorJson('Failed to consume an approval grant', error));
   }
 });
 
@@ -11435,10 +11556,35 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
 
     // Auto-expire if past deadline and still pending
     if (data.status === 'pending' && new Date(data.expires_at) < new Date()) {
-      await supabase
+      // Expire only a row still pending: a grant that raced this poll must
+      // not be overwritten by it (Lumen, #853).
+      const { data: expired } = await supabase
         .from('approval_requests')
         .update({ status: 'expired', resolved_at: new Date().toISOString() })
-        .eq('id', requestId);
+        .eq('id', requestId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('status', 'pending')
+        .select('id');
+      if (!Array.isArray(expired) || expired.length !== 1) {
+        const { data: current } = await supabase
+          .from('approval_requests')
+          .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at')
+          .eq('id', requestId)
+          .eq('user_id', authReq.inkUserId)
+          .single();
+        if (current) {
+          res.json({
+            requestId: current.id,
+            status: current.status,
+            action: current.action,
+            grantedTools: current.granted_tools,
+            grantedBy: current.granted_by,
+            expiresAt: current.expires_at,
+            resolvedAt: current.resolved_at,
+          });
+          return;
+        }
+      }
 
       res.json({
         requestId: data.id,

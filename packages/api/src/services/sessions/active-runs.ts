@@ -386,6 +386,20 @@ export function isGenerationAdmitted(sessionId: string, turnEpoch: string): bool
 }
 
 /**
+ * Whether `turnEpoch` is the admitted generation of `sessionId` AND its
+ * runner has not settled: the turn's work is still running. Admission
+ * deliberately outlives the runner (markRunnerSettled keeps the entry so
+ * finalization can still claim the row), so something that must end with
+ * the runner, like a space-turn token, asks this instead.
+ */
+export function isGenerationRunning(sessionId: string, turnEpoch: string): boolean {
+  return (
+    isGenerationAdmitted(sessionId, turnEpoch) &&
+    active.get(sessionId)?.runnerSettledAt === undefined
+  );
+}
+
+/**
  * Whether another generation of `sessionId` still owns a child: one pending,
  * or settled without a confirmed exit (childExited false, a rejection, a stop
  * that timed out). Such a child may still be running and writing, so no
@@ -462,7 +476,7 @@ export interface StopOwnedChildrenResult {
  * Stop the owned children, all of them or one generation's, and wait up to
  * `timeoutMs` for each to settle. A child is reported stopped only on a
  * confirmed exit; abort() returning, or `settled` resolving, is not one.
- * Exposed for graceful shutdown, which is not wired to it yet (P2d).
+ * Used by graceful shutdown after intake closes; surviving children remain owned.
  */
 export async function stopOwnedChildren(
   timeoutMs: number,

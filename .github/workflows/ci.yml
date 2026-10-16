@@ -39,6 +39,14 @@ jobs:
       - name: License scope and preserved grants
         run: node --test scripts/license-boundary.test.mjs
 
+      - name: Dependency security regressions (no shell execution or network)
+        run: node --test scripts/security-dependencies.test.cjs
+
+      # The dev API server's watcher restarts a run that crashed, stops on a
+      # signal even mid-backoff, and restarts on a change (task ff78e1dd).
+      - name: Dev server watcher
+        run: node --test scripts/dev-watch.test.mjs
+
       - run: yarn build
 
       # pi's grep/find tools shell out to ripgrep and fd, and pi downloads them
@@ -84,6 +92,11 @@ jobs:
 
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
+
+      # Backend config folders stay untracked at any depth; only the root's
+      # .claude/skills (the repo skills, for Claude Code) is tracked.
+      - name: Agent config ignore rules
+        run: sh scripts/gitignore-agent-dirs.test.sh
 
       # The migration wrapper (run a file, record it under the file's own
       # version; apply the pending set; refuse a window migration), the

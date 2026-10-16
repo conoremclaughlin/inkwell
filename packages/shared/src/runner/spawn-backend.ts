@@ -238,6 +238,10 @@ export const SPAWN_ENV_INHERITED_NAMES: readonly string[] = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_MODEL',
   'CLAUDE_CONFIG_DIR',
+  // Where claude makes its per-uid temp directory (claude-<uid>); without it,
+  // /tmp. A path, not a credential, like CLAUDE_CONFIG_DIR: it lets an
+  // operator keep a turn's temp files inside the turn's own directory.
+  'CLAUDE_CODE_TMPDIR',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
@@ -303,6 +307,7 @@ export function buildCleanEnv(
  */
 export const SESSION_ENV_HANDOFF_NAMES: readonly string[] = [
   'INK_ACCESS_TOKEN',
+  'INK_RUNNER_AUTH_REQUIRED',
   'INK_DELEGATION_SECRET',
   'INK_SESSION_ID',
   'INK_STUDIO_ID',

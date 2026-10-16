@@ -6,10 +6,18 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { fakeEnv } from '../../test/fake-env';
+vi.mock('../../config/env', async () => ({
+  env: (await import('../../test/fake-env')).fakeEnv,
+  isDevelopment: () => false,
+  isProduction: () => false,
+  isTest: () => true,
+}));
 import { tmpdir } from 'os';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { buildIdentityPrompt } from './claude-runner.js';
 import { deliverInklingHeartbeat } from '../inklings/inkling-heartbeat.js';
 import type { DueReminder, HeartbeatDeliveryOutcome } from '../heartbeat.js';
 import { cancelInklingTurns, liveInklingTurns } from '../inklings/inkling-turns.js';
@@ -148,6 +156,7 @@ describe('SessionService', () => {
     },
     user: {
       id: 'user-456',
+      email: 'fixture@example.invalid',
       timezone: 'America/Los_Angeles',
       contacts: {},
       preferences: {},
@@ -176,6 +185,13 @@ describe('SessionService', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv('JWT_SECRET', fakeEnv.JWT_SECRET);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => {
+        throw new Error('No network allowed in this service fixture');
+      })
+    );
 
     // Create fresh mocks for each test
     mockRepository = {
@@ -250,6 +266,180 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  describe('required runner credential admission', () => {
+    // Phase 2 gate 6 (ink://specs/inkling-multi-person-groups): a scope that
+    // merely includes mcp:tools is not a plain runner credential; a mixed
+    // "mcp:tools mcp:space-turn" token must not be admitted as broad, nor
+    // mcp:tools beside any other scope.
+    it.each([
+      ['mcp:tools', true],
+      ['mcp:tools offline_access', false],
+      ['mcp:tools mcp:space-turn', false],
+      ['mcp:space-turn mcp:tools', false],
+      ['mcp:space-turn', false],
+    ] as const)('runner credential scoped "%s" is admitted: %s', async (scope, admitted) => {
+      const { signInkAccessToken } = await import('../../auth/ink-tokens');
+      const token = signInkAccessToken(
+        {
+          type: 'mcp_access',
+          sub: 'user-scope',
+          email: 'owner@example.invalid',
+          scope,
+          sbSlug: 'wren',
+          sessionId: 'session-scope',
+        },
+        3600
+      );
+      const refusal = (
+        sessionService as unknown as {
+          runnerCredentialRefusal: (
+            token: string,
+            userId: string,
+            sbSlug: string,
+            session: { id: string; sbId?: string; contactId?: string }
+          ) => string | undefined;
+        }
+      ).runnerCredentialRefusal(token, 'user-scope', 'wren', { id: 'session-scope' });
+      expect(refusal === undefined).toBe(admitted);
+    });
+
+    it.each(['turn', 'compaction'])(
+      'rechecks credential expiry at the %s physical-spawn seam',
+      async (kind) => {
+        const session = createMockSession();
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        // Spawn admission belongs to the live runner invocation. After the
+        // turn finalizes, the generation fence correctly refuses admission
+        // before credential validation can run.
+        let checkedCredentialExpiry = false;
+        vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (_message, { config }) => {
+          expect(config.admitSpawn).toBeTypeOf('function');
+          expect(config.admitSpawn?.()).toBeUndefined();
+          vi.useFakeTimers({ toFake: ['Date'] });
+          vi.setSystemTime(Date.now() + 2 * 3600_000);
+          const refusal = config.admitSpawn?.();
+          expect(refusal).toBeDefined();
+          expect(refusal).toMatch(/runner credential unavailable/i);
+          checkedCredentialExpiry = true;
+          return createMockClaudeResult();
+        });
+        if (kind === 'compaction') await sessionService.triggerCompaction(session.id);
+        else
+          await (
+            sessionService as unknown as {
+              processMessage: (
+                request: ReturnType<typeof createMockRequest>,
+                session: Session
+              ) => Promise<unknown>;
+            }
+          ).processMessage(createMockRequest(), session);
+        expect(mockClaudeRunner.run).toHaveBeenCalledOnce();
+        expect(checkedCredentialExpiry).toBe(true);
+      }
+    );
+    it.each(['email', 'signing-key'])(
+      'refuses a turn without %s before any runner call',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        const start = vi.fn(async () => {});
+        const end = vi.fn(async (_result: unknown) => {});
+        const result = await sessionService.handleMessage(
+          createMockRequest({ turnHooks: { start, end } })
+        );
+        expect(result).toMatchObject({
+          success: false,
+          sessionId: session.id,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(start).toHaveBeenCalledOnce();
+        expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['email', 'signing-key'])(
+      'refuses compaction without %s and releases the lock',
+      async (missing) => {
+        const context = createMockInjectedContext();
+        if (missing === 'email') context.user.email = undefined;
+        else vi.stubEnv('JWT_SECRET', undefined);
+        vi.mocked(mockContextBuilder.buildContext).mockResolvedValue(context);
+        vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+        await expect(sessionService.triggerCompaction('session-123')).resolves.toMatchObject({
+          success: false,
+          sessionId: 'session-123',
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it.each(['turn', 'compaction'])(
+      'classifies a %s mint exception without exposing its details',
+      async (kind) => {
+        const session = createMockSession();
+        vi.spyOn(sessionService, 'getOrCreateSession').mockResolvedValue(session);
+        vi.mocked(mockRepository.findById).mockResolvedValue(session);
+        vi.spyOn(
+          sessionService as unknown as { createRunnerAccessToken: () => string },
+          'createRunnerAccessToken'
+        ).mockImplementation(() => {
+          throw new Error('synthetic private mint detail');
+        });
+        const end = vi.fn(async (_result: unknown) => {});
+        const result =
+          kind === 'turn'
+            ? await sessionService.handleMessage(
+                createMockRequest({ turnHooks: { start: async () => {}, end } })
+              )
+            : await sessionService.triggerCompaction(session.id);
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'RUNNER_CREDENTIAL_UNAVAILABLE',
+          classification: { category: 'auth', retryable: false },
+        });
+        expect(JSON.stringify(result)).not.toContain('synthetic private mint detail');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(mockCodexRunner.run).not.toHaveBeenCalled();
+        expect(mockInkRunner.run).not.toHaveBeenCalled();
+        if (kind === 'turn')
+          expect(end).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(result));
+        else expect(mockRepository.releaseCompactionLock).toHaveBeenCalledOnce();
+      }
+    );
+
+    it('compaction delivers the same explicit binding as ordinary turns', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(createMockSession());
+      await sessionService.triggerCompaction('session-123');
+      expect(mockClaudeRunner.run).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          config: expect.objectContaining({
+            inkSessionId: 'session-123',
+            sbSlug: 'myra',
+            inkAccessToken: expect.any(String),
+          }),
+        })
+      );
+    });
   });
 
   describe('turn hooks: each turn, in turn order (Lumen, #769)', () => {
@@ -1645,6 +1835,73 @@ describe('SessionService', () => {
             expect(POLICY().startsWith(`${join(inklingsRoot, SB)}/`)).toBe(false);
             expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
             expect(promptPassed()).toContain('### Your environment');
+          });
+
+          it("hands an inkling's ink turn its reply contract and tier as turnInstructions, and nothing private (task 9160180d)", async () => {
+            // ink has no system-prompt-append path: appendSystemPrompt never
+            // reached the turn, so the inkling was never told how to reply.
+            const KEY = 'chat:conversation-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
+            const base = createMockInjectedContext();
+            vi.mocked(mockContextBuilder.buildContext).mockResolvedValue({
+              ...base,
+              agent: { ...base.agent, soul: 'SOUL-CANARY', heartbeat: 'HEARTBEAT-CANARY' },
+            } as never);
+            // The file mocks the identity prompt to a constant, which would let
+            // the canaries never reach it. Here every call carries them, as the
+            // real one does, so their absence below is a real check (a mutant
+            // that builds the identity prompt a second time must fail too).
+            vi.mocked(buildIdentityPrompt).mockImplementation(
+              (_slug, _name, soul, _tz, heartbeat) => `IDENTITY-ONLY-SENTINEL ${soul} ${heartbeat}`
+            );
+            try {
+              await turn(
+                INKLING,
+                { ...fromOwner, metadata: { ...fromOwner.metadata, threadKey: KEY } },
+                OWNER
+              );
+            } finally {
+              vi.mocked(buildIdentityPrompt).mockImplementation(() => 'mocked-identity-prompt');
+            }
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const instructions = (configPassedToRunner() as { turnInstructions?: unknown })
+              .turnInstructions;
+            expect(typeof instructions).toBe('string');
+            expect(instructions).toContain('### Replying in this Inkling conversation');
+            expect(instructions).toContain(
+              `channel: "inkling", conversationId: ${JSON.stringify(KEY)}`
+            );
+            expect(instructions).toContain('### Your environment');
+            // The turn's own contract only: the identity prompt's private parts
+            // stay where they were.
+            expect(instructions).not.toContain('IDENTITY-ONLY-SENTINEL');
+            expect(instructions).not.toContain('SOUL-CANARY');
+            expect(instructions).not.toContain('HEARTBEAT-CANARY');
+            // The canaries did reach the identity prompt, so the absences above
+            // can fail; and Claude-style delivery is unchanged.
+            expect(promptPassed()).toContain('IDENTITY-ONLY-SENTINEL SOUL-CANARY HEARTBEAT-CANARY');
+            expect(promptPassed()).toContain('### Replying in this Inkling conversation');
+          });
+
+          it("gives an ordinary SB's ink turn its tier note in turnInstructions, and no inkling reply contract", async () => {
+            vi.stubEnv('INK_EXECUTION_TIER', 'tools');
+            await turn(
+              { runtimeConfig: { toolRouting: 'backend' } },
+              { sender: { id: 'system', name: 'heartbeat' } },
+              OWNER,
+              { session: { backend: 'ink' } }
+            );
+            expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+            const instructions = String(
+              (configPassedToRunner() as { turnInstructions?: unknown }).turnInstructions
+            );
+            expect(instructions).toContain('### Your environment');
+            expect(instructions).not.toContain('### Replying in this Inkling conversation');
+          });
+
+          it('gives a full-tier turn with nothing to add no turnInstructions at all', async () => {
+            await turn({}, { sender: { id: 'system', name: 'heartbeat' } });
+            expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+            expect(configPassedToRunner(mockClaudeRunner)).not.toHaveProperty('turnInstructions');
           });
 
           it('runs an ordinary SB on the full tier by default, with no policy of its own and no note', async () => {

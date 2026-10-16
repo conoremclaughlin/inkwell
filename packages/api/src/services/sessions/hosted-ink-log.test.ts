@@ -10,9 +10,15 @@ import {
   sessionContextNote,
   SESSION_CONTEXT_NOTE_MAX_BYTES,
 } from '@inklabs/shared/runtime';
+import { resolveParentJournalSync } from '@inklabs/shared/node-host';
 import { openHostedInkLog, hostedCloneLog } from './hosted-ink-log';
+const warn = vi.hoisted(() => vi.fn());
+vi.mock('../../utils/logger', () => ({
+  logger: { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
 const roots: string[] = [];
 afterEach(async () => {
+  warn.mockReset();
   await Promise.all(roots.splice(0).map((p) => rm(p, { recursive: true, force: true })));
 });
 async function read(log: Awaited<ReturnType<typeof openHostedInkLog>>) {
@@ -186,5 +192,68 @@ describe('hosted JSONL continuity', () => {
     await expect(
       openHostedInkLog({ cwd, sessionId: '../../other', project: () => {}, register: () => {} })
     ).rejects.toThrow();
+  });
+
+  // Task 65f3be41: ink chat attaches adopted clone journals as the session's
+  // own; hosted skipped clones and resumed an eleven-day-stale parent. The
+  // hosted pick must equal the CLI's on the same files.
+  describe('the CLI-to-hosted transition (task 65f3be41)', () => {
+    const attach = JSON.stringify({ type: 'session_attach', sessionId: 'session' }) + '\n';
+    const cloneStart = JSON.stringify({ type: 'clone_start', id: 'clone-4' }) + '\n';
+    const turn = (eid: number) =>
+      JSON.stringify({ eid, type: 'assistant', text: `t${eid}` }) + '\n';
+    const open = (cwd: string) =>
+      openHostedInkLog({ cwd, sessionId: 'session', project: () => {}, register: () => {} });
+
+    it('continues an adopted clone that is newest, as the CLI does, and warns once', async () => {
+      const { cwd, dir } = await fixture();
+      const parent = join(dir, 'session-100.jsonl');
+      await writeFile(parent, attach + turn(1));
+      await utimes(parent, 1, 1);
+      const adopted = join(dir, 'session-100.clone-4.jsonl');
+      await writeFile(adopted, cloneStart + attach + turn(2));
+      await utimes(adopted, 2, 2);
+      const log = await open(cwd);
+      expect(log.path).toBe(adopted);
+      expect(resolveParentJournalSync(dir, 'session').path).toBe(log.path);
+      expect((await read(log)).filter((e) => e.type === 'assistant').map((e) => e.eid)).toEqual([
+        2,
+      ]);
+      await open(cwd);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('[HostedInkLog] Session journal history is split', {
+        sessionId: 'session',
+        selected: adopted,
+        parents: [parent],
+        adoptedClones: [adopted],
+      });
+    });
+
+    it('resumes a parent that is newest again, and still names the adopted clones', async () => {
+      const { cwd, dir } = await fixture();
+      const adopted = join(dir, 'session-100.clone-4.jsonl');
+      await writeFile(adopted, cloneStart + attach + turn(2));
+      await utimes(adopted, 2, 2);
+      const parent = join(dir, 'session-100.jsonl');
+      await writeFile(parent, attach + turn(1) + turn(3));
+      await utimes(parent, 3, 3);
+      const log = await open(cwd);
+      expect(log.path).toBe(parent);
+      expect(resolveParentJournalSync(dir, 'session').path).toBe(log.path);
+      expect(warn).toHaveBeenCalledWith(
+        '[HostedInkLog] Session journal history is split',
+        expect.objectContaining({ selected: parent, parents: [parent], adoptedClones: [adopted] })
+      );
+    });
+
+    it('an ordinary newer clone neither wins nor warns', async () => {
+      const { cwd, dir } = await fixture();
+      const parent = join(dir, 'session-100.jsonl');
+      await writeFile(parent, attach + turn(1));
+      await utimes(parent, 1, 1);
+      await writeFile(join(dir, 'session-100.clone-1.jsonl'), cloneStart + turn(9));
+      expect((await open(cwd)).path).toBe(parent);
+      expect(warn).not.toHaveBeenCalled();
+    });
   });
 });

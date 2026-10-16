@@ -192,11 +192,9 @@ describe('Approval Interceptor Integration', () => {
       checkApprovalResponse(userId, 'telegram:chat-b', 'approve'),
     ]);
 
-    // At least one must have intercepted; since Supabase .update() returns
-    // success even when 0 rows are touched, both report intercepted=true.
-    // What matters is that the row is only written once — check the granted_by
-    // is one of the two, not a mix.
-    expect(a.intercepted || b.intercepted).toBe(true);
+    // Exactly one wins. The write reads back the rows it changed, so the loser
+    // of the race is not reported as resolved and wakes no one (#853).
+    expect([a.intercepted, b.intercepted].filter(Boolean)).toHaveLength(1);
 
     const row = await readRow(id);
     expect(row.status).toBe('granted');

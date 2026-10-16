@@ -36,14 +36,25 @@ const originalHome = vi.hoisted(() => {
 });
 
 vi.mock('../auth/tokens.js', () => ({
-  getValidAccessToken: vi.fn(async () => null),
+  getValidAccessToken: vi.fn(async () => 'fixture-access-token'),
   getValidDelegatedAccessToken: vi.fn(() => null),
+  hasSessionTokenBinding: vi.fn(() => false),
   loadAuth: vi.fn(),
   isTokenExpired: vi.fn(),
   decodeJwtPayload: vi.fn(),
 }));
 
+// The owned temporary directory is deliberately not a repository. Lifecycle
+// coverage does not need a real git process to discover that.
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execSync: vi.fn(() => {
+    throw new Error('fixture is not a git repository');
+  }),
+}));
+
 import { registerHooksCommands } from './hooks.js';
+import { getValidAccessToken, hasSessionTokenBinding } from '../auth/tokens.js';
 
 const SESSION_ID = 'a1b2c3d4-0000-4000-8000-000000000003';
 
@@ -66,6 +77,8 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
     'SB_SLUG',
     'AGENT_ID',
     'INK_STUDIO_ID',
+    'INK_ACCESS_TOKEN',
+    'INK_RUNNER_AUTH_REQUIRED',
   ] as const;
   const savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
   let requests: Recorded[];
@@ -74,11 +87,14 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
   let stdinWasTty: boolean | undefined;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
     for (const key of ENV_KEYS) delete process.env[key];
     process.env.INK_SERVER_URL = 'http://ink.test';
     process.env.INK_SESSION_ID = SESSION_ID;
     process.env.SB_SLUG = 'wren';
+    vi.mocked(getValidAccessToken).mockResolvedValue('fixture-access-token');
+    vi.mocked(hasSessionTokenBinding).mockReturnValue(false);
 
     workDir = mkdtempSync(join(tmpdir(), 'ink-hooks-server-run-'));
     originalCwd = process.cwd();
@@ -155,6 +171,7 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
 
   it('a spawned session start links the session without writing lifecycle', async () => {
     process.env.INK_CONTEXT = headlessContext();
+    vi.mocked(hasSessionTokenBinding).mockReturnValue(true);
 
     await runHook('on-session-start', '--backend', 'claude-code');
 
@@ -164,6 +181,17 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
     // The linkage still goes: the startup write is also where the session
     // learns its working directory.
     expect(updates[0].workingDir).toBe(process.cwd());
+  });
+
+  it('a bound startup without authority sends no request or lifecycle write', async () => {
+    process.env.INK_CONTEXT = headlessContext();
+    vi.mocked(hasSessionTokenBinding).mockReturnValue(true);
+    vi.mocked(getValidAccessToken).mockResolvedValue(null);
+
+    await runHook('on-session-start', '--backend', 'claude-code');
+
+    expect(getValidAccessToken).toHaveBeenCalled();
+    expect(requests).toEqual([]);
   });
 
   it('control: a person starting a session still marks it idle', async () => {
