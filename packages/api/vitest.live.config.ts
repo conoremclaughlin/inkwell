@@ -21,12 +21,29 @@ import path from 'path';
  */
 export default defineConfig({
   resolve: {
-    alias: {
-      '@inklabs/shared/node-host': path.resolve(__dirname, '../shared/src/node-host/index.ts'),
-      '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
-      '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
-      '@inklabs/shared': path.resolve(__dirname, '../shared/src/index.ts'),
-    },
+    alias: [
+      // Exact root matching must not rewrite a new subpath beneath index.ts.
+      {
+        find: /^@inklabs\/shared$/,
+        replacement: path.resolve(__dirname, '../shared/src/index.ts'),
+      },
+      {
+        find: '@inklabs/shared/node-host',
+        replacement: path.resolve(__dirname, '../shared/src/node-host/index.ts'),
+      },
+      {
+        find: '@inklabs/shared/runtime',
+        replacement: path.resolve(__dirname, '../shared/src/runtime/index.ts'),
+      },
+      {
+        find: '@inklabs/shared/providers',
+        replacement: path.resolve(__dirname, '../shared/src/providers/index.ts'),
+      },
+      {
+        find: '@inklabs/shared/security/untrusted-content',
+        replacement: path.resolve(__dirname, '../shared/src/security/untrusted-content.ts'),
+      },
+    ],
   },
   test: {
     globals: true,
