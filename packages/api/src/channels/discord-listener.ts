@@ -10,6 +10,7 @@
  * - Slash command: /balances
  */
 
+import { EphemeralMessageCache } from './ephemeral-message-cache';
 import { EventEmitter } from 'events';
 import {
   Client,
@@ -58,9 +59,7 @@ export class DiscordListener extends EventEmitter {
   private isRunning = false;
 
   // Ephemeral message cache - keyed by channelId, stores last N messages
-  private messageCache = new Map<string, EphemeralMessage[]>();
-  private readonly maxMessagesPerChat = 100;
-  private readonly messageTtlMs = 30 * 60 * 1000; // 30 minutes
+  private messageCache = new EphemeralMessageCache<EphemeralMessage>();
 
   constructor(config?: DiscordListenerConfig) {
     super();
@@ -101,6 +100,7 @@ export class DiscordListener extends EventEmitter {
     }
 
     logger.info('Starting Discord listener...');
+    this.messageCache.start();
 
     // Wire up event handlers before login
     this.client.on('messageCreate', (msg) => this.handleMessage(msg));
@@ -127,6 +127,7 @@ export class DiscordListener extends EventEmitter {
     } catch (error) {
       logger.error('Failed to connect to Discord:', error);
       this.isRunning = false;
+      this.messageCache.stop();
       throw error;
     }
   }
@@ -135,6 +136,7 @@ export class DiscordListener extends EventEmitter {
    * Stop listening for messages
    */
   async stop(): Promise<void> {
+    this.messageCache.stop();
     if (!this.isRunning) {
       return;
     }
@@ -846,38 +848,11 @@ export class DiscordListener extends EventEmitter {
   // ============================================================================
 
   private cacheMessage(message: EphemeralMessage): void {
-    const { chatId } = message;
-
-    if (!this.messageCache.has(chatId)) {
-      this.messageCache.set(chatId, []);
-    }
-
-    const cache = this.messageCache.get(chatId)!;
-    cache.push(message);
-
-    if (cache.length > this.maxMessagesPerChat) {
-      cache.shift();
-    }
-
-    this.cleanExpiredMessages(chatId);
-  }
-
-  private cleanExpiredMessages(chatId: string): void {
-    const cache = this.messageCache.get(chatId);
-    if (!cache) return;
-
-    const now = Date.now();
-    const filtered = cache.filter((msg) => now - msg.timestamp.getTime() < this.messageTtlMs);
-
-    if (filtered.length !== cache.length) {
-      this.messageCache.set(chatId, filtered);
-    }
+    this.messageCache.add(message);
   }
 
   getRecentMessages(chatId: string, limit = 50): EphemeralMessage[] {
-    this.cleanExpiredMessages(chatId);
-    const cache = this.messageCache.get(chatId) || [];
-    return cache.slice(-limit);
+    return this.messageCache.getRecent(chatId, limit);
   }
 
   clearMessageCache(chatId: string): void {
@@ -885,14 +860,7 @@ export class DiscordListener extends EventEmitter {
   }
 
   getCacheStats(): { chatCount: number; totalMessages: number } {
-    let totalMessages = 0;
-    for (const messages of this.messageCache.values()) {
-      totalMessages += messages.length;
-    }
-    return {
-      chatCount: this.messageCache.size,
-      totalMessages,
-    };
+    return this.messageCache.getStats();
   }
 }
 

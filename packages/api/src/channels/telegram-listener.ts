@@ -7,6 +7,7 @@
  * Can be switched to webhook mode for production deployments.
  */
 
+import { EphemeralMessageCache } from './ephemeral-message-cache';
 import { EventEmitter } from 'events';
 import type { InboundMessage, ChannelPlatform } from './types';
 import { MediaGroupBuffer } from './media-group-buffer';
@@ -184,9 +185,7 @@ export class TelegramListener extends EventEmitter {
 
   // Ephemeral message cache - keyed by chatId, stores last N messages
   // Auto-cleaned periodically, never persisted to disk
-  private messageCache = new Map<string, EphemeralMessage[]>();
-  private readonly maxMessagesPerChat = 100;
-  private readonly messageTtlMs = 30 * 60 * 1000; // 30 minutes
+  private messageCache = new EphemeralMessageCache<EphemeralMessage>();
 
   constructor(config?: TelegramListenerConfig) {
     super();
@@ -226,6 +225,7 @@ export class TelegramListener extends EventEmitter {
     await this.acquireLock();
 
     logger.info('Starting Telegram listener...');
+    this.messageCache.start();
     this.isRunning = true;
 
     // Get bot info
@@ -237,6 +237,7 @@ export class TelegramListener extends EventEmitter {
     } catch (error) {
       logger.error('Failed to connect to Telegram:', error);
       this.isRunning = false;
+      this.messageCache.stop();
       await this.releaseLock();
       throw error;
     }
@@ -249,6 +250,7 @@ export class TelegramListener extends EventEmitter {
    * Stop listening for messages
    */
   async stop(): Promise<void> {
+    this.messageCache.stop();
     if (!this.isRunning) {
       return;
     }
@@ -1369,54 +1371,14 @@ export class TelegramListener extends EventEmitter {
    * Messages are stored in memory only, never persisted
    */
   private cacheMessage(message: EphemeralMessage): void {
-    const { chatId } = message;
-
-    if (!this.messageCache.has(chatId)) {
-      this.messageCache.set(chatId, []);
-    }
-
-    const cache = this.messageCache.get(chatId)!;
-    cache.push(message);
-
-    // Trim to max messages
-    if (cache.length > this.maxMessagesPerChat) {
-      cache.shift();
-    }
-
-    // Clean expired messages periodically
-    this.cleanExpiredMessages(chatId);
+    this.messageCache.add(message);
   }
 
   /**
-   * Remove messages older than TTL
-   */
-  private cleanExpiredMessages(chatId: string): void {
-    const cache = this.messageCache.get(chatId);
-    if (!cache) return;
-
-    const now = Date.now();
-    const filtered = cache.filter((msg) => now - msg.timestamp.getTime() < this.messageTtlMs);
-
-    if (filtered.length !== cache.length) {
-      this.messageCache.set(chatId, filtered);
-      logger.debug(
-        `Cleaned ${cache.length - filtered.length} expired messages from chat ${chatId}`
-      );
-    }
-  }
-
-  /**
-   * Get recent messages from a chat for context
-   * Returns ephemeral data - not persisted, disappears after TTL
-   *
-   * @param chatId - The chat ID to get history from
-   * @param limit - Max messages to return (default: 50)
-   * @returns Array of recent messages, newest last
+   * Get recent context, newest last. Data is ephemeral and never persisted.
    */
   getRecentMessages(chatId: string, limit = 50): EphemeralMessage[] {
-    this.cleanExpiredMessages(chatId);
-    const cache = this.messageCache.get(chatId) || [];
-    return cache.slice(-limit);
+    return this.messageCache.getRecent(chatId, limit);
   }
 
   /**
@@ -1432,14 +1394,7 @@ export class TelegramListener extends EventEmitter {
    * Get cache stats for debugging
    */
   getCacheStats(): { chatCount: number; totalMessages: number } {
-    let totalMessages = 0;
-    for (const messages of this.messageCache.values()) {
-      totalMessages += messages.length;
-    }
-    return {
-      chatCount: this.messageCache.size,
-      totalMessages,
-    };
+    return this.messageCache.getStats();
   }
 }
 
