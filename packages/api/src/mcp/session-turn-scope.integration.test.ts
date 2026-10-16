@@ -2,14 +2,15 @@
  * The space-turn session marker, against the real schema
  * (ink://specs/inkling-multi-person-groups, Phase 2 gate 1).
  *
- * The CHECK constraint allows only NULL or 'space-turn', and the MCP
- * server's bearer-less context fallback refuses a marked session. That the
- * marker never changes after insert is enforced in server code, not here
- * (session-turn-scope-writes.test.ts): the migration adds no trigger.
+ * The CHECK constraint allows only NULL or 'space-turn', the trigger
+ * session_turn_scope_immutable refuses any update that changes the marker
+ * (server code never sends one: session-turn-scope-writes.test.ts), and the
+ * MCP server's bearer-less context fallback refuses a marked session.
  *
  * Run via: yarn test:integration:db
  */
 
+import { randomUUID } from 'crypto';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../data/composer';
 import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../test/integration-fixtures';
@@ -92,6 +93,65 @@ describe('sessions.turn_scope', () => {
     it('refuses any other value at insert', async () => {
       const { error } = await insertSession('space-turns');
       expect(error?.code).toBe('23514');
+    });
+  });
+
+  // The marker is set at insert only; the trigger is the database's floor
+  // under the server's own guarantee (approved by Conor, Oct 15, 2026).
+  describe('the immutability trigger', () => {
+    async function readSession(id: string) {
+      const { data, error } = await dataComposer
+        .getClient()
+        .from('sessions')
+        .select('turn_scope, lifecycle, turn_epoch')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      return data;
+    }
+
+    async function updateSession(id: string, patch: Record<string, unknown>) {
+      return dataComposer.getClient().from('sessions').update(patch).eq('id', id);
+    }
+
+    it('refuses unmarking a marked session, leaving the row as it was', async () => {
+      const { data } = await insertSession('space-turn');
+      const { error } = await updateSession(data!.id, { turn_scope: null });
+      expect(error?.code).toBe('23514');
+      expect((await readSession(data!.id))?.turn_scope).toBe('space-turn');
+    });
+
+    it('refuses marking an unmarked session, leaving the row as it was', async () => {
+      const { data } = await insertSession();
+      const { error } = await updateSession(data!.id, { turn_scope: 'space-turn' });
+      expect(error?.code).toBe('23514');
+      expect((await readSession(data!.id))?.turn_scope).toBeNull();
+    });
+
+    it('lets a marked session settle its turn, keeping the mark', async () => {
+      const { data } = await insertSession('space-turn');
+      const epoch = randomUUID();
+      const { error } = await updateSession(data!.id, { lifecycle: 'idle', turn_epoch: epoch });
+      expect(error).toBeNull();
+      expect(await readSession(data!.id)).toEqual({
+        turn_scope: 'space-turn',
+        lifecycle: 'idle',
+        turn_epoch: epoch,
+      });
+    });
+
+    it('lets an update write the same value', async () => {
+      const { data } = await insertSession('space-turn');
+      const { error } = await updateSession(data!.id, { turn_scope: 'space-turn' });
+      expect(error).toBeNull();
+      expect((await readSession(data!.id))?.turn_scope).toBe('space-turn');
+    });
+
+    it('lets a marked session be deleted', async () => {
+      const { data } = await insertSession('space-turn');
+      const { error } = await dataComposer.getClient().from('sessions').delete().eq('id', data!.id);
+      expect(error).toBeNull();
+      expect(await readSession(data!.id)).toBeNull();
     });
   });
 
