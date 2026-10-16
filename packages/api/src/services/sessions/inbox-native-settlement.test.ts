@@ -244,8 +244,11 @@ describe('inbox/native settlement planning (unwired, no durable-store claims)', 
     expect(Object.isFrozen(decision.plan.binding)).toBe(true);
     expect(Object.isFrozen(decision.plan.claims)).toBe(true);
     expect(Object.isFrozen(decision.plan.claims[0])).toBe(true);
+    expect(Object.isFrozen(expected.binding)).toBe(false);
+    expect(Object.isFrozen(expected.claims)).toBe(false);
+    expect(Object.isFrozen(expected.claims[0])).toBe(false);
     (expected.binding as { userId: string }).userId = 'changed';
-    (observation.claims[0] as { claimId: string }).claimId = 'changed';
+    (expected.claims[0] as { claimId: string }).claimId = 'changed';
     expect(decision.plan.binding.userId).toBe('owner');
     expect(decision.plan.claims[0].claimId).toBe('claim-a');
   });
