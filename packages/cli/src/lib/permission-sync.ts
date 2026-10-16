@@ -14,9 +14,9 @@
  * What it does. It adds each rule the profile has and the file lacks,
  * appended after the file's own rules in profile order. It removes only the
  * retired denies (RETIRED_DENY_RULES, spelled exactly), which earlier
- * profiles carried and which would otherwise keep a studio from ever
- * approving a delete; it never reorders a rule and keeps every other
- * setting. Two exceptions keep an author's explicit choice:
+ * profiles carried and which would otherwise keep a studio from doing what
+ * its profile now allows, and never one its own profile still denies; it
+ * never reorders a rule and keeps every other setting. Two exceptions keep an author's explicit choice:
  *   - a profile deny is not added when it would refuse something the file
  *     allows by name (`Bash(yarn install*)` against an authored
  *     `Bash(yarn install)`, `mcp__github__create_pull_request` against the
@@ -169,15 +169,24 @@ export function planProfileSync(
     return { state: 'no-rules', ...none };
   }
 
+  // A retired deny the studio's own profile still carries stays: the
+  // reviewer keeps denying the PR and SQL tools the builder no longer does.
+  const removeDeny = deny.filter(
+    (rule) => RETIRED_DENY_RULES.includes(rule) && !rules.deny.includes(rule)
+  );
+  // Allows are judged against the denies that survive this sync, so the
+  // allow a retired deny blocked is added in the same pass (Lumen, #868).
+  const keptDeny = deny.filter((rule) => !removeDeny.includes(rule));
+
   const kept: KeptRule[] = [];
   const addAllow: string[] = [];
   for (const rule of rules.allow) {
     if (allow.includes(rule)) continue;
-    if (deny.includes(rule) || ask.includes(rule)) {
+    if (keptDeny.includes(rule) || ask.includes(rule)) {
       kept.push({
         rule,
         list: 'allow',
-        reason: `this file ${deny.includes(rule) ? 'denies' : 'asks about'} ${rule} by name`,
+        reason: `this file ${keptDeny.includes(rule) ? 'denies' : 'asks about'} ${rule} by name`,
       });
       continue;
     }
@@ -194,13 +203,9 @@ export function planProfileSync(
     addDeny.push(rule);
   }
 
-  const removeDeny = deny.filter((rule) => RETIRED_DENY_RULES.includes(rule));
-
   const next: Record<string, unknown> = { ...permissions };
   if (addAllow.length > 0) next.allow = [...allow, ...addAllow];
-  if (addDeny.length > 0 || removeDeny.length > 0) {
-    next.deny = [...deny.filter((rule) => !removeDeny.includes(rule)), ...addDeny];
-  }
+  if (addDeny.length > 0 || removeDeny.length > 0) next.deny = [...keptDeny, ...addDeny];
   return { state: 'authored', addAllow, addDeny, removeDeny, kept, permissions: next };
 }
 

@@ -58,6 +58,17 @@ function decide(
 const bash = (command: string): Call => ({ tool: 'Bash', command });
 const builder = () => defaults.studioPermissionRules('builder', 'wren');
 const reviewer = () => defaults.studioPermissionRules('reviewer', 'wren');
+/** Every install spelling the retired denies named. */
+const INSTALLS = [
+  'yarn',
+  'yarn install',
+  'yarn install --immutable',
+  'yarn add left-pad',
+  'npm install',
+  'npm ci',
+  'pnpm add x',
+  'pnpm install',
+];
 
 describe('the evaluator models the documented matching (its own controls)', () => {
   it('a trailing " *" matches the bare command; "*" spans spaces; deny beats allow', () => {
@@ -139,12 +150,18 @@ describe('the builder profile — composition', () => {
     }
   });
 
-  it('denies the GitHub tools that open, merge, close or retarget a PR or write a branch or file', () => {
+  it('opens, updates and merges its PR, and is denied writing a branch or file through the API', () => {
     for (const tool of [
       'mcp__github__create_pull_request',
-      'mcp__github__merge_pull_request',
       'mcp__github__update_pull_request',
       'mcp__github__update_pull_request_branch',
+      'mcp__github__merge_pull_request',
+    ]) {
+      expect(decide(builder(), { tool }), tool).toBe('allow');
+    }
+    // Conor, 2026-10-15: every builder can merge its PR.
+    expect(decide(builder(), bash('gh pr merge 869 --merge'))).toBe('allow');
+    for (const tool of [
       'mcp__github__push_files',
       'mcp__github__create_or_update_file',
       'mcp__github__delete_file',
@@ -160,36 +177,40 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), { tool: 'mcp__github__add_issue_comment' })).toBe('ask');
   });
 
-  it('reads GitHub and Supabase, and is denied the database writes', () => {
+  it('reads GitHub and Supabase and runs SQL, and is denied applying a migration through the tool', () => {
     expect(decide(builder(), { tool: 'mcp__github__pull_request_read' })).toBe('allow');
     expect(decide(builder(), { tool: 'mcp__supabase__list_tables' })).toBe('allow');
-    expect(decide(builder(), { tool: 'mcp__supabase__execute_sql' })).toBe('deny');
+    expect(decide(builder(), { tool: 'mcp__supabase__execute_sql' })).toBe('allow');
     expect(decide(builder(), { tool: 'mcp__supabase__apply_migration' })).toBe('deny');
   });
 
-  it('denies installs, bare yarn included, and keeps the force-push defaults', () => {
-    for (const command of [
-      'yarn',
-      'yarn install',
-      'yarn install --immutable',
-      'yarn add left-pad',
-      'npm install',
-      'npm ci',
-      'pnpm add x',
-      'pnpm install',
-      'git push --force origin x',
-    ]) {
-      expect(decide(builder(), bash(command)), command).toBe('deny');
+  it('installs dependencies, bare yarn included, and keeps the force-push defaults', () => {
+    // Conor, 2026-10-15: a session installs in its own studio.
+    for (const command of INSTALLS) {
+      expect(decide(builder(), bash(command)), command).toBe('allow');
     }
     expect(decide(builder(), bash('yarn workspace @inklabs/shared build'))).toBe('allow');
+    expect(decide(builder(), bash('git push --force origin x'))).toBe('deny');
   });
 
   it('the destructive local commands are no longer denied: the PreToolUse hook decides them', () => {
     // A deny cannot be approved by anyone (spec automated-turn-permissions §3.4).
-    for (const rules of [builder(), reviewer()]) {
-      for (const retired of defaults.RETIRED_DENY_RULES) {
-        expect(rules.deny).not.toContain(retired);
+    for (const retired of defaults.RETIRED_DENY_RULES) {
+      expect(builder().deny).not.toContain(retired);
+      if (retired.startsWith('Bash(') && !defaults.GH_MERGE_DENY_RULES.includes(retired)) {
+        expect(reviewer().deny).not.toContain(retired);
       }
+    }
+    // The PR, SQL and merge rules the builder no longer denies stay denied
+    // for a reviewer, so sync must not strip them from a reviewer studio.
+    for (const tool of [
+      ...defaults.GITHUB_PR_TOOLS,
+      ...defaults.SUPABASE_SQL_TOOLS,
+      ...defaults.GITHUB_MERGE_TOOLS,
+      ...defaults.GH_MERGE_DENY_RULES,
+    ]) {
+      expect(defaults.RETIRED_DENY_RULES).toContain(tool);
+      expect(reviewer().deny).toContain(tool);
     }
     expect(defaults.DEFAULT_CLAUDE_DENY_RULES).toEqual([
       'Bash(git push --force *)',
@@ -250,9 +271,14 @@ describe('the reviewer profile — composition', () => {
       'git commit -m x',
       'git commit',
       'git -C . commit -m x',
-      'yarn install',
     ]) {
       expect(decide(reviewer(), bash(command)), command).toBe('deny');
+    }
+  });
+
+  it('installs the dependencies its tests need', () => {
+    for (const command of INSTALLS) {
+      expect(decide(reviewer(), bash(command)), command).toBe('allow');
     }
   });
 
@@ -262,6 +288,7 @@ describe('the reviewer profile — composition', () => {
     }
     for (const tool of [
       ...defaults.GITHUB_PUBLISH_TOOLS,
+      ...defaults.GITHUB_PR_TOOLS,
       ...defaults.GITHUB_OTHER_WRITE_TOOLS,
       ...defaults.SUPABASE_WRITE_TOOLS,
     ]) {
@@ -466,7 +493,7 @@ describe('the automated rules — yolo with ironclad denies (spec automated-turn
     }
   });
 
-  it('the ironclad rules hold: no push to main, no force-push, no --no-verify, no merge', () => {
+  it('the ironclad rules hold: no push to main, no force-push, no --no-verify', () => {
     for (const command of [
       'git push origin main',
       'git push origin HEAD:main',
@@ -478,26 +505,43 @@ describe('the automated rules — yolo with ironclad denies (spec automated-turn
       'git commit --no-verify -F msg',
       'git commit -n -F msg',
       'git -C /w commit -F msg -n',
-      'gh pr merge 851 --merge',
-      'gh -R owner/repo pr merge 851',
     ]) {
       expect(decide(yolo(), bash(command)), command).toBe('deny');
     }
     for (const tool of [
-      'mcp__github__merge_pull_request',
       'mcp__github__push_files',
       'mcp__github__create_or_update_file',
       'mcp__github__delete_file',
       'mcp__supabase__apply_migration',
-      'mcp__supabase__execute_sql',
     ]) {
       expect(decide(yolo(), { tool }), tool).toBe('deny');
     }
+    // SQL, the PR's own tools and merging it are not ironclad (Conor, 2026-10-15).
+    for (const tool of [
+      'mcp__supabase__execute_sql',
+      'mcp__github__create_pull_request',
+      'mcp__github__merge_pull_request',
+    ]) {
+      expect(decide(yolo(), { tool }), tool).toBe('allow');
+    }
+    for (const command of ['gh pr merge 851 --merge', 'gh -R owner/repo pr merge 851']) {
+      expect(decide(yolo(), bash(command)), command).toBe('allow');
+    }
   });
 
-  it('the ironclad list is the builder push policy plus the commit, merge and write denies', () => {
+  it('a reviewer launch still cannot merge, since merging is for the author', () => {
+    expect(decide(yolo('reviewer'), { tool: 'mcp__github__merge_pull_request' })).toBe('deny');
+    for (const command of ['gh pr merge 851 --merge', 'gh -R owner/repo pr merge 851']) {
+      expect(decide(yolo('reviewer'), bash(command)), command).toBe('deny');
+    }
+  });
+
+  it('the ironclad list is the builder push policy plus the commit and write denies', () => {
     for (const rule of defaults.STUDIO_PUSH_RULES.deny) {
       expect(defaults.IRONCLAD_DENY_RULES).toContain(rule);
+    }
+    for (const rule of [...defaults.GITHUB_MERGE_TOOLS, ...defaults.GH_MERGE_DENY_RULES]) {
+      expect(defaults.IRONCLAD_DENY_RULES).not.toContain(rule);
     }
     expect(new Set(defaults.IRONCLAD_DENY_RULES).size).toBe(defaults.IRONCLAD_DENY_RULES.length);
   });

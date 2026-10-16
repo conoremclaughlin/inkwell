@@ -9140,6 +9140,20 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'clientMessageId must be a UUID' });
       return;
     }
+    // Other people of a team space this group is shared with, beside its
+    // inkling (inkling-shared-space.ts). The thread gate holds each to a
+    // write-role membership of the inkling's team space.
+    const rawPeople: unknown = req.body?.people;
+    if (
+      rawPeople !== undefined &&
+      (!Array.isArray(rawPeople) || rawPeople.length > 15 || !rawPeople.every(isUuid))
+    ) {
+      res.status(400).json({ error: 'people must list up to 15 user ids' });
+      return;
+    }
+    const people = [
+      ...new Set(((rawPeople ?? []) as string[]).map((id) => id.toLowerCase())),
+    ].filter((id) => id !== authReq.inkUserId.toLowerCase());
 
     // The workspace role before any lookup. What keeps a replay to the
     // person who sent the original is the sender check inside
@@ -9169,7 +9183,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     // What a client-identified create is held to on a retry: the same
     // people (as a set) and the same title, beside the same sender and words.
     const createRequest = clientMessageId.value
-      ? createRequestOf(uniqueRecipients, title)
+      ? createRequestOf(uniqueRecipients, title, people)
       : undefined;
     // A client-identified create never joins a thread that exists. Either it
     // is a retry of the submission that created the thread, which answers
@@ -9273,7 +9287,17 @@ router.post('/threads', async (req: Request, res: Response) => {
         throw new Error(`Failed to read the conversation's members: ${membersError.message}`);
       }
       const rows = (members ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
-      if (rows.some((r) => r.user_id && r.user_id !== authReq.inkUserId)) return false;
+      // People besides this person only as this create named them.
+      if (
+        rows.some(
+          (r) =>
+            r.user_id &&
+            r.user_id !== authReq.inkUserId &&
+            !people.includes(r.user_id.toLowerCase())
+        )
+      ) {
+        return false;
+      }
       const present = new Set(rows.map((r) => r.sb_id).filter((id): id is string => !!id));
       let requested: SbPrincipal[];
       try {
@@ -9325,7 +9349,11 @@ router.post('/threads', async (req: Request, res: Response) => {
               principal: userPrincipal(authReq.inkUserId),
               workspaceId: authReq.inkWorkspaceId,
             },
-            ...(send.createOnly ? { createOnly: true } : {}),
+            // People join only a conversation this send makes: never one a
+            // concurrent create made first. A retry adopting its own create
+            // is the exception, held to the same people by its intent.
+            ...(send.createOnly || (people.length > 0 && send.created) ? { createOnly: true } : {}),
+            ...(people.length > 0 ? { people: people.map((id) => userPrincipal(id)) } : {}),
             // Recorded on the thread row if this send creates it.
             ...(clientMessageId.value && createRequest
               ? {
@@ -9356,6 +9384,13 @@ router.post('/threads', async (req: Request, res: Response) => {
             await answerForExistingThread(taken);
             return;
           }
+        }
+        // A group create with no client message id has nothing to replay: a
+        // concurrent create took its key, so the key is taken (Lumen's review
+        // of 4f7896e6).
+        if (error instanceof ThreadKeyTakenError) {
+          res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
+          return;
         }
         throw error;
       }
@@ -9398,6 +9433,10 @@ router.post('/threads', async (req: Request, res: Response) => {
     const existing = await findThread();
     if (clientMessageId.value && existing) {
       await answerForExistingThread(existing);
+      return;
+    }
+    if (people.length > 0 && existing) {
+      res.status(409).json({ error: THREAD_KEY_TAKEN_ERROR });
       return;
     }
     await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });

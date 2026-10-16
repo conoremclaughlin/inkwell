@@ -3759,6 +3759,7 @@ export type Database = {
           headline: string | null;
           headline_updated_at: string | null;
           turn_epoch: string | null;
+          turn_scope: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -3802,6 +3803,7 @@ export type Database = {
           headline?: string | null;
           headline_updated_at?: string | null;
           turn_epoch?: string | null;
+          turn_scope?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -3845,6 +3847,7 @@ export type Database = {
           headline?: string | null;
           headline_updated_at?: string | null;
           turn_epoch?: string | null;
+          turn_scope?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;

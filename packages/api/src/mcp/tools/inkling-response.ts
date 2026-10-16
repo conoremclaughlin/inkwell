@@ -6,33 +6,42 @@ import { INKLING_CONVERSATION_MARK } from '../../services/inklings/inkling-threa
 import { resolveCallerWorkspace, assertWriteRole } from './caller-principal';
 import { handleSendToInbox } from './inbox-handlers';
 
-/** The inkling channel is an existing conversation, not an external transport. */
-export async function sendInklingResponse(
-  dataComposer: DataComposer,
-  input: { conversationId: string; content: string }
-): Promise<{ success: true; channel: 'inkling'; conversationId: string; messageId: string }> {
-  if (!input.content.trim()) throw new Error('An inkling reply must contain text');
+/**
+ * The caller an inkling reply is sent as, and the workspace its conversation
+ * is looked up in. Exported, with findInklingConversation, so the space-turn
+ * policy resolves the conversation exactly as the reply will
+ * (space-turn-thread-resolver.ts).
+ */
+export async function resolveInklingCaller(dataComposer: DataComposer) {
   const resolved = await resolveUserOrThrow({}, dataComposer);
-  const db = dataComposer.getClient();
   const context = getRequestContext() ?? getSessionContext();
-  const caller = await resolveCallerWorkspace(
-    db,
+  return resolveCallerWorkspace(
+    dataComposer.getClient(),
     resolved.user.id,
     getEffectiveSlug() || context?.sbSlug
   );
-  assertWriteRole(caller.role, 'send to a thread');
-  // Replies are from the calling SB. The owner's composer uses the ordinary
-  // thread POST route; no caller-supplied sender or internal-principal override.
-  if (!caller.sb) throw new Error('The inkling reply channel requires an authenticated SB');
+}
+
+/**
+ * The inkling conversation a reply addresses, by thread id or key, in one
+ * workspace. Throws when it isn't there, isn't an inkling conversation, or
+ * can't be read (an ambiguous key included).
+ */
+export async function findInklingConversation(
+  dataComposer: DataComposer,
+  workspaceId: string,
+  conversationId: string
+) {
+  const db = dataComposer.getClient();
   const lookup = db
     .from('inbox_threads')
-    .select('id, thread_key, metadata')
-    .eq('workspace_id', caller.workspaceId);
+    .select('id, thread_key, workspace_id, metadata')
+    .eq('workspace_id', workspaceId);
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const { data: thread, error } = await (
-    uuid.test(input.conversationId)
-      ? lookup.eq('id', input.conversationId)
-      : lookup.eq('thread_key', input.conversationId)
+    uuid.test(conversationId)
+      ? lookup.eq('id', conversationId)
+      : lookup.eq('thread_key', conversationId)
   ).maybeSingle();
   if (error) throw new Error('Could not read the inkling conversation');
   if (
@@ -41,6 +50,26 @@ export async function sendInklingResponse(
   ) {
     throw new Error('Inkling conversation not found in your workspace');
   }
+  return thread as { id: string; thread_key: string; workspace_id: string };
+}
+
+/** The inkling channel is an existing conversation, not an external transport. */
+export async function sendInklingResponse(
+  dataComposer: DataComposer,
+  input: { conversationId: string; content: string }
+): Promise<{ success: true; channel: 'inkling'; conversationId: string; messageId: string }> {
+  if (!input.content.trim()) throw new Error('An inkling reply must contain text');
+  const db = dataComposer.getClient();
+  const caller = await resolveInklingCaller(dataComposer);
+  assertWriteRole(caller.role, 'send to a thread');
+  // Replies are from the calling SB. The owner's composer uses the ordinary
+  // thread POST route; no caller-supplied sender or internal-principal override.
+  if (!caller.sb) throw new Error('The inkling reply channel requires an authenticated SB');
+  const thread = await findInklingConversation(
+    dataComposer,
+    caller.workspaceId,
+    input.conversationId
+  );
   const { data: member, error: memberError } = await db
     .from('inbox_thread_participants')
     .select('sb_id')
@@ -51,13 +80,16 @@ export async function sendInklingResponse(
 
   // Reuse the real send boundary: owner-test gate, fixed participants,
   // role checks, read pointers and quiet replies all remain authoritative.
+  // The send is bound to the thread checked above by id, so a thread
+  // replaced under the same key since then gets nothing (Phase 2 gate 3).
   const sent = await handleSendToInbox(
     {
       threadKey: thread.thread_key,
       recipientSlug: caller.sb.sbSlug,
       content: input.content,
     },
-    dataComposer
+    dataComposer,
+    { expectedThreadId: thread.id }
   );
   const body = JSON.parse(sent.content[0].text) as { success?: boolean; messageId?: string };
   if (body.success !== true || !body.messageId) throw new Error('The inkling reply was not stored');

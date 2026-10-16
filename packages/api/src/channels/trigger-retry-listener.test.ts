@@ -303,6 +303,9 @@ function rig(options: RigOptions = {}) {
     },
     formatThreadDescriptorLines: (descriptor: { lines: string[] } | null) =>
       descriptor ? descriptor.lines : [],
+    // A shared group's presence note (inkling-shared-space.ts): none in
+    // these synthetic threads.
+    sharedGroupNote: async () => null,
     getUserFromContext: () => ({ userId: 'user-synthetic' }),
     // The thread-borne trigger's scope (spec inkmail-thread-scope §1a): the
     // synthetic thread lives in the synthetic workspace and names its target

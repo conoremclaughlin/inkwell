@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { isPlainToolsScope } from '@inklabs/shared';
 
 // ============================================================================
 // Types
@@ -270,8 +271,7 @@ function usableRunnerCredential(token: string): boolean {
     payload.type === 'mcp_access' &&
     typeof payload.sub === 'string' &&
     !!payload.sub.trim() &&
-    typeof payload.scope === 'string' &&
-    payload.scope.split(/\s+/).includes('mcp:tools') &&
+    isPlainToolsScope(payload.scope) &&
     typeof payload.exp === 'number' &&
     Number.isFinite(payload.exp) &&
     payload.exp * 1000 > Date.now() + 60_000 &&

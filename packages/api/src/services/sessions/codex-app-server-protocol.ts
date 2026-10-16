@@ -298,7 +298,12 @@ export function createCodexAppServerProtocol(ports: CodexAppServerPorts) {
       await request(
         input.backendSessionId ? 'thread/resume' : 'thread/start',
         {
-          ...(input.backendSessionId ? { threadId: input.backendSessionId } : {}),
+          // Without excludeTurns, the resume reply carries every turn of the
+          // thread in one line. Only `thread.id` is read here, and a long
+          // thread's reply (32.6 MiB measured) exceeds the 4 MiB frame bound.
+          ...(input.backendSessionId
+            ? { threadId: input.backendSessionId, excludeTurns: true }
+            : {}),
           cwd: input.cwd,
           approvalPolicy: 'never',
           sandbox: input.sandbox ?? 'workspace-write',

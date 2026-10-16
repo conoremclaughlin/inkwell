@@ -93,6 +93,9 @@ describe('explicit server-runner credentials', () => {
     'wrong-sb',
     'human',
     'wrong-scope',
+    // Phase 2 gate 6: includes mcp:tools, but is not a plain runner credential.
+    'mixed-space-turn-scope',
+    'extra-scope',
     'future-nbf',
   ];
   it.each(invalid)('refuses %s without stored credentials or a bearerless call', async (kind) => {
@@ -105,6 +108,8 @@ describe('explicit server-runner credentials', () => {
     if (kind === 'wrong-sb') p.sbSlug = 'different';
     if (kind === 'human') p.type = 'pcp_admin';
     if (kind === 'wrong-scope') p.scope = 'admin';
+    if (kind === 'mixed-space-turn-scope') p.scope = 'mcp:tools mcp:space-turn';
+    if (kind === 'extra-scope') p.scope = 'mcp:tools offline_access';
     if (kind === 'future-nbf') p.nbf = Math.floor(Date.now() / 1000) + 1800;
     vi.stubEnv(
       'INK_ACCESS_TOKEN',

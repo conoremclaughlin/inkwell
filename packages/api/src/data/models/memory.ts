@@ -149,6 +149,17 @@ export interface Session {
   activeThreadKey?: string;
   /** The session key (`wren:inkwell:main`), stored in the `alias` column under its older name. */
   alias?: string;
+  /**
+   * `'space-turn'` for a session that runs turns in a shared conversation
+   * (ink://specs/inkling-multi-person-groups). Set only at insert: server code
+   * never writes it after that (pinned by session-turn-scope-writes.test.ts),
+   * and the trigger session_turn_scope_immutable refuses any update that
+   * changes it, whoever writes it. Such a session never authenticates a
+   * request by its context alone.
+   */
+  turnScope?: string;
+  /** The current admitted turn (`sessions.turn_epoch`), rotated by claim_turn_epoch. */
+  turnEpoch?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
   /** @deprecated Use lifecycle. Kept for backward compat. */
@@ -277,6 +288,9 @@ export interface SessionRow {
   thread_key: string | null;
   /** The session key, under the column's older name. */
   alias?: string | null;
+  /** 'space-turn' or null; absent on a database that predates the column. */
+  turn_scope?: string | null;
+  turn_epoch?: string | null;
   active_thread_key?: string | null;
   lifecycle?: string | null;
   status?: string | null;

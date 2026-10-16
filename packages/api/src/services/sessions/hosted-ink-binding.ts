@@ -1,6 +1,6 @@
 /** Concrete authenticated server ports for the extracted composition, no CLI subprocess. */
 import { createHostedMcpClient } from '@inklabs/shared/node-host';
-import { encodeContextToken, buildCleanEnv } from '@inklabs/shared';
+import { encodeContextToken, buildCleanEnv, isPlainToolsScope } from '@inklabs/shared';
 import { isAbsolute } from 'path';
 import {
   verifyInkAccessToken,
@@ -91,7 +91,7 @@ export function createBoundHostedInkRunner(input: HostedInkBinding) {
       if (
         run.userId !== claims.sub ||
         run.sbSlug !== config.sbSlug ||
-        !claims.scope.split(/\s+/).includes('mcp:tools')
+        !isPlainToolsScope(claims.scope)
       )
         throw new Error('Hosted credential does not belong to this admitted run');
       const budgetMs = config.timeoutMs ?? 30 * 60_000;

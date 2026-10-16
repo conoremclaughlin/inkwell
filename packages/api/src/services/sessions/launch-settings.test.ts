@@ -352,7 +352,7 @@ describe('automated mode: yolo for automated turns (spec automated-turn-permissi
       automated({ profile: undefined, owner: undefined, mainRoot: null })
     );
     expect(result.profile).toBeNull();
-    expect(fileOf(result.hostPath).permissions.deny).toContain('mcp__github__merge_pull_request');
+    expect(fileOf(result.hostPath).permissions.deny).toContain('mcp__github__push_files');
   });
 
   it('a reviewer keeps its own denies on top, and edits only its scratch', async () => {

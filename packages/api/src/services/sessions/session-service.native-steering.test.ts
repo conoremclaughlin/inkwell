@@ -57,6 +57,8 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 vi.mock('@inklabs/shared', async () => ({
   ...(await import('../../../../shared/src/errors/classify-error.js')),
+  // The runner-credential checks classify the token's scope with these.
+  ...(await import('../../../../shared/src/security/token-scope.js')),
   isPathWithinWorkspaceAsync: vi.fn(),
   studioPermissionProfile: vi.fn(),
   buildSessionEnv: vi.fn(() => ({})),
@@ -169,6 +171,7 @@ import { CodexRunner } from './codex-runner.js';
 import { verifyInkAccessToken } from '../../auth/ink-tokens.js';
 import {
   getActiveRun,
+  registerActiveRun,
   resetActiveRuns,
   submitRunSteering,
   listOwnedChildren,
@@ -177,6 +180,7 @@ import {
   stopOwnedChildren,
 } from './active-runs.js';
 import { runOwnedCodexAppServer } from './codex-app-server.js';
+import { spaceTurnIsLive } from '../../mcp/space-turn-liveness';
 import { ensureStudioComplete } from '../studio-complete.js';
 import { spawn } from 'child_process';
 import { resolveBinaryPath } from './resolve-binary.js';
@@ -752,5 +756,102 @@ describe('production native steering selection', () => {
     expect(native).toHaveBeenCalledOnce();
     expect(legacy).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
+  });
+});
+
+// Phase 2 gate 7 (ink://specs/inkling-multi-person-groups): a space-turn
+// token works only while its turn runs. Ordinary finalization through the
+// real SessionService path settles the row as idle or failed with the same
+// turn_epoch and no ended_at, so session state alone would still have
+// admitted the token (Lumen, PR #867 review).
+describe('a space-turn token across real turn finalization', () => {
+  const live = () =>
+    spaceTurnIsLive(
+      {
+        endedAt: row.ended_at ? new Date(row.ended_at as string) : null,
+        lifecycle: row.lifecycle as string | undefined,
+        turnScope: row.turn_scope as string | undefined,
+        turnEpoch: row.turn_epoch as string | undefined,
+      },
+      { sessionId, turnEpoch: 'synthetic-epoch' }
+    );
+  /** Even with the generation still registered here, the settled row refuses. */
+  const liveIfStillAdmitted = () => {
+    registerActiveRun({
+      sessionId,
+      userId,
+      sbSlug: 'echo',
+      backend: 'codex-cli',
+      startedAt: Date.now(),
+      turnEpoch: 'synthetic-epoch',
+    });
+    try {
+      return live();
+    } finally {
+      resetActiveRuns();
+    }
+  };
+
+  beforeEach(() => {
+    row.turn_scope = 'space-turn';
+  });
+
+  // The runner settles before the terminal write; with that write failing,
+  // the row stays running at the same epoch and the generation stays
+  // registered for finalization. The token still dies with the runner
+  // (Lumen, PR #867 round 2).
+  it.each([true, false])(
+    'refuses a finished runner while its finalization write fails; runner succeeded = %s',
+    async (succeeded) => {
+      if (!succeeded)
+        native.mockImplementationOnce(async () => {
+          throw new Error('Synthetic runner failure');
+        });
+      vi.spyOn(repository, 'updateIfTurnEpoch').mockRejectedValue(
+        new Error('Synthetic finalization write failure')
+      );
+      expect((await run()).success).toBe(succeeded);
+      expect(row).toMatchObject({
+        lifecycle: 'running',
+        turn_epoch: 'synthetic-epoch',
+        turn_scope: 'space-turn',
+      });
+      expect(row.ended_at ?? null).toBeNull();
+      expect(getActiveRun(sessionId)).toMatchObject({
+        turnEpoch: 'synthetic-epoch',
+        runnerSettledAt: expect.any(Number),
+        settledOutcome: succeeded ? 'succeeded' : 'failed',
+      });
+      expect(live()).toBe(false);
+    }
+  );
+
+  it('is live while the turn runs, and refused once it settles idle', async () => {
+    const turn = native.getMockImplementation()!;
+    let during: boolean | undefined;
+    native.mockImplementationOnce(async (input) => {
+      during = live();
+      return turn(input);
+    });
+    expect((await run()).success).toBe(true);
+    expect(during).toBe(true);
+    expect(row).toMatchObject({ lifecycle: 'idle', turn_epoch: 'synthetic-epoch' });
+    expect(row.ended_at ?? null).toBeNull();
+    expect(live()).toBe(false);
+    expect(liveIfStillAdmitted()).toBe(false);
+  });
+
+  it('is live while the turn runs, and refused once it settles failed', async () => {
+    let during: boolean | undefined;
+    native.mockImplementationOnce(async () => {
+      during = live();
+      throw new Error('Synthetic app-server failure');
+    });
+    expect((await run()).success).toBe(false);
+    expect(during).toBe(true);
+    expect(row).toMatchObject({ lifecycle: 'failed', turn_epoch: 'synthetic-epoch' });
+    expect(row.ended_at ?? null).toBeNull();
+    expect(live()).toBe(false);
+    expect(liveIfStillAdmitted()).toBe(false);
   });
 });

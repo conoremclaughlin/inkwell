@@ -13,6 +13,7 @@ import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { signRunnerAccessToken, verifyInkAccessToken } from '../../auth/ink-tokens';
+import { isPlainToolsScope } from '../../auth/token-scope';
 import { deriveDelegationSecret } from '../../auth/delegation-secret';
 import type { Database } from '../../data/supabase/types.js';
 import type {
@@ -2311,6 +2312,7 @@ export class SessionService implements ISessionService {
                   threadMessageId: typeof source === 'string' ? source : undefined,
                   inklingId: identity.id,
                   ownerUserId: identity.userId,
+                  workspaceId: identity.workspaceId,
                 });
               })
             );
@@ -2713,6 +2715,7 @@ export class SessionService implements ISessionService {
                 threadMessageId: metadata?.triggerThreadMessageId,
                 inklingId: inklingIdentity.id,
                 ownerUserId: inklingIdentity.userId,
+                workspaceId: inklingIdentity.workspaceId,
               });
       const inklingRefusal = inklingTurnRefusal(
         { identity: inklingIdentity, userId, ownerMessage },
@@ -4064,8 +4067,7 @@ export class SessionService implements ISessionService {
       claims.sessionId !== session.id ||
       claims.sbId !== (session.sbId ?? undefined) ||
       claims.contactId !== (session.contactId ?? undefined) ||
-      typeof claims.scope !== 'string' ||
-      !claims.scope.split(/\s+/).includes('mcp:tools') ||
+      !isPlainToolsScope(claims.scope) ||
       typeof claims.exp !== 'number' ||
       !Number.isFinite(claims.exp) ||
       claims.exp * 1000 <= Date.now() + 60_000
