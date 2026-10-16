@@ -5,6 +5,7 @@ const request = vi.hoisted(() => vi.fn());
 vi.mock('./state', () => ({ panelRequest: request }));
 // Pairing has its own mounted UI tests; these isolate the capture controls.
 vi.mock('./pairing-panel', () => ({ mountPairingPanel: vi.fn() }));
+vi.mock('./hosted-chat-panel', () => ({ mountHostedChatPanel: vi.fn() }));
 const changed = vi.fn();
 const permission = vi.fn();
 const originInput = () => document.getElementById('origin') as HTMLInputElement;
@@ -14,8 +15,8 @@ beforeEach(() => {
     <div id="status"></div><section id="capture"></section><pre id="preview"></pre>
     <p id="privacy"></p><section id="confirmation"></section><div id="changes"></div>
     <input id="whole-page-consent" type="checkbox"><textarea id="proposal-json"></textarea>
-    <button id="selection"></button><button id="page"></button><button id="share"></button>
-    <button id="import"></button><button id="apply"></button><button id="clear"></button>`;
+    <div id="snapshot-tools"><button id="selection"></button><button id="page"></button><button id="share"></button>
+    <button id="import"></button><button id="apply"></button><button id="clear"></button></div>`;
   request.mockReset().mockResolvedValue({ dashboardOrigin: 'http://localhost:4102' });
   changed.mockReset();
   permission.mockReset().mockResolvedValue(true);

@@ -25,6 +25,8 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../data/supabase/types';
 import { logger } from '../utils/logger';
+import { createBrowserChatRouter } from './browser-chat';
+import { getDataComposer, type DataComposer } from '../data/composer';
 import {
   BROWSER_CLIENT_TOKEN_LIFETIME_SECONDS,
   readBearerToken,
@@ -63,9 +65,8 @@ interface CompanionRoute {
 }
 
 /**
- * The allowlist. Four entries — this PR ships the credential boundary, not the
- * companion API. Thread reads, page observations and command/receipt
- * endpoints each arrive as their own entry.
+ * The allowlist. Installation authentication and narrowly scoped chat operations
+ * only. Page observations and commands require their own explicit entries.
  *
  * None of these is a page action. This grant is pairing and installation
  * authority: it says a `browser_client` credential may exist, and nothing
@@ -79,6 +80,10 @@ const ROUTES: CompanionRoute[] = [
   { method: 'POST', path: '/auth/token', credential: 'pairing_material' },
   { method: 'POST', path: '/auth/revoke', credential: 'revocation' },
   { method: 'GET', path: '/session', credential: 'browser_client_jwt' },
+  { method: 'GET', path: '/chat/inklings', credential: 'browser_client_jwt' },
+  { method: 'GET', path: '/chat/messages', credential: 'browser_client_jwt' },
+  { method: 'GET', path: '/chat/receipt', credential: 'browser_client_jwt' },
+  { method: 'POST', path: '/chat/message', credential: 'browser_client_jwt' },
 ];
 
 /** Exported so tests can assert the allowlist itself, not a copy of it. */
@@ -143,7 +148,10 @@ async function resolveRevocationCaller(
   };
 }
 
-export function createBrowserCompanionRouter(client: SupabaseClient<Database>): Router {
+export function createBrowserCompanionRouter(
+  client: SupabaseClient<Database>,
+  getComposer: () => Promise<DataComposer> = getDataComposer
+): Router {
   const router = Router();
   const grants = new BrowserCompanionGrantService(client);
 
@@ -397,5 +405,6 @@ export function createBrowserCompanionRouter(client: SupabaseClient<Database>): 
     });
   });
 
+  router.use(createBrowserChatRouter(getComposer));
   return router;
 }

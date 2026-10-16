@@ -10,6 +10,7 @@ import {
 import { connectDashboard } from '../dashboard-bridge';
 import type { CompanionState, Reply } from '../state';
 import { createPairingClient, parsePairingRecord } from '../pairing';
+import { registerHostedChatWorker } from '../hosted-chat-worker';
 
 export default defineBackground(() => {
   // MV3 suspension is normal. Captures and pairing material use session
@@ -58,6 +59,7 @@ export default defineBackground(() => {
     }
     throw new Error('Unsupported pairing action.');
   }
+  const hostedChat = registerHostedChatWorker(async () => (await getPairing()).connectionRecord());
   const requireSnapshot = (state: CompanionState, id: unknown) => {
     if (
       !state.snapshot ||
@@ -133,6 +135,7 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener((message: Record<string, unknown>, sender, respond) => {
     if (typeof message?.type === 'string' && message.type.startsWith('pair:')) {
+      if (message.type === 'pair:disconnect' && isPanel(sender)) hostedChat.disconnect();
       // This lane never queues behind captures, page fills, or an auth fetch.
       // In particular, Disconnect reaches its local fence while claim waits.
       const action = isPanel(sender)

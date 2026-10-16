@@ -2,7 +2,9 @@ import './style.css';
 import { dashboardOrigin, dashboardPermission, privacySignals } from '../../protocol';
 import { panelRequest, type CompanionState } from '../../state';
 import { mountPairingPanel } from '../../pairing-panel';
+import { mountHostedChatPanel } from '../../hosted-chat-panel';
 
+mountHostedChatPanel();
 mountPairingPanel();
 
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -43,7 +45,7 @@ async function refresh() {
 async function run(action: () => Promise<unknown>) {
   if (busy) return;
   busy = true;
-  document.querySelectorAll<HTMLButtonElement>('button:not([data-pairing])').forEach((button) => {
+  document.querySelectorAll<HTMLButtonElement>('#snapshot-tools button').forEach((button) => {
     button.disabled = true;
   });
   try {
@@ -54,7 +56,7 @@ async function run(action: () => Promise<unknown>) {
   } finally {
     await refresh().catch(() => status('Extension unavailable. Reopen the panel.'));
     busy = false;
-    document.querySelectorAll<HTMLButtonElement>('button:not([data-pairing])').forEach((button) => {
+    document.querySelectorAll<HTMLButtonElement>('#snapshot-tools button').forEach((button) => {
       button.disabled = false;
     });
   }

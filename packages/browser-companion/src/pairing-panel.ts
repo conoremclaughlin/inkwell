@@ -41,8 +41,7 @@ export function mountPairingPanel() {
       claiming: 'Waiting for a pairing receipt. You can disconnect now.',
       unknown:
         'Pairing outcome unknown. Do not try the code again. Disconnect before starting a new pairing. Without the missing receipt, any previous server grant cannot be revoked here and must expire.',
-      paired:
-        'Pairing receipt received. Hosted chat is not enabled in this checkpoint; no page authority was granted.',
+      paired: 'Paired. Use Connect to start hosted chat. No page authority was granted.',
       disconnected:
         current.revocation === 'confirmed'
           ? current.storageUnavailable

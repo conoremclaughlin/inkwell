@@ -107,10 +107,10 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
         headers: { Authorization: `Bearer ${token}` },
       }),
     ]);
-    expect(f.fetcher.mock.calls[1][1]).not.toHaveProperty('body');
+    expect(f.fetcher.mock.calls[1]![1]).not.toHaveProperty('body');
     expect(JSON.stringify(result)).not.toContain(token);
     expect(JSON.stringify(result)).not.toContain(record().grant!.secret);
-    expect(Object.keys(f.connection).sort()).toEqual(['close', 'current', 'refresh']);
+    expect(Object.keys(f.connection).sort()).toEqual(['chat', 'close', 'current', 'refresh']);
     result.workspaceId = otherId;
     expect(f.connection.current()).toEqual(view());
     f.connection.current()!.userId = otherId;
@@ -130,8 +130,8 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
       Response.json({ ...sessionReceipt(), privateExtra: 'synthetic extra' })
     );
     expect(await f.connection.refresh()).toEqual(view());
-    expect(f.fetcher.mock.calls[0][0]).toBe(`${origin}/api/browser-companion/auth/token`);
-    expect(f.fetcher.mock.calls[0][1]?.body).toContain(record().grant!.secret);
+    expect(f.fetcher.mock.calls[0]![0]).toBe(`${origin}/api/browser-companion/auth/token`);
+    expect(f.fetcher.mock.calls[0]![1]?.body).toContain(record().grant!.secret);
     f.connection.close();
   });
   it.each([
@@ -310,7 +310,7 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
       if (stop === 'close') f.connection.close();
       else f.intent.abort('synthetic private reason');
       expect(f.connection.current()).toBeUndefined();
-      expect(f.fetcher.mock.calls[0][1]?.signal?.aborted).toBe(true);
+      expect(f.fetcher.mock.calls[0]![1]?.signal?.aborted).toBe(true);
       await rejected; // Does not wait for the transport to cooperate.
       late.resolve(Response.json(tokenReceipt()));
       await vi.advanceTimersByTimeAsync(0);
@@ -401,7 +401,7 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
         code: status === 401 || status === 403 ? 'refused' : 'unavailable',
       });
       expect(f.fetcher).toHaveBeenCalledTimes(1);
-      expect(f.fetcher.mock.calls[0][1]?.signal?.aborted).toBe(true);
+      expect(f.fetcher.mock.calls[0]![1]?.signal?.aborted).toBe(true);
       f.connection.close();
     }
   );
@@ -532,5 +532,66 @@ describe('fixed connection transport (synthetic fetch only, not registered)', ()
     await rejected;
     expect(f.connection.current()).toBeUndefined();
     f.connection.close();
+  });
+});
+
+describe('fixed chat transport (invented HTTP responses)', () => {
+  it('sends only a fixed chat operation with the private bearer, no cookies or redirects', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockResolvedValueOnce(Response.json({ messages: [] }));
+    expect(await f.connection.chat({ kind: 'messages', inklingId: otherId })).toEqual({
+      messages: [],
+    });
+    expect(f.fetcher.mock.calls.at(-1)).toEqual([
+      `${origin}/api/browser-companion/chat/messages?inklingId=${otherId}`,
+      expect.objectContaining({
+        method: 'GET',
+        credentials: 'omit',
+        redirect: 'error',
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    ]);
+    f.connection.close();
+  });
+  it('validates the operation before any token exchange', async () => {
+    const f = fixture();
+    await expect(
+      f.connection.chat({ kind: 'fetch', url: 'https://fixture.test' } as never)
+    ).rejects.toMatchObject({ code: 'invalid-response' });
+    expect(f.fetcher).not.toHaveBeenCalled();
+    f.connection.close();
+  });
+  it.each([401, 403, 503])('never retries an ambiguous send after HTTP %s', async (status) => {
+    const f = fixture();
+    await f.connection.refresh();
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockResolvedValueOnce(new Response('synthetic private detail', { status }));
+    await expect(
+      f.connection.chat({
+        kind: 'message',
+        inklingId: otherId,
+        operationId: installationId,
+        body: 'Invented message.',
+      })
+    ).rejects.toBeInstanceOf(Error);
+    expect(
+      f.fetcher.mock.calls.filter(([url]) => String(url).endsWith('/chat/message'))
+    ).toHaveLength(1);
+    expect(f.fetcher.mock.calls.at(-1)?.[1]?.signal?.aborted).toBe(true);
+    f.connection.close();
+  });
+  it('fences a chat result arriving after Disconnect', async () => {
+    const f = fixture();
+    await f.connection.refresh();
+    const late = deferred<Response>();
+    f.fetcher.mockResolvedValueOnce(Response.json(sessionReceipt()));
+    f.fetcher.mockReturnValueOnce(late.promise);
+    const result = f.connection.chat({ kind: 'messages', inklingId: otherId });
+    await vi.waitFor(() => expect(f.fetcher).toHaveBeenCalledTimes(4));
+    f.intent.abort();
+    late.resolve(Response.json({ messages: [{ body: 'Do not display.' }] }));
+    await expect(result).rejects.toMatchObject({ code: 'closed' });
   });
 });

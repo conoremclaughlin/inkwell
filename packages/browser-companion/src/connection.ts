@@ -34,10 +34,10 @@ const date = (value: unknown) => (typeof value === 'string' ? Date.parse(value) 
 const invalid = () => new ConnectionError('invalid-response');
 
 /** Read a bounded body, not an unbounded response.text() followed by a size check. */
-async function readJson(response: Response, signal: AbortSignal) {
+async function readJson(response: Response, signal: AbortSignal, limit = 8192) {
   if (!response.headers.get('content-type')?.match(/^application\/json(?:\s*;|$)/i))
     throw invalid();
-  if (Number(response.headers.get('content-length')) > 8192 || !response.body) throw invalid();
+  if (Number(response.headers.get('content-length')) > limit || !response.body) throw invalid();
   const reader = response.body.getReader();
   const cancel = () => {
     void reader.cancel().catch(() => undefined);
@@ -53,7 +53,7 @@ async function readJson(response: Response, signal: AbortSignal) {
       signal.throwIfAborted();
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > 8192) throw invalid();
+      if (bytes > limit) throw invalid();
       text += decoder.decode(chunk.value, { stream: true });
     }
     return object(JSON.parse(text + decoder.decode()));
@@ -264,5 +264,80 @@ export function createBrowserConnection(
     })();
     return pending;
   }
-  return { current, refresh, close };
+  // This is deliberately not an arbitrary authenticated fetch API. The worker
+  // supplies only fixed chat operations, never page-chosen URLs or headers.
+  async function chat(operation: BrowserChatOperation): Promise<Record<string, unknown>> {
+    const request = chatRequest(operation);
+    await refresh();
+    guard();
+    const token = bearer;
+    if (!token) throw new ConnectionError('closed');
+    const operationLifetime = new AbortController();
+    const timer = setTimeout(() => operationLifetime.abort(), 15_000);
+    const signal = AbortSignal.any([lifetime.signal, operationLifetime.signal]);
+    const url = `${origin}/api/browser-companion/chat/${request.path}`;
+    try {
+      guard(signal);
+      const response = await fetcher(url, {
+        method: request.body ? 'POST' : 'GET',
+        credentials: 'omit',
+        redirect: 'error',
+        cache: 'no-store',
+        referrerPolicy: 'no-referrer',
+        headers: {
+          Authorization: `Bearer ${token.value}`,
+          ...(request.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(request.body ? { body: JSON.stringify(request.body) } : {}),
+        signal,
+      });
+      guard(signal);
+      if (response.redirected || (response.url && response.url !== url)) throw invalid();
+      if (response.status !== 200)
+        throw new ConnectionError(
+          response.status === 401 || response.status === 403 ? 'refused' : 'unavailable'
+        );
+      const result = await readJson(response, signal, 4_000_000);
+      guard(signal);
+      return result;
+    } catch (error) {
+      if (
+        error instanceof ConnectionError &&
+        (error.code === 'refused' || error.code === 'expired')
+      )
+        close();
+      if (error instanceof ConnectionError) throw error;
+      throw new ConnectionError('unavailable');
+    } finally {
+      clearTimeout(timer);
+      operationLifetime.abort();
+    }
+  }
+  return { current, refresh, close, chat };
+}
+
+export type BrowserChatOperation =
+  | { kind: 'inklings' }
+  | { kind: 'messages'; inklingId: string }
+  | { kind: 'receipt'; inklingId: string; operationId: string }
+  | { kind: 'message'; inklingId: string; operationId: string; body: string };
+
+function chatRequest(op: BrowserChatOperation): { path: string; body?: Record<string, string> } {
+  if (op.kind === 'inklings') return { path: 'inklings' };
+  if (!uuid(op.inklingId)) throw invalid();
+  if (op.kind === 'messages') return { path: `messages?inklingId=${op.inklingId}` };
+  if (!uuid(op.operationId)) throw invalid();
+  if (op.kind === 'receipt')
+    return { path: `receipt?inklingId=${op.inklingId}&operationId=${op.operationId}` };
+  if (
+    op.kind !== 'message' ||
+    typeof op.body !== 'string' ||
+    !op.body.trim() ||
+    op.body.length > 4_000
+  )
+    throw invalid();
+  return {
+    path: 'message',
+    body: { inklingId: op.inklingId, operationId: op.operationId, body: op.body },
+  };
 }

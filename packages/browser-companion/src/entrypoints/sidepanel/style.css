@@ -70,6 +70,7 @@ button:disabled {
   gap: 8px;
 }
 input,
+select,
 textarea {
   width: 100%;
   padding: 10px;
@@ -97,6 +98,33 @@ pre {
 footer {
   font-size: 11px;
   color: #536365;
+}
+summary {
+  cursor: pointer;
+  padding: 12px 0;
+  font-weight: 600;
+}
+#chat-status {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.row {
+  align-items: center;
+}
+header {
+  padding-bottom: 16px;
+}
+h1 {
+  font-size: 30px;
+  margin: 12px 0;
+}
+header p {
+  margin-bottom: 0;
+}
+#hosted-chat .ink-chat-panel {
+  padding: 12px 0 0;
+  border: 0;
+  margin: 0;
 }
 .warning {
   border-left: 3px solid #a96c26;

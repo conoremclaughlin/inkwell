@@ -42,6 +42,8 @@ export interface ChatPanelViewState {
   conversation: ChatConversation | null;
   page: { title: string; url: string; binding: ChatPageBinding } | null;
   connection: ChatConnectionState;
+  /** A transport read/send is in flight. Disable submission without changing connection evidence. */
+  busy?: boolean;
   sharing: { state: 'active'; sessionId: string } | { state: 'off' | 'stopped' | 'expired' };
   /** Oldest first, with adapter-established statuses. Within the bounded tail,
    * duplicate IDs use their last occurrence's fields and position.
@@ -185,6 +187,7 @@ function snapshot(state: ChatPanelViewState): ChatPanelViewState {
           }
         : null,
     connection: state.connection,
+    busy: state.busy === true,
     page:
       state.page && binding && pageValid
         ? {
@@ -210,7 +213,7 @@ function snapshot(state: ChatPanelViewState): ChatPanelViewState {
   };
 }
 
-/** Dependency-free conversation view; intentionally not wired to any entrypoint.
+/** Dependency-free conversation view; the adapter owns all transport.
  * No network, capture, persistence, credentials, HTML/Markdown interpretation or retry.
  * Same-target updates preserve the draft; changing scope/thread/SB/page/controller discards it instead
  * of carrying potentially private text to another recipient. An unknown send locks
@@ -238,7 +241,6 @@ export function createChatPanel(
   root.className = 'ink-chat-panel';
   root.setAttribute('aria-label', 'Page conversation');
   const heading = element('h2');
-  const thread = element('p');
   const page = element('p');
   const sharing = element('p');
   const connection = element('p');
@@ -253,12 +255,13 @@ export function createChatPanel(
   const messages = element('ol');
   log.append(history, messages);
   const form = element('form');
-  const label = element('label', 'Message to selected SB');
+  const label = element('label');
+  const labelText = element('span', 'Message your inkling');
   const composer = element('textarea');
-  composer.setAttribute('aria-label', 'Message to selected SB');
+  composer.setAttribute('aria-label', 'Message your inkling');
   composer.maxLength = CHAT_PANEL_LIMITS.draftChars;
   composer.rows = 4;
-  label.append(composer);
+  label.append(labelText, composer);
   const count = element('p');
   const send = element('button', 'Send message');
   send.type = 'submit';
@@ -276,7 +279,7 @@ export function createChatPanel(
   inspect.type = 'button';
   recovery.append(reference, inspect);
   form.append(label, count, send, stop, notice, guard, recovery);
-  root.append(heading, thread, page, sharing, connection, log, form);
+  root.append(heading, page, sharing, connection, log, form);
   host.append(root);
 
   let state = snapshot(initial);
@@ -306,6 +309,7 @@ export function createChatPanel(
       : undefined;
   const canSend = () =>
     !destroyed &&
+    !state.busy &&
     state.connection === 'ready' &&
     !!state.conversation &&
     !pending &&
@@ -339,15 +343,20 @@ export function createChatPanel(
   function render() {
     if (destroyed) return;
     renderControls();
-    setText(heading, state.conversation ? `With ${state.conversation.sbName}` : 'Choose an SB');
     setText(
-      thread,
-      state.conversation ? `Thread: ${state.conversation.threadKey}` : 'No thread selected'
+      heading,
+      state.conversation ? `With ${state.conversation.sbName}` : 'Choose an inkling'
     );
+    const prompt = state.conversation
+      ? `Message ${state.conversation.sbName}`
+      : 'Message your inkling';
+    setText(labelText, prompt);
+    composer.setAttribute('aria-label', prompt);
     setText(
       page,
       state.page ? `Attached page: ${state.page.title}\n${state.page.url}` : 'No page attached'
     );
+    page.hidden = !state.page;
     setText(
       sharing,
       activeRead()
@@ -396,6 +405,9 @@ export function createChatPanel(
           ? 'Sending — delivery unconfirmed'
           : deliveryLabels[message.status]
       );
+      // Keep uncertainty and execution evidence per message, but avoid repeating
+      // the same storage-only receipt on every historical row.
+      nodes.status.hidden = message.status === 'stored' && message !== visible.at(-1);
       if (nodes.row === position) position = position.nextElementSibling;
       else messages.insertBefore(nodes.row, position);
     }
@@ -579,7 +591,7 @@ export function createChatPanel(
     inspect.removeEventListener('click', inspectUncertainDelivery);
     for (const node of [
       heading,
-      thread,
+      labelText,
       page,
       sharing,
       connection,

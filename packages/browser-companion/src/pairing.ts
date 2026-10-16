@@ -239,6 +239,13 @@ export function createPairingClient(store: PairingStore, transport = pairingTran
   }
   return {
     status: () => transition(view, true),
+    // Worker-only access. Never put this record in a panel response.
+    connectionRecord: () =>
+      transition(() => {
+        if (failed || record?.phase !== 'paired' || record.revocation !== 'none')
+          throw new Error('Pair this browser before connecting.');
+        return parsePairingRecord(record)!;
+      }),
     async prepare(input: string, permitted: () => Promise<boolean> = async () => true) {
       const origin = dashboardOrigin(input);
       const generation = stopped;

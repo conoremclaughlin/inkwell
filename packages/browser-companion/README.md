@@ -4,10 +4,12 @@ An opt-in Chrome MV3 extension for deliberately sharing page context and reviewi
 suggested field changes. Built with WXT, following Inkah's build pattern rather
 than copying its all-sites content script. No browsing recorder or background agent.
 
-The current UI is a snapshot/share/confirmed-fill prototype with an installation
-pairing checkpoint. It does **not** yet
-provide a live conversation in the sidebar or automatic follow-up page inspection.
-The required page-aware read/chat/interact experience is being built separately.
+The panel now connects explicitly to hosted chat with one of the paired owner's
+inklings. Messages use the existing inbox dispatch and hosted runtime, not a
+second extension agent loop. Page control is still separate: connecting or
+chatting does not read a tab. The older snapshot/confirmed-fill prototype remains
+under its own disclosure. This is local source, not a deployed or real-account
+acceptance claim.
 
 ## Build and load
 
@@ -35,6 +37,40 @@ dashboard authentication and API authorization are unchanged.
 
 ## First conversation
 
+1. Expand **Pairing and connection settings** and pair with your dashboard.
+2. Click **Connect**, choose your inkling, and send a message. The server must
+   include the companion chat endpoints; the older auth-only server is not enough.
+3. The panel reads replies from that installation grant's own conversation.
+   The server derives the thread from the grant and selected identity UUID;
+   clients cannot supply another workspace, conversation, runtime or SB slug.
+4. Closing/reloading the panel drops its connection intent. A surviving document
+   may reconnect after worker suspension, but a new document needs Connect.
+   Bearers stay in worker memory. Disconnect in any panel stops every panel and
+   requests installation revocation through the existing pairing path.
+
+Ambiguous sends are never replayed. A session-storage operation reference is
+written before dispatch and reconciled through an exact, read-only receipt lookup,
+even when its message is outside the recent-history window. A missing receipt
+stays unknown. A crash before dispatch can conservatively leave an unsent operation
+unknown too; it is not safe to infer rejection from absence. No message body or
+bearer is kept in that reference. Chat Stop closes the local connection, not a
+remote runtime or an already accepted message.
+
+The selected inkling retains its ordinary tools. Page content will be labelled
+untrusted when page integration lands; no claim of a restricted runtime or prompt
+injection containment is made. Scoped page control, named task tabs/groups, and
+page-text intake remain follow-ups, not implicit effects of Connect. Pasted chat
+text gets a narrow control-character cleanup in the visible draft before Send:
+bidi controls, zero-width spacing, BOM, control bytes and hidden Unicode tags are
+removed, while writing, joiners, emoji presentation and recognised subdivision
+flags are preserved. This is not a detector for visible prompt injection. The
+researched third-party cleaners are not installed or represented as audited.
+
+Installation-wide Disconnect broadcasts before returning. If persistence, remote
+revocation, and delivery to a surviving panel all fail together, that panel may
+retain intent across worker replacement. This residual is not represented as a
+confirmed revocation; no owner-only Disconnect restriction is introduced.
+
 ### Installation pairing checkpoint
 
 Use **Open pairing approval** to open the authenticated dashboard. The extension
@@ -49,8 +85,8 @@ The worker claims the code over the fixed companion namespace with explicit
 Pairing credentials use `storage.session`, explicitly restricted to trusted
 extension contexts; other trusted extension pages are part of this trust boundary,
 not isolated from one another. Credentials are never returned in panel messages,
-rendered, put in URLs, or stored in local/sync storage. This checkpoint does not
-mint a bearer token or admit a page; hosted chat remains unwired.
+rendered, put in URLs, or stored in local/sync storage. Pairing alone does not
+mint a bearer token or admit a page; the separate Connect action starts chat access.
 
 **Disconnect** fences a pending claim without waiting for its network response.
 The worker attempts to revoke a late successful claim, never reattaches it. A failed revocation retains
@@ -207,16 +243,16 @@ operations to the exact document/navigation, and enforce the private result path
 Local counters do not survive worker replacement; persistent server budgets must.
 Do not restore a stopped instance or construct a replacement from stale authority.
 
-Production wiring requires the separate browser-client authorization and
-browser-restricted execution/egress contracts. A privacy marker in a prompt does
-not contain an unrestricted coding backend with shell/network access. Unit tests
+Production page wiring requires separate page authorization. The selected
+inkling uses its ordinary execution tier; a privacy marker in a prompt does
+not contain a runtime with shell/network access. Unit tests
 use synthetic snapshots, injected clocks and fake adapters, not native Chrome or
 an actual authenticated SB roundtrip.
 
-## Sidebar conversation view (not enabled)
+## Sidebar conversation view
 
 `src/chat-panel.ts` and `src/chat-panel.css` provide the next conversation view,
-without changing the installed prototype or adding network access. The view
+with network access supplied by the hosted panel adapter. The reusable view
 accepts a trusted, typed state snapshot plus injected send/Stop/subscription
 callbacks; these are UI contracts, not server API schemas or authorization.
 
@@ -265,7 +301,16 @@ callbacks; these are UI contracts, not server API schemas or authorization.
 - Destroy removes listeners, clears visible data and aborts local
   pending delivery, but is not a remote grant-revocation operation.
 
-Production entrypoints do not import this view yet. Pairing, thread-scoped API,
-page-grant admission, browser-restricted runtime/egress, real Chrome targeting,
-and authenticated multi-turn acceptance remain necessary before enabling live
-page-aware chat. Unit tests use synthetic state and fake callbacks, not an SB.
+The production panel now imports this view. Chat APIs stay inside the browser
+credential allowlist and use existing owner-scoped inkling listing, inbox dispatch,
+and durable client-message deduplication. Page-grant admission and real Chrome
+targeting remain unwired. Unit tests use synthetic state and fake callbacks.
+
+The compiled extension also passed a two-message synthetic HTTP conversation in
+real isolated Chromium, including authenticated extension-document ports, two
+panels with separate Connect intent, cross-panel Disconnect, and a 390 px overflow
+check. A DevTools-terminated worker reached stopped and restarted states; both
+surviving panels resumed, while reloading a panel required a fresh Connect.
+The test seeds an invented pairing record and supplies static replies: it
+does not demonstrate native sidepanel geometry, host-permission prompts, actual
+dashboard login, the database, or an LLM turn. Those remain acceptance work.

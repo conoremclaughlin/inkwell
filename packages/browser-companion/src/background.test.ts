@@ -46,6 +46,8 @@ function makeChrome() {
   return {
     runtime: {
       id: extensionId,
+      onConnect: { addListener: vi.fn() },
+      sendMessage: vi.fn(async () => undefined),
       getURL: (path: string) => `chrome-extension://${extensionId}/${path.replace(/^\//, '')}`,
       onMessage: {
         addListener: (fn: Handler) => {

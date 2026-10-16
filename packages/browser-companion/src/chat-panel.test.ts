@@ -92,18 +92,32 @@ afterEach(() => {
 });
 
 describe('chat panel view', () => {
-  it('labels the recipient, thread, attached page, sharing, composer and message log', () => {
+  it('shows a storage receipt only on the latest row while keeping uncertainty visible', () => {
+    const p = setup(
+      view({
+        messages: [
+          message('first', 'stored'),
+          message('unknown', 'unknown'),
+          message('latest', 'stored'),
+        ],
+      })
+    );
+    const receipts = [...p.host.querySelectorAll<HTMLParagraphElement>('li p')];
+    expect(receipts.map((receipt) => receipt.hidden)).toEqual([true, false, false]);
+    expect(receipts[2]!.textContent).toBe('Stored — not confirmed read');
+  });
+  it('labels the recipient and composer without exposing raw thread identifiers', () => {
     const p = setup();
     expect(p.host.textContent).toContain('With Example SB');
-    expect(p.host.textContent).toContain('Thread: thread:synthetic-page');
+    expect(p.host.textContent).not.toContain('thread:synthetic-page');
     expect(p.host.textContent).toContain('Attached page: Example page');
     expect(p.host.textContent).toContain('https://example.test/page');
     expect(p.host.textContent).toContain('Page sharing active');
     expect(p.host.querySelector('[role="log"]')?.getAttribute('aria-label')).toBe(
       'Conversation messages'
     );
-    expect(p.composer.closest('label')?.textContent).toBe('Message to selected SB');
-    expect(p.composer.getAttribute('aria-label')).toBe('Message to selected SB');
+    expect(p.composer.closest('label')?.textContent).toBe('Message Example SB');
+    expect(p.composer.getAttribute('aria-label')).toBe('Message Example SB');
     expect(p.sendButton.disabled).toBe(true);
     expect(p.stopButton.disabled).toBe(false);
     p.input('A question');
@@ -159,7 +173,7 @@ describe('chat panel view', () => {
     const p = setup(view({ conversation: null, page: null, sharing: { state: 'off' } }));
     p.input('Keep this draft');
     p.submit();
-    expect(p.host.textContent).toContain('Choose an SB');
+    expect(p.host.textContent).toContain('Choose an inkling');
     expect(p.host.textContent).toContain('No page attached');
     expect(p.host.textContent).toContain('Page not shared');
     expect(p.send).not.toHaveBeenCalled();
