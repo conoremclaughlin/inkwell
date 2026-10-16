@@ -132,7 +132,7 @@ describe('setThreadPin', () => {
 
       expect(queries.map((q) => q.table)).toEqual(['inbox_threads', 'inbox_thread_participants']);
       expect(queries[0].calls).toEqual([
-        ['select', 'id, metadata'],
+        ['select', 'id, metadata, conversation_mode'],
         ['eq', 'workspace_id', WS],
         ['eq', 'thread_key', 'chat:pip'],
         ['maybeSingle'],

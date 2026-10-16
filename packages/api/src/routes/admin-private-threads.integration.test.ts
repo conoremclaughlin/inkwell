@@ -9,14 +9,16 @@
  * count, timeline or a carrier's spine, and a workspace role confers nothing,
  * the space owner's included. So is a group chat the owner made with the
  * member: its people read it, marked shared, and nobody else does. An
- * ordinary thread in the same space stays readable by everyone in it.
+ * ordinary thread in the same space stays readable by everyone in it, and so
+ * does a public conversation (conversation_mode 'public'), which an admin
+ * not in it joins by posting. A person outside the space reads none of it.
  *
  * Run via: yarn test:integration:db:local src/routes/admin-private-threads.integration.test.ts
  *
  * Every person here is invented, at example.com.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import type { Client } from 'pg';
@@ -70,6 +72,8 @@ async function call(
     query?: Record<string, string>;
     params?: Record<string, string>;
     body?: Record<string, unknown>;
+    /** False for a person the middleware is expected to refuse. */
+    reaches?: boolean;
   } = {}
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const headers: Record<string, string> = {
@@ -116,7 +120,11 @@ async function call(
   });
   await handled;
   for (const close of closes) close();
-  expect(handled, `${person.label} reached ${path}`).toBeDefined();
+  if (options.reaches === false) {
+    expect(handled, `${person.label} was stopped before ${path}`).toBeUndefined();
+  } else {
+    expect(handled, `${person.label} reached ${path}`).toBeDefined();
+  }
   return { status: sent.status, body: sent.body as Record<string, unknown> };
 }
 
@@ -129,6 +137,8 @@ const get = (
 const run = randomUUID().slice(0, 8);
 let spaceId: string;
 let inklingSbId: string;
+/** The owner's inkling in the public conversation: an owner-test inkling, so the gates admit posts. */
+let reedSbId: string;
 /** One of the owner's SBs that isn't an inkling and isn't in any conversation here. */
 let ownersSbId: string;
 const taskGroupIds: string[] = [];
@@ -136,6 +146,8 @@ let owner: Person;
 let member: Person;
 let viewer: Person;
 let admin: Person;
+/** A person with an account but no place in the space. */
+let outsider: Person;
 const threadIdByKey = new Map<string, string>();
 const threadIds: string[] = [];
 const sessionIds: string[] = [];
@@ -147,17 +159,19 @@ const keys = {
   markFalse: `chat:mark-false-${run}`,
   markString: `chat:mark-string-${run}`,
   group: `chat:group-${run}`,
+  public: `chat:public-${run}`,
 };
 const canary = {
   ownerChat: `owner-chat-canary-${run}`,
   memberChat: `member-chat-canary-${run}`,
   open: `open-thread-words-${run}`,
   group: `group-chat-canary-${run}`,
+  public: `public-thread-words-${run}`,
 };
 
 async function person(
   label: string,
-  role: 'owner' | 'admin' | 'member' | 'viewer'
+  role: 'owner' | 'admin' | 'member' | 'viewer' | null
 ): Promise<Person> {
   const email = `${label}-${run}@example.com`;
   const { rows } = await db.query<{ id: string }>(
@@ -172,11 +186,13 @@ async function person(
     );
     spaceId = space[0].id;
   }
-  await db.query(
-    `INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
-     ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-    [spaceId, userId, role]
-  );
+  if (role) {
+    await db.query(
+      `INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
+       ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [spaceId, userId, role]
+    );
+  }
   const { getDataComposer } = await import('../data/composer');
   const supabase = (await getDataComposer()).getClient();
   const tokens = await issueMobileTokens(supabase as never, userId, email);
@@ -191,12 +207,14 @@ async function thread(
   key: string,
   metadata: Record<string, unknown>,
   people: string[],
-  words: string
+  words: string,
+  options: { mode?: 'public' | 'private'; sbId?: string } = {}
 ): Promise<string> {
+  const sbId = options.sbId ?? inklingSbId;
   const { rows } = await db.query<{ id: string }>(
-    `INSERT INTO inbox_threads (thread_key, workspace_id, created_by_kind, created_by_user_id, title, metadata)
-     VALUES ($1, $2, 'user', $3, $4, $5) RETURNING id`,
-    [key, spaceId, people[0], `fixture ${key}`, JSON.stringify(metadata)]
+    `INSERT INTO inbox_threads (thread_key, workspace_id, created_by_kind, created_by_user_id, title, metadata, conversation_mode)
+     VALUES ($1, $2, 'user', $3, $4, $5, $6) RETURNING id`,
+    [key, spaceId, people[0], `fixture ${key}`, JSON.stringify(metadata), options.mode ?? null]
   );
   const threadId = rows[0].id;
   threadIds.push(threadId);
@@ -209,7 +227,7 @@ async function thread(
   }
   await db.query(
     'INSERT INTO inbox_thread_participants (thread_id, workspace_id, sb_id) VALUES ($1, $2, $3)',
-    [threadId, spaceId, inklingSbId]
+    [threadId, spaceId, sbId]
   );
   await db.query(
     `INSERT INTO inbox_thread_messages (thread_id, sender_kind, sender_user_id, content, created_at)
@@ -219,7 +237,7 @@ async function thread(
   await db.query(
     `INSERT INTO inbox_thread_messages (thread_id, sender_kind, sender_sb_id, sender_agent_id, content, created_at)
      VALUES ($1, 'sb', $2, $3, $4, $5)`,
-    [threadId, inklingSbId, `moss-${run}`, `reply ${words}`, tick()]
+    [threadId, sbId, sbId === inklingSbId ? `moss-${run}` : `reed-${run}`, `reply ${words}`, tick()]
   );
   return threadId;
 }
@@ -230,6 +248,7 @@ beforeAll(async () => {
   member = await person('ben', 'member');
   viewer = await person('cai', 'viewer');
   admin = await person('dee', 'admin');
+  outsider = await person('eli', null);
 
   const { rows: inkling } = await db.query<{ id: string }>(
     `INSERT INTO agent_identities (user_id, workspace_id, agent_id, name, role, backend, metadata)
@@ -248,8 +267,19 @@ beforeAll(async () => {
     [owner.userId, spaceId, `ivy-${run}`]
   );
   ownersSbId = ownersSb[0].id;
+  const { rows: reed } = await db.query<{ id: string }>(
+    `INSERT INTO agent_identities (user_id, workspace_id, agent_id, name, role, backend, metadata)
+     VALUES ($1, $2, $3, 'Reed', 'Integration inkling', 'claude', $4) RETURNING id`,
+    [
+      owner.userId,
+      spaceId,
+      `reed-${run}`,
+      JSON.stringify({ client: 'inkling-mobile', ownerTest: true, fixture: true }),
+    ]
+  );
+  reedSbId = reed[0].id;
 
-  // The space is new, so these six are every thread in it.
+  // The space is new, so these seven are every thread in it.
   await thread(keys.ownerChat, { inklingConversation: true }, [owner.userId], canary.ownerChat);
   await thread(keys.memberChat, { inklingConversation: true }, [member.userId], canary.memberChat);
   await thread(keys.open, {}, [owner.userId], canary.open);
@@ -262,6 +292,12 @@ beforeAll(async () => {
     [owner.userId, member.userId],
     canary.group
   );
+  // A public conversation the member started with Reed, the owner's
+  // inkling. The owner is not in it.
+  await thread(keys.public, { inklingConversation: true }, [member.userId], canary.public, {
+    mode: 'public',
+    sbId: reedSbId,
+  });
 
   // The inkling's session on the owner's 1:1: a carrier that names its key.
   const { rows: session } = await db.query<{ id: string }>(
@@ -289,6 +325,7 @@ afterAll(async () => {
     }
     if (inklingSbId) await db.query('DELETE FROM agent_identities WHERE id = $1', [inklingSbId]);
     if (ownersSbId) await db.query('DELETE FROM agent_identities WHERE id = $1', [ownersSbId]);
+    if (reedSbId) await db.query('DELETE FROM agent_identities WHERE id = $1', [reedSbId]);
     await db.end();
   }
 });
@@ -297,10 +334,14 @@ afterAll(async () => {
 async function list(who: Person) {
   const { status, body } = await get(who, '/threads');
   expect(status, `${who.label} lists threads`).toBe(200);
-  const spines = body.spines as Array<{ key: string; thread: { shared?: boolean } | null }>;
+  const spines = body.spines as Array<{
+    key: string;
+    thread: { shared?: boolean; conversationMode?: string | null } | null;
+  }>;
   return {
     keys: new Set(spines.map((s) => s.key)),
     shared: new Map(spines.map((s) => [s.key, s.thread?.shared])),
+    mode: new Map(spines.map((s) => [s.key, s.thread?.conversationMode])),
     text: JSON.stringify(body),
     meta: (body.meta as { threads: { fetched: number; total: number } }).threads,
   };
@@ -310,7 +351,7 @@ async function timeline(who: Person, key: string) {
   const { status, body } = await get(who, '/threads/messages', { query: { key } });
   expect(status, `${who.label} reads ${key}`).toBe(200);
   return body as {
-    thread: { threadKey: string; shared?: boolean } | null;
+    thread: { threadKey: string; shared?: boolean; conversationMode?: string | null } | null;
     messages: Array<{ content: string }>;
     studioHistory: unknown[];
   };
@@ -368,21 +409,43 @@ describe('the list (GET /threads)', () => {
     }
   });
 
-  it('counts only what the person may read', async () => {
-    // The viewer and the admin read the three open threads; the owner and
-    // the member each read their own 1:1 and the group besides. The
-    // viewer's window also hydrated the owner's 1:1 for the inkling's
-    // session, and dropped it.
+  it('shows everyone in the space the public conversation, marked public, with its preview', async () => {
+    for (const who of [owner, member, viewer, admin]) {
+      const seen = await list(who);
+      expect(seen.keys.has(keys.public), `${who.label} sees the public conversation`).toBe(true);
+      expect(seen.mode.get(keys.public), who.label).toBe('public');
+      expect(seen.text).toContain(canary.public);
+    }
+    // A group made with people stays private: no mode.
+    expect((await list(owner)).mode.get(keys.group)).toBeNull();
+  });
+
+  it('counts only what the person may read, and a public conversation its people are in once', async () => {
+    // Everyone reads the three open threads and the public conversation,
+    // which the member is in. The owner and the member each read their own
+    // 1:1 and the group besides. The viewer's window also hydrated the
+    // owner's 1:1 for the inkling's session, and dropped it.
     const [ownerSeen, memberSeen, viewerSeen, adminSeen] = await Promise.all([
       list(owner),
       list(member),
       list(viewer),
       list(admin),
     ]);
-    expect(viewerSeen.meta).toMatchObject({ total: 3, fetched: 3 });
-    expect(adminSeen.meta).toMatchObject({ total: 3, fetched: 3 });
-    expect(ownerSeen.meta).toMatchObject({ total: 5, fetched: 5 });
-    expect(memberSeen.meta).toMatchObject({ total: 5, fetched: 5 });
+    expect(viewerSeen.meta).toMatchObject({ total: 4, fetched: 4 });
+    expect(adminSeen.meta).toMatchObject({ total: 4, fetched: 4 });
+    expect(ownerSeen.meta).toMatchObject({ total: 6, fetched: 6 });
+    expect(memberSeen.meta).toMatchObject({ total: 6, fetched: 6 });
+  });
+
+  it('shows a person outside the space nothing: the middleware stops them', async () => {
+    for (const [routePath, query] of [
+      ['/threads', {}],
+      ['/threads/messages', { key: keys.public }],
+    ] as const) {
+      const refused = await call(outsider, 'get', routePath, { query, reaches: false });
+      expect(refused.status, routePath).toBe(403);
+      expect(JSON.stringify(refused.body)).not.toContain(canary.public);
+    }
   });
 });
 
@@ -432,6 +495,20 @@ describe('the timeline (GET /threads/messages)', () => {
     }
   });
 
+  it('serves the public conversation to everyone in the space, marked public', async () => {
+    for (const who of [owner, member, viewer, admin]) {
+      const seen = await timeline(who, keys.public);
+      expect(seen.thread, who.label).toMatchObject({
+        threadKey: keys.public,
+        conversationMode: 'public',
+      });
+      expect(seen.messages.map((m) => m.content)).toEqual([
+        `hello ${canary.public}`,
+        `reply ${canary.public}`,
+      ]);
+    }
+  });
+
   it('serves an ordinary thread to everyone in the space, unchanged', async () => {
     for (const who of [owner, member, viewer]) {
       const seen = await timeline(who, keys.open);
@@ -459,6 +536,15 @@ describe("an inkling's own inbox (GET /individuals/:sbSlug/inbox)", () => {
       false
     );
   });
+
+  it("shows its owner a public conversation of its inkling's that the owner is not in", async () => {
+    const { status, body } = await get(owner, '/individuals/:sbSlug/inbox', {
+      params: { sbSlug: `reed-${run}` },
+    });
+    expect(status).toBe(200);
+    const threadKeys = (body.groupThreads as Array<{ threadKey: string }>).map((t) => t.threadKey);
+    expect(threadKeys).toEqual([keys.public]);
+  });
 });
 
 describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
@@ -470,13 +556,17 @@ describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
     const dataComposer = await getDataComposer();
     const res = await runWithRequestContext({ userId: who.userId }, () =>
       handleGetInbox(
-        { userId: who.userId, status: 'unread', limit: 5, markRead: false },
+        { userId: who.userId, status: 'unread', limit: 20, markRead: false },
         dataComposer
       )
     );
     const body = JSON.parse((res as { content: Array<{ text: string }> }).content[0].text);
     const threads = body.threadsWithUnread as Array<{ threadKey: string }>;
-    return { keys: new Set(threads.map((t) => t.threadKey)), text: JSON.stringify(body) };
+    return {
+      keys: new Set(threads.map((t) => t.threadKey)),
+      all: threads.map((t) => t.threadKey),
+      text: JSON.stringify(body),
+    };
   }
 
   it("shows a member and a viewer none of the owner's 1:1, and the owner none of a member's", async () => {
@@ -497,6 +587,16 @@ describe('the agent-less inbox (MCP get_inbox without sbSlug)', () => {
     expect((await inbox(member)).keys.has(keys.memberChat)).toBe(true);
     for (const who of [owner, member, viewer]) {
       expect((await inbox(who)).keys.has(keys.open), who.label).toBe(true);
+    }
+  });
+
+  it('shows everyone the public conversation, once to a person in it', async () => {
+    for (const who of [owner, member, viewer, admin]) {
+      const seen = await inbox(who);
+      expect(
+        seen.all.filter((key) => key === keys.public),
+        who.label
+      ).toEqual([keys.public]);
     }
   });
 });
@@ -520,13 +620,17 @@ describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1 and r2
     const dataComposer = await getDataComposer();
     const res = await runWithRequestContext({ userId: owner.userId, ...context }, () =>
       handleGetInbox(
-        { userId: owner.userId, status: 'unread', limit: 5, markRead: false },
+        { userId: owner.userId, status: 'unread', limit: 20, markRead: false },
         dataComposer
       )
     );
     const body = JSON.parse((res as { content: Array<{ text: string }> }).content[0].text);
     const threads = body.threadsWithUnread as Array<{ threadKey: string }>;
-    return { keys: new Set(threads.map((t) => t.threadKey)), text: JSON.stringify(body) };
+    return {
+      keys: new Set(threads.map((t) => t.threadKey)),
+      all: threads.map((t) => t.threadKey),
+      text: JSON.stringify(body),
+    };
   }
 
   it.each([
@@ -541,8 +645,18 @@ describe('the agent-less inbox for a token bound to an SB (Lumen, #874 r1 and r2
       expect(seen.keys.has(keys.group)).toBe(false);
       expect(seen.text).not.toContain(canary.group);
       expect(seen.keys.has(keys.open)).toBe(true);
+      // A public conversation is the space's, so any reader in it sees it.
+      expect(seen.keys.has(keys.public)).toBe(true);
     }
   );
+
+  it.each([
+    ['by slug and id', true],
+    ['by id alone', false],
+  ])('shows the public conversation once to its own inkling, bound %s', async (_label, slug) => {
+    const seen = await inbox(await bound(`reed-${run}`, reedSbId, slug));
+    expect(seen.all.filter((key) => key === keys.public)).toEqual([keys.public]);
+  });
 
   it.each([
     ['by slug and id', true],
@@ -692,6 +806,91 @@ describe('the write routes answer a non-participant as for a key nobody has used
   });
 });
 
+describe('the public conversation: joined by posting', () => {
+  const messagesIn = async (key: string) =>
+    Number(
+      (
+        await db.query<{ n: string }>(
+          'SELECT count(*) AS n FROM inbox_thread_messages WHERE thread_id = $1',
+          [threadIdByKey.get(key)]
+        )
+      ).rows[0].n
+    );
+
+  it('pin and react: an admin not yet in it is told so, not that the thread is missing', async () => {
+    const pin = await call(admin, 'put', '/threads/pin', {
+      body: { threadKey: keys.public, pinned: true },
+    });
+    expect(pin.body).toMatchObject({ code: 'background_thread' });
+    const { rows } = await db.query<{ id: string }>(
+      'SELECT id FROM inbox_thread_messages WHERE thread_id = $1 LIMIT 1',
+      [threadIdByKey.get(keys.public)]
+    );
+    const reaction = await call(admin, 'post', '/threads/reactions', {
+      body: { threadKey: keys.public, messageId: rows[0].id, emoji: '👍' },
+    });
+    expect(reaction.status).toBe(403);
+    expect(reaction.body.code).not.toBe('thread_not_found');
+  });
+
+  it('reopen: an admin not yet in it recovers it, as an ordinary thread', async () => {
+    await db.query(
+      `UPDATE inbox_threads SET status = 'closed', closed_at = now(), closed_by_kind = 'user',
+       closed_by_user_id = $2 WHERE id = $1`,
+      [threadIdByKey.get(keys.public), owner.userId]
+    );
+    const recovered = await call(admin, 'post', '/threads/reopen', { body: { key: keys.public } });
+    expect(recovered.status).toBe(200);
+    expect(recovered.body).toMatchObject({ success: true, reopened: true });
+  });
+
+  it('reply: a viewer reads it but cannot post', async () => {
+    const before = await messagesIn(keys.public);
+    const refused = await call(viewer, 'post', '/threads/reply', {
+      body: { key: keys.public, content: 'may I?' },
+    });
+    expect(refused.status).toBe(403);
+    expect(await messagesIn(keys.public)).toBe(before);
+  });
+
+  it('reply: an admin not in it posts, joins it, and the message wakes its inkling', async () => {
+    const threadId = threadIdByKey.get(keys.public)!;
+    vi.stubEnv('INKLING_OWNER_TEST_USER_IDS', '');
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', owner.userId);
+    try {
+      const posted = await call(admin, 'post', '/threads/reply', {
+        body: { key: keys.public, content: `joining ${run}` },
+      });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(200);
+      const messageId = posted.body.messageId as string;
+      const { rows: joined } = await db.query<{ user_id: string }>(
+        'SELECT user_id FROM inbox_thread_participants WHERE thread_id = $1 AND user_id = $2',
+        [threadId, admin.userId]
+      );
+      expect(joined).toHaveLength(1);
+      const { rows: stored } = await db.query<{ sender_user_id: string; content: string }>(
+        'SELECT sender_user_id, content FROM inbox_thread_messages WHERE id = $1',
+        [messageId]
+      );
+      expect(stored).toEqual([{ sender_user_id: admin.userId, content: `joining ${run}` }]);
+      // The turn gate's shared branch reads the stored message: it wakes the inkling.
+      const { isOwnersOwnMessage } = await import('../services/inklings/inkling-turn-gate');
+      const { getDataComposer } = await import('../data/composer');
+      const supabase = (await getDataComposer()).getClient();
+      expect(
+        await isOwnersOwnMessage(supabase as never, {
+          threadMessageId: messageId,
+          inklingId: reedSbId,
+          ownerUserId: owner.userId,
+          workspaceId: spaceId,
+        })
+      ).toBe('yes');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 describe('link views (artifact backlinks)', () => {
   let artifactId: string;
   const uri = `ink://specs/d3-fixture-${run}`;
@@ -703,7 +902,7 @@ describe('link views (artifact backlinks)', () => {
       [uri, owner.userId, spaceId]
     );
     artifactId = rows[0].id;
-    for (const key of [keys.ownerChat, keys.memberChat, keys.open]) {
+    for (const key of [keys.ownerChat, keys.memberChat, keys.open, keys.public]) {
       await db.query(
         `INSERT INTO thread_links (workspace_id, source_thread_id, target_kind, target_artifact_id,
          relation, linked_by_kind, linked_by_user_id)
@@ -732,6 +931,25 @@ describe('link views (artifact backlinks)', () => {
     );
     expect('threads' in backlinks, JSON.stringify(backlinks)).toBe(true);
     const threadKeys = 'threads' in backlinks ? backlinks.threads.map((t) => t.threadKey) : [];
-    expect(threadKeys.sort()).toEqual([keys.open, keys.ownerChat].sort());
+    expect(threadKeys.sort()).toEqual([keys.open, keys.ownerChat, keys.public].sort());
+  });
+
+  it("gives a full reader not in the public conversation its link, and neither 1:1's", async () => {
+    // The owner's own SB, in no conversation here: the team's full view.
+    const { artifactBacklinks } = await import('../services/thread-links');
+    const { getDataComposer } = await import('../data/composer');
+    const supabase = (await getDataComposer()).getClient();
+    const backlinks = await artifactBacklinks(
+      supabase,
+      {
+        workspaceId: spaceId,
+        callerUserId: owner.userId,
+        reader: { kind: 'full', principal: { kind: 'sb', sbId: ownersSbId } },
+      },
+      { id: artifactId, uri }
+    );
+    expect('threads' in backlinks, JSON.stringify(backlinks)).toBe(true);
+    const threadKeys = 'threads' in backlinks ? backlinks.threads.map((t) => t.threadKey) : [];
+    expect(threadKeys.sort()).toEqual([keys.open, keys.public].sort());
   });
 });

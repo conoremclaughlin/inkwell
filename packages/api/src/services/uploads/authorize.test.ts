@@ -61,6 +61,7 @@ const read = (over: Partial<Extract<UploadAccess, { kind: 'read' }>> = {}): Uplo
   userId: SAM,
   workspaceId: WS,
   isPersonParticipant: true,
+  threadIsPublic: false,
   ...over,
 });
 
@@ -91,6 +92,21 @@ describe('authorizeUpload: reads', () => {
     expect(decide({ access: read({ userId: ADA, isPersonParticipant: false }) })).toEqual({
       ok: false,
       reason: 'not-yours',
+    });
+  });
+
+  it('lets anyone in the space read a public thread’s committed upload, and only that', () => {
+    const outsider = { isPersonParticipant: false, threadIsPublic: true };
+    expect(decide({ access: read(outsider) })).toEqual({ ok: true });
+    // Another workspace is still refused, public or not.
+    expect(decide({ access: read({ ...outsider, workspaceId: OTHER_WS }) })).toEqual({
+      ok: false,
+      reason: 'not-yours',
+    });
+    // Before its message commits, it is still the uploader's alone.
+    expect(decide({ claim, message: null, access: read(outsider) })).toEqual({
+      ok: false,
+      reason: 'not-committed',
     });
   });
 

@@ -427,6 +427,31 @@ describe('GET /threads/uploads/:id', () => {
     expect((await get(id, SAM)).status).toBe(404);
   });
 
+  it('follows the thread: a public conversation’s upload is read by anyone in its space, a private one’s only by its people', async () => {
+    // Someone the route admits to the space who is not on the thread.
+    const CAI = '0c0c0c0c-0000-4000-8000-0000000000c1';
+    const id = idOf(await upload());
+    commit(id);
+    expect((await get(id, CAI)).status).toBe(404);
+    db.rows('inbox_threads')[0].conversation_mode = 'public';
+    const read = await get(id, CAI);
+    expect(read.status).toBe(200);
+    expect((read.body as Buffer).equals(JPEG)).toBe(true);
+    // Never from another workspace.
+    expect((await get(id, CAI, {}, OTHER_WS)).status).toBe(404);
+    // 'private' is participant-only, as no mode is.
+    db.rows('inbox_threads')[0].conversation_mode = 'private';
+    expect((await get(id, CAI)).status).toBe(404);
+  });
+
+  it('keeps a public conversation’s unsent upload its uploader’s alone', async () => {
+    const CAI = '0c0c0c0c-0000-4000-8000-0000000000c1';
+    db.rows('inbox_threads')[0].conversation_mode = 'public';
+    const id = idOf(await upload());
+    expect((await get(id, CAI)).status).toBe(404);
+    expect((await get(id)).status).toBe(200);
+  });
+
   it('answers the same 404 for another workspace, a bad id, an ended row or uploads off', async () => {
     const id = idOf(await upload());
     commit(id);

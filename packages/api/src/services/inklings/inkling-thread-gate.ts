@@ -17,11 +17,14 @@
  * wakes another, and the turn gate wakes an inkling only for its owner's
  * message besides.
  *
- * One exception, in a team space only (inkling-shared-space.ts): a group
- * created with other people of the space is shared with them. Its people
- * are write-role members of the inklings' space, any of them may write, and
- * a member inkling answers whoever is present. A starter space, and every
- * conversation not created as such a group, keeps the owner-only rule.
+ * One exception, in a team space only (inkling-shared-space.ts): a
+ * conversation shared with the space's people. That is a group created with
+ * other people of the space (`inklingShared`), or a public conversation
+ * (conversation_mode 'public', conversation-mode.ts), which any write-role
+ * member of the space may start or join by posting. Its people are
+ * write-role members of the inklings' space, any of them may write, and a
+ * member inkling answers whoever is present. A starter space, and every
+ * other conversation, keeps the owner-only rule.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -33,6 +36,7 @@ import {
 import type { Principal, SbPrincipal } from '../principals';
 import { INKLING_CLIENT, INKLINGS_DISABLED } from './inkling-service';
 import { areSpaceWriters, INKLING_SHARED_MARK, isSharedInklingSpace } from './inkling-shared-space';
+import { isPublicConversation } from '../threads/conversation-mode';
 
 export const INKLING_THREAD_REFUSED = 'inkling_thread_refused';
 
@@ -66,9 +70,10 @@ export interface InklingThreadVerdict {
   /** True when the conversation holds an inkling, so its members are fixed at creation. */
   inklingConversation: boolean;
   /**
-   * True when the conversation is shared with the space's people
-   * (inkling-shared-space.ts): created as a group in a team space, or one
-   * already marked so.
+   * True when the conversation is a group shared with the space's people
+   * (inkling-shared-space.ts): created as a group with people in a team
+   * space, or one already marked so. A public conversation without people
+   * is not one: it carries its mode, not this mark.
    */
   shared: boolean;
 }
@@ -91,6 +96,11 @@ export async function assertInklingThreadAllowed(
      * a group in a team space (POST /threads `people`). Never on a reply.
      */
     addedPeople?: string[];
+    /**
+     * This send creates a public conversation (POST /threads `mode`), which
+     * a write-role member of a team space may start with its inkling.
+     */
+    creatingPublic?: boolean;
   },
   ownerTestUserIds: OwnerTestAllowlist = inklingOwnerTestUserIds()
 ): Promise<InklingThreadVerdict> {
@@ -106,15 +116,21 @@ export async function assertInklingThreadAllowed(
   let marked = false;
   /** Created as a group shared with the space's people. */
   let sharedMark = false;
+  /** Created public to the space's people (conversation_mode). */
+  let publicMode = false;
   if (input.existingThreadId) {
     const { data: threadRows, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('metadata')
+      .select('metadata, conversation_mode')
       .eq('id', input.existingThreadId);
     if (threadError) throw new Error(`Failed to read the conversation: ${threadError.message}`);
-    const [threadRow] = (threadRows ?? []) as Array<{ metadata: Record<string, unknown> | null }>;
+    const [threadRow] = (threadRows ?? []) as Array<{
+      metadata: Record<string, unknown> | null;
+      conversation_mode: string | null;
+    }>;
     marked = threadRow?.metadata?.[INKLING_CONVERSATION_MARK] === true;
     sharedMark = threadRow?.metadata?.[INKLING_SHARED_MARK] === true;
+    publicMode = isPublicConversation(threadRow ?? {});
     const { data, error } = await supabase
       .from('inbox_thread_participants')
       .select('sb_id, user_id')
@@ -217,19 +233,27 @@ export async function assertInklingThreadAllowed(
     [...people].every((person) => person === owner);
   if (ownersOwn) return { quiet: sender.kind === 'sb', inklingConversation: true, shared: false };
 
-  // A group shared with the space's people: created with people, or marked
-  // so when it was. Its people are write-role members of a team space, the
+  // A conversation shared with the space's people: a group created with
+  // people, or marked so when it was, or a public conversation, made so or
+  // being made. Its people are write-role members of a team space, the
   // inklings' own, and a member inkling answers whoever of them is present.
-  const creatingShared = input.existingThreadId === null && addedPeople.length > 0;
+  const creatingShared =
+    input.existingThreadId === null && (addedPeople.length > 0 || input.creatingPublic === true);
   const space = inklings[0].workspace_id;
   const sharedShape =
     inklingsHold &&
-    (sharedMark || creatingShared) &&
+    (sharedMark || publicMode || creatingShared) &&
     !!space &&
     inklings.every((inkling) => inkling.workspace_id === space) &&
     (sender.kind === 'user' || (fromMemberInkling && people.size > 0));
   if (sharedShape && space) {
-    const writers = [...people, ...addedPeople];
+    // Who must write in the space now. A group made with people is held to
+    // all of them, as at its creation. A public conversation is the space's,
+    // so only the person writing, and anyone this create adds, must be: one
+    // who posted before and has since lost write access stops only
+    // themselves (Lumen's review of 074ea6d5).
+    const publicConversation = publicMode || input.creatingPublic === true;
+    const writers = publicConversation ? [...addedPeople] : [...people, ...addedPeople];
     if (sender.kind === 'user') writers.push(sender.userId.toLowerCase());
     const [teamSpace, allWriters] = await Promise.all([
       isSharedInklingSpace(supabase, space),
@@ -239,7 +263,13 @@ export async function assertInklingThreadAllowed(
       throw new Error("Failed to read the conversation's space");
     }
     if (teamSpace === 'yes' && allWriters === 'yes') {
-      return { quiet: sender.kind === 'sb', inklingConversation: true, shared: true };
+      return {
+        quiet: sender.kind === 'sb',
+        inklingConversation: true,
+        // The group mark is for a group made with people, never for a
+        // public conversation made without them.
+        shared: sharedMark || addedPeople.length > 0,
+      };
     }
   }
   throw new InklingThreadRefusedError(

@@ -4,6 +4,9 @@
  * Mirrors GET /api/admin/threads and GET /api/admin/threads/messages.
  */
 
+/** A conversation's mode (inbox_threads.conversation_mode). */
+export type ConversationMode = 'public' | 'private';
+
 export interface SpineIdentity {
   project: string | null;
   type: string | null;
@@ -96,6 +99,13 @@ export interface ThreadSpine {
      * viewer isn't a participant in.
      */
     pinned?: boolean | null;
+    /**
+     * The conversation's mode, fixed when it was created: 'public' is read by
+     * everyone in the space and joined by posting; 'private' is read by its
+     * participants only; null is no mode, read like 'private' in a
+     * conversation with an inkling. Absent from servers that predate it.
+     */
+    conversationMode?: ConversationMode | null;
   } | null;
   sessions: SpineSession[];
   studios: SpineStudio[];
@@ -195,6 +205,8 @@ export interface ThreadMessagesResponse {
     createdByKind?: 'sb' | 'user' | 'system';
     createdAt: string;
     closedAt: string | null;
+    /** As on ThreadSpine.thread. Absent from servers that predate it. */
+    conversationMode?: ConversationMode | null;
     /** As on ThreadSpine's thread: a group chat created with other people. */
     shared?: boolean;
   } | null;

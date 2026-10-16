@@ -209,6 +209,12 @@ describe('POST /inklings/awaken', () => {
 });
 
 describe('GET /inklings', () => {
+  it('advertises public threads as JSON true, so the app offers them only on this server', async () => {
+    const res = await call(list, undefined, { role: 'viewer' });
+    expect(res._status).toBe(200);
+    expect((res._json as Record<string, unknown>).publicThreads).toBe(true);
+  });
+
   it('lists only inklings born through this flow, oldest first, and a viewer may read', async () => {
     seedOwnSb(db, { userId: ME, workspaceId: MY_WORKSPACE }, 'myra');
     const a = await call(awaken, { clientRequestId: REQUEST });
@@ -224,6 +230,7 @@ describe('GET /inklings', () => {
       ],
       now: expect.any(String),
       groupReplies: GROUP_REPLIES,
+      publicThreads: true,
     });
   });
 
@@ -234,6 +241,7 @@ describe('GET /inklings', () => {
       inklings: [],
       now: expect.any(String),
       groupReplies: GROUP_REPLIES,
+      publicThreads: true,
     });
   });
 
@@ -273,6 +281,7 @@ describe('GET /inklings', () => {
         inklings: [],
         now: '2026-10-04T09:05:00.000Z',
         groupReplies: GROUP_REPLIES,
+        publicThreads: true,
       });
     } finally {
       vi.useRealTimers();
@@ -337,6 +346,7 @@ describe('GET /inklings', () => {
           inklings: [],
           now: expect.any(String),
           groupReplies: GROUP_REPLIES,
+          publicThreads: true,
         });
       }
     } finally {

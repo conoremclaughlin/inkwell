@@ -16,7 +16,11 @@
 import type { DataComposer } from '../data/composer';
 import { resolveSbsByIds } from './principals';
 import { classifyIdentityById } from './inklings/inkling-turn-gate';
-import { PARTICIPANT_ONLY_COLUMN } from './threads/thread-read-access';
+import {
+  READ_ACCESS_COLUMNS,
+  isParticipantOnlyRow,
+  type ReadAccessColumns,
+} from './threads/thread-read-access';
 
 type SupabaseClient = ReturnType<DataComposer['getClient']>;
 // thread_links is not in the generated types until they are regenerated
@@ -618,10 +622,11 @@ export async function describeThreadLinks(
   ]);
 
   // A full reader passes every thread check but one: a participant-only
-  // conversation (D3) shows only to its participants, whoever reads.
+  // conversation (D3) shows only to its participants, whoever reads. A
+  // public one is not participant-only.
   const knownThreads = [...threadsByKey.values(), ...sourcesById.values()];
   const participantOnly = new Set(
-    knownThreads.filter((t) => t.participant_only === true).map((t) => t.id)
+    knownThreads.filter((t) => isParticipantOnlyRow(t)).map((t) => t.id)
   );
   const askAbout =
     reader.kind === 'full'
@@ -755,13 +760,12 @@ export async function artifactBacklinks(
   }
 }
 
-interface ThreadSummaryRow {
+/** Read with READ_ACCESS_COLUMNS, so isParticipantOnlyRow can judge it. */
+interface ThreadSummaryRow extends ReadAccessColumns {
   id: string;
   thread_key: string;
   title: string | null;
   status: string;
-  /** JSON `true` when the conversation is its participants' alone (PARTICIPANT_ONLY_COLUMN). */
-  participant_only?: unknown;
 }
 
 async function threadsWhere(
@@ -774,7 +778,7 @@ async function threadsWhere(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data, error } = await (supabase as any)
     .from('inbox_threads')
-    .select(`id, thread_key, title, status, ${PARTICIPANT_ONLY_COLUMN}`)
+    .select(`id, thread_key, title, status, ${READ_ACCESS_COLUMNS}`)
     .eq('workspace_id', workspaceId)
     .in(column, values);
   if (error) throw new Error(`Failed to read linked threads: ${error.message}`);

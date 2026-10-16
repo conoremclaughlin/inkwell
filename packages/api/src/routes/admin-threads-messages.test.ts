@@ -47,7 +47,11 @@ function chainFor(table: string) {
   const equalities: Array<[string, unknown]> = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const q: any = {};
-  for (const m of ['select', 'order', 'limit', 'is', 'not']) q[m] = () => q;
+  for (const m of ['order', 'limit', 'is', 'not']) q[m] = () => q;
+  q.select = (columns: string) => {
+    tables.filters.push([table, 'select', columns]);
+    return q;
+  };
   q.eq = (col: string, value: unknown) => {
     tables.filters.push([table, 'eq', col]);
     equalities.push([col, value]);
@@ -292,6 +296,29 @@ describe('GET /threads/messages names every author for the viewer', () => {
   });
 });
 
+describe('the conversation mode (D8)', () => {
+  const threadOf = async () => {
+    const res = createRes();
+    await messages(createReq('user-a'), res);
+    expect(res._status).toBe(200);
+    return (res._json as { thread: { conversationMode?: unknown } }).thread;
+  };
+
+  it('is carried as stored, and as null when the thread has none', async () => {
+    tables.thread = { ...tables.thread!, conversation_mode: 'public' };
+    expect((await threadOf()).conversationMode).toBe('public');
+    tables.thread = { ...tables.thread!, conversation_mode: null };
+    expect((await threadOf()).conversationMode).toBeNull();
+  });
+
+  it('is selected from the thread row', async () => {
+    await threadOf();
+    const selects = tables.filters.filter(([t, m]) => t === 'inbox_threads' && m === 'select');
+    expect(selects).toHaveLength(1);
+    expect(selects[0][2].split(',').map((c) => c.trim())).toContain('conversation_mode');
+  });
+});
+
 describe('error text in an inkling conversation (task 935af241)', () => {
   // A trigger-failure notice as it was written before its inkling wording:
   // the raw error rides in its metadata.
@@ -400,7 +427,9 @@ describe('an inkling conversation is its participants alone (D3)', () => {
   it('checks the participant row by this thread and this person', async () => {
     tables.thread = { ...tables.thread!, metadata: { inklingConversation: true } };
     await read('user-a');
-    const membership = tables.filters.filter(([t]) => t === 'inbox_thread_participants');
+    const membership = tables.filters.filter(
+      ([t, op]) => t === 'inbox_thread_participants' && op === 'eq'
+    );
     expect(membership).toEqual([
       ['inbox_thread_participants', 'eq', 'thread_id'],
       ['inbox_thread_participants', 'eq', 'user_id'],

@@ -361,11 +361,11 @@ export async function handleListThreadLinks(args: unknown, dataComposer: DataCom
   if (parsed.threadKey) {
     const found = await findThread(supabase, caller.workspaceId, parsed.threadKey);
     // A participant-only conversation (D3) the caller is not in reads as no
-    // thread at all, so `threadExists` says nothing about it either.
+    // thread at all, so `threadExists` says nothing about it either. A
+    // public one reads like any thread.
     const thread =
       found &&
-      (!isParticipantOnlyThread(found.metadata) ||
-        (await isParticipant(supabase, found.id, caller)))
+      (!isParticipantOnlyThread(found) || (await isParticipant(supabase, found.id, caller)))
         ? found
         : null;
     const views = await threadLinkViewsFor(

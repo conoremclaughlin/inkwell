@@ -16,7 +16,8 @@
           }
         ],
         "now": "2026-10-02T08:10:00.000Z",
-        "groupReplies": { "inTurn": true, "wake": true }
+        "groupReplies": { "inTurn": true, "wake": true },
+        "publicThreads": true
       }
     },
     "listWorking": {
@@ -33,7 +34,8 @@
           }
         ],
         "now": "2026-10-02T08:03:40.000Z",
-        "groupReplies": { "inTurn": true, "wake": true }
+        "groupReplies": { "inTurn": true, "wake": true },
+        "publicThreads": true
       }
     },
     "listEmpty": {
@@ -41,7 +43,8 @@
       "body": {
         "inklings": [],
         "now": "2026-10-02T07:59:00.000Z",
-        "groupReplies": { "inTurn": true, "wake": true }
+        "groupReplies": { "inTurn": true, "wake": true },
+        "publicThreads": true
       }
     },
     "awaken": {

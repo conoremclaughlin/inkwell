@@ -27,6 +27,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
 import { isUuid } from './inklings/inkling-service';
 import { mediaUploadIds } from './uploads/claims';
+import { storedConversationMode, type ConversationMode } from './threads/conversation-mode';
 
 /** The unique index that makes a second copy of one client message impossible. */
 export const CLIENT_MESSAGE_INDEX = 'inbox_thread_messages_thread_client_message_key';
@@ -160,10 +161,13 @@ export type ReplayLookup =
   | { kind: 'conflict' };
 
 /**
- * Who a client-identified create addressed, and its title: recorded on the
- * stored message at metadata.pcp.createRequest so a retry can be held to the
- * same submission. Recipients are a set (lowercased, deduplicated, sorted),
- * so a retry listing them in another order is the same create.
+ * Who a client-identified create addressed, its title, the people a shared
+ * group named and the conversation mode it named: recorded on the stored
+ * message at metadata.pcp.createRequest
+ * so a retry can be held to the same submission. Recipients are a set
+ * (lowercased, deduplicated, sorted), so a retry listing them in another
+ * order is the same create. `mode` is present only when the create named one;
+ * a record without it named none, so only a retry naming none matches it.
  */
 export interface CreateRequest {
   recipients: string[];
@@ -174,22 +178,28 @@ export interface CreateRequest {
    * groups could name people is the same create as one naming nobody.
    */
   people?: string[];
+  mode?: ConversationMode;
 }
 
 export function createRequestOf(
   recipients: string[],
   title: string,
-  people: string[] = []
+  people: string[] = [],
+  mode: ConversationMode | null = null
 ): CreateRequest {
   const peopleSet = [...new Set(people.map((p) => p.toLowerCase()))].sort();
   return {
     recipients: [...new Set(recipients.map((r) => r.toLowerCase()))].sort(),
     title: title || null,
     ...(peopleSet.length > 0 ? { people: peopleSet } : {}),
+    ...(mode ? { mode } : {}),
   };
 }
 
-/** The same create: the same recipients, title and people, each as a set. */
+/**
+ * The same create: the same recipients, title and people, each as a set.
+ * The mode is compared on its own (requestedMode), before this.
+ */
 function sameRequest(a: CreateRequest, b: CreateRequest): boolean {
   const sameList = (x: string[], y: string[]) =>
     x.length === y.length && x.every((item, i) => item === y[i]);
@@ -204,6 +214,11 @@ function stringsOf(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }
 
+/** The mode a request or a recorded one named, or null when it named none. */
+function requestedMode(record: { mode?: unknown } | null | undefined): ConversationMode | null {
+  return storedConversationMode(record?.mode);
+}
+
 /** A digest of the words, so the intent can pin them without storing them twice. */
 function contentDigestOf(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex');
@@ -214,7 +229,8 @@ function contentDigestOf(content: string): string {
  * (inbox_threads.metadata.createIntent), in the same insert, before any
  * participant is written: its client message id, its recipients as a set,
  * its full title (not the thread's bounded display title), a digest of its
- * words, and the members it named to wake (wakeRequestOf). It is the only
+ * words, the members it named to wake (wakeRequestOf), and its conversation
+ * mode when it named one. It is the only
  * durable evidence of what an interrupted create meant, so it is what a
  * retry is held to.
  */
@@ -231,13 +247,15 @@ export function createIntentOf(
     ...(request.people ? { people: request.people } : {}),
     contentDigest: contentDigestOf(content),
     wake,
+    ...(request.mode ? { mode: request.mode } : {}),
   };
 }
 
 /**
  * Is this thread the one this exact create made? Its recorded intent must
  * name the same client message id, the same recipients (as a set), the
- * same title, the same words and the same members to wake. A thread with no
+ * same title, the same words, the same members to wake and the same mode
+ * (none matching none). A thread with no
  * recorded intent never matches, and the same id with edited words is not
  * its retry. An intent recorded before creates could name members has no
  * `wake`: it named nobody, so only a retry that names nobody matches it.
@@ -257,12 +275,14 @@ export function matchesCreateIntent(
         people?: unknown;
         contentDigest?: unknown;
         wake?: unknown;
+        mode?: unknown;
       }
     | undefined;
   if (
     !intent ||
     intent.clientMessageId !== clientMessageId ||
     intent.contentDigest !== contentDigestOf(content) ||
+    requestedMode(intent) !== requestedMode(request) ||
     !Array.isArray(intent.recipients) ||
     !sameWakeRequest({ pcp: { wake: intent.wake } }, wake)
   ) {
@@ -300,6 +320,7 @@ function sameCreateRequest(metadata: Record<string, unknown> | null, request: Cr
   const stored = (metadata?.pcp as { createRequest?: Partial<CreateRequest> } | undefined)
     ?.createRequest;
   if (!stored || !Array.isArray(stored.recipients)) return false;
+  if (requestedMode(stored) !== requestedMode(request)) return false;
   const storedSet = createRequestOf(
     stringsOf(stored.recipients),
     stored.title ?? '',

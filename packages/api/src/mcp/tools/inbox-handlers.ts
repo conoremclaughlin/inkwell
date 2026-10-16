@@ -73,11 +73,19 @@ import {
   INKLING_THREAD_REFUSED,
   InklingThreadRefusedError,
 } from '../../services/inklings/inkling-thread-gate.js';
-import { INKLING_SHARED_MARK } from '../../services/inklings/inkling-shared-space.js';
 import {
+  INKLING_SHARED_MARK,
+  isSharedInklingSpace,
+} from '../../services/inklings/inkling-shared-space.js';
+import {
+  NOT_PUBLIC_FILTER,
   OPEN_THREADS_FILTER,
   PARTICIPANT_ONLY_PATH,
 } from '../../services/threads/thread-read-access.js';
+import {
+  ConversationModeRefusedError,
+  type ConversationMode,
+} from '../../services/threads/conversation-mode.js';
 import {
   inklingWakeDue,
   openReplyChain,
@@ -459,6 +467,14 @@ export interface InternalSendContext {
    */
   createIntent?: Record<string, unknown>;
   /**
+   * The conversation's mode (services/threads/conversation-mode.ts), written
+   * by the insert that creates the thread and never after. Only a
+   * create-only send may name one, and only for an inkling conversation;
+   * anything else throws ConversationModeRefusedError before any write.
+   * POST /api/admin/threads sets it on a client-identified create.
+   */
+  conversationMode?: ConversationMode;
+  /**
    * People besides the sender that a create puts on the conversation: a
    * group shared with a team space's people beside its inkling
    * (inkling-shared-space.ts). The thread gate holds each one to a
@@ -836,12 +852,41 @@ export async function handleSendToInbox(
       // marked; its people are checked again, as they are now, before any of
       // them is added.
       addedPeople: addedPeople.map((person) => person.userId),
+      // A public conversation a write-role member of a team space starts.
+      creatingPublic: internal?.createOnly === true && internal.conversationMode === 'public',
     });
     if (addedPeople.length > 0 && !inklingVerdict.shared) {
       throw new InklingThreadRefusedError(
         INKLING_THREAD_REFUSED,
         "People are added only to a new group shared with a team space's inkling"
       );
+    }
+
+    // A mode is fixed at creation and belongs to an inkling conversation
+    // (conversation-mode.ts): only a send that must create its thread may
+    // name one, and that thread must hold an inkling. Asked before anything
+    // is written; a create-only send that finds the key taken still stops at
+    // ThreadKeyTakenError below.
+    if (internal?.conversationMode !== undefined) {
+      if (!internal.createOnly) {
+        throw new ConversationModeRefusedError(
+          'A conversation mode is set only by the send that creates the conversation'
+        );
+      }
+      if (!inklingVerdict.inklingConversation) {
+        throw new ConversationModeRefusedError('Only a conversation with an inkling has a mode');
+      }
+      // Public is to a space's people, so only a team space has it: a
+      // person's own space stays as it was.
+      if (internal.conversationMode === 'public') {
+        const teamSpace = await isSharedInklingSpace(supabase, workspaceId);
+        if (teamSpace === 'unreadable') throw new Error("Failed to read the conversation's space");
+        if (teamSpace !== 'yes') {
+          throw new ConversationModeRefusedError(
+            'A public conversation is made only in a shared space'
+          );
+        }
+      }
     }
 
     // Only meaningful before creation: an existing thread's identity was pinned
@@ -900,6 +945,7 @@ export async function handleSendToInbox(
             participants: participantSbs,
             person: sender.kind === 'user' ? sender : null,
             ...(Object.keys(newThreadMetadata).length > 0 ? { metadata: newThreadMetadata } : {}),
+            ...(internal?.conversationMode ? { conversationMode: internal.conversationMode } : {}),
           });
     // A create-only send stops here when the key was already taken, whether
     // before this send or by a concurrent request between the lookup above
@@ -1785,6 +1831,12 @@ export async function findOrCreateThread(
     person?: UserPrincipal | null;
     /** Written with the new thread row only; an existing thread is not touched. */
     metadata?: Record<string, unknown>;
+    /**
+     * The conversation's mode, written with the new thread row only and
+     * never after (conversation-mode.ts). This insert is the one place the
+     * server sets inbox_threads.conversation_mode.
+     */
+    conversationMode?: ConversationMode;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
@@ -1813,6 +1865,7 @@ export async function findOrCreateThread(
       created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: boundThreadTitle(opts.title),
       ...(opts.metadata ? { metadata: opts.metadata } : {}),
+      ...(opts.conversationMode ? { conversation_mode: opts.conversationMode } : {}),
     })
     .select()
     .single();
@@ -2374,12 +2427,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           );
         } else {
           // The agent-less view: every thread in the account's workspaces,
-          // except a participant-only conversation (D3), which appears only
-          // to someone on it. An unbound person reads as the account, by
-          // their own participant row. A token bound to an SB, by slug or by
-          // its canonical id alone, reads as that SB even when it names none,
-          // by the SB's row (Lumen, #874 r1 and r2). A binding that resolves
-          // to no identity sees no participant-only conversation.
+          // public conversations included, except a participant-only
+          // conversation (D3), which appears only to someone on it. An
+          // unbound person reads as the account, by their own participant
+          // row. A token bound to an SB, by slug or by its canonical id
+          // alone, reads as that SB even when it names none, by the SB's row
+          // (Lumen, #874 r1 and r2). A binding that resolves to no identity
+          // sees no participant-only conversation.
           // Two reads, so the others never take a place on the page.
           const privateReader = await (async (): Promise<{
             column: 'viewer.user_id' | 'viewer.sb_id';
@@ -2417,6 +2471,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                   )
                   .in('workspace_id', threadWorkspaceIds)
                   .eq(PARTICIPANT_ONLY_PATH, true)
+                  // A public conversation comes from the open read, never both.
+                  .or(NOT_PUBLIC_FILTER)
                   .eq(privateReader.column, privateReader.id)
                   .order('updated_at', { ascending: false })
                   .limit(THREAD_PAGE_LIMIT)

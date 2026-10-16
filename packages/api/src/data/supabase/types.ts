@@ -1838,6 +1838,7 @@ export type Database = {
           closed_by_kind: string | null;
           closed_by_sb_id: string | null;
           closed_by_user_id: string | null;
+          conversation_mode: string | null;
           created_at: string | null;
           created_by_kind: string;
           created_by_sb_id: string | null;
@@ -1863,6 +1864,7 @@ export type Database = {
           closed_by_kind?: string | null;
           closed_by_sb_id?: string | null;
           closed_by_user_id?: string | null;
+          conversation_mode?: string | null;
           created_at?: string | null;
           created_by_kind: string;
           created_by_sb_id?: string | null;
@@ -1888,6 +1890,7 @@ export type Database = {
           closed_by_kind?: string | null;
           closed_by_sb_id?: string | null;
           closed_by_user_id?: string | null;
+          conversation_mode?: string | null;
           created_at?: string | null;
           created_by_kind?: string;
           created_by_sb_id?: string | null;
