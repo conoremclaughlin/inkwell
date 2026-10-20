@@ -30,8 +30,8 @@
 -- This file makes a fresh build match the stack as it is; narrowing that
 -- table is a separate change.
 --
--- From here on, the migration that creates a table, view or sequence in public
--- grants service_role on it itself (README.md, "Grants").
+-- From here on, the migration that creates a table, view, sequence or function
+-- in public grants service_role on it itself (README.md, "Grants").
 --
 -- ALL TABLES covers tables, partitioned tables, views, materialized views and
 -- foreign tables. Sequences get USAGE, SELECT and UPDATE, which is what the
@@ -40,3 +40,24 @@
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO service_role;
+
+-- Functions lose their automatic grant too. The old default privileges gave
+-- EXECUTE on every new function to anon, authenticated and service_role; the
+-- new ones give it to the owner alone. These seven had no grant of their own.
+-- Measured on a fresh build with the rule on (CLI 2.121.0,
+-- auto_expose_new_tables = false): without these lines, the API's RPC calls
+-- to the first three answer 42501 "permission denied for function". The other
+-- four are trigger functions. On the live stack service_role already holds
+-- EXECUTE on all seven.
+--
+-- They are granted by name. GRANT EXECUTE ON ALL FUNCTIONS would also give
+-- service_role the _graph_* helpers, which earlier migrations deliberately
+-- withhold from it.
+
+GRANT EXECUTE ON FUNCTION public.claim_turn_epoch(uuid, boolean, timestamp with time zone, uuid, jsonb, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.fence_turn_attempts(uuid, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION public.repoint_sessions_off_ephemeral(uuid, uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION public.delete_saved_login_secrets_of_login() TO service_role;
+GRANT EXECUTE ON FUNCTION public.delete_vault_secret_of_owner_row() TO service_role;
+GRANT EXECUTE ON FUNCTION public.handle_session_running_write() TO service_role;
+GRANT EXECUTE ON FUNCTION public.refuse_session_turn_scope_change() TO service_role;
