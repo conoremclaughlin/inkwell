@@ -36,6 +36,9 @@ jobs:
 
       - run: yarn install --immutable
 
+      - name: License scope and preserved grants
+        run: node --test scripts/license-boundary.test.mjs
+
       - name: Dependency security regressions (no shell execution or network)
         run: node --test scripts/security-dependencies.test.cjs
 

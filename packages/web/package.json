@@ -2,7 +2,7 @@
   "name": "@inklabs/web",
   "version": "0.5.0",
   "private": true,
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "description": "Inkwell Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
     "dev": "BASE_PORT=${INK_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next dev -p $WEB_PORT",
