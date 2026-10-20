@@ -577,8 +577,11 @@ describe('launches found by their tag', { timeout: 30_000 }, () => {
 
 describe('every runner reports its launches', () => {
   // A census of the spawn seams: each physical spawn in a runner is followed
-  // by its onSpawned report, before anything else can happen to the process.
-  // claude-runner.stop.test.ts checks the report itself on a real launch.
+  // by its onSpawned report. Claude's ownership wrapper makes its legacy
+  // report farther from spawn; pin it before the ceiling setup instead of
+  // widening the window for every runner. Native Claude reports after its
+  // stop handlers are installed, before input. The native-queue tests check
+  // that order and exact-once reporting; stop.test.ts covers legacy launches.
   it.each([
     'claude-runner.ts',
     'ink-runner.ts',
@@ -597,7 +600,12 @@ describe('every runner reports its launches', () => {
       );
     expect(spawns.length, file).toBeGreaterThan(0);
     for (const { i } of spawns) {
-      const after = lines.slice(i, i + 12).join('\n');
+      const end =
+        file === 'claude-runner.ts'
+          ? lines.findIndex((line, index) => index > i && line.includes('const ceilingMs ='))
+          : i + 12;
+      expect(end, `${file}: report boundary`).toBeGreaterThan(i);
+      const after = lines.slice(i, end).join('\n');
       expect(after, `${file}:${i + 1}`).toMatch(/onSpawned\?\.\(\{ pid: (proc|child)\.pid/);
     }
   });

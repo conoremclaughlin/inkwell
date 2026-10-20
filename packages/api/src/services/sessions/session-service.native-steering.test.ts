@@ -232,6 +232,7 @@ let native: MockedFunction<typeof runOwnedCodexAppServer>;
 let legacy: MockInstance<CodexRunnerTestPorts['spawnProcess']>;
 let repository: SessionRepository;
 let service: SessionService;
+let claude: MockedFunction<IRunner['run']>;
 const sessionId = 'synthetic-session';
 const sbId = '00000000-0000-4000-8000-000000000001';
 const userId = 'synthetic-user';
@@ -294,6 +295,7 @@ beforeEach(() => {
   vi.stubEnv('INK_EXECUTION_TIER', 'full');
   vi.stubEnv('INK_EXECUTION_TIER_CLIENTS', '');
   vi.stubEnv('INK_EXECUTION_TIER_SBS', '');
+  vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', '');
   vi.stubGlobal(
     'fetch',
     vi.fn(() => {
@@ -364,10 +366,15 @@ beforeEach(() => {
     agent: { sbSlug: 'echo', name: 'Echo', backend: 'codex', values: [] },
     user: { id: userId, email: 'fixture@example.invalid', timezone: 'America/Los_Angeles' },
   };
+  claude = vi.fn(async (_message, options) => {
+    seenConfigs.push(options.config);
+    options.config.nativeSteering?.assertCurrent();
+    return success;
+  });
   service = new SessionService(
     repository,
     { buildContext: vi.fn(async () => context) } as never,
-    unusedRunner,
+    { uploadMedia: 'refuse', run: claude },
     {
       logActivity: vi.fn(async () => ({ id: 'synthetic-activity' })),
       logMessage: vi.fn(async () => ({ id: 'synthetic-message' })),
@@ -474,6 +481,64 @@ async function realNativeTransport(
 }
 
 describe('production native steering selection', () => {
+  it.each(['', 'echo', '00000000-0000-4000-8000-000000000002', '*'])(
+    'keeps Claude on its existing transport without exact opt-in: %s',
+    async (allowed) => {
+      row.backend = 'claude-code';
+      vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', allowed);
+      await run({ nativeSteering: {}, nativeQueueEnabled: true });
+      expect(claude).toHaveBeenCalledOnce();
+      expect(seenConfigs[0].nativeSteering).toBeUndefined();
+      expect(spawn).not.toHaveBeenCalled();
+    }
+  );
+
+  it('selects the Claude input queue with the same owner-bound credential', async () => {
+    row.backend = 'claude-code';
+    vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', ` ${sbId} `);
+    expect((await run()).success).toBe(true);
+    expect(claude).toHaveBeenCalledOnce();
+    expect(native).not.toHaveBeenCalled();
+    expect(seenConfigs[0].nativeSteering?.turnEpoch).toBe('synthetic-epoch');
+    expect(verifyInkAccessToken(seenConfigs[0].inkAccessToken!, 'mcp_access')).toMatchObject({
+      sub: userId,
+      sbId,
+      sbSlug: 'echo',
+      sessionId,
+      scope: 'mcp:tools',
+    });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'attached',
+    'unknown-attachment',
+    'contact',
+    'missing-metadata',
+    'malformed-metadata',
+    'wrong-owner',
+    'container',
+  ])('keeps Claude on its existing transport for %s', async (kind) => {
+    row.backend = 'claude-code';
+    vi.stubEnv('INK_CLAUDE_NATIVE_QUEUE_SB_IDS', sbId);
+    if (kind === 'attached') row.cli_attached = true;
+    if (kind === 'unknown-attachment') row.cli_attached = null;
+    if (kind === 'contact') row.contact_id = 'synthetic-contact';
+    if (kind === 'missing-metadata') identity.metadata = null;
+    if (kind === 'malformed-metadata') identity.metadata = [];
+    if (kind === 'wrong-owner') identity.user_id = 'synthetic-other-user';
+    await run({
+      nativeSteering: {},
+      executionTier: 'full',
+      cliAttached: false,
+      identityMetadata: {},
+      ...(kind === 'container' ? { sandboxContainerName: 'synthetic-container' } : {}),
+    });
+    expect(claude).toHaveBeenCalledOnce();
+    expect(seenConfigs[0].nativeSteering).toBeUndefined();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])(
     'preserves a real thread/resume owner refusal through finalization, immediate close: %s',
     async (close) => {

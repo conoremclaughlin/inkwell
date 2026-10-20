@@ -56,7 +56,11 @@ import {
 } from '../session/runtime.js';
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
-import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
+import {
+  contextDeclaresHeadless,
+  parentOwnsTurn,
+  promptAttachmentWrite,
+} from '../lib/turn-owner.js';
 import { admitsCodexMailHook } from '../lib/codex-mail/hook-binding.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
@@ -3394,8 +3398,23 @@ async function onStopHandler(options?: {
     return;
   }
   const cwd = process.cwd();
-
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
+
+  // A Claude Stop is not necessarily the parent's terminal: another
+  // synchronous hook can continue the query, or native queued input can start
+  // the next query inside this same owned process. The parent
+  // owns both lifecycle and input delivery. Do not retire its epoch record,
+  // adjudicate takeovers, or poll and inject its inbox from a child hook.
+  // This includes existing headless ink-chat Claude steps, not only native
+  // steering runners. Other backends keep their existing Stop behavior.
+  if (
+    lifecycleBackend.name === 'claude-code' &&
+    contextDeclaresHeadless(process.env) &&
+    parentOwnsTurn(process.env)
+  ) {
+    hookLog('on_stop_parent_owned', { backend: lifecycleBackend.name });
+    return;
+  }
 
   const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';

@@ -22,7 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { Command } from 'commander';
@@ -55,6 +55,7 @@ vi.mock('child_process', async (importOriginal) => ({
 
 import { registerHooksCommands } from './hooks.js';
 import { getValidAccessToken, hasSessionTokenBinding } from '../auth/tokens.js';
+import { cliTurnEpochPath, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 
 const SESSION_ID = 'a1b2c3d4-0000-4000-8000-000000000003';
 
@@ -79,6 +80,9 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
     'INK_STUDIO_ID',
     'INK_ACCESS_TOKEN',
     'INK_RUNNER_AUTH_REQUIRED',
+    'INK_TURN_OWNER',
+    'INK_RUNTIME_LINK_ID',
+    'INK_HOOK_BACKEND',
   ] as const;
   const savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
   let requests: Recorded[];
@@ -223,5 +227,74 @@ describe('hooks: a backend the server spawned leaves the lifecycle to the run', 
       ['post-compact', 'idle'],
     ]);
     for (const post of posts) expect(post).not.toHaveProperty('headless');
+  });
+
+  it('a parent-owned headless Claude Stop neither ends the turn nor polls its inbox', async () => {
+    process.env.INK_CONTEXT = headlessContext();
+    process.env.INK_TURN_OWNER = 'parent';
+    const owner = { sessionId: SESSION_ID };
+    writeCliTurnEpoch(workDir, { ...owner, turnEpoch: 'synthetic-parent-epoch' });
+    const recordPath = cliTurnEpochPath(workDir, owner);
+    const before = readFileSync(recordPath, 'utf8');
+
+    // A hook can continue this query; queued input can start the next one.
+    // Neither this intermediate event nor the final Stop owns the process boundary.
+    await runHook('on-stop', '--backend', 'claude-code');
+    await runHook('on-stop', '--backend', 'claude-code');
+
+    expect(requests).toEqual([]);
+    expect(readFileSync(recordPath, 'utf8')).toBe(before);
+  });
+
+  it.each(['explicit', 'environment'])(
+    'preserves a headless Codex Stop via %s backend selection',
+    async (selection) => {
+      process.env.INK_CONTEXT = headlessContext();
+      process.env.INK_TURN_OWNER = 'parent';
+      if (selection === 'environment') process.env.INK_HOOK_BACKEND = 'codex';
+
+      await runHook('on-stop', ...(selection === 'explicit' ? ['--backend', 'codex'] : []));
+
+      expect(lifecyclePosts()).toEqual([
+        expect.objectContaining({ event: 'stop', turnEpochMissing: true }),
+      ]);
+      expect(
+        requests.some(
+          (r) =>
+            r.url.endsWith('/mcp') && (r.body?.params as { name?: string })?.name === 'get_inbox'
+        )
+      ).toBe(true);
+    }
+  );
+
+  it('also leaves environment-selected headless Claude Stop to the parent', async () => {
+    process.env.INK_CONTEXT = headlessContext();
+    process.env.INK_TURN_OWNER = 'parent';
+    process.env.INK_HOOK_BACKEND = 'claude-code';
+
+    await runHook('on-stop');
+
+    expect(requests).toEqual([]);
+  });
+
+  it('an unowned headless Stop still reports missing epoch evidence', async () => {
+    process.env.INK_CONTEXT = headlessContext();
+
+    await runHook('on-stop', '--backend', 'claude-code');
+
+    expect(lifecyclePosts()).toEqual([
+      expect.objectContaining({ event: 'stop', turnEpochMissing: true }),
+    ]);
+  });
+
+  it('a parent marker alone does not suppress an interactive Stop', async () => {
+    process.env.INK_TURN_OWNER = 'parent';
+    writeCliTurnEpoch(workDir, { sessionId: SESSION_ID, turnEpoch: 'synthetic-person-epoch' });
+
+    await runHook('on-stop', '--backend', 'claude-code');
+
+    expect(lifecyclePosts()).toEqual([
+      expect.objectContaining({ event: 'stop', turnEpoch: 'synthetic-person-epoch' }),
+    ]);
   });
 });

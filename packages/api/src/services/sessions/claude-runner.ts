@@ -28,11 +28,13 @@ import {
   CONTAINER_RUNNER_FILES,
   PRINT_MODE_CHANNEL_ENV,
 } from '@inklabs/shared';
+import { PARENT_OWNED_TURN_ENV } from '@inklabs/shared/providers';
+import { openClaudeInputQueue, type ClaudeInputQueue } from './claude-input-queue.js';
 import { homedir, tmpdir } from 'os';
 import { basename, join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
-import { isGroupId, stopProcessAndWait } from './stop-process.js';
+import { isGroupId, probeGroup, stopProcessAndWait } from './stop-process.js';
 import { ceilingFromEnv, lowestCeiling } from './turn-ceiling.js';
 import {
   prepareLaunchSettings,
@@ -327,7 +329,7 @@ export class ClaudeRunner implements IRunner {
       if (result.refusedBeforeSpawn !== undefined) return refusedRun(result.refusedBeforeSpawn);
 
       // Check if resume failed because session doesn't exist
-      if (result.resumeFailedNoSession && isResume) {
+      if (result.resumeFailedNoSession && isResume && !config.nativeSteering) {
         logger.warn('Resume failed - session not found locally. Starting fresh session.', {
           oldSessionId: sessionId,
         });
@@ -369,7 +371,7 @@ export class ClaudeRunner implements IRunner {
       // way. What changes is that the outcome is now classified rather than
       // inferred from the absence of a thrown error.
       return {
-        success: !result.timedOut,
+        success: !result.timedOut && !result.nativeError,
         backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
@@ -377,6 +379,7 @@ export class ClaudeRunner implements IRunner {
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
         ...(result.timedOut ? { error: result.timedOut.message } : {}),
+        ...(result.nativeError ? { error: result.nativeError } : {}),
         ...(result.stopUnconfirmed ? { stopUnconfirmed: result.stopUnconfirmed } : {}),
       };
     } catch (error) {
@@ -401,6 +404,9 @@ export class ClaudeRunner implements IRunner {
     uploadDirs: readonly string[] = []
   ): string[] {
     const args: string[] = ['--print', '--output-format', 'stream-json', '--verbose'];
+    if (config.nativeSteering) {
+      args.push('--input-format', 'stream-json', '--replay-user-messages');
+    }
 
     // Session handling
     if (isResume) {
@@ -468,6 +474,7 @@ export class ClaudeRunner implements IRunner {
     stopUnconfirmed?: RunnerResult['stopUnconfirmed'];
     /** `config.admitSpawn`'s reason, when it refused: nothing was spawned. */
     refusedBeforeSpawn?: string;
+    nativeError?: string;
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -585,14 +592,45 @@ export class ClaudeRunner implements IRunner {
       );
     }
 
+    // Every prepared resource is retired once, including failures before spawn.
+    let preparedCleanup: Promise<void> | undefined;
+    const cleanupPrepared = () =>
+      (preparedCleanup ??= Promise.allSettled([
+        Promise.resolve().then(() => mcpInjection?.cleanup()),
+        Promise.resolve().then(() => restoreOverlay?.()),
+        Promise.resolve().then(() => launchSettings?.cleanup()),
+      ]).then(() => undefined));
+    let nativeQueue: ClaudeInputQueue | undefined;
+    let nativeWrite = (_line: string): void | false => {
+      throw new Error('Claude input not ready');
+    };
+    let nativeEnd = (): void => {
+      throw new Error('Claude input not ready');
+    };
+    let nativeFailed = (): void => {};
+    if (config.nativeSteering) {
+      const sessionFlag = args.includes('--resume') ? '--resume' : '--session-id';
+      try {
+        nativeQueue = await openClaudeInputQueue({
+          binding: config.nativeSteering,
+          nativeSessionId: args[args.indexOf(sessionFlag) + 1],
+          write: (line) => nativeWrite(line),
+          endInput: () => nativeEnd(),
+          failed: () => nativeFailed(),
+        });
+      } catch (error) {
+        await cleanupPrepared();
+        throw error;
+      }
+    }
+
     // The caller's admission, asked again past the last await above. Nothing
     // below awaits before spawn(), so no answer can change between the two.
     // A refusal undoes what was prepared and starts nothing.
     const refusal = config.admitSpawn?.();
     if (refusal !== undefined) {
-      mcpInjection?.cleanup();
-      restoreOverlay?.().catch(() => {});
-      launchSettings?.cleanup().catch(() => {});
+      await nativeQueue?.dispose();
+      await cleanupPrepared();
       logger.warn('Claude Code spawn refused by its caller at the spawn seam; nothing started', {
         workingDirectory: config.workingDirectory,
         reason: refusal,
@@ -614,7 +652,8 @@ export class ClaudeRunner implements IRunner {
       }
     }
 
-    return new Promise((resolve, reject) => {
+    type ProcessResult = Awaited<ReturnType<ClaudeRunner['spawnProcess']>>;
+    return new Promise<ProcessResult>((resolve, reject) => {
       // The child inherits an allowlist of the server's env (resolveSpawnTarget
       // → buildCleanEnv), never the whole of it: spec:sender-token-binding
       // Phase 0. What it needs beyond that is set here, explicitly.
@@ -645,6 +684,7 @@ export class ClaudeRunner implements IRunner {
         // notification. The project config still loads the inkmail plugin;
         // this keeps it from acking messages that arrive during the turn.
         ...PRINT_MODE_CHANNEL_ENV,
+        ...(config.nativeSteering ? PARENT_OWNED_TURN_ENV : {}),
       };
 
       // Route through container or host — resolveSpawnTarget handles the
@@ -661,13 +701,44 @@ export class ClaudeRunner implements IRunner {
       // A run that must stop with its tools leads its own process group, so a
       // stop can signal the whole group (stopProcess).
       const killGroup = config.killProcessGroup === true;
-      const proc = spawn(target.binary, target.args, {
-        cwd: target.cwd,
-        env: target.env,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: killGroup,
+      config.nativeSteering?.assertCurrent();
+      let abortOwned = (): void => {};
+      let confirmExit!: (result: { childExited: boolean }) => void;
+      const ownership = config.nativeSteering?.ownChild({
+        abort: () => abortOwned(),
+        settled: new Promise((done) => {
+          confirmExit = done;
+        }),
       });
-      if (proc.pid !== undefined)
+      let released = false;
+      let survivorPoll: ReturnType<typeof setInterval> | undefined;
+      const giveBack = () => {
+        if (!ownership || released) return;
+        released = true;
+        clearInterval(survivorPoll);
+        ownership.release();
+        confirmExit({ childExited: true });
+      };
+      const proc = (() => {
+        try {
+          return spawn(target.binary, target.args, {
+            cwd: target.cwd,
+            env: target.env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            detached: killGroup,
+          });
+        } catch (error) {
+          giveBack();
+          throw error;
+        }
+      })();
+      let closed = false;
+      const reconcileExit = () => {
+        if (!closed || released || !ownership) return;
+        if (killGroup && (!isGroupId(proc.pid) || probeGroup(proc.pid) !== 'empty')) return;
+        giveBack();
+      };
+      if (!nativeQueue && proc.pid !== undefined)
         config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
       // No ceiling unless one is configured, for the module or for this run;
       // the lower one wins when both are.
@@ -711,6 +782,7 @@ export class ClaudeRunner implements IRunner {
         }
       ) => {
         settled = true;
+        void nativeQueue?.stop();
         clearTimeout(timeout);
         clearTimeout(idleTimer);
         void stopProcessAndWait(proc, { group: killGroup }).then((stop) => {
@@ -718,6 +790,11 @@ export class ClaudeRunner implements IRunner {
           // A group stop is confirmed only by a group seen empty, never by an
           // outcome that says nothing of the group.
           const confirmed = stop.exited && (!killGroup || stop.group === 'empty');
+          if (confirmed) giveBack();
+          else if (ownership && !released && !survivorPoll) {
+            survivorPoll = setInterval(reconcileExit, 1000);
+            survivorPoll.unref();
+          }
           let stopUnconfirmed: RunnerResult['stopUnconfirmed'];
           if (!confirmed) {
             const pgid = killGroup && isGroupId(proc.pid) ? proc.pid : undefined;
@@ -818,6 +895,8 @@ export class ClaudeRunner implements IRunner {
             'Claude Code turn cancelled; its processes did not confirm they had stopped',
         }));
       };
+      nativeFailed = onAbort;
+      abortOwned = onAbort;
       if (config.signal?.aborted) onAbort();
       else config.signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -844,13 +923,29 @@ export class ClaudeRunner implements IRunner {
                 const billed = parseClaudeUsage(parsed.usage as Record<string, unknown>);
                 const modelUsage = parseModelUsage(parsed.modelUsage);
                 servedModel = canonicalizeModel(reportedModel, modelUsage);
+                const previous = nativeQueue ? usage : undefined;
+                // Native 2.1.301 reports usage per query, but modelUsage is
+                // cumulative across the process's queries. Keep its latest
+                // snapshot; summing those snapshots double-counts earlier work.
                 usage = {
                   ...billed,
+                  ...(previous
+                    ? {
+                        inputTokens: previous.inputTokens + billed.inputTokens,
+                        outputTokens: previous.outputTokens + billed.outputTokens,
+                        cacheReadTokens:
+                          (previous.cacheReadTokens ?? 0) + (billed.cacheReadTokens ?? 0),
+                        cacheWriteTokens:
+                          (previous.cacheWriteTokens ?? 0) + (billed.cacheWriteTokens ?? 0),
+                      }
+                    : {}),
                   // Measured per-step, never taken from the query aggregate.
                   ...(measuredContextTokens !== undefined
                     ? { contextTokens: measuredContextTokens }
                     : {}),
-                  ...(modelUsage ? { modelUsage } : {}),
+                  ...(modelUsage || previous?.modelUsage
+                    ? { modelUsage: modelUsage ?? previous?.modelUsage }
+                    : {}),
                 };
               }
               // Capture the final text response from the result
@@ -880,6 +975,7 @@ export class ClaudeRunner implements IRunner {
                 finalTextResponse = textContent;
               }
             }
+            nativeQueue?.receive(parsed);
           } catch {
             // Not JSON, likely plain text
           }
@@ -902,10 +998,11 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('error', (error) => {
+        void nativeQueue?.stop();
+        if (proc.pid === undefined) giveBack();
         clearTimeout(timeout);
         clearTimeout(idleTimer);
-        restoreOverlay?.().catch(() => {});
-        launchSettings?.cleanup().catch(() => {});
+        void cleanupPrepared();
         if (!settled) {
           settled = true;
           reject(new Error(`Failed to spawn Claude: ${error.message}`));
@@ -913,12 +1010,19 @@ export class ClaudeRunner implements IRunner {
       });
 
       proc.on('close', (code) => {
+        // Seal synchronously: promise settlement/disposal is too late for a
+        // new arrival from another close listener or a queued microtask.
+        void nativeQueue?.stop();
+        closed = true;
+        reconcileExit();
+        if (ownership && !released && !survivorPoll) {
+          survivorPoll = setInterval(reconcileExit, 1000);
+          survivorPoll.unref();
+        }
         config.signal?.removeEventListener('abort', onAbort);
         clearTimeout(timeout);
         clearTimeout(idleTimer);
-        mcpInjection?.cleanup();
-        restoreOverlay?.().catch(() => {});
-        launchSettings?.cleanup().catch(() => {});
+        void cleanupPrepared();
         if (settled) return; // Already resolved by timeout
         settled = true;
         // Before resolving: the stream's last line may have arrived without a
@@ -941,19 +1045,69 @@ export class ClaudeRunner implements IRunner {
         if (code !== 0) {
           logger.warn('Claude Code exited with non-zero code', { code, stderr });
           // Don't reject on non-zero exit if we got responses or text
-          if (responses.length === 0 && !finalTextResponse) {
+          if (responses.length === 0 && !finalTextResponse && !nativeQueue) {
             reject(new Error(`Claude exited with code ${code}: ${stderr}`));
             return;
           }
         }
 
-        resolve({ responses, usage, servedModel, toolCalls, finalTextResponse });
+        const stopUnconfirmed =
+          ownership && !released
+            ? {
+                leaderExited: true,
+                pgid: proc.pid,
+                group: isGroupId(proc.pid) ? probeGroup(proc.pid) : ('unknown' as const),
+              }
+            : undefined;
+        resolve({
+          responses,
+          usage,
+          servedModel,
+          toolCalls,
+          finalTextResponse,
+          ...(nativeQueue && code !== 0 ? { nativeError: 'Claude native process failed' } : {}),
+          ...(stopUnconfirmed
+            ? { stopUnconfirmed, nativeError: 'Claude child group remains unconfirmed' }
+            : {}),
+        });
       });
 
-      // Send the message
-      proc.stdin.write(message);
-      proc.stdin.end();
-    });
+      if (nativeQueue) {
+        nativeWrite = (line) => {
+          if (settled || proc.stdin.destroyed || proc.stdin.writableEnded) return false;
+          // Do not return Writable.write's boolean: false there is accepted
+          // backpressure, whereas this port's false means no attempt was made.
+          proc.stdin.write(line);
+          return undefined;
+        };
+        nativeEnd = () => proc.stdin.end();
+        proc.stdin.on('error', nativeFailed);
+        try {
+          if (proc.pid !== undefined)
+            config.onSpawned?.({ pid: proc.pid, ...(killGroup ? { pgid: proc.pid } : {}) });
+          if (!settled) nativeQueue.start(message);
+        } catch {
+          nativeFailed();
+        }
+      } else {
+        proc.stdin.write(message);
+        proc.stdin.end();
+      }
+    }).then(
+      async (result) => {
+        await nativeQueue?.dispose();
+        await cleanupPrepared();
+        if (nativeQueue && (!nativeQueue.drained || nativeQueue.error))
+          result.nativeError =
+            nativeQueue.error ?? 'Claude exited before all native inputs completed';
+        return result;
+      },
+      async (error: unknown) => {
+        await nativeQueue?.dispose();
+        await cleanupPrepared();
+        throw error;
+      }
+    );
   }
 
   /**
