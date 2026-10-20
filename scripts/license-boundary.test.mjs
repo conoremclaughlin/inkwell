@@ -28,14 +28,18 @@ test('the original server future MIT grant remains byte-for-byte unchanged', () 
 });
 
 test('the extension is identified as modified and connected to the grant', () => {
+  assert.ok(server.startsWith('# FSL Ink Labs Extended 1.0\n'));
   assert.match(server, /extension of the Functional Source License, Version 1\.1/);
   assert.match(server, /not the unmodified FSL-1\.1-MIT license/);
-  assert.match(server, /LicenseRef-Inkwell-Server-1\.0/);
+  assert.match(server, /with additional Ink Labs provisions/);
+  assert.match(server, /LicenseRef-FSL-Ink-Labs-Extended-1\.0/);
   assert.match(
     server,
     /A Permitted Purpose is any purpose other than a Competing Use or a Restricted\nCommercial Use/
   );
-  assert.match(server, /### Additional Provisions \(Inkwell Extension\)/);
+  assert.match(server, /### Additional Provisions \(Ink Labs Extension\)/);
+  assert.match(compact(root), /FSL Ink Labs Extended 1\.0/);
+  assert.match(read('docs/licensing.md'), /LicenseRef-FSL-Ink-Labs-Extended-1\.0/);
 });
 
 test('root and API metadata point to scoped license texts', () => {
@@ -103,13 +107,13 @@ test('dashboard metadata and scope documentation agree with the expanded license
     const row = docs
       .split('\n')
       .find((line) => line.startsWith('|') && line.includes(`\`${path}\``));
-    assert.ok(row?.includes('Inkwell Server License 1.0'), `scope table: ${path}`);
+    assert.ok(row?.includes('FSL Ink Labs Extended 1.0'), `scope table: ${path}`);
   }
   const readmeLicense = read('README.md').split('## License\n')[1];
   for (const path of ['packages/api', 'packages/web', 'supabase/']) {
     assert.ok(readmeLicense.includes(`\`${path}\``), `README scope: ${path}`);
   }
-  assert.match(readmeLicense, /Inkwell Server License/);
+  assert.match(readmeLicense, /FSL Ink Labs Extended 1\.0/);
   assert.match(
     compact(docs),
     /Earlier MIT grants for the dashboard and database files remain available/
@@ -126,15 +130,37 @@ test('the community invitation requests permission rather than granting an exemp
   assert.match(docs, /This invitation does not itself authorize a use outside the license grant/);
 });
 
-test('the commercial-use wording and exceptions remain byte-for-byte unchanged', () => {
+test('the commercial-use wording matches the reviewed simplified boundary', () => {
   const start = '### Permitted Purpose\n';
   const end = '### Patents\n';
   assert.equal(server.split(start).length, 2);
   assert.equal(server.split(end).length, 2);
   const terms = server.slice(server.indexOf(start), server.indexOf(end));
-  // The complete restriction/boundary block at the previously reviewed 9b58183a.
+  // The 281118e8 block with only the extension heading renamed and the redundant
+  // closing clarification in infrastructure boundary 4 removed.
   assert.equal(
     createHash('sha256').update(terms).digest('hex'),
-    '110d65a3a6054cad0bf086b5249f576df611bb9b01b7dcfa6754f3d0e6869619'
+    'aca54617dce11e0418638793f22de8c753a08dc092be8a9e656a9aa8c215ea6b'
+  );
+});
+
+test('the explainer omits the standalone independent-client paragraph', () => {
+  const docs = read('docs/licensing.md');
+  assert.doesNotMatch(docs, /Independent paid clients need separate analysis/);
+  assert.doesNotMatch(docs, /client seller who neither uses nor distributes the server/);
+});
+
+test('the infrastructure boundary is concise and the managed-service restriction remains', () => {
+  const boundaries = server.slice(
+    server.indexOf('#### Boundaries and permitted activities\n'),
+    server.indexOf('#### Other licenses and earlier grants\n')
+  );
+  assert.equal(
+    compact(boundaries.slice(boundaries.indexOf('4. '), boundaries.indexOf('5. '))).trim(),
+    '4. Supplying general-purpose computing, storage, or network resources on which a customer installs and operates their own permitted deployment.'
+  );
+  assert.match(
+    compact(server),
+    /Selling, reselling, or providing hosting, managed operation, or access to the Software for another party as part of a Commercial Offering/
   );
 });
