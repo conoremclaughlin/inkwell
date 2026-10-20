@@ -13,6 +13,8 @@
  * - the builders that take a caller's object drop a turnScope or turn_scope
  *   smuggled into it;
  * - no migration names the column but the marker's own and the trigger's.
+ *   The catch-up grants migration names the trigger's function, in one
+ *   GRANT EXECUTE line and nowhere else.
  *
  * Outside this census: a service-role or raw SQL write, and a query builder
  * stored in a variable before .update is called on it (none exists today).
@@ -41,6 +43,7 @@ const API_SRC = fileURLToPath(new URL('../../', import.meta.url));
 const MIGRATIONS = fileURLToPath(new URL('../../../../../supabase/migrations/', import.meta.url));
 const MARKER_MIGRATION = '20261015070518_sessions_turn_scope_marker.sql';
 const TRIGGER_MIGRATION = '20261015203541_sessions_turn_scope_immutable.sql';
+const GRANTS_MIGRATION = '20261020151202_service_role_explicit_grants.sql';
 const FORBIDDEN = 'turn_scope';
 
 const sessionWritesIn = (fileName: string, source: string) =>
@@ -200,6 +203,15 @@ describe('no migration but the marker and its trigger names turn_scope', () => {
       (name) =>
         name.endsWith('.sql') && readFileSync(join(MIGRATIONS, name), 'utf8').includes(FORBIDDEN)
     );
-    expect(naming.sort()).toEqual([MARKER_MIGRATION, TRIGGER_MIGRATION]);
+    expect(naming.sort()).toEqual([MARKER_MIGRATION, TRIGGER_MIGRATION, GRANTS_MIGRATION]);
+  });
+
+  it('lets the grants migration name the trigger function only to grant EXECUTE on it', () => {
+    const naming = readFileSync(join(MIGRATIONS, GRANTS_MIGRATION), 'utf8')
+      .split('\n')
+      .filter((line) => line.includes(FORBIDDEN));
+    expect(naming).toEqual([
+      'GRANT EXECUTE ON FUNCTION public.refuse_session_turn_scope_change() TO service_role;',
+    ]);
   });
 });
