@@ -186,6 +186,29 @@ other people's unmerged branches show up as "applied from another checkout" in
 Never `supabase db reset` against the shared local stack. It rebuilds the
 database from the files and discards every row of live data.
 
+## Grants (important)
+
+**The migration that creates a table, view or sequence in `public` grants
+`service_role` on it, in the same file:**
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.<table> TO service_role;
+GRANT USAGE, SELECT ON SEQUENCE public.<sequence> TO service_role;
+```
+
+Supabase used to grant this automatically on every new object in `public`.
+From 2026-10-30 it no longer does for existing hosted projects, and newer CLIs
+can apply the same rule to `supabase start` and `db reset` (supabase/supabase
+discussion 45329). `service_role` bypasses RLS, not GRANT, so a table without
+the grant fails every API call on it with 42501 "permission denied for table".
+Don't grant `anon` or `authenticated`: the web package uses Supabase for auth
+only, and all data goes through the API. To keep a table away from them
+explicitly, `REVOKE ALL ... FROM PUBLIC, anon, authenticated`, as
+`20261008004326_saved_logins_vault.sql` does.
+
+`20261020151202_service_role_explicit_grants.sql` granted `service_role` on
+everything that existed before it, so the rule only applies from that file on.
+
 ## `updated_at` trigger standard (important)
 
 PCP uses one canonical trigger function for `updated_at`:

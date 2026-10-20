@@ -1,0 +1,42 @@
+-- Explicit Data API grants for service_role on everything already in public.
+--
+-- Supabase is ending the automatic grant on new tables in "public". From
+-- 2026-10-30 a new table in an existing hosted project gets no SELECT,
+-- INSERT, UPDATE or DELETE for anon, authenticated or service_role, and
+-- sequences lose their USAGE and SELECT the same way. Supabase CLI 2.102.0
+-- and later can apply the same rule to `supabase start` and `db reset`
+-- (supabase/supabase discussion 45329). Tables that already exist keep the
+-- grants they were created with.
+--
+-- service_role bypasses RLS, not GRANT. The API reaches every table through
+-- PostgREST as service_role, so a table it holds no privilege on answers
+-- with 42501 "permission denied for table".
+--
+-- A database that already exists has its grants, so this file changes nothing
+-- on the local stack as it stands: on 2026-10-20, service_role held all four
+-- privileges on all 98 relations in public, every one owned by postgres, and
+-- public had no sequences. It is for a build from an empty database under the
+-- new rule (a fresh integration stack, a new machine, a new or branched
+-- project), where every table created above this point would otherwise come
+-- up with no privileges for service_role.
+--
+-- Only service_role is granted. anon and authenticated get no table access:
+-- the web package uses Supabase for auth only, and its data goes through the
+-- API.
+--
+-- One table's own migration grants less than this. saved_login_secrets is
+-- given SELECT, INSERT and DELETE, without UPDATE, but the default grant
+-- gave service_role UPDATE on it as well, and the local stack holds it today.
+-- This file makes a fresh build match the stack as it is; narrowing that
+-- table is a separate change.
+--
+-- From here on, the migration that creates a table, view or sequence in public
+-- grants service_role on it itself (README.md, "Grants").
+--
+-- ALL TABLES covers tables, partitioned tables, views, materialized views and
+-- foreign tables. Sequences get USAGE, SELECT and UPDATE, which is what the
+-- default grant gave them. Granting a privilege that is already held changes
+-- nothing, so the file can run twice.
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO service_role;
