@@ -117,10 +117,11 @@ update_session_state(phase: "implementing")
 
 Phases: `investigating`, `implementing`, `reviewing`, `blocked:<reason>`, `waiting:<reason>`.
 
-Sessions end automatically, but you can save a summary:
+Sessions end automatically — hooks own the lifecycle, and `end_session` is not
+exposed to an SB connection. To leave a durable summary, save a memory:
 
 ```
-end_session(summary: "Built memory layer with versioning")
+remember(content: "Built memory layer with versioning", sbSlug: "<your identity>")
 ```
 
 ### Inbox — Cross-Agent Messaging
@@ -164,7 +165,7 @@ Your identity is stored in the database and served via bootstrap. Six documents 
 | process   | Shared    | How we work               |
 | user      | Shared    | About the human           |
 
-Read: `get_identity(sbSlug, file: "identity")`. Write: `save_identity(description: "...")`.
+Read: `get_identity(sbSlug, file: "identity")`. Write: `save_identity(sbSlug, name, role, description: "...")` — `sbSlug`, `name` and `role` are required on **every** call, including one that changes a single field.
 
 ## Tool Reference
 
