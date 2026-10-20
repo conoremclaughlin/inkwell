@@ -109,7 +109,7 @@ describe('the census', () => {
         JOIN information_schema.tables t
           ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
         WHERE c.table_schema = 'public' AND c.data_type = 'uuid'
-          AND (c.column_name ~ '(user_id|sb_id|identity_id|_by)$')
+          AND (c.column_name ~ '(user_id|sb_id|identity_id|owner_id|recipient_id|_by)$')
       ), fk AS (
         SELECT conrelid::regclass::text AS tbl, a.attname AS col
         FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
@@ -129,13 +129,13 @@ describe('the census', () => {
     ]);
   });
 
-  it('every key without a delete rule to an account is one delete_account handles', async () => {
+  it('every NO ACTION or RESTRICT key to an account is one delete_account handles', async () => {
     const { rows } = await db.query(`
       SELECT k.conrelid::regclass::text || '.' ||
              (SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
               WHERE attrelid = k.conrelid AND attnum = ANY (k.conkey)) AS ref
       FROM pg_constraint k
-      WHERE k.contype = 'f' AND k.confdeltype = 'a'
+      WHERE k.contype = 'f' AND k.confdeltype IN ('a', 'r')
         AND k.confrelid IN ('public.users'::regclass, 'public.agent_identities'::regclass)
       ORDER BY 1`);
     expect(rows.map((r) => r.ref)).toEqual([
@@ -185,6 +185,104 @@ describe('the census', () => {
       'user_permissions.granted_by',
       'user_permissions.user_id',
     ]);
+  });
+});
+
+describe('delete_account with retained delivery references', () => {
+  it('erases every delivery state and cross-account legacy references without settling unrelated work', async () => {
+    const departing = await account('retained-departing');
+    const remaining = await account('retained-remaining');
+    const departedThread = await thread(departing.personal, { sbId: departing.inkling });
+    const remainingThread = await thread(remaining.personal, { sbId: remaining.inkling });
+    const deliveries: string[] = [];
+
+    async function execution(who: Account) {
+      const { id: session } = await one<{ id: string }>(
+        `INSERT INTO sessions (user_id) VALUES ($1) RETURNING id`,
+        [who.id]
+      );
+      const { id: launch } = await one<{ id: string }>(
+        `INSERT INTO launched_processes (session_id, backend, boot_id, server_instance)
+         VALUES ($1, 'claude-code', 'synthetic-boot', 'synthetic-host:4001') RETURNING id`,
+        [session]
+      );
+      return { session, launch };
+    }
+    const leavingRun = await execution(departing);
+    const stayingRun = await execution(remaining);
+
+    for (const state of ['pending', 'bound', 'held', 'settled']) {
+      const ownSource = await userMessage(departedThread, departing.id, 'Synthetic retained input');
+      // The recipient owns this obligation, but delete_account erases the
+      // departing sender's legacy source. It must not block across accounts.
+      const { id: sentSource } = await one<{ id: string }>(
+        `INSERT INTO agent_inbox (sender_user_id, recipient_user_id, recipient_agent_id, recipient_sb_id, content)
+         VALUES ($1, $2, $3, $4, 'Synthetic cross-account input') RETURNING id`,
+        [departing.id, remaining.id, `inkling-retained-remaining-${run}`, remaining.inkling]
+      );
+      for (const [who, executionRow, threadSource, legacySource] of [
+        [departing, leavingRun, ownSource, null],
+        [remaining, stayingRun, null, sentSource],
+      ] as const) {
+        const { id } = await one<{ id: string }>(
+          `INSERT INTO sb_inbox_deliveries
+           (id, owner_id, recipient_id, session_id, thread_message_id, inbox_message_id,
+            state, launch_id, turn_epoch, settled_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8,
+                   CASE WHEN $6 = 'settled' THEN now() ELSE NULL END) RETURNING id`,
+          [
+            who.id,
+            who.inkling,
+            executionRow.session,
+            threadSource,
+            legacySource,
+            state,
+            state === 'pending' ? null : executionRow.launch,
+            state === 'pending' ? null : 'synthetic:deletion-epoch',
+          ]
+        );
+        deliveries.push(id);
+      }
+    }
+    const keptSource = await userMessage(remainingThread, remaining.id, 'Unrelated pending input');
+    const { id: kept } = await one<{ id: string }>(
+      `INSERT INTO sb_inbox_deliveries (id, owner_id, recipient_id, session_id, thread_message_id)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING id`,
+      [remaining.id, remaining.inkling, stayingRun.session, keptSource]
+    );
+    expect(
+      await count(`SELECT count(*) AS n FROM sb_inbox_deliveries WHERE id = ANY($1::uuid[])`, [
+        deliveries,
+      ])
+    ).toBe(8);
+    await requestAt(departing.id, 'files_removed');
+    expect(
+      (
+        await one<{ counts: Record<string, number> }>(`SELECT delete_account($1) AS counts`, [
+          departing.id,
+        ])
+      ).counts
+    ).toMatchObject({ users: 1, identities: 1 });
+    expect(
+      (
+        await one<{ step: string }>(
+          `SELECT step FROM account_deletion_requests WHERE user_id = $1`,
+          [departing.id]
+        )
+      ).step
+    ).toBe('rows_removed');
+    expect(
+      await count(`SELECT count(*) AS n FROM sb_inbox_deliveries WHERE id = ANY($1::uuid[])`, [
+        deliveries,
+      ])
+    ).toBe(0);
+    expect(
+      await one(`SELECT state, revision, settled_at FROM sb_inbox_deliveries WHERE id = $1`, [kept])
+    ).toEqual({ state: 'pending', revision: 0, settled_at: null });
+    expect(await count(`SELECT count(*) AS n FROM users WHERE id = $1`, [remaining.id])).toBe(1);
+    expect(
+      await count(`SELECT count(*) AS n FROM launched_processes WHERE id = $1`, [stayingRun.launch])
+    ).toBe(1);
   });
 });
 

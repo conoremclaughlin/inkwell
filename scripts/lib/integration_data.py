@@ -69,6 +69,7 @@ WINDOWED_FIXTURE_TABLES = (
     ("20261007093000", "", ("thread_upload_claims", "thread_uploads")),
     ("20261008004326", "", ("saved_login_secrets", "saved_logins")),
     ("20261008004946", "", ("saved_logins_sealed",)),
+    ("20261016195755", "", ("sb_inbox_deliveries",)),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
