@@ -48,6 +48,31 @@ const host: BackendHost = {
 // Exercise the provider-neutral dispatch contract under Claude's backend name.
 // ClaudeStreamParser's own assembly policy remains covered separately.
 describe('stream result semantics across backends', () => {
+  it.each([true, false])(
+    'propagates only the final text source (identified: %s)',
+    async (identified) => {
+      const source = { messageId: 'synthetic-final', origin: 'parent' as const };
+      state.events = [
+        { kind: 'result', text: 'older', source: { messageId: 'synthetic-old', origin: 'parent' } },
+        { kind: 'result', text: '', ...(identified ? { source } : {}) },
+      ];
+      state.exitCode = 0;
+      const result = await runBackendTurn({
+        backend: 'claude',
+        sbSlug: 'synthetic-sb',
+        prompt: 'hello',
+        stream: true,
+        cliAttached: false,
+        workingDirectory: '/synthetic/studio',
+        inkSessionId: undefined,
+        studioId: undefined,
+        host,
+      });
+      expect(result.responseText).toBe('');
+      expect(result.responseSource).toEqual(identified ? source : undefined);
+    }
+  );
+
   it('keeps an explicit empty final result rather than earlier progress', async () => {
     state.events = [
       { kind: 'text', text: 'progress' },
@@ -70,7 +95,10 @@ describe('stream result semantics across backends', () => {
   });
 
   it('still falls back to completed text when the parser has no final text', async () => {
-    state.events = [{ kind: 'text', text: 'answer' }, { kind: 'result' }];
+    state.events = [
+      { kind: 'text', text: 'answer' },
+      { kind: 'result', source: { messageId: 'synthetic-unconfirmed', origin: 'parent' } },
+    ];
     state.exitCode = 0;
     const result = await runBackendTurn({
       backend: 'claude',
@@ -85,6 +113,7 @@ describe('stream result semantics across backends', () => {
     });
     expect(result.success).toBe(true);
     expect(result.responseText).toBe('answer');
+    expect(result).not.toHaveProperty('responseSource');
   });
 
   it('retains terminal errors and nonzero child exits independently', async () => {

@@ -34,7 +34,7 @@ function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
   // cloneRequest) that the budget measurer shares — those literals are spawn
   // sites too.
   const re =
-    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn)\(\{|: BackendRunRequest => \(\{/g;
+    /\b(?:startBackendTurn|runBackendTurn|ports\.startTurn|runAttempt)\(\{|: BackendRunRequest => \(\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     const open = m.index + m[0].length - 1;

@@ -145,6 +145,7 @@ describe('every backend turn forwards the override', () => {
     ...callSites('startBackendTurn'),
     ...callSites('runBackendTurn'),
     ...callSites('ports.startTurn'),
+    ...callSites('runAttempt'),
     // Request builders shared by a spawn and the relay-budget measurer.
     ...callSites('BackendRunRequest => '),
   ];

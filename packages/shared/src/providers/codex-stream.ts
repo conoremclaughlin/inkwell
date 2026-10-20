@@ -5,7 +5,7 @@
  * https://learn.chatgpt.com/docs/non-interactive-mode
  */
 import { extractBackendTokenUsage } from '../runtime/token-usage.js';
-import type { BackendStreamParser, BackendTurnEvent } from './stream.js';
+import type { BackendMessageSource, BackendStreamParser, BackendTurnEvent } from './stream.js';
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -22,6 +22,8 @@ export class CodexStreamParser implements BackendStreamParser {
   private buffer = '';
   private bufferBytes = 0;
   private lastAssistantText = '';
+  private lastAssistantSource: BackendMessageSource | undefined;
+  private completedMessages = new Set<string>();
   private finished = false;
 
   push(chunk: string): BackendTurnEvent[] {
@@ -83,7 +85,12 @@ export class CodexStreamParser implements BackendStreamParser {
     if (event.type === 'turn.completed') {
       this.finished = true;
       const usage = extractBackendTokenUsage('codex', JSON.stringify(event), '');
-      out.push({ kind: 'result', text: this.lastAssistantText, ...(usage ? { usage } : {}) });
+      out.push({
+        kind: 'result',
+        text: this.lastAssistantText,
+        ...(this.lastAssistantSource ? { source: this.lastAssistantSource } : {}),
+        ...(usage ? { usage } : {}),
+      });
       return;
     }
     // `error` can describe a reconnect attempt, not a terminal failure.
@@ -92,8 +99,30 @@ export class CodexStreamParser implements BackendStreamParser {
     if (!item) return;
     if (event.type === 'item.completed' && item.type === 'agent_message') {
       if (typeof item.text === 'string') {
-        this.lastAssistantText = item.text;
-        if (item.text) out.push({ kind: 'text', text: item.text });
+        // Exec's documented item shape provides identity but no origin marker.
+        // Do not invent parent authority from that absence. Backend evidence
+        // must establish origin before this adapter can authorize stream tools.
+        const source: BackendMessageSource | undefined =
+          typeof item.id === 'string' && item.id
+            ? { messageId: item.id, origin: 'unknown' }
+            : undefined;
+        const repeated = source && this.completedMessages.has(source.messageId);
+        if (!repeated) {
+          this.lastAssistantText = item.text;
+          this.lastAssistantSource = source;
+        }
+        if (source && !repeated)
+          out.push({ kind: 'text-boundary', boundary: 'message-start', source });
+        if (item.text)
+          out.push({
+            kind: 'text',
+            text: item.text,
+            ...(source ? { source: { ...source, blockId: source.messageId, offset: 0 } } : {}),
+          });
+        if (source) {
+          out.push({ kind: 'text-boundary', boundary: 'message-end', source, complete: true });
+          this.completedMessages.add(source.messageId);
+        }
       }
       return;
     }

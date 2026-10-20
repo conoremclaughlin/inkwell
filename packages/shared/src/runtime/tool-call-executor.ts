@@ -30,7 +30,7 @@ export interface ToolCallResult {
   result?: RuntimeToolCallResponse;
   reason?: string;
   error?: string;
-  /** Present only when this invocation reached the pre-dispatch barrier. */
+  /** Executor barrier ID; an owning journal may also identify an earlier refused admission. */
   invocationId?: string;
   /**
    * `returned` means the dispatcher answered, NOT that an external effect
@@ -44,7 +44,7 @@ export interface ToolCallExecutorPorts {
   /** Policy engine for permission decisions */
   policy: ToolCallPolicy;
   /** Per-host unique invocation identity, never ambient process state. */
-  mintInvocationId(): string;
+  mintInvocationId(call: LocalToolCall): string;
   /** Existing local-surface name diagnostics, supplied by the host catalog. */
   impossibleCallRefusal(tool: string): RuntimeToolCallResponse | null;
   /**
@@ -118,7 +118,8 @@ function cancelledBeforeRun(call: LocalToolCall): ToolCallResult {
 
 /**
  * Execute a list of local tool calls with policy checks, sequentially unless
- * `concurrentReads` is on.
+ * `concurrentReads` is on. An async source admits calls as their blocks close;
+ * arrays retain the same batch contract. The source must eventually close.
  *
  * For each call:
  * 1. Check policy via canCallInkTool()
@@ -129,13 +130,13 @@ function cancelledBeforeRun(call: LocalToolCall): ToolCallResult {
  * 4. If blocked (not promptable) → report as blocked
  */
 export async function executeToolCalls(
-  calls: LocalToolCall[],
+  calls: Iterable<LocalToolCall> | AsyncIterable<LocalToolCall>,
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult[]> {
   if (deps.concurrentReads) return executeWithConcurrentReads(calls, deps);
   const results: ToolCallResult[] = [];
 
-  for (const call of calls) {
+  for await (const call of calls) {
     if (deps.signal?.aborted) {
       const cancelled = cancelledBeforeRun(call);
       results.push(cancelled);
@@ -168,7 +169,7 @@ export async function executeToolCalls(
  * as a serial call would.
  */
 async function executeWithConcurrentReads(
-  calls: LocalToolCall[],
+  calls: Iterable<LocalToolCall> | AsyncIterable<LocalToolCall>,
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult[]> {
   const results: ToolCallResult[] = [];
@@ -190,43 +191,49 @@ async function executeWithConcurrentReads(
   };
   let settled: Promise<void> = Promise.resolve();
 
-  for (const call of calls) {
-    const concurrent = runsConcurrently(call);
-    if (!concurrent) await settled;
-    if (failure) break;
-    if (deps.signal?.aborted) {
-      const cancelled = cancelledBeforeRun(call);
-      settled = settled.then(() => settle(cancelled));
-      continue;
-    }
-    let awaitingApproval = false;
-    const callDeps: ToolCallExecutorPorts = {
-      ...deps,
-      promptForApproval: (tool, reason, args) => {
-        awaitingApproval = true;
-        return deps.promptForApproval(tool, reason, args);
-      },
-    };
-    const outcome = executeOneToolCall(call, callDeps).then(
-      (result) => ({ result }),
-      (error: unknown) => {
-        failure ??= { error };
-        return { error };
+  try {
+    for await (const call of calls) {
+      const concurrent = runsConcurrently(call);
+      if (!concurrent) await settled;
+      if (failure) break;
+      if (deps.signal?.aborted) {
+        const cancelled = cancelledBeforeRun(call);
+        settled = settled.then(() => settle(cancelled));
+        continue;
       }
-    );
-    settled = settled.then(async () => {
-      const done = await outcome;
-      if ('result' in done) settle(done.result);
-    });
-    if (!concurrent) {
-      await settled;
-      continue;
+      let awaitingApproval = false;
+      const callDeps: ToolCallExecutorPorts = {
+        ...deps,
+        promptForApproval: (tool, reason, args) => {
+          awaitingApproval = true;
+          return deps.promptForApproval(tool, reason, args);
+        },
+      };
+      const outcome = executeOneToolCall(call, callDeps).then(
+        (result) => ({ result }),
+        (error: unknown) => {
+          failure ??= { error };
+          return { error };
+        }
+      );
+      settled = settled.then(async () => {
+        const done = await outcome;
+        if ('result' in done) settle(done.result);
+      });
+      if (!concurrent) {
+        await settled;
+        continue;
+      }
+      // One tick, so a port that threw while this call was starting (a policy
+      // read, say) is seen before the next call starts. Policy is synchronous,
+      // so by then a call that needs approval has already asked for it.
+      await Promise.resolve();
+      if (awaitingApproval) await settled;
     }
-    // One tick, so a port that threw while this call was starting (a policy
-    // read, say) is seen before the next call starts. Policy is synchronous,
-    // so by then a call that needs approval has already asked for it.
-    await Promise.resolve();
-    if (awaitingApproval) await settled;
+  } catch (error) {
+    // An incremental producer can fail independently of a tool. It must not
+    // abandon reads already admitted through this scheduler.
+    failure ??= { error };
   }
 
   await settled;
@@ -327,7 +334,7 @@ async function executeTool(
   call: LocalToolCall,
   deps: ToolCallExecutorPorts
 ): Promise<ToolCallResult> {
-  const invocationId = deps.mintInvocationId();
+  const invocationId = deps.mintInvocationId(call);
   const identity = { tool: call.tool, args: call.args, invocationId };
   try {
     await deps.commitIntent(call, invocationId);

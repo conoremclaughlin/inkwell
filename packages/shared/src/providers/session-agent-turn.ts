@@ -9,9 +9,22 @@ import {
 } from '../runtime/index.js';
 import { createSessionProviderTurn, type SessionProviderPorts } from './session-provider.js';
 import type { TurnMedia } from './types.js';
+import { createSessionToolStream } from '../runtime/session-tool-stream.js';
+import type { SessionToolBatchPorts } from '../runtime/session-tool-batch.js';
+import type { createToolInvocationJournal } from '../runtime/tool-invocation-journal.js';
+import type { ProviderToolStreamPorts } from './tool-stream-attempt.js';
+import type { ToolSettlementSupervisor } from '../runtime/tool-settlement-supervisor.js';
 
 export interface SessionAgentTurnPorts extends Omit<AgentLoopPorts, 'backend'> {
-  provider: SessionProviderPorts;
+  provider: Omit<SessionProviderPorts, 'toolStream'>;
+  /** Default-off. A host must own/recover this journal for the whole session. */
+  streamTools?: {
+    journal: ReturnType<typeof createToolInvocationJournal>;
+    supervisor: ToolSettlementSupervisor;
+    turnId: string;
+    ports: SessionToolBatchPorts;
+    reportFailure: ProviderToolStreamPorts['reportFailure'];
+  };
   /** Close mid-turn admission before the enclosing outcome commit or hook. */
   finishSteering?(): Promise<void>;
   /** Invalidate native history and persist the roll, as the CLI already does. */
@@ -51,8 +64,31 @@ export async function runSessionAgentTurn(
   };
   try {
     input.signal?.throwIfAborted();
+    const streaming = ports.streamTools;
+    if (streaming && streaming.journal.sessionId !== ports.provider.spawnContext().inkSessionId) {
+      const error = new Error('Tool journal and provider must belong to the same session');
+      await streaming.reportFailure(error.message);
+      throw error;
+    }
     providerTurn = createSessionProviderTurn(
-      ports.provider,
+      {
+        ...ports.provider,
+        ...(streaming
+          ? {
+              toolStream: {
+                open: async (signal: AbortSignal) =>
+                  (await createSessionToolStream({
+                    enabled: true,
+                    ports: { ...streaming.ports, signal },
+                    journal: streaming.journal,
+                    supervisor: streaming.supervisor,
+                    owner: { turnId: streaming.turnId, attemptId: ports.provider.mintId() },
+                  }))!,
+                reportFailure: streaming.reportFailure,
+              },
+            }
+          : {}),
+      },
       input.raw,
       input.turnMedia,
       input.prepared
@@ -62,6 +98,7 @@ export async function runSessionAgentTurn(
       {
         prompt: providerTurn.prompt,
         toolRouting: ports.provider.runtime.toolRouting,
+        canonicalTools: streaming !== undefined,
         signal: input.signal,
         relayBudgetBytes: () => {
           const pending = ports.provider.steering?.pendingTextBytes?.() ?? 0;

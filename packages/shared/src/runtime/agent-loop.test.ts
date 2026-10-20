@@ -2523,7 +2523,9 @@ describe('extractToolBlocks — a block that cannot be parsed is reported, never
     expect(malformed).toHaveLength(1);
     expect(malformed[0]!.tool).toBe('remember');
     expect(describeMalformedBlock(malformed[0]!)).toContain('remember');
-    expect(describeMalformedBlock(malformed[0]!)).toContain('Nothing ran and nothing was written');
+    expect(describeMalformedBlock(malformed[0]!)).toContain(
+      'This block ran no tool and wrote nothing'
+    );
   });
 
   it('refuses to repair a block whose fence never closed', () => {

@@ -35,6 +35,16 @@ const noteSpawn = provider.slice(
 );
 
 describe('runAgentLoop hosts and their relay budgets', () => {
+  it('keeps both production parent hosts disconnected from the opt-in tool stream', () => {
+    const server = readFileSync(
+      join(here, '../../../shared/src/node-host/session-composition.ts'),
+      'utf8'
+    );
+    for (const host of [cli, server]) {
+      expect(host).not.toMatch(/streamTools\s*:|createSessionToolStream\(/);
+    }
+  });
+
   it('there are exactly two production hosts: the parent turn and the clone', () => {
     expect(loopCalls).toHaveLength(2);
     expect(cli).toMatch(
@@ -71,7 +81,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
 
   it("the continuation spawn goes through the request builder WITH the decision's session args and delivery (Lumen, PR #577 final pass)", () => {
     expect(provider).toMatch(
-      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
+      /contResult = await runAttempt\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     // Keep the main-branch image delivery target coupled to the shared decision.
     expect(provider).toContain(
@@ -110,17 +120,17 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     );
     // Captured with request construction, before the awaited spawn — both paths.
     const initialCapture = provider.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
-    const initialSpawn = provider.indexOf('const turn = ports.startTurn({', initialCapture);
+    const initialSpawn = provider.indexOf('runResult = await runAttempt({', initialCapture);
     expect(initialCapture).toBeGreaterThan(0);
     expect(provider.slice(initialCapture, initialSpawn).replace(/\s+/g, ' ').trim()).toBe(
-      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); let runResult: BackendRunResult; await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
+      'const ledgerIdBeforeSpawn = maxLedgerId(); const generationBeforeSpawn = ports.contextGeneration(); let runResult: ToolStreamingBackendResult; await beforeDispatch(ctx.signal); ports.beginSpawn(); try {'
     );
     const contCapture = provider.indexOf(
       'const ledgerIdBeforeSpawn = maxLedgerId();',
       initialCapture + 1
     );
     const contSpawn = provider.search(
-      /const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
+      /contResult = await runAttempt\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(contCapture).toBeGreaterThan(0);
     expect(contSpawn).toBeGreaterThan(contCapture);
@@ -153,13 +163,17 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       join(here, '../../../shared/src/runtime/session-tool-batch.ts'),
       'utf8'
     );
-    expect(batch).toMatch(/const settleMutation = ports\.beginContextMutation\(calls\);\s*try \{/);
-    expect(batch).toMatch(/finally \{\s*settleMutation\(\);\s*\}/);
+    expect(batch).toMatch(
+      /const batch = createSessionToolBatch\(ports\);\s*batch\.admit\(calls\);\s*try \{\s*await executeToolCalls\(calls, batch\.executor\);/
+    );
+    expect(batch).toMatch(/finally \{\s*batch\.release\(\);\s*\}/);
+    expect(batch).toContain('mutations.push(ports.beginContextMutation(calls));');
+    expect(batch).toMatch(/for \(const settle of mutations\) \{\s*try \{\s*settle\(\);/);
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: BackendRunResult;\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const turn = ports\.startTurn\(\{/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*let runResult: ToolStreamingBackendResult;\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*runResult = await runAttempt\(\{/
     );
     expect(provider).toMatch(
-      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*const contTurn = ports\.startTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
+      /const generationBeforeSpawn = ports\.contextGeneration\(\);\s*await beforeDispatch\(ctx\.signal\);\s*ports\.beginSpawn\(\);\s*try \{\s*contResult = await runAttempt\(\s*continuationRequest\(\s*continuationPrompt,\s*contSpawn,\s*contImages\)\s*\);/
     );
     expect(source).toMatch(
       /const generationBeforeSpawn = sessionContext\.generation;\s*const turn = ports\.startTurn\(cloneRequest\(prompt, sessionArgs\)\);/

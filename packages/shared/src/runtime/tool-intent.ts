@@ -1,4 +1,5 @@
 import type { ToolCallExecutorPorts } from './tool-call-executor.js';
+import type { LocalToolCall } from './agent-loop.js';
 
 /**
  * Commit through the session's existing ordered log. Await queued
@@ -7,12 +8,21 @@ import type { ToolCallExecutorPorts } from './tool-call-executor.js';
  * CLI parent and clone use this today. Backend-owned tools, manual /mcp call
  * and host auto-forward do not go through this executor/barrier.
  */
-export function createToolIntentCommitter(log: {
-  append(entry: Record<string, unknown>): number;
-  flush(): Promise<void>;
-}): ToolCallExecutorPorts['commitIntent'] {
+export function createToolIntentCommitter(
+  log: {
+    append(entry: Record<string, unknown>): number;
+    flush(): Promise<void>;
+  },
+  metadata?: (call: LocalToolCall) => Record<string, unknown>
+): ToolCallExecutorPorts['commitIntent'] {
   return async (call, invocationId) => {
-    log.append({ type: 'tool_intent', invocationId, tool: call.tool, args: call.args });
+    log.append({
+      ...metadata?.(call),
+      type: 'tool_intent',
+      invocationId,
+      tool: call.tool,
+      args: call.args,
+    });
     await log.flush();
   };
 }

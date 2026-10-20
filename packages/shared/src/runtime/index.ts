@@ -50,6 +50,7 @@ export { bootstrapSessionIdentity, type SessionBootstrapPorts } from './session-
 
 export * from './headless-session.js';
 export * from './session-tool-batch.js';
+export * from './tool-settlement-supervisor.js';
 export * from './session-usage.js';
 export * from './context-limits.js';
 export * from './context-pressure.js';

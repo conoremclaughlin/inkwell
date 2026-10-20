@@ -156,6 +156,39 @@ describe('concurrent reads', () => {
   /** Let every queued microtask and timer callback run once. */
   const drain = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+  it('settles admitted reads before reporting an incremental source failure', async () => {
+    const gate = gatedDispatcher();
+    const settled: string[] = [];
+    async function* source() {
+      yield named('read');
+      throw new Error('provider source failed');
+    }
+    let finished = false;
+    const run = executeToolCalls(
+      source(),
+      ports({
+        concurrentReads: true,
+        callTool: gate.callTool,
+        onResult: (result) => settled.push(result.tool),
+      })
+    );
+    const failed = expect(run).rejects.toThrow('provider source failed');
+    void run.then(
+      () => {
+        finished = true;
+      },
+      () => {
+        finished = true;
+      }
+    );
+    await vi.waitFor(() => expect(gate.entered).toEqual(['read']));
+    await drain();
+    expect(finished).toBe(false);
+    await gate.answer('read');
+    await failed;
+    expect(settled).toEqual(['read']);
+  });
+
   it('starts adjacent reads together and settles them in emission order', async () => {
     const gate = gatedDispatcher();
     const settled: string[] = [];

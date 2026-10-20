@@ -20,7 +20,12 @@ import {
   type BackendModelUsage,
   type ContextParts,
 } from '../runtime/token-usage.js';
-import type { BackendStreamParser, BackendTurnEvent } from './stream.js';
+import type {
+  BackendMessageSource,
+  BackendStreamParser,
+  BackendTextSource,
+  BackendTurnEvent,
+} from './stream.js';
 
 interface ClaudeContentBlock {
   type?: string;
@@ -42,13 +47,46 @@ interface ClaudeStreamMessage {
   /** Set on events that belong to a subagent's context, not this session's. */
   parent_tool_use_id?: string | null;
   session_id?: string;
+  uuid?: string;
   /** Model id serving the session (`system`/`init` event). */
   model?: string;
   /** Raw SSE event nested under `stream_event` (--include-partial-messages). */
   event?: {
     type?: string;
-    delta?: { type?: string; text?: string };
+    message?: { id?: string };
+    index?: number;
+    content_block?: ClaudeContentBlock;
+    delta?: { type?: string; text?: string; stop_reason?: string | null };
   };
+}
+
+function messageSource(
+  ev: ClaudeStreamMessage,
+  messageId?: string
+): BackendMessageSource | undefined {
+  if (typeof messageId !== 'string' || !messageId) return undefined;
+  return {
+    messageId,
+    origin:
+      ev.parent_tool_use_id === null
+        ? 'parent'
+        : typeof ev.parent_tool_use_id === 'string' && ev.parent_tool_use_id
+          ? 'child'
+          : 'unknown',
+    ...(typeof ev.parent_tool_use_id === 'string' && ev.parent_tool_use_id
+      ? { parentToolUseId: ev.parent_tool_use_id }
+      : {}),
+  };
+}
+
+function sourceKey(source: BackendMessageSource): string {
+  return JSON.stringify([source.origin, source.parentToolUseId, source.messageId]);
+}
+
+interface PartialMessage {
+  source: BackendMessageSource;
+  blocks: Map<number, { type?: string; offset: number; closed: boolean; snapshotted: boolean }>;
+  stopReason?: string | null;
 }
 
 const NO_SESSION_MARKER = 'No conversation found with session ID';
@@ -165,6 +203,7 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
 
 export class ClaudeStreamParser implements BackendStreamParser {
   private buffer = '';
+  private finished = false;
   /**
    * Text of the assistant message currently being assembled — the real final
    * response when `result` is empty or partial.
@@ -178,7 +217,15 @@ export class ClaudeStreamParser implements BackendStreamParser {
    * accumulate here; a new message id starts over.
    */
   private lastAssistantText = '';
+  /** A child may interleave without erasing earlier blocks of its parent. */
+  private messageTexts = new Map<string, string>();
   private lastAssistantMessageId: string | undefined;
+  private lastAssistantSource: BackendMessageSource | undefined;
+  private partialMessages = new Map<string, PartialMessage>();
+  /** Correlation survives block/message closure until this attempt ends. */
+  private messageBlocks = new Map<string, PartialMessage>();
+  private snapshotSources = new Map<string, BackendTextSource>();
+  private completedTextBlocks = new Set<string>();
   /**
    * The newest top-level assistant message's own usage — one API request,
    * so its input + cache parts are the context that request was handed.
@@ -188,7 +235,112 @@ export class ClaudeStreamParser implements BackendStreamParser {
   private lastRequestUsage: ContextParts | undefined;
   private lastRequestMessageId: string | undefined;
 
+  private originKey(ev: ClaudeStreamMessage): string {
+    return JSON.stringify([typeof ev.parent_tool_use_id, ev.parent_tool_use_id]);
+  }
+
+  /** Match snapshots independently of whether their SSE block has closed. */
+  private snapshotSource(ev: ClaudeStreamMessage): BackendTextSource | undefined {
+    const source = messageSource(ev, ev.message?.id);
+    if (!source) return undefined;
+    const uuid = typeof ev.uuid === 'string' && ev.uuid ? ev.uuid : undefined;
+    const snapshotKey = uuid ? JSON.stringify([sourceKey(source), uuid]) : undefined;
+    const previous = snapshotKey ? this.snapshotSources.get(snapshotKey) : undefined;
+    if (previous) return previous;
+    const partial = this.messageBlocks.get(sourceKey(source));
+    const content = ev.message?.content;
+    const streamedBlock =
+      content?.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string'
+        ? [...(partial?.blocks ?? [])]
+            .reverse()
+            .find(([, block]) => block.type === 'text' && !block.snapshotted)
+        : undefined;
+    const blockId = streamedBlock
+      ? `index:${streamedBlock[0]}`
+      : uuid
+        ? `snapshot:${uuid}`
+        : undefined;
+    if (!blockId) return undefined;
+    if (streamedBlock) streamedBlock[1].snapshotted = true;
+    const result = { ...source, blockId, offset: 0 };
+    if (snapshotKey) this.snapshotSources.set(snapshotKey, result);
+    return result;
+  }
+
+  private partialEvent(ev: ClaudeStreamMessage, out: BackendTurnEvent[]): void {
+    const event = ev.event;
+    if (!event) return;
+    const key = this.originKey(ev);
+    if (event.type === 'message_start') {
+      // Missing identity clears the old association; never borrow it.
+      this.partialMessages.delete(key);
+      const source = messageSource(ev, event.message?.id);
+      if (source) {
+        const partial: PartialMessage = { source, blocks: new Map() };
+        this.partialMessages.set(key, partial);
+        this.messageBlocks.set(sourceKey(source), partial);
+        out.push({ kind: 'text-boundary', boundary: 'message-start', source });
+      }
+      return;
+    }
+    const partial = this.partialMessages.get(key);
+    const index = Number.isSafeInteger(event.index) && event.index! >= 0 ? event.index : undefined;
+    if (event.type === 'content_block_start' && partial && index !== undefined) {
+      const initial =
+        event.content_block?.type === 'text' && typeof event.content_block.text === 'string'
+          ? event.content_block.text
+          : '';
+      partial.blocks.set(index, {
+        type: event.content_block?.type,
+        offset: initial.length,
+        closed: false,
+        snapshotted: false,
+      });
+      out.push({
+        kind: 'text-boundary',
+        boundary: 'block-start',
+        source: { ...partial.source, blockId: `index:${index}` },
+        ...(initial ? { text: initial } : {}),
+      });
+    } else if (event.type === 'content_block_delta') {
+      const delta = event.delta;
+      if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
+        const block = index !== undefined ? partial?.blocks.get(index) : undefined;
+        const source =
+          partial && block?.type === 'text' && !block.closed
+            ? { ...partial.source, blockId: `index:${index}`, offset: block.offset }
+            : undefined;
+        out.push({ kind: 'text-delta', text: delta.text, ...(source ? { source } : {}) });
+        if (block && !block.closed) block.offset += delta.text.length;
+      }
+    } else if (event.type === 'content_block_stop' && partial && index !== undefined) {
+      out.push({
+        kind: 'text-boundary',
+        boundary: 'block-end',
+        source: { ...partial.source, blockId: `index:${index}` },
+      });
+      const block = partial.blocks.get(index);
+      if (block) block.closed = true;
+    } else if (event.type === 'message_delta' && partial) {
+      partial.stopReason = event.delta?.stop_reason;
+    } else if (event.type === 'message_stop' && partial) {
+      // New SDKs also emit message_stop after interruption. It is not alone
+      // proof that an EOF fence is complete or that the child has exited.
+      const complete =
+        ['end_turn', 'tool_use', 'stop_sequence'].includes(partial.stopReason ?? '') &&
+        [...partial.blocks.values()].every((block) => block.closed);
+      out.push({
+        kind: 'text-boundary',
+        boundary: 'message-end',
+        source: partial.source,
+        complete,
+      });
+      this.partialMessages.delete(key);
+    }
+  }
+
   push(chunk: string): BackendTurnEvent[] {
+    if (this.finished) return [];
     this.buffer += chunk;
     const out: BackendTurnEvent[] = [];
     let nl: number;
@@ -208,6 +360,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
   }
 
   private consume(line: string, out: BackendTurnEvent[]): void {
+    if (this.finished) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let ev: ClaudeStreamMessage;
@@ -219,7 +372,10 @@ export class ClaudeStreamParser implements BackendStreamParser {
 
     switch (ev.type) {
       case 'assistant': {
-        if (!ev.parent_tool_use_id) {
+        const source = this.snapshotSource(ev);
+        const blockKey = source ? JSON.stringify([sourceKey(source), source.blockId]) : undefined;
+        const repeated = blockKey !== undefined && this.completedTextBlocks.has(blockKey);
+        if (!ev.parent_tool_use_id && !repeated) {
           const messageId = typeof ev.message?.id === 'string' ? ev.message.id : undefined;
           const parts =
             ev.message?.usage && typeof ev.message.usage === 'object'
@@ -257,13 +413,28 @@ export class ClaudeStreamParser implements BackendStreamParser {
         }
         if (text) {
           const messageId = typeof ev.message?.id === 'string' ? ev.message.id : undefined;
+          const message = messageSource(ev, messageId);
           const continuesMessage =
             messageId !== undefined &&
             messageId === this.lastAssistantMessageId &&
+            message !== undefined &&
+            this.lastAssistantSource !== undefined &&
+            sourceKey(message) === sourceKey(this.lastAssistantSource) &&
             this.lastAssistantText.length > 0;
-          out.push({ kind: 'text', text, ...(continuesMessage ? { continuesMessage } : {}) });
-          this.lastAssistantText = continuesMessage ? this.lastAssistantText + text : text;
-          this.lastAssistantMessageId = messageId;
+          out.push({
+            kind: 'text',
+            text,
+            ...(continuesMessage ? { continuesMessage } : {}),
+            ...(source ? { source } : {}),
+          });
+          if (!repeated) {
+            const key = message ? sourceKey(message) : undefined;
+            this.lastAssistantText = (key ? (this.messageTexts.get(key) ?? '') : '') + text;
+            if (key) this.messageTexts.set(key, this.lastAssistantText);
+            this.lastAssistantMessageId = messageId;
+            this.lastAssistantSource = message;
+          }
+          if (blockKey) this.completedTextBlocks.add(blockKey);
         }
         out.push(...toolUses);
         break;
@@ -283,6 +454,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
         break;
       }
       case 'result': {
+        this.finished = true;
         const resumeFailedNoSession =
           ev.subtype === 'error_during_execution' &&
           Array.isArray(ev.errors) &&
@@ -313,6 +485,11 @@ export class ClaudeStreamParser implements BackendStreamParser {
         out.push({
           kind: 'result',
           text,
+          // A diagnostic or unrelated final string cannot borrow the last
+          // message's provenance. Successful exact confirmation only.
+          ...(ev.subtype === 'success' && text === assembled && this.lastAssistantSource
+            ? { source: this.lastAssistantSource }
+            : {}),
           usage: ev.usage
             ? { ...toUsage(ev.usage, this.lastRequestUsage), ...(modelUsage ? { modelUsage } : {}) }
             : undefined,
@@ -329,14 +506,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
         break;
       }
       case 'stream_event': {
-        // Partial-message text fragments (--include-partial-messages). Only
-        // text deltas matter here — thinking/input_json deltas are noise for
-        // display, and the completed `assistant` block event remains the
-        // authoritative text (deltas never feed final-response extraction).
-        const delta = ev.event?.type === 'content_block_delta' ? ev.event.delta : undefined;
-        if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
-          out.push({ kind: 'text-delta', text: delta.text });
-        }
+        this.partialEvent(ev, out);
         break;
       }
       default:

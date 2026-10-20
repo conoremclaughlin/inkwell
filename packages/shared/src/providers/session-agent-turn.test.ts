@@ -11,6 +11,18 @@ import type { BackendRunRequest, BackendRunResult } from './backend-runner.js';
 import type { BackendHost } from './types.js';
 import { runSessionAgentTurn, type SessionAgentTurnPorts } from './session-agent-turn.js';
 import type { SessionProviderPorts } from './session-provider.js';
+import { SessionLog } from '../runtime/session-log.js';
+import { createToolInvocationJournal } from '../runtime/tool-invocation-journal.js';
+import { ToolSettlementSupervisor } from '../runtime/tool-settlement-supervisor.js';
+import type { SessionToolBatchPorts } from '../runtime/session-tool-batch.js';
+import type { BackendMessageSource, BackendTextSource } from './stream.js';
+
+const parentSource: BackendMessageSource = { messageId: 'synthetic-message', origin: 'parent' };
+const blockSource = (offset = 0, blockId = 'synthetic-block'): BackendTextSource => ({
+  ...parentSource,
+  blockId,
+  offset,
+});
 
 const tool = (name: string, args: Record<string, unknown> = {}) =>
   `\n\`\`\`ink-tool\n${JSON.stringify({ tool: name, args })}\n\`\`\``;
@@ -18,6 +30,7 @@ const result = (text: string, over: Partial<BackendRunResult> = {}): BackendRunR
   success: true,
   stdout: text,
   responseText: text,
+  responseSource: parentSource,
   stderr: '',
   exitCode: 0,
   durationMs: 3,
@@ -65,7 +78,11 @@ function harness(results: BackendRunResult[], session = 'one') {
       order.push('provider');
       const next = results.shift();
       if (!next) throw new Error('Unscripted provider launch');
-      request.onEvent?.({ kind: 'text-delta', text: next.responseText ?? '' });
+      request.onEvent?.({
+        kind: 'text-delta',
+        text: next.responseText ?? '',
+        source: blockSource(),
+      });
       return { result: Promise.resolve(next), abort: vi.fn() };
     }),
     onEvent: vi.fn(),
@@ -109,6 +126,693 @@ function harness(results: BackendRunResult[], session = 'one') {
     );
   return { provider, ports, run, events, order, prepared, occupancy };
 }
+
+function gate<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+/** No provider process, network, database or real tool dispatcher. */
+function streamHarness(results: BackendRunResult[] = []) {
+  const h = harness(results, 'synthetic-stream-session');
+  const lines: string[] = [];
+  const log = new SessionLog({
+    path: '/synthetic/stream-turn.jsonl',
+    sink: {
+      write: (line) => {
+        lines.push(line);
+      },
+    },
+  });
+  let invocation = 0;
+  const journal = createToolInvocationJournal({
+    sessionId: 'synthetic-stream-session',
+    log,
+    mintInvocationId: () => `synthetic-invocation-${++invocation}`,
+  });
+  const dispatched = gate<void>();
+  const release = vi.fn();
+  const batch: SessionToolBatchPorts = {
+    sessionId: journal.sessionId,
+    ledger: h.provider.ledger,
+    log,
+    policy: { canCallInkTool: vi.fn(() => ({ allowed: true, reason: 'fixture' })) },
+    mintInvocationId: () => {
+      throw new Error('Expected reserved invocation identity');
+    },
+    impossibleCallRefusal: () => null,
+    callTool: vi.fn(async () => {
+      dispatched.resolve();
+      return { success: true };
+    }),
+    promptForApproval: vi.fn(async () => false),
+    beginContextMutation: vi.fn(() => release),
+    isHandoffTool: () => false,
+    takeImages: vi.fn(() => []),
+    onResult: vi.fn(),
+  };
+  const reportFailure = vi.fn(async () => {});
+  const supervisor = new ToolSettlementSupervisor({
+    sessionId: journal.sessionId,
+    maxActiveAttempts: 4,
+  });
+  h.ports.streamTools = {
+    journal,
+    supervisor,
+    ports: batch,
+    turnId: 'synthetic-user-turn',
+    reportFailure,
+  };
+  let userTurns = 0;
+  const run = (signal?: AbortSignal, continueOnFailure = true) => {
+    userTurns++;
+    return h.run(signal, continueOnFailure);
+  };
+  const events = () => lines.map((line) => JSON.parse(line));
+  return {
+    ...h,
+    run,
+    batch,
+    supervisor,
+    log,
+    journal,
+    dispatched,
+    release,
+    reportFailure,
+    events,
+    counts: () => ({
+      userTurns,
+      providerRequests: vi.mocked(h.provider.startTurn).mock.calls.length,
+    }),
+  };
+}
+
+describe('opt-in provider-attempt stream composition', () => {
+  it('dispatches before generation ends, dedupes completed text, and never batch-executes final extraction', async () => {
+    const h = streamHarness([result('Done.')]);
+    const providerEnd = gate<BackendRunResult>();
+    const text = tool('send_response', { content: 'Synthetic progress.' }) + '\n';
+    vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+      request.onEvent?.({ kind: 'text-delta', text: text.slice(0, 17), source: blockSource() });
+      request.onEvent?.({ kind: 'text-delta', text: text.slice(17), source: blockSource(17) });
+      request.onEvent?.({ kind: 'text', text, source: blockSource() });
+      request.onEvent?.({ kind: 'result', text, source: parentSource });
+      return { result: providerEnd.promise, abort: vi.fn() };
+    });
+    const running = h.run();
+    await h.dispatched.promise;
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    expect(h.events().some((event) => event.type === 'tool_intent')).toBe(true);
+    providerEnd.resolve(result(text));
+    const done = await running;
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+    expect(h.ports.tools.screen).not.toHaveBeenCalled();
+    expect(done.loop.toolResults).toMatchObject([
+      { tool: 'send_response', invocationId: 'synthetic-invocation-1', dispatchState: 'returned' },
+    ]);
+    expect(
+      h.provider.ledger.listEntries().filter((entry) => entry.source === 'local-tool')
+    ).toHaveLength(1);
+    expect(h.release).toHaveBeenCalledOnce();
+  });
+
+  it.each(['exit', 'reject', 'missing-session'] as const)(
+    'retains the committed prefix after provider %s without a retry',
+    async (mode) => {
+      const h = streamHarness();
+      h.provider.state.id = 'synthetic-recovered-native';
+      const providerEnd = gate<BackendRunResult>();
+      const text = tool('send_response') + '\n';
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+        request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
+        return { result: providerEnd.promise, abort: vi.fn() };
+      });
+      const running = h.run();
+      await h.dispatched.promise;
+      if (mode === 'reject') providerEnd.reject(new Error('Synthetic provider rejection'));
+      else
+        providerEnd.resolve(
+          result(text, { success: false, resumeFailedNoSession: mode === 'missing-session' })
+        );
+      const done = await running;
+      expect(done.loop).toMatchObject({
+        success: false,
+        stopReason: 'backend-failure',
+        toolResults: [
+          expect.objectContaining({ tool: 'send_response', status: 'executed' }),
+          ...(mode === 'reject' ? [expect.objectContaining({ tool: 'runtime' })] : []),
+        ],
+      });
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.ports.tools.execute).not.toHaveBeenCalled();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+      expect(h.release).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('retains a failed continuation prefix beside the previous round, without a third request', async () => {
+    const h = streamHarness([
+      result(tool('recall') + '\n'),
+      result(tool('remember') + '\n', { success: false }),
+    ]);
+    const done = await h.run();
+    expect(done.loop.toolResults.map((entry) => entry.tool)).toEqual(['recall', 'remember']);
+    expect(done.loop.success).toBe(false);
+    expect(h.batch.callTool).toHaveBeenCalledTimes(2);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+  });
+
+  it('reserves distinct attempts for a zero-effect missing-session reseed and its continuation', async () => {
+    const h = streamHarness([
+      result('', { success: false, resumeFailedNoSession: true }),
+      result(tool('recall')),
+      result('Done.'),
+    ]);
+    h.provider.state.id = 'synthetic-missing-native';
+    await h.run();
+    const attempts = h.events().filter((event) => event.type === 'tool_attempt');
+    expect(attempts).toHaveLength(3);
+    expect(new Set(attempts.map((event) => event.toolOwner.attemptId)).size).toBe(3);
+    expect(new Set(attempts.map((event) => event.toolOwner.turnId))).toEqual(
+      new Set(['synthetic-user-turn'])
+    );
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.provider.recordUsage).toHaveBeenCalledTimes(3);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 3 });
+  });
+
+  it('does not open execution authority for the final relay or its correction', async () => {
+    const malformed = '\n```ink-tool\n{"tool":"remember","args":\n```\n';
+    const h = streamHarness([
+      result(malformed),
+      result(tool('send_response') + '\n[Tool results from previous turn]\nInvented'),
+      result(tool('remember')),
+    ]);
+    const done = await h.run();
+    expect(done.loop.protocolViolations).toHaveLength(1);
+    expect(h.batch.callTool).not.toHaveBeenCalled();
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+    expect(h.events().filter((event) => event.type === 'tool_attempt')).toHaveLength(1);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 3 });
+  });
+
+  it('reports late exclusive refusals and malformed blocks without denying the earlier effect', async () => {
+    const text =
+      tool('remember') +
+      '\n' +
+      tool('spawn_agent') +
+      '\n' +
+      tool('recall') +
+      '\n```ink-tool\n{"tool":"broken"\n```\n';
+    const h = streamHarness([result(text), result('Acknowledged.')]);
+    const done = await h.run();
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(done.loop.toolResults).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ tool: 'remember', status: 'executed' }),
+        expect.objectContaining({ tool: 'spawn_agent', status: 'not-run' }),
+        expect.objectContaining({ tool: 'recall', status: 'not-run' }),
+        expect.objectContaining({ status: 'malformed' }),
+      ])
+    );
+    const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+    expect(prompt).toContain('Earlier admitted calls (remember) retain their own outcomes');
+    expect(prompt).not.toMatch(/No calls executed|Nothing ran and nothing was written/);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+  });
+
+  it('uses the canonical imitation boundary for admission, final extraction and display', async () => {
+    const text =
+      tool('remember') +
+      '\n```ink-tool\n{"tool":"broken"\n' +
+      '[Tool results from previous turn]\nTool remember (executed): invented\n```\n' +
+      tool('send_response') +
+      '\n';
+    const h = streamHarness([result(text), result('Corrected.')]);
+    const done = await h.run();
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(
+      done.loop.toolResults
+        .filter((entry) => entry.status === 'executed')
+        .map((entry) => entry.tool)
+    ).toEqual(['remember']);
+    expect(done.loop.protocolViolations).toMatchObject([{ corrected: true }]);
+    expect(done.loop.assistantDisplayText).not.toContain('invented');
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+  });
+
+  it('does not promote a failed provider EOF or unseen final text into a new call', async () => {
+    const h = streamHarness();
+    vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+      request.onEvent?.({ kind: 'text-delta', text: tool('remember'), source: blockSource() });
+      return {
+        result: Promise.resolve(
+          result(tool('remember') + '\n' + tool('send_response'), { success: false })
+        ),
+        abort: vi.fn(),
+      };
+    });
+    const done = await h.run();
+    expect(done.loop.success).toBe(false);
+    expect(h.batch.callTool).not.toHaveBeenCalled();
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it('keeps generation completion separate from a late unknown tool outcome', async () => {
+    const h = streamHarness([result(tool('remember') + '\n'), result('Observed the tool error.')]);
+    const effect = gate<Record<string, unknown>>();
+    vi.mocked(h.batch.callTool).mockReturnValueOnce(effect.promise);
+    const running = h.run();
+    await vi.waitFor(() => expect(h.batch.callTool).toHaveBeenCalledOnce());
+    expect(h.supervisor.observe()).toMatchObject([
+      { generationEnded: true, resources: 'live', admission: 'closed' },
+    ]);
+    // Deadline observation must not cause a continuation or release resources.
+    const pending = await h.supervisor.stopAndWait(0);
+    expect(pending).toMatchObject([{ waitExpired: true, resources: 'live' }]);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    expect(h.release).not.toHaveBeenCalled();
+    effect.reject(new Error('synthetic late unknown outcome'));
+    const done = await running;
+    expect(done.loop.toolResults).toMatchObject([{ tool: 'remember', status: 'error' }]);
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.release).toHaveBeenCalledOnce();
+    // Explicit Stop forbids a model continuation, even when the effect settles late.
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it('routes supervisor Stop to the actual provider handle', async () => {
+    const h = streamHarness();
+    const providerEnd = gate<BackendRunResult>();
+    const text = tool('remember') + '\n';
+    const abort = vi.fn(() => providerEnd.resolve(result(text, { success: false, exitCode: 143 })));
+    vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+      request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
+      return { result: providerEnd.promise, abort };
+    });
+    const running = h.run();
+    await h.dispatched.promise;
+    await h.supervisor.stopAndWait(50);
+    await running;
+    expect(abort).toHaveBeenCalledOnce();
+    expect(h.supervisor.observe()).toEqual([]);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it('closes admission on Stop, retains the effect, and ignores late output', async () => {
+    const h = streamHarness();
+    const controller = new AbortController();
+    const providerEnd = gate<BackendRunResult>();
+    let request!: BackendRunRequest;
+    const text = tool('remember') + '\n';
+    const abort = vi.fn(() => providerEnd.resolve(result(text, { success: false, exitCode: 143 })));
+    vi.mocked(h.provider.startTurn).mockImplementationOnce((value) => {
+      request = value;
+      request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
+      return { result: providerEnd.promise, abort };
+    });
+    const running = h.run(controller.signal);
+    await h.dispatched.promise;
+    controller.abort();
+    request.onEvent?.({
+      kind: 'text-delta',
+      text: tool('send_response') + '\n',
+      source: blockSource(text.length),
+    });
+    const done = await running;
+    expect(done.loop).toMatchObject({
+      stopReason: 'aborted',
+      toolResults: [expect.objectContaining({ tool: 'remember' })],
+    });
+    expect(abort).toHaveBeenCalledOnce();
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    expect(h.release).toHaveBeenCalledOnce();
+  });
+
+  it('alerts and refuses the turn when its journal cannot open, with no batch fallback', async () => {
+    const h = streamHarness([result(tool('remember'))]);
+    vi.spyOn(h.log, 'flush').mockRejectedValueOnce(
+      new Error('Synthetic journal read/write failure')
+    );
+    await expect(h.run()).rejects.toThrow('Synthetic journal');
+    expect(h.reportFailure).toHaveBeenCalledWith(expect.stringContaining('without batch fallback'));
+    expect(h.provider.startTurn).not.toHaveBeenCalled();
+    expect(h.batch.callTool).not.toHaveBeenCalled();
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+  });
+
+  it('refuses a journal from another session before provider or tool work', async () => {
+    const h = streamHarness();
+    h.provider.spawnContext = () => ({
+      host: {} as BackendHost,
+      inkSessionId: 'synthetic-other-session',
+    });
+    await expect(h.run()).rejects.toThrow('same session');
+    expect(h.reportFailure).toHaveBeenCalledOnce();
+    expect(h.provider.startTurn).not.toHaveBeenCalled();
+    expect(h.batch.callTool).not.toHaveBeenCalled();
+  });
+
+  it('refuses an already recovered attempt rather than replaying its text through batch execution', async () => {
+    const h = streamHarness([result(tool('remember')), result('Done.')]);
+    await h.run();
+    const firstAttempt = h.events().find((event) => event.type === 'tool_attempt')
+      .toolOwner.attemptId;
+    h.ports.streamTools!.journal = createToolInvocationJournal({
+      sessionId: h.journal.sessionId,
+      log: h.log,
+      mintInvocationId: () => 'synthetic-not-issued',
+      recoveredEvents: h.events(),
+    });
+    h.provider.mintId = () => firstAttempt;
+    await expect(h.run()).rejects.toThrow('never redispatch');
+    expect(h.counts()).toEqual({ userTurns: 2, providerRequests: 2 });
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.reportFailure).toHaveBeenCalledOnce();
+    expect(h.ports.tools.execute).not.toHaveBeenCalled();
+  });
+
+  it('retains the known outcome and releases mutation ownership if outcome persistence throws', async () => {
+    const h = streamHarness([result(tool('remember') + '\n')]);
+    const append = h.log.append.bind(h.log);
+    vi.spyOn(h.log, 'append').mockImplementation((event) => {
+      if (event.type === 'local_tool_call') throw new Error('Synthetic outcome write failure');
+      return append(event);
+    });
+    const done = await h.run();
+    expect(done.loop.success).toBe(false);
+    expect(done.loop.toolResults[0]).toMatchObject({ tool: 'remember', status: 'executed' });
+    expect(h.reportFailure).toHaveBeenCalledWith(expect.stringContaining('outcome write failure'));
+    expect(h.release).toHaveBeenCalledOnce();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it.each(['initial-result', 'usage', 'images', 'abort-clear', 'spawn-end'] as const)(
+    'retains the stream outcomes when provider settlement fails at %s',
+    async (stage) => {
+      const h = streamHarness([result(tool('remember') + '\n')]);
+      const fail = () => {
+        throw new Error('Synthetic provider settlement failure');
+      };
+      if (stage === 'initial-result') h.provider.onInitialResult = fail;
+      else if (stage === 'usage') h.provider.recordUsage = fail;
+      else if (stage === 'images') h.provider.noteImagesDelivered = fail;
+      else if (stage === 'spawn-end') h.provider.endSpawn = fail;
+      else
+        h.provider.onAbortHandle = (abort) => {
+          if (abort === null) fail();
+        };
+      const done = await h.run();
+      expect(done.loop.success).toBe(false);
+      expect(done.loop.toolResults[0]).toMatchObject({ tool: 'remember', status: 'executed' });
+      expect(h.reportFailure).toHaveBeenCalledWith(expect.stringContaining('settlement failure'));
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.release).toHaveBeenCalledOnce();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    }
+  );
+
+  it.each(['opening-flush', 'intent-flush', 'approval'] as const)(
+    'Stop at %s never dispatches and retains the owner until settlement',
+    async (stage) => {
+      const h = streamHarness();
+      const controller = new AbortController();
+      const reached = gate<void>();
+      const resume = gate<void>();
+      const providerEnd = gate<BackendRunResult>();
+      const text = tool('remember') + '\n';
+      const flush = h.log.flush.bind(h.log);
+      let flushes = 0;
+      vi.spyOn(h.log, 'flush').mockImplementation(async () => {
+        if (++flushes === (stage === 'opening-flush' ? 1 : stage === 'intent-flush' ? 2 : -1)) {
+          reached.resolve();
+          await resume.promise;
+        }
+        return flush();
+      });
+      if (stage === 'approval') {
+        vi.mocked(h.batch.policy.canCallInkTool).mockReturnValue({
+          allowed: false,
+          promptable: true,
+          reason: 'fixture approval',
+        });
+        vi.mocked(h.batch.promptForApproval).mockImplementation(async () => {
+          reached.resolve();
+          await resume.promise;
+          return true;
+        });
+      }
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+        request.onEvent?.({ kind: 'text-delta', text, source: blockSource() });
+        return {
+          result: providerEnd.promise,
+          abort: () => providerEnd.resolve(result(text, { success: false })),
+        };
+      });
+      const running = h.run(controller.signal);
+      await reached.promise;
+      controller.abort();
+      expect(h.batch.callTool).not.toHaveBeenCalled();
+      expect(h.release).not.toHaveBeenCalled();
+      resume.resolve();
+      const done = await running;
+      expect(done.loop.stopReason).toBe('aborted');
+      expect(h.batch.callTool).not.toHaveBeenCalled();
+      expect(h.counts()).toEqual({
+        userTurns: 1,
+        providerRequests: stage === 'opening-flush' ? 0 : 1,
+      });
+      expect(h.release).toHaveBeenCalledTimes(stage === 'opening-flush' ? 0 : 1);
+    }
+  );
+
+  it('joins the launched provider after a host abort-registration callback throws', async () => {
+    const h = streamHarness();
+    const end = gate<BackendRunResult>();
+    const abort = vi.fn(() => end.resolve(result('Stopped.')));
+    vi.mocked(h.provider.startTurn).mockReturnValueOnce({ result: end.promise, abort });
+    vi.mocked(h.provider.onAbortHandle).mockImplementationOnce(() => {
+      throw new Error('Synthetic callback failure');
+    });
+    const done = await h.run();
+    expect(done.loop.success).toBe(false);
+    expect(done.backend.childExited).toBe(true);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(h.reportFailure).toHaveBeenCalledOnce();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it.each([
+    ['bash', '1 failed, 3 passed. Command exited with code 1'],
+    ['read', 'Synthetic fixture file does not exist'],
+    ['send_response', 'Synthetic lost receipt'],
+  ])(
+    'relays an unknown %s outcome without automatically retrying the call',
+    async (name, error) => {
+      const h = streamHarness([result(tool(name) + '\n'), result('I will inspect the failure.')]);
+      vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error(error));
+      const done = await h.run();
+      expect(done.loop.success).toBe(true);
+      expect(done.loop.toolResults[0]).toMatchObject({ tool: name, dispatchState: 'unknown' });
+      const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+      expect(prompt).toContain(error);
+      expect(prompt).toContain('dispatchState: unknown');
+      expect(prompt).toContain('not retried automatically');
+      expect(prompt).not.toContain('none of those calls ran');
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.reportFailure).not.toHaveBeenCalled();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    }
+  );
+
+  it('relays unknown outcomes in the final-only response when failure continuation is off', async () => {
+    const h = streamHarness([result(tool('send_response') + '\n'), result(tool('send_response'))]);
+    vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic lost receipt'));
+    await h.run(undefined, false);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+    expect(prompt).toContain('FINAL');
+    expect(prompt).toContain('dispatchState: unknown');
+    expect(prompt).toContain('not retried automatically');
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.events().filter((event) => event.type === 'tool_attempt')).toHaveLength(1);
+    expect(h.reportFailure).not.toHaveBeenCalled();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+  });
+
+  it('requires a new model emission to resend a call after an unknown outcome', async () => {
+    const text = tool('read', { path: '/synthetic/fixture.txt' }) + '\n';
+    const h = streamHarness([result(text), result(text), result('Read the fixture.')]);
+    vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic read failure'));
+    const done = await h.run();
+    expect(done.loop.success).toBe(true);
+    expect(done.loop.toolResults).toMatchObject([
+      { invocationId: 'synthetic-invocation-1', dispatchState: 'unknown' },
+      { invocationId: 'synthetic-invocation-2', dispatchState: 'returned' },
+    ]);
+    expect(h.batch.callTool).toHaveBeenCalledTimes(2);
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 3 });
+  });
+
+  it('does not reseed a missing provider session after an unknown effect', async () => {
+    const h = streamHarness([
+      result(tool('send_response') + '\n', { success: false, resumeFailedNoSession: true }),
+    ]);
+    h.provider.state.id = 'synthetic-missing-session';
+    vi.mocked(h.batch.callTool).mockRejectedValueOnce(new Error('Synthetic lost receipt'));
+    const done = await h.run();
+    expect(done.loop.success).toBe(false);
+    expect(done.loop.toolResults[0]).toMatchObject({ dispatchState: 'unknown' });
+    expect(h.batch.callTool).toHaveBeenCalledOnce();
+    expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+  });
+
+  it.each([false, true])(
+    'reports capped calls once, in emission order (terminal: %s)',
+    async (terminal) => {
+      const names = [
+        'remember',
+        'recall',
+        'read',
+        'list_tasks',
+        terminal ? 'signal_status' : 'bash',
+        'send_response',
+        'create_task',
+      ];
+      const h = streamHarness([
+        result(names.map((name) => tool(name)).join('\n') + '\n'),
+        result('Acknowledged.'),
+      ]);
+      vi.mocked(h.batch.callTool).mockImplementation(async (name) =>
+        name === 'signal_status'
+          ? {
+              content: [
+                { type: 'text', text: JSON.stringify({ signal: { status: 'completed' } }) },
+              ],
+            }
+          : { success: true }
+      );
+      const done = await h.run();
+      expect(done.loop.toolResults.map((entry) => entry.tool)).toEqual(names);
+      const prompt = vi.mocked(h.provider.startTurn).mock.calls[1][0].prompt;
+      expect([...prompt.matchAll(/Tool (\w+) \(/g)].map((match) => match[1])).toEqual(names);
+      expect(prompt.match(/Per-response tool cap reached/g)).toHaveLength(2);
+      expect(prompt).not.toContain('never reached it at all');
+      expect(prompt).not.toContain('NOT EXECUTED —');
+      expect(prompt.includes('FINAL')).toBe(terminal);
+      expect(h.batch.callTool).toHaveBeenCalledTimes(5);
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    }
+  );
+
+  it.each(['changed-final', 'changed-frame', 'second-message'] as const)(
+    'fails closed on %s while retaining the effect already admitted',
+    async (mode) => {
+      const h = streamHarness();
+      const end = gate<BackendRunResult>();
+      const prefix = tool('remember') + '\n';
+      let request!: BackendRunRequest;
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((value) => {
+        request = value;
+        request.onEvent?.({ kind: 'text-delta', text: prefix, source: blockSource() });
+        return { result: end.promise, abort: vi.fn(() => end.resolve(result(prefix))) };
+      });
+      const running = h.run();
+      await h.dispatched.promise;
+      if (mode === 'changed-final') end.resolve(result(tool('send_response')));
+      else {
+        if (mode === 'second-message')
+          request.onEvent?.({ kind: 'text', text: prefix, source: blockSource() });
+        request.onEvent?.({
+          kind: 'text',
+          text: tool('send_response') + '\n',
+          source: {
+            ...blockSource(),
+            ...(mode === 'second-message' ? { messageId: 'synthetic-second-message' } : {}),
+          },
+        });
+      }
+      const done = await running;
+      expect(done.loop.success).toBe(false);
+      expect(done.loop.toolResults[0]).toMatchObject({ tool: 'remember', status: 'executed' });
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.reportFailure).toHaveBeenCalledOnce();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    }
+  );
+
+  it('dedupes continued content blocks with positioned deltas or completed block snapshots', async () => {
+    for (const streamed of [true, false]) {
+      const text = 'Checking.\n' + tool('recall') + '\n';
+      const h = streamHarness([result('Done.')]);
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+        request.onEvent?.({ kind: 'text', text: 'Checking.\n', source: blockSource() });
+        if (streamed)
+          request.onEvent?.({
+            kind: 'text-delta',
+            text: tool('recall') + '\n',
+            source: blockSource(0, 'synthetic-second-block'),
+          });
+        request.onEvent?.({
+          kind: 'text',
+          text: tool('recall') + '\n',
+          continuesMessage: true,
+          source: blockSource(0, 'synthetic-second-block'),
+        });
+        return {
+          result: Promise.resolve(result(text)),
+          abort: vi.fn(),
+        };
+      });
+      await h.run();
+      expect(h.batch.callTool).toHaveBeenCalledOnce();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 2 });
+    }
+  });
+
+  it.each(['missing', 'unknown', 'raw-stdout'])(
+    'does not batch-fallback or reseed when the stream has %s provenance',
+    async (mode) => {
+      const h = streamHarness();
+      const text = tool('remember') + '\n';
+      h.provider.state.id = 'synthetic-existing-session';
+      vi.mocked(h.provider.startTurn).mockImplementationOnce((request) => {
+        if (mode === 'missing') request.onEvent?.({ kind: 'text-delta', text });
+        if (mode === 'unknown')
+          request.onEvent?.({
+            kind: 'text-delta',
+            text,
+            source: { ...blockSource(), origin: 'unknown' },
+          });
+        return {
+          result: Promise.resolve(
+            result(
+              text,
+              mode === 'raw-stdout' ? { responseText: undefined, responseSource: undefined } : {}
+            )
+          ),
+          abort: vi.fn(),
+        };
+      });
+      const done = await h.run();
+      expect(done.loop.success).toBe(false);
+      expect(h.batch.callTool).not.toHaveBeenCalled();
+      expect(h.ports.tools.execute).not.toHaveBeenCalled();
+      expect(h.reportFailure).toHaveBeenCalledOnce();
+      expect(h.counts()).toEqual({ userTurns: 1, providerRequests: 1 });
+    }
+  );
+});
 
 describe('shared parent session turn', () => {
   it('reserves pending UTF-8 steering bytes before truncating the result relay', async () => {
