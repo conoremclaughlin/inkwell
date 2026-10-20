@@ -19,7 +19,7 @@ test('the original server future MIT grant remains byte-for-byte unchanged', () 
   const marker = '## Grant of Future License\n';
   assert.equal(server.split(marker).length, 2, 'exactly one future grant');
   const future = server.slice(server.indexOf(marker));
-  // SHA-256 of the grant at 5742d266, before adding the Inkwell extension.
+  // SHA-256 of the grant at 5742d266, before adding the additional provisions.
   // Changing this pin requires deliberate review of the future-license promise.
   assert.equal(
     createHash('sha256').update(future).digest('hex'),
@@ -163,4 +163,10 @@ test('the infrastructure boundary is concise and the managed-service restriction
     compact(server),
     /Selling, reselling, or providing hosting, managed operation, or access to the Software for another party as part of a Commercial Offering/
   );
+});
+
+test('the explainer omits the repeated infrastructure clarification', () => {
+  const docs = compact(read('docs/licensing.md'));
+  assert.doesNotMatch(docs, /General-purpose infrastructure is not a managed-hosting exception/);
+  assert.doesNotMatch(docs, /Running that service on an ordinary VM does not change the distinction/);
 });

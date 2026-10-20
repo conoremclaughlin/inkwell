@@ -70,11 +70,6 @@ grant. Other license obligations, including the competing-use rule, still apply.
 | Renting a general-purpose VM, disk space, or bandwidth on which a customer installs and runs a permitted deployment | Not restricted merely for supplying those resources.                                                                                                                                                            |
 | Selling documents or reports created using an internal deployment                                                   | Permitted when selling the work product, not server-backed application or service access. A service fulfilling users' requests with server functionality is not exempt merely because its output is a document. |
 
-**General-purpose infrastructure is not a managed-hosting exception.** Supplying
-resources on which a customer operates their own deployment is different from
-selling a managed Inkwell instance or an Inkwell-backed application. Running that
-service on an ordinary VM does not change the distinction.
-
 ## Two years, per version
 
 The **Grant of Future License is unchanged**. On the second anniversary of when a
