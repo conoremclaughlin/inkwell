@@ -6,16 +6,16 @@ that boundary; the applicable license text controls.
 
 ## Scope
 
-| Component                                                                                         | License                                                                                                  |
-| ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| API server, `packages/api`, and its modifications and derivatives                                 | [FSL Ink Labs Extended 1.0](../packages/api/LICENSE), an extension of FSL 1.1 with additional provisions |
-| Web dashboard, `packages/web`, and its modifications and derivatives                              | [FSL Ink Labs Extended 1.0](../packages/web/LICENSE)                                                     |
-| First-party database source and configuration, `supabase/`, and its modifications and derivatives | [FSL Ink Labs Extended 1.0](../supabase/LICENSE)                                                         |
-| All of `packages/shared`, including runtime, providers, and node-host exports                     | [MIT immediately](../packages/shared/LICENSE)                                                            |
-| CLI, `packages/cli`                                                                               | [MIT immediately](../packages/cli/LICENSE)                                                               |
-| Benchmark harness source, `packages/benchmarks`                                                   | [MIT](../packages/benchmarks/LICENSE); the API it imports retains the server license                     |
-| Other first-party files outside those three covered directories                                   | [Root MIT license](../LICENSE), unless separately marked                                                 |
-| Third-party dependencies and files with their own notices                                         | Their respective licenses, not replaced by this table                                                    |
+| Component                                                                                         | License                                                                                                      |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| API server, `packages/api`, and its modifications and derivatives                                 | [FSL-1.1 Ink Labs Extended 1.0](../packages/api/LICENSE), an extension of FSL 1.1 with additional provisions |
+| Web dashboard, `packages/web`, and its modifications and derivatives                              | [FSL-1.1 Ink Labs Extended 1.0](../packages/web/LICENSE)                                                     |
+| First-party database source and configuration, `supabase/`, and its modifications and derivatives | [FSL-1.1 Ink Labs Extended 1.0](../supabase/LICENSE)                                                         |
+| All of `packages/shared`, including runtime, providers, and node-host exports                     | [MIT immediately](../packages/shared/LICENSE)                                                                |
+| CLI, `packages/cli`                                                                               | [MIT immediately](../packages/cli/LICENSE)                                                                   |
+| Benchmark harness source, `packages/benchmarks`                                                   | [MIT](../packages/benchmarks/LICENSE); the API it imports retains the server license                         |
+| Other first-party files outside those three covered directories                                   | [Root MIT license](../LICENSE), unless separately marked                                                     |
+| Third-party dependencies and files with their own notices                                         | Their respective licenses, not replaced by this table                                                        |
 
 The database scope covers Inkwell's own schema, migrations, seed files, and
 configuration, not the Supabase platform or users' stored data. The three covered
@@ -38,7 +38,7 @@ The license retains FSL 1.1's competing-use rule and adds **Restricted Commercia
 Use** to the purposes excluded from the grant. This is one integrated, modified
 license, not standard FSL offered alongside an optional restriction. Package
 metadata points to the full text rather than identifying it as unmodified
-`FSL-1.1-MIT`. `LicenseRef-FSL-Ink-Labs-Extended-1.0` is a custom reference, not a claim
+`FSL-1.1-MIT`. `LicenseRef-FSL-1.1-Ink-Labs-Extended-1.0` is a custom reference, not a claim
 that this is a standard SPDX-listed license.
 
 Separate written authorization is required to provide commercial server hosting,

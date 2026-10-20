@@ -5,7 +5,7 @@ The MIT license below applies to this repository except for:
 - The first-party Inkwell API server in packages/api, web dashboard in
   packages/web, database source and configuration in supabase/, and their
   modifications and derivatives, which are governed by packages/api/LICENSE
-  (FSL Ink Labs Extended 1.0, an extension of FSL 1.1 with additional
+  (FSL-1.1 Ink Labs Extended 1.0, an extension of FSL 1.1 with additional
   provisions and a two-year MIT future grant).
 - Components or files carrying separate third-party license notices, which
   remain governed by their respective licenses.
