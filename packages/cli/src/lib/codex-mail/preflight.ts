@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import {
   codexMailHooks,
@@ -9,6 +8,7 @@ import {
 import { probeCodexMailHooks } from './hook-probe.js';
 import { isCodexMailHookScope } from './hook-scope.js';
 import { splitCodexMailArgs } from './launch.js';
+import { probeCodexMailCapabilities } from './capabilities.js';
 
 type LaunchInput = {
   binary: string;
@@ -23,15 +23,7 @@ export async function prepareCodexMailLaunch(options: LaunchInput) {
   if (process.platform === 'win32') throw new Error('Codex Inkmail requires macOS or Linux');
   const cwd = realpathSync(options.cwd);
   const launch = splitCodexMailArgs(options.args, cwd);
-  const version = spawnSync(options.binary, ['--version'], {
-    env: options.env,
-    cwd,
-    encoding: 'utf8',
-    timeout: 5000,
-  });
-  if (version.status !== 0 || !/^codex-cli 0\.159\.2\s*$/.test(version.stdout)) {
-    throw new Error('Codex Inkmail currently requires codex-cli 0.159.2');
-  }
+  probeCodexMailCapabilities({ ...options, cwd });
   const expectedHooks = codexMailHooks();
   launch.serverArgs.splice(1, 0, '--enable', 'hooks');
   const probe = () => probeCodexMailHooks({ ...options, cwd, serverArgs: launch.serverArgs });

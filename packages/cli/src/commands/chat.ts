@@ -279,6 +279,7 @@ import {
   decodeDelegationToken,
   drainThreads,
   encodeContextToken,
+  formatInkmailMessage,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
   TURN_REPLY_TOKEN_ENV,
@@ -1600,18 +1601,14 @@ function filterSessionsByPolicy(
 }
 
 function buildAutoRunPromptFromInbox(runtime: ChatRuntime, message: InboxMessage): string {
-  const from = message.from || 'unknown';
-  const parts = [
-    `Inbox task from ${from}${message.subject ? ` (${message.subject})` : ''}.`,
-    message.threadKey ? `Thread: ${message.threadKey}.` : '',
-    message.messageType ? `Message type: ${message.messageType}.` : '',
-    '',
-    message.content.trim(),
-    '',
-    'Handle this request now. If follow-up to sender is needed, send it before finishing.',
-  ].filter(Boolean);
-
-  return parts.join('\n');
+  return formatInkmailMessage({
+    sender: message.from || 'unknown',
+    threadKey: message.threadKey,
+    messageType: message.messageType,
+    messageId: message.id,
+    subject: message.subject,
+    content: message.content,
+  });
 }
 
 function matchesAttachQuery(session: SessionSummary, query?: string): boolean {

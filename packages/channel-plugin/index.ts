@@ -35,6 +35,7 @@ import {
   drainThreads,
   drainLegacyInbox,
 } from '../shared/src/inkmail/drain.js';
+import { INKMAIL_HANDLING_INSTRUCTIONS } from '../shared/src/inkmail/presentation.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -245,10 +246,8 @@ const mcp = new Server(
 
 These are real-time notifications from the Ink inbox — thread replies, task requests, review feedback, etc.
 
-When you receive a channel message:
-- Read and understand the content
-- If it requires action, act on it
-- To reply, use the existing send_to_inbox tool (from the inkwell MCP server) with the thread_key from the channel tag metadata
+${INKMAIL_HANDLING_INSTRUCTIONS}
+Use the thread_key from the channel tag metadata as the reply's threadKey.
 
 Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`
       : `InkMail push is off in this process: this host cannot show Claude channel messages. Messages that arrive during this turn stay unread and are delivered separately.`,

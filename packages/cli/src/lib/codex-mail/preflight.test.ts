@@ -3,12 +3,16 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { probeCodexMailCapabilities } from './capabilities.js';
 import { prepareCodexMailLaunch, selectCodexMailLaunch } from './preflight.js';
 import { codexMailHooks } from './hooks.js';
 import { probeCodexMailHooks } from './hook-probe.js';
 vi.mock('./hook-probe.js', () => ({ probeCodexMailHooks: vi.fn() }));
 
-// No native provider: version detection only, with an isolated project fixture.
+// No native process: capability discovery and hook probing are both mocked.
+vi.mock('./capabilities.js', () => ({ probeCodexMailCapabilities: vi.fn() }));
+// Also fence the old release probe so the regression can safely run against
+// the previous implementation. No executable, even a fixture name, is started.
 vi.mock('node:child_process', () => ({ spawnSync: vi.fn() }));
 const dirs: string[] = [];
 afterEach(() => {
@@ -28,9 +32,6 @@ function fixture() {
   mkdirSync(join(cwd, '.codex'));
   const path = join(cwd, '.codex', 'config.toml');
   writeFileSync(path, legacy);
-  vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: 'codex-cli 0.159.2\n' } as ReturnType<
-    typeof spawnSync
-  >);
   vi.mocked(probeCodexMailHooks).mockImplementation(async ({ cwd, serverArgs }) => ({
     enabled: !serverArgs.includes('--disable'),
     sessionHooks: false,
@@ -73,6 +74,16 @@ function fixture() {
   return { options, path };
 }
 describe('default Codex Inkmail selection', () => {
+  it('accepts a compatible future release without consulting its version number', async () => {
+    const f = fixture();
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: 'codex-cli 99.0.0\n' } as ReturnType<
+      typeof spawnSync
+    >);
+    expect(await selectCodexMailLaunch(f.options)).toMatchObject({ kind: 'mail' });
+    expect(probeCodexMailCapabilities).toHaveBeenCalledOnce();
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(readFileSync(f.path, 'utf8')).toBe(legacy);
+  });
   it('defaults eligible launches to mail with guarded hooks and unchanged user overrides', async () => {
     const f = fixture();
     const args = ['-c', 'model="fixture"', '--sandbox', 'read-only'];
@@ -108,7 +119,7 @@ describe('default Codex Inkmail selection', () => {
     });
     expect(prepare).not.toHaveBeenCalled();
     expect(probeCodexMailHooks).not.toHaveBeenCalled();
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(probeCodexMailCapabilities).not.toHaveBeenCalled();
     expect(readFileSync(f.path, 'utf8')).toBe(legacy);
   });
   it.each([undefined, true])(
@@ -119,24 +130,24 @@ describe('default Codex Inkmail selection', () => {
       const result = await selectCodexMailLaunch({ ...f.options, args, mode });
       expect(result.kind).toBe(mode ? 'error' : 'native');
       expect('reason' in result && result.reason).toContain('does not yet support');
-      expect(spawnSync).not.toHaveBeenCalled();
+      expect(probeCodexMailCapabilities).not.toHaveBeenCalled();
       expect(readFileSync(f.path, 'utf8')).toBe(legacy);
       expect(args).toEqual(['--profile', 'custom']);
     }
   );
-  it.each(['codex-cli 0.159.1', 'codex-cli 0.160.0', 'unrecognized'])(
-    'unsupported version %s does not migrate or launch',
-    async (stdout) => {
-      const f = fixture();
-      vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout } as ReturnType<typeof spawnSync>);
-      expect(await selectCodexMailLaunch(f.options)).toMatchObject({
-        kind: 'native',
-        reason: expect.stringContaining('0.159.2'),
-      });
-      expect(readFileSync(f.path, 'utf8')).toBe(legacy);
-    }
-  );
-  it('refuses missing/mismatched scope before checking versions or writing hooks', async () => {
+  it('opens the native fallback only when an actual required capability is unavailable', async () => {
+    const f = fixture();
+    vi.mocked(probeCodexMailCapabilities).mockImplementation(() => {
+      throw new Error('Codex Inkmail capability unavailable: thread/queue/add');
+    });
+    expect(await selectCodexMailLaunch(f.options)).toMatchObject({
+      kind: 'native',
+      reason: expect.stringContaining('thread/queue/add'),
+    });
+    expect(probeCodexMailHooks).not.toHaveBeenCalled();
+    expect(readFileSync(f.path, 'utf8')).toBe(legacy);
+  });
+  it('refuses missing/mismatched scope before probing capabilities or writing hooks', async () => {
     const f = fixture();
     for (const scope of [{ sessionId: undefined }, { studioId: 'different' }, { env: {} }]) {
       expect(await selectCodexMailLaunch({ ...f.options, ...scope })).toMatchObject({
@@ -144,7 +155,7 @@ describe('default Codex Inkmail selection', () => {
         reason: expect.stringContaining('exact attached'),
       });
     }
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(probeCodexMailCapabilities).not.toHaveBeenCalled();
     expect(readFileSync(f.path, 'utf8')).toBe(legacy);
   });
   it('leaves unrelated custom project config untouched while using native discovery', async () => {
@@ -162,7 +173,7 @@ describe('default Codex Inkmail selection', () => {
     ).toMatchObject({
       kind: 'error',
     });
-    expect(spawnSync).not.toHaveBeenCalled();
+    expect(probeCodexMailCapabilities).not.toHaveBeenCalled();
   });
   it.each(['trusted', 'untrusted'])(
     'reuses exact existing %s handlers without adding another copy',
